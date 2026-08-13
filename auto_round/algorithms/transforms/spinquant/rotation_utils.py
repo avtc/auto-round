@@ -184,7 +184,230 @@ __all__ = [
     "apply_hadamard_to_linear",
     "get_model_arch_info",
     "InputRotationWrapperHadamard",
+    "get_proj",
+    "iter_mlp_blocks",
+    "iter_layer_mlp_blocks",
+    "get_router_linears",
+    "get_mlp_module",
+    "dedupe_modules",
+    "iter_transformer_layers",
+    "find_embed_tokens",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Architecture-generic traversal helpers.
+#
+# A decoder layer's MLP submodule may be named ``mlp`` (most models),
+# ``feed_forward`` (Llama4) or ``block_sparse_moe`` (Granite MoE).  Inside it,
+# experts may live in ``mlp.experts`` either as an ``nn.ModuleList`` of
+# per-expert MLPs (HF style) or as numbered ``_ExpertContainer`` children
+# holding ``nn.Linear`` projections (auto-round's unfused layout, see
+# ``modeling.fused_moe``); shared experts may sit inside the MoE block
+# (``mlp.shared_expert(s)``) or directly on the decoder layer
+# (``layer.shared_mlp``, GraniteMoEShared).
+#
+# Projection name aliases:
+#   gate/up : ``gate_proj``/``up_proj`` (HF), ``w1``/``w3`` (Mixtral),
+#             ``input_linear`` (Granite, fused gate+up), ``gate_up_proj``
+#             (fused gate+up, e.g. MiniMax shared experts)
+#   down    : ``down_proj``, ``w2``, ``output_linear`` (Granite)
+# For fused gate+up projections, ``get_proj(block, "gate")`` and
+# ``get_proj(block, "up")`` return the SAME module — callers must deduplicate
+# by module identity before applying transforms.
+# ---------------------------------------------------------------------------
+
+_PROJ_NAME_ALIASES = {
+    "gate": ("gate_proj", "w1", "input_linear", "gate_up_proj"),
+    "up": ("up_proj", "w3", "input_linear", "gate_up_proj"),
+    "down": ("down_proj", "w2", "output_linear"),
+}
+_ROUTER_NAMES = ("gate", "router", "shared_expert_gate")
+_SHARED_EXPERT_NAMES = ("shared_expert", "shared_experts")
+_MLP_ATTR_NAMES = ("mlp", "feed_forward", "block_sparse_moe", "ffn")
+_LAYER_SHARED_MLP_NAMES = ("shared_mlp",)
+
+
+def get_mlp_module(layer: nn.Module) -> Optional[nn.Module]:
+    """Return the layer's MLP/MoE submodule, tolerating naming differences."""
+    for name in _MLP_ATTR_NAMES:
+        mod = getattr(layer, name, None)
+        if isinstance(mod, nn.Module):
+            return mod
+    return None
+
+
+def get_proj(block: nn.Module, kind: str) -> Optional[nn.Linear]:
+    """Resolve a projection Linear from an MLP / expert block.
+
+    Args:
+        block: The MLP-like module (dense MLP, single expert, shared expert).
+        kind: One of ``"gate"``, ``"up"``, ``"down"``.
+
+    Returns:
+        The ``nn.Linear`` projection, or None if the block has none.
+        Note: for fused gate+up projections (``input_linear`` /
+        ``gate_up_proj``), kinds ``"gate"`` and ``"up"`` return the same
+        module — deduplicate by identity before transforming.
+    """
+    for name in _PROJ_NAME_ALIASES[kind]:
+        proj = getattr(block, name, None)
+        if isinstance(proj, nn.Linear):
+            return proj
+    return None
+
+
+def dedupe_modules(modules) -> list:
+    """Deduplicate modules by identity, preserving order."""
+    seen = set()
+    out = []
+    for m in modules:
+        if id(m) not in seen:
+            seen.add(id(m))
+            out.append(m)
+    return out
+
+
+def iter_mlp_blocks(mlp: nn.Module):
+    """Yield ``(block, kind)`` for every MLP-like block inside ``mlp``.
+
+    ``kind`` is one of ``"dense"`` (the mlp module itself), ``"expert"``
+    (each routed expert), or ``"shared"`` (shared expert modules).  Blocks
+    that do not expose ``nn.Linear`` projections (e.g. still-fused 3D expert
+    parameters) are silently skipped — callers that need them should unfuse
+    first (auto-round's ``_patch_model`` does this before rotation).
+    """
+    if any(get_proj(mlp, k) is not None for k in ("gate", "up", "down")):
+        yield mlp, "dense"
+
+    experts = getattr(mlp, "experts", None)
+    if experts is not None:
+        if isinstance(experts, nn.ModuleList):
+            # HF style: mlp.experts[i] is a per-expert MLP module.
+            for expert in experts:
+                yield expert, "expert"
+        elif isinstance(experts, nn.Module):
+            # auto-round unfused layout: mlp.experts.<idx> containers.
+            for child_name, child in experts.named_children():
+                if child_name.isdigit():
+                    yield child, "expert"
+
+    for shared_name in _SHARED_EXPERT_NAMES:
+        shared = getattr(mlp, shared_name, None)
+        if shared is not None and any(get_proj(shared, k) is not None for k in ("gate", "up", "down")):
+            yield shared, "shared"
+
+
+def iter_layer_mlp_blocks(layer: nn.Module):
+    """Yield ``(block, kind)`` for every MLP-like block of a decoder layer.
+
+    Covers the layer's MLP/MoE module (any supported attribute name) plus
+    shared-expert MLPs that hang directly off the layer (``layer.shared_mlp``).
+    """
+    mlp = get_mlp_module(layer)
+    if mlp is not None:
+        yield from iter_mlp_blocks(mlp)
+    for name in _LAYER_SHARED_MLP_NAMES:
+        shared = getattr(layer, name, None)
+        if shared is not None and any(get_proj(shared, k) is not None for k in ("gate", "up", "down")):
+            yield shared, "shared"
+
+
+def get_router_linears(mlp: nn.Module) -> list:
+    """Return router / gating modules that consume the (normed) residual stream.
+
+    Accepts both ``nn.Linear`` routers (older HF modeling, e.g. Qwen2Moe's
+    ``mlp.gate``) and routers holding a bare 2D ``weight`` parameter applied
+    via ``F.linear`` (transformers 5.x ``*TopKRouter`` modules).  Only
+    ``.weight`` is ever accessed by rotation / norm-fusion code, so both
+    forms are handled identically.
+    """
+    routers = []
+    for name in _ROUTER_NAMES:
+        mod = getattr(mlp, name, None)
+        if mod is None:
+            continue
+        if isinstance(mod, nn.Linear):
+            routers.append(mod)
+        elif isinstance(getattr(mod, "weight", None), nn.Parameter) and mod.weight.dim() == 2:
+            routers.append(mod)
+    return routers
+
+
+# ---------------------------------------------------------------------------
+# Text-backbone location helpers (VL-safe).
+#
+# Vision-language models nest the text backbone under ``language_model`` /
+# ``text_model`` while vision towers expose their own ``layers`` containers.
+# Rotation only targets the text part, so explicit preferred paths are
+# resolved first; the generic fallback additionally requires children to
+# look like LLM decoder layers (input_layernorm + post_attention_layernorm).
+# ---------------------------------------------------------------------------
+
+_LAYER_CONTAINER_PATHS = (
+    "model.language_model.layers",
+    "language_model.layers",
+    "model.text_model.layers",
+    "text_model.layers",
+    "model.model.layers",
+    "model.layers",
+    "layers",
+    "transformer.h",
+    "model.decoder.layers",
+)
+
+_EMBED_TOKEN_PATHS = (
+    "model.language_model.embed_tokens",
+    "language_model.embed_tokens",
+    "model.text_model.embed_tokens",
+    "text_model.embed_tokens",
+    "model.model.embed_tokens",
+    "model.embed_tokens",
+    "embed_tokens",
+    "transformer.wte",
+    "decoder.embed_tokens",
+)
+
+
+def _resolve_attr_path(obj: nn.Module, path: str):
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def iter_transformer_layers(model: nn.Module):
+    """Yield decoder layers of the TEXT backbone, VL-safe.
+
+    Preferred explicit paths are tried first (covering VL nesting such as
+    ``model.language_model.layers``); the fallback picks the first
+    ``*.layers`` container whose children look like LLM decoder layers, so
+    vision towers are not mistaken for the text backbone.
+    """
+    for path in _LAYER_CONTAINER_PATHS:
+        container = _resolve_attr_path(model, path)
+        if container is not None and hasattr(container, "__iter__"):
+            yield from container
+            return
+    # Fallback: first *.layers container with decoder-layer-looking children.
+    for name, module in model.named_modules():
+        if name.endswith(".layers") or name == "layers":
+            children = list(module.children()) if isinstance(module, nn.Module) else []
+            if children and hasattr(children[0], "input_layernorm") and hasattr(
+                children[0], "post_attention_layernorm"
+            ):
+                yield from module
+                return
+
+
+def find_embed_tokens(model: nn.Module) -> Optional[nn.Module]:
+    """Locate the input embedding module of the text backbone, VL-safe."""
+    for path in _EMBED_TOKEN_PATHS:
+        embed = _resolve_attr_path(model, path)
+        if embed is not None:
+            return embed
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -477,65 +700,64 @@ def fuse_rmsnorm_in_model(model: nn.Module) -> None:
 
 
 def _fuse_rmsnorm_llama_like(model: nn.Module) -> None:
-    """Traverse layers, supporting both model.layers and model.model.layers patterns."""
-    # Try different layer container paths
-    layers = None
-    for path in ("model.layers", "layers", "transformer.h"):
-        parts = path.split(".")
-        obj = model
-        for p in parts:
-            if not hasattr(obj, p):
-                break
-            obj = getattr(obj, p)
-        else:
-            layers = obj
-            break
+    """Fuse norm gamma into consumers, VL-safe and architecture-generic.
 
-    if layers is None:
-        # Try recursive search
-        for name, module in model.named_modules():
-            if name.endswith(".layers") or name == "layers":
-                if hasattr(module, "__iter__"):
-                    layers = module
-                    break
-
-    if layers is None:
+    Gamma is only cleared (``fill_(1.0)``) when it was actually folded into at
+    least one consumer — otherwise the norm would be silently changed.
+    """
+    layers = list(iter_transformer_layers(model))
+    if not layers:
         return
 
     for layer in layers:
         # 1. input_layernorm -> q / k / v
         if hasattr(layer, "input_layernorm") and hasattr(layer.input_layernorm, "weight"):
             gamma = layer.input_layernorm.weight.data.to(torch.float64)
+            fused = False
             if hasattr(layer, "self_attn"):
                 for proj_name in ("q_proj", "k_proj", "v_proj"):
-                    if hasattr(layer.self_attn, proj_name):
-                        proj = getattr(layer.self_attn, proj_name)
+                    proj = getattr(layer.self_attn, proj_name, None)
+                    if isinstance(proj, nn.Linear):
                         w = proj.weight.data.to(torch.float64)
                         proj.weight.data = (w * gamma.view(1, -1)).to(proj.weight.dtype)
-            layer.input_layernorm.weight.data.fill_(1.0)
+                        fused = True
+            if fused:
+                layer.input_layernorm.weight.data.fill_(1.0)
 
-        # 2. post_attention_layernorm -> gate / up
+        # 2. post_attention_layernorm -> gate / up (+ experts & router for MoE)
         if hasattr(layer, "post_attention_layernorm") and hasattr(layer.post_attention_layernorm, "weight"):
             gamma = layer.post_attention_layernorm.weight.data.to(torch.float64)
-            if hasattr(layer, "mlp"):
-                for proj_name in ("gate_proj", "up_proj"):
-                    if hasattr(layer.mlp, proj_name):
-                        proj = getattr(layer.mlp, proj_name)
-                        w = proj.weight.data.to(torch.float64)
-                        proj.weight.data = (w * gamma.view(1, -1)).to(proj.weight.dtype)
-            layer.post_attention_layernorm.weight.data.fill_(1.0)
+            consumers = []
+            for block, _block_kind in iter_layer_mlp_blocks(layer):
+                for proj_kind in ("gate", "up"):
+                    proj = get_proj(block, proj_kind)
+                    if proj is not None:
+                        consumers.append(proj)
+            # Router/gating linears consume the same normed hidden states.
+            mlp = get_mlp_module(layer)
+            if mlp is not None:
+                consumers.extend(get_router_linears(mlp))
+            # Fused gate+up projections resolve to the same module for
+            # "gate" and "up" — fold gamma only once.
+            consumers = dedupe_modules(consumers)
+            for proj in consumers:
+                w = proj.weight.data.to(torch.float64)
+                proj.weight.data = (w * gamma.view(1, -1)).to(proj.weight.dtype)
+            if consumers:
+                layer.post_attention_layernorm.weight.data.fill_(1.0)
 
     # 3. final norm -> lm_head
     final_norm = None
-    for path in ("model.norm", "norm"):
-        parts = path.split(".")
-        obj = model
-        for p in parts:
-            if not hasattr(obj, p):
-                break
-            obj = getattr(obj, p)
-        else:
-            final_norm = obj
+    for path in (
+        "model.language_model.norm",
+        "language_model.norm",
+        "model.text_model.norm",
+        "text_model.norm",
+        "model.norm",
+        "norm",
+    ):
+        final_norm = _resolve_attr_path(model, path)
+        if final_norm is not None:
             break
 
     lm_head = getattr(model, "lm_head", None)
@@ -562,9 +784,11 @@ def untie_word_embeddings_if_needed(model: nn.Module) -> bool:
     frameworks (e.g. lm_eval's HFLM, HuggingFace Trainer) do not re-tie
     the weights after we've separated them.
     """
-    if hasattr(model, "model") and hasattr(model.model, "embed_tokens") and hasattr(model, "lm_head"):
-        embed = model.model.embed_tokens.weight
-        head = model.lm_head.weight
+    embed_module = find_embed_tokens(model)
+    lm_head = getattr(model, "lm_head", None)
+    if embed_module is not None and lm_head is not None and hasattr(embed_module, "weight"):
+        embed = embed_module.weight
+        head = lm_head.weight
         if embed.data_ptr() == head.data_ptr():
             model.lm_head.weight = nn.Parameter(head.clone())
             # Prevent frameworks from re-tying the now-separate weights
@@ -666,11 +890,14 @@ def get_model_arch_info(model: nn.Module) -> dict:
     info: dict = {"model_type": "unknown"}
     if hasattr(model, "config"):
         cfg = model.config
+        # VL models nest the LM architecture fields under text_config.
+        if not getattr(cfg, "hidden_size", None) and getattr(cfg, "text_config", None) is not None:
+            cfg = cfg.text_config
         info["model_type"] = getattr(cfg, "model_type", "unknown")
         info["hidden_size"] = getattr(cfg, "hidden_size", 0)
         info["num_q_heads"] = getattr(cfg, "num_attention_heads", 0)
         info["num_kv_heads"] = getattr(cfg, "num_key_value_heads", info["num_q_heads"])
-        info["intermediate_size"] = getattr(cfg, "intermediate_size", 0)
+        info["intermediate_size"] = getattr(cfg, "intermediate_size", 0) or getattr(cfg, "moe_intermediate_size", 0)
         info["head_dim"] = getattr(cfg, "head_dim", info["hidden_size"] // max(info["num_q_heads"], 1))
         if all(v for v in [info["hidden_size"], info["head_dim"], info["intermediate_size"]]):
             return info

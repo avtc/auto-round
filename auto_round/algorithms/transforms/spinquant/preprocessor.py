@@ -40,11 +40,19 @@ from auto_round.algorithms.transforms.spinquant.inplace.apply import (
 from auto_round.algorithms.transforms.spinquant.rotation_utils import (
     apply_hadamard_to_linear,
     create_block_diag_from_head_matrix,
+    dedupe_modules,
     deterministic_hadamard_matrix,
+    find_embed_tokens,
     fuse_rmsnorm_in_model,
     get_hadamard_K,
+    get_mlp_module,
     get_model_arch_info,
+    get_proj,
+    get_router_linears,
     is_pow2,
+    iter_layer_mlp_blocks,
+    iter_mlp_blocks,
+    iter_transformer_layers,
     matmul_hadU,
     random_hadamard_matrix,
     rotate_in_channels_,
@@ -250,6 +258,14 @@ class SpinQuantPreprocessor:
 
         # Validate dimensions for enabled rotations
         self._validate_dimensions()
+
+        # MoE awareness: warn about unfused experts and unvalidated training.
+        self._check_moe_support()
+
+        # Offline R1 rewrites the residual stream; refuse early (before any
+        # weight mutation) on architectures whose consumers we cannot rotate.
+        if self.config.r1 and not self.config.online_r1_rotation:
+            self._validate_offline_r1_support()
 
         # Step 1: untie embeddings (only needed for offline R1 — it rotates embed_tokens)
         if self.config.untie_embeddings and not self.config.online_r1_rotation:
@@ -633,16 +649,102 @@ class SpinQuantPreprocessor:
                 K = 0
 
             if self.config.r4 and self.intermediate_size % self.r4_rotation_size != 0:
+                # Do NOT disable R4 here: MoE expert intermediate sizes may
+                # differ from config.intermediate_size. The fusion and hook
+                # registration both apply a per-module divisibility check and
+                # rotate only the down_proj modules that are compatible.
                 logger.warning(
-                    f"[SpinQuant] R4 rotation_size={self.r4_rotation_size} must divide "
-                    f"intermediate_size={self.intermediate_size}. Disabling R4."
+                    f"[SpinQuant] R4 rotation_size={self.r4_rotation_size} does not divide "
+                    f"intermediate_size={self.intermediate_size}. R4 will be applied per-module: "
+                    f"only down_proj modules whose in_features is divisible by the rotation "
+                    f"size will be rotated (relevant for MoE models)."
                 )
-                self.config.r4 = False
             elif self.config.r4:
                 logger.info(
                     f"[SpinQuant] R4 Hadamard: K={K}, "
                     f"r4_rotation_size={inter}, intermediate_size={self.intermediate_size}"
                 )
+
+    def _has_moe_experts(self) -> bool:
+        """Check whether any layer has routed experts in per-expert Linear form."""
+        for layer in self._get_layers():
+            mlp = get_mlp_module(layer)
+            if mlp is None:
+                continue
+            for _block, kind in iter_mlp_blocks(mlp):
+                if kind == "expert":
+                    return True
+        return False
+
+    def _check_moe_support(self) -> None:
+        """Log MoE-related guidance: unfused experts and training limitations."""
+        has_experts_attr = False
+        for layer in self._get_layers():
+            mlp = get_mlp_module(layer)
+            if mlp is not None and hasattr(mlp, "experts"):
+                has_experts_attr = True
+                break
+        if not has_experts_attr:
+            return
+
+        if not self._has_moe_experts():
+            logger.warning(
+                "[SpinQuant] MoE experts found but not in per-expert nn.Linear form "
+                "(fused 3D weights). Expert weights will NOT be rotated. Run rotation "
+                "through the AutoRound pipeline (its _patch_model step unfuses experts) "
+                "or call prepare_model_for_moe_quantization() first."
+            )
+        elif self.config.trainable_rotation or self.config.trainable_smooth:
+            logger.warning(
+                "[SpinQuant] MoE model detected with trainable rotation/smooth: "
+                "the training loop has not been validated for MoE models. "
+                "Use trainable_rotation=False (QuaRot mode) for MoE."
+            )
+
+    def _validate_offline_r1_support(self) -> None:
+        """Refuse offline R1 on architectures it cannot keep equivalent.
+
+        Offline R1 rotates the whole residual stream, so EVERY consumer of the
+        stream must absorb the inverse rotation.  That is currently only
+        guaranteed for layers with standard q/k/v/o_proj attention and
+        linearized (per-expert nn.Linear) experts.  Unsupported cases:
+
+          - layers without ``self_attn`` (e.g. qwen3_next GatedDeltaNet
+            linear-attention layers),
+          - attention without the full q/k/v/o proj set (e.g. DeepSeek MLA),
+          - experts still in fused 3D form (rotation outside the pipeline).
+
+        Raises:
+            ValueError: always, with a human-readable explanation.  Online R1
+                (``online_r1_rotation=True``) remains available for these
+                architectures because it leaves the residual stream unchanged.
+        """
+        problems = []
+        for idx, layer in enumerate(self._get_layers()):
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                problems.append(f"layer {idx}: no self_attn (hybrid/linear-attention layer)")
+                continue
+            missing = [
+                p for p in ("q_proj", "k_proj", "v_proj", "o_proj") if not isinstance(getattr(attn, p, None), nn.Linear)
+            ]
+            if missing:
+                problems.append(f"layer {idx}: attention lacks {missing} (e.g. MLA)")
+            mlp = get_mlp_module(layer)
+            if mlp is not None and hasattr(mlp, "experts"):
+                has_linear_experts = any(kind == "expert" for _b, kind in iter_mlp_blocks(mlp))
+                if not has_linear_experts:
+                    problems.append(f"layer {idx}: experts are in fused (non-linearized) form")
+        if problems:
+            raise ValueError(
+                "[SpinQuant] Offline R1 (online_r1_rotation=False) is not supported for "
+                "this model architecture — the residual-stream rotation cannot be kept "
+                "equivalent for the following layers:\n  - "
+                + "\n  - ".join(problems[:10])
+                + ("\n  ..." if len(problems) > 10 else "")
+                + "\nUse online_r1_rotation=True (default) instead, which leaves the "
+                "residual stream unchanged and is safe for these architectures."
+            )
 
     # ------------------------------------------------------------------
     # Step 3: Trainable RMSNorm
@@ -860,39 +962,12 @@ class SpinQuantPreprocessor:
             torch.cuda.empty_cache()
 
     def _get_embed_tokens(self) -> Optional[nn.Module]:
-        """Get embedding module, supporting both model.embed_tokens and model.model.embed_tokens."""
-        for attr_path in ("embed_tokens", "model.embed_tokens"):
-            parts = attr_path.split(".")
-            obj = self.model
-            for p in parts:
-                if not hasattr(obj, p):
-                    break
-                obj = getattr(obj, p)
-            else:
-                return obj
-        return None
+        """Get the text-backbone embedding module (VL-safe)."""
+        return find_embed_tokens(self.model)
 
     def _get_layers(self):
-        """Yield transformer layers, supporting multiple nesting patterns."""
-        for attr_path in ("layers", "model.layers", "transformer.h", "model.decoder.layers"):
-            parts = attr_path.split(".")
-            obj = self.model
-            for p in parts:
-                if not hasattr(obj, p):
-                    break
-                obj = getattr(obj, p)
-            else:
-                if hasattr(obj, "__iter__"):
-                    for layer in obj:
-                        yield layer
-                    return
-        # Fallback: search recursively
-        for name, module in self.model.named_modules():
-            if name.endswith(".layers") or name == "layers":
-                if hasattr(module, "__iter__"):
-                    for layer in module:
-                        yield layer
-                    return
+        """Yield transformer decoder layers of the text backbone (VL-safe)."""
+        yield from iter_transformer_layers(self.model)
 
     def _get_lm_head(self) -> Optional[nn.Module]:
         """Get LM head module."""
@@ -928,20 +1003,27 @@ class SpinQuantPreprocessor:
         the linear computation, and WrapperWALayer steals & runs them at
         inference time.
 
-        .. warning::
-            Hook-based online R1 is **not serializable** — ``save_pretrained()``
-            will NOT save the activation hooks.  If you need to save and reload
-            the rotated model, use offline R1 instead
-            (``SpinQuantConfig(online_r1_rotation=False)``).
+        .. note::
+            The hooks themselves are not serialized by a plain HF
+            ``save_pretrained()``, but AutoRound's export pipeline
+            (``quantize_and_save`` / auto_round format) stores the rotation
+            metadata and matrices as QuantLinear buffers plus
+            ``spinquant_config`` in ``config.json``, and
+            ``auto_round.inference.convert_hf_model()`` rebuilds the exact
+            same hooks on load — so a quantized save→reload round-trip via
+            AutoRound stays mathematically equivalent.  The hooks are only
+            lost when the rotated model is saved directly with
+            ``save_pretrained()`` and reloaded outside AutoRound's
+            export/convert path.
         """
         r1_size = self.r1_rotation_size
         use_random = self.config.random_r1
 
-        logger.warning(
-            "[SpinQuant] Online R1 uses forward_pre_hooks which are NOT saved by "
-            "save_pretrained(). The saved model will lose activation rotation hooks. "
-            "Use SpinQuantConfig(online_r1_rotation=False) for offline R1 if you "
-            "need to save/reload the model."
+        logger.info(
+            "[SpinQuant] Online R1 uses forward_pre_hooks on the live model. "
+            "They are not part of a plain HF save_pretrained() round-trip, but "
+            "AutoRound's export saves rotation metadata/buffers and "
+            "convert_hf_model() rebuilds equivalent hooks on load."
         )
 
         r1_size, use_random, R1_full, hadamard_K, K = self._compute_online_r1_shared()
@@ -997,52 +1079,59 @@ class SpinQuantPreprocessor:
 
         Returns ``(n_rotated, n_hooked)``.
         """
-        if not (hasattr(layer, "self_attn") and hasattr(layer, "mlp")):
-            return 0, 0
-
+        # Hybrid-safe traversal: attention may be absent on hybrid
+        # architectures (e.g. qwen3_next / qwen3_5_moe GatedDeltaNet layers);
+        # MLP rotation does not depend on attention, so experts are still
+        # rotated on those layers. iter_layer_mlp_blocks covers dense MLPs,
+        # routed/shared experts; fused gate+up projections are deduplicated so
+        # they are rotated/hooked exactly once. Router/gating linears are NOT
+        # rotated (online R1 leaves the residual stream unchanged).
         layer_device = next(layer.parameters()).device
+        attn = getattr(layer, "self_attn", None)
 
-        attn = layer.self_attn
-        mlp = layer.mlp
-
-        # Target modules: (parent_module, attr_name)
-        target_specs = []
-        for proj_name in ("q_proj", "k_proj", "v_proj"):
-            if hasattr(attn, proj_name):
-                target_specs.append((attn, proj_name))
-        for proj_name in ("gate_proj", "up_proj"):
-            if hasattr(mlp, proj_name):
-                target_specs.append((mlp, proj_name))
+        target_modules = []
+        if attn is not None:
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                proj = getattr(attn, proj_name, None)
+                if isinstance(proj, nn.Linear):
+                    target_modules.append(proj)
+        for block, _block_kind in iter_layer_mlp_blocks(layer):
+            for proj_kind in ("gate", "up"):
+                proj = get_proj(block, proj_kind)
+                if proj is not None:
+                    target_modules.append(proj)
+        target_modules = dedupe_modules(target_modules)
+        if not target_modules:
+            return 0, 0
 
         n_rotated = 0
         n_hooked = 0
-        for parent, attr_name in target_specs:
-            module = getattr(parent, attr_name)
+        for module in target_modules:
             dtype = module.weight.data.dtype
             in_features = module.weight.shape[-1]
 
             if use_random:
-                # Random R1: explicit matrix multiply
+                # Random R1: explicit W @ R (matches the online hook x @ R).
+                # Random Hadamard is orthonormal but NOT symmetric, so pass
+                # R.T to rotate_in_channels_ to compute W @ (R.T).T = W @ R.
                 R = R1_full.to(layer_device)
                 if r1_size == in_features:
                     W = module.weight.data.to(torch.float64)
                     module.weight.data = (W @ R).to(dtype)
                 elif in_features % r1_size == 0:
-                    # Block rotation must use W @ R (not W @ R.T) to stay
-                    # consistent with the online hook (x @ R). The random
-                    # Hadamard matrix is orthonormal but NOT symmetric, so
-                    # rotate_in_channels_ (which applies R.T) would break
-                    # equivalence. Pass R.T so it computes W @ (R.T).T = W @ R.
                     rotate_in_channels_(module, R_in=R.T)
                 else:
                     raise ValueError(
-                        f"Online R1: in_features={in_features} not compatible " f"with r1_rotation_size={r1_size}"
+                        f"Online R1: in_features={in_features} not compatible "
+                        f"with r1_rotation_size={r1_size}"
                     )
             else:
-                # Deterministic Hadamard: butterfly algorithm
+                # Deterministic Hadamard: butterfly algorithm.
                 had_K_local = hadamard_K.to(layer_device)
                 if r1_size == in_features:
-                    module.weight.data = matmul_hadU(module.weight.data, hadamard_K=had_K_local, K=K).to(dtype)
+                    module.weight.data = matmul_hadU(
+                        module.weight.data, hadamard_K=had_K_local, K=K
+                    ).to(dtype)
                 elif in_features % r1_size == 0:
                     R_block = had_K_local.to(torch.float64)
                     if R_block.shape[0] != r1_size:
@@ -1055,11 +1144,12 @@ class SpinQuantPreprocessor:
                     rotate_in_channels_(module, R_in=R_block)
                 else:
                     raise ValueError(
-                        f"Online R1: in_features={in_features} not compatible " f"with r1_rotation_size={r1_size}"
+                        f"Online R1: in_features={in_features} not compatible "
+                        f"with r1_rotation_size={r1_size}"
                     )
             n_rotated += 1
 
-            # Register forward_pre_hook for online activation rotation
+            # Register forward_pre_hook for online activation rotation.
             if use_random:
                 hook = self._make_online_r1_hook_matrix(R1_full.to(layer_device), r1_size, in_features)
             else:
@@ -1165,10 +1255,10 @@ class SpinQuantPreprocessor:
         # Transformer layers
         n_layers = 0
         for layer in self._get_layers():
-            if not (hasattr(layer, "self_attn") and hasattr(layer, "mlp")):
+            if not hasattr(layer, "self_attn"):
                 continue
             attn = layer.self_attn
-            mlp = layer.mlp
+            mlp = get_mlp_module(layer)
 
             # Ensure R1_inv is on the same device as layer weights
             layer_device = next(layer.parameters()).device
@@ -1185,13 +1275,28 @@ class SpinQuantPreprocessor:
             if hasattr(attn, "o_proj"):
                 rotate_out_channels_(attn.o_proj, R_out=R1_local, rotated_modules=self._rotated_modules)
 
-            # MLP: same convention
-            if hasattr(mlp, "gate_proj"):
-                rotate_in_channels_(mlp.gate_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
-            if hasattr(mlp, "up_proj"):
-                rotate_in_channels_(mlp.up_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
-            if hasattr(mlp, "down_proj"):
-                rotate_out_channels_(mlp.down_proj, R_out=R1_local, rotated_modules=self._rotated_modules)
+            # MLP (dense + MoE experts + shared experts): same convention.
+            # Expert down_proj writes to the residual stream, so it takes the
+            # output-side rotation just like a dense down_proj.
+            # iter_layer_mlp_blocks covers feed_forward/block_sparse_moe naming
+            # and layer-level shared_mlp; fused gate+up projections are
+            # deduplicated via rotated_modules.
+            for block, _block_kind in iter_layer_mlp_blocks(layer):
+                gate = get_proj(block, "gate")
+                if gate is not None:
+                    rotate_in_channels_(gate, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
+                up = get_proj(block, "up")
+                if up is not None:
+                    rotate_in_channels_(up, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
+                down = get_proj(block, "down")
+                if down is not None:
+                    rotate_out_channels_(down, R_out=R1_local, rotated_modules=self._rotated_modules)
+            # Router/gating linears consume the rotated residual stream and must
+            # absorb R1_inv to keep routing logits unchanged (they stay
+            # unquantized, so no online hook is involved).
+            if mlp is not None:
+                for router in get_router_linears(mlp):
+                    rotate_in_channels_(router, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
             n_layers += 1
 
         logger.info(
@@ -1218,8 +1323,18 @@ class SpinQuantPreprocessor:
         v_proj output channels and o_proj input channels per attention head.
 
         Math:
-            v_rotated = v @ R2  per head  →  fuse into v_proj: W_new = R2^T @ W
+            v_rotated = v @ R2  per head  →  fuse into v_proj: W_new = R2^T @ W,
+            b_new = R2^T @ b (per head)
             o_proj input is R2-rotated    →  fuse into o_proj: W_new = W @ R2
+
+        Safety guards (per layer):
+          - v_proj and o_proj must BOTH exist — rotating only one side (e.g.
+            MLA attention, which has o_proj but no v_proj) would silently
+            break equivalence.
+          - Output-gated attention (qwen3_next / qwen3_5 style, where the
+            o_proj input is ``attn * sigmoid(gate)``) does not commute with
+            an orthogonal rotation, so R2 is skipped.  Detected generically
+            via ``q_proj.out_features != o_proj.in_features``.
         """
         if not self.config.r2 or self.head_dim <= 0:
             return
@@ -1232,40 +1347,71 @@ class SpinQuantPreprocessor:
         R2_T = R2.t()
 
         n_fused = 0
-        for layer in self._get_layers():
-            n_fused += self._fuse_r2_to_layer(layer, R2, R2_T)
+        n_skipped = 0
+        for layer_idx, layer in enumerate(self._get_layers()):
+            if self._fuse_r2_to_layer(layer, R2, R2_T) == 1:
+                n_fused += 1
+            else:
+                n_skipped += 1
 
-        logger.info(f"[SpinQuant] R2 fused into {n_fused} layers (v_proj out + o_proj in, head_dim={self.head_dim})")
+        logger.info(
+            f"[SpinQuant] R2 fused into {n_fused} layers (v_proj out + o_proj in, "
+            f"head_dim={self.head_dim}, skipped={n_skipped})"
+        )
 
     def _fuse_r2_to_layer(self, layer, R2, R2_T) -> int:
         """Fuse R2 per-head rotation into a single layer's v_proj/o_proj.
 
         Returns 1 if the layer was fused, else 0.
+
+        Safety guards (per layer):
+          - v_proj and o_proj must BOTH exist as ``nn.Linear`` — rotating only
+            one side (e.g. MLA attention, which has o_proj but no v_proj)
+            would silently break equivalence.
+          - Output-gated attention (qwen3_next / qwen3_5 style, where the
+            o_proj input is ``attn * sigmoid(gate)``) does not commute with an
+            orthogonal rotation, so R2 is skipped. Detected generically via
+            ``q_proj.out_features != o_proj.in_features``.
         """
         if not hasattr(layer, "self_attn"):
             return 0
         attn = layer.self_attn
 
+        v_proj = getattr(attn, "v_proj", None)
+        o_proj = getattr(attn, "o_proj", None)
+        if not (isinstance(v_proj, nn.Linear) and isinstance(o_proj, nn.Linear)):
+            return 0  # MLA / non-standard attention: no paired v↔o to rotate.
+
+        # Output-gated attention: R2 does not commute through the elementwise gate.
+        q_proj = getattr(attn, "q_proj", None)
+        if isinstance(q_proj, nn.Linear) and q_proj.weight.shape[0] != o_proj.weight.shape[1]:
+            return 0
+
         # v_proj: W_new = R2^T @ W per head on output dimension
-        if hasattr(attn, "v_proj"):
-            W = attn.v_proj.weight.data
-            dtype = W.dtype
-            W = W.to(torch.float64)
-            n_heads = W.shape[0] // self.head_dim
-            W_reshaped = W.reshape(n_heads, self.head_dim, W.shape[1])
-            W_reshaped = torch.einsum("ij,kjl->kil", R2_T.to(W.device), W_reshaped)
-            attn.v_proj.weight.data = W_reshaped.reshape(W.shape).to(dtype)
+        W = v_proj.weight.data
+        dtype = W.dtype
+        W = W.to(torch.float64)
+        n_heads = W.shape[0] // self.head_dim
+        W_reshaped = W.reshape(n_heads, self.head_dim, W.shape[1])
+        W_reshaped = torch.einsum("ij,kjl->kil", R2_T.to(W.device), W_reshaped)
+        v_proj.weight.data = W_reshaped.reshape(W.shape).to(dtype)
+
+        # v_proj bias must be rotated with the same per-head transform.
+        if v_proj.bias is not None:
+            b = v_proj.bias.data.to(torch.float64)
+            b_reshaped = b.reshape(n_heads, self.head_dim)
+            b_reshaped = torch.einsum("ij,kj->ki", R2_T.to(b.device), b_reshaped)
+            v_proj.bias.data = b_reshaped.reshape(-1).to(v_proj.bias.dtype)
 
         # o_proj: W_new = W @ R2 per head on input dimension
         # (R2^{-1} = R2^T on the activation side ↔ W @ R2 on the weight side)
-        if hasattr(attn, "o_proj"):
-            W = attn.o_proj.weight.data
-            dtype = W.dtype
-            W = W.to(torch.float64)
-            n_heads = W.shape[1] // self.head_dim
-            W_reshaped = W.reshape(W.shape[0], n_heads, self.head_dim)
-            W_reshaped = torch.einsum("ijk,kl->ijl", W_reshaped, R2.to(W.device))
-            attn.o_proj.weight.data = W_reshaped.reshape(W.shape).to(dtype)
+        W = o_proj.weight.data
+        dtype = W.dtype
+        W = W.to(torch.float64)
+        n_heads = W.shape[1] // self.head_dim
+        W_reshaped = W.reshape(W.shape[0], n_heads, self.head_dim)
+        W_reshaped = torch.einsum("ijk,kl->ijl", W_reshaped, R2.to(W.device))
+        o_proj.weight.data = W_reshaped.reshape(W.shape).to(dtype)
 
         return 1
 
@@ -1295,55 +1441,68 @@ class SpinQuantPreprocessor:
             R4 = R4_matrix.to(torch.float64)
 
         n_fused = 0
+        n_skipped = 0
         for layer in self._get_layers():
-            n_fused += self._fuse_r4_to_layer(layer, r4_size, use_random, R4)
+            n_layer_fused, n_layer_skipped = self._fuse_r4_to_layer(layer, r4_size, use_random, R4)
+            n_fused += n_layer_fused
+            n_skipped += n_layer_skipped
 
         mode_str = "random x @ R" if use_random else "deterministic butterfly"
         logger.info(
             f"[SpinQuant] R4 offline fused into {n_fused} down_proj layers "
-            f"(r4_rotation_size={r4_size}, mode={mode_str})"
+            f"(r4_rotation_size={r4_size}, mode={mode_str}, skipped={n_skipped})"
         )
 
-    def _fuse_r4_to_layer(self, layer, r4_size, use_random, R4) -> int:
-        """Fuse R4 rotation into a single layer's down_proj input side.
+    def _fuse_r4_to_layer(self, layer, r4_size, use_random, R4):
+        """Fuse R4 rotation into every down_proj of a layer (dense + experts).
 
-        Returns 1 if the layer was fused, else 0.
+        Returns ``(n_fused, n_skipped)``. Uses iter_layer_mlp_blocks so routed
+        experts, shared experts and alternate MLP names (feed_forward /
+        block_sparse_moe) are all covered — matching the R4 hook registration
+        set. Per-module divisibility check skips down_projs whose in_features
+        is not a multiple of r4_size (MoE expert intermediate sizes may differ).
         """
-        if not hasattr(layer, "mlp"):
-            return 0
-        mlp = layer.mlp
-        if not hasattr(mlp, "down_proj"):
-            return 0
+        n_fused = 0
+        n_skipped = 0
+        for block, _block_kind in iter_layer_mlp_blocks(layer):
+            down_proj = get_proj(block, "down")
+            if down_proj is None:
+                continue
 
-        W = mlp.down_proj.weight.data
-        dtype = W.dtype
+            W = down_proj.weight.data
+            dtype = W.dtype
 
-        if use_random:
-            # Random: explicit W @ R per block
-            W = W.to(torch.float64)
-            R4 = R4.to(W.device)
-            if r4_size == W.shape[1]:
-                mlp.down_proj.weight.data = (W @ R4).to(dtype)
+            if W.shape[1] % r4_size != 0:
+                n_skipped += 1
+                continue
+
+            if use_random:
+                # Random: explicit W @ R per block
+                W = W.to(torch.float64)
+                R = R4.to(W.device)
+                if r4_size == W.shape[1]:
+                    down_proj.weight.data = (W @ R).to(dtype)
+                else:
+                    out_feat, in_feat = W.shape
+                    n_blocks = in_feat // r4_size
+                    W_reshaped = W.reshape(out_feat, n_blocks, r4_size)
+                    W_reshaped = torch.einsum("ijk,kl->ijl", W_reshaped, R)
+                    down_proj.weight.data = W_reshaped.reshape(out_feat, in_feat).to(dtype)
             else:
-                out_feat, in_feat = W.shape
-                n_blocks = in_feat // r4_size
-                W_reshaped = W.reshape(out_feat, n_blocks, r4_size)
-                W_reshaped = torch.einsum("ijk,kl->ijl", W_reshaped, R4)
-                mlp.down_proj.weight.data = W_reshaped.reshape(out_feat, in_feat).to(dtype)
-        else:
-            # Deterministic: matmul_hadU (butterfly algorithm)
-            # matmul_hadU operates on the last dimension — for weight
-            # shape [out, in], last dim = in_features which is what
-            # we want to rotate (input channels of down_proj).
-            if r4_size == W.shape[1]:
-                mlp.down_proj.weight.data = matmul_hadU(W).to(dtype)
-            else:
-                out_feat, in_feat = W.shape
-                n_blocks = in_feat // r4_size
-                W_reshaped = W.reshape(out_feat, n_blocks, r4_size)
-                W_rotated = matmul_hadU(W_reshaped)
-                mlp.down_proj.weight.data = W_rotated.reshape(out_feat, in_feat).to(dtype)
-        return 1
+                # Deterministic: matmul_hadU (butterfly algorithm).
+                # matmul_hadU operates on the last dimension — for weight
+                # shape [out, in], last dim = in_features (input channels of
+                # down_proj), which is what we rotate.
+                if r4_size == W.shape[1]:
+                    down_proj.weight.data = matmul_hadU(W).to(dtype)
+                else:
+                    out_feat, in_feat = W.shape
+                    n_blocks = in_feat // r4_size
+                    W_reshaped = W.reshape(out_feat, n_blocks, r4_size)
+                    W_rotated = matmul_hadU(W_reshaped)
+                    down_proj.weight.data = W_rotated.reshape(out_feat, in_feat).to(dtype)
+            n_fused += 1
+        return n_fused, n_skipped
 
     # ------------------------------------------------------------------
     # Step 8: Cleanup
@@ -1460,10 +1619,10 @@ class SpinQuantPreprocessor:
 
         # Transformer layers
         layers = list(self._get_layers())
-        n_layers = sum(1 for l in layers if hasattr(l, "self_attn") and hasattr(l, "mlp"))
+        n_layers = sum(1 for l in layers if hasattr(l, "self_attn") or get_mlp_module(l) is not None)
 
         for i, layer in enumerate(layers):
-            if not (hasattr(layer, "self_attn") and hasattr(layer, "mlp")):
+            if not (hasattr(layer, "self_attn") or get_mlp_module(layer) is not None):
                 continue
 
             # Only show first 2 and last layer to keep output concise
@@ -1498,10 +1657,12 @@ class SpinQuantPreprocessor:
                 n_blocks = self.r4_rotation_size // r4_K
                 r4_status = f"blockH(K={r4_K},b={n_blocks})"
 
-            # Print attention row
-            lines.append(f"  {layer_name + '.self_attn':<35} {r1_attn:<20} {r2_status:<20} {r3_status:<22} {'-':<22}")
+            # Print attention row (hybrid layers may not have self_attn)
+            if hasattr(layer, "self_attn"):
+                lines.append(f"  {layer_name + '.self_attn':<35} {r1_attn:<20} {r2_status:<20} {r3_status:<22} {'-':<22}")
             # Print MLP row
-            lines.append(f"  {layer_name + '.mlp':<35} {r1_mlp:<20} {'-':<20} {'-':<22} {r4_status:<22}")
+            if get_mlp_module(layer) is not None:
+                lines.append(f"  {layer_name + '.mlp':<35} {r1_mlp:<20} {'-':<20} {'-':<22} {r4_status:<22}")
 
         # lm_head
         if online_r1:

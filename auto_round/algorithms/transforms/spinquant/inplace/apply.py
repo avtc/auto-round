@@ -25,7 +25,10 @@ import torch
 import torch.nn as nn
 
 from auto_round.algorithms.transforms.spinquant.rotation_utils import (
+    get_proj,
     is_pow2,
+    iter_layer_mlp_blocks,
+    iter_transformer_layers,
     matmul_hadU,
 )
 
@@ -140,8 +143,23 @@ def register_spinquant_hooks(
         # Use r4_rotation_size if provided, otherwise fall back to intermediate_size
         r4_size = r4_rotation_size if r4_rotation_size > 0 else intermediate_size
 
-        # Determine if we need block rotation (r4_size < intermediate_size)
-        need_block_rotation = r4_size < intermediate_size
+        # Collect down_proj modules via the SAME traversal used by
+        # ``SpinQuantPreprocessor._fuse_r4_rotation`` (decoder layers →
+        # MLP/expert/shared blocks), instead of name matching.  This
+        # guarantees hook set == fused set for every architecture — dense,
+        # MoE, feed_forward/block_sparse_moe naming, and layer-level
+        # shared_mlp alike.
+        down_modules = []
+        r4_skipped = 0
+        for layer in iter_transformer_layers(model):
+            for block, _block_kind in iter_layer_mlp_blocks(layer):
+                down = get_proj(block, "down")
+                if down is None:
+                    continue
+                if down.in_features % r4_size != 0:
+                    r4_skipped += 1
+                    continue
+                down_modules.append(down)
 
         if random_r4:
             # Random R4: use stored full matrix
@@ -170,18 +188,16 @@ def register_spinquant_hooks(
 
                 return hook
 
-            r4_count = 0
-            for name, module in list(model.named_modules()):
-                if "down_proj" in name and isinstance(module, nn.Linear):
-                    hook = _make_r4_hook_matrix(R4, r4_size, need_block_rotation)
-                    hook._spinquant_hook = True
-                    handle = module.register_forward_pre_hook(hook)
-                    handles.append(handle)
-                    r4_count += 1
+            for module in down_modules:
+                hook = _make_r4_hook_matrix(R4, r4_size, r4_size < module.in_features)
+                hook._spinquant_hook = True
+                handle = module.register_forward_pre_hook(hook)
+                handles.append(handle)
 
             logger.info(
                 f"[SpinQuant] R4: Registered forward_pre_hook(rotation_size={r4_size}, "
-                f"mode=random x @ R, block_rotation={need_block_rotation}) on {r4_count} down_proj layers"
+                f"mode=random x @ R) on {len(down_modules)} down_proj layers"
+                + (f" (skipped {r4_skipped} incompatible)" if r4_skipped else "")
             )
         else:
             # Deterministic: butterfly algorithm
@@ -215,19 +231,16 @@ def register_spinquant_hooks(
 
                     return hook
 
-                r4_count = 0
-                for name, module in list(model.named_modules()):
-                    if "down_proj" in name and isinstance(module, nn.Linear):
-                        hook = _make_r4_hook_butterfly(had_K_mat, had_K_val, r4_size, need_block_rotation)
-                        hook._spinquant_hook = True
-                        handle = module.register_forward_pre_hook(hook)
-                        handles.append(handle)
-                        r4_count += 1
+                for module in down_modules:
+                    hook = _make_r4_hook_butterfly(had_K_mat, had_K_val, r4_size, r4_size < module.in_features)
+                    hook._spinquant_hook = True
+                    handle = module.register_forward_pre_hook(hook)
+                    handles.append(handle)
 
                 logger.info(
                     f"[SpinQuant] R4: Registered forward_pre_hook(rotation_size={r4_size}, "
-                    f"K={had_K_val}, mode=deterministic butterfly, "
-                    f"block_rotation={need_block_rotation}) on {r4_count} down_proj layers"
+                    f"K={had_K_val}, mode=deterministic butterfly) on {len(down_modules)} down_proj layers"
+                    + (f" (skipped {r4_skipped} incompatible)" if r4_skipped else "")
                 )
 
     return handles

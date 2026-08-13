@@ -201,6 +201,66 @@ with a `*_type` code: `0` = deterministic, `1` = random, `2` = trained):
   re-patches the QuantLinear forward (R1/R4) and re-applies the R3 RoPE monkeypatch.
   R3 is rebuilt purely from `config.json`, not from stored buffers.
 
+### 1.8 MoE models
+
+The SpinQuant pipeline is MoE-aware: rotation runs *after* AutoRound's model-patching
+step (`_patch_model`), which unfuses fused expert weights into per-expert `nn.Linear`
+modules (`mlp.experts.<idx>.{gate,up,down}_proj`), so every expert is rotated exactly
+like a dense MLP. HF-native `nn.ModuleList` expert layouts and Mixtral-style
+`w1`/`w3`/`w2` projection names are also recognized.
+
+- **R1**: every expert's `gate/up_proj` is rotated (online mode additionally registers
+  the activation hook on each of them); every expert's `down_proj` takes the
+  output-side rotation just like a dense `down_proj`. Shared experts
+  (`mlp.shared_expert(s)`) are treated the same way.
+- **Router**: routers that consume the residual stream (`mlp.gate` / `mlp.router`,
+  including transformers 5.x `*TopKRouter` modules with a bare `weight` parameter) are
+  rotated in **offline** R1 mode (they must absorb `R1⁻¹` to keep routing logits
+  unchanged) and left untouched in **online** R1 mode (the residual stream is
+  unchanged there, matching Quark). Routers are never hooked.
+- **R4**: the online hook and the weight fusion both apply a per-module divisibility
+  check (`in_features % rotation_size == 0`), so the hook set always equals the fused
+  set even when expert intermediate sizes differ from `config.intermediate_size`
+  (`moe_intermediate_size` is used as a fallback).
+- **RMSNorm fusion** (offline R1): `post_attention_layernorm`'s gamma is folded into
+  every expert's `gate/up_proj` and into router weights, not just the dense MLP.
+- **Limitations**: trainable rotation (`trainable_rotation=True`) has not been
+  validated for MoE models — use QuaRot mode. If experts are still in fused 3D form
+  (rotation applied outside the AutoRound pipeline), a warning is logged and expert
+  weights are skipped; run through the pipeline or call
+  `prepare_model_for_moe_quantization()` first.
+
+### 1.9 Architecture generality & safety guards
+
+Rotation only ever targets the **text backbone**: for vision-language models the
+decoder layers, embeddings and architecture info are resolved under
+`model.language_model` / `config.text_config` (vision towers are never touched).
+
+Beyond the standard `mlp` naming, decoder-layer MLP modules named `feed_forward`
+(Llama4) or `block_sparse_moe` (Granite MoE) are recognized, as are fused gate+up
+projections (`input_linear`, `gate_up_proj`), Granite's `output_linear`, and
+layer-level shared experts (`layer.shared_mlp`).
+
+The pipeline refuses to silently produce a non-equivalent model:
+
+- **Offline R1** (`online_r1_rotation=False`) rotates the whole residual stream, so
+  every consumer must absorb the inverse rotation. It raises `ValueError` up front on
+  unsupported architectures: hybrid linear-attention layers (qwen3_next GatedDeltaNet),
+  MLA attention (DeepSeek-V3 / Kimi-K2.5), or experts still in fused form (Llama4).
+  Use the default online R1 for these models.
+- **R2** is skipped per layer (with a warning) when it cannot be applied safely:
+  attention without a paired `v_proj`/`o_proj` (MLA), or output-gated attention
+  (qwen3_next / qwen3_5, detected via `q_proj.out_features != o_proj.in_features`).
+  The `v_proj` **bias** is rotated together with its weight.
+- **R4** hook registration uses the exact same layer/MLP traversal as the weight
+  fusion, so the hooked modules always equal the fused modules on every architecture.
+
+Serialization (`serialize.py`) matches online-rotation targets by module-name suffix
+(`q/k/v_proj`, `gate_proj`, `up_proj`, `down_proj`); models whose projections use
+exotic names (e.g. Granite's `input_linear`/`output_linear`) are rotated correctly at
+preprocess time but their online hooks cannot yet be rebuilt on load — use offline
+R1 or keep inference in the same process for those architectures.
+
 ---
 
 ## 2. Per-Linear Block Rotation

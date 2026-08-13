@@ -681,9 +681,10 @@ def _get_head_dim(model: nn.Module) -> int:
 
 
 def _get_intermediate_size(model: nn.Module) -> int:
-    """Extract intermediate_size from model config."""
+    """Extract intermediate_size from model config (MoE fallback included)."""
     if hasattr(model, "config"):
-        return getattr(model.config, "intermediate_size", 0)
+        cfg = model.config
+        return getattr(cfg, "intermediate_size", 0) or getattr(cfg, "moe_intermediate_size", 0)
     return 0
 
 
