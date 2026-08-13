@@ -38,6 +38,8 @@ from auto_round.algorithms.transforms.spinquant.inplace.apply import (
     remove_spinquant_hooks,
 )
 from auto_round.algorithms.transforms.spinquant.rotation_utils import (
+    _LINEAR_ATTN_INPUT_PROJS,
+    _linear_attn_fix_enabled,
     apply_hadamard_to_linear,
     create_block_diag_from_head_matrix,
     dedupe_modules,
@@ -723,6 +725,13 @@ class SpinQuantPreprocessor:
         for idx, layer in enumerate(self._get_layers()):
             attn = getattr(layer, "self_attn", None)
             if attn is None:
+                if _linear_attn_fix_enabled() and isinstance(getattr(layer, "linear_attn", None), nn.Module):
+                    # Gated fix (AR_ROTATION_FIX_LINEAR_ATTN): GatedDeltaNet
+                    # linear-attention layers are handled by
+                    # _rotate_linear_attn_r1() (input projections absorb R1_inv,
+                    # out_proj absorbs R1) plus input_layernorm gamma fusion, so
+                    # offline R1 stays equivalent — do not refuse.
+                    continue
                 problems.append(f"layer {idx}: no self_attn (hybrid/linear-attention layer)")
                 continue
             missing = [
@@ -1255,27 +1264,47 @@ class SpinQuantPreprocessor:
         # Transformer layers
         n_layers = 0
         for layer in self._get_layers():
-            if not hasattr(layer, "self_attn"):
-                continue
-            attn = layer.self_attn
+            attn = getattr(layer, "self_attn", None)
             mlp = get_mlp_module(layer)
+
+            # Linear-attention layers (qwen3_next / qwen3_5 GatedDeltaNet)
+            # expose ``linear_attn`` instead of ``self_attn``.  When the gated
+            # fix (AR_ROTATION_FIX_LINEAR_ATTN) is on, their MLP and
+            # linear_attn projections absorb R1 too, keeping offline R1
+            # equivalent.  Otherwise the layer is skipped — legacy behaviour
+            # (and ``_validate_offline_r1_support`` would already have refused).
+            linear_attn = getattr(layer, "linear_attn", None) if attn is None else None
+            if attn is None and not (_linear_attn_fix_enabled() and isinstance(linear_attn, nn.Module)):
+                continue
 
             # Ensure R1_inv is on the same device as layer weights
             layer_device = next(layer.parameters()).device
             R1_inv_local = R1_inv.to(layer_device)
             R1_local = R1.to(layer_device)
 
-            # Attention: in-channel uses R1_inv (→ W @ R1), out-channel uses R1 (→ R1_inv @ W)
-            if hasattr(attn, "q_proj"):
-                rotate_in_channels_(attn.q_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
-            if hasattr(attn, "k_proj"):
-                rotate_in_channels_(attn.k_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
-            if hasattr(attn, "v_proj"):
-                rotate_in_channels_(attn.v_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
-            if hasattr(attn, "o_proj"):
-                rotate_out_channels_(attn.o_proj, R_out=R1_local, rotated_modules=self._rotated_modules)
+            # Attention projections (full-attention layers only): in-channel
+            # uses R1_inv (→ W @ R1), out-channel uses R1 (→ R1_inv @ W).
+            if attn is not None:
+                if hasattr(attn, "q_proj"):
+                    rotate_in_channels_(attn.q_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
+                if hasattr(attn, "k_proj"):
+                    rotate_in_channels_(attn.k_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
+                if hasattr(attn, "v_proj"):
+                    rotate_in_channels_(attn.v_proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
+                if hasattr(attn, "o_proj"):
+                    rotate_out_channels_(attn.o_proj, R_out=R1_local, rotated_modules=self._rotated_modules)
 
-            # MLP (dense + MoE experts + shared experts): same convention.
+            # Gated fix: GatedDeltaNet linear-attention projections.
+            # Input projections read the R1-rotated residual stream (after the
+            # now-pure input_layernorm) → absorb R1_inv on input channels.
+            # out_proj writes back into the R1-rotated residual → absorb R1 on
+            # output channels.  Internal state (conv1d / delta rule) is in the
+            # projected space and untouched.
+            if linear_attn is not None:
+                self._rotate_linear_attn_r1(linear_attn, R1_inv_local, R1_local)
+
+            # MLP (dense + MoE experts + shared experts): same convention on
+            # every processed layer (full-attention AND linear-attention).
             # Expert down_proj writes to the residual stream, so it takes the
             # output-side rotation just like a dense down_proj.
             # iter_layer_mlp_blocks covers feed_forward/block_sparse_moe naming
@@ -1299,8 +1328,10 @@ class SpinQuantPreprocessor:
                     rotate_in_channels_(router, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
             n_layers += 1
 
+        extra = " + linear_attn in_proj*/out_proj" if _linear_attn_fix_enabled() else ""
         logger.info(
-            f"[SpinQuant] R1 fused into {n_layers} layers (embed_tokens, q/k/v/o_proj, gate/up/down_proj, lm_head)"
+            f"[SpinQuant] R1 fused into {n_layers} layers "
+            f"(embed_tokens, q/k/v/o_proj, gate/up/down_proj, lm_head{extra})"
         )
 
         # LM head: in-channel uses R1_inv (→ W @ R1)
@@ -1314,6 +1345,31 @@ class SpinQuantPreprocessor:
 
         # R4 offline fusion (Hadamard on down_proj input side)
         self._fuse_r4_rotation()
+
+    def _rotate_linear_attn_r1(
+        self, linear_attn: nn.Module, R1_inv_local: torch.Tensor, R1_local: torch.Tensor
+    ) -> None:
+        """Fuse R1 into a GatedDeltaNet-style linear-attention module.
+
+        Called only when the gated linear-attention fix is active
+        (``AR_ROTATION_FIX_LINEAR_ATTN``).  GatedDeltaNet consumes the residual
+        stream through its input projections and writes back into it via
+        ``out_proj``; the internal delta-rule / conv1d state lives in the
+        projected space and does not interact with the residual rotation, so
+        absorbing R1 on these linear projections keeps offline R1 exact.
+
+        - Input projections (``in_proj_*``): absorb R1_inv on input channels
+          (same role as q/k/v / gate / up) → ``W_new = W @ R1``.
+        - ``out_proj``: absorb R1 on output channels (same role as o_proj /
+          down_proj) → ``W_new = R1^T @ W``.
+        """
+        for proj_name in _LINEAR_ATTN_INPUT_PROJS:
+            proj = getattr(linear_attn, proj_name, None)
+            if isinstance(proj, nn.Linear):
+                rotate_in_channels_(proj, R_in=R1_inv_local, rotated_modules=self._rotated_modules)
+        out_proj = getattr(linear_attn, "out_proj", None)
+        if isinstance(out_proj, nn.Linear):
+            rotate_out_channels_(out_proj, R_out=R1_local, rotated_modules=self._rotated_modules)
 
     def _fuse_r2_rotation(self) -> None:
         """Fuse R2 per-head rotation into v_proj and o_proj.
