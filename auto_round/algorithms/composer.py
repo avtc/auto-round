@@ -130,6 +130,15 @@ class AlgorithmComposer:
         self._rotation_configs = [c for c in configs if isinstance(c, BaseRotationConfig)]
         self._layerwise_rotation = bool(getattr(orchestrator, "layerwise_rotation", False))
 
+        _algos = {getattr(c, "algorithm", None) for c in self._rotation_configs}
+        if "presinq" in _algos and "spinquant" in _algos:
+            # Both transforms modify norm weights; their composition is untested
+            # and easy to get silently wrong — require an explicit choice.
+            raise ValueError(
+                "PreSINQ and SpinQuant transforms are mutually exclusive: both "
+                "modify RMSNorm weights. Pass only one of them in alg_configs."
+            )
+
         _, block_quantizer_configs = split_quantization_configs(configs)
         if not block_quantizer_configs:
             from auto_round.algorithms.quantization.rtn.config import RTNConfig
