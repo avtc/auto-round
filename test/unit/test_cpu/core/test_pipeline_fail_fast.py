@@ -259,8 +259,43 @@ def test_rtn_routing_disable_opt_rtn_from_resolved_scheme(scheme, expect_disable
 def test_rtn_routing_respects_explicit_enable_opt_rtn():
     """An explicit user choice must not be clobbered by the W8A16/W8A8 heuristic."""
     config = RTNConfig(enable_opt_rtn=True)
-    _select_rtn_compressor_base_cls(config, "W8A16", "auto_round", {})
+    _select_rtn_compressor_base_cls(config, "W4A16", "auto_round", {})
     assert config.disable_opt_rtn is False
+
+
+def test_preprocessor_path_applies_optimized_rtn_morph(monkeypatch):
+    """A preprocessor (SpinQuant) + RTNConfig(disable_opt_rtn=False) must still morph
+    the RTN config to OptimizedRTNConfig so the data-free clip search runs.
+
+    Previously the preprocessor branch returned early without calling
+    _select_rtn_compressor_base_cls, so the registry picked RTNQuantizer, whose
+    quantize_block hardcodes disable_opt_rtn=True — silently dropping the user's
+    explicit disable_opt_rtn=False whenever a preprocessor config was present.
+    """
+    captured = {}
+
+    def _fake_init(self, config, **kwargs):
+        captured["config"] = config
+
+    monkeypatch.setattr(Compressor, "__init__", _fake_init)
+    monkeypatch.setattr("auto_round.utils.is_mllm_model", lambda *args, **kwargs: False)
+    monkeypatch.setattr("auto_round.utils.is_diffusion_model", lambda *args, **kwargs: False)
+    monkeypatch.setattr("auto_round.utils.model.detect_model_type", lambda *args, **kwargs: "llm")
+
+    NewAutoRound(
+        "dummy-model",
+        scheme="W4A16",
+        alg_configs=[SpinQuantConfig(r1=False, r2=False), RTNConfig(group_size=128, disable_opt_rtn=False)],
+        seqlen=8,
+        nsamples=1,
+    )
+
+    configs = captured["config"] if isinstance(captured["config"], list) else [captured["config"]]
+    rtn_cfg = next(cfg for cfg in configs if isinstance(cfg, RTNConfig))
+    assert isinstance(
+        rtn_cfg, OptimizedRTNConfig
+    ), "preprocessor path must morph RTNConfig to OptimizedRTNConfig so the clip search runs"
+    assert rtn_cfg.disable_opt_rtn is False
 
 
 @pytest.mark.parametrize("bits, expected_lr", [(3, 2.0 / 1000), (4, 1.0 / 1000)])

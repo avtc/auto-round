@@ -715,6 +715,13 @@ class _CompressorBuilder(object):
         # actually runs; the pipeline auto-appends RTN when no block_quantizer
         # is supplied. SignRound is itself data-driven and shares the same host.
         if preprocessor_configs or isinstance(quant_config, SignRoundConfig):
+            if isinstance(quant_config, RTNConfig):
+                # Mirror the non-preprocessor path's optimized-RTN selection so the
+                # morph to OptimizedRTNConfig also applies when a preprocessor
+                # (SpinQuant/AWQ) is present. Without this, RTNQuantizer.quantize_block
+                # silently forces plain RTN and drops the user's disable_opt_rtn=False
+                # (and the data-free clip search with it).
+                _select_rtn_compressor_base_cls(quant_config, scheme, format, base_kwargs)
             return _get_compressor_class(model_type, Compressor)(alg_configs, **local_args, **ctor_kwargs)
         elif isinstance(quant_config, RTNConfig):
             base_cls = _select_rtn_compressor_base_cls(quant_config, scheme, format, base_kwargs)
