@@ -21,6 +21,9 @@ Current algorithms
 ------------------
 * **hadamard** – Block-diagonal Hadamard rotations (QuaRot / SpinQuant style).
   See :mod:`auto_round.algorithms.transforms.hadamard`.
+* **presinq** – Calibration-free, function-preserving Sinkhorn-normalised
+  column-scale folding (Pre-SINQ). See
+  :mod:`auto_round.algorithms.transforms.presinq`.
 * **spinquant** – SpinQuant/QuaRot multi-level rotation (R1–R4) with optional
   online hooks, trainable rotations, and known Hadamard matrices for non-pow2.
   See :mod:`auto_round.algorithms.transforms.spinquant`.
@@ -126,6 +129,14 @@ def normalize_rotation_config(
         alg = config.get("algorithm", "hadamard")
         if alg == "hadamard":
             return RotationConfig.model_validate(config)
+        if alg == "presinq":
+            from auto_round.algorithms.transforms.presinq.config import PreSINQConfig
+
+            import dataclasses
+
+            valid_fields = {f.name for f in dataclasses.fields(PreSINQConfig)}
+            filtered = {k: v for k, v in config.items() if k != "algorithm" and k in valid_fields}
+            return PreSINQConfig(**filtered)
         if alg == "spinquant":
             from auto_round.algorithms.transforms.spinquant.preprocessor import SpinQuantConfig
 
@@ -141,6 +152,10 @@ def normalize_rotation_config(
 
     if isinstance(config, str):
         key = config.strip().lower()
+        if key == "presinq":
+            from auto_round.algorithms.transforms.presinq.config import PreSINQConfig
+
+            return PreSINQConfig()
         if key in ("spinquant", "quarot"):
             from auto_round.algorithms.transforms.spinquant.preprocessor import SpinQuantConfig
 

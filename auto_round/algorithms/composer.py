@@ -127,9 +127,26 @@ class AlgorithmComposer:
         """
         from auto_round.algorithms.quantization.base import BaseQuantizer
         from auto_round.algorithms.quantization.config import QuantizationConfig
-        from auto_round.algorithms.transforms.base import BasePreprocessor
+        from auto_round.algorithms.transforms.base import BasePreprocessor, BaseRotationConfig
 
         configs = list(configs)
+
+        # Rotation configs travel in the same config list but are not pipeline
+        # members (they are ``BaseRotationConfig``, not ``QuantizationConfig``).
+        # Capture them here so the composer owns the full rotation lifecycle
+        # (see ``apply_model_transforms`` / ``finalize_run``) and the orchestrator
+        # stays rotation-agnostic.
+        self._rotation_configs = [c for c in configs if isinstance(c, BaseRotationConfig)]
+        self._layerwise_rotation = bool(getattr(orchestrator, "layerwise_rotation", False))
+
+        _algos = {getattr(c, "algorithm", None) for c in self._rotation_configs}
+        if "presinq" in _algos and "spinquant" in _algos:
+            # Both transforms modify norm weights; their composition is untested
+            # and easy to get silently wrong — require an explicit choice.
+            raise ValueError(
+                "PreSINQ and SpinQuant transforms are mutually exclusive: both "
+                "modify RMSNorm weights. Pass only one of them in alg_configs."
+            )
 
         _, block_quantizer_configs = split_quantization_configs(configs)
         if not block_quantizer_configs:
