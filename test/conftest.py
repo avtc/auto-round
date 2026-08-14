@@ -19,6 +19,12 @@ import pytest
 _torchvision_spec = importlib.util.find_spec("torchvision")
 try:
     import torchvision  # noqa: F401
+except ModuleNotFoundError:
+    # torchvision simply absent — transformers' optional-import machinery
+    # handles that natively. Stubbing would poison later find_spec() calls
+    # (datasets calls find_spec("torchvision") at import time and raises
+    # ValueError on a spec-less sys.modules entry).
+    pass
 except Exception:
     for _name in list(sys.modules):
         if _name == "torchvision" or _name.startswith("torchvision."):
@@ -76,6 +82,9 @@ except Exception:
 _torchaudio_spec = importlib.util.find_spec("torchaudio")
 try:
     import torchaudio  # noqa: F401
+except ModuleNotFoundError:
+    # absent — no stub needed (see the torchvision note above)
+    pass
 except Exception:
     for _name in list(sys.modules):
         if _name == "torchaudio" or _name.startswith("torchaudio."):
