@@ -433,3 +433,30 @@ class TestReviewEdgeCases:
             layer.input_layernorm.bias = nn.Parameter(torch.zeros(D))
             layer.post_attention_layernorm.bias = nn.Parameter(torch.zeros(D))
         _assert_exact(model)  # untouched -> trivially exact
+
+
+class TestChunking:
+    def test_multi_chunk_row_scaling_exact(self, monkeypatch):
+        """Regression: _ROW_CHUNK slices of t must track the row slices (27B hit this)."""
+        import auto_round.algorithms.transforms.presinq.apply as apply_mod
+
+        monkeypatch.setattr(apply_mod, "_ROW_CHUNK", 16)  # force many chunks
+        torch.manual_seed(13)
+        model = TinyModel()
+        before = _forward_logits(model).clone()
+        PreSINQRotation(PreSINQConfig()).apply_to_model(model, data_type="int")
+        assert _rel_err(_forward_logits(model), before) < 1e-5
+
+    def test_scale_rows_chunk_matches_direct(self):
+        import auto_round.algorithms.transforms.presinq.apply as apply_mod
+
+        torch.manual_seed(3)
+        w = nn.Parameter(torch.randn(100, 7))
+        t = torch.rand(100).double() + 0.5
+        expected = (w.data.double() * t.view(-1, 1)).to(w.dtype)
+        apply_mod._ROW_CHUNK = 13
+        try:
+            apply_mod._scale_rows_(w, t)
+        finally:
+            apply_mod._ROW_CHUNK = 8192
+        assert torch.equal(w.data, expected)
