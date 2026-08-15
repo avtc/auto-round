@@ -80,7 +80,7 @@ def _scale_rows_(weight: nn.Parameter, scale: torch.Tensor, bias: Optional[torch
     t = scale.to(weight.device, torch.float64)
     w = weight.data
     for s in range(0, w.shape[0], _ROW_CHUNK):
-        block = w[s : s + _ROW_CHUNK].to(torch.float64) * t.view(-1, 1)
+        block = w[s : s + _ROW_CHUNK].to(torch.float64) * t[s : s + _ROW_CHUNK].view(-1, 1)
         w[s : s + _ROW_CHUNK] = block.to(w.dtype)
     if bias is not None:
         bias.data.copy_((bias.data.to(torch.float64) * t).to(bias.dtype))
