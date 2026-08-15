@@ -435,28 +435,36 @@ class TestReviewEdgeCases:
         _assert_exact(model)  # untouched -> trivially exact
 
 
-class TestChunking:
-    def test_multi_chunk_row_scaling_exact(self, monkeypatch):
-        """Regression: _ROW_CHUNK slices of t must track the row slices (27B hit this)."""
+class TestShadowArithmetic:
+    def test_cumulative_scales_single_writeback(self):
+        """Multi-pass folds == one fp64 product applied once (single dtype rounding)."""
         import auto_round.algorithms.transforms.presinq.apply as apply_mod
 
-        monkeypatch.setattr(apply_mod, "_ROW_CHUNK", 16)  # force many chunks
-        torch.manual_seed(13)
-        model = TinyModel()
-        before = _forward_logits(model).clone()
-        PreSINQRotation(PreSINQConfig()).apply_to_model(model, data_type="int", use_tqdm=False)
-        assert _rel_err(_forward_logits(model), before) < 1e-5
-
-    def test_scale_rows_chunk_matches_direct(self):
-        import auto_round.algorithms.transforms.presinq.apply as apply_mod
-
-        torch.manual_seed(3)
-        w = nn.Parameter(torch.randn(100, 7))
-        t = torch.rand(100).double() + 0.5
-        expected = (w.data.double() * t.view(-1, 1)).to(w.dtype)
-        apply_mod._ROW_CHUNK = 13
-        try:
-            apply_mod._scale_rows_(w, t)
-        finally:
-            apply_mod._ROW_CHUNK = 8192
+        torch.manual_seed(5)
+        w = nn.Parameter(torch.randn(50, 40, dtype=torch.float32))
+        rot = apply_mod.PreSINQRotation(PreSINQConfig())
+        t1 = torch.rand(40).double() + 0.5
+        t2 = torch.rand(50).double() + 0.5  # row scale
+        t3 = torch.rand(40).double() + 0.5
+        rot._apply_col(w, t1)
+        rot._apply_row(w, t2)
+        rot._apply_col(w, t3)
+        expected = (w.data.double() * (t1 * t3).view(1, -1) * t2.view(-1, 1)).to(w.dtype)
+        rot._finalize()
         assert torch.equal(w.data, expected)
+        rot._states.clear()
+
+    def test_effective_reflects_cumulative_scales(self):
+        import auto_round.algorithms.transforms.presinq.apply as apply_mod
+
+        torch.manual_seed(6)
+        w = nn.Parameter(torch.randn(12, 10))
+        rot = apply_mod.PreSINQRotation(PreSINQConfig())
+        c = torch.rand(10).double() + 0.5
+        r = torch.rand(12).double() + 0.5
+        rot._apply_col(w, c)
+        rot._apply_row(w, r)
+        expected = (w.data.double() * c.view(1, -1) * r.view(-1, 1)).to(torch.float32)
+        eff = rot._effective(w)
+        assert torch.allclose(eff, expected, atol=1e-6)
+        rot._states.clear()
