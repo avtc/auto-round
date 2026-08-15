@@ -468,3 +468,40 @@ class TestShadowArithmetic:
         eff = rot._effective(w)
         assert torch.allclose(eff, expected, atol=1e-6)
         rot._states.clear()
+
+
+class TestLayerwise:
+    def test_layerwise_protocol_matches_full_model(self):
+        """Per-layer rotate_layer(n_repeat local passes) == full-model apply_to_model.
+
+        Valid because every fold is layer-local; also proves exactness of the
+        simulated composer protocol (prepare -> rotate per layer -> finalize).
+        """
+        torch.manual_seed(21)
+        full = TinyModel(linear_attn=True, moe=True)
+        torch.manual_seed(21)
+        lw = TinyModel(linear_attn=True, moe=True)
+        before = _forward_logits(lw).clone()
+
+        rot = PreSINQRotation(PreSINQConfig())
+        rot.prepare_layerwise(lw, data_type="int")
+        for i, layer in enumerate(lw.layers):
+            rot.rotate_layer(layer, i)
+        rot.finalize_layerwise(lw)
+
+        PreSINQRotation(PreSINQConfig()).apply_to_model(full, data_type="int", use_tqdm=False)
+
+        for (n1, p1), (n2, p2) in zip(full.named_parameters(), lw.named_parameters()):
+            assert n1 == n2 and torch.allclose(p1.detach(), p2.detach(), atol=1e-6), f"mismatch at {n1}"
+        assert _rel_err(_forward_logits(lw), before) < 1e-5
+
+    def test_rotate_layer_idempotent_safe(self):
+        torch.manual_seed(22)
+        m = TinyModel()
+        before = _forward_logits(m).clone()
+        rot = PreSINQRotation(PreSINQConfig())
+        rot.prepare_layerwise(m, data_type="int")
+        for i, layer in enumerate(m.layers):
+            rot.rotate_layer(layer, i)
+            rot.rotate_layer(layer, i)  # second call must stay function-preserving
+        assert _rel_err(_forward_logits(m), before) < 1e-5

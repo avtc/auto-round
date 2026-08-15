@@ -132,7 +132,57 @@ class PreSINQRotation(BaseRotation):
 
     @property
     def supports_layerwise(self) -> bool:
-        return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Layer-wise protocol (models too large for full residency)
+    # ------------------------------------------------------------------
+    # Valid here because every Pre-SINQ fold is strictly layer-local (norm <->
+    # its consumers, up<->down, v<->o, MoE blocks/routers all live inside one
+    # decoder layer) and function-preserving on its own — unlike offline
+    # SpinQuant R1, which rotates the shared inter-layer residual stream and
+    # therefore cannot be applied per-layer.
+    def prepare_layerwise(
+        self,
+        model: nn.Module,
+        data_type: str = "mx_fp",
+        **kwargs,
+    ) -> "PreSINQRotation":
+        """Init per-run state; no weights are touched (base-class contract)."""
+        self._stats_log_t, self._stats_n = 0.0, 0
+        self._states.clear()
+        cfg = self.config
+        logger.info(
+            "[PreSINQ] Layer-wise mode armed (group_size=%d, n_iter=%d, n_repeat=%d, "
+            "normalize_outproj=%s); folds will be applied per loaded layer.",
+            cfg.group_size,
+            cfg.n_iter,
+            cfg.n_repeat,
+            cfg.normalize_outproj,
+        )
+        return self
+
+    def rotate_layer(self, layer: nn.Module, layer_idx: int, **kwargs) -> None:
+        """Fold one decoder layer (n_repeat local passes) and flush its scales.
+
+        Runs before reference-output collection, so the block quantizer sees
+        the folded weights. Refolding an already-folded layer remains
+        function-preserving (any positive scales are exact). Per-layer state
+        is flushed here, keeping peak bookkeeping at one layer's worth.
+        """
+        cfg = self.config
+        for _ in range(cfg.n_repeat):
+            self._fold_attention_inputs(layer)
+            self._fold_mlp(layer)
+            if cfg.normalize_outproj:
+                self._fold_v_o(layer)
+        self._finalize()
+        self._states.clear()
+
+    def finalize_layerwise(self, model: nn.Module) -> None:
+        """Post-loop summary; nothing to clean up (no global state)."""
+        mean_log_t = self._stats_log_t / max(self._stats_n, 1)
+        logger.info("[PreSINQ] Layer-wise pass complete (all layers), mean |log t| = %.4f.", mean_log_t)
 
     # ------------------------------------------------------------------
     # Shadow-scale registry
