@@ -17,7 +17,11 @@ Port of the Pre-SINQ reparameterisation from the SINQ project
 (https://github.com/huawei-csl/SINQ, Apache-2.0, arXiv 2509.22944) with
 auto-round adaptations:
 
-* float64 folds with broadcast scaling (no ``diag`` matmuls), row-chunked;
+* **single-writeback shadow arithmetic**: folds accumulate float64 scale
+  vectors per weight and write back to the original dtype exactly once after
+  all passes, so repeated passes do not compound bf16 rounding noise;
+* sinkhorn scale computation runs batched (all CPU cores) and on the GPU
+  when the weights already live there;
 * the (1+weight) RMSNorm convention (qwen3_next / qwen3_5) is handled via the
   runtime probe reused from the SpinQuant transform;
 * hybrid linear-attention layers (``linear_attn.in_proj_qkv/z/a/b``) fold on
@@ -36,7 +40,7 @@ artifacts, so checkpoints quantized afterwards export unchanged.
 
 from __future__ import annotations
 
-from typing import Optional
+import time
 
 import torch
 import torch.nn as nn
@@ -57,8 +61,6 @@ from auto_round.logger import logger
 
 __all__ = ["PreSINQRotation"]
 
-_ROW_CHUNK = 8192  # cap fp64 temporaries regardless of matrix width
-
 #: Direct-Linear children of self_attn that consume the post-input_layernorm
 #: hidden state (MLA down-projections included).
 _ATTN_INPUT_CONSUMERS = ("q_proj", "k_proj", "v_proj", "q_a_proj", "kv_a_proj_with_mqa")
@@ -67,39 +69,16 @@ _ATTN_INPUT_CONSUMERS = ("q_proj", "k_proj", "v_proj", "q_a_proj", "kv_a_proj_wi
 _ATTN_NON_CONSUMERS = ("o_proj", "q_b_proj", "kv_b_proj")
 
 
-def _scale_columns_(weight: nn.Parameter, scale: torch.Tensor) -> None:
-    """In-place ``weight <- weight * scale[None, :]`` in float64 (chunked)."""
-    t = scale.to(weight.device, torch.float64)
-    w = weight.data
-    for s in range(0, w.shape[0], _ROW_CHUNK):
-        block = w[s : s + _ROW_CHUNK].to(torch.float64) * t.view(1, -1)
-        w[s : s + _ROW_CHUNK] = block.to(w.dtype)
+class _WeightState:
+    """Cumulative float64 scales for one weight (lazy, device-local)."""
 
+    __slots__ = ("col", "row", "bias", "one_plus")
 
-def _scale_rows_(weight: nn.Parameter, scale: torch.Tensor, bias: Optional[torch.Tensor] = None) -> None:
-    """In-place ``weight <- weight * scale[:, None]`` (and its bias) in float64."""
-    t = scale.to(weight.device, torch.float64)
-    w = weight.data
-    for s in range(0, w.shape[0], _ROW_CHUNK):
-        block = w[s : s + _ROW_CHUNK].to(torch.float64) * t[s : s + _ROW_CHUNK].view(-1, 1)
-        w[s : s + _ROW_CHUNK] = block.to(w.dtype)
-    if bias is not None:
-        bias.data.copy_((bias.data.to(torch.float64) * t).to(bias.dtype))
-
-
-def _fold_into_norm_(norm: nn.Module, scale: torch.Tensor) -> None:
-    """Fold ``scale`` into the norm's effective gamma.
-
-    Standard RMSNorm (``out = normed * w``): ``w <- w * scale``.
-    (1+weight) RMSNorm (``out = normed * (1 + w)``): ``w <- (1 + w) * scale - 1``.
-    """
-    w = norm.weight.data
-    t = scale.to(w.device, torch.float64)
-    w64 = w.to(torch.float64)
-    if _is_one_plus_weight_norm(norm):
-        w.copy_(((1.0 + w64) * t).sub_(1.0).to(w.dtype))
-    else:
-        w.copy_((w64 * t).to(w.dtype))
+    def __init__(self):
+        self.col: torch.Tensor | None = None  # [in_features]
+        self.row: torch.Tensor | None = None  # [out_features]
+        self.bias: nn.Parameter | None = None  # bias shares the row scale
+        self.one_plus: bool | None = None  # norm convention (norm weights only)
 
 
 def _linears(mod: nn.Module, names) -> list[nn.Linear]:
@@ -111,7 +90,7 @@ def _linears(mod: nn.Module, names) -> list[nn.Linear]:
     return out
 
 
-def _norm_is_foldable(norm: Optional[nn.Module]) -> bool:
+def _norm_is_foldable(norm) -> bool:
     if norm is None or not hasattr(norm, "weight"):
         return False
     if getattr(norm, "bias", None) is not None:
@@ -137,18 +116,86 @@ class PreSINQRotation(BaseRotation):
     """Pre-SINQ transform registered under ``"presinq"``.
 
     Runs ``n_repeat`` whole-model passes over the text backbone, folding
-    Sinkhorn-normalised column scales between adjacent weights. See the
-    package docstring for the fold patterns and their exactness arguments.
+    Sinkhorn-normalised column scales between adjacent weights. Scales
+    accumulate in float64 and are written back to the weights' dtype exactly
+    once at the end of the final pass. See the package docstring for the fold
+    patterns and their exactness arguments.
     """
 
     def __init__(self, config: PreSINQConfig) -> None:
         super().__init__(config)
+        self._states: dict = {}  # Parameter -> _WeightState (identity keys)
         self._stats_log_t = 0.0
         self._stats_n = 0
 
     @property
     def supports_layerwise(self) -> bool:
         return False
+
+    # ------------------------------------------------------------------
+    # Shadow-scale registry
+    # ------------------------------------------------------------------
+    def _state(self, weight: nn.Parameter) -> _WeightState:
+        st = self._states.get(weight)
+        if st is None:
+            st = _WeightState()
+            self._states[weight] = st
+        return st
+
+    def _effective(self, weight: nn.Parameter, dtype=torch.float32) -> torch.Tensor:
+        """Current effective weight = original * cumulative scales (fp64 math)."""
+        st = self._state(weight)
+        w = weight.data.to(torch.float64)
+        if st.col is not None:
+            w = w * st.col.view(1, -1)
+        if st.row is not None:
+            w = w * st.row.view(-1, 1)
+        return w.to(dtype)
+
+    def _apply_col(self, weight: nn.Parameter, t: torch.Tensor) -> None:
+        st = self._state(weight)
+        t = t.to(weight.device, torch.float64)
+        st.col = t if st.col is None else st.col * t
+
+    def _apply_row(self, weight: nn.Parameter, t: torch.Tensor, bias: nn.Parameter = None) -> None:
+        st = self._state(weight)
+        t = t.to(weight.device, torch.float64)
+        st.row = t if st.row is None else st.row * t
+        if bias is not None:
+            st.bias = bias
+
+    def _apply_norm_fold(self, norm: nn.Module, t: torch.Tensor) -> None:
+        st = self._state(norm.weight)
+        if st.one_plus is None:
+            st.one_plus = _is_one_plus_weight_norm(norm)
+        t = t.to(norm.weight.device, torch.float64)
+        st.col = t if st.col is None else st.col * t
+
+    def _finalize(self) -> None:
+        """Single dtype write-back of all accumulated scales."""
+        for weight, st in self._states.items():
+            if st.one_plus is None:
+                # regular weight matrix: col scales columns, row scales rows (+bias)
+                if st.col is None and st.row is None:
+                    continue
+                w = weight.data.to(torch.float64)
+                if st.col is not None:
+                    w = w * st.col.view(1, -1)
+                if st.row is not None:
+                    w = w * st.row.view(-1, 1)
+                weight.data.copy_(w.to(weight.dtype))
+                if st.bias is not None and st.row is not None:
+                    st.bias.data.copy_((st.bias.data.to(torch.float64) * st.row).to(st.bias.dtype))
+            else:
+                # norm weight: 1-D gamma; st.col is elementwise
+                if st.col is None:
+                    continue
+                w64 = weight.data.to(torch.float64)
+                if st.one_plus:
+                    gamma = (1.0 + w64) * st.col
+                    weight.data.copy_(gamma.sub_(1.0).to(weight.dtype))
+                else:
+                    weight.data.copy_((w64 * st.col).to(weight.dtype))
 
     # ------------------------------------------------------------------
     # Entry point
@@ -170,15 +217,21 @@ class PreSINQRotation(BaseRotation):
             cfg.normalize_outproj,
         )
         n_layers = 0
-        for _rep in range(cfg.n_repeat):
-            n_layers = self._fold_pass(model, _rep + 1, use_tqdm)
+        t_start = time.time()
+        try:
+            for _rep in range(cfg.n_repeat):
+                n_layers = self._fold_pass(model, _rep + 1, use_tqdm)
+            self._finalize()
+        finally:
+            self._states.clear()
         if n_layers == 0:
             logger.warning("[PreSINQ] no transformer layers found — model left unchanged.")
         mean_log_t = self._stats_log_t / max(self._stats_n, 1)
         logger.info(
-            "[PreSINQ] Done: %d layers folded per pass, %d passes, mean |log t| = %.4f.",
+            "[PreSINQ] Done: %d layers x %d passes in %.1fs, mean |log t| = %.4f (single fp64 writeback).",
             n_layers,
             cfg.n_repeat,
+            time.time() - t_start,
             mean_log_t,
         )
         return model
@@ -187,8 +240,6 @@ class PreSINQRotation(BaseRotation):
     # Per-pass logic
     # ------------------------------------------------------------------
     def _fold_pass(self, model: nn.Module, pass_idx: int, use_tqdm: bool = True) -> int:
-        import time
-
         cfg = self.config
         layers = list(iter_transformer_layers(model))
         t0 = time.time()
@@ -235,11 +286,11 @@ class PreSINQRotation(BaseRotation):
             return
         if not consumers:
             return
-        t = column_scales([c.weight for c in consumers], self.config.group_size, self.config.n_iter)
+        t = column_scales([self._effective(c.weight) for c in consumers], self.config.group_size, self.config.n_iter)
         self._track(t)
-        _fold_into_norm_(norm, t)
+        self._apply_norm_fold(norm, t)
         for lin in consumers:
-            _scale_columns_(lin.weight, t.reciprocal())
+            self._apply_col(lin.weight, t.reciprocal())
 
     def _fold_mlp(self, layer: nn.Module) -> None:
         mlp = get_mlp_module(layer)
@@ -261,17 +312,19 @@ class PreSINQRotation(BaseRotation):
             return
         if up is not None and down is not None:
             # SwiGLU up<->down: silu(g) * (u*t) == (silu(g) * u) * t
-            t = column_scales([down.weight], self.config.group_size, self.config.n_iter)
+            t = column_scales([self._effective(down.weight)], self.config.group_size, self.config.n_iter)
             self._track(t)
-            _scale_columns_(down.weight, t.reciprocal())
-            _scale_rows_(up.weight, t, bias=up.bias)
+            self._apply_col(down.weight, t.reciprocal())
+            self._apply_row(up.weight, t, bias=up.bias)
         norm = getattr(layer, "post_attention_layernorm", None)
         if _norm_is_foldable(norm) and gate is not None and up is not None:
-            t = column_scales([gate.weight, up.weight], self.config.group_size, self.config.n_iter)
+            t = column_scales(
+                [self._effective(gate.weight), self._effective(up.weight)], self.config.group_size, self.config.n_iter
+            )
             self._track(t)
-            _fold_into_norm_(norm, t)
-            _scale_columns_(gate.weight, t.reciprocal())
-            _scale_columns_(up.weight, t.reciprocal())
+            self._apply_norm_fold(norm, t)
+            self._apply_col(gate.weight, t.reciprocal())
+            self._apply_col(up.weight, t.reciprocal())
 
     def _fold_moe(self, mlp: nn.Module, experts: nn.ModuleList, layer: nn.Module) -> None:
         blocks = _moe_blocks(mlp, experts)
@@ -282,39 +335,39 @@ class PreSINQRotation(BaseRotation):
                 continue  # fused gate_up inside a block — skip that block
             if up is None or down is None:
                 continue
-            t = column_scales([down.weight], self.config.group_size, self.config.n_iter)
+            t = column_scales([self._effective(down.weight)], self.config.group_size, self.config.n_iter)
             self._track(t)
-            _scale_columns_(down.weight, t.reciprocal())
-            _scale_rows_(up.weight, t, bias=up.bias)
+            self._apply_col(down.weight, t.reciprocal())
+            self._apply_row(up.weight, t, bias=up.bias)
         # One shared scale vector for the post-attention norm, pooled over all
         # blocks' gate+up (a single norm can only carry one vector).
         norm = getattr(layer, "post_attention_layernorm", None)
         if not _norm_is_foldable(norm):
             return
-        pooled: list[torch.Tensor] = []
+        pooled = []
         for blk in blocks:
             gate, up = get_proj(blk, "gate"), get_proj(blk, "up")
             if gate is not None and gate is not up:
-                pooled.append(gate.weight)
+                pooled.append(self._effective(gate.weight))
             if up is not None:
-                pooled.append(up.weight)
+                pooled.append(self._effective(up.weight))
         if not pooled:
             return
         t = column_scales(pooled, self.config.group_size, self.config.n_iter)
         self._track(t)
-        _fold_into_norm_(norm, t)
+        self._apply_norm_fold(norm, t)
         # The norm feeds the blocks AND the router(s)/shared-expert gates;
         # every consumer of the norm output absorbs 1/t. (The upstream
         # DeepSeek-Lite script skips the router — inexact; we don't.)
         # NOTE: get_router_linears already covers gate/router/shared_expert_gate.
         for router in get_router_linears(mlp):
-            _scale_columns_(router.weight, t.reciprocal())
+            self._apply_col(router.weight, t.reciprocal())
         for blk in blocks:
             gate, up = get_proj(blk, "gate"), get_proj(blk, "up")
             if gate is not None and gate is not up:
-                _scale_columns_(gate.weight, t.reciprocal())
+                self._apply_col(gate.weight, t.reciprocal())
             if up is not None:
-                _scale_columns_(up.weight, t.reciprocal())
+                self._apply_col(up.weight, t.reciprocal())
 
     def _fold_v_o(self, layer: nn.Module) -> None:
         """Exact v<->o fold, GQA-aware.
@@ -356,11 +409,11 @@ class PreSINQRotation(BaseRotation):
             )
             return
         kv = v_rows // hd
-        t = column_scales([o.weight], self.config.group_size, self.config.n_iter)  # per o column
+        t = column_scales([self._effective(o.weight)], self.config.group_size, self.config.n_iter)  # per o column
         t_heads = t.view(kv * g, hd)  # rows = q-heads
         s = t_heads.view(kv, g, hd).median(dim=1).values  # [kv, hd] pooled per value channel
         s_flat = s.reshape(-1)  # aligned with v rows (r = b*hd + d)
         s_cols = s.repeat_interleave(g, dim=0).reshape(-1)  # aligned with o columns
         self._track(s_flat)
-        _scale_columns_(o.weight, s_cols.reciprocal())
-        _scale_rows_(v.weight, s_flat, bias=v.bias)
+        self._apply_col(o.weight, s_cols.reciprocal())
+        self._apply_row(v.weight, s_flat, bias=v.bias)

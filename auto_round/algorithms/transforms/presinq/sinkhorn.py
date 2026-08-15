@@ -11,25 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sinkhorn-normalized scaling for Pre-SINQ.
+"""Sinkhorn-normalised scaling for Pre-SINQ.
 
-This module is a port of the ``sinkhorn_log`` routine from the SINQ project
-(https://github.com/huawei-csl/SINQ, Apache-2.0, arXiv 2509.22944) adapted for
-auto-round: float64 math for exactness, no vmap (plain loop over column tiles)
-and device-agnostic execution. The algorithm and its hyperparameter semantics
-are kept faithful to the original.
+Port of the ``sinkhorn_log`` routine from the SINQ project
+(https://github.com/huawei-csl/SINQ, Apache-2.0, arXiv 2509.22944) adapted
+for auto-round:
+
+* float64 math for exactness;
+* **batched over leading dimensions**: column tiles are processed as a
+  ``[n_tiles, H, block]`` batch (in groups), so a single op set engages all
+  CPU cores via torch's intra-op parallelism — or runs on the GPU when the
+  weights already live there (device is inherited from the inputs);
+* the algorithm and its hyperparameter semantics are faithful to the
+  original scalar-per-matrix routine.
 
 The routine iteratively rescales the rows and columns of a matrix to balance
 their standard deviations and returns, alongside the scaled matrix, the
 best-so-far column scale vector ``mu1`` and row scale vector ``mu2``.
-Pre-SINQ consumes only the *column* scales (see ``fold.py``).
+Pre-SINQ consumes only the *column* scales (see ``apply.py``).
 """
 
 from __future__ import annotations
 
 import torch
 
-__all__ = ["sinkhorn_log"]
+__all__ = ["sinkhorn_log", "column_scales"]
+
+_TILE_GROUP = 16  # tiles processed per batched call (bounds fp64 temporaries)
 
 
 def sinkhorn_log(
@@ -42,125 +50,123 @@ def sinkhorn_log(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sinkhorn-style std balancing; returns ``(scaled, mu1_cols, mu2_rows)``.
 
-    Faithful float64 port of SINQ's ``sinkhorn_log``: the dual variables whose
-    scaled matrix achieved the minimal imbalance (max-std / min-std ratio) are
-    tracked and returned even if the iteration later diverges.
-
-    Args:
-        matrix: 2D weight (block) tensor, any float dtype, any device.
-        order: number of iterations (Pre-SINQ upstream default: 4).
-        clip_min/clip_max: clamps for the std ratios used in the updates.
-        eps: numerical slack for the target scale.
-        stop_on_increasing_imbalance: freeze updates once imbalance rises.
+    Faithful float64 port of SINQ's ``sinkhorn_log``, batched over leading
+    dimensions: ``matrix`` is ``[..., K, L]``; for a plain 2D input the
+    results match the original routine exactly. The dual variables whose
+    scaled matrix achieved the minimal imbalance (max-std / min-std ratio)
+    are tracked and returned even if the iteration later diverges.
 
     Returns:
         ``(scaled, mu1, mu2)`` where ``scaled = matrix / mu1 / mu2``,
-        ``mu1`` is ``[1, L]`` (column scales) and ``mu2`` is ``[K, 1]`` (row
-        scales), both float64 on the input device.
+        ``mu1`` is ``[..., L]`` (column scales) and ``mu2`` is
+        ``[..., K, 1]`` (row scales), float64 on the input device.
     """
     dtype = torch.float64
     m = matrix.to(dtype)
-    dev = m.device
-    measure = torch.std
 
     def imbalance(mat: torch.Tensor) -> torch.Tensor:
-        s1, s2 = measure(mat, 1), measure(mat, 0)
-        s_min = torch.minimum(s1.min(), s2.min()).clamp_min(1e-12)
-        s_max = torch.maximum(s1.max(), s2.max())
-        return s_max / s_min
+        s1 = mat.std(dim=-1)  # [..., K] per-row std
+        s2 = mat.std(dim=-2)  # [..., L] per-col std
+        s_min = torch.minimum(s1.amin(dim=-1), s2.amin(dim=-1)).clamp_min(1e-12)
+        s_max = torch.maximum(s1.amax(dim=-1), s2.amax(dim=-1))
+        return s_max / s_min  # [...]
 
-    imb_min = torch.tensor(float("inf"), dtype=dtype, device=dev)
-    gate = torch.tensor(0.0, dtype=dtype, device=dev)
+    imb_min = torch.full(m.shape[:-2], float("inf"), dtype=dtype, device=m.device)
 
     tgt_small = (
         torch.minimum(
-            m.std(1).clamp(clip_min, clip_max).min(),
-            m.std(0).clamp(clip_min, clip_max).min(),
+            m.std(-1).clamp(clip_min, clip_max).amin(-1),
+            m.std(-2).clamp(clip_min, clip_max).amin(-1),
         )
         + eps
-    )
+    )  # [...]
 
-    log_mu1 = torch.zeros(m.shape[1], dtype=dtype, device=dev)
-    log_mu2 = torch.zeros(m.shape[0], 1, dtype=dtype, device=dev)
+    log_mu1 = torch.zeros(*m.shape[:-2], m.shape[-1], dtype=dtype, device=m.device)
+    log_mu2 = torch.zeros(*m.shape[:-2], m.shape[-2], 1, dtype=dtype, device=m.device)
 
     # Candidate for step k=0 (identity scaling)
     mu1_star = log_mu1.exp().clone()
     mu2_star = log_mu2.exp().clone()
     imb_min = torch.minimum(imb_min, imbalance(m))
 
+    gate = torch.zeros_like(imb_min)
+
     for _ in range(order):
-        cur = (m / log_mu1.exp()) / log_mu2.exp()
+        cur = (m / log_mu1.exp().unsqueeze(-2)) / log_mu2.exp()
         ib = imbalance(cur)
 
-        better = (ib <= imb_min).to(dtype)
-        imb_min = torch.min(imb_min, ib)
-        mu1_star = torch.where(better.bool(), log_mu1.exp(), mu1_star)
-        mu2_star = torch.where(better.bool(), log_mu2.exp(), mu2_star)
+        better = ib <= imb_min  # [...]
+        imb_min = torch.minimum(imb_min, ib)
+        mu1_star = torch.where(better.unsqueeze(-1), log_mu1.exp(), mu1_star)
+        mu2_star = torch.where(better.unsqueeze(-1).unsqueeze(-1), log_mu2.exp(), mu2_star)
 
         if stop_on_increasing_imbalance:
             rising = (ib > imb_min).to(dtype)
             gate = torch.clip(gate + rising, max=1.0)
 
-        g = 1.0 - gate
+        g = 1.0 - gate  # [...]
 
-        std_r = measure(cur, 1).clamp(clip_min, clip_max)
-        std_c = measure(cur, 0).clamp(clip_min, clip_max)
+        std_r = cur.std(dim=-1).clamp(clip_min, clip_max)  # [..., K]
+        std_c = cur.std(dim=-2).clamp(clip_min, clip_max)  # [..., L]
 
-        sal_col = (std_c / tgt_small).clamp(0.7, 2.0).log()
-        sal_row = (std_r[:, None] / tgt_small).clamp(0.7, 2.0).log()
+        sal_col = (std_c / tgt_small.unsqueeze(-1)).clamp(0.7, 2.0).log()  # [..., L]
+        sal_row = (std_r / tgt_small.unsqueeze(-1)).clamp(0.7, 2.0).log()  # [..., K]
 
-        log_mu1 = (log_mu1 + (sal_col * g)).clip(-0.3, 10.0)
-        log_mu2 = (log_mu2 + (sal_row * g)).clip(-0.3, 10.0)
+        log_mu1 = (log_mu1 + sal_col * g.unsqueeze(-1)).clip(-0.3, 10.0)
+        log_mu2 = (log_mu2 + sal_row.unsqueeze(-1) * g.unsqueeze(-1).unsqueeze(-1)).clip(-0.3, 10.0)
 
-    scaled = m / mu1_star / mu2_star
+    scaled = m / mu1_star.unsqueeze(-2) / mu2_star
     return scaled, mu1_star, mu2_star
 
 
 def column_scales(
-    weights: list[torch.Tensor],
+    matrices: list[torch.Tensor],
     group_size: int,
     n_iter: int,
 ) -> torch.Tensor:
     """Per-column Sinkhorn scales for the concatenated consumers of one input.
 
-    Mirrors SINQ's ``get_sink_scale``: concatenate the weight matrices of all
-    consumers along rows, split columns into tiles of ``group_size`` (adjusted
-    to a divisor of the input width), run :func:`sinkhorn_log` per tile with
-    ``n_iter`` iterations and median-normalise the concatenated column scales.
+    Mirrors SINQ's ``get_sink_scale``: concatenate the (effective) weight
+    matrices of all consumers along rows, split columns into tiles of
+    ``group_size`` (adjusted to a divisor of the input width), run a batched
+    :func:`sinkhorn_log` over tile groups and median-normalise the
+    concatenated column scales.
 
-    Computation concatenates in float32 on the CPU (weights are moved; the
-    copies are freed immediately) and each tile is upcast to float64 inside
-    :func:`sinkhorn_log`, so peak memory stays near a single fp32 copy of the
-    concatenated matrix plus one fp64 tile. The returned vector is float64
-    CPU.
+    Device policy: when every input matrix lives on the same device it is
+    used as-is (GPU weights -> GPU computation); otherwise everything is
+    moved to the CPU. The result is float64 on that device.
 
     Args:
-        weights: list of 2D weight tensors sharing the same input width.
+        matrices: list of 2D weight tensors sharing the same input width.
         group_size: nominal tile width (adjusted to a divisor).
         n_iter: sinkhorn iterations per tile.
 
     Returns:
-        float64 CPU tensor of shape ``[input_width]``.
+        float64 tensor of shape ``[input_width]`` on the compute device.
     """
-    ws = [w.detach().to("cpu", torch.float32) for w in weights]
-    del weights
+    devices = {m.device for m in matrices}
+    device = next(iter(devices)) if len(devices) == 1 else torch.device("cpu")
+    ws = [m.detach().to(device, torch.float32) for m in matrices]
     W = torch.cat(ws, dim=0)
     del ws
-    width = W.shape[1]
+    H, width = W.shape
 
     block = _find_block(width, group_size)
     n_tiles = width // block
+    Wt = W.view(H, n_tiles, block).permute(1, 0, 2)  # [n_tiles, H, block]
+    del W
 
-    tiles = []
-    for i in range(n_tiles):
-        _, mu1, _ = sinkhorn_log(W[:, i * block : (i + 1) * block], order=n_iter)
-        tiles.append(mu1.reshape(-1))
-    t = torch.cat(tiles)
+    parts = []
+    for i in range(0, n_tiles, _TILE_GROUP):
+        batch = Wt[i : i + _TILE_GROUP].contiguous()
+        _, mu1, _ = sinkhorn_log(batch, order=n_iter)
+        parts.append(mu1.reshape(-1, block))
+    t = torch.cat(parts).reshape(-1)
     return t / t.median()
 
 
 def _find_block(width: int, block: int) -> int:
-    """Return the largest divisor of ``width`` closest to ``block`` (>=1)."""
+    """Return the divisor of ``width`` closest to ``block`` (>=1)."""
     if block <= 0 or width % block == 0:
         return max(block, 1)
     for i in range(block):
