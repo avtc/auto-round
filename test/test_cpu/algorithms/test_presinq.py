@@ -166,7 +166,7 @@ def _forward_logits(model):
 
 def _assert_exact(model, atol_rel=1e-5):
     before = _forward_logits(model).clone()
-    PreSINQRotation(PreSINQConfig()).apply_to_model(model, data_type="int")
+    PreSINQRotation(PreSINQConfig()).apply_to_model(model, data_type="int", use_tqdm=False)
     after = _forward_logits(model)
     assert _rel_err(after, before) < atol_rel, f"fold changed the function: rel_err={_rel_err(after, before):.3e}"
 
@@ -215,14 +215,14 @@ class TestFoldExactness:
         torch.manual_seed(7)
         model = TinyModel()
         before = _forward_logits(model).clone()
-        PreSINQRotation(PreSINQConfig(n_repeat=3)).apply_to_model(model, data_type="int")
+        PreSINQRotation(PreSINQConfig(n_repeat=3)).apply_to_model(model, data_type="int", use_tqdm=False)
         assert _rel_err(_forward_logits(model), before) < 1e-5
 
     def test_normalize_outproj_mha(self):
         torch.manual_seed(7)
         model = TinyModel()
         before = _forward_logits(model).clone()
-        PreSINQRotation(PreSINQConfig(normalize_outproj=True)).apply_to_model(model, data_type="int")
+        PreSINQRotation(PreSINQConfig(normalize_outproj=True)).apply_to_model(model, data_type="int", use_tqdm=False)
         assert _rel_err(_forward_logits(model), before) < 1e-5
 
     def test_one_plus_weight_norm(self):
@@ -400,7 +400,7 @@ class TestReviewEdgeCases:
     def test_gqa_v_o_fold_exact(self):
         model = self._model_with(attn_cls=lambda d: TinyGQAAttention(d, heads=2, kv_heads=1))
         before = _forward_logits(model).clone()
-        PreSINQRotation(PreSINQConfig(normalize_outproj=True)).apply_to_model(model, data_type="int")
+        PreSINQRotation(PreSINQConfig(normalize_outproj=True)).apply_to_model(model, data_type="int", use_tqdm=False)
         assert _rel_err(_forward_logits(model), before) < 1e-5
 
     def test_mla_extra_consumer_exact(self):
@@ -444,7 +444,7 @@ class TestChunking:
         torch.manual_seed(13)
         model = TinyModel()
         before = _forward_logits(model).clone()
-        PreSINQRotation(PreSINQConfig()).apply_to_model(model, data_type="int")
+        PreSINQRotation(PreSINQConfig()).apply_to_model(model, data_type="int", use_tqdm=False)
         assert _rel_err(_forward_logits(model), before) < 1e-5
 
     def test_scale_rows_chunk_matches_direct(self):
