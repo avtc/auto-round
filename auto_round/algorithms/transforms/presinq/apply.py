@@ -171,7 +171,7 @@ class PreSINQRotation(BaseRotation):
         )
         n_layers = 0
         for _rep in range(cfg.n_repeat):
-            n_layers = self._fold_pass(model)
+            n_layers = self._fold_pass(model, _rep + 1)
         if n_layers == 0:
             logger.warning("[PreSINQ] no transformer layers found — model left unchanged.")
         mean_log_t = self._stats_log_t / max(self._stats_n, 1)
@@ -186,15 +186,21 @@ class PreSINQRotation(BaseRotation):
     # ------------------------------------------------------------------
     # Per-pass logic
     # ------------------------------------------------------------------
-    def _fold_pass(self, model: nn.Module) -> int:
+    def _fold_pass(self, model: nn.Module, pass_idx: int) -> int:
+        import time
+
         cfg = self.config
         n = 0
+        t0 = time.time()
         for layer in iter_transformer_layers(model):
             self._fold_attention_inputs(layer)
             self._fold_mlp(layer)
             if cfg.normalize_outproj:
                 self._fold_v_o(layer)
             n += 1
+            if n % 8 == 0:
+                logger.info("[PreSINQ] pass %d/%d: %d layers folded (%.1fs elapsed in pass)",
+                            pass_idx, cfg.n_repeat, n, time.time() - t0)
         return n
 
     def _track(self, t: torch.Tensor) -> None:
