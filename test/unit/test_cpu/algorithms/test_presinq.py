@@ -504,3 +504,23 @@ class TestLayerwise:
             rot.rotate_layer(layer, i)
             rot.rotate_layer(layer, i)  # second call must stay function-preserving
         assert _rel_err(_forward_logits(m), before) < 1e-5
+
+
+class TestDevicePolicy:
+    def test_cpu_inputs_prefer_cuda_when_available(self, monkeypatch):
+        from auto_round.algorithms.transforms.presinq import sinkhorn as sk
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        # single-CPU-device inputs must NOT short-circuit to CPU (regression:
+        # the first policy version fast-pathed cpu-resident weights to cpu)
+        w = [torch.randn(4, 8)]
+        assert sk._select_device(w).type == "cuda"
+        # mixed devices -> cuda too
+        assert sk._select_device([torch.randn(4, 8), torch.randn(4, 8).to("meta")]).type == "cuda"
+
+    def test_cpu_used_only_without_cuda(self, monkeypatch):
+        from auto_round.algorithms.transforms.presinq import sinkhorn as sk
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert sk._select_device([torch.randn(4, 8)]).type == "cpu"

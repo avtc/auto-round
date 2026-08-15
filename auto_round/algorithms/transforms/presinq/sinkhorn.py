@@ -132,10 +132,10 @@ def column_scales(
     :func:`sinkhorn_log` over tile groups and median-normalise the
     concatenated column scales.
 
-    Device policy: when every input matrix lives on the same device it is
-    used as-is (GPU weights -> GPU computation). For CPU-resident or mixed
-    inputs, a CUDA device is preferred when available (the sinkhorn batches
-    are small, ~0.3 GiB fp64) and the CPU is only used as a last resort.
+    Device policy: when every input matrix lives on the same non-CPU device it
+    is used as-is (GPU weights -> GPU computation). CPU-resident or mixed
+    inputs prefer a CUDA device when available (the sinkhorn batches are
+    small, ~0.3 GiB fp64); the CPU is only used as a last resort.
     The result is float64 on the compute device.
 
     Args:
@@ -146,15 +146,7 @@ def column_scales(
     Returns:
         float64 tensor of shape ``[input_width]`` on the compute device.
     """
-    devices = {m.device for m in matrices}
-    if len(devices) == 1:
-        device = next(iter(devices))
-    elif torch.cuda.is_available():
-        # CPU-resident or mixed weights: compute on the GPU anyway, it is
-        # ~50x faster for the batched fp64 sinkhorn and the batches are small.
-        device = torch.device("cuda", torch.cuda.current_device())
-    else:
-        device = torch.device("cpu")
+    device = _select_device(matrices)
     _log_device_once(device)
     ws = [m.detach().to(device, torch.float32) for m in matrices]
     W = torch.cat(ws, dim=0)
@@ -173,6 +165,18 @@ def column_scales(
         parts.append(mu1.reshape(-1, block))
     t = torch.cat(parts).reshape(-1)
     return t / t.median()
+
+
+def _select_device(matrices: list[torch.Tensor]) -> torch.device:
+    """GPU when possible: same non-CPU device > CUDA > CPU."""
+    devices = {m.device for m in matrices}
+    if len(devices) == 1 and next(iter(devices)).type != "cpu":
+        return next(iter(devices))
+    if torch.cuda.is_available():
+        # CPU-resident or mixed weights: compute on the GPU anyway - the
+        # batched fp64 sinkhorn is ~50x faster there and batches are small.
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
 
 
 def _log_device_once(device: torch.device) -> None:
