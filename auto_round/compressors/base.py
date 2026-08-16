@@ -233,10 +233,20 @@ class BaseOrchestrator(object):
 
         dataset_was_explicitly_set = dataset is not None
         self.dataset = dataset if dataset_was_explicitly_set else "NeelNanda/pile-10k"
-        batch_size = min(kwargs.pop("batch_size", 8), nsamples)
+        # Normalize before any use: the #2039 refactor made nsamples/seqlen
+        # default to None but left `min(batch_size, nsamples)` unguarded,
+        # crashing for callers that omit nsamples (min(8, None) -> TypeError).
+        if nsamples is None:
+            nsamples = 128
+        if seqlen is None:
+            seqlen = 2048
+        batch_size = kwargs.pop("batch_size", 8)
+        if batch_size is None:
+            batch_size = 8
+        batch_size = min(batch_size, nsamples)
         self.calibration_context = CalibrationContext(
-            nsamples=nsamples if nsamples is not None else 128,
-            seqlen=seqlen if seqlen is not None else 2048,
+            nsamples=nsamples,
+            seqlen=seqlen,
             batch_size=batch_size,
             orig_batch_size=batch_size,
             dataset=self.dataset,
