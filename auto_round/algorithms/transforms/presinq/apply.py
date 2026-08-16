@@ -102,12 +102,13 @@ def _norm_is_foldable(norm) -> bool:
 def _moe_blocks(mlp: nn.Module, experts: nn.ModuleList) -> list[nn.Module]:
     """Expert-like blocks consuming the post-attention norm: experts + shared experts."""
     blocks = list(experts)
-    shared = getattr(mlp, "shared_expert", None)
-    if isinstance(shared, nn.Module):
-        blocks.append(shared)
-    shared_list = getattr(mlp, "shared_experts", None)
-    if isinstance(shared_list, nn.ModuleList):
-        blocks.extend(shared_list)
+    for name in ("shared_expert", "shared_experts", "shared_mlp"):
+        shared = getattr(mlp, name, None)
+        if isinstance(shared, nn.Module) and not isinstance(shared, nn.ModuleList):
+            blocks.append(shared)
+            continue
+        if isinstance(shared, nn.ModuleList):
+            blocks.extend(shared)
     return blocks
 
 

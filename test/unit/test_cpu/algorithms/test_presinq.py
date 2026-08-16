@@ -524,3 +524,79 @@ class TestDevicePolicy:
 
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         assert sk._select_device([torch.randn(4, 8)]).type == "cpu"
+
+
+class TestHy3Naming:
+    """hy_v3 (HYV3) module naming: mlp.shared_mlp, mlp.router.gate, mlp.experts."""
+
+    def _hy3_moe_mlp(self, hidden=16, inter=8, n_experts=3):
+        import torch.nn as nn
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(hidden, inter, bias=False)
+                self.up_proj = nn.Linear(hidden, inter, bias=False)
+                self.down_proj = nn.Linear(inter, hidden, bias=False)
+
+        class Router(nn.Module):  # hy_v3: mlp.router.gate (nested Linear)
+            def __init__(self):
+                super().__init__()
+                self.gate = nn.Linear(hidden, n_experts, bias=False)
+
+        class MoE(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = nn.ModuleList([Blk() for _ in range(n_experts)])
+                self.shared_mlp = Blk()
+                self.router = Router()
+
+        return MoE()
+
+    def test_helpers_cover_hy3_names(self):
+        from auto_round.algorithms.transforms.presinq.apply import _moe_blocks
+        from auto_round.algorithms.transforms.spinquant.rotation_utils import get_router_linears
+
+        mlp = self._hy3_moe_mlp()
+        blocks = _moe_blocks(mlp, mlp.experts)
+        assert len(blocks) == 4  # 3 experts + shared_mlp
+        routers = get_router_linears(mlp)
+        assert routers == [mlp.router.gate]
+
+    def test_hy3_moe_fold_is_exact(self):
+        """Fold on an hy_v3-shaped MoE layer preserves its function exactly."""
+        import torch.nn as nn
+
+        torch.manual_seed(0)
+
+
+        class Layer(nn.Module):
+            def __init__(self, mlp):
+                super().__init__()
+                self.post_attention_layernorm = StdRMSNorm(16)
+                self.mlp = mlp
+
+        layer = Layer(self._hy3_moe_mlp())
+        rot = PreSINQRotation(PreSINQConfig(n_repeat=1))
+        h = torch.randn(5, 16)  # one fixed input for both passes
+        before = self._forward(layer, h)
+        rot.rotate_layer(layer, 0)
+        after = self._forward(layer, h)
+        assert torch.allclose(before, after, rtol=1e-3, atol=1e-4)
+
+    def _forward(self, layer, h=None):
+        """MoE forward: sigmoid-router top-1 over experts + shared, biases on logits."""
+        import torch.nn.functional as F
+
+        if h is None:
+            h = torch.randn(5, 16)
+        x = layer.post_attention_layernorm(h)
+        mlp = layer.mlp
+        logits = F.linear(x, mlp.router.gate.weight) + torch.arange(3.0)  # expert_bias analogue
+        w = torch.sigmoid(logits) * (logits > 0)
+        w = w / w.sum(-1, keepdim=True)
+        exp_out = torch.zeros(5, 16)
+        for i, blk in enumerate(mlp.experts):
+            exp_out += w[:, i : i + 1] * blk.down_proj(F.silu(blk.gate_proj(x)) * blk.up_proj(x))
+        sh = mlp.shared_mlp
+        return exp_out + sh.down_proj(F.silu(sh.gate_proj(x)) * sh.up_proj(x))
