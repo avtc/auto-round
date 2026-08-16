@@ -1292,6 +1292,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             if lm_head_name is not None:
                 tied_weights_layers.append(lm_head_name)
 
+        # ── stream_checkpoint: per-block tensor streaming from the checkpoint ──
+        streamer = getattr(self.model_context, "checkpoint_streamer", None)
+        if streamer is not None and not self.compress_context.is_immediate_saving:
+            raise ValueError(
+                "stream_checkpoint=True requires immediate saving "
+                "(enable low_cpu_mem_usage=True and keep inplace packing; int data types only)."
+            )
+
         all_blocks = self.quant_block_list or get_block_names(self.model)
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         for block_names in all_blocks:
@@ -1300,6 +1308,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block = get_module(self.model, block_name)
 
                 # ── Infrastructure: materialize ───────────────────────────
+                if streamer is not None:
+                    streamer.load_module_(block, block_name, device=str(self.device))
                 materialize_model_(block)
 
                 # ── Pure algorithm ────────────────────────────────────────
@@ -1347,7 +1357,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     block.to("meta")
                 else:
                     mv_module_from_gpu(block)
-                    if self.compress_context.low_cpu_mem_usage:
+                    if self.compress_context.low_cpu_mem_usage and streamer is None:
                         self._offloader(self.model, block_name)
 
                 clear_memory()
@@ -1365,6 +1375,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             remain_layer_names.append(n)
         for name in remain_layer_names:
             logger.info(f"Quantizing remaining layer {name} on CPU.")
+            if streamer is not None:
+                parent = name.rsplit(".", 1)[0]
+                streamer.load_module_(get_module(self.model, parent), parent, device="cpu")
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.
@@ -1373,8 +1386,33 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         # Convert remaining fp8
         convert_module_to_hp_if_necessary(self.model, self.amp_dtype, self.device)
-        if self.compress_context.low_cpu_mem_usage:
+        if self.compress_context.low_cpu_mem_usage and streamer is None:
             self._offloader.reload(self.model)
+        if streamer is not None and self.compress_context.is_immediate_saving:
+            # Root pass-through tensors (embeddings, final norm, lm_head, ...) are
+            # still meta; stream them in so ShardWriter.finalize() sees real data
+            # (finalize silently skips meta tensors).
+            from auto_round.compressors.utils import check_to_quantized as _ctq
+
+            saved = set(self.shard_writer._all_saved)
+            quantized_prefixes = tuple(
+                n for n, m in self.model.named_modules() if _ctq(m) and not any(m.children())
+            )
+            targets = dict(self.model.named_parameters())
+            targets.update(dict(self.model.named_buffers()))
+            for pname, tensor in self.model.state_dict().items():
+                if pname in saved or tensor.device.type != "meta":
+                    continue
+                if any(pname == q or pname.startswith(q + ".") for q in quantized_prefixes):
+                    continue  # quantized layer's original weight — packed name was written
+                tgt = targets.get(pname, None)
+                if tgt is None:
+                    logger.debug(f"[stream] root tensor {pname} has no live parameter/buffer; skipped")
+                    continue
+                if pname not in streamer.weight_map:
+                    logger.warning(f"[stream] root tensor {pname} missing from checkpoint; skipped")
+                    continue
+                streamer.fetch_into_(self.model, pname)
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
