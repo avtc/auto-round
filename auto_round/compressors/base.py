@@ -307,7 +307,19 @@ class BaseOrchestrator(object):
         disable_deterministic_algorithms = kwargs.pop("disable_deterministic_algorithms", True)
         enable_deterministic_algorithms = kwargs.pop("enable_deterministic_algorithms", False)
 
-        self._offloader = OffloadManager(enabled=low_cpu_mem_usage, mode="offload", offload_dir_prefix="compressor")
+        # Stream the checkpoint per block instead of materializing the whole
+        # model (meta-device load + per-block tensor streaming + immediate
+        # saving). For models far larger than host RAM.
+        self.stream_checkpoint = kwargs.pop("stream_checkpoint", False)
+
+        # ``stream_checkpoint`` handles its own block lifecycle (meta -> stream
+        # -> quantize -> write -> meta), so the accelerate-style offloader
+        # must not interfere.
+        self._offloader = OffloadManager(
+            enabled=low_cpu_mem_usage and not self.stream_checkpoint,
+            mode="offload",
+            offload_dir_prefix="compressor",
+        )
 
         # Model related
         model_dtype = kwargs.pop("model_dtype", None)
@@ -403,6 +415,7 @@ class BaseOrchestrator(object):
             formats=self.formats,
             is_act_quantize=self.quantize_config.is_act_quantize,
             quant_nontext_module=quant_nontext_module,
+            stream_checkpoint=self.stream_checkpoint,
         )
         # Reset the singleton so each new orchestrator gets a fresh CompressContext.
         # CompressContext uses AutoSkipInitMeta (singleton), so without a reset the
@@ -466,8 +479,20 @@ class BaseOrchestrator(object):
         """
         from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
 
-        if any(getattr(config, "need_calib", True) for config in self._alg_configs):
-            return True
+        demanding = [c for c in self._alg_configs if getattr(c, "need_calib", True)]
+        if demanding:
+            # stream_checkpoint cannot provide cached block inputs (no full-model
+            # forward exists). The RTN family (incl. optimized RTN) is weight-only:
+            # its clip search never consumes activations, so the demand is waived
+            # and the zero-shot block loop runs instead.
+            from auto_round.algorithms.quantization.rtn.config import RTNConfig as _RTN
+
+            if not (getattr(self, "stream_checkpoint", False) and all(isinstance(c, _RTN) for c in demanding)):
+                return True
+            logger.info(
+                "[stream_checkpoint] RTN-family quantizer: proceeding zero-shot "
+                "(weight-only clip search; calibration data would be unused)."
+            )
 
         # AutoScheme needs data for delta-loss scheme selection
         if isinstance(self.scheme, AutoScheme):

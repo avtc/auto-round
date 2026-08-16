@@ -343,7 +343,7 @@ class ShardWriter:
                 else f"model-{idx:05d}-of-{self.shard_counter:05d}.{self.shard_suffix}"
             )
             new_path = os.path.join(shard_dir, new_name)
-            os.rename(old_path, new_path)
+            os.replace(old_path, new_path)
             for p in meta["params"]:
                 self.global_weight_map[p] = new_name
 

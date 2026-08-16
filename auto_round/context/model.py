@@ -67,6 +67,7 @@ class ModelContext(BaseContext):
         need_calib: bool = True,
         is_act_quantize: bool = False,
         quant_nontext_module: bool = False,
+        stream_checkpoint: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -82,6 +83,9 @@ class ModelContext(BaseContext):
         assert model is not None, "model must be provided for ModelContext"
         self.model = model
         self.tokenizer = tokenizer
+        self.stream_checkpoint = stream_checkpoint
+        self.model_path = model if isinstance(model, str) else None
+        self.checkpoint_streamer = None
 
         # MLLM / diffusion artifacts – always present so callers need no getattr guards.
         # _load_model() will populate the ones that are relevant to the model type.
@@ -109,7 +113,7 @@ class ModelContext(BaseContext):
         # by the time BaseCompressor.post_init() runs.
         self._load_model()
 
-        if unsupported_meta_device(self.model):
+        if unsupported_meta_device(self.model) and not self.stream_checkpoint:
             raise RuntimeError(
                 "AutoRound does not support parameters on meta device. "
                 "Please use more GPUs by setting `--device 0,1,2,3` or just place the model on CPU."
@@ -144,6 +148,47 @@ class ModelContext(BaseContext):
     def device(self, value) -> None:
         device_manager.device = value
 
+    def _load_model_on_meta(self):
+        """Load the model structure on the meta device + build a tensor streamer.
+
+        ``stream_checkpoint`` mode for models far larger than host RAM: weights
+        are never materialized as a whole; the zero-shot block loop streams each
+        block from the checkpoint shards right before quantizing it and the
+        ShardWriter releases it right after (requires immediate saving).
+        """
+        from accelerate import init_empty_weights
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        if self.config is None:
+            self.config = AutoConfig.from_pretrained(self.model, trust_remote_code=self.trust_remote_code)
+        try:
+            self._import_custom_moe_replacements(self.config)
+        except Exception as e:  # structural only - proceed regardless
+            logger.debug(f"_import_custom_moe_replacements skipped: {e}")
+        from auto_round.utils.common import monkey_patch_model
+        from auto_round.utils.model import handle_generation_config
+
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=self.trust_remote_code)
+        monkey_patch_model(model)
+        handle_generation_config(model)
+        self.model = model.eval()
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=self.trust_remote_code)
+        except Exception as e:
+            # Zero-shot streaming never consumes calibration data; a tokenizer
+            # is only needed for the export copy-through.
+            logger.warning(f"[stream_checkpoint] tokenizer unavailable ({e}); continuing without it.")
+            self.tokenizer = None
+        self.checkpoint_streamer = CheckpointStreamer(self.model_path)
+        logger.info(
+            f"[stream_checkpoint] model structure loaded on meta device; "
+            f"{len(self.checkpoint_streamer.tensor_names)} tensors will be streamed from "
+            f"{self.model_path} per block (model never fully materialized)."
+        )
+
     def _load_model(self):
         if is_mllm_model(self.model, platform=self.platform):
             self.is_mllm = True
@@ -156,6 +201,8 @@ class ModelContext(BaseContext):
             self.pipe, self.model = diffusion_load_model(
                 self.model, platform=self.platform, device="cpu", model_dtype=self.model_dtype
             )
+        elif isinstance(self.model, str) and self.stream_checkpoint:
+            self._load_model_on_meta()
         elif isinstance(self.model, str):
             config = self.config
             try:

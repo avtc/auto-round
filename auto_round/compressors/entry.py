@@ -29,6 +29,7 @@ _ENTRY_COMPRESSOR_KWARGS = {
     "quant_lm_head",
     "to_quant_block_names",
     "layerwise_rotation",
+    "stream_checkpoint",
 }
 _ENTRY_BASE_KWARGS = {
     "format",

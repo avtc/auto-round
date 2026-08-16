@@ -29,6 +29,11 @@ __all__ = ["PreSINQConfig", "PRE_SINQ_ATTRIBUTION"]
 
 @dataclass
 class PreSINQConfig(BaseRotationConfig):
+    # Weight-statistics-only transform: never requires calibration data.
+    # (Transform configs default to need_calib=True in _needs_calibration_data,
+    #  which would force the data-driven path - wrong for Pre-SINQ.)
+    need_calib = False
+
     """Configuration for the Pre-SINQ function-preserving weight fold.
 
     Pre-SINQ computes Sinkhorn-normalised *column* scales from weight
