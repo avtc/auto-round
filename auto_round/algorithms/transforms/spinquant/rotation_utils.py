@@ -224,7 +224,7 @@ _PROJ_NAME_ALIASES = {
     "down": ("down_proj", "w2", "output_linear"),
 }
 _ROUTER_NAMES = ("gate", "router", "shared_expert_gate")
-_SHARED_EXPERT_NAMES = ("shared_expert", "shared_experts")
+_SHARED_EXPERT_NAMES = ("shared_expert", "shared_experts", "shared_mlp")
 _MLP_ATTR_NAMES = ("mlp", "feed_forward", "block_sparse_moe", "ffn")
 _LAYER_SHARED_MLP_NAMES = ("shared_mlp",)
 
@@ -417,11 +417,12 @@ def iter_layer_mlp_blocks(layer: nn.Module):
 def get_router_linears(mlp: nn.Module) -> list:
     """Return router / gating modules that consume the (normed) residual stream.
 
-    Accepts both ``nn.Linear`` routers (older HF modeling, e.g. Qwen2Moe's
-    ``mlp.gate``) and routers holding a bare 2D ``weight`` parameter applied
-    via ``F.linear`` (transformers 5.x ``*TopKRouter`` modules).  Only
-    ``.weight`` is ever accessed by rotation / norm-fusion code, so both
-    forms are handled identically.
+    Accepts ``nn.Linear`` routers (older HF modeling, e.g. Qwen2Moe's
+    ``mlp.gate``), routers holding a bare 2D ``weight`` parameter applied
+    via ``F.linear`` (transformers 5.x ``*TopKRouter`` modules), and nested
+    containers whose ``.gate`` child is the routing Linear (HYV3's
+    ``mlp.router.gate``).  Only ``.weight`` is ever accessed by rotation /
+    norm-fusion code, so all forms are handled identically.
     """
     routers = []
     for name in _ROUTER_NAMES:
@@ -432,6 +433,9 @@ def get_router_linears(mlp: nn.Module) -> list:
             routers.append(mod)
         elif isinstance(getattr(mod, "weight", None), nn.Parameter) and mod.weight.dim() == 2:
             routers.append(mod)
+        elif isinstance(getattr(mod, "gate", None), nn.Linear):
+            # nested router container, e.g. hy_v3 ``mlp.router.gate``
+            routers.append(mod.gate)
     return routers
 
 
