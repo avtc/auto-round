@@ -84,6 +84,7 @@ class WrapperLinear(torch.nn.Module):
         enable_round_tuning=True,
         enable_torch_compile=False,
         disable_opt_rtn=True,
+        asym_search=None,
         **kwargs,
     ):
         """Initializes the WrapperLinear module.
@@ -98,6 +99,7 @@ class WrapperLinear(torch.nn.Module):
         self.orig_layer = orig_layer
         self.orig_layer.iters = kwargs.pop("iters", 200)
         self.disable_opt_rtn = disable_opt_rtn
+        self.asym_search = asym_search
         self.output_device = device
         self.device = self.orig_layer.tuning_device if hasattr(self.orig_layer, "tuning_device") else device
         self.enable_minmax_tuning = enable_minmax_tuning
@@ -191,6 +193,7 @@ class WrapperLinear(torch.nn.Module):
             self.disable_opt_rtn,
             orig_layer.group_size,
             iters=orig_layer.iters,
+            asym_search=self.asym_search,
         )
         if self.enable_torch_compile:
             self.weight_quant_func = compile_func(self.weight_quant_func, self.device)
