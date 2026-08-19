@@ -449,6 +449,11 @@ class AutoRound(object):
             base_cls = _select_rtn_compressor_base_cls(quant_config, scheme, format, base_kwargs)
             return _get_compressor_class(model_type, base_cls)(alg_configs, **local_args, **ctor_kwargs)
 
+        elif isinstance(quant_config, QuantizationConfig):
+            # Any other terminal quantizer (e.g. QronosConfig) runs on the
+            # standard data-driven Compressor - same host as SignRound.
+            return _get_compressor_class(model_type, Compressor)(alg_configs, **local_args, **ctor_kwargs)
+
 
 class AutoRoundCompatible:
     """AutoRoundCompatible wrapper class for backward compatibility.
