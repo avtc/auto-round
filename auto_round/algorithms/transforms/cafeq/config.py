@@ -46,6 +46,7 @@ class CafeQConfig(BaseRotationConfig):
     lr: float = 1e-2
     lse_temp: float = 5.0
     seed: int = 42
+    allow_gated: bool = False
 
     def __init__(
         self,
@@ -55,6 +56,7 @@ class CafeQConfig(BaseRotationConfig):
         lr: float = 1e-2,
         lse_temp: float = 5.0,
         seed: int = 42,
+        allow_gated: bool = False,
         **kwargs,
     ) -> None:
         """Initialize a CafeQ configuration.
@@ -70,6 +72,10 @@ class CafeQConfig(BaseRotationConfig):
             lse_temp: temperature ``t`` of the LogSumExp smooth-max (the
                 paper found the loss insensitive to ``t``).
             seed: init seed for the random-orthogonal starting point.
+            allow_gated: proceed on architectures that gate the attention
+                output before o_proj (Qwen3.5/Next-style). The fold is NOT
+                exact there (an input-dependent channelwise gate does not
+                commute with a non-diagonal M); default False refuses.
             **kwargs: Reserved.
         """
         super().__init__(**kwargs)
@@ -78,3 +84,4 @@ class CafeQConfig(BaseRotationConfig):
         self.lr = lr
         self.lse_temp = lse_temp
         self.seed = seed
+        self.allow_gated = allow_gated

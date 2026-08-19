@@ -26,20 +26,22 @@ N_LAYERS = 2
 
 
 class MultiHeadAttn(nn.Module):
-    """GQA-shaped attention: N_V_HEADS v-heads, scalar row-weighted mixing.
+    """GQA-shaped attention: N_V_HEADS v-heads serve N_Q_HEADS o-input blocks.
 
     The row-wise mixing (diag-attention) commutes with any right-multiplication
     on the head axis - the exactness property CafeQ's fold relies on.
     """
 
-    def __init__(self, dim, head_dim, n_heads):
+    def __init__(self, dim, head_dim, n_v_heads, n_q_heads=None):
         super().__init__()
         self.head_dim = head_dim
-        self.n_heads = n_heads
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.n_v_heads = n_v_heads
+        self.n_q_heads = n_q_heads if n_q_heads is not None else n_v_heads
+        self.group = self.n_q_heads // n_v_heads
+        self.q_proj = nn.Linear(dim, self.n_q_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, self.n_q_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_v_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_q_heads * head_dim, dim, bias=False)
 
     def forward(self, x):
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -47,8 +49,32 @@ class MultiHeadAttn(nn.Module):
         seq = x.shape[1]
         scores = (q * k).mean(-1, keepdim=True) / (q.shape[-1] ** 0.5)
         a = torch.softmax(scores, dim=1)
-        vh = v.reshape(v.shape[0], seq, self.n_heads, self.head_dim)
+        vh = v.reshape(v.shape[0], seq, self.n_v_heads, self.head_dim)
+        vh = vh.repeat_interleave(self.group, dim=2)  # GQA broadcast
         out = (a.unsqueeze(-1) * vh).reshape(v.shape[0], seq, -1)
+        return self.o_proj(out)
+
+
+class GatedAttn(MultiHeadAttn):
+    """Qwen3.5-style: q_proj packs [query | gate]; sigmoid gate on o input."""
+
+    def __init__(self, dim, head_dim, n_v_heads):
+        super().__init__(dim, head_dim, n_v_heads)
+        # doubled q_proj output = the gate signature CafeQ must refuse
+        self.q_proj = nn.Linear(dim, 2 * self.n_q_heads * head_dim, bias=False)
+
+    def forward(self, x):
+        seq = x.shape[1]
+        qg = self.q_proj(x).reshape(x.shape[0], seq, self.n_q_heads, 2 * self.head_dim)
+        q, gate = torch.chunk(qg, 2, dim=-1)
+        k = self.k_proj(x).reshape(x.shape[0], seq, self.n_q_heads, self.head_dim)
+        v = self.v_proj(x)
+        scores = (q * k).mean(-1, keepdim=True) / (self.head_dim ** 0.5)
+        a = torch.softmax(scores, dim=1)
+        vh = v.reshape(x.shape[0], seq, self.n_v_heads, self.head_dim)
+        vh = vh.repeat_interleave(self.group, dim=2)
+        out = (a.unsqueeze(-1) * vh).reshape(x.shape[0], seq, -1)
+        out = out * torch.sigmoid(gate.reshape(x.shape[0], seq, -1))
         return self.o_proj(out)
 
 
@@ -145,6 +171,38 @@ class TestCafeQ:
         model = nn.Sequential(nn.Linear(HIDDEN, HIDDEN))
         with pytest.raises(ValueError, match="no.*attention"):
             CafeQTransform(CafeQConfig(iters=10)).apply_to_model(model)
+
+    def test_gqa_replication_exactness(self):
+        """GQA: each v-head serves multiple o-input blocks; the fold replicates."""
+        torch.manual_seed(3)
+        model = MiniModel()
+        with torch.no_grad():
+            for l in model.layers:
+                l.self_attn = MultiHeadAttn(HIDDEN, HEAD_DIM, n_v_heads=2, n_q_heads=4).to(
+                    l.self_attn.q_proj.weight.device
+                )
+                for p in l.self_attn.parameters():
+                    p.copy_(torch.randn_like(p) * 0.5)
+        model.eval()
+        ids = torch.randint(0, 32, (2, 10))
+        with torch.no_grad():
+            before = model(ids)
+        CafeQTransform(CafeQConfig(head_dim=HEAD_DIM, iters=100, seed=7)).apply_to_model(model)
+        with torch.no_grad():
+            after = model(ids)
+        torch.testing.assert_close(before, after, atol=2e-4, rtol=2e-4)
+
+    def test_gated_attn_refused(self):
+        torch.manual_seed(3)
+        model = MiniModel()
+        with torch.no_grad():
+            for l in model.layers:
+                l.self_attn = GatedAttn(HIDDEN, HEAD_DIM, N_V_HEADS)
+                for p in l.self_attn.parameters():
+                    p.copy_(torch.randn_like(p) * 0.5)
+        model.eval()
+        with pytest.raises(ValueError, match="gates the attention output"):
+            CafeQTransform(CafeQConfig(head_dim=HEAD_DIM, iters=10)).apply_to_model(model)
 
     def test_head_dim_unresolvable_raises(self):
         model = self._model()

@@ -92,6 +92,22 @@ class CafeQTransform(BaseRotation):
         return out
 
     @staticmethod
+    def _check_not_gated(attn_v, attn_o, attn_q) -> None:
+        """Refuse archs whose attention output is gated before o_proj.
+
+        Qwen3.5/Next-style attention packs [query | gate] into q_proj
+        (out = 2 x o.in) and multiplies the o_proj INPUT by sigmoid(gate)
+        elementwise. An input-dependent channelwise gate does not commute
+        with a non-diagonal M, so the fold would NOT be exact.
+        """
+        if attn_q.out_features == 2 * attn_o.in_features:
+            raise ValueError(
+                "[CafeQ] this architecture gates the attention output before o_proj "
+                "(q_proj packs [query | gate]); a non-diagonal V/O transform cannot "
+                "fold exactly. Pass allow_gated=True to proceed anyway (inexact)."
+            )
+
+    @staticmethod
     def _resolve_head_dim(model, layers) -> int:
         cfg = getattr(model, "config", None)
         for candidate in (cfg, getattr(cfg, "text_config", None), getattr(cfg, "language_model", None)):
@@ -110,18 +126,20 @@ class CafeQTransform(BaseRotation):
         """Paired LogSumExp proxy (arXiv 2511.19705 Sec. 4.2).
 
         Per v-head h (shared M): U_h = (M^T W_v[h])^T with channel maxes over
-        the head axis (input channels), V_h = M^T W_o[:, h]^T with channel
-        maxes over the head axis (output channels). The loss is the smooth
-        max (temperature t) over every channel max of both matrices.
+        the head axis (input channels); V_j = M^T W_o[:, j]^T for every o input
+        block j consuming head h (GQA replication) with channel maxes over the
+        head axis (output channels). Smooth max (temperature t) over all.
         """
         n_vh = W_v.shape[0] // hd
+        group = W_o.shape[1] // W_v.shape[0]  # o input blocks per v-head
         t = self.config.lse_temp
         chans = []
         for h in range(n_vh):
             U = (M.T @ W_v[h * hd : (h + 1) * hd]).T  # [in, hd]
-            V = M.T @ W_o[:, h * hd : (h + 1) * hd].T  # [hd, out]
             chans.append(U.abs().amax(dim=1))  # per input channel, max over head axis
-            chans.append(V.abs().amax(dim=0))  # per output channel, max over head axis
+            for j in range(h * group, (h + 1) * group):
+                V = M.T @ W_o[:, j * hd : (j + 1) * hd].T  # [hd, out]
+                chans.append(V.abs().amax(dim=0))  # per output channel, max over head axis
         allc = torch.cat(chans)
         return (t * allc).logsumexp(0) / t
 
@@ -149,10 +167,12 @@ class CafeQTransform(BaseRotation):
     @staticmethod
     def _fold(v: nn.Linear, o: nn.Linear, M: torch.Tensor, hd: int) -> None:
         n_vh = v.weight.shape[0] // hd
+        group = o.weight.shape[1] // v.weight.shape[0]  # GQA: o input blocks per v-head
         wv, wo = v.weight.data, o.weight.data
         for h in range(n_vh):
             wv[h * hd : (h + 1) * hd, :] = M.T @ wv[h * hd : (h + 1) * hd, :]
-            wo[:, h * hd : (h + 1) * hd] = wo[:, h * hd : (h + 1) * hd] @ M  # M^{-T} == M (orthogonal)
+            for j in range(h * group, (h + 1) * group):
+                wo[:, j * hd : (j + 1) * hd] = wo[:, j * hd : (j + 1) * hd] @ M  # M^{-T} == M
         if v.bias is not None:
             for h in range(n_vh):
                 v.bias.data[h * hd : (h + 1) * hd] = M.T @ v.bias.data[h * hd : (h + 1) * hd]
@@ -168,7 +188,12 @@ class CafeQTransform(BaseRotation):
         hd = cfg.head_dim or self._resolve_head_dim(model, layers)
         total_before, total_after = 0.0, 0.0
         for layer, v, o in layers:
-            if v.weight.shape[0] % hd != 0 or o.weight.shape[1] != v.weight.shape[0]:
+            q = getattr(getattr(layer, "self_attn", None), "q_proj", None)
+            if q is not None and not cfg.allow_gated:
+                self._check_not_gated(v, o, q)
+            if v.weight.shape[0] % hd != 0 or o.weight.shape[1] % hd != 0 or (
+                o.weight.shape[1] % v.weight.shape[0] != 0
+            ):
                 raise ValueError(
                     f"[CafeQ] head_dim {hd} incompatible with v_proj {tuple(v.weight.shape)} / "
                     f"o_proj {tuple(o.weight.shape)}"
