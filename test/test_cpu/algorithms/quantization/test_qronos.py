@@ -96,6 +96,30 @@ class TestQronosSequentialQuantize:
         err_r = (X @ (W - Q_rtn).T).pow(2).sum()
         assert err_q < err_r
 
+    def test_identity_L_fallback_matches_rtn(self):
+        """use_init=False with an identity L must reduce to plain RTN.
+
+        The error-correcting init assumes the Cholesky block identity
+        L_{>=2,>=2} L_{>=2,>=2}^T == (H_{>=2,>=2})^{-1}; with an identity L
+        it degenerates to a raw Hessian conjugation of the weights, which is
+        arbitrarily worse than RTN. The fallback path must therefore skip it.
+        """
+        torch.manual_seed(3)
+        n, N = 32, 48
+        H = _damp(_spd_gram(torch.randn(128, N)))
+        W = torch.randn(n, N) * 0.3
+        maxq = 15
+        scale, zp = compute_group_grid(W, bits=4, group_size=16, sym=False)
+        sc = torch.repeat_interleave(scale, 16, dim=1)
+        zc = torch.repeat_interleave(zp, 16, dim=1)
+        L_eye = torch.eye(N)
+        Q, _ = qronos_sequential_quantize(W, H, H, sc, zc, maxq, block_size=16, L=L_eye, use_init=False)
+        Q_rtn = _rtn(W, sc, zc, maxq)
+        assert torch.allclose(Q, Q_rtn, atol=1e-6)
+        # and the init-active variant on the same identity L is far worse
+        Q_bad, _ = qronos_sequential_quantize(W, H, H, sc, zc, maxq, block_size=16, L=L_eye, use_init=True)
+        assert (W - Q_bad).norm() > 3 * (W - Q_rtn).norm()
+
     def test_xtilde_neq_x_corrects_previous_layers(self):
         """With X~ != X, the G = X~^T X term must not increase the X~-output error."""
         torch.manual_seed(3)

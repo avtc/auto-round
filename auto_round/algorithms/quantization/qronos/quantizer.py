@@ -91,6 +91,7 @@ def qronos_sequential_quantize(
     maxq: float,
     block_size: int = 128,
     L: torch.Tensor = None,
+    use_init: bool = True,
 ) -> tuple:
     """The Qronos rounding loop (Algorithm 1, arXiv 2505.11695).
 
@@ -103,6 +104,10 @@ def qronos_sequential_quantize(
         maxq: grid bound (``2^bits - 1`` asym, ``2^(bits-1)`` sym).
         block_size: blocked-update granularity (exact at any value).
         L: precomputed lower Cholesky factor of ``H^{-1}`` (optional).
+        use_init: apply the error-correcting first-column initialization.
+            Must be ``False`` when ``L`` is an identity fallback (see
+            :meth:`quantize`): the init assumes the Cholesky block identity
+            and degenerates into a raw Hessian conjugation otherwise.
 
     Returns:
         ``(Q, loss)``: quantize-dequantized weight [n, N] and the per-layer
@@ -116,41 +121,46 @@ def qronos_sequential_quantize(
         L = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)))
     losses = torch.zeros(n, device=W.device, dtype=W.dtype)
 
-    # ── special first column (error-correcting initialization) ─────────────
-    # q_1 = Q((G_{1,>=1} w - H_{1,>=2} w_{>=2}) / H_11)          [Prop. E.2]
-    num = W @ G[0, :] - W[:, 1:] @ H[0, 1:]
-    q0 = _quant_col(num / H[0, 0], scale[:, 0], None if zp is None else zp[:, 0], maxq)
-    W[:, 0] = q0
-    losses += (num / H[0, 0] - q0) ** 2 / (L[0, 0] ** 2)
-    if N > 1:
-        # w_{>=2}^{(1)} = (H_{>=2,>=2})^{-1} (G_{>=2,>=1} w - H_{>=2,1} q_1)  [Lemma G.3:
-        # (H_{>=2,>=2})^{-1} == L_{>=2,>=2} L_{>=2,>=2}^T for L = chol(H^{-1}),
-        # so the factor is APPLIED, not solved against]
-        C = L[1:, 1:]
-        M = W @ G[1:, :].T - q0.unsqueeze(1) * H[1:, 0].unsqueeze(0)
-        W[:, 1:] = (M @ C) @ C.T
+    if use_init:
+        # ── special first column (error-correcting initialization) ─────────
+        # q_1 = Q((G_{1,>=1} w - H_{1,>=2} w_{>=2}) / H_11)          [Prop. E.2]
+        num = W @ G[0, :] - W[:, 1:] @ H[0, 1:]
+        q0 = _quant_col(num / H[0, 0], scale[:, 0], None if zp is None else zp[:, 0], maxq)
+        W[:, 0] = q0
+        losses += (num / H[0, 0] - q0) ** 2 / (L[0, 0] ** 2)
+        if N > 1:
+            # w_{>=2}^{(1)} = (H_{>=2,>=2})^{-1} (G_{>=2,>=1} w - H_{>=2,1} q_1)  [Lemma G.3:
+            # (H_{>=2,>=2})^{-1} == L_{>=2,>=2} L_{>=2,>=2}^T for L = chol(H^{-1}),
+            # so the factor is APPLIED, not solved against]
+            C = L[1:, 1:]
+            M = W @ G[1:, :].T - q0.unsqueeze(1) * H[1:, 0].unsqueeze(0)
+            W[:, 1:] = (M @ C) @ C.T
+    else:
+        # fallback path: plain RTN on the first column (the sequential loop
+        # below starts at t = 2, so without this the column stays fp32)
+        W[:, 0] = _quant_col(W[:, 0], scale[:, 0], None if zp is None else zp[:, 0], maxq)
 
-        # ── blocked sequential loop, t = 2..N (OPTQ-style diffusion) ──────
-        for i1 in range(1, N, block_size):
-            i2 = min(i1 + block_size, N)
-            W1 = W[:, i1:i2].clone()
-            Q1 = torch.empty_like(W1)
-            Err1 = torch.empty_like(W1)
-            for k in range(i2 - i1):
-                t = i1 + k
-                w = W1[:, k]
-                z = None if zp is None else zp[:, t]
-                q = _quant_col(w, scale[:, t], z, maxq)
-                Q1[:, k] = q
-                e = (w - q) / L[t, t]
-                Err1[:, k] = e
-                losses += (w - q) ** 2 / (L[t, t] ** 2)
-                if k + 1 < i2 - i1:
-                    W1[:, k + 1 :] -= e.unsqueeze(1) * L[t + 1 : i2, t].unsqueeze(0)
-            W[:, i1:i2] = Q1
-            if i2 < N:
-                # lower-triangular L: cross-block entries live in L[i2:, i1:i2]
-                W[:, i2:] -= Err1 @ L[i2:, i1:i2].T
+    # ── blocked sequential loop, t = 2..N (OPTQ-style diffusion) ──────
+    for i1 in range(1, N, block_size):
+        i2 = min(i1 + block_size, N)
+        W1 = W[:, i1:i2].clone()
+        Q1 = torch.empty_like(W1)
+        Err1 = torch.empty_like(W1)
+        for k in range(i2 - i1):
+            t = i1 + k
+            w = W1[:, k]
+            z = None if zp is None else zp[:, t]
+            q = _quant_col(w, scale[:, t], z, maxq)
+            Q1[:, k] = q
+            e = (w - q) / L[t, t]
+            Err1[:, k] = e
+            losses += (w - q) ** 2 / (L[t, t] ** 2)
+            if k + 1 < i2 - i1:
+                W1[:, k + 1 :] -= e.unsqueeze(1) * L[t + 1 : i2, t].unsqueeze(0)
+        W[:, i1:i2] = Q1
+        if i2 < N:
+            # lower-triangular L: cross-block entries live in L[i2:, i1:i2]
+            W[:, i2:] -= Err1 @ L[i2:, i1:i2].T
     return W, losses.sum() / 2
 
 def _sanitise_input(module: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -424,13 +434,24 @@ class QronosQuantizer(BaseQuantizer):
                 break
             except Exception:  # pylint: disable=broad-except
                 lam *= 10.0
+        use_init = True
         if L is None:
             logger.warning(
                 "[Qronos] %s: Hessian inversion failed (damping escalated x1000) - "
-                "falling back to plain RTN ordering",
+                "falling back to plain RTN",
                 getattr(m, "global_name", "?"),
             )
             L = torch.eye(N, dtype=H_p.dtype, device=H_p.device)
+            # the error-correcting init relies on the Cholesky identity
+            # L_{>=2,>=2} L_{>=2,>=2}^T == (H_{>=2,>=2})^{-1}; an identity L
+            # turns the init into a pure Hessian conjugation of the weights,
+            # so it must be skipped entirely for the fallback to be RTN.
+            use_init = False
+        else:
+            # the init's H terms must use the same (dampened) matrix the
+            # Cholesky factor was computed from, or the Lemma G.3 identity
+            # no longer holds after damping escalation.
+            H_p = H_d
 
         # grid from the ORIGINAL (dead-zeroed) weight - identical to RTN
         scale, zp = compute_group_grid(W, bits=bits, group_size=g, sym=sym)
@@ -443,7 +464,7 @@ class QronosQuantizer(BaseQuantizer):
         zp_c = None if zp is None else zp[:, col_group].to(torch.float32)
 
         Q_p, loss = qronos_sequential_quantize(
-            W[:, perm].contiguous(), H_p, G_p, scale_c, zp_c, maxq, cfg.block_size, L=L
+            W[:, perm].contiguous(), H_p, G_p, scale_c, zp_c, maxq, cfg.block_size, L=L, use_init=use_init
         )
         Q = torch.empty_like(W)
         Q[:, perm] = Q_p
