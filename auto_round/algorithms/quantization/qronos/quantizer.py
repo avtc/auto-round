@@ -238,11 +238,17 @@ class QronosQuantizer(BaseQuantizer):
                 if xfp:
                     idx = getattr(module, "_qronos_idx", 0)
                     if idx < len(xfp):
+                        xf = xfp[idx].to(x.device, torch.float32)
                         G = getattr(module, "_qronos_G", None)
                         if G is None:
                             G = torch.zeros(N, N, dtype=torch.float32, device=x.device)
-                        G += x.T @ xfp[idx].to(x.device, torch.float32)
+                        G += x.T @ xf
                         module._qronos_G = G
+                        Hf = getattr(module, "_qronos_Hfp", None)
+                        if Hf is None:
+                            Hf = torch.zeros(N, N, dtype=torch.float32, device=x.device)
+                        Hf += xf.T @ xf
+                        module._qronos_Hfp = Hf
                         module._qronos_idx = idx + 1
 
             return hook
@@ -323,6 +329,7 @@ class QronosQuantizer(BaseQuantizer):
             self._quantize_layer_via_rtn(m, disable_opt_rtn=True)
             return 0.0
         G = getattr(m, "_qronos_G", None)
+        Hfp = getattr(m, "_qronos_Hfp", None)
         if G is not None:
             G = G.to(torch.float32)
             n_pair = getattr(m, "_qronos_idx", 0)
@@ -336,7 +343,36 @@ class QronosQuantizer(BaseQuantizer):
                     n_fp,
                 )
                 G = None
-        else:
+            elif Hfp is not None:
+                Hfp = Hfp.to(torch.float32)
+                # Gate 1 - pairing consistency: a correctly paired sweep yields
+                # G close to H (both approximate the quantized-input Gram); a
+                # pairing-order bug makes them wildly inconsistent.
+                if float(torch.norm(G - H)) / float(torch.norm(H).clamp(min=1e-30)) > 0.5:
+                    logger.warning_once(
+                        "[Qronos] %s: cross-Gram inconsistent with H - dropping G, reducing to OPTQ",
+                        getattr(m, "global_name", "?"),
+                    )
+                    G = None
+
+        if Hfp is not None:
+            Hfp = Hfp.to(torch.float32)
+            # Gate 2 - quantized-sweep divergence: H must stay within a modest
+            # factor of the fp Gram. A finitely diverging bf16 replay inflates
+            # H and G consistently (G-vs-H passes); only the fp reference
+            # exposes it. Runs regardless of Gate 1.
+            ratio = torch.diag(H) / torch.diag(Hfp).clamp(min=1e-30)
+            med = float(ratio.median())
+            if med > 8.0:
+                logger.warning_once(
+                    "[Qronos] %s: quantized-input sweep diverged from fp statistics "
+                    "(median diag ratio %.1f) - using fp statistics (OPTQ mode)",
+                    getattr(m, "global_name", "?"),
+                    med,
+                )
+                H = Hfp.clone()
+                G = None
+        if G is None and Hfp is None:
             n_fp = len(getattr(m, "_qronos_xfp", []) or [])
             if n_fp:
                 logger.warning(
@@ -424,7 +460,7 @@ class QronosQuantizer(BaseQuantizer):
             # the signed sym range into [0, 2^b - 1] for the int packer
             m.zp = int(maxq)
 
-        for attr in ("_qronos_H", "_qronos_G", "_qronos_xfp", "_qronos_idx"):
+        for attr in ("_qronos_H", "_qronos_G", "_qronos_Hfp", "_qronos_xfp", "_qronos_idx"):
             if hasattr(m, attr):
                 delattr(m, attr)
         return loss.item()

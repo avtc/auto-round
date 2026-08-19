@@ -345,3 +345,59 @@ class _ParentOf(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+class TestCrossGramGates:
+    """The first-column + posterior-mean steps consume G globally, so any G/H
+    anomaly (pairing-order bug, finitely diverging bf16 replay) must be caught
+    by the fp-referenced health gates and degrade to OPTQ instead of
+    destroying the layer."""
+
+    def _layer(self, W, bits=4, g=32):
+        import torch.nn as nn
+
+        lin = nn.Linear(W.shape[1], W.shape[0], bias=False)
+        with torch.no_grad():
+            lin.weight.copy_(W)
+        lin.bits, lin.sym, lin.group_size, lin.data_type = bits, False, g, "int"
+        lin.global_name = "test.linear"
+        lin._qronos_xfp = [torch.zeros(1)]
+        lin._qronos_idx = 1
+        return lin
+
+    def test_diverged_and_misaligned_degrade_to_healthy(self):
+        from auto_round.algorithms.quantization.qronos.quantizer import (
+            QronosQuantizer, compute_group_grid,
+        )
+        from auto_round.algorithms.quantization.qronos.config import QronosConfig
+
+        torch.manual_seed(3)
+        n, N, g = 128, 256, 32
+        W = torch.randn(n, N) * 0.02
+        A = torch.randn(2048, N)
+        H_fp = A.T @ A / 2048
+        X2 = A + 0.05 * torch.randn_like(A)
+        Xdiv = A.clone()
+        Xdiv[:100] *= 300.0
+        Xbad = A[torch.randperm(2048)]
+
+        scale, zp = compute_group_grid(W, bits=4, group_size=g, sym=False)
+        sg = scale.unsqueeze(-1).to(torch.float32)
+        zg = zp.unsqueeze(-1).to(torch.float32)
+        rtn = (sg * (torch.clamp(torch.round(W.view(n, N // g, g) / sg + zg), 0, 15.0) - zg)).view(n, N)
+        rel_rtn = float((W - rtn).norm() / W.norm())
+
+        quant = QronosQuantizer(QronosConfig(group_size=g, sym=False, block_size=128, actorder=True))
+        scenarios = {
+            "healthy": (X2.T @ X2 / 2048, X2.T @ A / 2048),
+            "misaligned": (X2.T @ X2 / 2048, Xbad.T @ A / 2048),
+            "diverged": (Xdiv.T @ Xdiv / 2048, Xdiv.T @ A / 2048),
+        }
+        for tag, (H, G) in scenarios.items():
+            lin = self._layer(W)
+            lin._qronos_H = H
+            lin._qronos_G = G
+            lin._qronos_Hfp = H_fp
+            quant._qronos_quantize_layer(lin)
+            rel = float((W - lin.weight.data).norm() / W.norm())
+            assert rel < 2.0 * rel_rtn + 0.02, f"{tag}: rel err {rel:.4f} vs RTN {rel_rtn:.4f}"
