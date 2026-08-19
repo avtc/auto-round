@@ -31,6 +31,7 @@ from auto_round.algorithms.transforms.base import BaseRotation
 from auto_round.algorithms.transforms.block_hadamard.apply import (
     BlockHadamardRotation,
     build_block_rotation,
+    resolve_auto_block_size,
 )
 from auto_round.algorithms.transforms.perq.config import PeRQConfig
 from auto_round.algorithms.transforms.spinquant.rotation_utils import (
@@ -173,8 +174,6 @@ class PeRQRotation(BlockHadamardRotation):
     # ------------------------------------------------------------------
     def apply_to_model(self, model: nn.Module, **kwargs) -> nn.Module:
         cfg = self.config
-        if cfg.block_size < 2:
-            raise ValueError(f"block_size must be >= 2, got {cfg.block_size}")
         if cfg.mass not in ("weight", "none"):
             raise ValueError(f"unknown mass source {cfg.mass!r} (expected 'weight' or 'none')")
 
@@ -183,6 +182,15 @@ class PeRQRotation(BlockHadamardRotation):
         layers = list(iter_transformer_layers(model))
         if not layers:
             raise ValueError("[PeRQ] no decoder layers found - unsupported model structure")
+        if embed is not None and cfg.block_size == 0:
+            cfg.block_size = resolve_auto_block_size(embed.weight.shape[-1])
+            logger.info(
+                "[PeRQ] block_size=0 (auto) resolved to %d for hidden=%d.",
+                cfg.block_size,
+                embed.weight.shape[-1],
+            )
+        if cfg.block_size < 2:
+            raise ValueError(f"block_size must be >= 2, got {cfg.block_size}")
         self._validate(model, layers, embed, lm_head)
         hidden = embed.weight.shape[-1]
 

@@ -189,6 +189,22 @@ def _rand_init(model, seed=0):
 
 
 class TestBlockRotationMatrix:
+    def test_auto_resolution(self):
+        from auto_round.algorithms.transforms.block_hadamard import resolve_auto_block_size
+
+        # largest pow2 divisor STRICTLY below full width (Full is degenerate:
+        # no blocks left for MassDiff to balance, quality collapses)
+        assert resolve_auto_block_size(5120) == 1024
+        assert resolve_auto_block_size(4096) == 2048  # pow2 hidden -> step down once
+        assert resolve_auto_block_size(6144) == 2048
+        assert resolve_auto_block_size(128) == 64
+        # odd x 2 hidden with no valid sub-full pow2 divisor
+        with pytest.raises(ValueError, match="auto block_size"):
+            resolve_auto_block_size(2)
+
+    def test_default_is_auto(self):
+        assert BlockHadamardConfig().block_size == 0
+
     def test_orthogonal_symmetric_deterministic(self):
         r1 = build_block_rotation(BLOCK, seed=7, randomized=True)
         r2 = build_block_rotation(BLOCK, seed=7, randomized=True)
@@ -271,7 +287,7 @@ class TestPlumbing:
         assert "block_hadamard" in BaseRotation._REGISTRY
         cfg = normalize_rotation_config("block_hadamard")
         assert isinstance(cfg, BlockHadamardConfig)
-        assert cfg.block_size == 64
+        assert cfg.block_size == 0
         cfg2 = normalize_rotation_config({"algorithm": "block_hadamard", "block_size": 32})
         assert isinstance(cfg2, BlockHadamardConfig) and cfg2.block_size == 32
         inst = BaseRotation.from_config(cfg)

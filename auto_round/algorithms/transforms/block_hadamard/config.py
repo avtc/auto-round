@@ -57,13 +57,18 @@ class BlockHadamardConfig(BaseRotationConfig):
         block_size: Hadamard block dimension (power of two, or a known
             Hadamard size). The rotation is applied block-diagonally to every
             weight dimension that is a multiple of ``block_size``.
-            Default 64 (PeRQ Table 5 sweet spot).
+            ``0`` (default) = AUTO: the largest power-of-two divisor of the
+            hidden width, strictly below full width (e.g. 1024 for hidden
+            5120, 2048 for hidden 4096). PeRQ Table 5: quality trends upward
+            with block size up to - but NOT including - the degenerate
+            full-width block (no blocks left to balance; quality collapses:
+            L3-8B RTN 10.2 @2048 vs 38.0 @Full).
         seed: seed for the random sign diagonal (reproducibility).
         randomized: use ``D @ H @ D`` (randomized Hadamard, spreads sign
             structure); False uses the plain normalized Hadamard.
     """
 
     algorithm: str = "block_hadamard"
-    block_size: int = 64
+    block_size: int = 0
     seed: int = 42
     randomized: bool = True

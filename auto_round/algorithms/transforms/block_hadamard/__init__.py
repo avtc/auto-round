@@ -34,11 +34,16 @@ from auto_round.algorithms.transforms.block_hadamard.config import (
     BLOCK_HADAMARD_ATTRIBUTION,
     BlockHadamardConfig,
 )
-from auto_round.algorithms.transforms.block_hadamard.apply import BlockHadamardRotation, build_block_rotation
+from auto_round.algorithms.transforms.block_hadamard.apply import (
+    BlockHadamardRotation,
+    build_block_rotation,
+    resolve_auto_block_size,
+)
 
 __all__ = [
     "BLOCK_HADAMARD_ATTRIBUTION",
     "BlockHadamardConfig",
     "BlockHadamardRotation",
     "build_block_rotation",
+    "resolve_auto_block_size",
 ]

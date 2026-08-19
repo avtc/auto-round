@@ -54,7 +54,13 @@ class PeRQConfig(BaseRotationConfig):
     Args:
         algorithm: registry key, always ``"perq"``.
         block_size: Hadamard block dimension; MassDiff balances mass over
-            blocks of this size. Default 64 (PeRQ Table 5 sweet spot).
+            blocks of this size. ``0`` (default) = AUTO: the largest
+            power-of-two divisor of the hidden width, strictly below full
+            width (same rule as BlockHadamardConfig). Evidence (PeRQ Table 5):
+            MassDiff beats no-permute at EVERY block size and quality trends
+            upward with b up to - but NOT including - the degenerate
+            full-width block; manual values in the 256-1024 band are the
+            recommended sweep points on 5120-wide models.
         seed: seed for the randomized Hadamard sign diagonal.
         randomized: use ``D @ H @ D`` per block; False uses plain Hadamard.
         mass: mass-vector source. ``"weight"`` (default, calibration-free)
@@ -63,7 +69,7 @@ class PeRQConfig(BaseRotationConfig):
     """
 
     algorithm: str = "perq"
-    block_size: int = 64
+    block_size: int = 0
     seed: int = 42
     randomized: bool = True
     mass: str = "weight"

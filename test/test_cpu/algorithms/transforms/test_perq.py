@@ -96,13 +96,32 @@ class TestPeRQExactness:
             rot.apply_to_model(bh.MiniModel())
 
 
+class TestPeRQAuto:
+    def test_resolves_below_full_width(self):
+        torch.manual_seed(0)
+        model = bh.MiniModel()
+        bh._rand_init(model)
+        rot = PeRQRotation(PeRQConfig())  # block_size=0 -> auto
+        rot.apply_to_model(model)
+        # mini hidden = 128 (pow2) -> auto steps down once -> 64
+        assert rot.config.block_size == 64
+
+    def test_mass_none_same_auto_rule(self):
+        torch.manual_seed(0)
+        model = bh.MiniModel()
+        bh._rand_init(model)
+        rot = PeRQRotation(PeRQConfig(mass="none"))
+        rot.apply_to_model(model)
+        assert rot.config.block_size == 64
+
+
 class TestPeRQPlumbing:
     def test_registry_and_normalization(self):
         from auto_round.algorithms.transforms import normalize_rotation_config
 
         assert "perq" in BaseRotation._REGISTRY
         cfg = normalize_rotation_config("perq")
-        assert isinstance(cfg, PeRQConfig) and cfg.block_size == 64 and cfg.mass == "weight"
+        assert isinstance(cfg, PeRQConfig) and cfg.block_size == 0 and cfg.mass == "weight"
         cfg2 = normalize_rotation_config({"algorithm": "perq", "block_size": 32, "mass": "none"})
         assert isinstance(cfg2, PeRQConfig) and cfg2.block_size == 32
         inst = BaseRotation.from_config(cfg)

@@ -101,6 +101,36 @@ def build_block_rotation(
     return signs.unsqueeze(1) * H * signs.unsqueeze(0)
 
 
+def resolve_auto_block_size(hidden: int) -> int:
+    """Resolve the AUTO block size (``block_size=0``) for a hidden width.
+
+    Returns the largest power-of-two divisor of *hidden* that is strictly
+    below the full width (5120 -> 1024, 4096 -> 2048, 6144 -> 2048).
+
+    Rationale (PeRQ Table 5, RTN): MassDiff beats no-permute at EVERY block
+    size and quality trends upward with b - up to, but NOT including, the
+    degenerate full-width block, where the permutation has no blocks left to
+    balance and quality collapses (L3-8B: 10.2 @2048 vs 38.0 @Full; the
+    no-permute control shows the same cliff). AUTO therefore never resolves
+    to the full width even when the hidden width is a power of two.
+
+    Raises:
+        ValueError: for hidden widths with no power-of-two divisor >= 2
+            below full width; the caller must then choose a manual block size
+            (any known Hadamard size dividing the width works).
+    """
+    auto = hidden & (-hidden)  # lowest set bit = largest pow2 divisor
+    if auto == hidden:  # hidden itself is a power of two -> step down once
+        auto = hidden // 2
+    if auto < 2:
+        raise ValueError(
+            f"auto block_size resolution failed for hidden={hidden}: no power-of-two "
+            "divisor >= 2 below the full width. Set block_size explicitly (any known "
+            "Hadamard size dividing the hidden width works, e.g. 64/128/256)."
+        )
+    return auto
+
+
 @BaseRotation.register("block_hadamard")
 class BlockHadamardRotation(BaseRotation):
     """Block-Hadamard rotation registered under ``"block_hadamard"``.
@@ -375,14 +405,21 @@ class BlockHadamardRotation(BaseRotation):
     # ------------------------------------------------------------------
     def apply_to_model(self, model: nn.Module, **kwargs) -> nn.Module:
         cfg = self.config
-        if cfg.block_size < 2:
-            raise ValueError(f"block_size must be >= 2, got {cfg.block_size}")
 
         embed = self._get_embed(model)
         lm_head = self._get_lm_head(model)
         layers = list(iter_transformer_layers(model))
         if not layers:
             raise ValueError("[BlockHadamard] no decoder layers found - unsupported model structure")
+        if embed is not None and cfg.block_size == 0:
+            cfg.block_size = resolve_auto_block_size(embed.weight.shape[-1])
+            logger.info(
+                "[BlockHadamard] block_size=0 (auto) resolved to %d for hidden=%d.",
+                cfg.block_size,
+                embed.weight.shape[-1],
+            )
+        if cfg.block_size < 2:
+            raise ValueError(f"block_size must be >= 2, got {cfg.block_size}")
         self._validate(model, layers, embed, lm_head)
 
         R = build_block_rotation(cfg.block_size, seed=cfg.seed, randomized=cfg.randomized)
