@@ -23,7 +23,7 @@ class RTNConfig(QuantizationConfig):
         self,
         *,
         disable_opt_rtn: bool = None,
-        asym_search: bool = None,
+        asym_search: str = "auto",
         **kwargs,
     ) -> None:
         """Initialize an RTN configuration.
@@ -32,24 +32,25 @@ class RTNConfig(QuantizationConfig):
             disable_opt_rtn: Whether to disable the optimized RTN path.
                 ``None`` keeps the default heuristic, True forces plain
                 RTN, and False forces the optimized implementation.
-            asym_search: Explicit control over the asymmetric joint
-                (scale, integer zero-point) search (NeUQI, arXiv 2505.17595)
-                used by the optimized-RTN path when ``sym=False``:
+            asym_search: How the per-group scale and integer zero point are
+                initialized on the asymmetric zero-shot optimized-RTN path:
 
-                * ``None`` (default) - auto: engage whenever the optimized
-                  path runs (``disable_opt_rtn`` False, ``iters == 0``).
-                * ``True`` - force it; raises ``ValueError`` at construction
-                  when the config cannot engage it (``sym=True`` or explicit
-                  ``disable_opt_rtn=True``). Engagement additionally requires
-                  the zero-shot pipeline (``iters == 0``), which is inherent
-                  to the optimized-RTN dispatch.
-                * ``False`` - plain min/max asymmetric quantization even on
-                  the optimized path (per-config equivalent of
-                  ``AR_DISABLE_NEUQI=1``).
+                * ``"auto"`` (default): use the best available initializer -
+                  the joint (scale, zero-point) search (NeUQI) when the
+                  optimized path runs, plain min/max otherwise.
+                * ``"neuqi"``: force the joint (scale, integer zero-point)
+                  search (arXiv 2505.17595). Requires ``sym=False`` and the
+                  optimized path (``disable_opt_rtn`` not forced True).
+                * ``"minmax"``: plain min/max initialization even on the
+                  optimized path.
 
-                The symmetric path (``sym=True``) is never affected. The
-                ``AR_DISABLE_NEUQI`` env var still wins as a kill-switch.
-                Grid sizes are tunable via ``AR_NEUQI_COARSE``/``AR_NEUQI_FINE``.
+                Scope: asymmetric zero-shot RTN only. Other quantizers
+                (SignRound at ``iters > 0``, Qronos, AWQ) perform their own
+                parameter search and ignore this field; the symmetric path
+                uses its own scale grid search. The ``AR_DISABLE_NEUQI``
+                environment variable overrides any setting globally; the
+                search grid sizes are tunable via ``AR_NEUQI_COARSE`` and
+                ``AR_NEUQI_FINE``.
             **kwargs: Common quantization arguments forwarded to
                 QuantizationConfig, such as bits, group_size, sym,
                 data_type, and activation quantization fields.
@@ -73,17 +74,21 @@ class RTNConfig(QuantizationConfig):
             disable_opt_rtn = False
         self.disable_opt_rtn = disable_opt_rtn
 
-        if asym_search is True:
-            if self.sym:
-                raise ValueError(
-                    "asym_search=True requires sym=False: the joint (scale, zero-point) search is an "
-                    "asymmetric-path algorithm; the symmetric path keeps its own grid search."
-                )
-            if disable_opt_rtn:
-                raise ValueError(
-                    "asym_search=True requires the optimized-RTN path: it replaces the plain min/max "
-                    "initialization of that path. Set disable_opt_rtn=False (or leave it unset)."
-                )
+        valid_asym_search = ("auto", "neuqi", "minmax")
+        if asym_search not in valid_asym_search:
+            raise ValueError(
+                f"asym_search={asym_search!r} is not one of {valid_asym_search}."
+            )
+        if asym_search != "auto" and self.sym:
+            raise ValueError(
+                f"asym_search={asym_search!r} applies to the asymmetric path only (sym=False); the "
+                "symmetric path uses its own scale grid search."
+            )
+        if asym_search == "neuqi" and disable_opt_rtn:
+            raise ValueError(
+                'asym_search="neuqi" requires the optimized-RTN path: it replaces the plain min/max '
+                "initialization of that path. Set disable_opt_rtn=False (or leave it unset)."
+            )
         self.asym_search = asym_search
 
 
