@@ -65,7 +65,15 @@ class PeRQConfig(BaseRotationConfig):
         randomized: use ``D @ H @ D`` per block; False uses plain Hadamard.
         mass: mass-vector source. ``"weight"`` (default, calibration-free)
             aggregates per-column weight magnitudes of all stream consumers;
+            ``"acts"`` uses activation statistics from an autoround imatrix
+            dump file (see *imatrix_path*; the paper's regime - per-channel
+            RMS|x| aggregated over every hidden-stream consumer);
             ``"none"`` disables the permutation (block-Hadamard only).
+        imatrix_path: path to an imatrix dump produced by ``dump_imatrix.py``
+            (``{"imatrix": {module_name: E[x^2] per input channel}, ...}``).
+            Required when ``mass="acts"``; module names are matched by exact
+            name or unique suffix, so VLM-wrapped names (``language_model.``
+            nesting) resolve against canonical dump keys.
     """
 
     algorithm: str = "perq"
@@ -73,3 +81,4 @@ class PeRQConfig(BaseRotationConfig):
     seed: int = 42
     randomized: bool = True
     mass: str = "weight"
+    imatrix_path: str = None

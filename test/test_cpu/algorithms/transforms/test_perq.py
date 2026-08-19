@@ -28,7 +28,6 @@ from auto_round.algorithms.transforms.perq import (
     PeRQRotation,
     massdiff_permutation,
 )
-
 HIDDEN = bh.HIDDEN
 BLOCK = 64
 VOCAB = bh.VOCAB
@@ -92,8 +91,77 @@ class TestPeRQExactness:
 
     def test_unknown_mass_source(self):
         rot = PeRQRotation(PeRQConfig(mass="acts"))
-        with pytest.raises(ValueError, match="mass source"):
+        with pytest.raises(ValueError, match="imatrix_path"):
             rot.apply_to_model(bh.MiniModel())
+
+
+class Wrapper(torch.nn.Module):
+    """VLM-style wrapper: renames the backbone with a language_model. prefix."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.language_model = inner
+
+    def forward(self, ids):
+        return self.language_model(ids)
+
+
+class TestPeRQActsMass:
+    def _make_dump(self, model, tmp_path, drop=0, gen=None):
+        gen = gen or torch.Generator().manual_seed(11)
+        stats = {}
+        names = [n for n, _ in model.named_modules()]
+        for n in names:
+            stats[n] = torch.rand(HIDDEN, generator=gen) + 0.1
+        if drop:
+            stats = dict(list(stats.items())[: len(stats) - drop])
+        path = str(tmp_path / "imatrix.pt")
+        torch.save({"imatrix": stats, "counts": {}, "meta": {}}, path)
+        return path
+
+    def test_acts_exactness_and_matching(self, tmp_path):
+        torch.manual_seed(0)
+        model = bh.MiniModel()
+        bh._rand_init(model)
+        model.eval()
+        # dump uses CANONICAL names (model.layers...) while the wrapped model
+        # exposes language_model.model.layers... - suffix matching must resolve
+        wrapped = Wrapper(model)
+        dump = self._make_dump(model, tmp_path)
+        ids = torch.randint(0, VOCAB, (2, 16))
+        with torch.no_grad():
+            before = wrapped(ids)
+        rot = PeRQRotation(PeRQConfig(block_size=64, mass="acts", imatrix_path=dump))
+        rot.apply_to_model(wrapped)
+        with torch.no_grad():
+            after = wrapped(ids)
+        torch.testing.assert_close(before, after, atol=2e-4, rtol=2e-4)
+
+    def test_partial_coverage_warns(self, tmp_path):
+        torch.manual_seed(0)
+        model = bh.MiniModel()
+        bh._rand_init(model)
+        dump = self._make_dump(model, tmp_path, drop=3)
+        rot = PeRQRotation(PeRQConfig(block_size=64, mass="acts", imatrix_path=dump))
+        rot.apply_to_model(model)  # warns, still works
+
+    def test_missing_path(self):
+        rot = PeRQRotation(PeRQConfig(mass="acts"))
+        with pytest.raises(ValueError, match="imatrix_path"):
+            rot.apply_to_model(bh.MiniModel())
+        rot2 = PeRQRotation(PeRQConfig(mass="acts", imatrix_path="nope.pt"))
+        with pytest.raises(FileNotFoundError):
+            rot2.apply_to_model(bh.MiniModel())
+
+    def test_no_match_raises(self, tmp_path):
+        torch.manual_seed(0)
+        model = bh.MiniModel()
+        bh._rand_init(model)
+        path = str(tmp_path / "empty.pt")
+        torch.save({"imatrix": {"unrelated.module": torch.rand(HIDDEN)}}, path)
+        rot = PeRQRotation(PeRQConfig(mass="acts", imatrix_path=path))
+        with pytest.raises(ValueError, match="no stream consumers matched"):
+            rot.apply_to_model(model)
 
 
 class TestPeRQAuto:

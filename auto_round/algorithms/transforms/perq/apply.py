@@ -169,13 +169,83 @@ class PeRQRotation(BlockHadamardRotation):
             raise ValueError("[PeRQ] no stream consumers found for the weight mass proxy")
         return acc.sqrt()
 
+    def _mass_acts(self, model, layers, lm_head) -> torch.Tensor:
+        """Per-channel mass from activation statistics in an imatrix dump.
+
+        Loads ``{"imatrix": {module_name: E[x^2] per input channel}}`` (as
+        produced by ``dump_imatrix.py``) and aggregates the per-channel RMS
+        ``sqrt(E[x^2])`` over every hidden-stream consumer found in the dump.
+        All consumers observe the same (norm-scaled) residual stream, so the
+        aggregate is a sound global mass vector. Module names are matched by
+        exact name or unique suffix (VLM wrappers rename the backbone with a
+        ``language_model.`` prefix that canonical dump keys lack).
+        """
+        import os
+
+        cfg = self.config
+        if not cfg.imatrix_path:
+            raise ValueError('[PeRQ] mass="acts" requires imatrix_path pointing at an imatrix dump')
+        if not os.path.isfile(cfg.imatrix_path):
+            raise FileNotFoundError(f"[PeRQ] imatrix dump not found: {cfg.imatrix_path}")
+        payload = torch.load(cfg.imatrix_path, map_location="cpu")
+        stats = payload.get("imatrix", payload) if isinstance(payload, dict) else None
+        if not isinstance(stats, dict) or not stats:
+            raise ValueError(f"[PeRQ] {cfg.imatrix_path} does not contain an imatrix dict")
+
+        names = {id(mod): name for name, mod in model.named_modules()}
+        keys = list(stats.keys())
+
+        def match(name: str):
+            if name and name in stats:
+                return name
+            cands = [k for k in keys if k and name and (name.endswith(k) or k.endswith(name))]
+            if len(cands) == 1:
+                return cands[0]
+            return None  # missing or ambiguous
+
+        acc = None
+        n_found, n_missing = 0, 0
+        seen = set()
+        for proj in self._collect_consumer_columns(layers, lm_head):
+            if id(proj) in seen:
+                continue
+            seen.add(id(proj))
+            key = match(names.get(id(proj), ""))
+            if key is None:
+                n_missing += 1
+                continue
+            vec = stats[key]
+            if isinstance(vec, (tuple, list)) and len(vec) == 2:  # (sums, counts) fallback
+                sums, cnt = vec
+                vec = sums / cnt.clamp(min=1)
+            vec = vec.to(torch.float64)
+            if acc is None:
+                acc = vec.clamp(min=0).sqrt()
+            else:
+                acc = acc + vec.clamp(min=0).sqrt()
+            n_found += 1
+        if n_found == 0:
+            raise ValueError(
+                f"[PeRQ] no stream consumers matched the imatrix dump "
+                f"({cfg.imatrix_path}); check module naming"
+            )
+        if n_missing:
+            logger.warning(
+                "[PeRQ] %d/%d stream consumers missing from the imatrix dump "
+                "(aggregated from the remaining %d).",
+                n_missing,
+                n_found + n_missing,
+                n_found,
+            )
+        return acc / n_found
+
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
     def apply_to_model(self, model: nn.Module, **kwargs) -> nn.Module:
         cfg = self.config
-        if cfg.mass not in ("weight", "none"):
-            raise ValueError(f"unknown mass source {cfg.mass!r} (expected 'weight' or 'none')")
+        if cfg.mass not in ("weight", "none", "acts"):
+            raise ValueError(f"unknown mass source {cfg.mass!r} (expected 'weight', 'acts' or 'none')")
 
         embed = self._get_embed(model)
         lm_head = self._get_lm_head(model)
@@ -196,12 +266,16 @@ class PeRQRotation(BlockHadamardRotation):
 
         perm: Optional[List[int]] = None
         if cfg.mass != "none":
-            mass = self._mass_weight_proxy(layers, lm_head)
+            if cfg.mass == "acts":
+                mass = self._mass_acts(model, layers, lm_head)
+            else:
+                mass = self._mass_weight_proxy(layers, lm_head)
             perm = massdiff_permutation(mass, cfg.block_size)
             block_masses = mass.to(torch.float64)[torch.tensor(perm)].reshape(-1, cfg.block_size).sum(dim=1)
             logger.info(
-                "[PeRQ] MassDiff permutation from weight statistics: %d channels / %d blocks, "
+                "[PeRQ] MassDiff permutation from %s statistics: %d channels / %d blocks, "
                 "block l1 mass min/mean/max = %.4f/%.4f/%.4f (balance ratio %.3f).",
+                "activation" if cfg.mass == "acts" else "weight",
                 hidden,
                 hidden // cfg.block_size,
                 block_masses.min().item(),

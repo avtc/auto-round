@@ -172,18 +172,43 @@ class BlockHadamardRotation(BaseRotation):
         return None
 
     @classmethod
+    def _resolve_by_suffix(cls, model: nn.Module, last_segment: str, check) -> Optional[nn.Module]:
+        """Resolve a module by its LAST name segment (nesting-agnostic).
+
+        Handles arbitrary VLM/MTP wrappers whose fixed path layouts differ
+        (e.g. ``language_model.model.embed_tokens``). Candidates are ranked
+        by name depth (shallowest first) for determinism.
+        """
+        cands = [
+            (name.count("."), name, mod)
+            for name, mod in model.named_modules()
+            if name.split(".")[-1] == last_segment and check(mod)
+        ]
+        if not cands:
+            return None
+        cands.sort(key=lambda t: (t[0], t[1]))
+        return cands[0][2]
+
+    @classmethod
     def _get_embed(cls, model) -> Optional[nn.Embedding]:
         mod = cls._resolve(model, _EMBED_PATHS)
-        return mod if isinstance(mod, nn.Embedding) else None
+        if mod is None or not isinstance(mod, nn.Embedding):
+            mod = cls._resolve_by_suffix(model, "embed_tokens", lambda m: isinstance(m, nn.Embedding))
+        return mod
 
     @classmethod
     def _get_lm_head(cls, model) -> Optional[nn.Linear]:
         mod = cls._resolve(model, _HEAD_PATHS)
-        return mod if isinstance(mod, nn.Linear) else None
+        if mod is None or not isinstance(mod, nn.Linear):
+            mod = cls._resolve_by_suffix(model, "lm_head", lambda m: isinstance(m, nn.Linear))
+        return mod
 
     @classmethod
     def _get_final_norm(cls, model) -> Optional[nn.Module]:
-        return cls._resolve(model, _FINAL_NORM_PATHS)
+        mod = cls._resolve(model, _FINAL_NORM_PATHS)
+        if mod is None:
+            mod = cls._resolve_by_suffix(model, "norm", lambda m: hasattr(m, "weight") and not isinstance(m, nn.Linear))
+        return mod
 
     # ------------------------------------------------------------------
     # Validation
