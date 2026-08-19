@@ -32,7 +32,6 @@ experts, routers), embedding, and lm_head.
 
 from __future__ import annotations
 
-import logging
 import math
 from typing import Optional
 
@@ -55,7 +54,7 @@ from auto_round.algorithms.transforms.spinquant.rotation_utils import (
     rotate_out_channels_,
 )
 
-logger = logging.getLogger(__name__)
+from auto_round.logger import logger
 
 _HEAD_PATHS = ("lm_head", "model.lm_head", "model.language_model.lm_head", "language_model.lm_head")
 _EMBED_PATHS = (

@@ -36,7 +36,6 @@ Not ported from the paper (by design):
 
 from __future__ import annotations
 
-import logging
 
 import torch
 import torch.nn as nn
@@ -45,7 +44,7 @@ from auto_round.algorithms.transforms.base import BaseRotation
 from auto_round.algorithms.transforms.cafeq.config import CafeQConfig
 from auto_round.algorithms.transforms.spinquant.rotation_utils import iter_transformer_layers
 
-logger = logging.getLogger(__name__)
+from auto_round.logger import logger
 
 
 def _random_orthogonal(dim: int, generator: torch.Generator) -> torch.Tensor:

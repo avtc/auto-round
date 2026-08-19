@@ -21,7 +21,6 @@ only the mass vector and the permutation stage are PeRQ-specific.
 
 from __future__ import annotations
 
-import logging
 from typing import List, Optional
 
 import torch
@@ -43,7 +42,7 @@ from auto_round.algorithms.transforms.spinquant.rotation_utils import (
     iter_transformer_layers,
 )
 
-logger = logging.getLogger(__name__)
+from auto_round.logger import logger
 
 
 def massdiff_permutation(mass: torch.Tensor, block_size: int) -> List[int]:
