@@ -39,16 +39,28 @@ fixes ``z = 0``).
 """
 
 import math
+from functools import lru_cache
 
 import torch
 
 from auto_round import envs
 from auto_round.data_type.register import register_dtype
 from auto_round.data_type.utils import reshape_pad_tensor_by_group_size, revert_tensor_by_pad, round_ste
+from auto_round.logger import logger
 
 # Upper bound on the number of elements of the temporary [chunk, group, zero_point]
 # loss tensor, used to cap peak memory regardless of the input size.
 _MAX_TMP_ELEMS = 2**25
+
+
+@lru_cache(maxsize=1)
+def _log_search_engaged(coarse_n: int, fine_n: int) -> None:
+    logger.info("[NeUQI] joint (scale, zero-point) search active (coarse=%d, fine=%d)", coarse_n, fine_n)
+
+
+@lru_cache(maxsize=1)
+def _log_disabled() -> None:
+    logger.info("[NeUQI] disabled via AR_DISABLE_NEUQI; using plain min/max asym quantization")
 
 
 def _best_zp_for_scale(data, qw, scale, maxq):
@@ -127,6 +139,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
         coarse_n = envs.AR_NEUQI_COARSE if envs.AR_NEUQI_COARSE else 64
     if fine_n is None:
         fine_n = envs.AR_NEUQI_FINE if envs.AR_NEUQI_FINE else 32
+    _log_search_engaged(coarse_n, fine_n)
 
     maxq = int(2**bits) - 1
     data = data.to(torch.float32)
@@ -205,6 +218,7 @@ def quant_tensor_opt_rtn_asym(
     from auto_round.data_type.int import quant_tensor_asym
 
     if envs.AR_DISABLE_NEUQI:
+        _log_disabled()
         return quant_tensor_asym(
             tensor, bits=bits, group_size=group_size, v=v, q_scale_thresh=q_scale_thresh, **kwargs
         )
@@ -229,3 +243,6 @@ def quant_tensor_opt_rtn_asym(
     qdq_result = (scale * (q - zp)).to(tensor.dtype)
     qdq_result = revert_tensor_by_pad(qdq_result, orig_shape=orig_shape, pad_len=pad_len)
     return qdq_result, scale, zp
+
+
+logger.info("[NeUQI] opt_rtn_int_asym registered (clean-room, arXiv 2505.17595; AR_DISABLE_NEUQI=%s)", bool(envs.AR_DISABLE_NEUQI))

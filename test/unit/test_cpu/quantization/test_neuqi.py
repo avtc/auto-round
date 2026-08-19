@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+
 import pytest
 import torch
 
 from auto_round.data_type.int import quant_tensor_asym
-from auto_round.data_type.neuqi import neuqi_search_scale_zero, quant_tensor_opt_rtn_asym
+from auto_round.data_type.neuqi import _log_search_engaged, neuqi_search_scale_zero, quant_tensor_opt_rtn_asym
 from auto_round.data_type.register import QUANT_FUNC_WITH_DTYPE
 from auto_round.data_type.utils import get_quant_func
 
@@ -118,6 +120,45 @@ class TestNeuqiSearch:
             tensor = torch.randn(*shape, generator=gen)
             qdq, scale, zp = quant_tensor_opt_rtn_asym(tensor.clone(), bits=4, group_size=32)
             assert qdq.shape == tensor.shape
+
+
+class _LogCapture(logging.Handler):
+    records: list
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record.getMessage())
+
+
+class TestNeuqiLogging:
+    def test_engaged_log_line(self):
+        _log_search_engaged.cache_clear()
+        cap = _LogCapture()
+        ar_logger = logging.getLogger("autoround")
+        ar_logger.addHandler(cap)
+        try:
+            quant_tensor_opt_rtn_asym(_heavy_tailed_data(n_groups=4).clone(), bits=4, group_size=128)
+        finally:
+            ar_logger.removeHandler(cap)
+        assert any("[NeUQI]" in m and "search active" in m for m in cap.records)
+
+    def test_disabled_log_line(self, monkeypatch):
+        from auto_round.data_type.neuqi import _log_disabled
+
+        monkeypatch.setenv("AR_DISABLE_NEUQI", "1")
+        _log_disabled.cache_clear()
+        cap = _LogCapture()
+        ar_logger = logging.getLogger("autoround")
+        ar_logger.addHandler(cap)
+        try:
+            quant_tensor_opt_rtn_asym(_heavy_tailed_data(n_groups=4).clone(), bits=4, group_size=128)
+        finally:
+            ar_logger.removeHandler(cap)
+        assert any("[NeUQI]" in m and "disabled" in m for m in cap.records)
+        monkeypatch.delenv("AR_DISABLE_NEUQI")
 
 
 class TestNeuqiIntegration:
