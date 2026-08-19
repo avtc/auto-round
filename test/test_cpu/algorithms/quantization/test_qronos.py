@@ -272,8 +272,9 @@ class TestQronosPipeline:
 
 
 class TestHessianRobustness:
-    """Server incident 2026-08-19: bf16 quantized-input replay produced inf/huge
-    activations that poisoned H = X^T X (cholesky failures, 1e11-1e13 proxies)."""
+    """Statistics collection must survive non-finite replay activations and
+    poisoned Hessians (diverging bf16 quantized-prefix replay, exploding input
+    channels) without corrupting the weights."""
 
     def _mk_linear(self, n=8, N=32):
         import torch.nn as nn

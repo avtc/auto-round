@@ -158,10 +158,10 @@ def _sanitise_input(module: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
 
     The quantized-input sweep replays calibration data through the already
     quantized prefix; on chaotic architectures (hybrid linear-attention) some
-    blocks diverge to inf/nan in bf16. Accumulating ``x.T @ x`` on such inputs
-    poisons the Hessian (observed 2026-08-19: cholesky failures across ~1/3 of
-    blocks, trace-loss proxies 1e11-1e13 vs ~5e4 on healthy blocks). Dropping
-    only the non-finite entries keeps the remaining tokens of the sample.
+    blocks may diverge to inf/nan in bf16. Accumulating ``x.T @ x`` on such
+    inputs poisons the Hessian and, through the error-compensation math,
+    destroys the affected weights. Dropping only the non-finite entries keeps
+    the remaining tokens of the sample.
     """
     if torch.isfinite(x).all():
         return x

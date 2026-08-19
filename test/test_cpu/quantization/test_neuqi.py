@@ -203,33 +203,33 @@ class TestNeuqiIntegration:
 
 
 class TestAsymSearchAPI:
-    """Explicit RTNConfig(asym_search) control over the NeUQI joint search."""
+    """RTNConfig(asym_search) enum: auto | neuqi | minmax (asym path only)."""
 
     def test_default_auto_resolves_neuqi(self):
         func, name = get_quant_func("int", 4, False, disable_opt_rtn=False, group_size=None, iters=0)
         assert name == "opt_rtn_int_asym"
 
-    def test_off_resolves_plain_asym(self):
+    def test_minmax_resolves_plain_asym(self):
         from auto_round.data_type.int import quant_tensor_asym as plain_asym
 
         func, name = get_quant_func(
-            "int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search=False
+            "int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search="minmax"
         )
         assert "opt_rtn" not in name
         assert name.endswith("_asym")
         assert func is plain_asym
 
-    def test_off_does_not_touch_sym_path(self):
+    def test_minmax_does_not_touch_sym_path(self):
         _, sym_name = get_quant_func(
-            "int", 4, True, disable_opt_rtn=False, group_size=None, iters=0, asym_search=False
+            "int", 4, True, disable_opt_rtn=False, group_size=None, iters=0, asym_search="minmax"
         )
         assert sym_name == "opt_rtn_int_sym"
 
-    def test_off_output_matches_plain_quant(self):
+    def test_minmax_output_matches_plain_quant(self):
         torch.manual_seed(7)
         data = _heavy_tailed_data(n_groups=8, group_size=64, seed=7)
         func, _ = get_quant_func(
-            "int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search=False
+            "int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search="minmax"
         )
         from auto_round.data_type.int import quant_tensor_asym
 
@@ -239,26 +239,34 @@ class TestAsymSearchAPI:
         torch.testing.assert_close(actual[1], expected[1])
         torch.testing.assert_close(actual[2], expected[2])
 
-    def test_force_true_accepted_when_engageable(self):
+    def test_force_neuqi_accepted_when_engageable(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
-        cfg = RTNConfig(bits=4, group_size=32, sym=False, disable_opt_rtn=False, asym_search=True)
-        assert cfg.asym_search is True
+        cfg = RTNConfig(bits=4, group_size=32, sym=False, disable_opt_rtn=False, asym_search="neuqi")
+        assert cfg.asym_search == "neuqi"
 
-    def test_force_true_with_sym_raises(self):
+    def test_non_auto_with_sym_raises(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
-        with pytest.raises(ValueError, match="asym_search=True requires sym=False"):
-            RTNConfig(bits=4, group_size=32, sym=True, disable_opt_rtn=False, asym_search=True)
+        with pytest.raises(ValueError, match="asymmetric path only"):
+            RTNConfig(bits=4, group_size=32, sym=True, disable_opt_rtn=False, asym_search="neuqi")
+        with pytest.raises(ValueError, match="asymmetric path only"):
+            RTNConfig(bits=4, group_size=32, sym=True, disable_opt_rtn=False, asym_search="minmax")
 
-    def test_force_true_with_opt_rtn_disabled_raises(self):
+    def test_neuqi_with_opt_rtn_disabled_raises(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
-        with pytest.raises(ValueError, match="asym_search=True requires the optimized-RTN path"):
-            RTNConfig(bits=4, group_size=32, sym=False, disable_opt_rtn=True, asym_search=True)
+        with pytest.raises(ValueError, match='asym_search="neuqi" requires the optimized-RTN path'):
+            RTNConfig(bits=4, group_size=32, sym=False, disable_opt_rtn=True, asym_search="neuqi")
 
-    def test_default_is_none(self):
+    def test_unknown_value_raises(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        with pytest.raises(ValueError, match="not one of"):
+            RTNConfig(bits=4, group_size=32, sym=False, asym_search="grid")
+
+    def test_default_is_auto(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
         cfg = RTNConfig(bits=4, group_size=32, sym=False)
-        assert cfg.asym_search is None
+        assert cfg.asym_search == "auto"

@@ -84,7 +84,7 @@ class WrapperLinear(torch.nn.Module):
         enable_round_tuning=True,
         enable_torch_compile=False,
         disable_opt_rtn=True,
-        asym_search=None,
+        asym_search="auto",
         **kwargs,
     ):
         """Initializes the WrapperLinear module.
