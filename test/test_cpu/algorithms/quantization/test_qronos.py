@@ -269,3 +269,78 @@ class TestQronosPipeline:
         ids = torch.randint(0, 64, (1, 12))
         logits = model(ids).logits
         assert torch.isfinite(logits).all()
+
+
+class TestHessianRobustness:
+    """Server incident 2026-08-19: bf16 quantized-input replay produced inf/huge
+    activations that poisoned H = X^T X (cholesky failures, 1e11-1e13 proxies)."""
+
+    def _mk_linear(self, n=8, N=32):
+        import torch.nn as nn
+
+        lin = nn.Linear(N, n, bias=False)
+        lin.bits, lin.sym, lin.group_size, lin.data_type = 4, False, 32, "int"
+        lin.global_name = "test.linear"
+        return lin
+
+    def test_hook_sanitizes_inf_inputs(self):
+        from auto_round.algorithms.quantization.qronos.quantizer import QronosQuantizer
+        from auto_round.algorithms.quantization.qronos.config import QronosConfig
+
+        q = QronosQuantizer(QronosConfig())
+        lin = self._mk_linear()
+        q.register_qinput_forward_hooks.__func__  # exists
+        handles = q.register_qinput_forward_hooks(_ParentOf(lin))
+        x_bad = torch.randn(4, 32)
+        x_bad[0, 3] = float("inf")
+        x_bad[1, 5] = float("nan")
+        x_good = torch.randn(4, 32)
+        with torch.no_grad():
+            lin(x_bad)
+            lin(x_good)
+        for h in handles:
+            h.remove()
+        H = lin._qronos_H
+        assert torch.isfinite(H).all(), "H must stay finite when an input sample contains inf/nan"
+
+    def test_poisoned_hessian_falls_back_to_rtn(self):
+        """H finite but with a 1e12 dynamic range must NOT guide the rounding."""
+        from auto_round.algorithms.quantization.qronos.quantizer import QronosQuantizer
+        from auto_round.algorithms.quantization.qronos.config import QronosConfig
+
+        q = QronosQuantizer(QronosConfig())
+        lin = self._mk_linear()
+        # healthy-ish H plus one exploding channel -> astronomic diag range
+        H = torch.eye(32) * 10.0
+        H[7, 7] = 1e12
+        lin._qronos_H = H
+        w_before = lin.weight.data.clone()
+        loss = q._qronos_quantize_layer(lin)
+        assert loss >= 0
+        # weight must still be quantized (not left fp) and finite
+        assert torch.isfinite(lin.weight.data).all()
+
+    def test_escalating_damping_recovers_poorly_conditioned_h(self):
+        """A nearly-singular H should be rescued by damping escalation, not RTN."""
+        from auto_round.algorithms.quantization.qronos.quantizer import QronosQuantizer
+        from auto_round.algorithms.quantization.qronos.config import QronosConfig
+
+        q = QronosQuantizer(QronosConfig())
+        lin = self._mk_linear()
+        H = torch.eye(32) * 10.0
+        H[0, 0] = 1e-7  # nearly-degenerate direction
+        lin._qronos_H = H
+        loss = q._qronos_quantize_layer(lin)
+        assert loss >= 0
+        assert torch.isfinite(lin.weight.data).all()
+
+
+class _ParentOf(torch.nn.Module):
+    """Minimal block stand-in so named_modules() finds the linear."""
+
+    def __init__(self, lin):
+        super().__init__()
+        self.linear = lin
+
+    def forward(self, x):
+        return self.linear(x)

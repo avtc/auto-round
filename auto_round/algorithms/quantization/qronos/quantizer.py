@@ -153,6 +153,31 @@ def qronos_sequential_quantize(
                 W[:, i2:] -= Err1 @ L[i2:, i1:i2].T
     return W, losses.sum() / 2
 
+def _sanitise_input(module: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Zero out non-finite activations so a diverging bf16 replay cannot poison H/G.
+
+    The quantized-input sweep replays calibration data through the already
+    quantized prefix; on chaotic architectures (hybrid linear-attention) some
+    blocks diverge to inf/nan in bf16. Accumulating ``x.T @ x`` on such inputs
+    poisons the Hessian (observed 2026-08-19: cholesky failures across ~1/3 of
+    blocks, trace-loss proxies 1e11-1e13 vs ~5e4 on healthy blocks). Dropping
+    only the non-finite entries keeps the remaining tokens of the sample.
+    """
+    if torch.isfinite(x).all():
+        return x
+    n_bad = int((~torch.isfinite(x)).sum())
+    logger.warning_once(
+        "[Qronos] %s: %d non-finite input entries zeroed before statistics accumulation "
+        "(diverging bf16 replay); the affected tokens no longer contribute to H/G.",
+        getattr(module, "global_name", type(module).__name__),
+        n_bad,
+    )
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+_POISONED_DIAG_SPREAD = 1e12
+
+
 @register_pipeline_member(QronosConfig)
 class QronosQuantizer(BaseQuantizer):
     """Data-driven sequential Hessian rounding with cross-layer correction."""
@@ -182,7 +207,8 @@ class QronosQuantizer(BaseQuantizer):
         def make_hook():
             def hook(module, args, output):
                 x = self._extract_input(args).detach()
-                x = x.reshape(-1, x.shape[-1])
+                x = x.reshape(-1, x.shape[-1]).to(torch.float32)
+                x = _sanitise_input(module, x)
                 if not hasattr(module, "_qronos_xfp"):
                     module._qronos_xfp = []
                 module._qronos_xfp.append(x.to("cpu"))
@@ -201,6 +227,7 @@ class QronosQuantizer(BaseQuantizer):
             def hook(module, args, output):
                 x = self._extract_input(args).detach().to(torch.float32)
                 x = x.reshape(-1, x.shape[-1])
+                x = _sanitise_input(module, x)
                 N = x.shape[1]
                 H = getattr(module, "_qronos_H", None)
                 if H is None:
@@ -277,6 +304,24 @@ class QronosQuantizer(BaseQuantizer):
     def _qronos_quantize_layer(self, m: torch.nn.Module) -> float:
         cfg = self.config
         H = m._qronos_H.to(torch.float32)
+        if not torch.isfinite(H).all():
+            logger.warning_once(
+                "[Qronos] %s: Hessian contains non-finite entries - falling back to RTN",
+                getattr(m, "global_name", "?"),
+            )
+            self._quantize_layer_via_rtn(m, disable_opt_rtn=True)
+            return 0.0
+        _diag_live = torch.diag(H)
+        _diag_live = _diag_live[_diag_live > 0]
+        if _diag_live.numel() and float(_diag_live.max()) / float(_diag_live.median()) > _POISONED_DIAG_SPREAD:
+            logger.warning_once(
+                "[Qronos] %s: Hessian diag spread exceeds %.0e (one or more exploding input "
+                "channels) - guidance would be garbage, falling back to RTN",
+                getattr(m, "global_name", "?"),
+                _POISONED_DIAG_SPREAD,
+            )
+            self._quantize_layer_via_rtn(m, disable_opt_rtn=True)
+            return 0.0
         G = getattr(m, "_qronos_G", None)
         if G is not None:
             G = G.to(torch.float32)
@@ -331,15 +376,22 @@ class QronosQuantizer(BaseQuantizer):
         H_p = H[perm][:, perm].contiguous()
         G_p = (G if G is not None else H)[perm][:, perm].contiguous()
 
-        # dampening: lambda = alpha * sigma_1 (bounds the condition number)
+        # dampening: lambda = alpha * sigma_1 (bounds the condition number);
+        # escalate x10 on inversion failure before giving up on Hessian guidance
         lam = cfg.dampening_alpha * spectral_norm_estimate(H_p)
-        H_p.diagonal().add_(lam)
-
-        try:
-            L = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H_p)))
-        except Exception:  # pylint: disable=broad-except
+        L = None
+        for _attempt in range(3):
+            H_d = H_p.clone()
+            H_d.diagonal().add_(lam)
+            try:
+                L = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H_d)))
+                break
+            except Exception:  # pylint: disable=broad-except
+                lam *= 10.0
+        if L is None:
             logger.warning(
-                "[Qronos] %s: Hessian inversion failed - falling back to plain RTN ordering",
+                "[Qronos] %s: Hessian inversion failed (damping escalated x1000) - "
+                "falling back to plain RTN ordering",
                 getattr(m, "global_name", "?"),
             )
             L = torch.eye(N, dtype=H_p.dtype, device=H_p.device)
