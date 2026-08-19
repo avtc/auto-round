@@ -138,6 +138,16 @@ class AlgorithmComposer:
                 "PreSINQ and SpinQuant transforms are mutually exclusive: both "
                 "modify RMSNorm weights. Pass only one of them in alg_configs."
             )
+        # Rotation-family transforms all apply orthogonal transforms to the
+        # residual stream; composing them is untested and redundant.
+        _rotation_family = {"spinquant", "hadamard", "block_hadamard"}
+        family = _algos.intersection(_rotation_family)
+        if len(family) > 1:
+            raise ValueError(
+                f"Rotation-family transforms are mutually exclusive: {sorted(family)}. "
+                "Combining orthogonal residual-stream transforms is untested; "
+                "pass at most one of them in alg_configs."
+            )
 
         _, block_quantizer_configs = split_quantization_configs(configs)
         if not block_quantizer_configs:
