@@ -145,6 +145,14 @@ def normalize_rotation_config(
             valid_fields = {f.name for f in dataclasses.fields(BlockHadamardConfig)}
             filtered = {k: v for k, v in config.items() if k != "algorithm" and k in valid_fields}
             return BlockHadamardConfig(**filtered)
+        if alg == "perq":
+            from auto_round.algorithms.transforms.perq.config import PeRQConfig
+
+            import dataclasses
+
+            valid_fields = {f.name for f in dataclasses.fields(PeRQConfig)}
+            filtered = {k: v for k, v in config.items() if k != "algorithm" and k in valid_fields}
+            return PeRQConfig(**filtered)
         if alg == "spinquant":
             from auto_round.algorithms.transforms.spinquant.preprocessor import SpinQuantConfig
 
@@ -168,6 +176,10 @@ def normalize_rotation_config(
             from auto_round.algorithms.transforms.block_hadamard.config import BlockHadamardConfig
 
             return BlockHadamardConfig()
+        if key == "perq":
+            from auto_round.algorithms.transforms.perq.config import PeRQConfig
+
+            return PeRQConfig()
         if key in ("spinquant", "quarot"):
             from auto_round.algorithms.transforms.spinquant.preprocessor import SpinQuantConfig
 

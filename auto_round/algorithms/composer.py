@@ -140,7 +140,7 @@ class AlgorithmComposer:
             )
         # Rotation-family transforms all apply orthogonal transforms to the
         # residual stream; composing them is untested and redundant.
-        _rotation_family = {"spinquant", "hadamard", "block_hadamard"}
+        _rotation_family = {"spinquant", "hadamard", "block_hadamard", "perq"}
         family = _algos.intersection(_rotation_family)
         if len(family) > 1:
             raise ValueError(
