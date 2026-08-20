@@ -228,10 +228,20 @@ def quant_tensor_opt_rtn_asym(
 
     qw = None
     if imatrix is not None:
-        qw = imatrix.reshape(1, -1)
-        qw = reshape_pad_tensor_by_group_size(qw, group_size, val=1e-5)[0].view(1, -1)
-        qw = qw.expand(tensor.numel() // qw.numel(), -1)
-        qw = qw.reshape(tensor.shape)
+        if imatrix.dim() == 1:
+            # per-column importance shared by every row of this tensor
+            qw = imatrix.reshape(1, -1)
+            qw = reshape_pad_tensor_by_group_size(qw, group_size, val=1e-5)[0].view(1, -1)
+            qw = qw.expand(tensor.numel() // qw.numel(), -1)
+            qw = qw.reshape(tensor.shape)
+        else:
+            # per-row importance (stacked same-shape modules: each module keeps
+            # its own column weights); must already match the tensor's shape
+            qw = reshape_pad_tensor_by_group_size(imatrix, group_size, val=1e-5)[0]
+            if qw.shape != tensor.shape:
+                raise ValueError(
+                    f"per-row imatrix shape {tuple(imatrix.shape)} incompatible with tensor {tuple(tensor.shape)}"
+                )
         qw = _imatrix_handle_zero(qw, tensor, bits, group_size)
 
     scale, zp = neuqi_search_scale_zero(tensor.to(torch.float32), bits, qw=qw, q_scale_thresh=q_scale_thresh)

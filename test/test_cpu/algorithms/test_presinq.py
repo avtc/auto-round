@@ -564,6 +564,31 @@ class TestHy3Naming:
         routers = get_router_linears(mlp)
         assert routers == [mlp.router.gate]
 
+    def test_expert_fold_fanout_matches_serial(self):
+        """Parallel expert folds must reproduce the serial loop exactly.
+
+        Exercises the ThreadPoolExecutor path by forcing CPU worker devices
+        (no CUDA needed locally); the block folds are device-independent.
+        """
+        import copy
+
+        torch.manual_seed(1)
+        layer_a = self._hy3_moe_mlp(n_experts=5)
+        layer_b = copy.deepcopy(layer_a)
+
+        rot_serial = PreSINQRotation(PreSINQConfig(n_repeat=1))
+        rot_serial._fold_moe(layer_a, layer_a.experts, None)
+
+        rot_par = PreSINQRotation(PreSINQConfig(n_repeat=1))
+        rot_par._fold_devices = lambda n: ["cpu", "cpu"]  # force the fan-out path
+        rot_par._fold_moe(layer_b, layer_b.experts, None)
+
+        for (na, wa), (nb, wb) in zip(layer_a.named_parameters(), layer_b.named_parameters()):
+            assert na == nb
+            assert torch.allclose(wa, wb, atol=1e-12), na
+        assert abs(rot_serial._stats_log_t - rot_par._stats_log_t) < 1e-6
+        assert rot_serial._stats_n == rot_par._stats_n
+
     def test_hy3_moe_fold_is_exact(self):
         """Fold on an hy_v3-shaped MoE layer preserves its function exactly."""
         import torch.nn as nn

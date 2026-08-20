@@ -54,6 +54,10 @@ class PreSINQConfig(BaseRotationConfig):
         n_iter: sinkhorn iterations per tile (upstream pre-SINQ default 4).
         n_repeat: whole-model folding passes (fixed-point iteration;
             upstream default 3).
+        parallel_folds: fan the per-expert fold loop out over all visible
+            GPUs (MoE layers carry hundreds of independent expert folds).
+            ``None`` (default) enables it with more than one CUDA device;
+            ``False`` forces the serial loop. Per-block results identical.
         normalize_outproj: additionally fold per-column scales between
             ``v_proj`` and ``o_proj``. Exact for multi-head attention
             (heads == kv heads); skipped with a warning for GQA.
@@ -64,3 +68,4 @@ class PreSINQConfig(BaseRotationConfig):
     n_iter: int = 4
     n_repeat: int = 3
     normalize_outproj: bool = False
+    parallel_folds: bool = None  # None: fan expert folds out when >1 CUDA visible
