@@ -600,3 +600,51 @@ class TestHy3Naming:
             exp_out += w[:, i : i + 1] * blk.down_proj(F.silu(blk.gate_proj(x)) * blk.up_proj(x))
         sh = mlp.shared_mlp
         return exp_out + sh.down_proj(F.silu(sh.gate_proj(x)) * sh.up_proj(x))
+
+
+class TestLazyMoEMaterialization:
+    """Weight transforms must run after lazy-MoE materialization."""
+
+    def test_apply_model_transforms_materializes_lazy_moe(self):
+        """Fused-MoE replacement modules hold expert weights on the meta device
+        until materialize_weights() runs. apply_model_transforms runs earlier and
+        reads/writes every weight, so it must materialize the model first; a meta
+        expert weight otherwise crashes the transform pass."""
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.modeling.fused_moe.replace_modules import ReplacementModuleBase
+
+        class LazyExpert(ReplacementModuleBase):
+            def __init__(self, original):
+                super().__init__(original)
+                dim = original.gate_proj.weight.shape[0]
+                self.gate_proj = nn.Linear(dim, dim, bias=False, device="meta")
+                self.up_proj = nn.Linear(dim, dim, bias=False, device="meta")
+                self.down_proj = nn.Linear(dim, dim, bias=False, device="meta")
+
+            @classmethod
+            def original_module_class(cls):
+                return "TinyMLP"
+
+            @classmethod
+            def from_original(cls, original, config):
+                return cls(original)
+
+            def _materialize_weights(self):
+                src = self._get_original_module()
+                self.gate_proj.weight = nn.Parameter(src.gate_proj.weight.detach().clone())
+                self.up_proj.weight = nn.Parameter(src.up_proj.weight.detach().clone())
+                self.down_proj.weight = nn.Parameter(src.down_proj.weight.detach().clone())
+
+        model = TinyModel(moe=True)
+        moe_layer = model.layers[0]
+        assert hasattr(moe_layer.mlp, "experts"), "fixture must place a MoE MLP in layer 0"
+        originals = list(moe_layer.mlp.experts)
+        moe_layer.mlp.experts = nn.ModuleList([LazyExpert(e) for e in originals])
+
+        composer = AlgorithmComposer([PreSINQConfig(n_iter=1, n_repeat=1), RTNConfig()])
+        out = composer.apply_model_transforms(model)
+
+        for expert in out.layers[0].mlp.experts:
+            for param in expert.parameters():
+                assert param.device.type != "meta"

@@ -647,6 +647,14 @@ class AlgorithmComposer:
         from auto_round.algorithms.transforms import apply_rotation, normalize_rotation_config
         from auto_round.algorithms.transforms.base import BaseRotation
 
+        # Weight transforms read and rewrite every module's parameters, so any
+        # lazy materialization (e.g. fused-MoE replacement modules holding
+        # expert weights on the meta device until first use) must be resolved
+        # before the transform pass, not at first block touch.
+        from auto_round.modeling.fused_moe import materialize_model_
+
+        materialize_model_(model)
+
         data_type = self._resolve_rotation_data_type()
         logger.info("Applying Hadamard transform to the model.")
         for rotation_cfg in self._rotation_configs:
