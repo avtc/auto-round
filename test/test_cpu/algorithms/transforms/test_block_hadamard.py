@@ -340,6 +340,26 @@ class TestPlumbing:
             for param in expert.parameters():
                 assert param.device.type != "meta"
 
+    def test_layerwise_mode_skips_full_materialization(self):
+        """Layer-wise rotation must not force full-model materialization.
+
+        Layer-wise mode exists for models intentionally kept beyond memory
+        residency; transforms run per block after the block loop materializes
+        it. Materializing the whole model here would defeat that mode.
+        """
+        from unittest import mock as _mock
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.modeling import fused_moe
+
+        model = MiniModel()
+        composer = AlgorithmComposer([BlockHadamardConfig(), RTNConfig()])
+        composer._layerwise_rotation = True
+        with _mock.patch.object(fused_moe, "materialize_model_") as mat:
+            composer.apply_model_transforms(model)
+        mat.assert_not_called()
+
     def test_composer_accepts_and_excludes(self):
         from auto_round.algorithms.composer import AlgorithmComposer
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
