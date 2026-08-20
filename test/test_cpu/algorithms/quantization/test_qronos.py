@@ -116,9 +116,13 @@ class TestQronosSequentialQuantize:
         Q, _ = qronos_sequential_quantize(W, H, H, sc, zc, maxq, block_size=16, L=L_eye, use_init=False)
         Q_rtn = _rtn(W, sc, zc, maxq)
         assert torch.allclose(Q, Q_rtn, atol=1e-6)
-        # and the init-active variant on the same identity L is far worse
-        Q_bad, _ = qronos_sequential_quantize(W, H, H, sc, zc, maxq, block_size=16, L=L_eye, use_init=True)
-        assert (W - Q_bad).norm() > 3 * (W - Q_rtn).norm()
+        # the init-active variant on the same identity L applies the OPTQ
+        # first-column correction (solve form) and must stay bounded near RTN;
+        # the historical failure was a raw Hessian conjugation growing the
+        # error several-fold
+        Q_init, _ = qronos_sequential_quantize(W, H, H, sc, zc, maxq, block_size=16, L=L_eye, use_init=True)
+        assert (W - Q_init).norm() < 1.5 * (W - Q_rtn).norm()
+        assert not torch.allclose(Q_init, Q_rtn), "the init correction must be applied"
 
     def test_xtilde_neq_x_corrects_previous_layers(self):
         """With X~ != X, the G = X~^T X term must not increase the X~-output error."""

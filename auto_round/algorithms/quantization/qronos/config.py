@@ -41,6 +41,7 @@ class QronosConfig(QuantizationConfig):
         *,
         block_size: int = 128,
         dampening_alpha: float = 1e-6,
+        dampening_target: str = "spectral",
         actorder: bool = True,
         enable_quanted_input: bool = True,
         enable_init: bool = True,
@@ -52,10 +53,17 @@ class QronosConfig(QuantizationConfig):
             block_size: Number of weight columns processed per blocked update
                 (memory/compute granularity only - mathematically exact at any
                 value). Default 128.
-            dampening_alpha: Hessian dampening ``lambda = alpha * sigma_1(H)``
-                (sigma_1 = largest eigenvalue), bounding the condition number
-                at ``alpha^-1``. The paper uses 1e-6 for weight-only
-                quantization. Default 1e-6.
+            dampening_alpha: Hessian dampening multiplier (see
+                *dampening_target*). Default 1e-6.
+            dampening_target: Statistic the dampening multiplier scales.
+                ``"spectral"`` (paper): ``lambda = alpha * sigma_1(H)``,
+                condition number bounded at ``alpha^-1``; the paper uses
+                alpha 1e-6 for weight-only quantization. ``"mean_diag"``:
+                ``lambda = alpha * mean(diag(H))`` - the GPTQ convention
+                (alpha 0.01); on heavy-tailed Hessians ``sigma_1`` exceeds
+                ``mean(diag)`` by orders of magnitude, so the two targets at
+                numerically similar alphas correspond to very different
+                dampening strengths. Default ``"spectral"``.
             actorder: Quantize columns in descending order of ``diag(H)``
                 (activation ordering, as in GPTQ). The result is written back
                 in the original column order, so no ``g_idx`` remapping is
@@ -74,6 +82,9 @@ class QronosConfig(QuantizationConfig):
         super().__init__(**kwargs)
         self.block_size = block_size
         self.dampening_alpha = dampening_alpha
+        if dampening_target not in ("spectral", "mean_diag"):
+            raise ValueError(f"dampening_target must be 'spectral' or 'mean_diag', got {dampening_target!r}")
+        self.dampening_target = dampening_target
         self.actorder = actorder
         self.enable_quanted_input = enable_quanted_input
         self.enable_init = enable_init

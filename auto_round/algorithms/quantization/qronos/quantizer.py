@@ -123,18 +123,35 @@ def qronos_sequential_quantize(
 
     if use_init:
         # ── special first column (error-correcting initialization) ─────────
-        # q_1 = Q((G_{1,>=1} w - H_{1,>=2} w_{>=2}) / H_11)          [Prop. E.2]
-        num = W @ G[0, :] - W[:, 1:] @ H[0, 1:]
-        q0 = _quant_col(num / H[0, 0], scale[:, 0], None if zp is None else zp[:, 0], maxq)
-        W[:, 0] = q0
-        losses += (num / H[0, 0] - q0) ** 2 / (L[0, 0] ** 2)
-        if N > 1:
-            # w_{>=2}^{(1)} = (H_{>=2,>=2})^{-1} (G_{>=2,>=1} w - H_{>=2,1} q_1)  [Lemma G.3:
-            # (H_{>=2,>=2})^{-1} == L_{>=2,>=2} L_{>=2,>=2}^T for L = chol(H^{-1}),
-            # so the factor is APPLIED, not solved against]
-            C = L[1:, 1:]
-            M = W @ G[1:, :].T - q0.unsqueeze(1) * H[1:, 0].unsqueeze(0)
-            W[:, 1:] = (M @ C) @ C.T
+        g_is_h = G is H or (
+            G is not None and float(torch.norm(G - H)) <= 1e-6 * float(torch.norm(H).clamp(min=1e-30))
+        )
+        if g_is_h:
+            # X~ == X: the init reduces exactly to the OPTQ first-column
+            # update, W[:, 1:] += err_0 (H_{22}^{-1} H_{21})^T. Computed via a
+            # linear solve: the explicit inverse-conjugation form
+            # ((M @ C) @ C.T) suffers catastrophic cancellation at low damping
+            # and a gross global rescaling at high damping, while the solve is
+            # stable across the whole damping range.
+            q0 = _quant_col(W[:, 0].clone(), scale[:, 0], None if zp is None else zp[:, 0], maxq)
+            losses += (W[:, 0] - q0) ** 2 / (L[0, 0] ** 2)
+            W[:, 0] = q0
+            if N > 1:
+                sol = torch.linalg.solve(H[1:, 1:], H[1:, 0])  # H_{22}^{-1} H_{21}
+                W[:, 1:] += (W[:, 0] - q0).unsqueeze(1) * sol.unsqueeze(0)
+        else:
+            # q_1 = Q((G_{1,>=1} w - H_{1,>=2} w_{>=2}) / H_11)          [Prop. E.2]
+            num = W @ G[0, :] - W[:, 1:] @ H[0, 1:]
+            q0 = _quant_col(num / H[0, 0], scale[:, 0], None if zp is None else zp[:, 0], maxq)
+            W[:, 0] = q0
+            losses += (num / H[0, 0] - q0) ** 2 / (L[0, 0] ** 2)
+            if N > 1:
+                # w_{>=2}^{(1)} = (H_{>=2,>=2})^{-1} (G_{>=2,>=1} w - H_{>=2,1} q_1)  [Lemma G.3:
+                # (H_{>=2,>=2})^{-1} == L_{>=2,>=2} L_{>=2,>=2}^T for L = chol(H^{-1}),
+                # so the factor is APPLIED, not solved against]
+                C = L[1:, 1:]
+                M = W @ G[1:, :].T - q0.unsqueeze(1) * H[1:, 0].unsqueeze(0)
+                W[:, 1:] = (M @ C) @ C.T
     else:
         # fallback path: plain RTN on the first column (the sequential loop
         # below starts at t = 2, so without this the column stays fp32)
@@ -446,9 +463,16 @@ class QronosQuantizer(BaseQuantizer):
         H_p = H[perm][:, perm].contiguous()
         G_p = (G if G is not None else H)[perm][:, perm].contiguous()
 
-        # dampening: lambda = alpha * sigma_1 (bounds the condition number);
+        # dampening: lambda = alpha * target (bounds the condition number);
         # escalate x10 on inversion failure before giving up on Hessian guidance
-        lam = cfg.dampening_alpha * spectral_norm_estimate(H_p)
+        if cfg.dampening_target == "mean_diag":
+            # GPTQ convention: 0.01 * mean(diag(H)); on heavy-tailed Hessians
+            # sigma_1 >> mean(diag), so the spectral target at the same alpha
+            # is far weaker (and a spectral alpha of 1e-2 far stronger) than
+            # the GPTQ-equivalent strength.
+            lam = cfg.dampening_alpha * float(torch.mean(torch.diag(H_p)))
+        else:
+            lam = cfg.dampening_alpha * spectral_norm_estimate(H_p)
         L = None
         for _attempt in range(3):
             H_d = H_p.clone()
