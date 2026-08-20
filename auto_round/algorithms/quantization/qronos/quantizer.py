@@ -211,8 +211,32 @@ class QronosQuantizer(BaseQuantizer):
         The stashed tensors pair index-wise with the quantized-input forward
         (both sweeps iterate the same cached samples in the same order), which
         is what the cross-Gram ``G = X~^T X`` accumulation requires.
+
+        Without the quantized-input cascade there is no second sweep to pair
+        with, so the fp forward accumulates ``H = X^T X`` directly (X~ == X;
+        pure OPTQ statistics) and no stash is kept.
         """
         handles = []
+
+        if not self.enable_quanted_input:
+
+            def make_h_hook():
+                def hook(module, args, output):
+                    x = self._extract_input(args).detach()
+                    x = x.reshape(-1, x.shape[-1]).to(torch.float32)
+                    x = _sanitise_input(module, x)
+                    H = getattr(module, "_qronos_H", None)
+                    if H is None:
+                        H = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=x.device)
+                    H += x.T @ x
+                    module._qronos_H = H
+
+                return hook
+
+            for _name, m in block.named_modules():
+                if check_to_quantized(m):
+                    handles.append(m.register_forward_hook(make_h_hook()))
+            return handles
 
         def make_hook():
             def hook(module, args, output):

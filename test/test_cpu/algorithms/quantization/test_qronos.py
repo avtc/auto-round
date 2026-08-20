@@ -328,6 +328,42 @@ class TestHessianRobustness:
         H = lin._qronos_H
         assert torch.isfinite(H).all(), "H must stay finite when an input sample contains inf/nan"
 
+    def test_fp_hooks_accumulate_H_without_cascade(self):
+        """enable_quanted_input=False: the fp sweep must accumulate H directly.
+
+        Without this the q-input sweep (which normally accumulates H) never
+        runs, no module carries statistics, and every layer silently degrades
+        to plain RTN instead of OPTQ.
+        """
+        from auto_round.algorithms.quantization.qronos.quantizer import QronosQuantizer
+        from auto_round.algorithms.quantization.qronos.config import QronosConfig
+
+        torch.manual_seed(0)
+        q = QronosQuantizer(QronosConfig(enable_quanted_input=False))
+        lin = self._mk_linear()
+        handles = q.register_fp_input_forward_hooks(_ParentOf(lin))
+        xs = [torch.randn(4, 32) for _ in range(3)]
+        with torch.no_grad():
+            for x in xs:
+                lin(x)
+        for h in handles:
+            h.remove()
+        H_ref = sum((x.T @ x) for x in xs)
+        assert hasattr(lin, "_qronos_H"), "fp sweep must accumulate H when the cascade is off"
+        assert torch.allclose(lin._qronos_H, H_ref, atol=1e-4)
+        assert not hasattr(lin, "_qronos_xfp"), "no pairing stash is needed without the cascade"
+
+        # with the cascade on, the fp sweep stashes inputs for G pairing instead
+        q_on = QronosQuantizer(QronosConfig(enable_quanted_input=True))
+        lin2 = self._mk_linear()
+        handles = q_on.register_fp_input_forward_hooks(_ParentOf(lin2))
+        with torch.no_grad():
+            lin2(torch.randn(4, 32))
+        for h in handles:
+            h.remove()
+        assert hasattr(lin2, "_qronos_xfp") and len(lin2._qronos_xfp) == 1
+        assert not hasattr(lin2, "_qronos_H")
+
     def test_poisoned_hessian_falls_back_to_rtn(self):
         """H finite but with a 1e12 dynamic range must NOT guide the rounding."""
         from auto_round.algorithms.quantization.qronos.quantizer import QronosQuantizer
