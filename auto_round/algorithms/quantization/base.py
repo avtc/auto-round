@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import threading
 import traceback
 from typing import TYPE_CHECKING
 
@@ -184,6 +185,7 @@ class BaseQuantizer(BaseAlgorithm):
         q_input: "list[torch.Tensor] | None" = None,
         disable_opt_rtn: "bool | None" = None,
         valid_token_mask: "list[torch.Tensor] | None" = None,
+        device_override: "str | torch.device | None" = None,
     ) -> None:
         """Quantize a single layer outside a transformer block using RTN fallback.
         Args:
@@ -194,16 +196,29 @@ class BaseQuantizer(BaseAlgorithm):
             disable_opt_rtn:  ``True`` skips optimized-RTN scale/zp search.
                               ``None`` defers to ``self.config.disable_opt_rtn``.
             valid_token_mask: Per-sample masks; unused in base RTN.
+            device_override:  Device the tuning runs on (parallel fan-out
+                              workers pass their assigned GPU); ``None`` uses
+                              the module's tuning device.
         """
-        self._quantize_layer_via_rtn(layer, disable_opt_rtn=disable_opt_rtn)
+        self._quantize_layer_via_rtn(layer, disable_opt_rtn=disable_opt_rtn, device_override=device_override)
 
     @torch.no_grad()
-    def _quantize_layer_via_rtn(self, layer: "torch.nn.Module", disable_opt_rtn: "bool | None" = None) -> None:
+    def _quantize_layer_via_rtn(
+        self,
+        layer: "torch.nn.Module",
+        disable_opt_rtn: "bool | None" = None,
+        device_override: "str | torch.device | None" = None,
+    ) -> None:
         """Quantize one layer with RTN (with optional optimized scale/zp search)."""
         layer_name = layer.global_name
-        layer = convert_module_to_hp_if_necessary(layer, self.model_context.amp_dtype, device_manager.device)
-        set_module(self.model, layer_name, layer)
-        tuning_device = layer.tuning_device if hasattr(layer, "tuning_device") else device_manager.device
+        tuning_device = device_override if device_override is not None else (
+            layer.tuning_device if hasattr(layer, "tuning_device") else device_manager.device
+        )
+        layer = convert_module_to_hp_if_necessary(layer, self.model_context.amp_dtype, tuning_device)
+        if not hasattr(self, "_set_module_lock"):
+            self._set_module_lock = threading.Lock()
+        with self._set_module_lock:
+            set_module(self.model, layer_name, layer)
         try:
             if disable_opt_rtn is None:
                 disable_opt_rtn = bool(getattr(self.config, "disable_opt_rtn", False))
@@ -252,7 +267,8 @@ class BaseQuantizer(BaseAlgorithm):
                 layer = layer.unwrapper({})
             except Exception:
                 raise
-        set_module(self.model, layer_name, layer)
+        with self._set_module_lock:
+            set_module(self.model, layer_name, layer)
 
     def dispatch_block(self, block: "torch.nn.Module", input_ids, input_others: dict):
         """Place a block on the correct device(s) for quantization.
