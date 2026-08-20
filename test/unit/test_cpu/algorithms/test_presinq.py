@@ -648,3 +648,37 @@ class TestLazyMoEMaterialization:
         for expert in out.layers[0].mlp.experts:
             for param in expert.parameters():
                 assert param.device.type != "meta"
+
+    def test_layerwise_mode_does_not_materialize_lazy_moe(self):
+        """Layer-wise rotation must not materialize the whole model: streamed
+        models may be intentionally larger than memory, and transforms apply
+        per block after the block loop materializes it."""
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.modeling.fused_moe.replace_modules import ReplacementModuleBase
+
+        class LazyExpert(ReplacementModuleBase):
+            def __init__(self, original):
+                super().__init__(original)
+                dim = original.gate_proj.weight.shape[0]
+                self.gate_proj = nn.Linear(dim, dim, bias=False, device="meta")
+
+            @classmethod
+            def original_module_class(cls):
+                return "TinyMLP"
+
+            @classmethod
+            def from_original(cls, original, config):
+                return cls(original)
+
+            def _materialize_weights(self):
+                raise AssertionError("layer-wise mode must not materialize expert weights")
+
+        model = TinyModel(moe=True)
+        moe_layer = model.layers[0]
+        originals = list(moe_layer.mlp.experts)
+        moe_layer.mlp.experts = nn.ModuleList([LazyExpert(e) for e in originals])
+
+        composer = AlgorithmComposer([PreSINQConfig(n_iter=1, n_repeat=1), RTNConfig()])
+        composer._layerwise_rotation = True
+        composer.apply_model_transforms(model)  # must not raise / not materialize
