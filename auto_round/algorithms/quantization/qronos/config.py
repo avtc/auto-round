@@ -43,6 +43,7 @@ class QronosConfig(QuantizationConfig):
         dampening_alpha: float = 1e-6,
         actorder: bool = True,
         enable_quanted_input: bool = True,
+        enable_init: bool = True,
         **kwargs,
     ) -> None:
         """Initialize a Qronos configuration.
@@ -62,6 +63,11 @@ class QronosConfig(QuantizationConfig):
             enable_quanted_input: Feed each block the outputs of the previously
                 quantized blocks (the cascade that makes ``X~ != X`` - the
                 source of Qronos' edge over OPTQ). Default True.
+            enable_init: Apply the error-correcting first-column
+                initialization (Algorithm 1). With ``enable_quanted_input=False``
+                the init reduces exactly to the OPTQ first-column update;
+                disabling it yields plain sequential RTN with error diffusion
+                from column two onward. Default True.
             **kwargs: Common quantization arguments forwarded to
                 QuantizationConfig (bits, group_size, sym, data_type, ...).
         """
@@ -70,6 +76,7 @@ class QronosConfig(QuantizationConfig):
         self.dampening_alpha = dampening_alpha
         self.actorder = actorder
         self.enable_quanted_input = enable_quanted_input
+        self.enable_init = enable_init
         if not self.enable_quanted_input:
             logger.warning_once(
                 "QronosConfig(enable_quanted_input=False): without the quantized-input cascade, "

@@ -434,7 +434,7 @@ class QronosQuantizer(BaseQuantizer):
                 break
             except Exception:  # pylint: disable=broad-except
                 lam *= 10.0
-        use_init = True
+        use_init = bool(getattr(cfg, "enable_init", True))
         if L is None:
             logger.warning(
                 "[Qronos] %s: Hessian inversion failed (damping escalated x1000) - "
@@ -446,6 +446,7 @@ class QronosQuantizer(BaseQuantizer):
             # L_{>=2,>=2} L_{>=2,>=2}^T == (H_{>=2,>=2})^{-1}; an identity L
             # turns the init into a pure Hessian conjugation of the weights,
             # so it must be skipped entirely for the fallback to be RTN.
+            # overrides cfg for this layer: identity L cannot support the init
             use_init = False
         else:
             # the init's H terms must use the same (dampened) matrix the
