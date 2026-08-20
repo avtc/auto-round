@@ -37,6 +37,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import tqdm
 
 from auto_round.algorithms.transforms.base import BaseRotation
 from auto_round.algorithms.transforms.block_hadamard.config import BlockHadamardConfig
@@ -345,14 +346,27 @@ class BlockHadamardRotation(BaseRotation):
         cfg = self.config
 
         device = embed.weight.device
-        R_local = R.to(device)
+        compute_device = torch.device("cuda") if torch.cuda.is_available() else device
+        if compute_device != device:
+            logger.info(
+                "[%s] rotating on %s (weights hop per module; model stays resident).",
+                type(self).__name__,
+                compute_device,
+            )
+        R_local = R.to(compute_device)
         with torch.no_grad():
             W = embed.weight.data
             if perm is not None:
                 W = W[:, perm]
-            W_f64 = W.to(torch.float64)
-            w_blocks = W_f64.reshape(W.shape[0], -1, cfg.block_size)
-            embed.weight.data = (w_blocks @ R_local.T).reshape(W.shape).to(embed.weight.dtype)
+            # chunked along rows so the float64 intermediate stays bounded on
+            # the compute device (embedding tables dwarf per-layer weights)
+            chunk = max(1, (1 << 24) // max(1, W.shape[1]))
+            rows = []
+            for s in range(0, W.shape[0], chunk):
+                Wc = W[s : s + chunk].to(device=compute_device, dtype=torch.float64)
+                w_blocks = Wc.reshape(Wc.shape[0], -1, cfg.block_size)
+                rows.append((w_blocks @ R_local.T).reshape(Wc.shape).to(device=W.device, dtype=W.dtype))
+            embed.weight.data = torch.cat(rows, dim=0)
 
         def _permute_in(proj: nn.Linear) -> bool:
             if proj in rotated:  # dedup BEFORE permuting (helper would skip later)
@@ -370,21 +384,24 @@ class BlockHadamardRotation(BaseRotation):
                     proj.bias.data = proj.bias.data[perm]
             return True
 
-        for layer in layers:
-            layer_device = next(layer.parameters()).device
-            R_l = R.to(layer_device)
-
+        layer_iter = tqdm.tqdm(
+            layers,
+            desc=f"[{type(self).__name__}] rotating",
+            unit="layer",
+            dynamic_ncols=True,
+        )
+        for layer in layer_iter:
             attn = getattr(layer, "self_attn", None)
             if attn is not None:
                 for proj_name in ("q_proj", "k_proj", "v_proj"):
                     proj = getattr(attn, proj_name, None)
                     if isinstance(proj, nn.Linear):
                         _permute_in(proj)
-                        rotate_in_channels_(proj, R_in=R_l, rotated_modules=rotated)
+                        rotate_in_channels_(proj, R_in=R_local, rotated_modules=rotated, compute_device=compute_device)
                 o_proj = getattr(attn, "o_proj", None)
                 if isinstance(o_proj, nn.Linear):
                     _permute_out(o_proj)
-                    rotate_out_channels_(o_proj, R_out=R_l, rotated_modules=rotated)
+                    rotate_out_channels_(o_proj, R_out=R_local, rotated_modules=rotated, compute_device=compute_device)
 
             linear_attn = getattr(layer, "linear_attn", None) if attn is None else None
             if isinstance(linear_attn, nn.Module):
@@ -392,35 +409,35 @@ class BlockHadamardRotation(BaseRotation):
                     proj = getattr(linear_attn, proj_name, None)
                     if isinstance(proj, nn.Linear):
                         _permute_in(proj)
-                        rotate_in_channels_(proj, R_in=R_l, rotated_modules=rotated)
+                        rotate_in_channels_(proj, R_in=R_local, rotated_modules=rotated, compute_device=compute_device)
                 out_proj = getattr(linear_attn, "out_proj", None)
                 if isinstance(out_proj, nn.Linear):
                     _permute_out(out_proj)
-                    rotate_out_channels_(out_proj, R_out=R_l, rotated_modules=rotated)
+                    rotate_out_channels_(out_proj, R_out=R_local, rotated_modules=rotated, compute_device=compute_device)
 
             for block, _kind in iter_layer_mlp_blocks(layer):
                 gate = get_proj(block, "gate")
                 if gate is not None:
                     _permute_in(gate)
-                    rotate_in_channels_(gate, R_in=R_l, rotated_modules=rotated)
+                    rotate_in_channels_(gate, R_in=R_local, rotated_modules=rotated, compute_device=compute_device)
                 up = get_proj(block, "up")
                 if up is not None:
                     _permute_in(up)
-                    rotate_in_channels_(up, R_in=R_l, rotated_modules=rotated)
+                    rotate_in_channels_(up, R_in=R_local, rotated_modules=rotated, compute_device=compute_device)
                 down = get_proj(block, "down")
                 if down is not None:
                     _permute_out(down)
-                    rotate_out_channels_(down, R_out=R_l, rotated_modules=rotated)
+                    rotate_out_channels_(down, R_out=R_local, rotated_modules=rotated, compute_device=compute_device)
 
             mlp = get_mlp_module(layer)
             if mlp is not None:
                 for router in get_router_linears(mlp):
                     _permute_in(router)
-                    rotate_in_channels_(router, R_in=R_l, rotated_modules=rotated)
+                    rotate_in_channels_(router, R_in=R_local, rotated_modules=rotated, compute_device=compute_device)
 
         if isinstance(lm_head, nn.Linear):
             _permute_in(lm_head)
-            rotate_in_channels_(lm_head, R_in=R.to(lm_head.weight.device), rotated_modules=rotated)
+            rotate_in_channels_(lm_head, R_in=R, rotated_modules=rotated, compute_device=compute_device)
 
         return len(rotated) + 1  # +1 for the embedding
 

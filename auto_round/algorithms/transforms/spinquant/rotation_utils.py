@@ -662,6 +662,7 @@ def rotate_in_channels_(
     rotation_matrix: Optional[torch.Tensor] = None,
     R_in: Optional[torch.Tensor] = None,
     rotated_modules: Optional[set] = None,
+    compute_device: Optional[torch.device] = None,
 ) -> None:
     """Fuse an input-side rotation into a linear layer's weight.
 
@@ -682,6 +683,11 @@ def rotate_in_channels_(
             ``rotate_out_channels_``.
         rotated_modules: Optional ``set`` used to deduplicate rotations
             when a module is shared across layers (e.g. MoE).
+        compute_device: Device the rotation matmul runs on. The weight is
+            moved there in float64, rotated, and moved back to its original
+            device and dtype; useful to offload large CPU-resident weights to
+            a GPU without loading the whole model. ``None`` (default) computes
+            where the weight already lives.
     """
     if rotated_modules is not None:
         if layer in rotated_modules:
@@ -694,17 +700,18 @@ def rotate_in_channels_(
         return
 
     rot_size = R.shape[0]
-    W_f64 = W.to(torch.float64)
-    R_f64 = R.to(torch.float64)
+    target = compute_device if compute_device is not None else W.device
+    W_f64 = W.to(device=target, dtype=torch.float64)
+    R_f64 = R.to(device=target, dtype=torch.float64)
 
     if W.shape[-1] == rot_size:
         # Full rotation: W_new = W @ R.T
-        layer.weight.data = (W_f64 @ R_f64.T).to(W.dtype)
+        layer.weight.data = (W_f64 @ R_f64.T).to(device=W.device, dtype=W.dtype)
     elif W.shape[-1] % rot_size == 0:
         # Block rotation: reshape → rotate → flatten
         w_reshaped = W_f64.reshape(*W_f64.shape[:-1], -1, rot_size)
         w_rotated = w_reshaped @ R_f64.T
-        layer.weight.data = w_rotated.reshape(W.shape).to(W.dtype)
+        layer.weight.data = w_rotated.reshape(W.shape).to(device=W.device, dtype=W.dtype)
     else:
         raise ValueError(f"rotate_in_channels_: rotation_size={rot_size} does not divide " f"weight dim={W.shape[-1]}")
 
@@ -718,6 +725,7 @@ def rotate_out_channels_(
     rotation_matrix: Optional[torch.Tensor] = None,
     R_out: Optional[torch.Tensor] = None,
     rotated_modules: Optional[set] = None,
+    compute_device: Optional[torch.device] = None,
 ) -> None:
     """Fuse an output-side rotation into a linear layer's weight.
 
@@ -735,6 +743,9 @@ def rotate_out_channels_(
         rotation_matrix: Full rotation matrix ``R`` (uses ``R.T`` internally).
         R_out: Alias for ``rotation_matrix``.
         rotated_modules: Optional ``set`` for deduplication.
+        compute_device: Device the rotation matmul runs on (see
+            :func:`rotate_in_channels_`); ``None`` computes where the
+            weight already lives.
     """
     if rotated_modules is not None:
         if layer in rotated_modules:
@@ -747,8 +758,9 @@ def rotate_out_channels_(
         return
 
     rot_size = R.shape[0]
-    W_f64 = W.to(torch.float64)
-    R_f64 = R.to(torch.float64)
+    target = compute_device if compute_device is not None else W.device
+    W_f64 = W.to(device=target, dtype=torch.float64)
+    R_f64 = R.to(device=target, dtype=torch.float64)
 
     # output rotation: we need to rotate rows (output dim) of W
     # For block rotation, use W.T so rotation acts on the last dim,
@@ -756,13 +768,13 @@ def rotate_out_channels_(
     out_dim = W.shape[0]
     if out_dim == rot_size:
         # Full rotation: W_new = R.T @ W
-        layer.weight.data = (R_f64.T @ W_f64).to(W.dtype)
+        layer.weight.data = (R_f64.T @ W_f64).to(device=W.device, dtype=W.dtype)
     elif out_dim % rot_size == 0:
         # Block rotation on output dim: transpose, block rotate, transpose back
         WT = W_f64.T  # [in_features, out_features]
         wt_reshaped = WT.reshape(*WT.shape[:-1], -1, rot_size)
         wt_rotated = wt_reshaped @ R_f64
-        layer.weight.data = wt_rotated.reshape(WT.shape).T.contiguous().to(W.dtype)
+        layer.weight.data = wt_rotated.reshape(WT.shape).T.contiguous().to(device=W.device, dtype=W.dtype)
     else:
         raise ValueError(f"rotate_out_channels_: rotation_size={rot_size} does not divide " f"output dim={out_dim}")
 
