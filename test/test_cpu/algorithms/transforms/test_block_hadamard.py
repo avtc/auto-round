@@ -293,6 +293,53 @@ class TestPlumbing:
         inst = BaseRotation.from_config(cfg)
         assert isinstance(inst, BlockHadamardRotation)
 
+    def test_apply_model_transforms_materializes_lazy_moe(self):
+        """Weight transforms must run after lazy-MoE materialization.
+
+        Fused-MoE replacement modules hold expert weights on the meta device
+        until materialize_weights() runs (first block touch in the quantize
+        loop). apply_model_transforms runs earlier and reads/writes every
+        weight, so it must materialize the model first; a meta expert weight
+        otherwise crashes the transform pass.
+        """
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.modeling.fused_moe.replace_modules import ReplacementModuleBase
+
+        class LazyExpert(ReplacementModuleBase):
+            def __init__(self, original):
+                super().__init__(original)
+                dim = original.gate_proj.weight.shape[0]
+                self.gate_proj = nn.Linear(dim, dim, bias=False, device="meta")
+                self.up_proj = nn.Linear(dim, dim, bias=False, device="meta")
+                self.down_proj = nn.Linear(dim, dim, bias=False, device="meta")
+
+            @classmethod
+            def original_module_class(cls):
+                return "MiniMLP"
+
+            @classmethod
+            def from_original(cls, original, config):
+                return cls(original)
+
+            def _materialize_weights(self):
+                src = self._get_original_module()
+                self.gate_proj.weight = nn.Parameter(src.gate_proj.weight.detach().clone())
+                self.up_proj.weight = nn.Parameter(src.up_proj.weight.detach().clone())
+                self.down_proj.weight = nn.Parameter(src.down_proj.weight.detach().clone())
+
+        model = MiniModel()
+        moe_layer = model.model.layers[2]
+        originals = list(moe_layer.mlp.experts)
+        moe_layer.mlp.experts = nn.ModuleList([LazyExpert(e) for e in originals])
+
+        composer = AlgorithmComposer([BlockHadamardConfig(), RTNConfig()])
+        out = composer.apply_model_transforms(model)
+
+        for expert in out.model.layers[2].mlp.experts:
+            for param in expert.parameters():
+                assert param.device.type != "meta"
+
     def test_composer_accepts_and_excludes(self):
         from auto_round.algorithms.composer import AlgorithmComposer
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
