@@ -24,6 +24,7 @@ class RTNConfig(QuantizationConfig):
         *,
         disable_opt_rtn: bool = None,
         asym_search: str = "auto",
+        parallel_tuning: bool = None,
         **kwargs,
     ) -> None:
         """Initialize an RTN configuration.
@@ -32,6 +33,11 @@ class RTNConfig(QuantizationConfig):
             disable_opt_rtn: Whether to disable the optimized RTN path.
                 ``None`` keeps the default heuristic, True forces plain
                 RTN, and False forces the optimized implementation.
+            parallel_tuning: Fan per-module tuning (scale/zp search, NeUQI
+                joint search) out over all available GPUs. ``None`` (default)
+                enables it when more than one CUDA device is visible; ``False``
+                forces the serial single-device path. Per-module results are
+                identical either way.
             asym_search: How the per-group scale and integer zero point are
                 initialized on the asymmetric zero-shot optimized-RTN path:
 
@@ -74,6 +80,7 @@ class RTNConfig(QuantizationConfig):
             disable_opt_rtn = False
         self.disable_opt_rtn = disable_opt_rtn
 
+        self.parallel_tuning = parallel_tuning
         valid_asym_search = ("auto", "neuqi", "minmax")
         if asym_search not in valid_asym_search:
             raise ValueError(

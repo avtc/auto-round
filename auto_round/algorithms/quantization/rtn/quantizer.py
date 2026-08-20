@@ -132,9 +132,48 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             input_ids: Raw token IDs from the tokenizer (unused in RTN).
             **kwargs: Reserved for forward-compatibility with future parameters.
         """
-        # Normalize imatrix and quantize layers
+        # Normalize imatrix (cheap elementwise divides), then quantize the
+        # block's target modules - fanned out over GPUs when several exist
+        targets = []
         for name, m in block.named_modules():
             if hasattr(m, "imatrix"):
                 m.imatrix /= m.imatrix_cnt
             if hasattr(m, "global_name") and check_to_quantized(m):
+                targets.append(m)
+        self._quantize_targets(targets)
+
+    def _quantize_targets(self, targets: list) -> None:
+        """Quantize a block's target modules, fanned out over available GPUs.
+
+        Per-module tuning (optimized-RTN scale/zp search, NeUQI joint search)
+        is independent across modules: each module's weight is hopped to its
+        worker's device, tuned, and written back under a lock. Round-robin
+        assignment; per-module results are identical to serial tuning.
+        """
+        if not targets:
+            return
+        parallel_tuning = getattr(self.config, "parallel_tuning", None)
+        n_gpu = torch.cuda.device_count()
+        if parallel_tuning is None:
+            parallel_tuning = n_gpu > 1
+        n_workers = min(len(targets), n_gpu) if parallel_tuning and n_gpu > 1 else 1
+
+        if n_workers == 1:
+            for m in targets:
                 self.quantize_layer_outside_block(m)
+            return
+
+        logger.info(
+            "[OptRTN] tuning fan-out: %d modules across %d GPUs (round-robin).",
+            len(targets),
+            n_workers,
+        )
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [
+                pool.submit(self.quantize_layer_outside_block, m, device_override=f"cuda:{i % n_workers}")
+                for i, m in enumerate(targets)
+            ]
+            for f in futures:
+                f.result()  # propagate the first worker exception
