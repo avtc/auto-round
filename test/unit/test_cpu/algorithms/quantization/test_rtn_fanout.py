@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Optimized-RTN tuning fan-out: per-module GPU scheduling and device override."""
+"""Optimized-RTN tuning fan-out and expert batching: scheduling + equivalence."""
 
 from unittest import mock
 
@@ -22,25 +22,50 @@ from auto_round.algorithms.quantization.rtn.config import RTNConfig
 from auto_round.algorithms.quantization.rtn.quantizer import OptimizedRTNQuantizer
 
 
-class _RecordingQuantizer:
-    """Stands in for the quantizer: records (device, order) per call."""
+def _mk_expert(parent, idx, proj="gate_proj", out=16, inn=32, imatrix=False):
+    m = nn.Linear(inn, out, bias=False)
+    m.global_name = f"{parent}.experts.{idx}.{proj}"
+    m.bits, m.sym, m.group_size, m.data_type = 4, False, 32, "int"
+    m.scale_dtype = torch.float16
+    if imatrix:
+        m.imatrix = torch.rand(inn) + 0.1
+    return m
 
-    def __init__(self, config):
+
+class _RecordingQuantizer:
+    """Stands in for the quantizer: records (device, order) per module call."""
+
+    def __init__(self, config, batch=False):
         self.config = config
         self.calls = []
+        self.batches = []
+        self.model_context = mock.MagicMock(is_moe_model=False)
+        if not batch:
+            self._split_expert_batches = lambda targets: ([], targets)
+        else:
+            self._quantize_expert_batch = self._record_expert_batch
 
-    # borrow the real scheduling method unbound
+    # borrow the real methods unbound
     _quantize_targets = OptimizedRTNQuantizer._quantize_targets
+    _expert_search_active = OptimizedRTNQuantizer._expert_search_active
+    _split_expert_batches = OptimizedRTNQuantizer._split_expert_batches
+    _quantize_expert_batch = OptimizedRTNQuantizer._quantize_expert_batch
 
     def quantize_layer_outside_block(self, m, device_override=None):
         self.calls.append((m, device_override))
 
+    def _record_expert_batch(self, mods, device):
+        self.batches.append((mods, device))
+        return True
 
-def _targets(n=10):
+    _quantize_expert_batch = OptimizedRTNQuantizer._quantize_expert_batch
+
+
+def _dense_targets(n=10):
     mods = []
     for i in range(n):
         m = nn.Linear(8, 8, bias=False)
-        m.global_name = f"layers.0.mlp.{i}"
+        m.global_name = f"layers.0.mlp.linear.{i}"
         mods.append(m)
     return mods
 
@@ -49,36 +74,87 @@ class TestQuantizeTargetsFanout:
     def test_serial_when_single_gpu(self):
         q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
         with mock.patch("torch.cuda.device_count", return_value=1):
-            q._quantize_targets(_targets())
+            q._quantize_targets(_dense_targets())
         assert all(dev is None for _, dev in q.calls)
         assert len(q.calls) == 10
 
     def test_serial_forced_by_config(self):
         q = _RecordingQuantizer(RTNConfig(parallel_tuning=False))
         with mock.patch("torch.cuda.device_count", return_value=8):
-            q._quantize_targets(_targets())
+            q._quantize_targets(_dense_targets())
         assert all(dev is None for _, dev in q.calls)
 
     def test_round_robin_across_gpus(self):
         q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
         with mock.patch("torch.cuda.device_count", return_value=4):
-            q._quantize_targets(_targets())
+            q._quantize_targets(_dense_targets())
         assert len(q.calls) == 10
         # deterministic round-robin assignment by submission index; call
         # completion order varies with thread scheduling, so assert the
         # module -> device mapping rather than the call order
         by_name = {m.global_name: dev for m, dev in q.calls}
         for i in range(10):
-            assert by_name[f"layers.0.mlp.{i}"] == f"cuda:{i % 4}"
+            assert by_name[f"layers.0.mlp.linear.{i}"] == f"cuda:{i % 4}"
 
     def test_round_robin_respects_worker_cap(self):
-        q = _RecordingQuantizer(RTNConfig(parallel_tuning=True))
-        mods = _targets(3)
+        q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
+        mods = _dense_targets(3)
         with mock.patch("torch.cuda.device_count", return_value=8):
             q._quantize_targets(mods)
-        assert [dev for _, dev in q.calls] == ["cuda:0", "cuda:1", "cuda:2"]
+        assert sorted(dev for _, dev in q.calls) == ["cuda:0", "cuda:1", "cuda:2"]
 
     def test_empty_targets_noop(self):
         q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
         q._quantize_targets([])
         assert q.calls == []
+
+
+class TestExpertBatching:
+    def _experts(self, n=4, imatrix=False):
+        return [_mk_expert("layers.1.mlp", i, imatrix=imatrix) for i in range(n)]
+
+    def test_split_groups_same_shape(self):
+        q = _RecordingQuantizer(RTNConfig(), batch=True)
+        targets = self._experts(4) + _dense_targets(3)
+        batches, singles = q._split_expert_batches(targets)
+        assert len(batches) == 1 and len(batches[0]) == 4
+        assert len(singles) == 3
+        # different projection names and shapes form separate groups
+        targets = self._experts(2) + self._experts(2, imatrix=False)
+        targets += [_mk_expert("layers.1.mlp", 0, proj="up_proj") for _ in range(2)]
+        targets += [_mk_expert("layers.2.mlp", i, out=8) for i in range(2)]
+        batches, singles = q._split_expert_batches(targets)
+        # gate@l1 (x4, identical keys merge), up@l1 (x2), gate@l2 (x2, shape differs)
+        sizes = sorted(len(b) for b in batches)
+        assert sizes == [2, 2, 4]
+
+    def test_batches_are_scheduled_as_single_jobs(self):
+        q = _RecordingQuantizer(RTNConfig(), batch=True)
+        with mock.patch("torch.cuda.device_count", return_value=2):
+            q._quantize_targets(self._experts(4) + _dense_targets(2))
+        assert len(q.batches) == 1 and len(q.batches[0][0]) == 4  # one batch job
+        assert len(q.calls) == 2  # dense modules as singles
+
+    def test_batched_matches_per_module_search(self):
+        """Stacked expert search must reproduce per-module results exactly."""
+        torch.manual_seed(7)
+        mods = self._experts(3, imatrix=True)
+        copies = [_mk_expert("layers.1.mlp", i, imatrix=True) for i in range(3)]
+        for m, c in zip(mods, copies):
+            with torch.no_grad():
+                c.weight.copy_(m.weight)
+            c.imatrix = m.imatrix.clone()
+
+        # batch=False keeps the REAL _quantize_expert_batch on the stub
+        q = _RecordingQuantizer(RTNConfig())
+        assert q._quantize_expert_batch(mods, "cpu") is True
+
+        from auto_round.data_type.neuqi import quant_tensor_opt_rtn_asym
+
+        for m, c in zip(mods, copies):
+            qdq, scale, zp = quant_tensor_opt_rtn_asym(
+                c.weight.data, bits=c.bits, group_size=c.group_size, v=0.0, imatrix=c.imatrix
+            )
+            assert torch.allclose(m.weight.data, qdq, atol=1e-6), m.global_name
+            assert torch.allclose(m.scale.float(), scale.reshape(m.weight.shape[0], -1).float(), atol=1e-6)
+            assert torch.allclose(m.zp.float(), zp.reshape(m.weight.shape[0], -1).float(), atol=1e-6)

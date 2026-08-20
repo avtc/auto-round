@@ -25,6 +25,7 @@ class RTNConfig(QuantizationConfig):
         disable_opt_rtn: bool = None,
         asym_search: str = "auto",
         parallel_tuning: bool = None,
+        batch_expert_tuning: bool = True,
         **kwargs,
     ) -> None:
         """Initialize an RTN configuration.
@@ -33,6 +34,11 @@ class RTNConfig(QuantizationConfig):
             disable_opt_rtn: Whether to disable the optimized RTN path.
                 ``None`` keeps the default heuristic, True forces plain
                 RTN, and False forces the optimized implementation.
+            batch_expert_tuning: Quantize same-shape MoE expert projections
+                in single stacked search calls instead of one call per module.
+                Row-independent search: results identical to per-module tuning;
+                removes per-module overhead on models with hundreds of small
+                experts per layer. Default True.
             parallel_tuning: Fan per-module tuning (scale/zp search, NeUQI
                 joint search) out over all available GPUs. ``None`` (default)
                 enables it when more than one CUDA device is visible; ``False``
@@ -81,11 +87,10 @@ class RTNConfig(QuantizationConfig):
         self.disable_opt_rtn = disable_opt_rtn
 
         self.parallel_tuning = parallel_tuning
+        self.batch_expert_tuning = batch_expert_tuning
         valid_asym_search = ("auto", "neuqi", "minmax")
         if asym_search not in valid_asym_search:
-            raise ValueError(
-                f"asym_search={asym_search!r} is not one of {valid_asym_search}."
-            )
+            raise ValueError(f"asym_search={asym_search!r} is not one of {valid_asym_search}.")
         if asym_search != "auto" and self.sym:
             raise ValueError(
                 f"asym_search={asym_search!r} applies to the asymmetric path only (sym=False); the "

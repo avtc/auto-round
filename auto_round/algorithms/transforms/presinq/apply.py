@@ -57,6 +57,8 @@ from auto_round.algorithms.transforms.spinquant.rotation_utils import (
     get_router_linears,
     iter_transformer_layers,
 )
+import threading
+
 from auto_round.logger import logger
 
 __all__ = ["PreSINQRotation"]
@@ -126,6 +128,7 @@ class PreSINQRotation(BaseRotation):
     def __init__(self, config: PreSINQConfig) -> None:
         super().__init__(config)
         self._states: dict = {}  # Parameter -> _WeightState (identity keys)
+        self._state_lock = threading.Lock()  # fan-out folds touch _states/_stats concurrently
         self._stats_log_t = 0.0
         self._stats_n = 0
 
@@ -187,6 +190,10 @@ class PreSINQRotation(BaseRotation):
     # Shadow-scale registry
     # ------------------------------------------------------------------
     def _state(self, weight: nn.Parameter) -> _WeightState:
+        with self._state_lock:
+            return self._state_locked(weight)
+
+    def _state_locked(self, weight: nn.Parameter) -> _WeightState:
         st = self._states.get(weight)
         if st is None:
             st = _WeightState()
@@ -306,8 +313,10 @@ class PreSINQRotation(BaseRotation):
         return n
 
     def _track(self, t: torch.Tensor) -> None:
-        self._stats_log_t += float(t.to(torch.float64).log().abs().sum())
-        self._stats_n += t.numel()
+        s = float(t.to(torch.float64).log().abs().sum())
+        with self._state_lock:
+            self._stats_log_t += s
+            self._stats_n += t.numel()
 
     def _fold_attention_inputs(self, layer: nn.Module) -> None:
         """input_layernorm -> attention input projections (MLA included)."""
@@ -379,17 +388,10 @@ class PreSINQRotation(BaseRotation):
 
     def _fold_moe(self, mlp: nn.Module, experts: nn.ModuleList, layer: nn.Module) -> None:
         blocks = _moe_blocks(mlp, experts)
-        # Per-block up<->down folds (independent scales per block).
-        for blk in blocks:
-            gate, up, down = get_proj(blk, "gate"), get_proj(blk, "up"), get_proj(blk, "down")
-            if gate is not None and gate is up:
-                continue  # fused gate_up inside a block — skip that block
-            if up is None or down is None:
-                continue
-            t = column_scales([self._effective(down.weight)], self.config.group_size, self.config.n_iter)
-            self._track(t)
-            self._apply_col(down.weight, t.reciprocal())
-            self._apply_row(up.weight, t, bias=up.bias)
+        # Per-block up<->down folds (independent scales per block): each
+        # block's sinkhorn is independent, so the loop fans out over GPUs when
+        # several are visible (MoE layers carry hundreds of small experts).
+        self._fold_expert_blocks(blocks)
         # One shared scale vector for the post-attention norm, pooled over all
         # blocks' gate+up (a single norm can only carry one vector).
         norm = getattr(layer, "post_attention_layernorm", None)
@@ -419,6 +421,63 @@ class PreSINQRotation(BaseRotation):
                 self._apply_col(gate.weight, t.reciprocal())
             if up is not None:
                 self._apply_col(up.weight, t.reciprocal())
+
+    def _fold_expert_blocks(self, blocks: list) -> None:
+        """Fold every expert block's up<->down pair, in parallel over GPUs.
+
+        On models with many experts per layer (hundreds of small projections)
+        the per-block sinkhorn dominates the fold time; the blocks are
+        independent, so they are distributed round-robin across CUDA devices.
+        Per-block results are identical to the serial loop.
+        """
+        devices = self._fold_devices(len(blocks))
+        if devices is None:
+            for blk in blocks:
+                self._fold_one_expert_block(blk)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        logger.info(
+            "[PreSINQ] expert fold fan-out: %d blocks across %d GPUs (round-robin).",
+            len(blocks),
+            len(devices),
+        )
+        with ThreadPoolExecutor(max_workers=len(devices)) as pool:
+            futures = [
+                pool.submit(self._fold_one_expert_block, blk, device=devices[i % len(devices)])
+                for i, blk in enumerate(blocks)
+            ]
+            for f in futures:
+                f.result()  # propagate the first worker exception
+
+    def _fold_devices(self, n_blocks: int):
+        """Worker devices for the expert fold: CUDA round-robin or None (serial)."""
+        parallel_folds = getattr(self.config, "parallel_folds", None)
+        n_gpu = torch.cuda.device_count()
+        if parallel_folds is None:
+            parallel_folds = n_gpu > 1
+        if not parallel_folds or n_gpu <= 1 or n_blocks < 4:
+            return None
+        return [f"cuda:{i}" for i in range(min(n_gpu, n_blocks))]
+
+    def _fold_one_expert_block(self, blk: nn.Module, device=None) -> None:
+        gate, up, down = get_proj(blk, "gate"), get_proj(blk, "up"), get_proj(blk, "down")
+        if gate is not None and gate is up:
+            return  # fused gate_up inside a block — skip that block
+        if up is None or down is None:
+            return
+        if device is not None:
+            # compute the sinkhorn on the worker's device; the scale vector is
+            # tiny, so moving it back before the writebacks is free
+            t = column_scales([self._effective(down.weight).to(device)], self.config.group_size, self.config.n_iter).to(
+                down.weight.device
+            )
+        else:
+            t = column_scales([self._effective(down.weight)], self.config.group_size, self.config.n_iter)
+        self._track(t)
+        self._apply_col(down.weight, t.reciprocal())
+        self._apply_row(up.weight, t, bias=up.bias)
 
     def _fold_v_o(self, layer: nn.Module) -> None:
         """Exact v<->o fold, GQA-aware.

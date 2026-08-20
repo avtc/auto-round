@@ -569,7 +569,6 @@ class TestHy3Naming:
 
         torch.manual_seed(0)
 
-
         class Layer(nn.Module):
             def __init__(self, mlp):
                 super().__init__()
@@ -600,6 +599,31 @@ class TestHy3Naming:
             exp_out += w[:, i : i + 1] * blk.down_proj(F.silu(blk.gate_proj(x)) * blk.up_proj(x))
         sh = mlp.shared_mlp
         return exp_out + sh.down_proj(F.silu(sh.gate_proj(x)) * sh.up_proj(x))
+
+    def test_expert_fold_fanout_matches_serial(self):
+        """Parallel expert folds must reproduce the serial loop exactly.
+
+        Exercises the ThreadPoolExecutor path by forcing CPU worker devices
+        (no CUDA needed locally); the block folds are device-independent.
+        """
+        import copy
+
+        torch.manual_seed(1)
+        layer_a = self._hy3_moe_mlp(n_experts=5)
+        layer_b = copy.deepcopy(layer_a)
+
+        rot_serial = PreSINQRotation(PreSINQConfig(n_repeat=1))
+        rot_serial._fold_moe(layer_a, layer_a.experts, None)
+
+        rot_par = PreSINQRotation(PreSINQConfig(n_repeat=1))
+        rot_par._fold_devices = lambda n: ["cpu", "cpu"]  # force the fan-out path
+        rot_par._fold_moe(layer_b, layer_b.experts, None)
+
+        for (na, wa), (nb, wb) in zip(layer_a.named_parameters(), layer_b.named_parameters()):
+            assert na == nb
+            assert torch.allclose(wa, wb, atol=1e-12), na
+        assert abs(rot_serial._stats_log_t - rot_par._stats_log_t) < 1e-6
+        assert rot_serial._stats_n == rot_par._stats_n
 
 
 class TestLazyMoEMaterialization:

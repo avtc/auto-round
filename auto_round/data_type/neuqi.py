@@ -187,14 +187,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
 
 @register_dtype("opt_rtn_int_asym")
 def quant_tensor_opt_rtn_asym(
-    tensor,
-    bits=4,
-    group_size=-1,
-    v=0,
-    q_scale_thresh=1e-5,
-    imatrix=None,
-    scale_dtype=torch.float16,
-    **kwargs
+    tensor, bits=4, group_size=-1, v=0, q_scale_thresh=1e-5, imatrix=None, scale_dtype=torch.float16, **kwargs
 ):
     """Quantize/dequantize with a joint near-optimal (scale, integer zero-point) search.
 
@@ -219,19 +212,27 @@ def quant_tensor_opt_rtn_asym(
 
     if envs.AR_DISABLE_NEUQI:
         _log_disabled()
-        return quant_tensor_asym(
-            tensor, bits=bits, group_size=group_size, v=v, q_scale_thresh=q_scale_thresh, **kwargs
-        )
+        return quant_tensor_asym(tensor, bits=bits, group_size=group_size, v=v, q_scale_thresh=q_scale_thresh, **kwargs)
 
     tensor, orig_shape, pad_len = reshape_pad_tensor_by_group_size(tensor, group_size)
     maxq = int(2**bits) - 1
 
     qw = None
     if imatrix is not None:
-        qw = imatrix.reshape(1, -1)
-        qw = reshape_pad_tensor_by_group_size(qw, group_size, val=1e-5)[0].view(1, -1)
-        qw = qw.expand(tensor.numel() // qw.numel(), -1)
-        qw = qw.reshape(tensor.shape)
+        if imatrix.dim() == 1:
+            # per-column importance shared by every row of this tensor
+            qw = imatrix.reshape(1, -1)
+            qw = reshape_pad_tensor_by_group_size(qw, group_size, val=1e-5)[0].view(1, -1)
+            qw = qw.expand(tensor.numel() // qw.numel(), -1)
+            qw = qw.reshape(tensor.shape)
+        else:
+            # per-row importance (stacked same-shape modules: each module keeps
+            # its own column weights); must already match the tensor's shape
+            qw = reshape_pad_tensor_by_group_size(imatrix, group_size, val=1e-5)[0]
+            if qw.shape != tensor.shape:
+                raise ValueError(
+                    f"per-row imatrix shape {tuple(imatrix.shape)} incompatible with tensor {tuple(tensor.shape)}"
+                )
         qw = _imatrix_handle_zero(qw, tensor, bits, group_size)
 
     scale, zp = neuqi_search_scale_zero(tensor.to(torch.float32), bits, qw=qw, q_scale_thresh=q_scale_thresh)
@@ -245,4 +246,7 @@ def quant_tensor_opt_rtn_asym(
     return qdq_result, scale, zp
 
 
-logger.info("[NeUQI] opt_rtn_int_asym registered (clean-room, arXiv 2505.17595; AR_DISABLE_NEUQI=%s)", bool(envs.AR_DISABLE_NEUQI))
+logger.info(
+    "[NeUQI] opt_rtn_int_asym registered (clean-room, arXiv 2505.17595; AR_DISABLE_NEUQI=%s)",
+    bool(envs.AR_DISABLE_NEUQI),
+)

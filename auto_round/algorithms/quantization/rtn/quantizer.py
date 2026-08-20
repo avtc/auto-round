@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
 import torch
+import torch.nn as nn
 
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig, RTNConfig
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.logger import logger
+from auto_round.utils.device_manager import device_manager
+
+_EXPERT_RE = re.compile(r"^(?P<parent>.*)\.experts\.\d+\.(?P<proj>[^.]+)$")
+
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
     check_to_quantized,
@@ -142,6 +149,104 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                 targets.append(m)
         self._quantize_targets(targets)
 
+    def _split_expert_batches(self, targets: list):
+        """Partition same-shape expert projections into batchable groups.
+
+        Experts of one layer share weight shapes (e.g. 192 x ``[1536, 4096]``
+        gate/up/down projections). The per-group search is row-independent, so
+        a whole group can be quantized in one call by stacking weights along
+        the output dim - same results as per-module calls, one search's worth
+        of per-module overhead instead of 192.
+        """
+        grouped = {}
+        singles = []
+        for m in targets:
+            match = _EXPERT_RE.match(getattr(m, "global_name", "") or "")
+            if (
+                match is None
+                or type(m) is not nn.Linear
+                or bool(getattr(m, "sym", False))
+                or not isinstance(getattr(m, "group_size", None), int)
+                or getattr(m, "group_size", None) <= 0
+                or getattr(m, "super_bits", None) is not None
+                or getattr(m, "data_type", "int") != "int"
+            ):
+                singles.append(m)
+                continue
+            key = (match["parent"], match["proj"], tuple(m.weight.shape), m.bits, m.group_size)
+            grouped.setdefault(key, []).append(m)
+        batches = [g for g in grouped.values() if len(g) >= 2]
+        return batches, singles
+
+    def _expert_search_active(self) -> bool:
+        """Whether the optimized-RTN asym search runs for expert modules.
+
+        Mirrors the MoE heuristic in ``_quantize_layer_via_rtn``: experts skip
+        the search unless explicitly forced on (``enable_opt_rtn``), so batching
+        must not change that decision - only batch when the search would run.
+        """
+        cfg = self.config
+        if bool(getattr(cfg, "disable_opt_rtn", False)):
+            return False
+        if getattr(cfg, "orig_disable_opt_rtn", None) is None and getattr(self.model_context, "is_moe_model", False):
+            return False
+        return getattr(cfg, "asym_search", "auto") != "minmax"
+
+    def _quantize_expert_batch(self, mods: list, device) -> bool:
+        """Quantize same-shape expert projections in one stacked search call.
+
+        Returns ``False`` when the batch cannot be handled here (caller falls
+        back to per-module tuning). Reproduces the per-module wrapper outputs:
+        quantize-dequantized weights written in place, plus ``scale``/``zp``/
+        ``q_scale_thresh`` attributes matching the unwrapper's conventions.
+        """
+        m0 = mods[0]
+        bits, g = m0.bits, m0.group_size
+        try:
+            from auto_round.data_type.neuqi import quant_tensor_opt_rtn_asym
+        except ImportError:
+            return False
+
+        max_elems = 2**28  # ~1 GiB fp32 stacked weights per call
+        per_call = max(1, max_elems // m0.weight.numel())
+        for s in range(0, len(mods), per_call):
+            chunk = mods[s : s + per_call]
+            dev = torch.device(device)
+            weights = torch.cat([m.weight.data.reshape(m.weight.shape[0], -1) for m in chunk], dim=0).to(dev)
+            imat_rows = []
+            for m in chunk:
+                if hasattr(m, "imatrix"):
+                    imat_rows.append(m.imatrix.to(dev).unsqueeze(0).expand(m.weight.shape[0], -1))
+                else:
+                    imat_rows.append(torch.ones(m.weight.shape, device=dev))
+            imat = torch.cat(imat_rows, dim=0)
+
+            qdq, scale, zp = quant_tensor_opt_rtn_asym(
+                weights,
+                bits=bits,
+                group_size=g,
+                v=0.0,
+                q_scale_thresh=1e-5,
+                imatrix=imat,
+                scale_dtype=getattr(m0, "scale_dtype", torch.float16),
+            )
+
+            row_w = row_g = 0
+            with torch.no_grad():
+                for m in chunk:
+                    out = m.weight.shape[0]
+                    if m.weight.shape[1] % g != 0:  # padded input dim: not row-divisible here
+                        return False
+                    n_groups_m = out * (m.weight.shape[1] // g)
+                    m.weight.data.copy_(qdq[row_w : row_w + out].reshape(m.weight.shape).to(m.weight.device))
+                    m.scale = scale[row_g : row_g + n_groups_m].reshape(out, -1).to("cpu")
+                    m.zp = zp[row_g : row_g + n_groups_m].reshape(out, -1).to("cpu")
+                    m.q_scale_thresh = 1e-5
+                    m.weight.grad = None
+                    row_w += out
+                    row_g += n_groups_m
+        return True
+
     def _quantize_targets(self, targets: list) -> None:
         """Quantize a block's target modules, fanned out over available GPUs.
 
@@ -152,28 +257,53 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         """
         if not targets:
             return
+        batches = []
+        if getattr(self.config, "batch_expert_tuning", True) and self._expert_search_active():
+            batches, targets = self._split_expert_batches(targets)
+            if batches:
+                n_batched = sum(len(b) for b in batches)
+                logger.info(
+                    "[OptRTN] expert batching: %d expert modules in %d same-shape groups.",
+                    n_batched,
+                    len(batches),
+                )
+
         parallel_tuning = getattr(self.config, "parallel_tuning", None)
         n_gpu = torch.cuda.device_count()
         if parallel_tuning is None:
             parallel_tuning = n_gpu > 1
-        n_workers = min(len(targets), n_gpu) if parallel_tuning and n_gpu > 1 else 1
+        n_workers = min(len(batches) + len(targets), n_gpu) if parallel_tuning and n_gpu > 1 else 1
+
+        def _run_batch(mods, device):
+            if not self._quantize_expert_batch(mods, device):
+                for m in mods:  # unexpected shape case: per-module fallback
+                    self.quantize_layer_outside_block(m, device_override=device)
 
         if n_workers == 1:
+            device = device_manager.device
+            for b in batches:
+                _run_batch(b, device)
             for m in targets:
                 self.quantize_layer_outside_block(m)
             return
 
         logger.info(
-            "[OptRTN] tuning fan-out: %d modules across %d GPUs (round-robin).",
+            "[OptRTN] tuning fan-out: %d jobs (%d batched expert groups, %d modules) " "across %d GPUs (round-robin).",
+            len(batches) + len(targets),
+            len(batches),
             len(targets),
             n_workers,
         )
         from concurrent.futures import ThreadPoolExecutor
 
+        jobs = [("batch", b) for b in batches] + [("single", m) for m in targets]
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = [
-                pool.submit(self.quantize_layer_outside_block, m, device_override=f"cuda:{i % n_workers}")
-                for i, m in enumerate(targets)
-            ]
+            futures = []
+            for i, (kind, payload) in enumerate(jobs):
+                dev = f"cuda:{i % n_workers}"
+                if kind == "batch":
+                    futures.append(pool.submit(_run_batch, payload, dev))
+                else:
+                    futures.append(pool.submit(self.quantize_layer_outside_block, payload, device_override=dev))
             for f in futures:
                 f.result()  # propagate the first worker exception
