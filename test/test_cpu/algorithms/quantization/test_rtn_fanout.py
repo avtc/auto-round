@@ -41,7 +41,7 @@ class _RecordingQuantizer:
         self.batches = []
         self.model_context = mock.MagicMock(is_moe_model=False)
         if not batch:
-            self._split_expert_batches = lambda targets: ([], targets)
+            self._split_expert_batches = lambda targets, n_jobs_hint=0: ([], targets)
         else:
             self._quantize_expert_batch = self._record_expert_batch
 
@@ -128,11 +128,32 @@ class TestExpertBatching:
         sizes = sorted(len(b) for b in batches)
         assert sizes == [2, 2, 4]
 
+    def test_job_hint_splits_groups_to_fill_gpus(self):
+        """n_jobs_hint splits same-shape groups into ~equal chunks so the
+        fan-out fills every GPU; hint=0 keeps monolithic groups."""
+        q = _RecordingQuantizer(RTNConfig(), batch=True)
+        targets = self._experts(6) + [_mk_expert("layers.1.mlp", i, proj="up_proj") for i in range(6)]
+
+        batches, singles = q._split_expert_batches(targets, n_jobs_hint=0)
+        assert sorted(len(b) for b in batches) == [6, 6]
+
+        # 8-GPU hint over 2 groups -> 4 chunks-per-group target; ceil-split of
+        # 6 by 2 yields 3 chunks of 2 per group -> 6 jobs of 2
+        batches, singles = q._split_expert_batches(targets, n_jobs_hint=8)
+        assert len(batches) == 6
+        sizes = sorted(len(b) for b in batches)
+        assert sizes == [2, 2, 2, 2, 2, 2]
+        # membership preserved exactly once across chunks
+        chunked = [m for b in batches for m in b]
+        assert sorted(id(m) for m in chunked) == sorted(id(m) for m in targets)
+        assert not singles
+
     def test_batches_are_scheduled_as_single_jobs(self):
         q = _RecordingQuantizer(RTNConfig(), batch=True)
         with mock.patch("torch.cuda.device_count", return_value=2):
             q._quantize_targets(self._experts(4) + _dense_targets(2))
-        assert len(q.batches) == 1 and len(q.batches[0][0]) == 4  # one batch job
+        # 2-GPU hint splits the 4-expert group into 2 chunks of 2 (one job each)
+        assert len(q.batches) == 2 and sorted(len(b[0]) for b in q.batches) == [2, 2]
         assert len(q.calls) == 2  # dense modules as singles
 
     def test_batched_matches_per_module_search(self):
