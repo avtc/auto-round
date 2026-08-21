@@ -340,6 +340,89 @@ class TestCheckpointStreamer:
         finally:
             streamer.stop_prefetch()
 
+    def test_check_ids_in_vocab(self):
+        from auto_round.utils.streaming_calibration import _check_ids_in_vocab
+
+        rows = [torch.tensor([[1, 2, 3]]), torch.tensor([[0, 5, 63]])]
+        _check_ids_in_vocab(rows, 64)  # in range: no raise
+        bad = [torch.tensor([[1, 2, 150000]])]  # Qwen-tokenized ids vs hy3 vocab
+        with pytest.raises(ValueError, match="different model's tokenizer"):
+            _check_ids_in_vocab(bad, 120832)
+
+    def test_stream_calibration_matches_data_driven(self, tiny_checkpoint, tmp_path):
+        """stream_calibration=True must reproduce the data-driven run exactly:
+        the streaming pass forwards the same rows through the same block chain
+        (same attention-mask rule, row-by-row) so the imatrix statistics — and
+        therefore the searched quantized weights — are identical."""
+        import shutil
+
+        torch.manual_seed(7)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]  # vocab_size=64
+        ck_a = str(tmp_path / "ck_a")
+        ck_b = str(tmp_path / "ck_b")
+        shutil.copytree(tiny_checkpoint, ck_a)
+        shutil.copytree(tiny_checkpoint, ck_b)
+        data_driven = self._quantize(ck_a, str(tmp_path / "a"), stream=False, dataset=rows)
+        streamed_calib = self._quantize(ck_b, str(tmp_path / "b"), stream=True, stream_calibration=True, dataset=rows)
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        t_a, t_b = load_all(data_driven), load_all(streamed_calib)
+        assert set(t_a) == set(t_b), f"tensor name mismatch: only-a={set(t_a) - set(t_b)} only-b={set(t_b) - set(t_a)}"
+        n_exact, n_close, n_diff = 0, 0, 0
+        for k in t_a:
+            if torch.equal(t_a[k], t_b[k]):
+                n_exact += 1
+            elif torch.allclose(t_a[k].float(), t_b[k].float(), atol=1e-6):
+                n_close += 1
+            else:
+                n_diff += 1
+        assert n_diff == 0, f"{n_diff} tensors differ beyond tolerance"
+        assert n_exact + n_close == len(t_a)
+
+    def test_partial_layer_config_resolves_format(self, tiny_checkpoint, tmp_path):
+        """layer_config entries are partial overrides: unset keys fall back to
+        the global scheme. Format resolution must not assume every entry
+        carries the full key set — asym scheme (RTNConfig sym=False, the NeUQI
+        path) hits the AutoAWQ enablement check in formats.py, which raised
+        KeyError('bits') on partial entries (hy3 NeUQI-asym server run)."""
+        import shutil
+
+        ck = str(tmp_path / "ck_partial")
+        shutil.copytree(tiny_checkpoint, ck)
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.autoround import AutoRound
+
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[RTNConfig(group_size=8, sym=False)],  # asym global scheme (NeUQI path)
+            layer_config={
+                ".*model.layers.0.": {"bits": 16, "data_type": "float"},
+                ".*shared_mlp": {"group_size": 8},  # partial: no bits key
+                ".*experts": {"group_size": 8},
+            },
+            layerwise_rotation=True,
+            stream_checkpoint=True,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.post_init()  # resolves formats; raised KeyError('bits') before the fix
+        assert ar.formats is not None
+
 
 @pytest.mark.slow
 class TestStreamQuantizeEquivalence:
