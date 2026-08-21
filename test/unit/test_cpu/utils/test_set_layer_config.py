@@ -148,6 +148,37 @@ class TestIgnoreLayersDigitSuffix:
         assert layer_config["layers.0.fc2"]["bits"] == 16
 
 
+class TestRegexExpandedEntriesAreIndependent:
+    """A regex-matched layer_config entry must not share one dict across the
+    matched layers: the shape-divisibility force (bits=16 on dims not divisible
+    by 32) would otherwise drag every sibling to fp16."""
+
+    @pytest.fixture
+    def mixed_model(self):
+        class MixedBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = nn.Linear(32, 32)  # divisible by 32
+                self.fc2 = nn.Linear(32, 32)  # divisible by 32
+                self.small = nn.Linear(32, 48)  # 48 % 32 != 0 -> forced fp16
+
+        class MixedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([MixedBlock()])
+                self.lm_head = nn.Linear(32, 64, bias=False)
+
+        return MixedModel()
+
+    def test_shape_force_does_not_aliase_siblings(self, mixed_model):
+        layer_config, _, _ = _call_set_layer_config(
+            mixed_model, layer_config={"layers.0..*": {"bits": 4, "group_size": 128}}
+        )
+        assert layer_config["layers.0.small"]["bits"] == 16  # forced by shape
+        assert layer_config["layers.0.fc1"]["bits"] == 4  # sibling must keep W4
+        assert layer_config["layers.0.fc2"]["bits"] == 4
+
+
 class TestUnmatchedLayerConfigWarns:
     """An unrecognised key in layer_config must trigger a warning, not ValueError."""
 
