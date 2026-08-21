@@ -314,6 +314,13 @@ class BaseOrchestrator(object):
         # Blocks staged into host RAM ahead of the quantize loop by a
         # background reader (stream_checkpoint only); 0 disables prefetch.
         self.stream_prefetch = kwargs.pop("stream_prefetch", 0)
+        # Where prefetched blocks wait: None = host RAM (default); "auto" =
+        # every CUDA device except the quant device; or an explicit list of
+        # devices (ints / "cuda:k" / "cpu"). Blocks are staged directly onto
+        # these devices and quantized in place (round-robin block homes), so
+        # no cross-device copy is needed when the loop reaches them.
+        # Requires stream_prefetch > 0.
+        self.stream_prefetch_gpus = kwargs.pop("stream_prefetch_gpus", None)
 
         # ``stream_checkpoint`` handles its own block lifecycle (meta -> stream
         # -> quantize -> write -> meta), so the accelerate-style offloader

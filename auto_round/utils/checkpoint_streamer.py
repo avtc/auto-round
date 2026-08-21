@@ -56,6 +56,7 @@ class CheckpointStreamer:
         self._prefetch_remaining: list[str] = []  # prefixes not yet consumed
         self._prefetch_staged: list[str] = []  # staged, awaiting consumption
         self._prefetch_depth = 0
+        self._prefetch_stage_devices: Optional[list] = None
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_stop = False
         self._prefetch_err: Optional[BaseException] = None
@@ -119,24 +120,40 @@ class CheckpointStreamer:
 
     # ── Prefetch ─────────────────────────────────────────────────────────────
 
-    def start_prefetch(self, module_prefixes: list, depth: int = 1) -> None:
-        """Stream whole module prefixes into host RAM on a background thread.
+    def start_prefetch(
+        self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None
+    ) -> None:
+        """Stream whole module prefixes ahead of the consumer on a background
+        thread.
 
         The reader stages prefixes in visit order and keeps at most ``depth``
-        staged-but-unconsumed prefixes beyond the current one; the consumer
-        releases a prefix with :meth:`prefetch_consumed`. Host RAM use is
-        bounded at roughly (depth + 1) prefixes worth of tensors.
+        staged-but-unconsumed prefixes; the consumer releases a prefix with
+        :meth:`prefetch_consumed`. With ``stage_devices`` (e.g. CUDA devices)
+        each prefix is staged directly onto its device, round-robin by prefix
+        index, overlapping the checkpoint read with block compute; without it
+        prefixes land in host RAM. Memory use is bounded at roughly ``depth``
+        prefixes worth of tensors.
         """
         if self._prefetch_thread is not None:
             raise RuntimeError("prefetch already running; call stop_prefetch() first")
+        if stage_devices:
+            for d in stage_devices:
+                if torch.device(d).type == "meta":
+                    raise ValueError(
+                        f"invalid staging device {d!r}: meta tensors hold no data; "
+                        "use a real device (e.g. 'cpu' or 'cuda:k')"
+                    )
         self._prefetch_remaining = list(module_prefixes)
         self._prefetch_depth = max(1, int(depth))
         self._prefetch_stop = False
         self._prefetch_err = None
+        self._prefetch_stage_devices = (
+            [torch.device(d) for d in stage_devices] if stage_devices else None
+        )
 
         def _reader():
             try:
-                for prefix in module_prefixes:
+                for idx, prefix in enumerate(module_prefixes):
                     with self._prefetch_cond:
                         while len(self._prefetch_staged) >= self._prefetch_depth and not self._prefetch_stop:
                             self._prefetch_cond.wait()
@@ -145,10 +162,17 @@ class CheckpointStreamer:
                     names = self.names_under(prefix)
                     if not names:
                         raise KeyError(f"no checkpoint tensors under prefix {prefix!r}")
+                    stage_dev = (
+                        self._prefetch_stage_devices[idx % len(self._prefetch_stage_devices)]
+                        if self._prefetch_stage_devices
+                        else None
+                    )
                     for name in names:
                         if self._prefetch_stop:
                             return
                         tensor = self._read_tensor(name, self._prefetch_handles, self._prefetch_handle_order)
+                        if stage_dev is not None:
+                            tensor = tensor.to(stage_dev)
                         with self._prefetch_cond:
                             self._prefetch_cache[name] = tensor
                     with self._prefetch_cond:

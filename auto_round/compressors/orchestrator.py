@@ -338,6 +338,46 @@ class CompressionOrchestrator(BaseOrchestrator):
         return self._quantize_data_driven()
 
     @torch.no_grad()
+    def _resolve_stream_stage_devices(self):
+        """Resolve ``stream_prefetch_gpus`` into a list of staging devices.
+
+        Returns None for host-RAM staging (the default). "auto" uses every CUDA
+        device except the quant device (all of them when only one exists);
+        explicit lists accept ints (``cuda:k``), device strings, or torch.device.
+        GPU staging with a CPU quant device falls back to host RAM: blocks
+        would quantize on CPU, so VRAM staging buys nothing there.
+        """
+        value = getattr(self, "stream_prefetch_gpus", None)
+        if not value:
+            return None
+        quant_dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            if quant_dev.type != "cuda":
+                logger.warning("[stream] stream_prefetch_gpus='auto' ignored: quant device is %s, not CUDA", quant_dev)
+                return None
+            n_gpu = torch.cuda.device_count()
+            if n_gpu == 0:
+                logger.warning("[stream] stream_prefetch_gpus='auto' ignored: no CUDA devices visible")
+                return None
+            devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
+        else:
+            devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
+            if quant_dev.type != "cuda" and any(d.type == "cuda" for d in devices):
+                logger.warning(
+                    "[stream] GPU staging devices ignored with CPU quant device %s; using host RAM", quant_dev
+                )
+                return None
+        for d in devices:
+            if d.type == "meta":
+                raise ValueError(f"invalid staging device {d}: meta tensors hold no data")
+        depth = int(getattr(self, "stream_prefetch", 0) or 0)
+        logger.info(
+            "[stream] staging %d block(s) deep on %s; blocks quantize in place (round-robin homes)",
+            depth,
+            [str(d) for d in devices],
+        )
+        return devices or None
+
     def _quantize_zero_shot(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Zero-shot (RTN) quantization path — no calibration data needed.
 
@@ -381,12 +421,15 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         all_blocks = self.quant_block_list or get_block_names(self.model)
 
-        # Prefetch pipeline: a background reader stages upcoming blocks into
-        # host RAM while the current one quantizes, hiding the disk read.
+        # Prefetch pipeline: a background reader stages upcoming blocks ahead
+        # of the quantize loop. With staging devices the blocks land directly
+        # on those devices (round-robin by block index) and are quantized in
+        # place there; otherwise they wait in host RAM.
         prefetch_depth = int(getattr(self, "stream_prefetch", 0) or 0)
+        stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and prefetch_depth > 0) else None
         if streamer is not None and prefetch_depth > 0:
             flat_prefixes = [name for group in all_blocks for name in group]
-            streamer.start_prefetch(flat_prefixes, depth=prefetch_depth)
+            streamer.start_prefetch(flat_prefixes, depth=prefetch_depth, stage_devices=stage_devices)
 
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         _zs_block_idx = 0
@@ -397,7 +440,12 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                 # ── Infrastructure: materialize ───────────────────────────
                 if streamer is not None:
-                    streamer.load_module_(block, block_name, device=str(self.device))
+                    if stage_devices:
+                        # round-robin home: the block was staged here, quantize in place
+                        load_device = stage_devices[_zs_block_idx % len(stage_devices)]
+                    else:
+                        load_device = str(self.device)
+                    streamer.load_module_(block, block_name, device=load_device)
                 materialize_model_(block)
 
                 # ── Pure algorithm ────────────────────────────────────────

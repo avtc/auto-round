@@ -31,6 +31,7 @@ _ENTRY_COMPRESSOR_KWARGS = {
     "layerwise_rotation",
     "stream_checkpoint",
     "stream_prefetch",
+    "stream_prefetch_gpus",
 }
 _ENTRY_BASE_KWARGS = {
     "format",
