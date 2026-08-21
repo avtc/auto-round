@@ -16,6 +16,8 @@
 import json
 import os
 
+import time
+
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -102,6 +104,84 @@ class TestCheckpointStreamer:
         assert torch.equal(streamer.fetch("x.weight"), t["x.weight"])
 
 
+    def test_prefetch_serves_cached_tensors(self, tmp_path):
+        """Prefetched tensors are served from the host-RAM cache and match disk."""
+        torch.manual_seed(2)
+        tensors = {
+            "blk.a.weight": torch.randn(4, 8),
+            "blk.b.weight": torch.randn(4, 4),
+            "blk.c.weight": torch.randn(8, 2),
+        }
+        path = _make_sharded_checkpoint(
+            tmp_path, {"model-00001-of-00002.safetensors": {"blk.a.weight": tensors["blk.a.weight"],
+                                                       "blk.b.weight": tensors["blk.b.weight"]},
+                       "model-00002-of-00002.safetensors": {"blk.c.weight": tensors["blk.c.weight"]}}
+        )
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["blk"], depth=1)
+        try:
+            deadline = time.monotonic() + 10.0
+            while streamer.prefetch_pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not streamer.prefetch_pending(), "prefetch did not finish"
+            for name, ref in tensors.items():
+                assert torch.equal(streamer.fetch(name), ref)
+            assert not streamer._prefetch_cache  # fully consumed
+        finally:
+            streamer.stop_prefetch()
+        # after stop, plain disk reads still work
+        assert torch.equal(streamer.fetch("blk.a.weight"), tensors["blk.a.weight"])
+
+    def test_prefetch_depth_and_consumption(self, tmp_path):
+        """The reader keeps at most ``depth`` prefixes staged ahead and releases
+        a slot only after the consumer reports the prefix consumed."""
+        torch.manual_seed(3)
+        shards = {}
+        for i in range(4):
+            shards[f"model-{i:05d}.safetensors"] = {f"b{i}.w.weight": torch.randn(2, 2)}
+        path = _make_sharded_checkpoint(tmp_path, shards)
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=1)
+
+        def wait_staged(prefix):
+            deadline = time.monotonic() + 10.0
+            while prefix not in streamer._prefetch_staged and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert prefix in streamer._prefetch_staged, f"{prefix} never staged"
+
+        try:
+            wait_staged("b0")
+            time.sleep(0.2)  # a wrongly-unbounded reader would stage b1..b3 now
+            assert streamer._prefetch_staged == ["b0"], streamer._prefetch_staged
+            assert torch.equal(streamer.fetch("b0.w.weight"), shards["model-00000.safetensors"]["b0.w.weight"])
+            streamer.prefetch_consumed("b0")
+            for p in ("b1", "b2", "b3"):
+                wait_staged(p)
+                streamer.prefetch_consumed(p)
+            assert not streamer._prefetch_remaining and not streamer._prefetch_staged
+            assert not streamer._prefetch_cache
+        finally:
+            streamer.stop_prefetch()
+
+    def test_prefetch_error_surfaces(self, tmp_path):
+        """A reader failure is re-raised at the next fetch."""
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["missing"], depth=1)
+        try:
+            deadline = time.monotonic() + 10.0
+            while streamer.prefetch_error() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert streamer.prefetch_error() is not None, "reader failure not recorded"
+            with pytest.raises(RuntimeError, match="prefetch"):
+                streamer.fetch("m.w.weight")
+        finally:
+            streamer.stop_prefetch()
+
+
+
+
+
 @pytest.mark.slow
 class TestStreamQuantizeEquivalence:
     """stream_checkpoint=True must produce the same export as the normal flow."""
@@ -138,7 +218,7 @@ class TestStreamQuantizeEquivalence:
         return str(d)
 
     @staticmethod
-    def _quantize(model_path, out_dir, stream):
+    def _quantize(model_path, out_dir, stream, stream_prefetch=0):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.algorithms.transforms.presinq import PreSINQConfig
         from auto_round.autoround import AutoRound
@@ -149,6 +229,7 @@ class TestStreamQuantizeEquivalence:
             alg_configs=[PreSINQConfig(group_size=16, n_iter=2, n_repeat=1), RTNConfig(group_size=16, disable_opt_rtn=False)],
             layerwise_rotation=True,
             stream_checkpoint=stream,
+            stream_prefetch=stream_prefetch,
             format="auto_round",
             disable_model_free=True,
             device_map="cpu",
@@ -251,3 +332,34 @@ class TestStreamQuantizeEquivalence:
         assert so and set(so) == set(sp)
         differing = [k for k in so if not torch.equal(so[k], sp[k])]
         assert differing, "opt-RTN clip search did not change any scales under stream_checkpoint"
+
+    def test_prefetched_export_matches_streamed(self, tiny_checkpoint, tmp_path):
+        """stream_prefetch only changes WHERE the tensors come from (host-RAM
+        cache instead of a synchronous disk read); the exported checkpoint must
+        stay bit-identical to the un-prefetched streaming run."""
+        import shutil
+
+        ck_a = str(tmp_path / "ck_a")
+        ck_b = str(tmp_path / "ck_b")
+        shutil.copytree(tiny_checkpoint, ck_a)
+        shutil.copytree(tiny_checkpoint, ck_b)
+        plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
+        prefetched = self._quantize(ck_b, str(tmp_path / "prefetched"), stream=True, stream_prefetch=1)
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        t_plain, t_prefetched = load_all(plain), load_all(prefetched)
+        assert set(t_plain) == set(t_prefetched)
+        for k in t_plain:
+            assert torch.equal(t_plain[k], t_prefetched[k]), f"tensor {k} differs under prefetch"
+

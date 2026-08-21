@@ -328,6 +328,9 @@ class BaseOrchestrator(object):
         # model (meta-device load + per-block tensor streaming + immediate
         # saving). For models far larger than host RAM.
         self.stream_checkpoint = kwargs.pop("stream_checkpoint", False)
+        # Blocks staged into host RAM ahead of the quantize loop by a
+        # background reader (stream_checkpoint only); 0 disables prefetch.
+        self.stream_prefetch = kwargs.pop("stream_prefetch", 0)
 
         # ``stream_checkpoint`` handles its own block lifecycle (meta -> stream
         # -> quantize -> write -> meta), so the accelerate-style offloader

@@ -22,6 +22,7 @@ is one decoder block plus the streamed pass-through tensors.
 
 import json
 import os
+import threading
 from typing import Optional
 
 import torch
@@ -47,6 +48,19 @@ class CheckpointStreamer:
         self._open_handles: dict[str, object] = {}  # shard path -> safe_open handle
         self._open_order: list[str] = []
         self._max_open = 4
+
+        # Prefetch state: a background reader stages whole module prefixes into
+        # host RAM ahead of the consumer; fetch() serves from that cache first.
+        self._prefetch_cache: dict[str, torch.Tensor] = {}
+        self._prefetch_cond = threading.Condition()
+        self._prefetch_remaining: list[str] = []  # prefixes not yet consumed
+        self._prefetch_staged: list[str] = []  # staged, awaiting consumption
+        self._prefetch_depth = 0
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetch_stop = False
+        self._prefetch_err: Optional[BaseException] = None
+        self._prefetch_handles: dict[str, object] = {}  # reader-owned handle pool
+        self._prefetch_handle_order: list[str] = []
 
         index = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.exists(index):
@@ -83,47 +97,152 @@ class CheckpointStreamer:
         return os.path.join(self.model_path, shard_name)
 
     def _get_safe_open(self, shard_name: str):
-        """Bounded-cache ``safe_open`` handle per shard (shards are visited in
-        mostly-sequential order during block streaming)."""
-        if shard_name in self._open_handles:
-            return self._open_handles[shard_name]
+        """Bounded-cache ``safe_open`` handle per shard on the consumer pool
+        (shards are visited in mostly-sequential order during block streaming)."""
+        return self._get_safe_open_pooled(shard_name, self._open_handles, self._open_order)
+
+    def _get_safe_open_pooled(self, shard_name: str, handles: dict, order: list):
+        """Bounded-cache ``safe_open`` handle per shard on a caller-owned pool."""
+        if shard_name in handles:
+            return handles[shard_name]
         from safetensors import safe_open
 
         handle = safe_open(self._shard_path(shard_name), framework="pt", device="cpu")
-        self._open_handles[shard_name] = handle
-        self._open_order.append(shard_name)
-        while len(self._open_order) > self._max_open:
-            old = self._open_order.pop(0)
-            h = self._open_handles.pop(old, None)
+        handles[shard_name] = handle
+        order.append(shard_name)
+        while len(order) > self._max_open:
+            old = order.pop(0)
+            h = handles.pop(old, None)
             if h is not None:
                 h.__exit__(None, None, None)
         return handle
 
+    # ── Prefetch ─────────────────────────────────────────────────────────────
+
+    def start_prefetch(self, module_prefixes: list, depth: int = 1) -> None:
+        """Stream whole module prefixes into host RAM on a background thread.
+
+        The reader stages prefixes in visit order and keeps at most ``depth``
+        staged-but-unconsumed prefixes beyond the current one; the consumer
+        releases a prefix with :meth:`prefetch_consumed`. Host RAM use is
+        bounded at roughly (depth + 1) prefixes worth of tensors.
+        """
+        if self._prefetch_thread is not None:
+            raise RuntimeError("prefetch already running; call stop_prefetch() first")
+        self._prefetch_remaining = list(module_prefixes)
+        self._prefetch_depth = max(1, int(depth))
+        self._prefetch_stop = False
+        self._prefetch_err = None
+
+        def _reader():
+            try:
+                for prefix in module_prefixes:
+                    with self._prefetch_cond:
+                        while len(self._prefetch_staged) >= self._prefetch_depth and not self._prefetch_stop:
+                            self._prefetch_cond.wait()
+                    if self._prefetch_stop:
+                        return
+                    names = self.names_under(prefix)
+                    if not names:
+                        raise KeyError(f"no checkpoint tensors under prefix {prefix!r}")
+                    for name in names:
+                        if self._prefetch_stop:
+                            return
+                        tensor = self._read_tensor(name, self._prefetch_handles, self._prefetch_handle_order)
+                        with self._prefetch_cond:
+                            self._prefetch_cache[name] = tensor
+                    with self._prefetch_cond:
+                        self._prefetch_staged.append(prefix)
+            except BaseException as e:  # surfaced at the next fetch
+                self._prefetch_err = e
+            finally:
+                self._close_prefetch_handles()
+
+        self._prefetch_thread = threading.Thread(target=_reader, daemon=True, name="ckpt-prefetch")
+        self._prefetch_thread.start()
+
+    def prefetch_pending(self) -> bool:
+        """Whether the reader has work left (not yet joined/stopped)."""
+        thread = self._prefetch_thread
+        return thread is not None and thread.is_alive() and self._prefetch_err is None
+
+    def prefetch_error(self) -> Optional[BaseException]:
+        return self._prefetch_err
+
+    def prefetch_consumed(self, prefix: str) -> None:
+        """Mark a prefix consumed: drop any unconsumed leftovers and release
+        the staging slot so the reader can proceed."""
+        with self._prefetch_cond:
+            for name in [n for n in self._prefetch_cache if n == prefix or n.startswith(prefix + ".")]:
+                del self._prefetch_cache[name]
+            for lst in (self._prefetch_remaining, self._prefetch_staged):
+                if prefix in lst:
+                    lst.remove(prefix)
+            self._prefetch_cond.notify_all()
+
+    def stop_prefetch(self) -> None:
+        """Signal the reader to stop, join it, and clear the staging cache."""
+        if self._prefetch_thread is None:
+            return
+        with self._prefetch_cond:
+            self._prefetch_stop = True
+            self._prefetch_cond.notify_all()
+        self._prefetch_thread.join()
+        self._prefetch_thread = None
+        with self._prefetch_cond:
+            self._prefetch_cache.clear()
+
+    def _prefetch_pop(self, name: str) -> Optional[torch.Tensor]:
+        if self._prefetch_err is not None:
+            raise RuntimeError(f"checkpoint prefetch failed: {self._prefetch_err!r}") from self._prefetch_err
+        if not self._prefetch_cache:
+            return None
+        with self._prefetch_cond:
+            return self._prefetch_cache.pop(name, None)
+
+    def _close_prefetch_handles(self) -> None:
+        for handle in self._prefetch_handles.values():
+            if hasattr(handle, "__exit__"):
+                try:
+                    handle.__exit__(None, None, None)
+                except Exception:  # pragma: no cover - best effort
+                    pass
+        self._prefetch_handles.clear()
+        self._prefetch_handle_order.clear()
+
     def fetch(self, name: str, device: Optional[str] = None) -> torch.Tensor:
-        """Read one tensor from the checkpoint (CPU unless ``device`` given)."""
+        """Read one tensor (CPU unless ``device`` given); prefetched tensors
+        are served from the host-RAM cache."""
+        tensor = self._prefetch_pop(name)
+        if tensor is None:
+            tensor = self._read_tensor(name, self._open_handles, self._open_order)
+        if device is not None:
+            tensor = tensor.to(device)
+        return tensor
+
+    def _read_tensor(self, name: str, handles: dict, order: list) -> torch.Tensor:
+        """Read one tensor through a caller-owned handle pool."""
         if name not in self.weight_map:
             raise KeyError(f"Tensor {name!r} not present in the checkpoint index.")
         shard = self.weight_map[name]
         if self._format == "safetensors":
-            tensor = self._get_safe_open(shard).get_tensor(name)
+            tensor = self._get_safe_open_pooled(shard, handles, order).get_tensor(name)
         else:
             # .bin shards: load (mmap-free) and keep a one-shard cache — shard
             # granularity is coarse for pickle checkpoints, but such shards are
             # also typically written sequentially.
             cache_key = f"__bin__{shard}"
-            if cache_key not in self._open_handles:
+            if cache_key not in handles:
                 try:
                     data = torch.load(self._shard_path(shard), map_location="cpu", weights_only=True)
                 except TypeError:  # older torch
                     data = torch.load(self._shard_path(shard), map_location="cpu")  # nosec
-                self._open_handles[cache_key] = data
-                self._open_order.append(cache_key)
-                while len(self._open_order) > self._max_open:
-                    old = self._open_order.pop(0)
-                    self._open_handles.pop(old, None)
-            tensor = self._open_handles[cache_key][name]
-        if device is not None:
-            tensor = tensor.to(device)
+                handles[cache_key] = data
+                order.append(cache_key)
+                while len(order) > self._max_open:
+                    old = order.pop(0)
+                    handles.pop(old, None)
+            tensor = handles[cache_key][name]
         return tensor
 
     def names_under(self, prefix: str) -> list[str]:
@@ -182,9 +301,12 @@ class CheckpointStreamer:
             loaded.append(name)
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
+        if self._prefetch_thread is not None:
+            self.prefetch_consumed(prefix)
         return loaded
 
     def close(self) -> None:
+        self.stop_prefetch()
         for handle in self._open_handles.values():
             if hasattr(handle, "__exit__"):
                 try:
