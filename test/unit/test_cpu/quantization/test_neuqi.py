@@ -35,6 +35,36 @@ def _mse(x, y):
 
 
 class TestNeuqiSearch:
+    def test_hist_sweep_matches_brute_force(self):
+        """The histogram zero-point sweep selects (scale, zp) with losses equal
+        to the brute-force grid within float noise; near-ties may flip but both
+        choices are optimal to ~1e-5 relative loss."""
+        from auto_round.data_type.neuqi import _best_zp_for_scale, _loss_all_zp_hist
+
+        torch.manual_seed(5)
+        maxq = 15
+        for qw_on in (True, False):
+            data = torch.randn(4096, 64) * 0.05
+            qw = torch.rand(4096, 64) + 0.1 if qw_on else None
+            scale = data.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) * (torch.rand(4096, 1) * 1.4 + 0.05)
+            bl, bz = _best_zp_for_scale(data, qw, scale, maxq)
+            hl, hz = _loss_all_zp_hist(data, qw, scale, maxq)
+            assert torch.allclose(bl, hl, rtol=1e-4, atol=1e-8)
+            # wherever they disagree the histogram choice must be no worse
+            assert (hl <= bl + 1e-4 * bl.abs() + 1e-8).all().item()
+
+    def test_brute_force_available_via_env(self, monkeypatch):
+        """AR_NEUQI_SWEEP=brute restores the reference grid sweep."""
+        import auto_round.data_type.neuqi as N
+
+        monkeypatch.setattr(N.envs, "AR_NEUQI_SWEEP", "brute")
+        torch.manual_seed(5)
+        data = torch.randn(512, 64) * 0.05
+        qw = torch.rand(512, 64) + 0.1
+        scale, zp = N.neuqi_search_scale_zero(data, bits=4, qw=qw, coarse_n=4, fine_n=3)
+        assert scale.shape == (512, 1) and zp.shape == (512, 1)
+        assert (zp >= 0).all() and (zp <= 15).all()
+
     def test_beats_minmax_on_heavy_tailed_data(self):
         data = _heavy_tailed_data()
         bits, group_size = 4, 128
