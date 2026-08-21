@@ -74,7 +74,10 @@ class FP8Format(OutputFormat):
 
             ignored_layers = []
             for layer_name, cfg in layer_config.items():
-                if cfg["bits"] >= 16 and cfg["act_bits"] >= 16:
+                # partial overrides fall back to the serialized scheme values
+                fb_bits = serialization_dict.get("bits", 4)
+                fb_act = serialization_dict.get("act_bits", 16)
+                if cfg.get("bits", fb_bits) >= 16 and cfg.get("act_bits", fb_act) >= 16:
                     ignored_layers.append(layer_name)
             if len(ignored_layers) > 0:
                 serialization_dict["ignored_layers"] = ignored_layers

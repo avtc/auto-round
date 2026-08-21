@@ -63,9 +63,10 @@ class AutoRoundFormat(OutputFormat):
                 if ctx.layer_config is None:
                     enable_awq = True
                 else:
-                    enable_awq = all(
-                        config["bits"] == scheme.bits or config["bits"] >= 16 for config in ctx.layer_config.values()
-                    )
+                    # layer_config entries are partial overrides: a missing bits key means
+                    # "use the global scheme" (scheme.bits)
+                    layer_bits = (config.get("bits", scheme.bits) for config in ctx.layer_config.values())
+                    enable_awq = all(bits == scheme.bits or bits >= 16 for bits in layer_bits)
                 if enable_awq:
                     self.backend = AutoAWQFormat("auto_round:auto_awq", scheme, ctx)
             elif scheme.is_nv_fp() or scheme.is_mx_fp() or scheme.data_type == BackendDataType.NVFP4_E5M3.value:
