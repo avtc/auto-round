@@ -148,13 +148,22 @@ class TestExpertBatching:
         assert sorted(id(m) for m in chunked) == sorted(id(m) for m in targets)
         assert not singles
 
-    def test_batches_are_scheduled_as_single_jobs(self):
+    def test_batches_are_scheduled_as_single_jobs(self, caplog):
+        import logging
+
         q = _RecordingQuantizer(RTNConfig(), batch=True)
-        with mock.patch("torch.cuda.device_count", return_value=2):
-            q._quantize_targets(self._experts(4) + _dense_targets(2))
+        ar_logger = logging.getLogger("autoround")
+        ar_logger.addHandler(caplog.handler)  # autoround logger has propagate=False
+        try:
+            with mock.patch("torch.cuda.device_count", return_value=2):
+                q._quantize_targets(self._experts(4) + _dense_targets(2))
+        finally:
+            ar_logger.removeHandler(caplog.handler)
         # 2-GPU hint splits the 4-expert group into 2 chunks of 2 (one job each)
         assert len(q.batches) == 2 and sorted(len(b[0]) for b in q.batches) == [2, 2]
         assert len(q.calls) == 2  # dense modules as singles
+        # the fan-out timing summary must be logged
+        assert any("fan-out done in" in r.getMessage() for r in caplog.records)
 
     def test_batched_matches_per_module_search(self):
         """Stacked expert search must reproduce per-module results exactly."""

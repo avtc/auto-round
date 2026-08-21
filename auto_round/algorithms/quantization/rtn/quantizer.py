@@ -236,9 +236,13 @@ class OptimizedRTNQuantizer(RTNQuantizer):
 
         max_elems = 2**28  # ~1 GiB fp32 stacked weights per call
         per_call = max(1, max_elems // m0.weight.numel())
+        import time as _time
+
+        phase_log = getattr(self, "_expert_phase_log", None)
         for s in range(0, len(mods), per_call):
             chunk = mods[s : s + per_call]
             dev = torch.device(device)
+            t0 = _time.perf_counter()
             weights = torch.cat([m.weight.data.reshape(m.weight.shape[0], -1) for m in chunk], dim=0).to(dev)
             imat_rows = []
             for m in chunk:
@@ -247,6 +251,9 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                 else:
                     imat_rows.append(torch.ones(m.weight.shape, device=dev))
             imat = torch.cat(imat_rows, dim=0)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(dev)
+            t1 = _time.perf_counter()
 
             qdq, scale, zp = quant_tensor_opt_rtn_asym(
                 weights,
@@ -258,6 +265,9 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                 scale_dtype=getattr(m0, "scale_dtype", torch.float16),
             )
 
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(dev)
+            t2 = _time.perf_counter()
             row_w = row_g = 0
             with torch.no_grad():
                 for m in chunk:
@@ -272,6 +282,12 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                     m.weight.grad = None
                     row_w += out
                     row_g += n_groups_m
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(dev)
+            t3 = _time.perf_counter()
+            if phase_log is not None:
+                # (stack+imatrix hop, search, writeback) per chunk-batch
+                phase_log.append((t1 - t0, t2 - t1, t3 - t2))
         return True
 
     def _quantize_targets(self, targets: list) -> None:
@@ -324,14 +340,50 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         )
         from concurrent.futures import ThreadPoolExecutor
 
+        import time as _time
+
+        self._expert_phase_log = []
+        job_durations = []  # (seconds, kind, name) appended by worker threads
+
+        def _timed(kind, name, fn, *args, **kwargs):
+            t0 = _time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                job_durations.append((_time.perf_counter() - t0, kind, name))
+
+        t_wall = _time.perf_counter()
         jobs = [("batch", b) for b in batches] + [("single", m) for m in targets]
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = []
             for i, (kind, payload) in enumerate(jobs):
                 dev = f"cuda:{i % n_workers}"
+                name = getattr(payload[0] if kind == "batch" else payload, "global_name", "?")
                 if kind == "batch":
-                    futures.append(pool.submit(_run_batch, payload, dev))
+                    futures.append(pool.submit(_timed, kind, f"{name} x{len(payload)}", _run_batch, payload, dev))
                 else:
-                    futures.append(pool.submit(self.quantize_layer_outside_block, payload, device_override=dev))
+                    futures.append(
+                        pool.submit(_timed, kind, name, self.quantize_layer_outside_block, payload, device_override=dev)
+                    )
             for f in futures:
                 f.result()  # propagate the first worker exception
+        elapsed = _time.perf_counter() - t_wall
+        durations = sorted(job_durations, reverse=True)
+        slowest = ", ".join(f"{n} {d:.1f}s" for d, k, n in durations[:3])
+        phases = getattr(self, "_expert_phase_log", None) or []
+        if phases:
+            stack_t = sum(p[0] for p in phases)
+            search_t = sum(p[1] for p in phases)
+            write_t = sum(p[2] for p in phases)
+            logger.info(
+                "[OptRTN] fan-out done in %.1fs | slowest jobs: %s | expert-batch (summed over jobs): "
+                "stack+hop %.1fs search %.1fs writeback %.1fs",
+                elapsed,
+                slowest,
+                stack_t,
+                search_t,
+                write_t,
+            )
+        else:
+            logger.info("[OptRTN] fan-out done in %.1fs | slowest jobs: %s", elapsed, slowest)
+        self._expert_phase_log = None
