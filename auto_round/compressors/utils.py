@@ -543,7 +543,9 @@ def set_layer_config(
         val = layer_config.pop(name)
         regex_config[name] = val  # keep regex config
         for match in matched:
-            layer_config[match] = val
+            # independent copy per match: the shape-divisibility force (bits=16)
+            # must not drag sibling layers that share the regex
+            layer_config[match] = copy.deepcopy(val)
 
     # 7. lm_head
     lm_head_name = get_lm_head_name(model)
