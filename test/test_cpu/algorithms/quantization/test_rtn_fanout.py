@@ -165,6 +165,30 @@ class TestExpertBatching:
         # the fan-out timing summary must be logged
         assert any("fan-out done in" in r.getMessage() for r in caplog.records)
 
+    def test_batched_matches_per_module_search_no_imatrix(self):
+        """imatrix-free (uniform weight) batching skips materializing a ones
+        tensor and must stay bit-identical to the per-module search."""
+        torch.manual_seed(11)
+        mods = self._experts(3, imatrix=False)
+        assert not any(hasattr(m, "imatrix") for m in mods)
+        copies = [_mk_expert("layers.1.mlp", i, imatrix=False) for i in range(3)]
+        for m, c in zip(mods, copies):
+            with torch.no_grad():
+                c.weight.copy_(m.weight)
+
+        q = _RecordingQuantizer(RTNConfig())
+        assert q._quantize_expert_batch(mods, "cpu") is True
+
+        from auto_round.data_type.neuqi import quant_tensor_opt_rtn_asym
+
+        for m, c in zip(mods, copies):
+            qdq, scale, zp = quant_tensor_opt_rtn_asym(
+                c.weight.data, bits=c.bits, group_size=c.group_size, v=0.0, imatrix=None
+            )
+            assert torch.allclose(m.weight.data, qdq, atol=1e-6), m.global_name
+            assert torch.allclose(m.scale.float(), scale.reshape(m.weight.shape[0], -1).float(), atol=1e-6)
+            assert torch.allclose(m.zp.float(), zp.reshape(m.weight.shape[0], -1).float(), atol=1e-6)
+
     def test_batched_matches_per_module_search(self):
         """Stacked expert search must reproduce per-module results exactly."""
         torch.manual_seed(7)

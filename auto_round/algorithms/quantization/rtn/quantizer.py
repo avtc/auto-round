@@ -266,9 +266,13 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             for m in chunk:
                 if hasattr(m, "imatrix"):
                     imat_rows.append(m.imatrix.to(dev).unsqueeze(0).expand(m.weight.shape[0], -1))
-                else:
-                    imat_rows.append(torch.ones(m.weight.shape, device=dev))
-            imat = torch.cat(imat_rows, dim=0)
+            if imat_rows and len(imat_rows) < len(chunk):  # mixed: fill gaps uniformly
+                it = iter(imat_rows)
+                imat_rows = [next(it) if hasattr(m, "imatrix") else torch.ones(m.weight.shape, device=dev) for m in chunk]
+            # uniform weighting needs no materialized tensor: qw=None is
+            # bit-identical to a full ones imatrix and skips ~module-size
+            # allocations per expert
+            imat = torch.cat(imat_rows, dim=0) if imat_rows else None
             if torch.cuda.is_available():
                 torch.cuda.synchronize(dev)
             t1 = _time.perf_counter()
