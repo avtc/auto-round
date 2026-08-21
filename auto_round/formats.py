@@ -186,7 +186,7 @@ def _check_divisible_by_32(ar):
                 if m.weight.shape[0] % 32 or m.weight.shape[1] % 32:
                     if ar.layer_config is None:
                         ar.layer_config = {}
-                    if ar.layer_config.get(n) is not None and ar.layer_config[n]["bits"] >= 16:
+                    if ar.layer_config.get(n) is not None and ar.layer_config[n].get("bits", ar.bits) >= 16:
                         continue
                     ar.layer_config.setdefault(n, copy.deepcopy(default_dict))
                     ar.layer_config[n].update({"bits": 16, "data_type": "fp", "fixed_by_user": True})
@@ -1062,7 +1062,9 @@ class FP8Format(OutputFormat):
 
             ignored_layers = []
             for layer_name, cfg in layer_config.items():
-                if cfg["bits"] >= 16 and cfg["act_bits"] >= 16:
+                # partial overrides fall back to the serialized scheme values
+                if cfg.get("bits", serialization_dict.get("bits", 4)) >= 16 and \
+                        cfg.get("act_bits", serialization_dict.get("act_bits", 16)) >= 16:
                     ignored_layers.append(layer_name)
             if len(ignored_layers) > 0:
                 serialization_dict["ignored_layers"] = ignored_layers
@@ -1172,9 +1174,10 @@ class AutoRoundFormat(OutputFormat):
                 if ar.layer_config is None:
                     enable_awq = True
                 else:
-                    enable_awq = all(
-                        config["bits"] == ar.bits or config["bits"] >= 16 for config in ar.layer_config.values()
-                    )
+                    # layer_config entries are partial overrides: a missing bits
+                    # key means "use the global scheme" (ar.bits)
+                    layer_bits = (config.get("bits", ar.bits) for config in ar.layer_config.values())
+                    enable_awq = all(bits == ar.bits or bits >= 16 for bits in layer_bits)
                 if enable_awq:
                     self.backend = AutoAWQFormat("auto_round:auto_awq", ar)
             elif is_nv_fp(ar.data_type) or is_mx_fp(ar.data_type):

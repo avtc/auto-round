@@ -326,6 +326,39 @@ class TestStreamQuantizeEquivalence:
             cs = json.load(f)
         assert cn == cs
 
+    def test_partial_layer_config_resolves_format(self, tiny_checkpoint, tmp_path):
+        """layer_config entries are partial overrides: unset keys fall back to
+        the global scheme. Format resolution must not assume every entry
+        carries the full key set — asym scheme (RTNConfig sym=False, the NeUQI
+        path) hits the AutoAWQ enablement check in formats.py, which raised
+        KeyError('bits') on partial entries (hy3 NeUQI-asym server run)."""
+        import shutil
+
+        ck = str(tmp_path / "ck_partial")
+        shutil.copytree(tiny_checkpoint, ck)
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.compressors.entry import AutoRound
+
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[RTNConfig(group_size=8, sym=False)],  # asym global scheme (NeUQI path)
+            layer_config={
+                ".*model.layers.0.": {"bits": 16, "data_type": "float"},
+                ".*shared_mlp": {"group_size": 8},  # partial: no bits key
+                ".*experts": {"group_size": 8},
+            },
+            layerwise_rotation=True,
+            stream_checkpoint=True,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.post_init()  # resolves formats; raised KeyError('bits') before the fix
+        assert ar.formats is not None
+
     def test_prefetched_export_matches_streamed(self, tiny_checkpoint, tmp_path):
         """stream_prefetch only changes WHERE the tensors come from (host-RAM
         cache instead of a synchronous disk read); the exported checkpoint must
