@@ -177,25 +177,25 @@ class TestCheckpointStreamer:
         assert torch.equal(streamer.fetch("blk.a.weight"), tensors["blk.a.weight"])
 
     def test_pick_stage_device_headroom(self, tmp_path, monkeypatch):
-        """Staging picks the first round-robin GPU above the headroom; when all
-        are below it returns None (caller waits for VRAM) instead of OOM-ing."""
+        """Staging needs block bytes + search headroom free; picks the first
+        round-robin GPU that qualifies, None when none does (caller waits)."""
         import auto_round.utils.checkpoint_streamer as cs
 
         gpu0, gpu1 = torch.device("cuda:0"), torch.device("cuda:1")
-        fake_free = {gpu0: 4 << 30, gpu1: 20 << 30}  # 4 GiB vs 20 GiB free
+        fake_free = {gpu0: 4 << 30, gpu1: 14 << 30}
         monkeypatch.setattr(cs, "device_free_bytes", lambda d: fake_free.get(torch.device(d)))
 
-        headroom = 8 << 30
-        # index 0 rotates to gpu0 first, skips it (4 < 8), picks gpu1
-        assert cs.pick_stage_device([gpu0, gpu1], 0, headroom) == gpu1
-        # index 1 rotates to gpu1 directly
-        assert cs.pick_stage_device([gpu0, gpu1], 1, headroom) == gpu1
+        headroom = 4 << 30
+        # an 8.5 GiB block needs 12.5 GiB: gpu0 (4) skipped, gpu1 (14) taken
+        assert cs.pick_stage_device([gpu0, gpu1], 0, 8 * 1024**3 + (512 << 20), headroom) == gpu1
+        # a small block fits gpu0 directly (4 GiB free >= 0 + 4 GiB headroom)
+        assert cs.pick_stage_device([gpu0, gpu1], 0, 0, headroom) == gpu0
         # non-CUDA devices report unknown free and are always eligible
         cpu = torch.device("cpu")
-        assert cs.pick_stage_device([cpu], 0, headroom) == cpu
-        # all GPUs below headroom -> None (no CPU fallback here)
+        assert cs.pick_stage_device([cpu], 0, 8 << 30, headroom) == cpu
+        # all GPUs below block+headroom -> None (no CPU fallback here)
         fake_free[gpu1] = 1 << 30
-        assert cs.pick_stage_device([gpu0, gpu1], 0, headroom) is None
+        assert cs.pick_stage_device([gpu0, gpu1], 0, 8 << 30, headroom) is None
 
     def test_prefetch_rescue_buffer_capped_at_one(self, tmp_path, monkeypatch):
         """With every GPU below the headroom the reader stages exactly ONE
@@ -213,7 +213,7 @@ class TestCheckpointStreamer:
         gpu = torch.device("cuda:0")
         state = {"free": 1 << 30}
         monkeypatch.setattr(cs, "device_free_bytes", lambda d: state["free"])
-        monkeypatch.setattr(cs.CheckpointStreamer, "_staging_headroom_bytes", 8 << 30)
+        monkeypatch.setattr(cs.CheckpointStreamer, "_staging_search_headroom", 4 << 30)
         # no CUDA locally: the device CHOICE is what matters, not the transfer
         monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: self)
 

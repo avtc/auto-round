@@ -56,6 +56,14 @@ def to_checkpoint_name(name: str) -> str:
     return name
 
 
+_DTYPE_BYTES = {
+    "BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
+    "I16": 2, "U16": 2, "F16": 2, "BF16": 2,
+    "I32": 4, "U32": 4, "F32": 4,
+    "I64": 8, "U64": 8, "F64": 8,
+}
+
+
 def device_free_bytes(device: torch.device) -> Optional[int]:
     """Free bytes on *device*; ``None`` when unknown (non-CUDA devices)."""
     if device.type != "cuda":
@@ -67,11 +75,10 @@ def device_free_bytes(device: torch.device) -> Optional[int]:
         return None
 
 
-def pick_stage_device(devices: list, index: int, headroom: int) -> Optional[torch.device]:
+def pick_stage_device(devices: list, index: int, needed_bytes: int, headroom: int) -> Optional[torch.device]:
     """Choose a staging device for prefix *index*, or ``None`` when no CUDA
-    device currently keeps ``headroom`` bytes free for the quantization
-    workspace (the tuning fan-out allocates multi-GB search batches beside
-    staged blocks).
+    device can hold ``needed_bytes`` while keeping ``headroom`` free for the
+    tuning fan-out's search batches.
 
     Walks the round-robin rotation first; callers decide how to react to
     ``None`` (wait for VRAM, or stage on host RAM when explicitly requested).
@@ -79,7 +86,7 @@ def pick_stage_device(devices: list, index: int, headroom: int) -> Optional[torc
     for k in range(len(devices)):
         d = torch.device(devices[(index + k) % len(devices)])
         free = device_free_bytes(d)
-        if free is None or free >= headroom:
+        if free is None or free >= needed_bytes + headroom:
             return d
     return None
 
@@ -174,24 +181,39 @@ class CheckpointStreamer:
 
     # ── Prefetch ─────────────────────────────────────────────────────────────
 
-    # Bytes kept free on each staging GPU for the quantization workspace
-    # (tuning fan-out allocates multi-GB search batches beside staged blocks).
-    _staging_headroom_bytes = 8 * 1024**3
+    # Bytes reserved per staging GPU for the tuning fan-out's share of the
+    # active block's search batches (chunked NeUQI stacks + intermediates).
+    _staging_search_headroom = 4 * 1024**3
 
-    def _wait_for_stage_device(self, index: int) -> Optional[torch.device]:
-        """Pick a staging device for prefix *index*, waiting for VRAM.
+    def _prefix_bytes_estimate(self, prefix: str) -> int:
+        """Exact staged size of the tensors under *prefix*, from shard metadata
+        (no tensor data is read)."""
+        import math
 
-        VRAM-first: returns the first round-robin GPU keeping the staging
-        headroom free. When no GPU has room, exactly ONE block may wait in
-        host RAM (rescue buffer, keeping some I/O overlap alive); further
-        blocks wait until VRAM frees or the rescue block is consumed.
+        total = 0
+        for name in self.names_under(prefix):
+            shard = self.weight_map[name]
+            h = self._get_safe_open_pooled(shard, self._prefetch_handles, self._prefetch_handle_order)
+            sl = h.get_slice(name)
+            total += math.prod(sl.get_shape()) * _DTYPE_BYTES.get(sl.get_dtype().upper(), 4)
+        return total
+
+    def _wait_for_stage_device(self, index: int, prefix: str) -> Optional[torch.device]:
+        """Pick a staging device for *prefix*, waiting for VRAM.
+
+        VRAM-first: a device qualifies when its free memory covers the block
+        (``needed_bytes``) plus the search headroom for the active layer's
+        tuning jobs. When no GPU qualifies, exactly ONE block may wait in host
+        RAM (rescue buffer, keeping some I/O overlap alive); further blocks
+        wait until VRAM frees or the rescue block is consumed.
         """
         devices = self._prefetch_stage_devices
-        headroom = int(getattr(self, "_staging_headroom_bytes", 0) or 0)
+        headroom = int(getattr(self, "_staging_search_headroom", 0) or 0)
+        needed = self._prefix_bytes_estimate(prefix) if devices else 0
         rescue_allowed = any(d.type == "cuda" for d in devices)
         rescue_logged = False
         while not self._prefetch_stop:
-            dev = pick_stage_device(devices, index, headroom)
+            dev = pick_stage_device(devices, index, needed, headroom)
             if dev is not None:
                 return dev
             if rescue_allowed:
@@ -200,14 +222,17 @@ class CheckpointStreamer:
                         self._prefetch_cpu_staged += 1
                         if not rescue_logged:
                             logger.info(
-                                "[stream] staging GPU(s) below %d GiB headroom; holding one block in host RAM",
+                                "[stream] no staging GPU has %d GiB free for a %d GiB block + %d GiB search headroom; "
+                                "holding one block in host RAM",
+                                (needed + headroom) // (1024**3),
+                                needed // (1024**3),
                                 headroom // (1024**3),
                             )
                             rescue_logged = True
                         return torch.device("cpu")
             if not rescue_logged and rescue_allowed:
                 logger.info(
-                    "[stream] staging GPU(s) below %d GiB headroom; waiting for VRAM", headroom // (1024**3)
+                    "[stream] staging GPUs below block+headroom watermarks; waiting for VRAM"
                 )
                 rescue_logged = True
             time.sleep(0.5)
@@ -259,7 +284,7 @@ class CheckpointStreamer:
                         raise KeyError(f"no checkpoint tensors under prefix {prefix!r}")
                     stage_dev = None
                     if self._prefetch_stage_devices:
-                        stage_dev = self._wait_for_stage_device(idx)
+                        stage_dev = self._wait_for_stage_device(idx, prefix)
                     if self._prefetch_stop:
                         return
                     for name in names:
