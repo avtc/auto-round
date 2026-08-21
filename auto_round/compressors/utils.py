@@ -146,6 +146,19 @@ def is_block_wfp8(ar_or_format: Callable) -> bool:
     )
 
 
+def resolve_block_replay_device(block_device, requested_device):
+    """Where a block replay should run.
+
+    A block resident on a CUDA device (e.g. a round-robin home GPU under
+    streaming) keeps its home: the (small) inputs move to the block rather
+    than the (multi-GB) block to the inputs. CPU-resident blocks defer to the
+    caller's device.
+    """
+    if block_device is not None and block_device.type == "cuda" and block_device != torch.device(requested_device):
+        return block_device
+    return torch.device(requested_device)
+
+
 def block_forward(
     block: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -171,6 +184,13 @@ def block_forward(
     """
     from auto_round.utils.model import to_device
 
+    # A block replaying on its own device (e.g. a round-robin home GPU under
+    # streaming) must receive its inputs there; moving the weights instead
+    # would defeat in-place quantization.
+    block_param = next(block.parameters(), None)
+    device = resolve_block_replay_device(
+        block_param.device if block_param is not None else None, device
+    )
     if input_ids.device != device:
         input_ids = to_device(input_ids, device)
         input_others = to_device(input_others, device)

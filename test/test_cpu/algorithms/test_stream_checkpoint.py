@@ -509,6 +509,17 @@ class TestStreamQuantizeEquivalence:
         with pytest.raises(ValueError, match="different model's tokenizer"):
             _check_ids_in_vocab(bad, 120832)
 
+    def test_resolve_block_replay_device(self):
+        """A CUDA-resident block keeps its home device for replays (inputs
+        follow the block); CPU-resident blocks defer to the caller."""
+        from auto_round.compressors.utils import resolve_block_replay_device as r
+
+        assert r(torch.device("cuda:1"), "cuda:0") == torch.device("cuda:1")
+        assert r(torch.device("cuda:0"), "cuda:0") == torch.device("cuda:0")
+        assert r(torch.device("cuda:2"), "cpu") == torch.device("cuda:2")
+        assert r(None, "cuda:0") == torch.device("cuda:0")
+        assert r(torch.device("cpu"), "cuda:0") == torch.device("cuda:0")  # cpu block defers
+
     def test_stream_calibration_matches_data_driven(self, tiny_checkpoint, tmp_path):
         """stream_calibration=True must reproduce the data-driven run exactly:
         the streaming pass forwards the same rows through the same block chain
