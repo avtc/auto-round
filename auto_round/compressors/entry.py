@@ -32,6 +32,8 @@ _ENTRY_COMPRESSOR_KWARGS = {
     "stream_checkpoint",
     "stream_prefetch",
     "stream_prefetch_gpus",
+    "stream_calibration",
+    "stream_calibration_rows",
 }
 _ENTRY_BASE_KWARGS = {
     "format",
