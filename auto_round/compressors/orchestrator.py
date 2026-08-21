@@ -381,6 +381,13 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         all_blocks = self.quant_block_list or get_block_names(self.model)
 
+        # Prefetch pipeline: a background reader stages upcoming blocks into
+        # host RAM while the current one quantizes, hiding the disk read.
+        prefetch_depth = int(getattr(self, "stream_prefetch", 0) or 0)
+        if streamer is not None and prefetch_depth > 0:
+            flat_prefixes = [name for group in all_blocks for name in group]
+            streamer.start_prefetch(flat_prefixes, depth=prefetch_depth)
+
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         _zs_block_idx = 0
         for block_names in all_blocks:
@@ -449,6 +456,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 pbar.update(1)
 
         # ── Pipeline lifecycle: model-level teardown (also finalizes rotation) ─
+        if streamer is not None and prefetch_depth > 0:
+            streamer.stop_prefetch()
         self.alg_composer.finalize_run()
 
         cnt = 1

@@ -30,6 +30,7 @@ _ENTRY_COMPRESSOR_KWARGS = {
     "to_quant_block_names",
     "layerwise_rotation",
     "stream_checkpoint",
+    "stream_prefetch",
 }
 _ENTRY_BASE_KWARGS = {
     "format",
