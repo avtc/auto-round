@@ -1,0 +1,234 @@
+#
+# Copyright 2025 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+"""Streaming calibration cache: per-block FP inputs without a full model load.
+
+Runs before the zero-shot quantization loop when ``stream_calibration=True``:
+calibration rows are pushed through the model one block at a time (blocks
+streamed onto the compute device, hidden states chained block-to-block), and
+each block's FP input tensors plus the forward kwargs are cached on the host —
+the same structure the data-driven calibrator produces. The quantization loop
+then replays the cached inputs through each block via the standard
+``compress_block`` path: transforms (rotation, PreSINQ) run first and the
+imatrix hooks fire on the replayed inputs, exactly matching the data-driven
+semantics for identical rows.
+
+Scope: block-local modules only. Modules outside the streamed blocks (e.g.
+lm_head) receive no cached inputs; the quantizer falls back to unweighted
+search there.
+
+Memory: the cache holds one tensor per row per block on the host
+(rows x blocks x seqlen x hidden). ``max_rows`` bounds it by subsampling —
+the imatrix is a column statistic, so a modest row count is statistically
+sufficient.
+"""
+
+import inspect
+
+import torch
+
+from auto_round.logger import logger
+
+
+def build_causal_attention_mask(input_ids):
+    """4D boolean attention mask (True = allowed) combining the causal
+    structure with the data-driven calibration key mask (all ones, trailing
+    repeated tokens masked, last position always masked - mirrors
+    calibration/llm.py and the model-level causal-mask preparation)."""
+    seq_len = input_ids.shape[-1]
+    mask_2d = torch.ones_like(input_ids, dtype=torch.long)
+    batch_size = input_ids.shape[0]
+    for i in range(batch_size):
+        last_token = input_ids[i, -1]
+        j = seq_len - 2
+        repeated = False
+        while j >= 0 and input_ids[i, j] == last_token:
+            repeated = True
+            mask_2d[i, j] = 0
+            j -= 1
+        if repeated:
+            mask_2d[i, -1] = 0
+    mask_2d[:, -1] = 0
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+    return causal[None, None] & (mask_2d != 0)[:, None, None, :]
+
+
+def _find_embedding(model, streamer):
+    """First embedding module whose weight is checkpoint-backed."""
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Embedding) and f"{name}.weight" in streamer.weight_map:
+            return name, module
+    return None, None
+
+
+def _ensure_real_rotary(rotary, cfg, device):
+    """Return a rotary module with real tensors on *device*.
+
+    A meta-built model leaves computed buffers such as ``inv_freq`` on meta;
+    meta ops are lazy, so a forward through such a module silently produces
+    meta cos/sin that detonate at the first real consumer. Rebuild the module
+    on the device when any of its tensors are meta; move it when real.
+    """
+    tensors = list(rotary.parameters()) + list(rotary.buffers())
+    if not any(t.device.type == "meta" for t in tensors):
+        return rotary.to(device)
+
+    text_cfg = getattr(cfg, "text_config", None) or cfg
+    cls = type(rotary)
+    candidates = []
+    if hasattr(text_cfg, "rope_theta"):
+        candidates.append(lambda: cls(config=text_cfg))
+    inv_freq = getattr(rotary, "inv_freq", None)
+    if inv_freq is not None and inv_freq.device.type == "meta" and inv_freq.ndim == 1:
+        d = int(inv_freq.shape[0]) * 2
+        base = getattr(rotary, "base", None) or getattr(text_cfg, "rope_theta", 10000.0)
+        max_pos = getattr(text_cfg, "max_position_embeddings", 262144)
+
+        def _manual():
+            import torch.nn as nn
+
+            mod = cls.__new__(cls)  # bypass __init__ device/context quirks
+            nn.Module.__init__(mod)
+            freqs = 1.0 / (base ** (torch.arange(0, d, 2, dtype=torch.float32, device=device) / d))
+            mod.register_buffer("inv_freq", freqs, persistent=False)
+            mod.base = base
+            mod.max_seq_len_cached = max_pos
+            return mod
+
+        if getattr(text_cfg, "rope_scaling", None) or getattr(text_cfg, "rope_parameters", None):
+            candidates.clear()  # manual formula ignores rope scaling: unsafe
+            candidates.append(lambda: cls(config=text_cfg))
+        else:
+            candidates.append(_manual)
+    for make in candidates:
+        try:
+            fresh = make().to(device)
+            fresh_tensors = list(fresh.parameters()) + list(fresh.buffers())
+            if not any(t.device.type == "meta" for t in fresh_tensors):
+                return fresh
+        except Exception:  # try the next construction pattern
+            continue
+    raise RuntimeError(
+        "rotary_emb has meta tensors and could not be rebuilt on the device; "
+        "construct it manually for this architecture"
+    )
+
+
+def _find_model_rotary(model, cfg, device):
+    """Locate the model-level rotary module (outside the blocks) and ensure it
+    holds real tensors; returns the module or None."""
+    base = getattr(model, "model", model)
+    rotary = getattr(base, "rotary_emb", None)
+    if rotary is None:
+        for name, mod in model.named_modules():
+            leaf = not list(mod.children())
+            if leaf and "rotary" in type(mod).__name__.lower():
+                rotary = mod
+                break
+    if rotary is None:
+        return None
+    return _ensure_real_rotary(rotary, cfg, device)
+
+
+def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0):
+    """Flatten the calibration dataset into a list of input_ids batches
+    (tensors), applying the data-driven skip rule (shorter than seqlen) and an
+    optional row cap."""
+    rows = []
+    if isinstance(dataset, str):
+        from auto_round.calib_dataset import get_dataloader
+
+        dataset = get_dataloader(tokenizer, seqlen, dataset.replace(" ", ""), 1234, 1, len(dataset))
+    for data in dataset:
+        if data.__class__.__name__ == "BatchEncoding":
+            data = data.data
+        if isinstance(data, torch.Tensor):
+            input_ids = data
+        elif isinstance(data, (tuple, list)):
+            input_ids = data[0]
+        else:
+            if "input_ids" not in data:
+                continue
+            input_ids = data["input_ids"]
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids["input_ids"] if isinstance(input_ids, dict) else input_ids
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if input_ids.shape[-1] < seqlen:
+            continue
+        rows.append(input_ids)
+    if max_rows and len(rows) > max_rows:
+        rows = rows[:max_rows]
+        logger.info("[stream_calibration] capping calibration rows to %d", max_rows)
+    return rows
+
+
+def prepare_streaming_calibration(
+    model, streamer, dataset, device, seqlen, tokenizer=None, max_rows=0, first_block=None
+):
+    """Initialize the streaming calibration chain.
+
+    Embeds the calibration rows once and builds the shared per-row forward
+    kwargs (4D boolean causal attention masks with the data-driven key-mask
+    rule, position ids, rotary position embeddings) in the exact format the
+    data-driven calibrator captures. The quantization loop then chains blocks:
+    each block's ``compress_block`` reference output becomes the next block's
+    FP inputs, matching the data-driven semantics (transforms applied before
+    the replay that collects activation statistics).
+
+    Returns ``(fp_inputs, input_others, summary)``: the initial per-row hidden
+    states, the shared kwargs cache, and a small summary dict.
+    """
+    rows = _normalize_rows(dataset, tokenizer, seqlen, max_rows)
+    if not rows:
+        raise ValueError("stream_calibration: no usable calibration rows (all shorter than seqlen?)")
+
+    embed_name, embed_mod = _find_embedding(model, streamer)
+    if embed_mod is None:
+        raise RuntimeError("stream_calibration: no checkpoint-backed embedding module found")
+    streamer.load_module_(embed_mod, embed_name, device=device)
+    with torch.no_grad():
+        fp_inputs = [embed_mod(ids.to(device)).cpu() for ids in rows]
+    embed_mod.to("meta")
+
+    cfg = getattr(model, "config", None)
+    rotary = _find_model_rotary(model, cfg, device)
+
+    masks = [build_causal_attention_mask(ids) for ids in rows]
+    # the data-driven pipeline replays a float32 0/1 mask (bool captured, cast
+    # during preprocessing); sdpa treats it additively. Match the dtype for
+    # statistics parity with the data-driven path.
+    input_others = {
+        "attention_mask": [m.cpu().to(torch.float32) for m in masks],
+        "use_cache": False,
+        "past_key_values": None,
+    }
+
+    # introspect the first streamed block's signature to know which positional
+    # kwargs to supply; every block of a model shares the same layout here
+    params = inspect.signature(first_block.forward).parameters if first_block is not None else {}
+    if "position_ids" in params:
+        input_others["position_ids"] = [torch.arange(ids.shape[-1]).unsqueeze(0) for ids in rows]
+    if "position_embeddings" in params and rotary is not None:
+        pe_list = []
+        for ids in rows:
+            pos = torch.arange(ids.shape[-1], device=device).unsqueeze(0)
+            cos, sin = rotary(torch.zeros(1, ids.shape[-1], device=device, dtype=torch.float32), pos)
+            pe_list.append((cos.cpu(), sin.cpu()))
+        input_others["position_embeddings"] = pe_list
+
+    summary = {"rows": len(rows)}
+    return fp_inputs, input_others, summary

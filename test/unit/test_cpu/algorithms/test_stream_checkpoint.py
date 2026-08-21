@@ -44,8 +44,11 @@ class TestCheckpointStreamer:
         b = torch.randn(4, 4)
         c = torch.randn(8, 2)
         path = _make_sharded_checkpoint(
-            tmp_path, {"model-00001-of-00002.safetensors": {"blk.a.weight": a, "blk.b.weight": b},
-                       "model-00002-of-00002.safetensors": {"blk.c.weight": c}}
+            tmp_path,
+            {
+                "model-00001-of-00002.safetensors": {"blk.a.weight": a, "blk.b.weight": b},
+                "model-00002-of-00002.safetensors": {"blk.c.weight": c},
+            },
         )
         streamer = CheckpointStreamer(path)
         assert set(streamer.tensor_names) == {"blk.a.weight", "blk.b.weight", "blk.c.weight"}
@@ -86,6 +89,7 @@ class TestCheckpointStreamer:
             streamer.load_module_(m, "nonexistent.prefix")
         with pytest.raises(KeyError):
             streamer.fetch("not.a.tensor")
+
         class Wrong(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -103,7 +107,6 @@ class TestCheckpointStreamer:
         streamer = CheckpointStreamer(str(tmp_path))
         assert torch.equal(streamer.fetch("x.weight"), t["x.weight"])
 
-
     def test_prefetch_serves_cached_tensors(self, tmp_path):
         """Prefetched tensors are served from the host-RAM cache and match disk."""
         torch.manual_seed(2)
@@ -113,9 +116,14 @@ class TestCheckpointStreamer:
             "blk.c.weight": torch.randn(8, 2),
         }
         path = _make_sharded_checkpoint(
-            tmp_path, {"model-00001-of-00002.safetensors": {"blk.a.weight": tensors["blk.a.weight"],
-                                                       "blk.b.weight": tensors["blk.b.weight"]},
-                       "model-00002-of-00002.safetensors": {"blk.c.weight": tensors["blk.c.weight"]}}
+            tmp_path,
+            {
+                "model-00001-of-00002.safetensors": {
+                    "blk.a.weight": tensors["blk.a.weight"],
+                    "blk.b.weight": tensors["blk.b.weight"],
+                },
+                "model-00002-of-00002.safetensors": {"blk.c.weight": tensors["blk.c.weight"]},
+            },
         )
         streamer = CheckpointStreamer(path)
         streamer.start_prefetch(["blk"], depth=1)
@@ -191,8 +199,9 @@ class TestCheckpointStreamer:
         streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=4, stage_devices=[stage])
         try:
             deadline = time.monotonic() + 10.0
-            while len(streamer._prefetch_staged) < 4 and streamer.prefetch_error() is None \
-                    and time.monotonic() < deadline:
+            while (
+                len(streamer._prefetch_staged) < 4 and streamer.prefetch_error() is None and time.monotonic() < deadline
+            ):
                 time.sleep(0.01)
             assert len(streamer._prefetch_staged) == 4, streamer._prefetch_staged
             for name in list(streamer._prefetch_cache):
@@ -206,7 +215,6 @@ class TestCheckpointStreamer:
         finally:
             streamer.stop_prefetch()
 
-
     def test_prefetch_invalid_stage_device_raises(self, tmp_path):
         """Meta staging devices are rejected eagerly: staging to meta would
         silently produce empty tensors instead of an error."""
@@ -216,11 +224,6 @@ class TestCheckpointStreamer:
             streamer.start_prefetch(["m"], depth=1, stage_devices=[torch.device("meta")])
         # no reader thread left behind
         assert streamer._prefetch_thread is None
-
-
-
-
-
 
 
 @pytest.mark.slow
@@ -233,8 +236,13 @@ class TestStreamQuantizeEquivalence:
         from transformers import LlamaConfig, LlamaForCausalLM
 
         cfg = LlamaConfig(
-            vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=3,
-            num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
         )
         torch.manual_seed(7)
         model = LlamaForCausalLM(cfg)
@@ -259,19 +267,37 @@ class TestStreamQuantizeEquivalence:
         return str(d)
 
     @staticmethod
-    def _quantize(model_path, out_dir, stream, stream_prefetch=0, stream_prefetch_gpus=None):
+    def _quantize(
+        model_path,
+        out_dir,
+        stream,
+        stream_prefetch=0,
+        stream_prefetch_gpus=None,
+        stream_calibration=False,
+        dataset=None,
+    ):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.algorithms.transforms.presinq import PreSINQConfig
         from auto_round.autoround import AutoRound
 
+        kwargs = {}
+        if dataset is not None:
+            kwargs["dataset"] = dataset
+            kwargs["seqlen"] = 32
+            kwargs["nsamples"] = 8
         ar = AutoRound(
             model_path,
             scheme="W4A16",
-            alg_configs=[PreSINQConfig(group_size=16, n_iter=2, n_repeat=1), RTNConfig(group_size=16, disable_opt_rtn=False)],
+            alg_configs=[
+                PreSINQConfig(group_size=16, n_iter=2, n_repeat=1),
+                RTNConfig(group_size=16, disable_opt_rtn=False),
+            ],
             layerwise_rotation=True,
             stream_checkpoint=stream,
             stream_prefetch=stream_prefetch,
             stream_prefetch_gpus=stream_prefetch_gpus,
+            stream_calibration=stream_calibration,
+            **kwargs,
             format="auto_round",
             disable_model_free=True,
             device_map="cpu",
@@ -350,10 +376,19 @@ class TestStreamQuantizeEquivalence:
         from auto_round.autoround import AutoRound
 
         ar = AutoRound(
-            ck_b, scheme="W4A16",
-            alg_configs=[PreSINQConfig(group_size=16, n_iter=2, n_repeat=1), RTNConfig(group_size=16, disable_opt_rtn=True)],
-            layerwise_rotation=True, stream_checkpoint=True, format="auto_round",
-            disable_model_free=True, device_map="cpu", low_gpu_mem_usage=True, low_cpu_mem_usage=True,
+            ck_b,
+            scheme="W4A16",
+            alg_configs=[
+                PreSINQConfig(group_size=16, n_iter=2, n_repeat=1),
+                RTNConfig(group_size=16, disable_opt_rtn=True),
+            ],
+            layerwise_rotation=True,
+            stream_checkpoint=True,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
         )
         ar.quantize_and_save(str(tmp_path / "b"), format="auto_round")
         d_plain = ar.output_dir
@@ -473,7 +508,141 @@ class TestStreamQuantizeEquivalence:
         ar.post_init()  # resolves formats; raised KeyError('bits') before the fix
         assert ar.formats is not None
 
+    def test_stream_calibration_matches_data_driven(self, tiny_checkpoint, tmp_path):
+        """stream_calibration=True must reproduce the data-driven run exactly:
+        the streaming pass forwards the same rows through the same block chain
+        (same attention-mask rule, row-by-row) so the imatrix statistics — and
+        therefore the searched quantized weights — are identical."""
+        import shutil
 
+        torch.manual_seed(7)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]  # vocab_size=64
+        ck_a = str(tmp_path / "ck_a")
+        ck_b = str(tmp_path / "ck_b")
+        shutil.copytree(tiny_checkpoint, ck_a)
+        shutil.copytree(tiny_checkpoint, ck_b)
+        data_driven = self._quantize(ck_a, str(tmp_path / "a"), stream=False, dataset=rows)
+        streamed_calib = self._quantize(ck_b, str(tmp_path / "b"), stream=True, stream_calibration=True, dataset=rows)
 
+        def load_all(d):
+            from safetensors import safe_open
 
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
 
+        t_a, t_b = load_all(data_driven), load_all(streamed_calib)
+        assert set(t_a) == set(t_b), f"tensor name mismatch: only-a={set(t_a) - set(t_b)} only-b={set(t_b) - set(t_a)}"
+        n_exact, n_close, n_diff = 0, 0, 0
+        for k in t_a:
+            if torch.equal(t_a[k], t_b[k]):
+                n_exact += 1
+            elif torch.allclose(t_a[k].float(), t_b[k].float(), atol=1e-6):
+                n_close += 1
+            else:
+                n_diff += 1
+        assert n_diff == 0, f"{n_diff} tensors differ beyond tolerance"
+        assert n_exact + n_close == len(t_a)
+
+    def test_partial_layer_config_resolves_format(self, tiny_checkpoint, tmp_path):
+        """layer_config entries are partial overrides: unset keys fall back to
+        the global scheme. Format resolution must not assume every entry
+        carries the full key set — asym scheme (RTNConfig sym=False, the NeUQI
+        path) hits the AutoAWQ enablement check in formats.py, which raised
+        KeyError('bits') on partial entries (hy3 NeUQI-asym server run)."""
+        import shutil
+
+        ck = str(tmp_path / "ck_partial")
+        shutil.copytree(tiny_checkpoint, ck)
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.autoround import AutoRound
+
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[RTNConfig(group_size=8, sym=False)],  # asym global scheme (NeUQI path)
+            layer_config={
+                ".*model.layers.0.": {"bits": 16, "data_type": "float"},
+                ".*shared_mlp": {"group_size": 8},  # partial: no bits key
+                ".*experts": {"group_size": 8},
+            },
+            layerwise_rotation=True,
+            stream_checkpoint=True,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.post_init()  # resolves formats; raised KeyError('bits') before the fix
+        assert ar.formats is not None
+
+    def test_prefetched_export_matches_streamed(self, tiny_checkpoint, tmp_path):
+        """stream_prefetch only changes WHERE the tensors come from (host-RAM
+        cache instead of a synchronous disk read); the exported checkpoint must
+        stay bit-identical to the un-prefetched streaming run."""
+        import shutil
+
+        ck_a = str(tmp_path / "ck_a")
+        ck_b = str(tmp_path / "ck_b")
+        shutil.copytree(tiny_checkpoint, ck_a)
+        shutil.copytree(tiny_checkpoint, ck_b)
+        plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
+        prefetched = self._quantize(ck_b, str(tmp_path / "prefetched"), stream=True, stream_prefetch=1)
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        t_plain, t_prefetched = load_all(plain), load_all(prefetched)
+        assert set(t_plain) == set(t_prefetched)
+        for k in t_plain:
+            assert torch.equal(t_plain[k], t_prefetched[k]), f"tensor {k} differs under prefetch"
+
+    def test_staged_export_matches_streamed(self, tiny_checkpoint, tmp_path):
+        """Device staging (round-robin block homes + tensors preloaded onto the
+        staging devices) must not change any exported bit: the quantization
+        math is device-independent, staging only changes where tensors wait.
+        Exercises the full home-rotation plumbing via CPU staging devices; the
+        multi-GPU variant runs on CUDA hosts."""
+        import shutil
+
+        ck_a = str(tmp_path / "ck_a")
+        ck_b = str(tmp_path / "ck_b")
+        shutil.copytree(tiny_checkpoint, ck_a)
+        shutil.copytree(tiny_checkpoint, ck_b)
+        stage_devs = ["cpu"] if torch.cuda.device_count() < 2 else ["cuda:1"]
+        plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
+        staged = self._quantize(
+            ck_b, str(tmp_path / "staged"), stream=True, stream_prefetch=2, stream_prefetch_gpus=stage_devs
+        )
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        t_plain, t_staged = load_all(plain), load_all(staged)
+        assert set(t_plain) == set(t_staged)
+        for k in t_plain:
+            assert torch.equal(t_plain[k], t_staged[k]), f"tensor {k} differs under device staging"

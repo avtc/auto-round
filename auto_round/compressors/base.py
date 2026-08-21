@@ -338,6 +338,15 @@ class BaseOrchestrator(object):
         # no cross-device copy is needed when the loop reaches them.
         # Requires stream_prefetch > 0.
         self.stream_prefetch_gpus = kwargs.pop("stream_prefetch_gpus", None)
+        # Collect imatrix activation statistics with a streaming forward pass
+        # before the zero-shot loop (stream_checkpoint only): one block at a
+        # time is materialized, all calibration rows are pushed through, and
+        # per-module statistics land on the modules for the clip search.
+        # Matches the data-driven imatrix exactly for identical rows.
+        self.stream_calibration = kwargs.pop("stream_calibration", False)
+        # Cap on calibration rows for the streaming FP-input cache (host-RAM
+        # bound: rows x blocks x seqlen x hidden); 0 = no cap.
+        self.stream_calibration_rows = kwargs.pop("stream_calibration_rows", 0)
 
         # ``stream_checkpoint`` handles its own block lifecycle (meta -> stream
         # -> quantize -> write -> meta), so the accelerate-style offloader

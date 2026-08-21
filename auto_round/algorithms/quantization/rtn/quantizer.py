@@ -31,6 +31,36 @@ from auto_round.utils import (
 )
 
 
+def register_imatrix_hooks(model, *, with_count: bool = False):
+    """Attach forward hooks collecting per-module imatrix statistics.
+
+    Each hooked module accumulates ``module.imatrix`` (fp32 sum of squared
+    input activations per input channel) and ``module.imatrix_cnt`` (rows
+    seen). Normalization (division by the count) is deferred to the consumer.
+    Returns the hook handles.
+    """
+
+    def collect_imatrix(module, input, output):
+        input = input[0] if isinstance(input, (tuple, list)) else input
+        flattened = input.reshape(-1, input.shape[-1]).to(torch.float32)
+        squared = torch.sum(torch.pow(flattened, 2), dim=0).to(torch.float32)
+
+        if not hasattr(module, "imatrix"):
+            module.imatrix = squared
+            if with_count:
+                module.imatrix_cnt = input.shape[0]
+            return
+        module.imatrix += squared.to(module.imatrix.device)
+        if with_count:
+            module.imatrix_cnt += input.shape[0]
+
+    handles = []
+    for _, module in model.named_modules():
+        if check_to_quantized(module):
+            handles.append(module.register_forward_hook(collect_imatrix))
+    return handles
+
+
 @register_pipeline_member(RTNConfig)
 class RTNQuantizer(BaseQuantizer):
 
@@ -91,25 +121,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         return handles
 
     def _register_imatrix_hooks(self, model, *, with_count: bool = False):
-        def collect_imatrix(module, input, output):
-            input = input[0] if isinstance(input, (tuple, list)) else input
-            flattened = input.reshape(-1, input.shape[-1]).to(torch.float32)
-            squared = torch.sum(torch.pow(flattened, 2), dim=0).to(torch.float32)
-
-            if not hasattr(module, "imatrix"):
-                module.imatrix = squared
-                if with_count:
-                    module.imatrix_cnt = input.shape[0]
-                return
-            module.imatrix += squared.to(module.imatrix.device)
-            if with_count:
-                module.imatrix_cnt += input.shape[0]
-
-        handles = []
-        for _, module in model.named_modules():
-            if isinstance(module, SUPPORTED_LAYER_TYPES) and check_to_quantized(module):
-                handles.append(module.register_forward_hook(collect_imatrix))
-        return handles
+        return register_imatrix_hooks(model, with_count=with_count)
 
     @torch.no_grad()
     def quantize_block(

@@ -330,6 +330,8 @@ _ENTRY_KWARG_OWNERS = {
     "stream_checkpoint": "compressor",
     "stream_prefetch": "compressor",
     "stream_prefetch_gpus": "compressor",
+    "stream_calibration": "compressor",
+    "stream_calibration_rows": "compressor",
     "format": "base",
     "dataset": "base",
     "batch_size": "base",
