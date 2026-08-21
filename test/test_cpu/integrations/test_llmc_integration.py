@@ -1,6 +1,9 @@
 import os
 
 import pytest
+
+pytest.importorskip("compressed_tensors", reason="llmcompressor is an optional integration dependency")
+
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from llmcompressor import oneshot

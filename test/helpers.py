@@ -401,6 +401,33 @@ def get_tiny_model(
 
 
 # for fixture usage only
+def _hub_snapshot_cached(repo_id: str) -> bool:
+    """Whether *repo_id* has a config.json in the local HuggingFace cache."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        return True
+    cached = try_to_load_from_cache(repo_id, "config.json")
+    return isinstance(cached, str) and os.path.exists(cached)
+
+
+def _maybe_skip_uncached_download(model_name_or_path):
+    """With AR_TEST_OFFLINE=1, skip tests whose source model is not cached yet.
+
+    Keeps disk-constrained machines from pulling multi-GB checkpoints: the
+    skip fires only for remote repo ids; local paths always run.
+    """
+    if not os.environ.get("AR_TEST_OFFLINE"):
+        return
+    if os.path.exists(model_name_or_path):
+        return
+    if not _hub_snapshot_cached(model_name_or_path):
+        pytest.skip(
+            f"AR_TEST_OFFLINE=1 and {model_name_or_path} is not in the local HuggingFace cache; "
+            "unset AR_TEST_OFFLINE or pre-download the model to run this test"
+        )
+
+
 def save_tiny_model(
     model_name_or_path,
     tiny_model_path,
@@ -428,6 +455,8 @@ def save_tiny_model(
     """
     if "use_config" in kwargs:
         from_config = kwargs.pop("use_config")
+
+    _maybe_skip_uncached_download(model_name_or_path)
 
     model = get_tiny_model(
         model_name_or_path,

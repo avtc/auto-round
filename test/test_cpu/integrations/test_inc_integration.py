@@ -3,6 +3,9 @@ import os
 import shutil
 
 import pytest
+
+pytest.importorskip("neural_compressor", reason="neural-compressor is an optional integration dependency")
+
 import torch
 import transformers
 from neural_compressor.torch.quantization import (

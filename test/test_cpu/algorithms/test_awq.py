@@ -155,6 +155,7 @@ class TestAWQW8A8LLMCompressor:
 
     def test_awq_w8a8_llmc_export(self, tiny_opt_model_path):
         """W8A8 AWQ → llm_compressor: verify compressed-tensors metadata fields."""
+        pytest.importorskip("compressed_tensors", reason="llm_compressor export needs compressed-tensors")
         ar = AutoRound(
             tiny_opt_model_path,
             scheme="INT8",
