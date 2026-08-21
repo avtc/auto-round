@@ -161,14 +161,20 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                 targets.append(m)
         self._quantize_targets(targets)
 
-    def _split_expert_batches(self, targets: list):
+    def _split_expert_batches(self, targets: list, n_jobs_hint: int = 0):
         """Partition same-shape expert projections into batchable groups.
 
-        Experts of one layer share weight shapes (e.g. 192 x ``[1536, 4096]``
+        Experts of one layer share weight shapes (e.g. 192 x ``[1536, 4096]`
         gate/up/down projections). The per-group search is row-independent, so
         a whole group can be quantized in one call by stacking weights along
         the output dim - same results as per-module calls, one search's worth
         of per-module overhead instead of 192.
+
+        With ``n_jobs_hint`` > number of groups, each group is split into
+        roughly equal chunks so the multi-GPU fan-out fills every device
+        (three monolithic groups would otherwise pin the search to three
+        GPUs no matter how many are visible). Chunking keeps results
+        bit-identical: rows are independent.
         """
         grouped = {}
         singles = []
@@ -188,6 +194,15 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             key = (match["parent"], match["proj"], tuple(m.weight.shape), m.bits, m.group_size)
             grouped.setdefault(key, []).append(m)
         batches = [g for g in grouped.values() if len(g) >= 2]
+        if n_jobs_hint > len(batches) > 0:
+            import math
+
+            chunks_per_group = max(1, round(n_jobs_hint / len(batches)))
+            split = []
+            for g in batches:
+                size = math.ceil(len(g) / chunks_per_group)
+                split.extend(g[i : i + size] for i in range(0, len(g), size))
+            batches = split
         return batches, singles
 
     def _expert_search_active(self) -> bool:
@@ -270,20 +285,21 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         if not targets:
             return
         batches = []
+        n_gpu = torch.cuda.device_count()
+        parallel_tuning = getattr(self.config, "parallel_tuning", None)
+        if parallel_tuning is None:
+            parallel_tuning = n_gpu > 1
         if getattr(self.config, "batch_expert_tuning", True) and self._expert_search_active():
-            batches, targets = self._split_expert_batches(targets)
+            hint = n_gpu if parallel_tuning and n_gpu > 1 else 0
+            batches, targets = self._split_expert_batches(targets, n_jobs_hint=hint)
             if batches:
                 n_batched = sum(len(b) for b in batches)
                 logger.info(
-                    "[OptRTN] expert batching: %d expert modules in %d same-shape groups.",
+                    "[OptRTN] expert batching: %d expert modules in %d batched groups.",
                     n_batched,
                     len(batches),
                 )
 
-        parallel_tuning = getattr(self.config, "parallel_tuning", None)
-        n_gpu = torch.cuda.device_count()
-        if parallel_tuning is None:
-            parallel_tuning = n_gpu > 1
         n_workers = min(len(batches) + len(targets), n_gpu) if parallel_tuning and n_gpu > 1 else 1
 
         def _run_batch(mods, device):
