@@ -439,6 +439,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 tokenizer=self.tokenizer,
                 max_rows=int(getattr(self, "stream_calibration_rows", 0) or 0),
                 first_block=get_module(self.model, flat_block_names[0]) if flat_block_names else None,
+                nsamples=int(getattr(self.calibration_context, "nsamples", 128) or 128),
             )
             calib_state = {"fp_inputs": fp_inputs, "input_others": input_others}
             logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])

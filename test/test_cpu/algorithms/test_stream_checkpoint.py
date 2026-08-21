@@ -500,6 +500,15 @@ class TestStreamQuantizeEquivalence:
             cs = json.load(f)
         assert cn == cs
 
+    def test_check_ids_in_vocab(self):
+        from auto_round.utils.streaming_calibration import _check_ids_in_vocab
+
+        rows = [torch.tensor([[1, 2, 3]]), torch.tensor([[0, 5, 63]])]
+        _check_ids_in_vocab(rows, 64)  # in range: no raise
+        bad = [torch.tensor([[1, 2, 150000]])]  # Qwen-tokenized ids vs hy3 vocab
+        with pytest.raises(ValueError, match="different model's tokenizer"):
+            _check_ids_in_vocab(bad, 120832)
+
     def test_stream_calibration_matches_data_driven(self, tiny_checkpoint, tmp_path):
         """stream_calibration=True must reproduce the data-driven run exactly:
         the streaming pass forwards the same rows through the same block chain
