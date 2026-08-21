@@ -67,6 +67,58 @@ class TestCheckpointStreamer:
         assert set(loaded) == {"blk.a.weight", "blk.b.weight", "blk.c.weight"}
         assert torch.equal(blk.a.weight.data, a) and blk.a.weight.device.type == "cpu"
 
+    def test_load_module_name_rewrites(self, tmp_path):
+        """hyv3-style checkpoints (shared_mlp / router.gate / expert_bias) map onto
+        modules spelled shared_experts / gate / e_score_correction_bias; direct
+        spellings are never shadowed by a rewrite."""
+        import torch.nn as nn
+
+        torch.manual_seed(2)
+        tensors = {
+            "model.layers.1.mlp.shared_mlp.gate_proj.weight": torch.randn(4, 8),
+            "model.layers.1.mlp.router.gate.weight": torch.randn(4, 8),
+            "model.layers.1.mlp.expert_bias": torch.arange(4, dtype=torch.float32),
+            "model.layers.1.mlp.experts.0.gate_proj.weight": torch.randn(4, 8),
+        }
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": tensors})
+        streamer = CheckpointStreamer(path)
+
+        class Shared(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(8, 4, bias=False)
+
+        class Expert(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(8, 4, bias=False)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared_experts = Shared()
+                self.gate = nn.Linear(8, 4, bias=False)
+                self.experts = nn.ModuleList([Expert()])
+                self.register_buffer("e_score_correction_bias", torch.zeros(4))
+
+        class L1(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = MLP()
+
+        with torch.device("meta"):
+            l1 = L1()
+        loaded = streamer.load_module_(l1, "model.layers.1")
+        assert set(loaded) == set(tensors)
+        assert torch.equal(l1.mlp.shared_experts.gate_proj.weight.data, tensors["model.layers.1.mlp.shared_mlp.gate_proj.weight"])
+        assert torch.equal(l1.mlp.gate.weight.data, tensors["model.layers.1.mlp.router.gate.weight"])
+        assert torch.equal(l1.mlp.e_score_correction_bias, tensors["model.layers.1.mlp.expert_bias"])
+        assert torch.equal(l1.mlp.experts[0].gate_proj.weight.data, tensors["model.layers.1.mlp.experts.0.gate_proj.weight"])
+        for _, p in l1.named_parameters():
+            assert p.device.type != "meta"
+        for _, b in l1.named_buffers():
+            assert b.device.type != "meta"
+
     def test_load_module_device_and_errors(self, tmp_path):
         torch.manual_seed(1)
         path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(3, 3)}})

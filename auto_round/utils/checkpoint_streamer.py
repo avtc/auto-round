@@ -30,6 +30,31 @@ import torch
 from auto_round.logger import logger
 
 
+# Checkpoint-name fragment -> module-name fragment, applied only when the
+# direct spelling misses (never shadows an exact match). Covers checkpoints
+# whose block spellings differ from the modeling code: hyv3 stores
+# ``mlp.shared_mlp`` / ``mlp.router.gate`` / ``mlp.expert_bias`` while the
+# runtime module exposes ``mlp.shared_experts`` / ``mlp.gate`` /
+# ``mlp.e_score_correction_bias``.
+_CKPT_NAME_REWRITES = (
+    (".mlp.shared_mlp.", ".mlp.shared_experts."),
+    (".mlp.router.gate.", ".mlp.gate."),
+    (".mlp.expert_bias", ".mlp.e_score_correction_bias"),
+)
+
+
+def to_checkpoint_name(name: str) -> str:
+    """Map a runtime module-name onto its checkpoint spelling.
+
+    Inverse of the rewrite table above: applies the first matching module-name
+    fragment substitution and returns *name* unchanged when nothing matches.
+    """
+    for ckpt_frag, mod_frag in _CKPT_NAME_REWRITES:
+        if mod_frag in name:
+            return name.replace(mod_frag, ckpt_frag)
+    return name
+
+
 class CheckpointStreamer:
     """Streams tensors from a HuggingFace checkpoint on demand.
 
@@ -310,8 +335,18 @@ class CheckpointStreamer:
         targets.update(dict(module.named_buffers(recurse=True)))
         by_short = {prefix + ("." if prefix else "") + k: v for k, v in targets.items()}
         loaded = []
+        rewrites_hit = 0
         for name in self.names_under(prefix):
-            tgt = by_short.get(name, None)
+            tgt, mod_name = by_short.get(name), name
+            if tgt is None:
+                for ckpt_frag, mod_frag in _CKPT_NAME_REWRITES:
+                    if ckpt_frag in name:
+                        cand = name.replace(ckpt_frag, mod_frag)
+                        tgt = by_short.get(cand)
+                        if tgt is not None:
+                            mod_name = cand
+                            rewrites_hit += 1
+                            break
             if tgt is None:
                 logger.debug(f"[stream] {name} has no matching parameter/buffer in the module; skipped")
                 continue
@@ -320,9 +355,12 @@ class CheckpointStreamer:
                 raise ValueError(
                     f"[stream] shape mismatch for {name}: checkpoint {tuple(tensor.shape)} vs module {tuple(tgt.shape)}"
                 )
-            if not self._assign_leaf_(module, name[len(prefix) + 1:] if prefix else name, tensor):
+            rel = mod_name[len(prefix) + 1 :] if prefix else mod_name
+            if not self._assign_leaf_(module, rel, tensor):
                 raise RuntimeError(f"[stream] failed to assign {name!r} into module")
             loaded.append(name)
+        if rewrites_hit:
+            logger.info(f"[stream] {rewrites_hit} checkpoint tensor(s) matched via name rewrite")
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
         if self._prefetch_thread is not None:

@@ -29,6 +29,7 @@ from auto_round.utils import (
     get_reverse_checkpoint_conversion_mapping,
     revert_checkpoint_conversion_mapping,
 )
+from auto_round.utils.checkpoint_streamer import to_checkpoint_name
 
 
 class ShardWriter:
@@ -215,6 +216,11 @@ class ShardWriter:
 
         # transformers will handle _checkpoint_conversion_mapping automatically if is_immediate_saving=False
         name = revert_checkpoint_conversion_mapping(name, self.reverse_checkpoint_conversion_mapping)
+
+        # hy_v3: write checkpoint spellings (shared_mlp / router.gate /
+        # expert_bias) so stock vLLM loads the export without renames
+        if getattr(getattr(self.model, "config", None), "model_type", None) == "hy_v3":
+            name = to_checkpoint_name(name)
 
         t_size = tensor.nbytes
         self.total_param_elems += tensor.numel()
