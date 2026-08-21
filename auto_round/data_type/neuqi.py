@@ -63,6 +63,103 @@ def _log_disabled() -> None:
     logger.info("[NeUQI] disabled via AR_DISABLE_NEUQI; using plain min/max asym quantization")
 
 
+def _loss_all_zp_hist(data, qw, scale, maxq, pre=None):
+    """Evaluate every integer zero point for one scale candidate via binning.
+
+    Mathematically identical to ``_best_zp_for_scale`` (same stabilization
+    clamp, same exhaustive z sweep, same first-min tie rule) but reformulated
+    for memory bandwidth: r = round(w/s) is integer-valued, so grouping
+    elements into r-bins and taking prefix sums over ~3*2^bits bins yields all
+    zero-point losses without materializing the [groups, g, 2^bits] grid
+    (a 16x data expansion that dominates the brute-force runtime).
+
+    Floating-point summation order differs from the brute force, so losses
+    can differ in the last ulp and exact ties may resolve differently.
+    """
+    n_groups = data.shape[0]
+    group_size = data.shape[1]
+    n_zp = maxq + 1
+    chunk = max(1, _MAX_TMP_ELEMS // group_size)
+
+    rmin, rmax = -(maxq + 1), 2 * maxq + 1
+    nbins = rmax - rmin + 1
+
+    best_loss = torch.full((n_groups,), float("inf"), device=data.device, dtype=torch.float32)
+    best_zp = torch.zeros(n_groups, device=data.device, dtype=torch.float32)
+
+    for start in range(0, n_groups, chunk):
+        stop = min(start + chunk, n_groups)
+        data_c = data[start:stop]
+        qw_c = qw[start:stop] if qw is not None else None
+        scale_c = scale[start:stop]
+
+        qwv = qw_c if qw_c is not None else torch.ones_like(data_c)
+        Aw, Bw = None, None
+        if pre is not None:
+            Aw_c, Bw_c = pre[0][start:stop], pre[1][start:stop]
+            Aw, Bw = Aw_c.double(), Bw_c.double()
+        r = torch.round(data_c / scale_c).clamp_(min=rmin, max=rmax)  # integer-valued
+        bins = (r - rmin).to(torch.int64)  # [c, g] bin index per element
+        # aggregate in fp32, compose in fp64: the expanded loss is a difference
+        # of large terms, and float32 cancellation flips near-optimal choices on
+        # heavy-tailed groups (verified against the brute-force reference)
+        zeros = torch.zeros(data_c.shape[0], nbins, device=data.device, dtype=torch.float64)
+        n_b = zeros.scatter_add_(1, bins, qwv.double())  # per-bin sum of weights
+        if Aw is None:
+            Aw = (qwv * data_c).double()
+            Bw = (qwv * data_c * data_c).double()
+        A_b = torch.zeros_like(zeros).scatter_add_(1, bins, Aw)  # sum qw*w
+        B_b = torch.zeros_like(zeros).scatter_add_(1, bins, Bw)  # sum qw*w^2
+        b = torch.arange(rmin, rmax + 1, device=data.device, dtype=torch.float64)
+        bn_b = b.unsqueeze(0) * A_b  # sum qw*r*w (r constant per bin)
+        b2n_b = (b * b).unsqueeze(0) * n_b  # sum qw*r^2
+
+        # exclusive prefix sums: P[:, i] = aggregates of bins < i
+        P_n = torch.cat([torch.zeros_like(n_b[:, :1]), n_b.cumsum(dim=1)], dim=1)
+        P_A = torch.cat([torch.zeros_like(A_b[:, :1]), A_b.cumsum(dim=1)], dim=1)
+        P_B = torch.cat([torch.zeros_like(B_b[:, :1]), B_b.cumsum(dim=1)], dim=1)
+        P_bn = torch.cat([torch.zeros_like(bn_b[:, :1]), bn_b.cumsum(dim=1)], dim=1)
+        P_b2n = torch.cat([torch.zeros_like(b2n_b[:, :1]), b2n_b.cumsum(dim=1)], dim=1)
+
+        z = torch.arange(0, n_zp, device=data.device, dtype=torch.float32)  # [n_zp]
+        idx_low = (maxq + 1 - z).long()  # bin index of threshold -z
+        idx_high = (2 * maxq + 1 - z).long()  # bin index of threshold maxq-z
+
+        # low: bins <= -z saturate at deq = -s*z
+        N_lo = P_n[:, idx_low + 1]
+        A_lo = P_A[:, idx_low + 1]
+        B_lo = P_B[:, idx_low + 1]
+        # high: bins >= maxq-z saturate at deq = s*(maxq-z)
+        tot_n, tot_A, tot_B = P_n[:, -1:], P_A[:, -1:], P_B[:, -1:]
+        N_hi = tot_n - P_n[:, idx_high]
+        A_hi = tot_A - P_A[:, idx_high]
+        B_hi = tot_B - P_B[:, idx_high]
+        # mid: -z < r < maxq-z keep deq = s*r
+        B_md = tot_B - B_lo - B_hi
+        M1_md = P_bn[:, -1:] - P_bn[:, idx_low + 1] - (P_bn[:, -1:] - P_bn[:, idx_high])
+        M2_md = P_b2n[:, -1:] - P_b2n[:, idx_low + 1] - (P_b2n[:, -1:] - P_b2n[:, idx_high])
+
+        s = scale_c.double()  # [c, 1]
+        sz = s * z.unsqueeze(0)  # [c, n_zp]
+        m = (maxq - z).unsqueeze(0)  # [c, n_zp]
+        loss = (
+            (sz * sz) * N_lo
+            + 2.0 * sz * A_lo
+            + B_lo
+            + (s * s) * M2_md
+            - 2.0 * s * M1_md
+            + B_md
+            + (s * s) * (m * m) * N_hi
+            - 2.0 * s * m * A_hi
+            + B_hi
+        )
+        min_loss, argmin_zp = loss.min(dim=-1)
+        best_loss[start:stop] = min_loss
+        best_zp[start:stop] = argmin_zp.to(torch.float32)
+
+    return best_loss, best_zp
+
+
 def _best_zp_for_scale(data, qw, scale, maxq):
     """Evaluate all integer zero points for one per-group scale candidate.
 
@@ -157,10 +254,16 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     best_frac = torch.ones(data.shape[0], device=data.device, dtype=torch.float32)
     best_zp = torch.zeros(data.shape[0], device=data.device, dtype=torch.float32)
 
+    zp_eval = _best_zp_for_scale if envs.AR_NEUQI_SWEEP == "brute" else _loss_all_zp_hist
+    pre = None
+    if zp_eval is _loss_all_zp_hist and qw is not None:
+        qwv = qw.to(torch.float32)
+        pre = (qwv * data, qwv * data * data)  # scale-independent per-element products
+
     # Coarse pass: shared log-spaced fractions of the per-group min-max scale.
     for idx in range(coarse_n):
         scale = s0 * coarse[idx]
-        loss, zp = _best_zp_for_scale(data, qw, scale, maxq)
+        loss, zp = zp_eval(data, qw, scale, maxq, pre) if pre is not None else zp_eval(data, qw, scale, maxq)
         improved = loss < best_loss
         best_loss = torch.where(improved, loss, best_loss)
         best_zp = torch.where(improved, zp, best_zp)
@@ -175,7 +278,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     for step in steps:
         frac = frac_lo * (1.0 - step) + frac_hi * step
         scale = s0 * frac.unsqueeze(-1)
-        loss, zp = _best_zp_for_scale(data, qw, scale, maxq)
+        loss, zp = zp_eval(data, qw, scale, maxq, pre) if pre is not None else zp_eval(data, qw, scale, maxq)
         improved = loss < best_loss
         best_loss = torch.where(improved, loss, best_loss)
         best_zp = torch.where(improved, zp, best_zp)

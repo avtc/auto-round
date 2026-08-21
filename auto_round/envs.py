@@ -72,6 +72,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NeUQI search in ``auto_round.data_type.neuqi``.
     "AR_NEUQI_COARSE": lambda: int(os.getenv("AR_NEUQI_COARSE", "64")),
     "AR_NEUQI_FINE": lambda: int(os.getenv("AR_NEUQI_FINE", "32")),
+    "AR_NEUQI_SWEEP": lambda: os.getenv("AR_NEUQI_SWEEP", "hist"),  # hist | brute zero-point sweep
     # Minimum value to which torch._dynamo cache_size_limit /
     # accumulated_cache_size_limit / recompile_limit are bumped when
     # ``enable_torch_compile`` is used. The default of 16 is enough to cover
