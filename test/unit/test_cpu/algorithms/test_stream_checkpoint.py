@@ -225,6 +225,171 @@ class TestCheckpointStreamer:
         # no reader thread left behind
         assert streamer._prefetch_thread is None
 
+    def test_load_module_name_rewrites(self, tmp_path):
+        """hyv3-style checkpoints (shared_mlp / router.gate / expert_bias) map onto
+        modules spelled shared_experts / gate / e_score_correction_bias; direct
+        spellings are never shadowed by a rewrite."""
+        import torch.nn as nn
+
+        torch.manual_seed(2)
+        tensors = {
+            "model.layers.1.mlp.shared_mlp.gate_proj.weight": torch.randn(4, 8),
+            "model.layers.1.mlp.router.gate.weight": torch.randn(4, 8),
+            "model.layers.1.mlp.expert_bias": torch.arange(4, dtype=torch.float32),
+            "model.layers.1.mlp.experts.0.gate_proj.weight": torch.randn(4, 8),
+        }
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": tensors})
+        streamer = CheckpointStreamer(path)
+
+        class Shared(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(8, 4, bias=False)
+
+        class Expert(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(8, 4, bias=False)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared_experts = Shared()
+                self.gate = nn.Linear(8, 4, bias=False)
+                self.experts = nn.ModuleList([Expert()])
+                self.register_buffer("e_score_correction_bias", torch.zeros(4))
+
+        class L1(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = MLP()
+
+        with torch.device("meta"):
+            l1 = L1()
+        loaded = streamer.load_module_(l1, "model.layers.1")
+        assert set(loaded) == set(tensors)
+        assert torch.equal(
+            l1.mlp.shared_experts.gate_proj.weight.data, tensors["model.layers.1.mlp.shared_mlp.gate_proj.weight"]
+        )
+        assert torch.equal(l1.mlp.gate.weight.data, tensors["model.layers.1.mlp.router.gate.weight"])
+        assert torch.equal(l1.mlp.e_score_correction_bias, tensors["model.layers.1.mlp.expert_bias"])
+        assert torch.equal(
+            l1.mlp.experts[0].gate_proj.weight.data, tensors["model.layers.1.mlp.experts.0.gate_proj.weight"]
+        )
+        for _, p in l1.named_parameters():
+            assert p.device.type != "meta"
+        for _, b in l1.named_buffers():
+            assert b.device.type != "meta"
+
+    def test_load_module_device_and_errors(self, tmp_path):
+        torch.manual_seed(1)
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(3, 3)}})
+        streamer = CheckpointStreamer(path)
+        import torch.nn as nn
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Linear(3, 3, bias=False)
+
+        with torch.device("meta"):
+            m = M()
+        streamer.load_module_(m, "m")
+        with pytest.raises(ValueError):  # nothing matches
+            streamer.load_module_(m, "nonexistent.prefix")
+        with pytest.raises(KeyError):
+            streamer.fetch("not.a.tensor")
+
+        class Wrong(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Linear(4, 4, bias=False)
+
+        with torch.device("meta"):
+            wrong = Wrong()
+        streamer2 = CheckpointStreamer(path)
+        with pytest.raises(ValueError):  # shape mismatch
+            streamer2.load_module_(wrong, "m")
+
+    def test_prefetch_serves_cached_tensors(self, tmp_path):
+        """Prefetched tensors are served from the host-RAM cache and match disk."""
+        torch.manual_seed(2)
+        tensors = {
+            "blk.a.weight": torch.randn(4, 8),
+            "blk.b.weight": torch.randn(4, 4),
+            "blk.c.weight": torch.randn(8, 2),
+        }
+        path = _make_sharded_checkpoint(
+            tmp_path,
+            {
+                "model-00001-of-00002.safetensors": {
+                    "blk.a.weight": tensors["blk.a.weight"],
+                    "blk.b.weight": tensors["blk.b.weight"],
+                },
+                "model-00002-of-00002.safetensors": {"blk.c.weight": tensors["blk.c.weight"]},
+            },
+        )
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["blk"], depth=1)
+        try:
+            deadline = time.monotonic() + 10.0
+            while streamer.prefetch_pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not streamer.prefetch_pending(), "prefetch did not finish"
+            for name, ref in tensors.items():
+                assert torch.equal(streamer.fetch(name), ref)
+            assert not streamer._prefetch_cache  # fully consumed
+        finally:
+            streamer.stop_prefetch()
+        # after stop, plain disk reads still work
+        assert torch.equal(streamer.fetch("blk.a.weight"), tensors["blk.a.weight"])
+
+    def test_prefetch_depth_and_consumption(self, tmp_path):
+        """The reader keeps at most ``depth`` prefixes staged ahead and releases
+        a slot only after the consumer reports the prefix consumed."""
+        torch.manual_seed(3)
+        shards = {}
+        for i in range(4):
+            shards[f"model-{i:05d}.safetensors"] = {f"b{i}.w.weight": torch.randn(2, 2)}
+        path = _make_sharded_checkpoint(tmp_path, shards)
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=1)
+
+        def wait_staged(prefix):
+            deadline = time.monotonic() + 10.0
+            while prefix not in streamer._prefetch_staged and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert prefix in streamer._prefetch_staged, f"{prefix} never staged"
+
+        try:
+            wait_staged("b0")
+            time.sleep(0.2)  # a wrongly-unbounded reader would stage b1..b3 now
+            assert streamer._prefetch_staged == ["b0"], streamer._prefetch_staged
+            assert torch.equal(streamer.fetch("b0.w.weight"), shards["model-00000.safetensors"]["b0.w.weight"])
+            streamer.prefetch_consumed("b0")
+            for p in ("b1", "b2", "b3"):
+                wait_staged(p)
+                streamer.prefetch_consumed(p)
+            assert not streamer._prefetch_remaining and not streamer._prefetch_staged
+            assert not streamer._prefetch_cache
+        finally:
+            streamer.stop_prefetch()
+
+    def test_prefetch_error_surfaces(self, tmp_path):
+        """A reader failure is re-raised at the next fetch."""
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["missing"], depth=1)
+        try:
+            deadline = time.monotonic() + 10.0
+            while streamer.prefetch_error() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert streamer.prefetch_error() is not None, "reader failure not recorded"
+            with pytest.raises(RuntimeError, match="prefetch"):
+                streamer.fetch("m.w.weight")
+        finally:
+            streamer.stop_prefetch()
+
 
 @pytest.mark.slow
 class TestStreamQuantizeEquivalence:
