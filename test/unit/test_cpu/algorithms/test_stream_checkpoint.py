@@ -811,3 +811,51 @@ class TestStreamQuantizeEquivalence:
         assert set(t_plain) == set(t_staged)
         for k in t_plain:
             assert torch.equal(t_plain[k], t_staged[k]), f"tensor {k} differs under device staging"
+
+    def test_unclaimed_block_passthrough(self, tiny_checkpoint, tmp_path):
+        """Checkpoint block groups with no module counterpart (e.g. the hy_v3 MTP
+        layer, which transformers does not model) must be written verbatim."""
+        import json
+        import os
+        import shutil
+
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        src = shutil.copytree(tiny_checkpoint, str(tmp_path / "ck"))
+        extra = {
+            "model.layers.3.eh_proj.weight": torch.randn(16, 32),
+            "model.layers.3.enorm.weight": torch.randn(32),
+        }
+        idx_path = os.path.join(src, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            idx = json.load(f)
+        last = sorted(set(idx["weight_map"].values()))[-1]
+        with safe_open(os.path.join(src, last), framework="pt") as f:
+            tensors = {k: f.get_tensor(k) for k in f.keys()}
+        tensors.update(extra)
+        save_file(tensors, os.path.join(src, last), metadata={"format": "pt"})
+        for k in extra:
+            idx["weight_map"][k] = last
+        with open(idx_path, "w") as f:
+            json.dump(idx, f)
+
+        out = self._quantize(src, str(tmp_path / "out"), stream=True)
+
+        idx_file = os.path.join(out, "model.safetensors.index.json")
+        single_file = os.path.join(out, "model.safetensors")
+        if os.path.exists(idx_file):
+            with open(idx_file) as f:
+                wm = json.load(f)["weight_map"]
+            shard = os.path.join(out, wm["model.layers.3.eh_proj.weight"])
+        else:
+            assert os.path.exists(single_file), f"no export tensors in {out}"
+            shard = single_file
+        from safetensors import safe_open
+
+        with safe_open(shard, framework="pt") as f:
+            keys = set(f.keys())
+            assert "model.layers.3.eh_proj.weight" in keys, "unclaimed block tensor dropped from export"
+            assert "model.layers.3.enorm.weight" in keys
+            assert torch.equal(f.get_tensor("model.layers.3.eh_proj.weight"), extra["model.layers.3.eh_proj.weight"])
+            assert torch.equal(f.get_tensor("model.layers.3.enorm.weight"), extra["model.layers.3.enorm.weight"])

@@ -161,6 +161,10 @@ class ShardWriter:
             param_name = f"{prefix}.{k}"
             self._add_tensor(param_name, v)
 
+    def save_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        """Accumulate a single raw (checkpoint-spelled) tensor for saving."""
+        self._add_tensor(name, tensor)
+
     def _expand_fused_experts(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]] | None:
         """Expand a fused 3D expert parameter into per-expert 2D weight tensors.
 
