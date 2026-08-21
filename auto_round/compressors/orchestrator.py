@@ -460,6 +460,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block = get_module(self.model, block_name)
 
                 # ── Infrastructure: materialize ───────────────────────────
+                import time as _time
+
+                _t_load = _time.perf_counter()
                 if streamer is not None:
                     if stage_devices:
                         # round-robin home: the block was staged here, quantize in place
@@ -468,6 +471,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
                 materialize_model_(block)
+                _t_load = _time.perf_counter() - _t_load
 
                 # ── Pure algorithm ────────────────────────────────────────
                 # ``block_index`` carries the global block index so compress_block
@@ -495,6 +499,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 else:
                     self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
                 if self.compress_context.is_immediate_packing:
+                    _t_pack = _time.perf_counter()
                     for _n, _mod in block.named_modules():
                         if hasattr(_mod, "bits") and check_to_quantized(_mod):
                             from auto_round.compressors.utils import immediate_pack as _immediate_pack
@@ -505,9 +510,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                             if module_name is None:
                                 continue
                             _immediate_pack(module_name, self.layer_config)
+                    _t_pack = _time.perf_counter() - _t_pack
+                else:
+                    _t_pack = 0.0
 
                 # ── Infrastructure: shard write / device cleanup ──────────
                 if self.compress_context.is_immediate_saving:
+                    _t_write = _time.perf_counter()
                     # Save non-quantized leaf modules (e.g. norms, embeddings in block).
                     for _n, m in block.named_modules():
                         if (
@@ -524,6 +533,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # Write at block scope for any remaining params/buffers.
                     self.shard_writer.write(name=block_name)
                     block.to("meta")
+                    _t_write = _time.perf_counter() - _t_write
+                    logger.info(
+                        "[stream] block timings: load %.1fs pack %.1fs write %.1fs",
+                        _t_load, _t_pack, _t_write,
+                    )
                 else:
                     mv_module_from_gpu(block)
                     if self.compress_context.low_cpu_mem_usage and streamer is None:
