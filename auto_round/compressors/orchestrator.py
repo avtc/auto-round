@@ -805,14 +805,21 @@ class CompressionOrchestrator(BaseOrchestrator):
             if rss_tick % 60 == 0:  # ~30s
                 bp.log_worker_rss(procs)
             if rss_tick % 10 == 0:  # ~5s
+                _next_g = min(pointer, key=lambda g: pointer[g])
+                _next_k = pointer[_next_g]
                 logger.info(
-                    "[bp-trace] tick %d: done=%s ptr=%s inflight=%s queue_pending=%s procs_alive=%d",
+                    "[bp-trace] tick %d: done=%s ptr=%s inflight=%s queue_pending=%s procs_alive=%d "
+                    "next=g%d/k%d ckpt_exists=%s results_dir=%s",
                     rss_tick,
                     {g: len(d) for g, d in done.items()},
                     dict(pointer),
                     sorted(inflight.values()),
                     bp.list_pending(qdir),
                     sum(1 for proc in procs if proc.poll() is None),
+                    _next_g,
+                    _next_k,
+                    bp.chain_state_exists(results_dir, _next_g, _next_k) if _next_k > 0 else "k0-n/a",
+                    results_dir,
                 )
             seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
 
