@@ -92,7 +92,16 @@ def worker_command(argv: Sequence[str], device: Optional[int] = None) -> List[st
     parent invocation don't request invisible devices.
     """
     argv = list(argv)
-    if argv and str(argv[0]).endswith(".py"):
+    if argv and str(argv[0]).endswith("__main__.py"):
+        # Parent was launched with ``python -m <pkg>``: reproduce -m semantics.
+        # Running __main__.py as a plain file puts the package directory (not
+        # the repo root) on sys.path, which can shadow the checkout with a
+        # stale site-packages copy and break imports.
+        from pathlib import PurePath
+
+        package = PurePath(str(argv[0])).parent.name
+        argv = [sys.executable, "-m", package] + argv[1:]
+    elif argv and str(argv[0]).endswith(".py"):
         argv = [sys.executable] + argv
     if device is not None:
         out, i = [], 0

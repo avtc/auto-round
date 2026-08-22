@@ -32,6 +32,13 @@ class TestWorkerCommand(unittest.TestCase):
         cmd = block_parallel.worker_command(["/usr/bin/auto-round", "--a", "1"])
         self.assertEqual(cmd, ["/usr/bin/auto-round", "--a", "1"])
 
+    def test_module_launch_reproduces_m(self):
+        argv = ["/home/ubuntu/git/auto-round/auto_round/__main__.py", "--iters", "500"]
+        self.assertEqual(
+            block_parallel.worker_command(argv),
+            [block_parallel.sys.executable, "-m", "auto_round", "--iters", "500"],
+        )
+
     def test_device_map_collapsed_for_pinned_worker(self):
         argv = ["auto-round", "--device_map", "0,1,2,3", "--iters", "500"]
         self.assertEqual(
