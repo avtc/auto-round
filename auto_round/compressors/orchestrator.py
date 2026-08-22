@@ -677,31 +677,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             bp.save_shared_inputs(self._snapshot_calib_state(all_inputs, input_ids_cache), inputs_path)
             logger.info("block-parallel tuning: shared calibration inputs to %s", inputs_path)
 
-        # host-RAM cap: the parent just ran the identical cache pass, so its
-        # measured peak RSS is the best per-worker estimate -- minus the parts
-        # workers no longer hold privately (mmap-shared non-block tensors and
-        # calibration inputs, whose on-disk sizes are exact lower bounds for
-        # the shared footprint)
-        shared_gib = 0.0
-        for shared_path in (nonblocks_path, inputs_path):
-            if os.path.isfile(shared_path):
-                shared_gib += os.path.getsize(shared_path) / (1024**3)
-        per_worker_ram_gb = max(2.5, 0.9 * max(memory_monitor.peak_ram, 4.0) - shared_gib)
-        # Host RAM is advisory, not enforced: --device_map is the user's
-        # request, estimates have repeatedly been wrong in both directions,
-        # and the fatal-fast + resume contract covers reality disagreeing with
-        # the estimate. Warn when the arithmetic looks tight so the risk is
-        # visible at spawn time (swap absorbs overruns; watch the RSS lines).
-        available_ram_gb = bp._available_ram_gb() or 0.0
-        estimated_total = len(gpu_ids) * per_worker_ram_gb
-        if available_ram_gb > 0 and estimated_total > available_ram_gb:
-            logger.warning(
-                "block-parallel tuning: estimated host RAM %.1f GiB for %d workers exceeds %.1f GiB "
-                "available (~%.1f GiB/worker estimate, shared pages may already cover part of it); "
-                "proceeding per --device_map -- watch worker RSS lines and expect fatal-fast abort "
-                "if the box thrashes",
-                estimated_total, len(gpu_ids), available_ram_gb, per_worker_ram_gb,
-            )
         if len(gpu_ids) < 2:
             return _fail_if_requested(
                 f"fewer than 2 usable GPUs ({gpu_ids}; required ~{required_vram_bytes / 1024**3:.1f} GiB "
