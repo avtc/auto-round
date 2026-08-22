@@ -254,37 +254,52 @@ def chain_state_exists(results_dir: str, group: int, block_idx: int) -> bool:
     return os.path.exists(_chain_state_path(results_dir or "", group, block_idx))
 
 
+def _to_cpu_recursive(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu")
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_cpu_recursive(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _to_cpu_recursive(v) for k, v in obj.items()}
+    return obj
+
+
+def _to_device_recursive(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_device_recursive(x, device) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _to_device_recursive(v, device) for k, v in obj.items()}
+    return obj
+
+
 def save_chain_state(results_dir: str, group: int, block_idx: int, hidden) -> None:
     """Checkpoint the chained hidden state entering block ``block_idx``.
 
     The hidden state is the only live chain variable across blocks (masks and
     positions are re-sourced from the per-block pre-cache every iteration), so
     saving it lets a resumed worker skip already-tuned prefix blocks with no
-    replay. Non-tensor chain payloads are skipped (nothing to restore).
+    replay. ``hidden`` may be a tensor, a per-sample list/tuple, or a dict --
+    block replay formats vary by model -- so it is persisted recursively and
+    restored with the same structure.
     """
-    if not isinstance(hidden, torch.Tensor):
-        return
     os.makedirs(results_dir, exist_ok=True)
-    payload = {"hidden": hidden.detach().to("cpu"), "dtype": str(hidden.dtype)}
+    payload = {"hidden": _to_cpu_recursive(hidden)}
     tmp = _chain_state_path(results_dir, group, block_idx) + ".tmp"
     torch.save(payload, tmp)
     os.replace(tmp, _chain_state_path(results_dir, group, block_idx))
 
 
 def load_chain_state(results_dir: str, group: int, block_idx: int, device: str):
-    """Restore a chained hidden state, or ``None`` when absent/non-tensor."""
+    """Restore a chained hidden state, or ``None`` when absent."""
     if not results_dir:
         return None
     path = _chain_state_path(results_dir, group, block_idx)
     if not os.path.exists(path):
         return None
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    dtype = getattr(torch, payload["dtype"].replace("torch.", ""), None)
-    hidden = payload["hidden"]
-    if dtype is not None:
-        hidden = hidden.to(dtype)
-    return hidden.to(device)
-
+    return _to_device_recursive(payload["hidden"], device)
 
 def queue_dir(results_dir: str) -> str:
     return os.path.join(results_dir, "queue")
