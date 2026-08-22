@@ -22,6 +22,7 @@ import torch
 from transformers import AutoConfig, set_seed
 
 from auto_round.algorithms.quantization import BaseQuantizer, QuantizationConfig
+from auto_round import envs
 from auto_round.algorithms.transforms import (
     BaseRotationConfig,
     apply_rotation,
@@ -2003,6 +2004,14 @@ class BaseOrchestrator(object):
         else:
             self.quantize()
             self.model_context.quantized = True
+
+        if envs.AR_BLOCK_PARALLEL_WORKER:
+            # Block-parallel tuning worker: tuning results were already dumped
+            # to AR_BLOCK_PARALLEL_RESULTS; the parent performs the packing and
+            # saving pass. Skip the export entirely (its output would be a
+            # span-partial model).
+            logger.info("block-parallel worker: skipping save (parent packs and exports)")
+            return self.model_context.model, None
 
         # Ensure ShardWriter is ready before saving (deferred from post_init).
         self._ensure_shard_writer()

@@ -14,6 +14,7 @@
 import copy
 import gc
 import os
+import sys
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -185,6 +186,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         token_ids: list[torch.Tensor] | None = None,
         resume_state: Optional["ResumeState"] = None,
         resume_input_ids=None,
+        span: Optional[tuple] = None,
     ):
         """Quantize and dequantize the weights of the specified blocks in the model.
 
@@ -194,6 +196,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         block_names: The names of the blocks to be quantized and dequantized.
         nblocks: The number of blocks to quantize and dequantize.
         device: The device for quantization and dequantization.
+        span: Optional ``(start, end)`` restriction for block-parallel workers:
+            blocks before ``start`` are fast-forwarded with original-weights
+            no-grad forwards (to chain this span's entry input, mirroring the
+            serial reference chain), blocks from ``end`` are skipped, and only
+            blocks inside the span are tuned.
         resume_state: when set and already partway through this block group
             (`resume_state.resume_index > 0`), the caller has already
             substituted `inputs`/`q_input` for the first not-yet-done block;
@@ -225,12 +232,33 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         start_index = resume_state.resume_index if resume_state is not None and nblocks == 1 else 0
         for i in range(start_index, len(block_names), nblocks):
+            if span is not None and i >= span[1]:
+                break  # span restriction: remaining blocks belong to another worker
             if input_others_extra_blocks and block_names[i] in input_others_extra_blocks:
                 input_others = input_others_extra_blocks[block_names[i]]
                 _, input_others = self._preprocess_block_inputs(input_others)
                 input_others_extra_blocks.pop(block_names[i])
             if i != 0:
                 pbar.update(1)
+            if span is not None and i < span[0]:
+                # ── Fast-forward: original-weights forward only ─────────────
+                # Chains this span's entry input exactly like the serial loop's
+                # reference chain (same block_forward call, original weights),
+                # without calibration or tuning. ~1000x cheaper than tuning.
+                n_ff = block_names[i]
+                m_ff = get_module(model, n_ff)
+                if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+                    self._offloader.reload(model, n_ff)
+                materialize_model_(m_ff)
+                m_ff = self.alg_composer.dispatch_block(m_ff, input_ids, input_others)
+                with torch.no_grad():
+                    ff_output = self.alg_composer.block_forward(m_ff, input_ids, input_others)
+                input_ids = ff_output
+                if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
+                    accelerate.hooks.remove_hook_from_submodules(m_ff)
+                mv_module_from_gpu(m_ff)
+                clear_memory(device_list=device_manager.device_list)
+                continue
             if nblocks == 1:
                 n = block_names[i]
                 pbar.set_description(f"Quantizing {n}")
@@ -386,6 +414,126 @@ class CompressionOrchestrator(BaseOrchestrator):
         del inputs
 
         clear_memory()
+
+    def _maybe_block_parallel_tune(self, all_blocks: list, is_worker: bool) -> bool:
+        """Run block-parallel tuning when enabled; returns True if results were applied.
+
+        Parent-side: spawns one worker process per eligible GPU (each pinned via
+        CUDA_VISIBLE_DEVICES and restricted to a contiguous span of blocks), waits,
+        merges the workers' tuned scale/zp dumps, and applies them through the
+        ordinary immediate-pack/save flow. Workers themselves (``is_worker``)
+        take the span-restricted serial loop instead.
+        """
+        if is_worker:
+            return False
+        from auto_round.compressors import block_parallel as bp
+
+        enabled = bp.block_parallel_tuning_enabled(
+            need_quanted_input=bool(self.alg_composer.need_quanted_input()),
+            super_group_size=self.super_group_size,
+            nblocks=self.nblocks,
+            n_block_groups=len(all_blocks),
+            is_immediate_packing=self.compress_context.is_immediate_packing,
+            is_immediate_saving=self.compress_context.is_immediate_saving,
+            n_blocks_total=sum(len(group) for group in all_blocks),
+            argv=sys.argv,
+        )
+        if not enabled:
+            return False
+        gpu_ids = bp.eligible_gpus()
+        if len(gpu_ids) < 2:
+            logger.info("block-parallel tuning disabled: fewer than 2 eligible GPUs (%s)", gpu_ids)
+            return False
+        spans = bp.split_spans([len(group) for group in all_blocks], len(gpu_ids))
+        output_root = getattr(self.compress_context, "output_dir", None) or "tmp_autoround"
+        results_dir = os.path.join(output_root, "block_parallel_results")
+        logger.info(
+            "block-parallel tuning: %d workers on GPUs %s; results/logs in %s",
+            len(spans),
+            gpu_ids[: len(spans)],
+            results_dir,
+        )
+        procs = bp.spawn_workers(sys.argv, spans, gpu_ids[: len(spans)], results_dir)
+        codes = bp.wait_workers(procs)
+        if any(code != 0 for code in codes):
+            raise RuntimeError(
+                f"block-parallel tuning: worker failure (exit codes {codes}); logs in {results_dir}. "
+                "Rerun with AR_ENABLE_BLOCK_PARALLEL_TUNING=0 for the serial path."
+            )
+        tuned = bp.load_worker_results(results_dir, len(spans))
+        if not tuned:
+            raise RuntimeError(
+                f"block-parallel tuning: no worker results produced; logs in {results_dir}. "
+                "Rerun with AR_ENABLE_BLOCK_PARALLEL_TUNING=0 for the serial path."
+            )
+        self._apply_tuned_results(all_blocks, tuned)
+        return True
+
+    def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
+        """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
+        from auto_round.compressors.utils import immediate_pack as _immediate_pack
+
+        n_blocks = sum(len(group) for group in all_blocks)
+        pbar = tqdm(range(n_blocks))
+        for group in all_blocks:
+            for block_name in group:
+                pbar.set_description(f"Packing {block_name}")
+                if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+                    self._offloader.reload(self.model_context.model, block_name)
+                block = get_module(self.model_context.model, block_name)
+                materialize_model_(block)
+                convert_module_to_hp_if_necessary(block, self.model_context.amp_dtype, device_manager.device)
+                applied = 0
+                for sub_name, sub in block.named_modules():
+                    layer_name = getattr(sub, "global_name", None) or (
+                        f"{block_name}.{sub_name}" if sub_name else block_name
+                    )
+                    entry = tuned.get(layer_name)
+                    if entry is None or not hasattr(sub, "weight"):
+                        continue
+                    sub.scale = entry["scale"].to(sub.weight.device)
+                    sub.zp = entry["zp"].to(sub.weight.device) if entry["zp"] is not None else entry["zp"]
+                    applied += 1
+                for sub_name, sub in block.named_modules():
+                    if hasattr(sub, "bits") and check_to_quantized(sub):
+                        module_name = getattr(sub, "global_name", None) or (
+                            f"{block_name}.{sub_name}" if sub_name else None
+                        )
+                        if module_name is None:
+                            continue
+                        _immediate_pack(module_name, self.layer_config)
+                if self.compress_context.is_immediate_saving:
+                    self.shard_writer.write(block, is_finalize=False)
+                if self.compress_context.low_cpu_mem_usage:
+                    self._offloader(self.model_context.model, block_name, overwrite=True)
+                pbar.update(1)
+                if applied == 0:
+                    logger.debug("block %s: no worker-tuned layers (kept as-is)", block_name)
+        pbar.close()
+
+    def _dump_parallel_worker_results(self, all_blocks: list, group_spans: dict) -> None:
+        """Worker-side: persist tuned scale/zp for this worker's span blocks."""
+        from auto_round.compressors.block_parallel import dump_worker_results
+
+        span_block_names = []
+        for group_idx, (start, end) in group_spans.items():
+            span_block_names.extend(all_blocks[group_idx][start:end])
+        results = {}
+        for name, module in self.model_context.model.named_modules():
+            if not hasattr(module, "scale"):
+                continue
+            if not any(name == block or name.startswith(block + ".") for block in span_block_names):
+                continue
+            layer_name = getattr(module, "global_name", None) or name
+            results[layer_name] = {
+                "scale": module.scale.detach().cpu() if isinstance(module.scale, torch.Tensor) else module.scale,
+                "zp": module.zp.detach().cpu() if isinstance(module.zp, torch.Tensor) else module.zp,
+            }
+        out_path = envs.AR_BLOCK_PARALLEL_RESULTS
+        if not out_path:
+            raise RuntimeError("AR_BLOCK_PARALLEL_WORKER is set but AR_BLOCK_PARALLEL_RESULTS is missing")
+        dump_worker_results(out_path, results)
+        logger.info("block-parallel worker: dumped %d tuned layers to %s", len(results), out_path)
 
     def quantize(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Quantize the model and return the quantized model along with layer configurations.The entry of AutoRound.
@@ -678,8 +826,32 @@ class CompressionOrchestrator(BaseOrchestrator):
                     ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names)
                 )
 
+        # ── Block-parallel tuning (AR_ENABLE_BLOCK_PARALLEL_TUNING, experimental) ──
+        # Worker processes re-exec the same CLI pinned to one GPU each, tune a
+        # contiguous span of blocks against the original-weights input chain
+        # (blocks are independent: the serial loop chains reference outputs,
+        # not quantized outputs), and dump tuned scale/zp. The parent merges
+        # the dumps and packs/saves through the ordinary immediate flow. The
+        # serial loop below remains the default and the fallback.
+        worker_group_spans = None
+        if envs.AR_BLOCK_PARALLEL_WORKER:
+            from auto_round.compressors.block_parallel import spans_from_json
+
+            worker_spans = [span for worker in spans_from_json(envs.AR_BLOCK_PARALLEL_SPANS or "[]") for span in worker]
+            worker_group_spans = {}
+            for group_idx, start, end in worker_spans:
+                if group_idx in worker_group_spans:
+                    raise ValueError(f"worker received multiple spans for group {group_idx}: unsupported")
+                worker_group_spans[group_idx] = (start, end)
+        parallel_applied = self._maybe_block_parallel_tune(all_blocks, worker_group_spans is not None)
+
         try:
-            for group_idx, block_names in enumerate(all_blocks):
+            for group_idx, block_names in enumerate(all_blocks if not parallel_applied else []):
+                span = None
+                if worker_group_spans is not None:
+                    span = worker_group_spans.get(group_idx)
+                    if span is None:
+                        continue  # another worker owns this group
                 inputs = all_inputs[block_names[0]]
                 all_inputs.pop(block_names[0])
                 q_inputs = None
@@ -734,6 +906,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     token_ids=input_ids_cache,
                     resume_state=resume_state,
                     resume_input_ids=resume_input_ids,
+                    span=span,
                 )
                 if self.compress_context.is_immediate_packing and len(self.formats) != 1:
                     raise ValueError(
@@ -759,6 +932,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             self.alg_composer.finalize_run()
         pbar.set_description("Quantizing done")
         pbar.close()
+        if worker_group_spans is not None:
+            # Worker process: its job ends with tuning its span and dumping
+            # scale/zp. Packing, saving, outside-block layers and model reloads
+            # all belong to the parent.
+            self._dump_parallel_worker_results(all_blocks, worker_group_spans)
+            return self.model_context.model, self.layer_config
         if self.compress_context.low_cpu_mem_usage:
             if envs.AR_RESUME_DIR and not self.compress_context.is_immediate_saving:
                 # `reload(names=None)` only reloads names in

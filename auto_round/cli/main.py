@@ -16,6 +16,8 @@ import argparse
 import difflib
 import sys
 
+from auto_round import envs
+
 from auto_round.cli.algorithms import AlgorithmHandler
 from auto_round.cli.parser import (
     add_common_quantization_arguments,
@@ -402,6 +404,13 @@ def tune(args):
     )
 
     model, folders = autoround.quantize_and_save(args.output_dir, format=args.format)  # pylint: disable=no-member
+    if folders is None and envs.AR_BLOCK_PARALLEL_WORKER:
+        # Block-parallel tuning worker: results already dumped; the parent
+        # packs and exports. Skip evaluation and exit cleanly.
+        from auto_round.utils import logger
+
+        logger.info("block-parallel worker: done.")
+        return
     tokenizer = autoround.tokenizer  # pylint: disable=no-member
     clear_memory()
 
