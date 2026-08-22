@@ -337,6 +337,22 @@ class CompressionOrchestrator(BaseOrchestrator):
                 input_others_extra_blocks.pop(block_names[i])
             if i != 0:
                 pbar.update(1)
+            if (
+                produce_only is not None
+                and bp_results_dir
+                and i > produce_only[0]
+            ):
+                # skip-ahead: a sibling replaying the same degenerate prefix
+                # published this step's checkpoint -- consume it instead of
+                # re-forwarding (coordination through the shared files; turns
+                # duplicated replay work into a race with early exit)
+                _existing = _bp_load_chain_state(
+                    bp_results_dir, group_idx, i + 1, device=self.compress_context.cache_device
+                )
+                if _existing is not None:
+                    input_ids = _existing
+                    pbar.update(1)
+                    continue
             if produce_only is not None or span is not None and (
                 i < span[0]
                 or (
