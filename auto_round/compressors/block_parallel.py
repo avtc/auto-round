@@ -136,6 +136,7 @@ def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_e
             _time.sleep(5.0)
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env["AR_BLOCK_PARALLEL_WORKER"] = "1"
         # AR_RESUME_DIR is deliberately inherited: workers derive their
         # per-block checkpoint dir from it (same user-facing flag as serial).
         env["AR_ENABLE_AUTO_SCHEME_PARALLEL"] = "0"  # single-GPU workers never fan out
@@ -164,7 +165,7 @@ def log_worker_rss(procs: List[subprocess.Popen], tag: str = "") -> None:
             with open(f"/proc/{proc.pid}/status", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("VmRSS:"):
-                        parts.append(f"w{idx}={int(line.split()[1]) / 1024:.1f}GiB")
+                        parts.append(f"w{idx}={int(line.split()[1]) / 1024**2:.2f}GiB")
                         break
         except OSError:
             return  # non-Linux or proc gone; skip silently
@@ -463,7 +464,7 @@ def block_parallel_tuning_enabled(
     """
     if not envs.AR_ENABLE_BLOCK_PARALLEL_TUNING:
         return "env"
-    if envs.AR_BLOCK_PARALLEL_WORKER:
+    if envs.AR_BLOCK_PARALLEL_WORKER or envs.AR_BLOCK_PARALLEL_QUEUE_DIR:
         return "worker process (no recursive parallelism)"
     if argv is None or len(argv) == 0:
         return "no reconstructible command line (API usage)"

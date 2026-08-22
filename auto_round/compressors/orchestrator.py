@@ -618,24 +618,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 largest_block_bytes = max(largest_block_bytes, nbytes)
         required_vram_bytes = int(largest_block_bytes * 3) + (4 * 1024**3)
         gpu_ids = bp.eligible_gpus(required_vram_bytes, allowed_indices=allowed or None)
-        # host-RAM cap: the parent just ran the identical cache pass, so its
-        # measured peak RSS is the best per-worker estimate
-        per_worker_ram_gb = max(4.0, 0.9 * max(memory_monitor.peak_ram, 4.0))
-        available_ram_gb = bp._available_ram_gb() or 0.0
-        if available_ram_gb > 0:
-            ram_cap = max(1, int(available_ram_gb / per_worker_ram_gb))
-            if len(gpu_ids) > ram_cap:
-                logger.info(
-                    "block-parallel tuning: using %d of %d GPU(s) -- host RAM %.1f GiB available "
-                    "at ~%.1f GiB per worker (parent peak RSS as estimate)",
-                    ram_cap, len(gpu_ids), available_ram_gb, per_worker_ram_gb,
-                )
-                gpu_ids = gpu_ids[:ram_cap]
-        if len(gpu_ids) < 2:
-            return _fail_if_requested(
-                f"fewer than 2 usable GPUs ({gpu_ids}; required ~{required_vram_bytes / 1024**3:.1f} GiB "
-                f"free VRAM each, host RAM {available_ram_gb:.1f} GiB at ~{per_worker_ram_gb:.1f} GiB/worker)"
-            )
+
         # Resume storage reuses the serial flag: AR_RESUME_DIR set -> per-block
         # result files + chain checkpoints under <AR_RESUME_DIR>/block_parallel,
         # validated by run signature; unset -> fresh scratch dir (no resume).
@@ -693,6 +676,32 @@ class CompressionOrchestrator(BaseOrchestrator):
         if not os.path.isfile(inputs_path) and all_inputs is not None:
             bp.save_shared_inputs(self._snapshot_calib_state(all_inputs, input_ids_cache), inputs_path)
             logger.info("block-parallel tuning: shared calibration inputs to %s", inputs_path)
+
+        # host-RAM cap: the parent just ran the identical cache pass, so its
+        # measured peak RSS is the best per-worker estimate -- minus the parts
+        # workers no longer hold privately (mmap-shared non-block tensors and
+        # calibration inputs, whose on-disk sizes are exact lower bounds for
+        # the shared footprint)
+        shared_gib = 0.0
+        for shared_path in (nonblocks_path, inputs_path):
+            if os.path.isfile(shared_path):
+                shared_gib += os.path.getsize(shared_path) / (1024**3)
+        per_worker_ram_gb = max(2.5, 0.9 * max(memory_monitor.peak_ram, 4.0) - shared_gib)
+        available_ram_gb = bp._available_ram_gb() or 0.0
+        if available_ram_gb > 0:
+            ram_cap = max(1, int(available_ram_gb / per_worker_ram_gb))
+            if len(gpu_ids) > ram_cap:
+                logger.info(
+                    "block-parallel tuning: using %d of %d GPU(s) -- host RAM %.1f GiB available "
+                    "at ~%.1f GiB per worker (parent peak RSS as estimate)",
+                    ram_cap, len(gpu_ids), available_ram_gb, per_worker_ram_gb,
+                )
+                gpu_ids = gpu_ids[:ram_cap]
+        if len(gpu_ids) < 2:
+            return _fail_if_requested(
+                f"fewer than 2 usable GPUs ({gpu_ids}; required ~{required_vram_bytes / 1024**3:.1f} GiB "
+                f"free VRAM each, host RAM {available_ram_gb:.1f} GiB at ~{per_worker_ram_gb:.1f} GiB/worker)"
+            )
 
         # Canonical done-state: serial manifests (contiguous prefix per group),
         # advanced by this sequencer as blocks complete in order. An unmodified
@@ -1336,7 +1345,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         # serial loop below remains the default and the fallback.
         parallel_applied = self._maybe_block_parallel_tune(
             all_blocks,
-            bool(envs.AR_BLOCK_PARALLEL_WORKER),
+            bool(envs.AR_BLOCK_PARALLEL_WORKER or envs.AR_BLOCK_PARALLEL_QUEUE_DIR),
             all_inputs=all_inputs,
             input_ids_cache=input_ids_cache,
         )
