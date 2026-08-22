@@ -739,17 +739,34 @@ class CompressionOrchestrator(BaseOrchestrator):
             seq += 1
         return seq
 
-    def _park_unused_modules_for_worker(self) -> None:
-        """Meta-park modules that block-wise text tuning never invokes.
+    _IMAGE_INPUT_KEYS = ("pixel_values", "pixel_values_videos", "image_grid_thw", "videos", "images")
 
-        The calibration forward early-stops at the last cached block (lm_head
-        is never computed) and text-only calibration never routes through the
-        vision tower, so both can sit on the meta device inside tuning workers,
-        cutting duplicated host RAM per process. Embeddings stay materialized
-        (the first block's cached input depends on them).
+    @classmethod
+    def _inputs_contain_images(cls, inputs) -> bool:
+        """True when cached calibration inputs carry image/video tensors."""
+        if not isinstance(inputs, dict):
+            return False
+        for key, value in inputs.items():
+            if isinstance(key, str) and any(token in key for token in cls._IMAGE_INPUT_KEYS):
+                if value is not None and (not isinstance(value, (list, tuple)) or len(value) > 0):
+                    return True
+        return False
+
+    def _park_unused_modules_for_worker(self, all_inputs: dict) -> None:
+        """Meta-park modules that block-wise tuning never invokes.
+
+        lm_head: the calibration forward early-stops at the last cached block
+        and block-wise tuning computes per-block losses only, so the head is
+        structurally unreachable -- parked unconditionally.
+
+        Vision encoders: unreachable for text-only calibration; parked only
+        when the cached calibration inputs contain no image/video data (the
+        runtime check replaces a configuration knob).
+
+        Embeddings stay materialized (the first block's cached input depends
+        on them). Parking cuts the duplicated non-block params from each
+        worker's host RAM.
         """
-        if not envs.AR_BLOCK_PARALLEL_WORKER_PARK:
-            return
         import gc as _gc
 
         model = self.model_context.model
@@ -757,12 +774,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         lm_head = get_lm_head_name(model)
         if lm_head:
             candidates.append(lm_head)
-        vision_tokens = ("visual", "vision", "multi_modal", "multimodal")
-        for name, _module in model.named_modules():
-            if not name or name.count(".") > 1:
-                continue  # only shallow modules: the encoder containers, not their guts
-            if any(tok in name.lower().split(".")[-1] for tok in vision_tokens):
-                candidates.append(name)
+        has_images = any(self._inputs_contain_images(v) for v in all_inputs.values())
+        if not has_images:
+            vision_tokens = ("visual", "vision", "multi_modal", "multimodal")
+            for name, _module in model.named_modules():
+                if not name or name.count(".") > 1:
+                    continue  # encoder containers only, not their internals
+                if any(tok in name.lower().split(".")[-1] for tok in vision_tokens):
+                    candidates.append(name)
         freed = 0
         for name in dict.fromkeys(candidates):
             module = get_module(model, name)
@@ -776,7 +795,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         if freed:
             _gc.collect()
             logger.info(
-                "block-parallel worker: parked lm_head/vision on meta (~%.2f GiB host RAM saved)",
+                "block-parallel worker: parked unused modules on meta (~%.2f GiB host RAM saved)",
                 freed / (1024**3),
             )
 
@@ -1081,9 +1100,6 @@ class CompressionOrchestrator(BaseOrchestrator):
     def _quantize_data_driven(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Data-driven quantization path — uses calibration data for optimization."""
 
-        if envs.AR_BLOCK_PARALLEL_WORKER:
-            self._park_unused_modules_for_worker()
-
         # Reclaim heap fragmentation from init/post_init before the memory-intensive quantize loop.
         gc.collect()
         _force_trim_malloc()
@@ -1225,6 +1241,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if envs.AR_BLOCK_PARALLEL_WORKER:
                 # queue-serve mode: consume dispatch jobs (tune / chain-produce)
                 # until the parent signals STOP and the queue is drained
+                self._park_unused_modules_for_worker(all_inputs)
                 self._serve_block_queue(all_blocks, all_inputs, input_ids_cache, pbar)
             for group_idx, block_names in enumerate(
                 all_blocks if not parallel_applied and not envs.AR_BLOCK_PARALLEL_WORKER else []
