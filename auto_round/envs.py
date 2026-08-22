@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK: bool = False
     AR_BLOCK_PARALLEL_RAM_PER_WORKER: float = 12.0
     AR_BLOCK_PARALLEL_MAX_WORKERS: int = 0
+    AR_BLOCK_PARALLEL_SPAWN_STAGGER: float = 10.0
+    AR_BLOCK_PARALLEL_WORKER_PARK: bool = True
     AR_BLOCK_PARALLEL_RESUME: bool = True
 
 
@@ -169,6 +171,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_BLOCK_PARALLEL_RAM_PER_WORKER": lambda: float(os.getenv("AR_BLOCK_PARALLEL_RAM_PER_WORKER", "12")),
     # Hard cap on tuning worker count (0 = no explicit cap beyond GPU/RAM limits).
     "AR_BLOCK_PARALLEL_MAX_WORKERS": lambda: int(os.getenv("AR_BLOCK_PARALLEL_MAX_WORKERS", "0")),
+    # Seconds between worker spawns: staggers the per-worker model-build and
+    # dataset-preprocessing RAM transients so N workers don't spike together.
+    "AR_BLOCK_PARALLEL_SPAWN_STAGGER": lambda: float(os.getenv("AR_BLOCK_PARALLEL_SPAWN_STAGGER", "10")),
+    # Park lm_head + vision tower on the meta device inside tuning workers
+    # (unused during block-wise text tuning: cache pass early-stops at the last
+    # block; vision is never routed for text calibration) to cut per-worker
+    # host RAM.
+    "AR_BLOCK_PARALLEL_WORKER_PARK": lambda: os.getenv("AR_BLOCK_PARALLEL_WORKER_PARK", "1").lower()
+    not in ("0", "false", "no"),
     # When enabled (default), block-parallel tuning workers checkpoint their
     # per-block tuned scale/zp plus the chained hidden state after every
     # completed block, so an interrupted run resumes from the first missing

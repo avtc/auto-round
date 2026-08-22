@@ -646,9 +646,9 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         import time as _time
 
+        rss_tick = 0
         while any(pointer[g] < len(all_blocks[g]) for g in pointer):
             _time.sleep(0.5)
-            # refresh done sets from result files
             for g, blocks in enumerate(all_blocks):
                 done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
             # absorb completed prefix blocks into the serial manifests
@@ -657,38 +657,31 @@ class CompressionOrchestrator(BaseOrchestrator):
                     rs = resume_states[g]
                     while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
                         k = rs.resume_index
-                        rs.mark_block_done(blocks[k], None, _bp_load_chain_state(results_dir, g, k + 1,
-                                                                                device="cpu"))
-            # retire finished in-flight jobs
+                        rs.mark_block_done(
+                            blocks[k], None, _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
+                        )
             for jseq in list(inflight):
                 g, k = inflight[jseq]
                 if k in done[g]:
                     inflight.pop(jseq)
-            # all workers dead with work left: requeue claimed-unfinished jobs, fail loudly
-            if all(proc.poll() is not None for proc in procs):
-                for fname in os.listdir(qdir):
-                    if ".claimed-" not in fname:
-                        continue
-                    claimed = os.path.join(qdir, fname)
-                    try:
-                        job = self._read_json(claimed)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    g, k = job.get("group"), job.get("index")
-                    if job.get("job_type") == "tune" and g is not None and k not in done.get(g, set()):
-                        bp.write_job(qdir, seq=seq, job_type="tune", group=g, index=k,
-                                     block_name=all_blocks[g][k])
-                        seq += 1
-                    try:
-                        os.remove(claimed)
-                    except OSError:
-                        pass
-                inflight.clear()
+            # fatal-fast liveness: any worker exit while work remains aborts the
+            # run -- no requeue/retry, the rerun IS the retry (resuming from the
+            # manifest prefix + per-block result files)
+            for widx, proc in enumerate(procs):
+                code = proc.poll()
+                if code is None:
+                    continue
+                for sibling in procs:
+                    if sibling.poll() is None:
+                        sibling.terminate()
                 raise RuntimeError(
-                    f"block-parallel tuning: workers exited before completion; logs in {results_dir}. "
-                    + ("Rerun the same command to resume the missing blocks." if resumable
-                       else "Rerun with AR_ENABLE_BLOCK_PARALLEL_TUNING=0 for the serial path.")
+                    f"block-parallel tuning: worker {widx} exited with code {code} while blocks "
+                    f"remained; terminated siblings. Completed blocks are persisted -- rerun the "
+                    f"same command to resume. Worker logs: {results_dir}/worker_*.log"
                 )
+            rss_tick += 1
+            if rss_tick % 60 == 0:  # ~30s
+                bp.log_worker_rss(procs)
             seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
 
         bp.write_stop(qdir)
@@ -719,13 +712,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         return True
 
     @staticmethod
-    def _read_json(path):
-        import json as _json
-
-        with open(path, encoding="utf-8") as f:
-            return _json.load(f)
-
-    @staticmethod
     def _dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir):
         """Write tune jobs for dispatchable blocks; advance pointers past done ones."""
         from auto_round.compressors import block_parallel as bp
@@ -752,6 +738,47 @@ class CompressionOrchestrator(BaseOrchestrator):
             inflight[seq] = (g, k)
             seq += 1
         return seq
+
+    def _park_unused_modules_for_worker(self) -> None:
+        """Meta-park modules that block-wise text tuning never invokes.
+
+        The calibration forward early-stops at the last cached block (lm_head
+        is never computed) and text-only calibration never routes through the
+        vision tower, so both can sit on the meta device inside tuning workers,
+        cutting duplicated host RAM per process. Embeddings stay materialized
+        (the first block's cached input depends on them).
+        """
+        if not envs.AR_BLOCK_PARALLEL_WORKER_PARK:
+            return
+        import gc as _gc
+
+        model = self.model_context.model
+        candidates = []
+        lm_head = get_lm_head_name(model)
+        if lm_head:
+            candidates.append(lm_head)
+        vision_tokens = ("visual", "vision", "multi_modal", "multimodal")
+        for name, _module in model.named_modules():
+            if not name or name.count(".") > 1:
+                continue  # only shallow modules: the encoder containers, not their guts
+            if any(tok in name.lower().split(".")[-1] for tok in vision_tokens):
+                candidates.append(name)
+        freed = 0
+        for name in dict.fromkeys(candidates):
+            module = get_module(model, name)
+            if module is None:
+                continue
+            params = list(module.parameters())
+            if not params or all(param.device.type == "meta" for param in params):
+                continue
+            freed += sum(param.numel() * param.element_size() for param in params)
+            module.to("meta")
+        if freed:
+            _gc.collect()
+            logger.info(
+                "block-parallel worker: parked lm_head/vision on meta (~%.2f GiB host RAM saved)",
+                freed / (1024**3),
+            )
 
     def _serve_block_queue(self, all_blocks: list, all_inputs: dict, token_ids, pbar) -> None:
         """Worker-side queue-serve loop for block-parallel tuning.
@@ -828,6 +855,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             except Exception as err:  # noqa: BLE001
                 bp.job_failed(qdir, job, repr(err))
                 logger.error("block-parallel worker: job %s failed: %r", job.get("seq"), err)
+                # fatal-fast: a failing job aborts this worker; the parent aborts
+                # the run and the rerun (resume) is the retry
+                raise
 
     def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
         """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
@@ -1050,6 +1080,9 @@ class CompressionOrchestrator(BaseOrchestrator):
 
     def _quantize_data_driven(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Data-driven quantization path — uses calibration data for optimization."""
+
+        if envs.AR_BLOCK_PARALLEL_WORKER:
+            self._park_unused_modules_for_worker()
 
         # Reclaim heap fragmentation from init/post_init before the memory-intensive quantize loop.
         gc.collect()
