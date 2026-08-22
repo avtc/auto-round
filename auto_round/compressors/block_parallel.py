@@ -45,21 +45,63 @@ from auto_round.utils import logger
 Span = Tuple[int, int, int]  # (group_idx, start, end) -- end exclusive
 
 
-def eligible_gpus(min_free_gb: Optional[float] = None) -> List[int]:
-    """CUDA devices with at least ``min_free_gb`` GiB free (heterogeneous-safe)."""
+def eligible_gpus(min_free_gb: Optional[float] = None, allowed_indices: Optional[List[int]] = None) -> List[int]:
+    """CUDA devices usable for tuning workers (heterogeneous-safe).
+
+    Filters by free VRAM (default 18 GiB, AR_BLOCK_PARALLEL_MIN_FREE_GB), by the
+    caller's allowed device indices (the user's --device_map), and by host RAM:
+    the worker count never exceeds what MemAvailable budgets at
+    AR_BLOCK_PARALLEL_RAM_PER_WORKER (GiB) per worker. AR_BLOCK_PARALLEL_MAX_WORKERS
+    applies a hard cap on top.
+    """
     if not torch.cuda.is_available():
         return []
     if min_free_gb is None:
         min_free_gb = float(os.getenv("AR_BLOCK_PARALLEL_MIN_FREE_GB", "18"))
+    visible = list(range(torch.cuda.device_count()))
+    if allowed_indices is not None:
+        visible = [i for i in allowed_indices if 0 <= i < torch.cuda.device_count()]
     out = []
-    for index in range(torch.cuda.device_count()):
+    for index in visible:
         try:
             free, _total = torch.cuda.mem_get_info(index)
         except Exception:  # noqa: BLE001
             continue
         if free / (1024**3) >= min_free_gb:
             out.append(index)
+    # host-RAM budget: each worker runs its own cache pass + model skeleton
+    ram_available_gb = _available_ram_gb()
+    if ram_available_gb is not None:
+        ram_cap = max(1, int(ram_available_gb / max(0.1, envs.AR_BLOCK_PARALLEL_RAM_PER_WORKER)))
+        if len(out) > ram_cap:
+            logger.info(
+                "block-parallel tuning: capping workers to %d by host RAM (%.1f GiB available, "
+                "%.1f GiB/worker budget)",
+                ram_cap,
+                ram_available_gb,
+                envs.AR_BLOCK_PARALLEL_RAM_PER_WORKER,
+            )
+            out = out[:ram_cap]
+    hard_cap = envs.AR_BLOCK_PARALLEL_MAX_WORKERS
+    if hard_cap > 0 and len(out) > hard_cap:
+        out = out[:hard_cap]
     return out
+
+
+def _available_ram_gb() -> Optional[float]:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / (1024**2)
+    except OSError:
+        pass
+    try:
+        import psutil  # noqa: PLC0415
+
+        return psutil.virtual_memory().available / (1024**3)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def worker_command(argv: Sequence[str], device: Optional[int] = None) -> List[str]:

@@ -551,7 +551,15 @@ class CompressionOrchestrator(BaseOrchestrator):
         if reason is not None:
             logger.info("block-parallel tuning disabled: %s", reason)
             return _fail_if_requested(reason)
-        gpu_ids = bp.eligible_gpus()
+        # respect the user's --device_map: workers never spread onto GPUs the
+        # user did not ask for (also keeps the host-RAM footprint bounded)
+        allowed = []
+        for dev in device_manager.device_list:
+            try:
+                allowed.append(int(str(dev).split(":")[-1]))
+            except ValueError:
+                continue
+        gpu_ids = bp.eligible_gpus(allowed_indices=allowed or None)
         if len(gpu_ids) < 2:
             return _fail_if_requested(f"fewer than 2 eligible GPUs ({gpu_ids})")
         # Resume storage reuses the serial flag: AR_RESUME_DIR set -> per-block
