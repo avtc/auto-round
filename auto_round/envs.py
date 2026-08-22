@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     AR_BLOCK_PARALLEL_WORKER: bool = False
     AR_BLOCK_PARALLEL_QUEUE_DIR: Optional[str] = None
     AR_BLOCK_PARALLEL_RESULTS: Optional[str] = None
+    AR_BLOCK_PARALLEL_SHARED_NONBLOCKS: Optional[str] = None
+    AR_BLOCK_PARALLEL_SHARED_INPUTS: Optional[str] = None
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -152,6 +154,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_BLOCK_PARALLEL_QUEUE_DIR": lambda: os.getenv("AR_BLOCK_PARALLEL_QUEUE_DIR", None),
     # Internal: directory where parallel tuning workers dump tuned scale/zp.
     "AR_BLOCK_PARALLEL_RESULTS": lambda: os.getenv("AR_BLOCK_PARALLEL_RESULTS", None),
+    # Internal: mmap-shared non-block tensors + calibration inputs written by
+    # the parent and consumed by workers (and by the parent on resume).
+    "AR_BLOCK_PARALLEL_SHARED_NONBLOCKS": lambda: os.getenv("AR_BLOCK_PARALLEL_SHARED_NONBLOCKS", None),
+    "AR_BLOCK_PARALLEL_SHARED_INPUTS": lambda: os.getenv("AR_BLOCK_PARALLEL_SHARED_INPUTS", None),
     # When enabled (default), block-parallel tuning workers checkpoint their
     # per-block tuned scale/zp plus the chained hidden state after every
     # completed block, so an interrupted run resumes from the first missing

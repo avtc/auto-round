@@ -512,7 +512,55 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         return states
 
-    def _maybe_block_parallel_tune(self, all_blocks: list, is_worker: bool) -> bool:
+    def _parent_shared_inputs_path(self) -> Optional[str]:
+        """Deterministic shared-inputs location for a parent parallel run (resume)."""
+        from auto_round.compressors import block_parallel as bp
+
+        results_dir = bp.parallel_results_dir()
+        if results_dir is None:
+            return None
+        return os.path.join(bp.shared_dir(results_dir), "calib_inputs.pt")
+
+    def _bp_compressor_list(self) -> list:
+        compressors = self.alg_composer.block_quantizer
+        if not isinstance(compressors, (list, tuple)):
+            compressors = [compressors]
+        else:
+            compressors = list(compressors)
+        compressors.extend(self.alg_composer.preprocessors)
+        return compressors
+
+    def _snapshot_calib_state(self, all_inputs: dict, input_ids_cache) -> dict:
+        """Capture the post-cache context so workers can skip their own pass."""
+        cctx = self.calibration_context
+        return {
+            "inputs": all_inputs,
+            "input_ids": input_ids_cache,
+            "batch_size": cctx.batch_size,
+            "seqlen": cctx.seqlen,
+            "batch_dim": cctx.batch_dim,
+            "is_only_supported_bs1": getattr(cctx, "is_only_supported_bs1", False),
+            "orig_batch_size": getattr(cctx, "orig_batch_size", None),
+            "block_forward_batch_size": self.alg_composer.block_forward.batch_size,
+            "ga_steps": [getattr(c, "gradient_accumulate_steps", None) for c in self._bp_compressor_list()],
+        }
+
+    def _restore_calib_state(self, state: dict) -> None:
+        cctx = self.calibration_context
+        cctx.batch_size = state["batch_size"]
+        cctx.seqlen = state["seqlen"]
+        cctx.batch_dim = state["batch_dim"]
+        cctx.is_only_supported_bs1 = state["is_only_supported_bs1"]
+        if state.get("orig_batch_size") is not None:
+            cctx.orig_batch_size = state["orig_batch_size"]
+        self.alg_composer.block_forward.batch_size = state["block_forward_batch_size"]
+        for comp, ga in zip(self._bp_compressor_list(), state.get("ga_steps", [])):
+            if ga is not None and hasattr(comp, "gradient_accumulate_steps"):
+                comp.gradient_accumulate_steps = ga
+
+    def _maybe_block_parallel_tune(
+        self, all_blocks: list, is_worker: bool, all_inputs: dict = None, input_ids_cache=None
+    ) -> bool:
         """Run block-parallel tuning when enabled; returns True if results were applied.
 
         Parent-side: spawns one worker process per eligible GPU (each pinned via
@@ -629,6 +677,23 @@ class CompressionOrchestrator(BaseOrchestrator):
         shutil.rmtree(qdir, ignore_errors=True)
         os.makedirs(qdir, exist_ok=True)
 
+        # Structural RAM dedup: persist non-block tensors + calibration inputs
+        # once; workers mmap them (OS-shared pages) instead of building private
+        # copies, and skip their dataset/cache pass entirely.
+        sdir = bp.shared_dir(results_dir)
+        nonblocks_path = os.path.join(sdir, "nonblocks.pt")
+        inputs_path = os.path.join(sdir, "calib_inputs.pt")
+        os.makedirs(sdir, exist_ok=True)
+        if not os.path.isfile(nonblocks_path):
+            block_prefixes = flatten_list(
+                get_block_names(self.model_context.model, quant_vision=self.model_context.quant_nontext_module)
+            )
+            n_saved = bp.save_shared_nonblocks(self.model_context.model, block_prefixes, nonblocks_path)
+            logger.info("block-parallel tuning: shared %d non-block tensors to %s", n_saved, nonblocks_path)
+        if not os.path.isfile(inputs_path) and all_inputs is not None:
+            bp.save_shared_inputs(self._snapshot_calib_state(all_inputs, input_ids_cache), inputs_path)
+            logger.info("block-parallel tuning: shared calibration inputs to %s", inputs_path)
+
         # Canonical done-state: serial manifests (contiguous prefix per group),
         # advanced by this sequencer as blocks complete in order. An unmodified
         # serial run can resume from them later; out-of-order (fringe)
@@ -660,7 +725,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             len(gpu_ids), gpu_ids, n_todo, qdir,
             " (resumable: rerun the same command to finish missing blocks)" if resumable else "",
         )
-        env_extra = {"AR_BLOCK_PARALLEL_QUEUE_DIR": qdir, "AR_BLOCK_PARALLEL_RESULTS": results_dir}
+        env_extra = {
+            "AR_BLOCK_PARALLEL_QUEUE_DIR": qdir,
+            "AR_BLOCK_PARALLEL_RESULTS": results_dir,
+            "AR_BLOCK_PARALLEL_SHARED_NONBLOCKS": nonblocks_path,
+            "AR_BLOCK_PARALLEL_SHARED_INPUTS": inputs_path,
+        }
         procs = bp.spawn_workers(sys.argv, gpu_ids, log_dir=results_dir, extra_env=env_extra)
 
         # in-group-order dispatch pointers: near-sequential completion lets the
@@ -1169,14 +1239,34 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         else:
             logger.info("start to cache block inputs")
-        all_inputs = self.cache_data(
-            to_cache_block_names,
-            self.calibration_context.nsamples,
-            to_cache_layer_names,
-            last_cache_name=_last_cache_name,
+        _shared_inputs_path = (
+            envs.AR_BLOCK_PARALLEL_SHARED_INPUTS
+            if envs.AR_BLOCK_PARALLEL_WORKER
+            else self._parent_shared_inputs_path()
         )
-        # Raw token IDs from the tokenizer, cached during calibration for use in quantize_block.
-        input_ids_cache = all_inputs.pop("input_ids", None)
+        if _shared_inputs_path and os.path.isfile(_shared_inputs_path):
+            # block-parallel worker (or parent resuming a prior parallel run):
+            # reuse the parent-saved calibration inputs + synced context
+            # snapshot via mmap -- skips the dataset pass and cache forward
+            from auto_round.compressors import block_parallel as _bp_shared
+
+            payload = _bp_shared.load_shared_inputs(_shared_inputs_path)
+            self._restore_calib_state(payload)
+            all_inputs = payload["inputs"]
+            input_ids_cache = payload["input_ids"]
+            logger.info(
+                "calibration inputs restored from shared file %s (cache pass skipped)",
+                _shared_inputs_path,
+            )
+        else:
+            all_inputs = self.cache_data(
+                to_cache_block_names,
+                self.calibration_context.nsamples,
+                to_cache_layer_names,
+                last_cache_name=_last_cache_name,
+            )
+            # Raw token IDs from the tokenizer, cached during calibration for use in quantize_block.
+            input_ids_cache = all_inputs.pop("input_ids", None)
         self.inputs = all_inputs
 
         all_q_inputs = None
@@ -1244,7 +1334,12 @@ class CompressionOrchestrator(BaseOrchestrator):
         # not quantized outputs), and dump tuned scale/zp. The parent merges
         # the dumps and packs/saves through the ordinary immediate flow. The
         # serial loop below remains the default and the fallback.
-        parallel_applied = self._maybe_block_parallel_tune(all_blocks, bool(envs.AR_BLOCK_PARALLEL_WORKER))
+        parallel_applied = self._maybe_block_parallel_tune(
+            all_blocks,
+            bool(envs.AR_BLOCK_PARALLEL_WORKER),
+            all_inputs=all_inputs,
+            input_ids_cache=input_ids_cache,
+        )
 
         resume_states = None
         if envs.AR_RESUME_DIR and not parallel_applied and not envs.AR_BLOCK_PARALLEL_WORKER:

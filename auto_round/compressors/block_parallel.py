@@ -380,6 +380,65 @@ def signature_matches(results_dir: str, signature: str) -> bool:
         return f.read().strip() == signature.strip()
 
 
+def shared_dir(results_dir: str) -> str:
+    return os.path.join(results_dir, "shared")
+
+
+def save_shared_nonblocks(model, block_prefixes, path: str) -> int:
+    """Persist non-block params/buffers once; workers mmap them (shared pages)."""
+    import torch  # noqa: PLC0415
+
+    def _in_block(name):
+        return any(name == pref or name.startswith(pref + ".") for pref in block_prefixes)
+
+    payload = {}
+    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        if tensor.device.type == "meta" or _in_block(name):
+            continue
+        payload[name] = tensor.detach().to("cpu").clone()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(payload, path)
+    return len(payload)
+
+
+def apply_shared_nonblocks(model, block_prefixes, path: str) -> int:
+    """Load the parent-saved non-block tensors via mmap into ``model``.
+
+    mmap-backed tensors share physical pages across all worker processes
+    through the OS page cache, so N workers hold one copy of the embeddings
+    (and anything else outside the blocks) instead of N copies.
+    """
+    import torch  # noqa: PLC0415
+    from accelerate.utils import set_module_tensor_to_device  # noqa: PLC0415
+
+    payload = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    applied = 0
+    for name, value in payload.items():
+        module_tensors = dict(model.named_parameters()) | dict(model.named_buffers())
+        current = module_tensors.get(name)
+        if current is None or current.device.type == "meta":
+            set_module_tensor_to_device(
+                model, name, "cpu", value=value, dtype=value.dtype
+            )
+            applied += 1
+    return applied
+
+
+def save_shared_inputs(payload: dict, path: str) -> None:
+    """Persist the parent's calibration inputs + synced context snapshot."""
+    import torch  # noqa: PLC0415
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(payload, path)
+
+
+def load_shared_inputs(path: str) -> dict:
+    """Mmap-load the shared calibration inputs (tensors share pages)."""
+    import torch  # noqa: PLC0415
+
+    return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+
+
 def block_parallel_tuning_enabled(
     *,
     need_quanted_input: bool,

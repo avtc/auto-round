@@ -99,5 +99,57 @@ class TestResumeDirReuse(unittest.TestCase):
             self.assertFalse(block_parallel.signature_matches(d, "sig-B"))
 
 
+class TestSharedNonblocks(unittest.TestCase):
+    def test_save_apply_roundtrip_excludes_blocks(self):
+        import torch
+        import torch.nn as nn
+
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(8, 4)
+                self.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(2)])
+                self.head = nn.Linear(4, 8)
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nonblocks.pt")
+            model = Tiny()
+            n = block_parallel.save_shared_nonblocks(model, ["blocks"], path)
+            # embed.weight + head.weight + head.bias saved; blocks excluded
+            self.assertEqual(n, 3)
+            # fresh model on meta: apply restores the tensors
+            fresh = Tiny()
+            for param in fresh.parameters():
+                param.data = torch.empty(0, device="meta")
+            applied = block_parallel.apply_shared_nonblocks(fresh, ["blocks"], path)
+            self.assertEqual(applied, 3)
+            self.assertTrue(torch.equal(fresh.embed.weight, model.embed.weight))
+            self.assertTrue(fresh.blocks[0].weight.device.type == "meta")
+
+
+class TestSharedInputs(unittest.TestCase):
+    def test_payload_roundtrip(self):
+        import torch
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "calib_inputs.pt")
+            payload = {
+                "inputs": {"model.layers.0": {"input_ids": torch.randn(2, 3, 4)}},
+                "input_ids": [torch.ones(1, 5, dtype=torch.long)],
+                "batch_size": 2,
+                "seqlen": 256,
+                "batch_dim": 0,
+                "is_only_supported_bs1": False,
+                "orig_batch_size": 4,
+                "block_forward_batch_size": 2,
+                "ga_steps": [8, None],
+            }
+            block_parallel.save_shared_inputs(payload, path)
+            back = block_parallel.load_shared_inputs(path)
+            self.assertEqual(back["batch_size"], 2)
+            self.assertEqual(back["ga_steps"], [8, None])
+            self.assertTrue(torch.equal(back["inputs"]["model.layers.0"]["input_ids"], payload["inputs"]["model.layers.0"]["input_ids"]))
+
+
 if __name__ == "__main__":
     unittest.main()

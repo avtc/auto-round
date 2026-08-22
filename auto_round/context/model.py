@@ -314,7 +314,19 @@ class ModelContext(BaseContext):
         from auto_round.utils.disk_stream_util import materialize_non_block_params
 
         block_prefixes = flatten_list(get_block_names(self.model, quant_vision=self.quant_nontext_module))
-        materialize_non_block_params(self.model, block_prefixes, self._disk_stream_index, device="cpu")
+        shared_path = envs.AR_BLOCK_PARALLEL_SHARED_NONBLOCKS
+        if shared_path and os.path.isfile(shared_path):
+            # block-parallel worker: mmap the parent-saved non-block tensors
+            # instead of reading the checkpoint -- one physical copy shared by
+            # every worker through the page cache
+            from auto_round.compressors.block_parallel import apply_shared_nonblocks
+
+            applied = apply_shared_nonblocks(self.model, block_prefixes, shared_path)
+            logger.info(
+                "block-parallel worker: mmap-shared %d non-block tensors from %s", applied, shared_path
+            )
+        else:
+            materialize_non_block_params(self.model, block_prefixes, self._disk_stream_index, device="cpu")
 
         # Tied output embeddings (e.g. lm_head.weight
         # tied to embed_tokens.weight) have no entry of their own in the checkpoint's
