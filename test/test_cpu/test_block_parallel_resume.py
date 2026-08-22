@@ -118,9 +118,7 @@ class TestSharedNonblocks(unittest.TestCase):
             # embed.weight + head.weight + head.bias saved; blocks excluded
             self.assertEqual(n, 3)
             # fresh model on meta: apply restores the tensors
-            fresh = Tiny()
-            for param in fresh.parameters():
-                param.data = torch.empty_like(param, device="meta")
+            fresh = Tiny().to("meta")
             applied = block_parallel.apply_shared_nonblocks(fresh, ["blocks"], path)
             self.assertEqual(applied, 3)
             self.assertTrue(torch.equal(fresh.embed.weight, model.embed.weight))
