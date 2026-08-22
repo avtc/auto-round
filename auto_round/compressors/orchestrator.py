@@ -1031,6 +1031,31 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _t.sleep(0.5)
                 if entry is None:
                     raise RuntimeError(f"chain entry for block {k} missing after replay")
+            if isinstance(entry, list) and any(t is None for t in entry):
+                bad = [i for i, t in enumerate(entry) if t is None][:4]
+                raise RuntimeError(
+                    f"chain entry for block {k} contains None samples at indices {bad} -- "
+                    "the checkpoint file is corrupt; delete it and rerun"
+                )
+
+            # extend the chain BEFORE tuning: the ff consumes the pristine
+            # entry; whatever the tuning pipeline does to the list afterward
+            # no longer matters (nothing reads it again). The block's original
+            # weights are streamed from the checkpoint either way.
+            if k + 1 < len(blocks):
+                _others = self._preprocess_block_inputs(_group_entry(blocks))[1]
+                next_entry = self._ff_one_block(
+                    self.model_context.model,
+                    blocks[k],
+                    entry,
+                    _others,
+                    g,
+                    k + 1,
+                    results_dir,
+                )
+                held = (g, k + 1, next_entry)
+            else:
+                held = None
 
             self._quantize_blocks(
                 self.model_context.model,
@@ -1046,23 +1071,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 start_block_idx=k,
                 resume_input_ids=entry,
             )
-
-            # extend the chain by one step: hold the next entry in RAM and
-            # publish it as the absorption handoff for the parent
-            if k + 1 < len(blocks):
-                _others = self._preprocess_block_inputs(_group_entry(blocks))[1]
-                next_entry = self._ff_one_block(
-                    self.model_context.model,
-                    blocks[k],
-                    entry,
-                    _others,
-                    g,
-                    k + 1,
-                    results_dir,
-                )
-                held = (g, k + 1, next_entry)
-            else:
-                held = None
             logger.info("[bp-worker %d] block %s done (rank holds %s)", rank, blocks[k], held[1] if held else "-")
 
     def _collect_tuned_layers(self, block_name: str) -> dict:
