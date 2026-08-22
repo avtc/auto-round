@@ -258,6 +258,10 @@ class CompressionOrchestrator(BaseOrchestrator):
     ):
         """Quantize and dequantize the weights of the specified blocks in the model.
 
+        Returns the final chained input (the entry of the block after the last
+        one processed) so fast-forwarding callers can use it directly instead
+        of round-tripping it through a checkpoint file.
+
         Args:
         model: The PyTorch model to be quantized.
         inputs: The input data for quantization.
@@ -337,22 +341,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 input_others_extra_blocks.pop(block_names[i])
             if i != 0:
                 pbar.update(1)
-            if (
-                produce_only is not None
-                and bp_results_dir
-                and i > produce_only[0]
-            ):
-                # skip-ahead: a sibling replaying the same degenerate prefix
-                # published this step's checkpoint -- consume it instead of
-                # re-forwarding (coordination through the shared files; turns
-                # duplicated replay work into a race with early exit)
-                _existing = _bp_load_chain_state(
-                    bp_results_dir, group_idx, i + 1, device=self.compress_context.cache_device
-                )
-                if _existing is not None:
-                    input_ids = _existing
-                    pbar.update(1)
-                    continue
             if produce_only is not None or span is not None and (
                 i < span[0]
                 or (
@@ -523,6 +511,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 resume_state.mark_block_done(n, q_input, input_ids)
         if pbar is not None:
             pbar.update(1)
+        chained_input = input_ids  # returned to fast-forwarding callers
 
         if not self.compress_context.is_immediate_saving:
             self.model = mv_module_from_gpu(self.model)
@@ -531,11 +520,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 delattr(m, "name")
 
         del q_input
-        del input_ids
         del input_others
         del inputs
 
         clear_memory()
+        return chained_input
+
 
     def _build_resume_states(self, all_blocks: list) -> list:
         """Build one ResumeState per block group under AR_RESUME_DIR.
@@ -1029,9 +1019,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     import time as _t
 
                     if prefix < k:
-                        # replay prefix..k-1 (publishes entries the parent can
-                        # consume for manifest absorption on the way)
-                        self._quantize_blocks(
+                        # in-RAM replay prefix..k-1: no checkpoint publishes --
+                        # only the assigned forward is ever saved; the chained
+                        # result comes back directly
+                        entry = self._quantize_blocks(
                             self.model_context.model,
                             _group_entry(blocks),
                             blocks,
@@ -1040,20 +1031,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                             input_others_extra_blocks=dict(all_inputs),
                             token_ids=token_ids,
                             group_idx=g,
-                            bp_results_dir=results_dir,
+                            bp_results_dir=None,
                             start_block_idx=prefix,
                             produce_only=(prefix, k),
                             resume_input_ids=frontier_entry,
                         )
-                        # a sibling replaying the same prefix may still be mid-
-                        # publish of this checkpoint -- retry before failing
-                        for _attempt in range(60):
-                            entry = _bp_load_chain_state(
-                                results_dir, g, k, device=self.compress_context.cache_device
-                            )
-                            if entry is not None:
-                                break
-                            _t.sleep(0.5)
                         if entry is None:
                             raise RuntimeError(f"chain entry for block {k} missing after replay")
                     elif frontier_entry is not None:
