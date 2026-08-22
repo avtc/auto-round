@@ -180,6 +180,59 @@ class CompressionOrchestrator(BaseOrchestrator):
             first_input_name=first_input_name,
         )
 
+    def _ff_one_block(self, model, block_name, entry, input_others, group_idx, next_idx, bp_results_dir):
+        """One original-weights forward of ``block_name`` chaining ``entry``.
+
+        Mirrors the serial reference chain exactly (same block_forward call,
+        original weights, no calibration/tuning) and optionally checkpoints the
+        resulting entry for the next block. The block is parked back on meta --
+        it was never tuned, its weights are unchanged from the checkpoint, and
+        keeping materialized copies would accumulate host memory.
+        """
+        m_ff = get_module(model, block_name)
+        if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+            self._offloader.reload(model, block_name)
+        materialize_model_(m_ff)
+        m_ff = self.alg_composer.dispatch_block(m_ff, entry, input_others)
+        with torch.no_grad():
+            ff_output = self.alg_composer.block_forward(m_ff, entry, input_others)
+        if bp_results_dir:
+            _bp_save_chain_state(bp_results_dir, group_idx, next_idx, ff_output)
+        if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
+            accelerate.hooks.remove_hook_from_submodules(m_ff)
+        m_ff.to("meta")
+        clear_memory(device_list=device_manager.device_list)
+        return ff_output
+
+    def _manifest_frontier(self, group_idx: int):
+        """(prefix, entry) from the serial manifest, or (0, None).
+
+        The manifest is the shared cross-mode resume contract: written by the
+        serial loop and by the parallel sequencer alike, holding the chained
+        entry at the contiguous done-prefix. Used by workers to obtain a replay
+        starting point without any parallel-specific state.
+        """
+        import json as _json
+
+        resume_dir = envs.AR_RESUME_DIR
+        if not resume_dir:
+            return 0, None
+        gdir = os.path.join(resume_dir, f"group_{group_idx}")
+        manifest = os.path.join(gdir, "resume_manifest.json")
+        input_ids = os.path.join(gdir, "resume_input_ids.pt")
+        if not (os.path.isfile(manifest) and os.path.isfile(input_ids)):
+            return 0, None
+        try:
+            with open(manifest, encoding="utf-8") as f:
+                data = _json.load(f)
+            completed = data.get("completed_blocks", [])
+            entry = torch.load(input_ids, map_location="cpu", weights_only=True)
+            from auto_round.compressors.block_parallel import _to_device_recursive
+
+            return len(completed), _to_device_recursive(entry, self.compress_context.cache_device)
+        except Exception:  # noqa: BLE001
+            return 0, None
+
     def _quantize_blocks(
         self,
         model: torch.nn.Module,
@@ -288,31 +341,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                     and _bp_load_chain_state(bp_results_dir, group_idx, i + 1, device="cpu") is None
                 )
             ):
-                # ── Fast-forward: original-weights forward only ─────────────
-                # Chains this span's entry input exactly like the serial loop's
-                # reference chain (same block_forward call, original weights),
-                # without calibration or tuning. ~1000x cheaper than tuning.
-                n_ff = block_names[i]
-                m_ff = get_module(model, n_ff)
-                if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
-                    self._offloader.reload(model, n_ff)
-                materialize_model_(m_ff)
-                m_ff = self.alg_composer.dispatch_block(m_ff, input_ids, input_others)
-                with torch.no_grad():
-                    ff_output = self.alg_composer.block_forward(m_ff, input_ids, input_others)
-                input_ids = ff_output
-                if bp_results_dir:
-                    # checkpoint the rebuilt chain so a later resume skips the replay
-                    _bp_save_chain_state(bp_results_dir, group_idx, i + 1, input_ids)
-                if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
-                    accelerate.hooks.remove_hook_from_submodules(m_ff)
-                # An FF'd block was never tuned -- its weights are unchanged
-                # from the checkpoint -- so park it straight back on meta
-                # instead of leaving the materialized copy on the host. Without
-                # this, a produce pass accumulates every block it replays
-                # (observed: +0.5-0.9 GiB/block, 54 GiB over a full group).
-                m_ff.to("meta")
-                clear_memory(device_list=device_manager.device_list)
+                input_ids = self._ff_one_block(
+                    model, block_names[i], input_ids, input_others, group_idx, i + 1, bp_results_dir
+                )
                 continue
             if nblocks == 1:
                 n = block_names[i]
@@ -668,13 +699,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             output_root = getattr(self.compress_context, "output_dir", None) or "tmp_autoround"
             results_dir = os.path.join(output_root, "block_parallel_results")
             shutil.rmtree(results_dir, ignore_errors=True)  # no resume: never reuse stale results
-        qdir = bp.queue_dir(results_dir)
-        shutil.rmtree(qdir, ignore_errors=True)
-        os.makedirs(qdir, exist_ok=True)
-
-        # Structural RAM dedup: persist non-block tensors + calibration inputs
-        # once; workers mmap them (OS-shared pages) instead of building private
-        # copies, and skip their dataset/cache pass entirely.
         sdir = bp.shared_dir(results_dir)
         nonblocks_path = os.path.join(sdir, "nonblocks.pt")
         inputs_path = os.path.join(sdir, "calib_inputs.pt")
@@ -689,45 +713,29 @@ class CompressionOrchestrator(BaseOrchestrator):
             bp.save_shared_inputs(self._snapshot_calib_state(all_inputs, input_ids_cache), inputs_path)
             logger.info("block-parallel tuning: shared calibration inputs to %s", inputs_path)
 
-        if len(gpu_ids) < 2:
-            return _fail_if_requested(
-                f"fewer than 2 usable GPUs ({gpu_ids}; required ~{required_vram_bytes / 1024**3:.1f} GiB "
-                f"free VRAM each)"
-            )
-
         # Canonical done-state: serial manifests (contiguous prefix per group),
         # advanced by this sequencer as blocks complete in order. An unmodified
         # serial run can resume from them later; out-of-order (fringe)
         # completions live only in per-block result files until absorbed.
         resume_states = self._build_resume_states(all_blocks) if resumable else [None] * len(all_blocks)
 
-        # per-group done sets: manifest prefix + fringe files from a prior run
+        # done sets: manifest prefix + result files from a prior run (works
+        # after a serial run too -- manifests carry the prefix, no result files
+        # needed -- and regardless of how many workers produced them)
         done = {}
         for g, blocks in enumerate(all_blocks):
             prefix = resume_states[g].resume_index if resume_states[g] is not None else 0
             done[g] = set(range(prefix))
             done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
+        total_blocks = sum(len(blocks) for blocks in all_blocks)
+        n_todo = total_blocks - sum(len(d) for d in done.values())
 
-        # producer jobs first: one per group, fast-forwarding from one block
-        # before the first undone block (so the first tune job's entry
-        # checkpoint gets published; index 0 uses the group's cached entry)
-        seq = 0
-        for g, blocks in enumerate(all_blocks):
-            undone = [k for k in range(len(blocks)) if k not in done[g]]
-            if not undone:
-                continue
-            bp.write_job(qdir, seq=seq, job_type="produce", group=g, start=max(0, undone[0] - 1),
-                         end=len(blocks))
-            seq += 1
-
-        n_todo = sum(len(all_blocks[g]) for g in done) - sum(len(d) for d in done.values())
         logger.info(
-            "block-parallel tuning: %d workers on GPUs %s, %d block(s) to tune, queue %s%s",
-            len(gpu_ids), gpu_ids, n_todo, qdir,
+            "block-parallel tuning: %d workers on GPUs %s, %d block(s) to tune, results %s%s",
+            len(gpu_ids), gpu_ids, n_todo, results_dir,
             " (resumable: rerun the same command to finish missing blocks)" if resumable else "",
         )
         env_extra = {
-            "AR_BLOCK_PARALLEL_QUEUE_DIR": qdir,
             "AR_BLOCK_PARALLEL_RESULTS": results_dir,
             "AR_BLOCK_PARALLEL_SHARED_NONBLOCKS": nonblocks_path,
             "AR_BLOCK_PARALLEL_SHARED_INPUTS": inputs_path,
@@ -737,68 +745,63 @@ class CompressionOrchestrator(BaseOrchestrator):
         _spawn_t0 = _t0.time()
         procs = bp.spawn_workers(sys.argv, gpu_ids, log_dir=results_dir, extra_env=env_extra)
         logger.info(
-            "[bp-trace] spawn complete in %.1fs (pids %s); initial dispatch next",
-            _t0.time() - _spawn_t0,
-            [proc.pid for proc in procs],
+            "[bp-trace] spawn complete in %.1fs (pids %s); pushing initial assignments",
+            _t0.time() - _spawn_t0, [proc.pid for proc in procs],
         )
 
-        # in-group-order dispatch pointers: near-sequential completion lets the
-        # serial manifest prefix absorb work as fast as possible
-        pointer = {g: 0 for g in range(len(all_blocks))}
-        inflight = {}  # job seq -> (group, index)
-        cap = len(gpu_ids) + 2
-        logger.info(
-            "[bp-trace] pre-dispatch state: done=%s pointer=%s inflight=%d cap=%d",
-            {g: len(d) for g, d in done.items()}, dict(pointer), len(inflight), cap,
-        )
-        seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
-        logger.info(
-            "[bp-trace] initial dispatch finished: seq=%d inflight=%s queue_pending=%s",
-            seq, dict(inflight), bp.list_pending(qdir),
-        )
+        def _ordered_undone():
+            return [(g, k) for g, blocks in enumerate(all_blocks) for k, b in enumerate(blocks)
+                    if k not in done[g] and (g, k) not in assigned.values()]
+
+        assigned = {}  # rank -> (group, index); absent == worker idle/finished
+        stopped = set()
+        seen_results = set()
+        sticky_pref = {}  # rank -> (g, k+1) the worker holds the entry for
+        finished_ranks = set()  # ranks that reported a result since last pass
+
+        def _send(rank: int, message: str) -> None:
+            proc = procs[rank]
+            if proc.poll() is not None:
+                return
+            try:
+                proc.stdin.write(message + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                pass  # worker death is handled by the liveness check
+
+        def _assign_next(rank: int, prefer=None) -> None:
+            """Push the next assignment to ``rank``: the sticky preference when
+            still undone and unassigned, else the lowest undone block. Worker
+            count never matters -- this works for any pool size."""
+            if prefer is not None and prefer in _ordered_undone():
+                target = prefer  # sticky: the worker already holds this entry
+            else:
+                candidates = _ordered_undone()
+                if not candidates:
+                    stopped.add(rank)
+                    _send(rank, "stop")
+                    return
+                target = candidates[0]
+            assigned[rank] = target
+            _send(rank, f"tune {target[0]} {target[1]}")
+            logger.info("block-parallel tuning: assigned g%d k%d to worker %d", target[0], target[1], rank)
+
+        for rank in range(len(procs)):
+            _assign_next(rank)
 
         import time as _time
 
-        total_blocks = sum(len(blocks) for blocks in all_blocks)
         shown_done = sum(len(d) for d in done.values())
         if pbar is not None:
             pbar.set_description("Tuning blocks (parallel)")
             pbar.refresh()
         rss_tick = 0
-        while any(pointer[g] < len(all_blocks[g]) for g in pointer):
+        while True:
+            undone_left = total_blocks - sum(len(d) for d in done.values())
+            if undone_left == 0 and not assigned:
+                break
             _time.sleep(0.5)
-            for g, blocks in enumerate(all_blocks):
-                done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
-                # a chain checkpoint is the ENTRY for block k: once k is tuned it
-                # has no consumers (dispatch moved past, entry consumed, resume
-                # regenerates it deterministically by fast-forward) -- prune it
-                # or ~2.7GB per block accumulates over the run
-                for k, _b in enumerate(blocks):
-                    if k in done[g] and os.path.exists(bp._chain_state_path(results_dir, g, k)):
-                        try:
-                            os.remove(bp._chain_state_path(results_dir, g, k))
-                        except OSError:
-                            pass
-            done_now = sum(len(d) for d in done.values())
-            if pbar is not None and done_now != shown_done:
-                pbar.update(done_now - shown_done)
-                shown_done = done_now
-            # absorb completed prefix blocks into the serial manifests
-            if resumable:
-                for g, blocks in enumerate(all_blocks):
-                    rs = resume_states[g]
-                    while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
-                        k = rs.resume_index
-                        rs.mark_block_done(
-                            blocks[k], None, _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
-                        )
-            for jseq in list(inflight):
-                g, k = inflight[jseq]
-                if k in done[g]:
-                    inflight.pop(jseq)
-            # fatal-fast liveness: any worker exit while work remains aborts the
-            # run -- no requeue/retry, the rerun IS the retry (resuming from the
-            # manifest prefix + per-block result files)
+            # fatal-fast liveness: any worker exit while work remains aborts
             for widx, proc in enumerate(procs):
                 code = proc.poll()
                 if code is None:
@@ -811,37 +814,64 @@ class CompressionOrchestrator(BaseOrchestrator):
                     f"remained; terminated siblings. Completed blocks are persisted -- rerun the "
                     f"same command to resume. Worker logs: {results_dir}/worker_*.log"
                 )
+            # new results -> absorb, then push the next assignment to that worker
+            for g, blocks in enumerate(all_blocks):
+                for k, b in enumerate(blocks):
+                    if (g, k) in seen_results or not bp.has_block_results(results_dir, b):
+                        continue
+                    seen_results.add((g, k))
+                    done[g].add(k)
+                    rank = bp.read_result_rank(results_dir, b)
+                    if rank >= 0:
+                        assigned.pop(rank, None)
+                        sticky_pref[rank] = (g, k + 1)
+                        finished_ranks.add(rank)
+            # ordered commit into the serial manifests, consuming the entry
+            # handoff files the workers published (then deleting them)
+            if resumable:
+                for g, blocks in enumerate(all_blocks):
+                    rs = resume_states[g]
+                    while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
+                        k = rs.resume_index
+                        entry_next = _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
+                        rs.mark_block_done(blocks[k], None, entry_next)
+                        try:
+                            os.remove(bp._chain_state_path(results_dir, g, k + 1))
+                        except OSError:
+                            pass
+            # re-assign ranks that reported a result since the last pass
+            for rank in list(finished_ranks):
+                finished_ranks.discard(rank)
+                if rank not in assigned and rank not in stopped:
+                    _assign_next(rank, prefer=sticky_pref.pop(rank, None))
+            done_now = sum(len(d) for d in done.values())
+            if pbar is not None and done_now != shown_done:
+                pbar.update(done_now - shown_done)
+                shown_done = done_now
             rss_tick += 1
-            if rss_tick % 60 == 0:  # ~30s
+            if rss_tick % 60 == 0:
                 bp.log_worker_rss(procs)
-            if rss_tick % 10 == 0:  # ~5s
-                _next_g = min(pointer, key=lambda g: pointer[g])
-                _next_k = pointer[_next_g]
+            if rss_tick % 10 == 0:
                 logger.info(
-                    "[bp-trace] tick %d: done=%s ptr=%s inflight=%s queue_pending=%s procs_alive=%d "
-                    "next=g%d/k%d ckpt_exists=%s results_dir=%s",
-                    rss_tick,
-                    {g: len(d) for g, d in done.items()},
-                    dict(pointer),
-                    sorted(inflight.values()),
-                    bp.list_pending(qdir),
-                    sum(1 for proc in procs if proc.poll() is None),
-                    _next_g,
-                    _next_k,
-                    bp.chain_state_exists(results_dir, _next_g, _next_k) if _next_k > 0 else "k0-n/a",
-                    results_dir,
+                    "[bp-trace] tick %d: done=%d/%d assigned=%s idle=%d",
+                    rss_tick, done_now, total_blocks,
+                    dict(assigned), sum(1 for r in range(len(procs)) if r not in assigned and r not in stopped),
                 )
-            seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
 
-        bp.write_stop(qdir)
+        for rank in range(len(procs)):
+            _send(rank, "stop")
         codes = bp.wait_workers(procs)
         if resumable:
             for g, blocks in enumerate(all_blocks):
                 rs = resume_states[g]
                 while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
                     k = rs.resume_index
-                    rs.mark_block_done(blocks[k], None, _bp_load_chain_state(results_dir, g, k + 1,
-                                                                            device="cpu"))
+                    entry_next = _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
+                    rs.mark_block_done(blocks[k], None, entry_next)
+                    try:
+                        os.remove(bp._chain_state_path(results_dir, g, k + 1))
+                    except OSError:
+                        pass
 
         tuned = bp.load_all_block_results(results_dir)
         missing = bp.missing_result_blocks(results_dir, all_blocks)
@@ -859,44 +889,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             # quantize_and_save clears these after a successful export (same as serial)
             self._resume_states = resume_states
         return True
-
-    @staticmethod
-    def _dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir):
-        """Write tune jobs for dispatchable blocks; advance pointers past done ones."""
-        from auto_round.compressors import block_parallel as bp
-
-        while len(inflight) < cap:
-            for g in list(pointer):
-                while pointer[g] < len(all_blocks[g]) and pointer[g] in done[g]:
-                    pointer[g] += 1
-            if logger.isEnabledFor(10):  # DEBUG-and-below detail only
-                logger.debug("[bp-trace] dispatch scan: ptr=%s inflight=%s", dict(pointer), dict(inflight))
-            target = None
-            for g in sorted(pointer):
-                # frontier walk: consider every block from the pointer upward,
-                # not just the pointer itself -- several blocks of a group must
-                # be tunable concurrently or the pool degrades to one tuner
-                # (pointer only advances past DONE blocks, so while block k is
-                # in flight it blocked k+1, k+2, ... whose checkpoints exist)
-                for k in range(pointer[g], len(all_blocks[g])):
-                    if k in done[g]:
-                        continue
-                    if any(v == (g, k) for v in inflight.values()):
-                        continue
-                    if k > 0 and not bp.chain_state_exists(results_dir, g, k):
-                        break  # checkpoints arrive in order; nothing later is ready
-                    target = (g, k)
-                    break
-                if target is not None:
-                    break
-            if target is None:
-                break
-            g, k = target
-            bp.write_job(qdir, seq=seq, job_type="tune", group=g, index=k, block_name=all_blocks[g][k])
-            logger.info("block-parallel tuning: dispatched tune g%d k%d (seq %d)", g, k, seq)
-            inflight[seq] = (g, k)
-            seq += 1
-        return seq
 
     _IMAGE_INPUT_KEYS = ("pixel_values", "pixel_values_videos", "image_grid_thw", "videos", "images")
 
@@ -959,61 +951,53 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
 
     def _serve_block_queue(self, all_blocks: list, all_inputs: dict, token_ids, pbar) -> None:
-        """Worker-side queue-serve loop for block-parallel tuning.
+        """Worker-side assignment loop (push protocol).
 
-        Consumes dispatch jobs until the parent writes STOP and the queue
-        drains. ``tune`` jobs restore their block's entry input from a chain
-        checkpoint (published by a ``produce`` job or a previous tuning pass)
-        and tune exactly one block; ``produce`` jobs fast-forward a block range
-        in original weights, publishing chain checkpoints for the tuners.
+        Assignments arrive as stdin lines (``tune G K`` / ``stop``). For each
+        block: obtain its entry -- from the held previous chain step when the
+        assignment is sticky (zero cost), else by replaying from the serial
+        manifest frontier (bounded by the in-flight gap, ~one block per worker)
+        -- tune it, extend the chain by one forward to hold the next entry, and
+        persist the result (block file; rank rides along as advisory metadata).
+        All durable state is files; the pipe carries ephemeral assignments only.
         """
-        import time as _time
-
         from auto_round.compressors import block_parallel as bp
 
-        from auto_round.calibration.utils import _update_inputs
-
-        qdir = envs.AR_BLOCK_PARALLEL_QUEUE_DIR
         results_dir = envs.AR_BLOCK_PARALLEL_RESULTS
-        if not qdir or not results_dir:
-            raise RuntimeError("block-parallel worker is missing its queue/results environment")
+        if not results_dir:
+            raise RuntimeError("block-parallel worker is missing its results environment")
+        rank = envs.AR_BLOCK_PARALLEL_RANK
 
         def _group_entry(blocks):
-            """Serial-parity entry prep: fresh copy per job (split_inputs pops
-            keys, so the shared entry must not be consumed in place) plus the
-            hidden_states -> input_ids re-key the serial loop performs via
-            _update_inputs before calling _quantize_blocks."""
             entry = dict(all_inputs[blocks[0]])
             entry, _q = _update_inputs(entry, None)
             return entry
 
-        import time as _t
-
-        while True:
-            job = bp.claim_next_job(qdir)
-            if job is None:
-                if bp.read_stop(qdir):
-                    break
-                _time.sleep(0.5)
+        held = None  # (group, next_index, entry)
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
                 continue
-            _job_t0 = _t.time()
-            logger.info(
-                "block-parallel worker: claimed %s job seq %s (group %s, index %s)",
-                job.get("job_type"), job.get("seq"), job.get("group"),
-                job.get("index", job.get("start")),
-            )
-            try:
-                g = job["group"]
-                blocks = all_blocks[g]
-                resume_entry = None
-                if job["job_type"] == "produce":
-                    start, end = job["start"], job["end"]
-                    if start > 0:
-                        resume_entry = _bp_load_chain_state(
-                            results_dir, g, start, device=self.compress_context.cache_device
-                        )
-                        if resume_entry is None:
-                            start = 0  # checkpoint lost: replay the whole prefix
+            if line == "stop":
+                break
+            _cmd, g, k = line.split()
+            g, k = int(g), int(k)
+            logger.info("[bp-worker %d] assignment: %s", rank, line)
+            blocks = all_blocks[g]
+            if k >= len(blocks):
+                raise RuntimeError(f"assignment out of range: {line}")
+
+            entry = None
+            if held is not None and held[0] == g and held[1] == k:
+                entry = held[2]  # sticky: previous assignment's chain tail
+            else:
+                prefix, frontier_entry = self._manifest_frontier(g)
+                if prefix > k:
+                    prefix = 0  # stale/odd manifest: replay from the group entry
+                    frontier_entry = None
+                if prefix < k:
+                    # replay prefix..k-1 (publishes entries the parent can
+                    # consume for manifest absorption on the way)
                     self._quantize_blocks(
                         self.model_context.model,
                         _group_entry(blocks),
@@ -1024,91 +1008,48 @@ class CompressionOrchestrator(BaseOrchestrator):
                         token_ids=token_ids,
                         group_idx=g,
                         bp_results_dir=results_dir,
-                        start_block_idx=start,
-                        produce_only=(start, end),
-                        resume_input_ids=resume_entry,
+                        start_block_idx=prefix,
+                        produce_only=(prefix, k),
+                        resume_input_ids=frontier_entry,
                     )
-                else:
-                    k = job["index"]
-                    # block 0 of a group has no chain checkpoint by design --
-                    # its entry input IS the group's cached input (the parent
-                    # dispatches it without a checkpoint requirement); only
-                    # k > 0 restores from a published checkpoint
-                    entry = None
-                    if k > 0:
-                        entry = _bp_load_chain_state(
-                            results_dir, g, k, device=self.compress_context.cache_device
-                        )
-                        if entry is None:
-                            raise RuntimeError(
-                                f"missing chain checkpoint for {blocks[k]} (group {g} block {k})"
-                            )
-                    self._quantize_blocks(
-                        self.model_context.model,
-                        _group_entry(blocks),
-                        blocks,
-                        nblocks=1,
-                        pbar=pbar,
-                        input_others_extra_blocks=dict(all_inputs),
-                        token_ids=token_ids,
-                        span=(k, k + 1),
-                        group_idx=g,
-                        bp_results_dir=results_dir,
-                        start_block_idx=k,
-                        resume_input_ids=entry,
-                    )
-                bp.job_done(qdir, job)
-                logger.info(
-                    "block-parallel worker: job seq %s done in %.1fs", job.get("seq"), _t.time() - _job_t0
+                entry = _bp_load_chain_state(
+                    results_dir, g, k, device=self.compress_context.cache_device
                 )
-            except Exception as err:  # noqa: BLE001
-                bp.job_failed(qdir, job, repr(err))
-                logger.error("block-parallel worker: job %s failed: %r", job.get("seq"), err)
-                # fatal-fast: a failing job aborts this worker; the parent aborts
-                # the run and the rerun (resume) is the retry
-                raise
+                if entry is None:
+                    raise RuntimeError(f"chain entry for block {k} missing after replay")
 
-    def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
-        """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
-        from auto_round.compressors.utils import immediate_pack as _immediate_pack
+            self._quantize_blocks(
+                self.model_context.model,
+                _group_entry(blocks),
+                blocks,
+                nblocks=1,
+                pbar=pbar,
+                input_others_extra_blocks=dict(all_inputs),
+                token_ids=token_ids,
+                span=(k, k + 1),
+                group_idx=g,
+                bp_results_dir=results_dir,
+                start_block_idx=k,
+                resume_input_ids=entry,
+            )
 
-        n_blocks = sum(len(group) for group in all_blocks)
-        pbar = tqdm(range(n_blocks))
-        for group in all_blocks:
-            for block_name in group:
-                pbar.set_description(f"Packing {block_name}")
-                if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
-                    self._offloader.reload(self.model_context.model, block_name)
-                block = get_module(self.model_context.model, block_name)
-                materialize_model_(block)
-                convert_module_to_hp_if_necessary(block, self.model_context.amp_dtype, device_manager.device)
-                applied = 0
-                for sub_name, sub in block.named_modules():
-                    layer_name = getattr(sub, "global_name", None) or (
-                        f"{block_name}.{sub_name}" if sub_name else block_name
-                    )
-                    entry = tuned.get(layer_name)
-                    if entry is None or not hasattr(sub, "weight"):
-                        continue
-                    sub.scale = entry["scale"].to(sub.weight.device)
-                    sub.zp = entry["zp"].to(sub.weight.device) if entry["zp"] is not None else entry["zp"]
-                    applied += 1
-                for sub_name, sub in block.named_modules():
-                    if hasattr(sub, "bits") and check_to_quantized(sub):
-                        module_name = getattr(sub, "global_name", None) or (
-                            f"{block_name}.{sub_name}" if sub_name else None
-                        )
-                        if module_name is None:
-                            continue
-                        _immediate_pack(module_name, self.layer_config)
-                if self.compress_context.is_immediate_saving:
-                    self.shard_writer.write(block, is_finalize=False)
-                if self.compress_context.low_cpu_mem_usage:
-                    self._offloader(self.model_context.model, block_name, overwrite=True)
-                pbar.update(1)
-                if applied == 0:
-                    logger.debug("block %s: no worker-tuned layers (kept as-is)", block_name)
-        pbar.close()
+            # extend the chain by one step: hold the next entry in RAM and
+            # publish it as the absorption handoff for the parent
+            if k + 1 < len(blocks):
+                _others = self._preprocess_block_inputs(_group_entry(blocks))[1]
+                next_entry = self._ff_one_block(
+                    self.model_context.model,
+                    blocks[k],
+                    entry,
+                    _others,
+                    g,
+                    k + 1,
+                    results_dir,
+                )
+                held = (g, k + 1, next_entry)
+            else:
+                held = None
+            logger.info("[bp-worker %d] block %s done (rank holds %s)", rank, blocks[k], held[1] if held else "-")
 
     def _collect_tuned_layers(self, block_name: str) -> dict:
         """Extract this block's tuned {layer_name: {scale, zp}} from live modules.
@@ -1430,7 +1371,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         # serial loop below remains the default and the fallback.
         parallel_applied = self._maybe_block_parallel_tune(
             all_blocks,
-            bool(envs.AR_BLOCK_PARALLEL_WORKER or envs.AR_BLOCK_PARALLEL_QUEUE_DIR),
+            bool(envs.AR_BLOCK_PARALLEL_WORKER),
             all_inputs=all_inputs,
             input_ids_cache=input_ids_cache,
             pbar=pbar,

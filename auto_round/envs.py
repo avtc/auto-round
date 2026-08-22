@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
     AR_ENABLE_BLOCK_PARALLEL_TUNING: bool = False
     AR_BLOCK_PARALLEL_WORKER: bool = False
-    AR_BLOCK_PARALLEL_QUEUE_DIR: Optional[str] = None
+    AR_BLOCK_PARALLEL_RANK: int = -1
     AR_BLOCK_PARALLEL_RESULTS: Optional[str] = None
     AR_BLOCK_PARALLEL_SHARED_NONBLOCKS: Optional[str] = None
     AR_BLOCK_PARALLEL_SHARED_INPUTS: Optional[str] = None
@@ -149,9 +149,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tuning; prevents workers from spawning further parallel runs.
     "AR_BLOCK_PARALLEL_WORKER": lambda: os.getenv("AR_BLOCK_PARALLEL_WORKER", "0").lower()
     in ("1", "true", "yes"),
-    # Internal: directory of the file-based dispatch queue consumed by
-    # block-parallel tuning workers in serve mode.
-    "AR_BLOCK_PARALLEL_QUEUE_DIR": lambda: os.getenv("AR_BLOCK_PARALLEL_QUEUE_DIR", None),
+    # Internal: advisory worker rank for live assignment targeting; injected
+    # by the parent into worker envs, recorded in block result payloads.
+    "AR_BLOCK_PARALLEL_RANK": lambda: int(os.getenv("AR_BLOCK_PARALLEL_RANK", "-1")),
     # Internal: directory where parallel tuning workers dump tuned scale/zp.
     "AR_BLOCK_PARALLEL_RESULTS": lambda: os.getenv("AR_BLOCK_PARALLEL_RESULTS", None),
     # Internal: mmap-shared non-block tensors + calibration inputs written by

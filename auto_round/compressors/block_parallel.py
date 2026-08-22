@@ -121,11 +121,13 @@ def worker_command(argv: Sequence[str], device: Optional[int] = None) -> List[st
 
 
 def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_env: dict) -> List[subprocess.Popen]:
-    """Spawn one queue-serving worker per GPU, staggered.
+    """Spawn one assignment-serving worker per GPU, staggered.
 
     Spawns are staggered by a fixed delay so the per-worker model-build and
     dataset-preprocessing host-RAM transients do not spike together on
-    small-RAM hosts.
+    small-RAM hosts. Assignments arrive as lines on each worker's stdin
+    (``tune G K`` / ``stop``); results come back as per-block files (durable
+    state), never through the pipe. Worker identity (rank) rides in the env.
     """
     import time as _time
 
@@ -137,6 +139,7 @@ def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_e
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         env["AR_BLOCK_PARALLEL_WORKER"] = "1"
+        env["AR_BLOCK_PARALLEL_RANK"] = str(rank)
         # AR_RESUME_DIR is deliberately inherited: workers derive their
         # per-block checkpoint dir from it (same user-facing flag as serial).
         env["AR_ENABLE_AUTO_SCHEME_PARALLEL"] = "0"  # single-GPU workers never fan out
@@ -148,7 +151,13 @@ def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_e
         log_file = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
         procs.append(
             subprocess.Popen(  # noqa: S603
-                worker_command(argv, device=gpu), env=env, stdout=log_file, stderr=subprocess.STDOUT
+                worker_command(argv, device=gpu),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
         )
     return procs
@@ -216,12 +225,16 @@ def save_block_results(results_dir: str, block_name: str, layers: dict) -> None:
 
     One file per block is the unit of resumption: block tuning is independent
     (inputs chain through original-weights outputs), so any subset of completed
-    blocks composes with a rerun that finishes the rest.
+    blocks composes with a rerun that finishes the rest -- with ANY worker
+    count, or by the serial path. ``_worker_rank`` is injected as advisory
+    metadata (live parent->worker targeting); it never carries durable meaning.
     """
     os.makedirs(results_dir, exist_ok=True)
+    payload = dict(layers)
+    payload["_worker_rank"] = int(os.getenv("AR_BLOCK_PARALLEL_RANK", "-1"))
     path = _block_results_path(results_dir, block_name)
     tmp = path + ".tmp"
-    torch.save(layers, tmp)
+    torch.save(payload, tmp)
     os.replace(tmp, path)
 
 
@@ -239,8 +252,22 @@ def load_all_block_results(results_dir: str) -> dict:
             continue
         data = torch.load(os.path.join(results_dir, fname), map_location="cpu", weights_only=True)
         for name, entry in data.items():
+            if name.startswith("_"):
+                continue  # advisory metadata (_worker_rank), not a layer
             merged[name] = {"scale": entry["scale"], "zp": entry["zp"]}
     return merged
+
+
+def read_result_rank(results_dir: str, block_name: str) -> int:
+    """Advisory worker rank recorded in a block result, or -1."""
+    path = _block_results_path(results_dir, block_name)
+    if not os.path.exists(path):
+        return -1
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        return int(data.get("_worker_rank", -1))
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 def missing_result_blocks(results_dir: str, all_blocks: "Sequence[list]") -> "List[str]":
@@ -300,85 +327,6 @@ def load_chain_state(results_dir: str, group: int, block_idx: int, device: str):
         return None
     payload = torch.load(path, map_location="cpu", weights_only=True)
     return _to_device_recursive(payload["hidden"], device)
-
-def queue_dir(results_dir: str) -> str:
-    return os.path.join(results_dir, "queue")
-
-
-def _job_sort_key(fname: str):
-    return int(fname.split("_", 1)[0])
-
-
-def write_job(qdir: str, seq: int, job_type: str, group: int, **fields) -> None:
-    """Write a dispatch job file. ``job_type`` is ``tune`` or ``produce``."""
-    os.makedirs(qdir, exist_ok=True)
-    payload = {"seq": seq, "job_type": job_type, "group": group}
-    payload.update(fields)
-    path = os.path.join(qdir, f"{seq:06d}.job")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    os.replace(tmp, path)
-
-
-def claim_next_job(qdir: str):
-    """Atomically claim the lowest-seq pending job (rename .job -> .claimed)."""
-    if not os.path.isdir(qdir):
-        return None
-    for fname in sorted(os.listdir(qdir)):
-        if not fname.endswith(".job"):
-            continue
-        path = os.path.join(qdir, fname)
-        claimed = path + f".claimed-{os.getpid()}"
-        try:
-            os.rename(path, claimed)  # atomic claim on POSIX
-        except OSError:
-            continue  # raced with another worker
-        with open(claimed, encoding="utf-8") as f:
-            job = json.load(f)
-        job["_claimed_path"] = claimed
-        return job
-    return None
-
-
-def job_done(qdir: str, job: dict) -> None:
-    """Remove a claimed job file after successful completion."""
-    try:
-        os.remove(job.get("_claimed_path", ""))
-    except OSError:
-        pass
-
-
-def job_failed(qdir: str, job: dict, error: str) -> None:
-    """Record a failure next to the claim; the parent requeues or reports."""
-    path = job.get("_claimed_path", "")
-    if not path:
-        return
-    with open(path + ".failed", "w", encoding="utf-8") as f:
-        f.write(error)
-
-
-def list_failed(qdir: str) -> List[str]:
-    if not os.path.isdir(qdir):
-        return []
-    return [f for f in sorted(os.listdir(qdir)) if f.endswith(".failed")]
-
-
-def list_pending(qdir: str) -> List[str]:
-    if not os.path.isdir(qdir):
-        return []
-    return [f for f in sorted(os.listdir(qdir)) if f.endswith(".job")]
-
-
-def write_stop(qdir: str) -> None:
-    os.makedirs(qdir, exist_ok=True)
-    with open(os.path.join(qdir, "STOP"), "w", encoding="utf-8") as f:
-        f.write("stop")
-
-
-def read_stop(qdir: str) -> bool:
-    return os.path.exists(os.path.join(qdir, "STOP"))
-
 
 def save_signature(results_dir: str, signature: str) -> None:
     """Persist the run signature the results were produced under."""
@@ -479,7 +427,7 @@ def block_parallel_tuning_enabled(
     """
     if not envs.AR_ENABLE_BLOCK_PARALLEL_TUNING:
         return "env"
-    if envs.AR_BLOCK_PARALLEL_WORKER or envs.AR_BLOCK_PARALLEL_QUEUE_DIR:
+    if envs.AR_BLOCK_PARALLEL_WORKER:
         return "worker process (no recursive parallelism)"
     if argv is None or len(argv) == 0:
         return "no reconstructible command line (API usage)"

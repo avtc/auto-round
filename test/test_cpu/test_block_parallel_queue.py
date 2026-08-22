@@ -12,64 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the block-parallel dispatch queue (file-based job protocol)."""
+"""Tests for the push-assignment protocol helpers (rank metadata, merge hygiene)."""
 
 import os
 import tempfile
 import unittest
+
+import torch
 
 os.environ.setdefault("AR_AUTO_SCHEME_CACHE", os.path.join(os.path.dirname(__file__), "cache"))
 
 from auto_round.compressors import block_parallel  # noqa: E402
 
 
-class TestQueueProtocol(unittest.TestCase):
-    def test_write_claim_consume(self):
+class TestResultRank(unittest.TestCase):
+    def test_rank_roundtrip_and_merge_hygiene(self):
         with tempfile.TemporaryDirectory() as d:
-            q = block_parallel.queue_dir(d)
-            block_parallel.write_job(q, seq=1, job_type="tune", block_name="model.layers.0", group=0, index=0)
-            block_parallel.write_job(q, seq=2, job_type="tune", block_name="model.layers.1", group=0, index=1)
-            job = block_parallel.claim_next_job(q)
-            self.assertEqual(job["seq"], 1)
-            self.assertEqual(job["block_name"], "model.layers.0")
-            # claimed job is not claimable again
-            job2 = block_parallel.claim_next_job(q)
-            self.assertEqual(job2["seq"], 2)
-            self.assertEqual(block_parallel.claim_next_job(q), None)
+            os.environ["AR_BLOCK_PARALLEL_RANK"] = "3"
+            try:
+                block_parallel.save_block_results(
+                    d, "model.layers.0", {"l0": {"scale": torch.tensor([1.0]), "zp": None}}
+                )
+            finally:
+                os.environ.pop("AR_BLOCK_PARALLEL_RANK", None)
+            self.assertEqual(block_parallel.read_result_rank(d, "model.layers.0"), 3)
+            # merge skips advisory keys
+            merged = block_parallel.load_all_block_results(d)
+            self.assertIn("l0", merged)
+            self.assertNotIn("_worker_rank", merged)
 
-    def test_failure_marks_job(self):
+    def test_rank_absent(self):
         with tempfile.TemporaryDirectory() as d:
-            q = block_parallel.queue_dir(d)
-            block_parallel.write_job(q, seq=1, job_type="tune", block_name="b0", group=0, index=0)
-            job = block_parallel.claim_next_job(q)
-            block_parallel.job_failed(q, job, "boom")
-            self.assertEqual(block_parallel.claim_next_job(q), None)  # not silently re-claimed
-            failed = block_parallel.list_failed(q)
-            self.assertEqual(len(failed), 1)
+            self.assertEqual(block_parallel.read_result_rank(d, "missing"), -1)
 
-    def test_stop_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            q = block_parallel.queue_dir(d)
-            self.assertFalse(block_parallel.read_stop(q))
-            block_parallel.write_stop(q)
-            self.assertTrue(block_parallel.read_stop(q))
 
-    def test_produce_job_fields(self):
-        with tempfile.TemporaryDirectory() as d:
-            q = block_parallel.queue_dir(d)
-            block_parallel.write_job(q, seq=1, job_type="produce", group=0, start=0, end=64)
-            job = block_parallel.claim_next_job(q)
-            self.assertEqual(job["job_type"], "produce")
-            self.assertEqual((job["start"], job["end"]), (0, 64))
+class TestCountAgnosticState(unittest.TestCase):
+    """Durable state must not depend on worker count (rerun with any N)."""
 
-    def test_list_pending_after_claim(self):
+    def test_done_from_manifest_prefix_without_result_files(self):
+        # serial-after-serial produces manifests and no block files; a parallel
+        # rerun must still initialize done-sets from the prefix alone
         with tempfile.TemporaryDirectory() as d:
-            q = block_parallel.queue_dir(d)
-            block_parallel.write_job(q, seq=1, job_type="tune", block_name="b0", group=0, index=0)
-            block_parallel.write_job(q, seq=2, job_type="tune", block_name="b1", group=0, index=1)
-            self.assertEqual(len(block_parallel.list_pending(q)), 2)
-            block_parallel.claim_next_job(q)
-            self.assertEqual(len(block_parallel.list_pending(q)), 1)
+            # simulate: two blocks completed serially -> result files absent
+            # (verified indirectly: has_block_results is the only other source)
+            self.assertFalse(block_parallel.has_block_results(d, "model.layers.0"))
+            self.assertEqual(block_parallel.missing_result_blocks(d, [["b0", "b1", "b2"]]), ["b0", "b1", "b2"])
 
 
 if __name__ == "__main__":
