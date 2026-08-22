@@ -738,7 +738,16 @@ def _vram_inventory(tag: str, top_k: int = 12):
         print(f"[mem-inv]   {nb / 2**30:6.2f} GiB x{cnt:<4} {dtype} {shape}", flush=True)
 
 
-def model_forward_low_gpu(model, dataloader, major_device="cuda", pbar=None, scheme_tag=None, disk_index=None):
+def model_forward_low_gpu(
+    model,
+    dataloader,
+    major_device="cuda",
+    pbar=None,
+    scheme_tag=None,
+    disk_index=None,
+    skip_batches=0,
+    batch_checkpoint=None,
+):
     """Run one full scoring pass (all calibration batches) in low-GPU-memory mode.
 
     For each batch: capture per-block inputs via ``prepare_model_low_gpu``, run a forward
@@ -770,6 +779,12 @@ def model_forward_low_gpu(model, dataloader, major_device="cuda", pbar=None, sch
         raise MyCustomError("Interrupt backward pass")
 
     for batch_idx, data in enumerate(dataloader, start=1):
+        if batch_idx <= skip_batches:
+            # resumed run: these batches' contributions are already in the
+            # restored accumulators; advance the loader and the progress bar only
+            if pbar is not None:
+                pbar.update(len(block_names) * 2)
+            continue
         captured_grad = None
         interrupted = False
         last_block_backward_hook = None
@@ -889,6 +904,9 @@ def model_forward_low_gpu(model, dataloader, major_device="cuda", pbar=None, sch
 
         _vram_inventory(f"scheme={scheme_tag} batch={batch_idx}/{total_batches} post-replay")
 
+        if batch_checkpoint is not None:
+            batch_checkpoint(batch_idx, total_batches or -1)
+
         _log_batch_avg_loss(
             model,
             batch_idx,
@@ -908,6 +926,8 @@ def get_score_for_scheme(
     ignore_scale_zp_bits=False,
     nsamples=16,
     seqlen=256,
+    skip_batches=0,
+    batch_checkpoint=None,
     pbar=None,
     shared_layers=None,
     need_weight_grad=False,
@@ -1145,7 +1165,8 @@ def get_score_for_scheme(
                     "Provide a `processor` and a multimodal `dataset`."
                 )
             model_forward_low_gpu(
-                model, mllm_loader, major_device=major_device, pbar=pbar, scheme_tag=scheme_tag, disk_index=disk_index
+                model, mllm_loader, major_device=major_device, pbar=pbar, scheme_tag=scheme_tag, disk_index=disk_index,
+                skip_batches=skip_batches, batch_checkpoint=batch_checkpoint,
             )
         else:
             try:
@@ -1157,6 +1178,8 @@ def get_score_for_scheme(
                     pbar=pbar,
                     scheme_tag=scheme_tag,
                     disk_index=disk_index,
+                    skip_batches=skip_batches,
+                    batch_checkpoint=batch_checkpoint,
                 )
             except Exception as exc:  # noqa: BLE001
                 if not is_vlm:
@@ -1667,6 +1690,57 @@ def _autoscheme_cache_path(cache_key, scheme_index):
     return os.path.join(cache_dir, f"scheme_{scheme_index:02d}_{cache_key}.json")
 
 
+def _extract_score_accumulators(model):
+    """Snapshot the additive per-layer scoring accumulators for mid-scheme resume."""
+    state = {}
+    for n, m in model.named_modules():
+        if hasattr(m, "mix_score"):
+            state[n] = [float(m.act_score), float(m.weight_score), float(m.act_cnt)]
+    return state
+
+
+def _inject_score_accumulators(model, state):
+    """Restore scoring accumulators snapshotted by ``_extract_score_accumulators``."""
+    for n, m in model.named_modules():
+        if n in state and hasattr(m, "mix_score"):
+            m.act_score, m.weight_score, m.act_cnt = state[n]
+
+
+def _partial_scores_path(cache_path):
+    return cache_path + ".partial"
+
+
+def _save_partial_scores(cache_path, batch_idx, total_batches, state):
+    """Atomically persist a batch-granularity scoring checkpoint (JSON)."""
+    payload = {
+        "version": 1,
+        "batches_done": batch_idx,
+        "total_batches": total_batches,
+        "scores_state": state,
+    }
+    tmp = _partial_scores_path(cache_path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, _partial_scores_path(cache_path))
+
+
+def _load_partial_scores(cache_path, expected_total_batches):
+    """Load a batch checkpoint if present and still applicable."""
+    path = _partial_scores_path(cache_path)
+    if cache_path is None or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("total_batches") != expected_total_batches:
+            return None
+        if not 0 < data.get("batches_done", 0) < expected_total_batches:
+            return None
+        return data
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _save_autoscheme_scores(
     cache_path,
     cache_key,
@@ -1975,6 +2049,7 @@ def _score_scheme_worker(args):
         total_schemes,
         progress_queue,
         disk_stream_model,
+        worker_cache_path,
     ) = args
 
     from auto_round.auto_scheme.utils import _scheme_short_name as _short_name
@@ -2052,6 +2127,27 @@ def _score_scheme_worker(args):
         scheme=scheme,
     )
 
+    # mid-scheme resume: reload additive accumulators and skip completed batches
+    skip_batches = 0
+    batch_checkpoint = None
+    if worker_cache_path is not None:
+        expected_total = max(1, math.ceil(nsamples / max(1, batch_size)))
+        partial = _load_partial_scores(worker_cache_path, expected_total)
+        if partial is not None:
+            _inject_score_accumulators(model, partial["scores_state"])
+            skip_batches = partial["batches_done"]
+            logger.info(
+                "_score_scheme_worker[%d]: resuming from batch checkpoint %d/%d",
+                index,
+                skip_batches,
+                expected_total,
+            )
+
+        def batch_checkpoint(batch_idx, total_batches):
+            _save_partial_scores(
+                worker_cache_path, batch_idx, total_batches, _extract_score_accumulators(model)
+            )
+
     is_bf16 = isinstance(scheme, str) and scheme.upper() == "BF16"
     if isinstance(scheme, dict):
         is_bf16 = scheme.get("bits", 16) >= 16 and scheme.get("act_bits", 16) >= 16
@@ -2076,6 +2172,8 @@ def _score_scheme_worker(args):
         pbar=_ProgressQueueProxy(progress_queue),
         nsamples=nsamples,
         seqlen=seqlen,
+        skip_batches=skip_batches,
+        batch_checkpoint=batch_checkpoint,
         need_weight_grad=need_weight_grad,
         enable_torch_compile=enable_torch_compile,
         low_gpu_mem_usage=low_gpu_mem_usage,
@@ -2444,6 +2542,10 @@ def _gen_layer_config(
         def _save_per_op_scores(index, scheme, cache_key, cache_path, per_op_scores):
             if cache_key is None or cache_path is None:
                 return
+            try:
+                os.remove(_partial_scores_path(cache_path))
+            except OSError:
+                pass
             if isinstance(scheme, str):
                 scheme_dict = asdict(preset_name_to_scheme(scheme))
             elif isinstance(scheme, QuantizationScheme):
@@ -2561,6 +2663,23 @@ def _gen_layer_config(
                     "AutoScheme: if parallel scoring runs out of RAM/VRAM or automatic serial fallback cannot "
                     "recover, set AR_ENABLE_AUTO_SCHEME_PARALLEL=0 and rerun."
                 )
+                # free the parent's GPU before spawning workers: non-block params
+                # (embed/lm_head/vision) parked on a device by earlier setup are
+                # dead weight during parallel scoring -- the parent never runs a
+                # forward, and each worker owns its private copy. A shared-GPU
+                # worker then gets the card's full budget.
+                _moved = 0
+                for _p in model.parameters():
+                    if _p.device.type == "cuda":
+                        _p.data = _p.data.to("cpu")
+                        _moved += 1
+                for _b in model.buffers():
+                    if _b.device.type == "cuda":
+                        _b.data = _b.data.to("cpu")
+                if _moved:
+                    logger.info("AutoScheme: parked %d parent-side GPU tensors on CPU before spawning workers", _moved)
+                    clear_memory()
+
                 _vram_inventory("parent pre-spawn")
 
                 spawn_context = multiprocessing.get_context("spawn")
@@ -2589,6 +2708,7 @@ def _gen_layer_config(
                             len(schemes),
                             progress_queue,
                             worker_disk_stream_model,
+                            scheme_cache_meta[index][1],  # cache_path for batch checkpoints
                         )
                         for slot, index in enumerate(uncached_indices)
                     ]
@@ -2599,6 +2719,7 @@ def _gen_layer_config(
                         # completed schemes -- the rerun picks them up from cache
                         result_iter = pool.imap_unordered(_score_scheme_worker, worker_args)
                         worker_results = []
+                        failed_workers = 0
                         while True:
                             try:
                                 worker_results.append(result_iter.next(timeout=0.5))
@@ -2608,10 +2729,23 @@ def _gen_layer_config(
                                 continue
                             except StopIteration:
                                 break
+                            except Exception as worker_error:  # noqa: BLE001
+                                # one worker's failure must not abort its siblings:
+                                # keep consuming their results (each already-saved
+                                # scheme survives in the per-scheme cache)
+                                failed_workers += 1
+                                logger.warning(
+                                    "AutoScheme: a scoring worker failed (%s); collecting remaining workers' results.",
+                                    worker_error,
+                                )
+                                _drain_progress_queue(progress_queue, pbar)
+                                continue
                             index, scores, _report = worker_results[-1]
                             cache_key, cache_path, _ = scheme_cache_meta[index]
                             _save_per_op_scores(index, schemes[index], cache_key, cache_path, scores)
                         _drain_progress_queue(progress_queue, pbar)
+                        if not worker_results:
+                            raise RuntimeError("all parallel scoring workers failed") from None
 
                     parallel_results = {index: scores for index, scores, _ in worker_results}
                     _merge_worker_memory_reports(memory_monitor, [report for _, _, report in worker_results])
@@ -2655,8 +2789,17 @@ def _gen_layer_config(
                         if not check_bf16_scheme(scheme):
                             pbar.update(pbar_cnt // effective_scheme_num if effective_scheme_num > 0 else 1)
                     else:
-                        per_op_scores = parallel_results[index]
-                        _save_per_op_scores(index, scheme, cache_key, cache_path, per_op_scores)
+                        if index in parallel_results:
+                            per_op_scores = parallel_results[index]
+                            _save_per_op_scores(index, scheme, cache_key, cache_path, per_op_scores)
+                        else:
+                            # worker died for this scheme; siblings' results are saved.
+                            # Rerunning resumes/scores only the missing schemes.
+                            raise RuntimeError(
+                                f"AutoScheme: scheme {index} ({_scheme_short_name(scheme)}) was lost with its "
+                                "worker; completed schemes are persisted in the per-scheme cache -- rerun to "
+                                "score only the failed schemes."
+                            )
                     total_loss = _record_scheme_scores(index, per_op_scores)
                     logger.info(
                         "AutoScheme transition: scheme %d/%d scoring finished (total_loss=%.6f)",
@@ -2668,6 +2811,8 @@ def _gen_layer_config(
                 logger.info("AutoScheme: parallel scoring completed.")
                 post_scoring_started = time.perf_counter()
             except Exception as parallel_error:  # noqa: BLE001
+                if "was lost with its worker" in str(parallel_error):
+                    raise
                 logger.warning(
                     "AutoScheme: parallel scoring failed, falling back to serial: %s. "
                     "If fallback cannot recover (for example after RAM/VRAM exhaustion), rerun with "
