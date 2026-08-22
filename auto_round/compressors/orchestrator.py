@@ -564,7 +564,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 comp.gradient_accumulate_steps = ga
 
     def _maybe_block_parallel_tune(
-        self, all_blocks: list, is_worker: bool, all_inputs: dict = None, input_ids_cache=None
+        self, all_blocks: list, is_worker: bool, all_inputs: dict = None, input_ids_cache=None, pbar=None
     ) -> bool:
         """Run block-parallel tuning when enabled; returns True if results were applied.
 
@@ -736,11 +736,20 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         import time as _time
 
+        total_blocks = sum(len(blocks) for blocks in all_blocks)
+        shown_done = sum(len(d) for d in done.values())
+        if pbar is not None:
+            pbar.set_description("Tuning blocks (parallel)")
+            pbar.refresh()
         rss_tick = 0
         while any(pointer[g] < len(all_blocks[g]) for g in pointer):
             _time.sleep(0.5)
             for g, blocks in enumerate(all_blocks):
                 done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
+            done_now = sum(len(d) for d in done.values())
+            if pbar is not None and done_now != shown_done:
+                pbar.update(done_now - shown_done)
+                shown_done = done_now
             # absorb completed prefix blocks into the serial manifests
             if resumable:
                 for g, blocks in enumerate(all_blocks):
@@ -1353,6 +1362,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             bool(envs.AR_BLOCK_PARALLEL_WORKER or envs.AR_BLOCK_PARALLEL_QUEUE_DIR),
             all_inputs=all_inputs,
             input_ids_cache=input_ids_cache,
+            pbar=pbar,
         )
 
         resume_states = None
