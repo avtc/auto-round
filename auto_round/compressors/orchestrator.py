@@ -897,10 +897,22 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         from auto_round.compressors import block_parallel as bp
 
+        from auto_round.calibration.utils import _update_inputs
+
         qdir = envs.AR_BLOCK_PARALLEL_QUEUE_DIR
         results_dir = envs.AR_BLOCK_PARALLEL_RESULTS
         if not qdir or not results_dir:
             raise RuntimeError("block-parallel worker is missing its queue/results environment")
+
+        def _group_entry(blocks):
+            """Serial-parity entry prep: fresh copy per job (split_inputs pops
+            keys, so the shared entry must not be consumed in place) plus the
+            hidden_states -> input_ids re-key the serial loop performs via
+            _update_inputs before calling _quantize_blocks."""
+            entry = dict(all_inputs[blocks[0]])
+            entry, _q = _update_inputs(entry, None)
+            return entry
+
         while True:
             job = bp.claim_next_job(qdir)
             if job is None:
@@ -922,7 +934,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                             start = 0  # checkpoint lost: replay the whole prefix
                     self._quantize_blocks(
                         self.model_context.model,
-                        all_inputs[blocks[0]],
+                        _group_entry(blocks),
                         blocks,
                         nblocks=1,
                         pbar=pbar,
@@ -943,7 +955,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         raise RuntimeError(f"missing chain checkpoint for {blocks[k]} (group {g} block {k})")
                     self._quantize_blocks(
                         self.model_context.model,
-                        all_inputs[blocks[0]],
+                        _group_entry(blocks),
                         blocks,
                         nblocks=1,
                         pbar=pbar,
