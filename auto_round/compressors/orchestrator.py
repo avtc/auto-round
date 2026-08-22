@@ -769,6 +769,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             _time.sleep(0.5)
             for g, blocks in enumerate(all_blocks):
                 done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
+                # a chain checkpoint is the ENTRY for block k: once k is tuned it
+                # has no consumers (dispatch moved past, entry consumed, resume
+                # regenerates it deterministically by fast-forward) -- prune it
+                # or ~2.7GB per block accumulates over the run
+                for k, _b in enumerate(blocks):
+                    if k in done[g] and os.path.exists(bp._chain_state_path(results_dir, g, k)):
+                        try:
+                            os.remove(bp._chain_state_path(results_dir, g, k))
+                        except OSError:
+                            pass
             done_now = sum(len(d) for d in done.values())
             if pbar is not None and done_now != shown_done:
                 pbar.update(done_now - shown_done)
