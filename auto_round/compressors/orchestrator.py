@@ -227,6 +227,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 data = _json.load(f)
             completed = data.get("completed_blocks", [])
             entry = torch.load(input_ids, map_location="cpu", weights_only=True)
+            if entry is None:
+                # prefix without a usable entry (e.g. absorption consumed a
+                # missing handoff): replay from the group entry instead of
+                # chaining from a wrong starting state
+                return 0, None
             from auto_round.compressors.block_parallel import _to_device_recursive
 
             return len(completed), _to_device_recursive(entry, self.compress_context.cache_device)
