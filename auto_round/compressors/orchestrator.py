@@ -306,7 +306,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _bp_save_chain_state(bp_results_dir, group_idx, i + 1, input_ids)
                 if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
                     accelerate.hooks.remove_hook_from_submodules(m_ff)
-                mv_module_from_gpu(m_ff)
+                # An FF'd block was never tuned -- its weights are unchanged
+                # from the checkpoint -- so park it straight back on meta
+                # instead of leaving the materialized copy on the host. Without
+                # this, a produce pass accumulates every block it replays
+                # (observed: +0.5-0.9 GiB/block, 54 GiB over a full group).
+                m_ff.to("meta")
                 clear_memory(device_list=device_manager.device_list)
                 continue
             if nblocks == 1:
