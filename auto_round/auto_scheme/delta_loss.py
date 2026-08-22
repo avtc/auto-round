@@ -1897,8 +1897,14 @@ def _can_parallel_scheme_scoring(
     disk_stream_model,
     is_vlm,
     low_gpu_mem_usage=True,
+    force_mllm=False,
 ):
-    """Return whether candidate schemes can be scored in separate workers."""
+    """Return whether candidate schemes can be scored in separate workers.
+
+    ``is_vlm`` is accepted for call-site compatibility; text-only scoring of a
+    VLM's language tower streams blocks just like a text model. Only vision
+    scoring (``force_mllm``) requires a full-model backward and is excluded
+    from the block-wise materialize/free path used by disk streaming."""
     return (
         parallel_enabled
         and low_gpu_mem_usage
@@ -1906,7 +1912,7 @@ def _can_parallel_scheme_scoring(
         and num_gpus >= 1
         and uncached_count >= 2
         and not need_imatrix
-        and (not disk_stream_model or not is_vlm)
+        and (not disk_stream_model or not force_mllm)
     )
 
 
@@ -2515,6 +2521,7 @@ def _gen_layer_config(
             worker_disk_stream_model,
             is_vlm,
             low_gpu_mem_usage=auto_scheme.low_gpu_mem_usage,
+            force_mllm=force_mllm,
         )
         logger.info(
             "AutoScheme scoring mode: parallel_configured=%s, parallel_enabled=%s, disk_stream_enabled=%s",
