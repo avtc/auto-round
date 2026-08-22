@@ -525,7 +525,18 @@ class CompressionOrchestrator(BaseOrchestrator):
             return False
         from auto_round.compressors import block_parallel as bp
 
-        enabled = bp.block_parallel_tuning_enabled(
+        def _fail_if_requested(reason: str) -> bool:
+            # Explicitly requested but cannot run: fail loudly instead of
+            # silently burning hours in the serial loop (opt-in escape hatch).
+            if envs.AR_ENABLE_BLOCK_PARALLEL_TUNING and not envs.AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK:
+                raise RuntimeError(
+                    f"AR_ENABLE_BLOCK_PARALLEL_TUNING=1 was requested but block-parallel tuning "
+                    f"cannot run: {reason}. Fix the condition, or set "
+                    f"AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK=1 to proceed with serial tuning."
+                )
+            return False
+
+        reason = bp.block_parallel_tuning_enabled(
             need_quanted_input=bool(self.alg_composer.need_quanted_input()),
             super_group_size=self.super_group_size,
             nblocks=self.nblocks,
@@ -535,12 +546,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             n_blocks_total=sum(len(group) for group in all_blocks),
             argv=sys.argv,
         )
-        if not enabled:
+        if reason == "env":
             return False
+        if reason is not None:
+            logger.info("block-parallel tuning disabled: %s", reason)
+            return _fail_if_requested(reason)
         gpu_ids = bp.eligible_gpus()
         if len(gpu_ids) < 2:
-            logger.info("block-parallel tuning disabled: fewer than 2 eligible GPUs (%s)", gpu_ids)
-            return False
+            return _fail_if_requested(f"fewer than 2 eligible GPUs ({gpu_ids})")
         # Resume storage reuses the serial flag: AR_RESUME_DIR set -> per-block
         # result files + chain checkpoints under <AR_RESUME_DIR>/block_parallel,
         # validated by run signature; unset -> fresh scratch dir (no resume).

@@ -331,34 +331,35 @@ def block_parallel_tuning_enabled(
     is_immediate_saving: bool,
     n_blocks_total: int,
     argv: Optional[Sequence[str]],
-) -> bool:
+) -> Optional[str]:
     """Decide whether block-parallel tuning may run in this process.
 
-    Parallel tuning re-execs the same CLI in worker processes, so it requires a
-    reconstructible command line (CLI usage). All conditions that make blocks
-    order-dependent or the save path non-mergeable disable it.
+    Returns ``None`` when enabled, the string ``"env"`` when the feature flag
+    is simply off (normal serial path -- never an error), or a human-readable
+    reason when the flag is ON but a guard blocks execution (the caller should
+    fail loudly rather than silently fall back to serial).
+
+    Parallel tuning re-execs the same CLI in worker processes, so it requires
+    a reconstructible command line (CLI usage). All conditions that make blocks
+    order-dependent or the save path non-mergeable block it.
     """
     if not envs.AR_ENABLE_BLOCK_PARALLEL_TUNING:
-        return False
+        return "env"
     if envs.AR_BLOCK_PARALLEL_WORKER:
-        return False  # never recurse
+        return "worker process (no recursive parallelism)"
     if argv is None or len(argv) == 0:
-        logger.info("block-parallel tuning disabled: no reconstructible command line (API usage)")
-        return False
+        return "no reconstructible command line (API usage)"
     if need_quanted_input:
-        logger.info("block-parallel tuning disabled: quantized-input chain (sequential replay) is active")
-        return False
-    if super_group_size is not None:
-        logger.info("block-parallel tuning disabled: super_group_size is set")
-        return False
-    if nblocks != 1:
-        logger.info("block-parallel tuning disabled: nblocks=%d != 1", nblocks)
-        return False
-    if not (is_immediate_packing and is_immediate_saving):
-        logger.info(
-            "block-parallel tuning disabled: requires immediate packing and saving (low-mem/disk-stream flow)"
+        return (
+            "quantized-input chain (sequential replay) is active; blocks are order-dependent. "
+            "Pass --no-enable_quanted_input for FP-chain calibration"
         )
-        return False
+    if super_group_size is not None:
+        return "super_group_size is set"
+    if nblocks != 1:
+        return f"nblocks={nblocks} != 1"
+    if not (is_immediate_packing and is_immediate_saving):
+        return "requires immediate packing and saving (low-mem/disk-stream flow)"
     if n_block_groups == 0 or n_blocks_total < 2:
-        return False
-    return True
+        return "fewer than 2 blocks to tune"
+    return None

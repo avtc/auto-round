@@ -47,5 +47,46 @@ class TestWorkerCommand(unittest.TestCase):
         )
 
 
+class TestGuardReasons(unittest.TestCase):
+    """Guard returns None (ok), 'env' (flag off), or a reason (flag on, blocked)."""
+
+    BASE = dict(
+        need_quanted_input=False,
+        super_group_size=None,
+        nblocks=1,
+        n_block_groups=1,
+        is_immediate_packing=True,
+        is_immediate_saving=True,
+        n_blocks_total=64,
+        argv=["auto-round", "--a"],
+    )
+
+    def setUp(self):
+        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "1"
+        os.environ.pop("AR_BLOCK_PARALLEL_WORKER", None)
+        os.environ.pop("AR_RESUME_DIR", None)
+
+    def tearDown(self):
+        os.environ.pop("AR_ENABLE_BLOCK_PARALLEL_TUNING", None)
+
+    def test_enabled_returns_none(self):
+        self.assertIsNone(block_parallel.block_parallel_tuning_enabled(**self.BASE))
+
+    def test_flag_off_returns_env(self):
+        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "0"
+        self.assertEqual(block_parallel.block_parallel_tuning_enabled(**self.BASE), "env")
+
+    def test_quanted_input_reason_mentions_flag(self):
+        reason = block_parallel.block_parallel_tuning_enabled(**{**self.BASE, "need_quanted_input": True})
+        self.assertIn("--no-enable_quanted_input", reason)
+
+    def test_worker_reason(self):
+        os.environ["AR_BLOCK_PARALLEL_WORKER"] = "1"
+        self.assertIn("worker", block_parallel.block_parallel_tuning_enabled(**self.BASE))
+
+    def test_api_usage_reason(self):
+        self.assertIn("command line", block_parallel.block_parallel_tuning_enabled(**{**self.BASE, "argv": None}))
+
+
 if __name__ == "__main__":
     unittest.main()
