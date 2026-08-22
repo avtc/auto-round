@@ -764,6 +764,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             return [(g, k) for g, blocks in enumerate(all_blocks) for k, b in enumerate(blocks)
                     if k not in done[g] and (g, k) not in assigned.values()]
 
+        ramp_start = {
+            g: next((k for k in range(len(blocks)) if k not in done[g]), len(blocks))
+            for g, blocks in enumerate(all_blocks)
+        }  # per-group starting frontier: its entry comes from manifest/group cache
         assigned = {}  # rank -> (group, index); absent == worker idle/finished
         stopped = set()
         seen_results = {
@@ -771,8 +775,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         }  # startup done-blocks are already accounted for -- the loop must not
         # re-process them as fresh results (which re-assigned their old ranks
         # and queued duplicate tune lines onto live workers)
-        finished_ranks = set()  # ranks that reported a result since last pass
-
         def _send(rank: int, message: str) -> None:
             proc = procs[rank]
             if proc.poll() is not None:
@@ -783,17 +785,26 @@ class CompressionOrchestrator(BaseOrchestrator):
             except (BrokenPipeError, ValueError):
                 pass  # worker death is handled by the liveness check
 
+        def _entry_available(target) -> bool:
+            g, k = target
+            if k == ramp_start[g]:
+                return True  # the run's starting frontier: manifest/group entry
+            return bp.chain_state_exists(results_dir, g, k)
+
         def _assign_next(rank: int) -> None:
             """Push the next assignment to ``rank``: the lowest undone,
-            unassigned block (the frontier). Strict sequential extension -- the
-            entry for the frontier block was published by the previous
-            assignee's chain forward before its tune began, so it is always
-            available on disk. Worker count never matters."""
-            candidates = _ordered_undone()
+            unassigned block whose entry is available. Strict sequential relay,
+            including at initialization: a block's entry checkpoint is published
+            by the previous assignee's chain forward (which runs before its
+            tune), so gating on it cascades the ramp -- worker n starts once
+            worker n-1's forward landed, reading instead of replaying. Worker
+            count never matters."""
+            candidates = [c for c in _ordered_undone() if _entry_available(c)]
             if not candidates:
-                stopped.add(rank)
-                _send(rank, "stop")
-                return
+                if not _ordered_undone():
+                    stopped.add(rank)
+                    _send(rank, "stop")
+                return  # entries not published yet; retried next tick
             target = candidates[0]
             assigned[rank] = target
             _send(rank, f"tune {target[0]} {target[1]}")
@@ -837,7 +848,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     rank = bp.read_result_rank(results_dir, b)
                     if rank >= 0:
                         assigned.pop(rank, None)
-                        finished_ranks.add(rank)
             # ordered commit into the serial manifests, consuming the entry
             # handoff files the workers published (then deleting them)
             if resumable:
@@ -850,9 +860,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                         # no delete: the frontier assignee may still need this
                         # entry file; prune-on-done removes it once block k+1
                         # completes (exactly the right window)
-            # re-assign ranks that reported a result since the last pass
-            for rank in list(finished_ranks):
-                finished_ranks.discard(rank)
+            # assign any idle rank whose next block's entry has appeared
+            # (result events AND newly published ramp tails both land here)
+            for rank in range(len(procs)):
                 if rank not in assigned and rank not in stopped:
                     _assign_next(rank)
             done_now = sum(len(d) for d in done.values())
