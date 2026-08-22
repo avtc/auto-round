@@ -2561,6 +2561,8 @@ def _gen_layer_config(
                     "AutoScheme: if parallel scoring runs out of RAM/VRAM or automatic serial fallback cannot "
                     "recover, set AR_ENABLE_AUTO_SCHEME_PARALLEL=0 and rerun."
                 )
+                _vram_inventory("parent pre-spawn")
+
                 spawn_context = multiprocessing.get_context("spawn")
                 with spawn_context.Manager() as manager:
                     progress_queue = manager.Queue()
@@ -2591,13 +2593,25 @@ def _gen_layer_config(
                         for slot, index in enumerate(uncached_indices)
                     ]
                     with spawn_context.Pool(processes=num_workers) as pool:
-                        async_results = pool.map_async(_score_scheme_worker, worker_args)
-                        while not async_results.ready():
-                            _drain_progress_queue(progress_queue, pbar)
-                            memory_monitor.update_cpu()
-                            async_results.wait(timeout=0.1)
+                        # incremental consumption: persist each scheme's scores to
+                        # the per-scheme cache as its worker returns, so a partial
+                        # failure (or serial-fallback crash) never discards
+                        # completed schemes -- the rerun picks them up from cache
+                        result_iter = pool.imap_unordered(_score_scheme_worker, worker_args)
+                        worker_results = []
+                        while True:
+                            try:
+                                worker_results.append(result_iter.next(timeout=0.5))
+                            except multiprocessing.TimeoutError:
+                                _drain_progress_queue(progress_queue, pbar)
+                                memory_monitor.update_cpu()
+                                continue
+                            except StopIteration:
+                                break
+                            index, scores, _report = worker_results[-1]
+                            cache_key, cache_path, _ = scheme_cache_meta[index]
+                            _save_per_op_scores(index, schemes[index], cache_key, cache_path, scores)
                         _drain_progress_queue(progress_queue, pbar)
-                        worker_results = async_results.get()
 
                     parallel_results = {index: scores for index, scores, _ in worker_results}
                     _merge_worker_memory_reports(memory_monitor, [report for _, _, report in worker_results])
