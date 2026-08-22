@@ -449,7 +449,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # the results dir; packing/shards/offload-write all belong to
                 # the parent's apply pass. Park the block back on meta so a
                 # long queue-serving lifetime never accumulates host memory.
-                get_module(model, block_name_or_names if nblocks == 1 else n).to("meta")
+                get_module(model, block_name_or_names).to("meta")
             elif self.compress_context.low_cpu_mem_usage and not self.compress_context.is_immediate_saving:
                 if nblocks == 1:
                     self._offloader(model, n, overwrite=True)
