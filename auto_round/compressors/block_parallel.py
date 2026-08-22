@@ -32,6 +32,7 @@ GGUF's sequential replay makes blocks order-dependent); see
 
 import json
 import os
+import re
 import subprocess
 import sys
 from typing import List, Optional, Sequence, Tuple
@@ -140,8 +141,11 @@ def spawn_workers(
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         env["AR_BLOCK_PARALLEL_WORKER"] = "1"
         env["AR_BLOCK_PARALLEL_SPANS"] = spans_to_json([worker_spans])
-        env["AR_BLOCK_PARALLEL_RESULTS"] = os.path.join(results_dir, f"worker_{rank}.pt")
-        env.pop("AR_RESUME_DIR", None)  # per-worker resume state is not supported
+        # AR_RESUME_DIR is deliberately inherited: workers derive their
+        # per-block checkpoint dir from it (same user-facing flag as serial).
+        # The serial per-group manifest machinery is bypassed inside workers
+        # via the worker sentinel.
+        env["AR_BLOCK_PARALLEL_RESULTS"] = results_dir
         # Never let a worker fan out its own AutoScheme scoring pool if the
         # scheme cache should miss (workers are single-GPU by construction).
         env["AR_ENABLE_AUTO_SCHEME_PARALLEL"] = "0"
@@ -167,23 +171,119 @@ def wait_workers(procs: List[subprocess.Popen]) -> List[int]:
     return codes
 
 
-def load_worker_results(results_dir: str, n_workers: int) -> dict:
-    """Merge per-worker tuned {layer_name: {scale, zp}} dumps into one dict."""
+def parallel_results_dir() -> Optional[str]:
+    """Directory for per-block tuned results, derived from AR_RESUME_DIR.
+
+    Resume is requested with the same flag as the serial path: when
+    AR_RESUME_DIR is set, per-block result files and chain checkpoints are
+    written under ``<AR_RESUME_DIR>/block_parallel`` and a rerun picks up every
+    block already tuned (regardless of span layout -- files are block-keyed).
+    Without AR_RESUME_DIR there is no resumability; the caller uses a fresh
+    scratch dir.
+    """
+    resume_dir = envs.AR_RESUME_DIR
+    if not resume_dir:
+        return None
+    return os.path.join(resume_dir, "block_parallel")
+
+
+def _sanitize(name: str) -> str:
+    return name.replace(".", "_").replace("/", "-")
+
+
+def _block_results_path(results_dir: str, block_name: str) -> str:
+    return os.path.join(results_dir, f"block_{_sanitize(block_name)}.pt")
+
+
+def _chain_state_path(results_dir: str, group: int, block_idx: int) -> str:
+    return os.path.join(results_dir, f"chain_g{group}_b{block_idx}.pt")
+
+
+def save_block_results(results_dir: str, block_name: str, layers: dict) -> None:
+    """Atomically persist one block's tuned ``{layer_name: {scale, zp}}``.
+
+    One file per block is the unit of resumption: block tuning is independent
+    (inputs chain through original-weights outputs), so any subset of completed
+    blocks composes with a rerun that finishes the rest.
+    """
+    os.makedirs(results_dir, exist_ok=True)
+    path = _block_results_path(results_dir, block_name)
+    tmp = path + ".tmp"
+    torch.save(layers, tmp)
+    os.replace(tmp, path)
+
+
+def has_block_results(results_dir: str, block_name: str) -> bool:
+    return os.path.exists(_block_results_path(results_dir, block_name))
+
+
+def load_all_block_results(results_dir: str) -> dict:
+    """Merge every per-block result file into one {layer_name: {scale, zp}} dict."""
     merged: dict = {}
-    for rank in range(n_workers):
-        path = os.path.join(results_dir, f"worker_{rank}.pt")
-        if not os.path.exists(path):
+    if not results_dir or not os.path.isdir(results_dir):
+        return merged
+    for fname in sorted(os.listdir(results_dir)):
+        if not (fname.startswith("block_") and fname.endswith(".pt")):
             continue
-        data = torch.load(path, map_location="cpu", weights_only=True)
+        data = torch.load(os.path.join(results_dir, fname), map_location="cpu", weights_only=True)
         for name, entry in data.items():
             merged[name] = {"scale": entry["scale"], "zp": entry["zp"]}
     return merged
 
 
-def dump_worker_results(path: str, results: dict) -> None:
-    """Worker-side: persist tuned scale/zp tensors for the parent to merge."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(results, path)
+def missing_result_blocks(results_dir: str, all_blocks: "Sequence[list]") -> "List[str]":
+    """Blocks (flattened) with no result file yet."""
+    if not results_dir:
+        return [block for group in all_blocks for block in group]
+    return [block for group in all_blocks for block in group if not has_block_results(results_dir, block)]
+
+
+def save_chain_state(results_dir: str, group: int, block_idx: int, hidden) -> None:
+    """Checkpoint the chained hidden state entering block ``block_idx``.
+
+    The hidden state is the only live chain variable across blocks (masks and
+    positions are re-sourced from the per-block pre-cache every iteration), so
+    saving it lets a resumed worker skip already-tuned prefix blocks with no
+    replay. Non-tensor chain payloads are skipped (nothing to restore).
+    """
+    if not isinstance(hidden, torch.Tensor):
+        return
+    os.makedirs(results_dir, exist_ok=True)
+    payload = {"hidden": hidden.detach().to("cpu"), "dtype": str(hidden.dtype)}
+    tmp = _chain_state_path(results_dir, group, block_idx) + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, _chain_state_path(results_dir, group, block_idx))
+
+
+def load_chain_state(results_dir: str, group: int, block_idx: int, device: str):
+    """Restore a chained hidden state, or ``None`` when absent/non-tensor."""
+    if not results_dir:
+        return None
+    path = _chain_state_path(results_dir, group, block_idx)
+    if not os.path.exists(path):
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    dtype = getattr(torch, payload["dtype"].replace("torch.", ""), None)
+    hidden = payload["hidden"]
+    if dtype is not None:
+        hidden = hidden.to(dtype)
+    return hidden.to(device)
+
+
+def save_signature(results_dir: str, signature: str) -> None:
+    """Persist the run signature the results were produced under."""
+    os.makedirs(results_dir, exist_ok=True)
+    with open(os.path.join(results_dir, "signature.txt"), "w", encoding="utf-8") as f:
+        f.write(signature)
+
+
+def signature_matches(results_dir: str, signature: str) -> bool:
+    """True when stored signature is absent or equal (absent = first run)."""
+    path = os.path.join(results_dir, "signature.txt")
+    if not os.path.exists(path):
+        return True
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip() == signature.strip()
 
 
 def block_parallel_tuning_enabled(
@@ -218,9 +318,6 @@ def block_parallel_tuning_enabled(
         return False
     if nblocks != 1:
         logger.info("block-parallel tuning disabled: nblocks=%d != 1", nblocks)
-        return False
-    if envs.AR_RESUME_DIR:
-        logger.info("block-parallel tuning disabled: AR_RESUME_DIR is set")
         return False
     if not (is_immediate_packing and is_immediate_saving):
         logger.info(
