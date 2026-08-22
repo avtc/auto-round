@@ -809,7 +809,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 target = candidates[0]
             assigned[rank] = target
             _send(rank, f"tune {target[0]} {target[1]}")
-            logger.info("block-parallel tuning: assigned g%d k%d to worker %d", target[0], target[1], rank)
+            logger.info(
+                "block-parallel tuning: assigned g%d k%d to worker %d (%s)",
+                target[0], target[1], rank,
+                "sticky" if prefer is not None and target == prefer else "frontier",
+            )
 
         for rank in range(len(procs)):
             _assign_next(rank)
