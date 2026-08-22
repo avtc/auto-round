@@ -527,14 +527,12 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         def _fail_if_requested(reason: str) -> bool:
             # Explicitly requested but cannot run: fail loudly instead of
-            # silently burning hours in the serial loop (opt-in escape hatch).
-            if envs.AR_ENABLE_BLOCK_PARALLEL_TUNING and not envs.AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK:
-                raise RuntimeError(
-                    f"AR_ENABLE_BLOCK_PARALLEL_TUNING=1 was requested but block-parallel tuning "
-                    f"cannot run: {reason}. Fix the condition, or set "
-                    f"AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK=1 to proceed with serial tuning."
-                )
-            return False
+            # silently burning hours in the serial loop. Want serial? Don't set
+            # the parallel flag.
+            raise RuntimeError(
+                f"AR_ENABLE_BLOCK_PARALLEL_TUNING=1 was requested but block-parallel tuning "
+                f"cannot run: {reason}. Fix the condition, or unset the flag for serial tuning."
+            )
 
         reason = bp.block_parallel_tuning_enabled(
             need_quanted_input=bool(self.alg_composer.need_quanted_input()),

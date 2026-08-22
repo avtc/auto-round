@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     AR_BLOCK_PARALLEL_WORKER: bool = False
     AR_BLOCK_PARALLEL_QUEUE_DIR: Optional[str] = None
     AR_BLOCK_PARALLEL_RESULTS: Optional[str] = None
-    AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK: bool = False
     AR_BLOCK_PARALLEL_RAM_PER_WORKER: float = 12.0
     AR_BLOCK_PARALLEL_MAX_WORKERS: int = 0
     AR_BLOCK_PARALLEL_SPAWN_STAGGER: float = 10.0
@@ -157,13 +156,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_BLOCK_PARALLEL_QUEUE_DIR": lambda: os.getenv("AR_BLOCK_PARALLEL_QUEUE_DIR", None),
     # Internal: directory where parallel tuning workers dump tuned scale/zp.
     "AR_BLOCK_PARALLEL_RESULTS": lambda: os.getenv("AR_BLOCK_PARALLEL_RESULTS", None),
-    # When block-parallel tuning was explicitly requested (AR_ENABLE_BLOCK_PARALLEL_TUNING=1)
-    # but a guard disables it, fail loudly instead of silently falling back to the
-    # serial loop. Set to 1 to restore the old silent-serial behavior.
-    "AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK": lambda: os.getenv(
-        "AR_BLOCK_PARALLEL_ALLOW_SERIAL_FALLBACK", "0"
-    ).lower()
-    in ("1", "true", "yes"),
     # Estimated host RAM (GiB) each tuning worker needs (model skeleton +
     # calibration cache pass + streaming buffers). Workers are capped so their
     # combined estimate fits MemAvailable.
