@@ -407,7 +407,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             memory_monitor.log_summary()
 
             # ── Infrastructure: immediate_pack / shard write ──────────────────
-            if self.compress_context.is_immediate_packing:
+            is_bp_worker = bool(envs.AR_BLOCK_PARALLEL_WORKER)
+            if self.compress_context.is_immediate_packing and not is_bp_worker:
                 for _n, _mod in m.named_modules():
                     if hasattr(_mod, "bits") and check_to_quantized(_mod):
                         from auto_round.compressors.utils import immediate_pack as _immediate_pack
@@ -429,7 +430,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 )
                 _bp_save_chain_state(bp_results_dir, group_idx, i + 1, input_ids)
 
-            if self.compress_context.is_immediate_saving:
+            if self.compress_context.is_immediate_saving and not is_bp_worker:
                 self.shard_writer.write(m, is_finalize=False)
                 # ShardWriter only actually flushes to disk once its
                 # shard-size budget is reached (`_flush_shard`, private but
@@ -443,7 +444,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if resume_state is not None:
                     self.shard_writer._flush_shard()
 
-            if self.compress_context.low_cpu_mem_usage and not self.compress_context.is_immediate_saving:
+            if is_bp_worker:
+                # Worker: the block's tuned scale/zp are already persisted to
+                # the results dir; packing/shards/offload-write all belong to
+                # the parent's apply pass. Park the block back on meta so a
+                # long queue-serving lifetime never accumulates host memory.
+                get_module(model, block_name_or_names if nblocks == 1 else n).to("meta")
+            elif self.compress_context.low_cpu_mem_usage and not self.compress_context.is_immediate_saving:
                 if nblocks == 1:
                     self._offloader(model, n, overwrite=True)
                 else:
@@ -927,6 +934,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             entry, _q = _update_inputs(entry, None)
             return entry
 
+        import time as _t
+
         while True:
             job = bp.claim_next_job(qdir)
             if job is None:
@@ -934,6 +943,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     break
                 _time.sleep(0.5)
                 continue
+            _job_t0 = _t.time()
+            logger.info(
+                "block-parallel worker: claimed %s job seq %s (group %s, index %s)",
+                job.get("job_type"), job.get("seq"), job.get("group"),
+                job.get("index", job.get("start")),
+            )
             try:
                 g = job["group"]
                 blocks = all_blocks[g]
@@ -990,6 +1005,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                         resume_input_ids=entry,
                     )
                 bp.job_done(qdir, job)
+                logger.info(
+                    "block-parallel worker: job seq %s done in %.1fs", job.get("seq"), _t.time() - _job_t0
+                )
             except Exception as err:  # noqa: BLE001
                 bp.job_failed(qdir, job, repr(err))
                 logger.error("block-parallel worker: job %s failed: %r", job.get("seq"), err)
