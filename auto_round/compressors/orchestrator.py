@@ -549,17 +549,45 @@ class CompressionOrchestrator(BaseOrchestrator):
         if reason is not None:
             logger.info("block-parallel tuning disabled: %s", reason)
             return _fail_if_requested(reason)
-        # respect the user's --device_map: workers never spread onto GPUs the
-        # user did not ask for (also keeps the host-RAM footprint bounded)
+        # Worker pool: the user's --device_map is the request; eligibility is
+        # derived from the model (VRAM) and from measured host RAM -- no knobs.
         allowed = []
         for dev in device_manager.device_list:
             try:
                 allowed.append(int(str(dev).split(":")[-1]))
             except ValueError:
                 continue
-        gpu_ids = bp.eligible_gpus(allowed_indices=allowed or None)
+        # per-GPU VRAM requirement: largest block's weight bytes with a
+        # working-set multiplier (original + QDQ copy + workspace) plus an
+        # activation margin. Shapes are known even on the meta skeleton.
+        largest_block_bytes = 0
+        for group in all_blocks:
+            for block_name in group:
+                block = get_module(self.model_context.model, block_name)
+                if block is None:
+                    continue
+                nbytes = sum(p.numel() * p.element_size() for p in block.parameters())
+                largest_block_bytes = max(largest_block_bytes, nbytes)
+        required_vram_bytes = int(largest_block_bytes * 3) + (4 * 1024**3)
+        gpu_ids = bp.eligible_gpus(required_vram_bytes, allowed_indices=allowed or None)
+        # host-RAM cap: the parent just ran the identical cache pass, so its
+        # measured peak RSS is the best per-worker estimate
+        per_worker_ram_gb = max(4.0, 0.9 * max(memory_monitor.peak_ram, 4.0))
+        available_ram_gb = bp._available_ram_gb() or 0.0
+        if available_ram_gb > 0:
+            ram_cap = max(1, int(available_ram_gb / per_worker_ram_gb))
+            if len(gpu_ids) > ram_cap:
+                logger.info(
+                    "block-parallel tuning: using %d of %d GPU(s) -- host RAM %.1f GiB available "
+                    "at ~%.1f GiB per worker (parent peak RSS as estimate)",
+                    ram_cap, len(gpu_ids), available_ram_gb, per_worker_ram_gb,
+                )
+                gpu_ids = gpu_ids[:ram_cap]
         if len(gpu_ids) < 2:
-            return _fail_if_requested(f"fewer than 2 eligible GPUs ({gpu_ids})")
+            return _fail_if_requested(
+                f"fewer than 2 usable GPUs ({gpu_ids}; required ~{required_vram_bytes / 1024**3:.1f} GiB "
+                f"free VRAM each, host RAM {available_ram_gb:.1f} GiB at ~{per_worker_ram_gb:.1f} GiB/worker)"
+            )
         # Resume storage reuses the serial flag: AR_RESUME_DIR set -> per-block
         # result files + chain checkpoints under <AR_RESUME_DIR>/block_parallel,
         # validated by run signature; unset -> fresh scratch dir (no resume).

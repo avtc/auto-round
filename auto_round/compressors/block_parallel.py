@@ -45,19 +45,16 @@ from auto_round.utils import logger
 Span = Tuple[int, int, int]  # (group_idx, start, end) -- end exclusive
 
 
-def eligible_gpus(min_free_gb: Optional[float] = None, allowed_indices: Optional[List[int]] = None) -> List[int]:
-    """CUDA devices usable for tuning workers (heterogeneous-safe).
+def eligible_gpus(required_free_bytes: int, allowed_indices: Optional[List[int]] = None) -> List[int]:
+    """CUDA devices with enough free VRAM for one tuning worker.
 
-    Filters by free VRAM (default 18 GiB, AR_BLOCK_PARALLEL_MIN_FREE_GB), by the
-    caller's allowed device indices (the user's --device_map), and by host RAM:
-    the worker count never exceeds what MemAvailable budgets at
-    AR_BLOCK_PARALLEL_RAM_PER_WORKER (GiB) per worker. AR_BLOCK_PARALLEL_MAX_WORKERS
-    applies a hard cap on top.
+    ``required_free_bytes`` is derived by the caller from the model (largest
+    block's weight bytes times a working-set multiplier plus an activation
+    margin) so eligibility adapts to the model instead of a fixed guess.
+    Heterogeneous or partially-occupied GPUs filter out naturally.
     """
     if not torch.cuda.is_available():
         return []
-    if min_free_gb is None:
-        min_free_gb = float(os.getenv("AR_BLOCK_PARALLEL_MIN_FREE_GB", "18"))
     visible = list(range(torch.cuda.device_count()))
     if allowed_indices is not None:
         visible = [i for i in allowed_indices if 0 <= i < torch.cuda.device_count()]
@@ -67,26 +64,9 @@ def eligible_gpus(min_free_gb: Optional[float] = None, allowed_indices: Optional
             free, _total = torch.cuda.mem_get_info(index)
         except Exception:  # noqa: BLE001
             continue
-        if free / (1024**3) >= min_free_gb:
+        if free >= required_free_bytes:
             out.append(index)
-    # host-RAM budget: each worker runs its own cache pass + model skeleton
-    ram_available_gb = _available_ram_gb()
-    if ram_available_gb is not None:
-        ram_cap = max(1, int(ram_available_gb / max(0.1, envs.AR_BLOCK_PARALLEL_RAM_PER_WORKER)))
-        if len(out) > ram_cap:
-            logger.info(
-                "block-parallel tuning: capping workers to %d by host RAM (%.1f GiB available, "
-                "%.1f GiB/worker budget)",
-                ram_cap,
-                ram_available_gb,
-                envs.AR_BLOCK_PARALLEL_RAM_PER_WORKER,
-            )
-            out = out[:ram_cap]
-    hard_cap = envs.AR_BLOCK_PARALLEL_MAX_WORKERS
-    if hard_cap > 0 and len(out) > hard_cap:
-        out = out[:hard_cap]
     return out
-
 
 def _available_ram_gb() -> Optional[float]:
     try:
@@ -134,9 +114,9 @@ def worker_command(argv: Sequence[str], device: Optional[int] = None) -> List[st
 def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_env: dict) -> List[subprocess.Popen]:
     """Spawn one queue-serving worker per GPU, staggered.
 
-    The stagger (AR_BLOCK_PARALLEL_SPAWN_STAGGER seconds) smooths the per-worker
-    model-build and dataset-preprocessing host-RAM transients so N workers do
-    not spike together on small-RAM hosts.
+    Spawns are staggered by a fixed delay so the per-worker model-build and
+    dataset-preprocessing host-RAM transients do not spike together on
+    small-RAM hosts.
     """
     import time as _time
 
@@ -144,7 +124,7 @@ def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_e
     procs = []
     for rank, gpu in enumerate(gpu_ids):
         if rank:
-            _time.sleep(max(0.0, envs.AR_BLOCK_PARALLEL_SPAWN_STAGGER))
+            _time.sleep(5.0)
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         # AR_RESUME_DIR is deliberately inherited: workers derive their

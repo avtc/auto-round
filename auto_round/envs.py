@@ -37,10 +37,6 @@ if TYPE_CHECKING:
     AR_BLOCK_PARALLEL_WORKER: bool = False
     AR_BLOCK_PARALLEL_QUEUE_DIR: Optional[str] = None
     AR_BLOCK_PARALLEL_RESULTS: Optional[str] = None
-    AR_BLOCK_PARALLEL_RAM_PER_WORKER: float = 12.0
-    AR_BLOCK_PARALLEL_MAX_WORKERS: int = 0
-    AR_BLOCK_PARALLEL_SPAWN_STAGGER: float = 10.0
-    AR_BLOCK_PARALLEL_RESUME: bool = True
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -156,21 +152,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_BLOCK_PARALLEL_QUEUE_DIR": lambda: os.getenv("AR_BLOCK_PARALLEL_QUEUE_DIR", None),
     # Internal: directory where parallel tuning workers dump tuned scale/zp.
     "AR_BLOCK_PARALLEL_RESULTS": lambda: os.getenv("AR_BLOCK_PARALLEL_RESULTS", None),
-    # Estimated host RAM (GiB) each tuning worker needs (model skeleton +
-    # calibration cache pass + streaming buffers). Workers are capped so their
-    # combined estimate fits MemAvailable.
-    "AR_BLOCK_PARALLEL_RAM_PER_WORKER": lambda: float(os.getenv("AR_BLOCK_PARALLEL_RAM_PER_WORKER", "12")),
-    # Hard cap on tuning worker count (0 = no explicit cap beyond GPU/RAM limits).
-    "AR_BLOCK_PARALLEL_MAX_WORKERS": lambda: int(os.getenv("AR_BLOCK_PARALLEL_MAX_WORKERS", "0")),
-    # Seconds between worker spawns: staggers the per-worker model-build and
-    # dataset-preprocessing RAM transients so N workers don't spike together.
-    "AR_BLOCK_PARALLEL_SPAWN_STAGGER": lambda: float(os.getenv("AR_BLOCK_PARALLEL_SPAWN_STAGGER", "10")),
     # When enabled (default), block-parallel tuning workers checkpoint their
     # per-block tuned scale/zp plus the chained hidden state after every
     # completed block, so an interrupted run resumes from the first missing
-    # block instead of restarting the whole span.
-    "AR_BLOCK_PARALLEL_RESUME": lambda: os.getenv("AR_BLOCK_PARALLEL_RESUME", "1").lower()
-    not in ("0", "false", "no", "off"),
 }
 
 
