@@ -781,7 +781,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         }  # startup done-blocks are already accounted for -- the loop must not
         # re-process them as fresh results (which re-assigned their old ranks
         # and queued duplicate tune lines onto live workers)
-        sticky_pref = {}  # rank -> (g, k+1) the worker holds the entry for
         finished_ranks = set()  # ranks that reported a result since last pass
 
         def _send(rank: int, message: str) -> None:
@@ -794,26 +793,21 @@ class CompressionOrchestrator(BaseOrchestrator):
             except (BrokenPipeError, ValueError):
                 pass  # worker death is handled by the liveness check
 
-        def _assign_next(rank: int, prefer=None) -> None:
-            """Push the next assignment to ``rank``: the sticky preference when
-            still undone and unassigned, else the lowest undone block. Worker
-            count never matters -- this works for any pool size."""
-            if prefer is not None and prefer in _ordered_undone():
-                target = prefer  # sticky: the worker already holds this entry
-            else:
-                candidates = _ordered_undone()
-                if not candidates:
-                    stopped.add(rank)
-                    _send(rank, "stop")
-                    return
-                target = candidates[0]
+        def _assign_next(rank: int) -> None:
+            """Push the next assignment to ``rank``: the lowest undone,
+            unassigned block (the frontier). Strict sequential extension -- the
+            entry for the frontier block was published by the previous
+            assignee's chain forward before its tune began, so it is always
+            available on disk. Worker count never matters."""
+            candidates = _ordered_undone()
+            if not candidates:
+                stopped.add(rank)
+                _send(rank, "stop")
+                return
+            target = candidates[0]
             assigned[rank] = target
             _send(rank, f"tune {target[0]} {target[1]}")
-            logger.info(
-                "block-parallel tuning: assigned g%d k%d to worker %d (%s)",
-                target[0], target[1], rank,
-                "sticky" if prefer is not None and target == prefer else "frontier",
-            )
+            logger.info("block-parallel tuning: assigned g%d k%d to worker %d", target[0], target[1], rank)
 
         for rank in range(len(procs)):
             _assign_next(rank)
@@ -853,7 +847,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     rank = bp.read_result_rank(results_dir, b)
                     if rank >= 0:
                         assigned.pop(rank, None)
-                        sticky_pref[rank] = (g, k + 1)
                         finished_ranks.add(rank)
             # ordered commit into the serial manifests, consuming the entry
             # handoff files the workers published (then deleting them)
@@ -864,15 +857,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                         k = rs.resume_index
                         entry_next = _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
                         rs.mark_block_done(blocks[k], None, entry_next)
-                        try:
-                            os.remove(bp._chain_state_path(results_dir, g, k + 1))
-                        except OSError:
-                            pass
+                        # no delete: the frontier assignee may still need this
+                        # entry file; prune-on-done removes it once block k+1
+                        # completes (exactly the right window)
             # re-assign ranks that reported a result since the last pass
             for rank in list(finished_ranks):
                 finished_ranks.discard(rank)
                 if rank not in assigned and rank not in stopped:
-                    _assign_next(rank, prefer=sticky_pref.pop(rank, None))
+                    _assign_next(rank)
             done_now = sum(len(d) for d in done.values())
             if pbar is not None and done_now != shown_done:
                 pbar.update(done_now - shown_done)
@@ -897,10 +889,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     k = rs.resume_index
                     entry_next = _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
                     rs.mark_block_done(blocks[k], None, entry_next)
-                    try:
-                        os.remove(bp._chain_state_path(results_dir, g, k + 1))
-                    except OSError:
-                        pass
 
         tuned = bp.load_all_block_results(results_dir)
         missing = bp.missing_result_blocks(results_dir, all_blocks)
@@ -1018,50 +1006,62 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             entry = None
             if held is not None and held[0] == g and held[1] == k:
-                entry = held[2]  # sticky: previous assignment's chain tail
+                entry = held[2]  # single-worker pools: held entry IS the frontier
             else:
-                prefix, frontier_entry = self._manifest_frontier(g)
-                if prefix > k:
-                    prefix = 0  # stale/odd manifest: replay from the group entry
-                    frontier_entry = None
-                import time as _t
+                # strict-frontier assignments always have their entry published
+                # (the previous assignee forwards before tuning) -- direct read
+                # first; replay is only for stale/missing files
+                import time as _t_direct
 
-                entry = None
-                if prefix < k:
-                    # replay prefix..k-1 (publishes entries the parent can
-                    # consume for manifest absorption on the way)
-                    self._quantize_blocks(
-                        self.model_context.model,
-                        _group_entry(blocks),
-                        blocks,
-                        nblocks=1,
-                        pbar=pbar,
-                        input_others_extra_blocks=dict(all_inputs),
-                        token_ids=token_ids,
-                        group_idx=g,
-                        bp_results_dir=results_dir,
-                        start_block_idx=prefix,
-                        produce_only=(prefix, k),
-                        resume_input_ids=frontier_entry,
+                for _attempt in range(4):
+                    entry = _bp_load_chain_state(
+                        results_dir, g, k, device=self.compress_context.cache_device
                     )
-                    # a sibling replaying the same prefix may still be mid-
-                    # publish of this checkpoint -- retry briefly before failing
-                    for _attempt in range(60):
-                        entry = _bp_load_chain_state(
-                            results_dir, g, k, device=self.compress_context.cache_device
+                    if entry is not None:
+                        break
+                    _t_direct.sleep(0.5)
+                if entry is None:
+                    # fallback: manifest frontier + bounded replay
+                    prefix, frontier_entry = self._manifest_frontier(g)
+                    if prefix > k:
+                        prefix = 0  # stale/odd manifest: replay from the group entry
+                        frontier_entry = None
+                    import time as _t
+
+                    if prefix < k:
+                        # replay prefix..k-1 (publishes entries the parent can
+                        # consume for manifest absorption on the way)
+                        self._quantize_blocks(
+                            self.model_context.model,
+                            _group_entry(blocks),
+                            blocks,
+                            nblocks=1,
+                            pbar=pbar,
+                            input_others_extra_blocks=dict(all_inputs),
+                            token_ids=token_ids,
+                            group_idx=g,
+                            bp_results_dir=results_dir,
+                            start_block_idx=prefix,
+                            produce_only=(prefix, k),
+                            resume_input_ids=frontier_entry,
                         )
-                        if entry is not None:
-                            break
-                        _t.sleep(0.5)
-                    if entry is None:
-                        raise RuntimeError(f"chain entry for block {k} missing after replay")
-                elif frontier_entry is not None:
-                    # the manifest frontier IS this block's entry (the parent
-                    # consumed-and-deleted the checkpoint file when absorbing)
-                    entry = frontier_entry
-                # else prefix == k == 0 with no manifest: entry stays None and
-                # the tune naturally uses the group's cached entry (serial
-                # block-0 semantics)
+                        # a sibling replaying the same prefix may still be mid-
+                        # publish of this checkpoint -- retry before failing
+                        for _attempt in range(60):
+                            entry = _bp_load_chain_state(
+                                results_dir, g, k, device=self.compress_context.cache_device
+                            )
+                            if entry is not None:
+                                break
+                            _t.sleep(0.5)
+                        if entry is None:
+                            raise RuntimeError(f"chain entry for block {k} missing after replay")
+                    elif frontier_entry is not None:
+                        # the manifest frontier IS this block's entry
+                        entry = frontier_entry
+                    # else prefix == k == 0 with no manifest: entry stays None
+                    # and the tune naturally uses the group's cached entry
+                    # (serial block-0 semantics)
             if isinstance(entry, list) and any(t is None for t in entry):
                 bad = [i for i, t in enumerate(entry) if t is None][:4]
                 raise RuntimeError(
