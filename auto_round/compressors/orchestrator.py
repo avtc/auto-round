@@ -841,6 +841,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 break
             g, k = target
             bp.write_job(qdir, seq=seq, job_type="tune", group=g, index=k, block_name=all_blocks[g][k])
+            logger.info("block-parallel tuning: dispatched tune g%d k%d (seq %d)", g, k, seq)
             inflight[seq] = (g, k)
             seq += 1
         return seq
