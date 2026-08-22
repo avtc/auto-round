@@ -948,11 +948,19 @@ class CompressionOrchestrator(BaseOrchestrator):
                     )
                 else:
                     k = job["index"]
-                    entry = _bp_load_chain_state(
-                        results_dir, g, k, device=self.compress_context.cache_device
-                    )
-                    if entry is None:
-                        raise RuntimeError(f"missing chain checkpoint for {blocks[k]} (group {g} block {k})")
+                    # block 0 of a group has no chain checkpoint by design --
+                    # its entry input IS the group's cached input (the parent
+                    # dispatches it without a checkpoint requirement); only
+                    # k > 0 restores from a published checkpoint
+                    entry = None
+                    if k > 0:
+                        entry = _bp_load_chain_state(
+                            results_dir, g, k, device=self.compress_context.cache_device
+                        )
+                        if entry is None:
+                            raise RuntimeError(
+                                f"missing chain checkpoint for {blocks[k]} (group {g} block {k})"
+                            )
                     self._quantize_blocks(
                         self.model_context.model,
                         _group_entry(blocks),
