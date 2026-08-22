@@ -45,44 +45,6 @@ from auto_round.utils import logger
 Span = Tuple[int, int, int]  # (group_idx, start, end) -- end exclusive
 
 
-def split_spans(group_sizes: Sequence[int], n_workers: int) -> List[List[Span]]:
-    """Split blocks into contiguous per-worker spans without crossing groups.
-
-    Blocks are assigned in order; each worker receives a near-equal count. A
-    span never crosses a group boundary (each group chains its own inputs from
-    its own cached entry point), so a group may contribute several spans.
-    """
-    total = sum(group_sizes)
-    if total == 0 or n_workers <= 0:
-        return []
-    n_workers = min(n_workers, total)
-    per = -(-total // n_workers)
-    spans: List[List[Span]] = [[] for _ in range(n_workers)]
-    worker, fill = 0, 0
-    for group_idx, size in enumerate(group_sizes):
-        start = 0
-        while start < size:
-            if fill >= per and worker < n_workers - 1:
-                worker += 1
-                fill = 0
-            room = per - fill
-            if room <= 0:  # last worker absorbs the remainder
-                room = size - start
-            end = min(size, start + room)
-            spans[worker].append((group_idx, start, end))
-            fill += end - start
-            start = end
-    return [s for s in spans if s]
-
-
-def spans_to_json(spans: List[List[Span]]) -> str:
-    return json.dumps([[list(t) for t in worker] for worker in spans])
-
-
-def spans_from_json(text: str) -> List[List[Span]]:
-    return [[(int(g), int(s), int(e)) for g, s, e in worker] for worker in json.loads(text)]
-
-
 def eligible_gpus(min_free_gb: Optional[float] = None) -> List[int]:
     """CUDA devices with at least ``min_free_gb`` GiB free (heterogeneous-safe)."""
     if not torch.cuda.is_available():
@@ -127,30 +89,21 @@ def worker_command(argv: Sequence[str], device: Optional[int] = None) -> List[st
     return argv
 
 
-def spawn_workers(
-    argv: Sequence[str],
-    spans: List[List[Span]],
-    gpu_ids: List[int],
-    results_dir: str,
-) -> List[subprocess.Popen]:
-    """Spawn one tuning worker per (span-set, gpu). Returns the process list."""
-    os.makedirs(results_dir, exist_ok=True)
+def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_env: dict) -> List[subprocess.Popen]:
+    """Spawn one queue-serving worker per GPU. Returns the process list."""
+    os.makedirs(log_dir, exist_ok=True)
     procs = []
-    for rank, (worker_spans, gpu) in enumerate(zip(spans, gpu_ids)):
+    for rank, gpu in enumerate(gpu_ids):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-        env["AR_BLOCK_PARALLEL_WORKER"] = "1"
-        env["AR_BLOCK_PARALLEL_SPANS"] = spans_to_json([worker_spans])
         # AR_RESUME_DIR is deliberately inherited: workers derive their
         # per-block checkpoint dir from it (same user-facing flag as serial).
-        # The serial per-group manifest machinery is bypassed inside workers
-        # via the worker sentinel.
-        env["AR_BLOCK_PARALLEL_RESULTS"] = results_dir
-        # Never let a worker fan out its own AutoScheme scoring pool if the
-        # scheme cache should miss (workers are single-GPU by construction).
-        env["AR_ENABLE_AUTO_SCHEME_PARALLEL"] = "0"
-        log_path = os.path.join(results_dir, f"worker_{rank}.log")
-        logger.info("block-parallel tuning: worker %d -> gpu %d, spans %s (log %s)", rank, gpu, worker_spans, log_path)
+        env["AR_ENABLE_AUTO_SCHEME_PARALLEL"] = "0"  # single-GPU workers never fan out
+        env.update(extra_env)
+        log_path = os.path.join(log_dir, f"worker_{rank}.log")
+        logger.info(
+            "block-parallel tuning: worker %d -> gpu %d (log %s)", rank, gpu, log_path
+        )
         log_file = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
         procs.append(
             subprocess.Popen(  # noqa: S603
@@ -158,7 +111,6 @@ def spawn_workers(
             )
         )
     return procs
-
 
 def wait_workers(procs: List[subprocess.Popen]) -> List[int]:
     """Wait for all workers; returns exit codes (nonzero entries logged)."""
@@ -238,6 +190,10 @@ def missing_result_blocks(results_dir: str, all_blocks: "Sequence[list]") -> "Li
     return [block for group in all_blocks for block in group if not has_block_results(results_dir, block)]
 
 
+def chain_state_exists(results_dir: str, group: int, block_idx: int) -> bool:
+    return os.path.exists(_chain_state_path(results_dir or "", group, block_idx))
+
+
 def save_chain_state(results_dir: str, group: int, block_idx: int, hidden) -> None:
     """Checkpoint the chained hidden state entering block ``block_idx``.
 
@@ -268,6 +224,85 @@ def load_chain_state(results_dir: str, group: int, block_idx: int, device: str):
     if dtype is not None:
         hidden = hidden.to(dtype)
     return hidden.to(device)
+
+
+def queue_dir(results_dir: str) -> str:
+    return os.path.join(results_dir, "queue")
+
+
+def _job_sort_key(fname: str):
+    return int(fname.split("_", 1)[0])
+
+
+def write_job(qdir: str, seq: int, job_type: str, group: int, **fields) -> None:
+    """Write a dispatch job file. ``job_type`` is ``tune`` or ``produce``."""
+    os.makedirs(qdir, exist_ok=True)
+    payload = {"seq": seq, "job_type": job_type, "group": group}
+    payload.update(fields)
+    path = os.path.join(qdir, f"{seq:06d}.job")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+
+def claim_next_job(qdir: str):
+    """Atomically claim the lowest-seq pending job (rename .job -> .claimed)."""
+    if not os.path.isdir(qdir):
+        return None
+    for fname in sorted(os.listdir(qdir)):
+        if not fname.endswith(".job"):
+            continue
+        path = os.path.join(qdir, fname)
+        claimed = path + f".claimed-{os.getpid()}"
+        try:
+            os.rename(path, claimed)  # atomic claim on POSIX
+        except OSError:
+            continue  # raced with another worker
+        with open(claimed, encoding="utf-8") as f:
+            job = json.load(f)
+        job["_claimed_path"] = claimed
+        return job
+    return None
+
+
+def job_done(qdir: str, job: dict) -> None:
+    """Remove a claimed job file after successful completion."""
+    try:
+        os.remove(job.get("_claimed_path", ""))
+    except OSError:
+        pass
+
+
+def job_failed(qdir: str, job: dict, error: str) -> None:
+    """Record a failure next to the claim; the parent requeues or reports."""
+    path = job.get("_claimed_path", "")
+    if not path:
+        return
+    with open(path + ".failed", "w", encoding="utf-8") as f:
+        f.write(error)
+
+
+def list_failed(qdir: str) -> List[str]:
+    if not os.path.isdir(qdir):
+        return []
+    return [f for f in sorted(os.listdir(qdir)) if f.endswith(".failed")]
+
+
+def list_pending(qdir: str) -> List[str]:
+    if not os.path.isdir(qdir):
+        return []
+    return [f for f in sorted(os.listdir(qdir)) if f.endswith(".job")]
+
+
+def write_stop(qdir: str) -> None:
+    os.makedirs(qdir, exist_ok=True)
+    with open(os.path.join(qdir, "STOP"), "w", encoding="utf-8") as f:
+        f.write("stop")
+
+
+def read_stop(qdir: str) -> bool:
+    return os.path.exists(os.path.join(qdir, "STOP"))
 
 
 def save_signature(results_dir: str, signature: str) -> None:

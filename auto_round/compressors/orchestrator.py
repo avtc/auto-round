@@ -195,6 +195,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         span: Optional[tuple] = None,
         group_idx: int = 0,
         bp_results_dir: Optional[str] = None,
+        start_block_idx: Optional[int] = None,
+        produce_only: Optional[tuple] = None,
     ):
         """Quantize and dequantize the weights of the specified blocks in the model.
 
@@ -239,7 +241,17 @@ class CompressionOrchestrator(BaseOrchestrator):
             pbar = tqdm(range(0, len(block_names), nblocks))
 
         start_index = resume_state.resume_index if resume_state is not None and nblocks == 1 else 0
+        if start_block_idx is not None:
+            # queue mode: the caller restored this block's entry input from a
+            # chain checkpoint -- start here directly, no fast-forward replay
+            start_index = start_block_idx
+        if produce_only is not None:
+            # queue mode producer job: fast-forward-only pass publishing chain
+            # checkpoints; nothing is tuned and no results are written
+            start_index = produce_only[0]
         for i in range(start_index, len(block_names), nblocks):
+            if produce_only is not None and i >= produce_only[1]:
+                break
             if span is not None and i >= span[1]:
                 break  # span restriction: remaining blocks belong to another worker
             if (
@@ -267,7 +279,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 input_others_extra_blocks.pop(block_names[i])
             if i != 0:
                 pbar.update(1)
-            if span is not None and (
+            if produce_only is not None or span is not None and (
                 i < span[0]
                 or (
                     bp_results_dir
@@ -461,6 +473,43 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         clear_memory()
 
+    def _build_resume_states(self, all_blocks: list) -> list:
+        """Build one ResumeState per block group under AR_RESUME_DIR.
+
+        Shared by the serial tuning path and the block-parallel parent so the
+        per-group manifests (signature strings, group_{idx} layout) are
+        byte-compatible: a manifest advanced by the parallel sequencer is
+        consumed by an unmodified serial run and vice versa.
+        """
+        from auto_round.utils.resume import ResumeState, compute_run_signature, layer_config_fingerprint
+
+        model_dir = getattr(self.model_context, "disk_stream_model_dir", None) or getattr(
+            getattr(self.model_context.model, "config", None), "_name_or_path", None
+        )
+        dataset_desc = str(getattr(self, "dataset", None))
+        # str(self.scheme) alone is bits-blind for AutoScheme runs: two runs
+        # with different avg_bits share it, so include the resolved
+        # per-layer allocation (see layer_config_fingerprint docstring).
+        scheme_desc = (
+            str(self.scheme)
+            + "|"
+            + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
+        )
+        states = []
+        for group_idx, block_names in enumerate(all_blocks):
+            sig = compute_run_signature(
+                model_dir,
+                scheme_desc,
+                dataset_desc,
+                self.calibration_context.nsamples,
+                self.calibration_context.seqlen,
+                block_names,
+            )
+            states.append(
+                ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names)
+            )
+        return states
+
     def _maybe_block_parallel_tune(self, all_blocks: list, is_worker: bool) -> bool:
         """Run block-parallel tuning when enabled; returns True if results were applied.
 
@@ -490,12 +539,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         if len(gpu_ids) < 2:
             logger.info("block-parallel tuning disabled: fewer than 2 eligible GPUs (%s)", gpu_ids)
             return False
-        spans = bp.split_spans([len(group) for group in all_blocks], len(gpu_ids))
         # Resume storage reuses the serial flag: AR_RESUME_DIR set -> per-block
         # result files + chain checkpoints under <AR_RESUME_DIR>/block_parallel,
         # validated by run signature; unset -> fresh scratch dir (no resume).
         results_dir = bp.parallel_results_dir()
         resumable = results_dir is not None
+        import shutil
+
         if resumable:
             from auto_round.utils.resume import compute_run_signature, layer_config_fingerprint
 
@@ -518,56 +568,241 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "signature; discarding them and starting fresh",
                     results_dir,
                 )
-                import shutil
-
                 shutil.rmtree(results_dir, ignore_errors=True)
             bp.save_signature(results_dir, signature)
         else:
             output_root = getattr(self.compress_context, "output_dir", None) or "tmp_autoround"
             results_dir = os.path.join(output_root, "block_parallel_results")
-            import shutil
-
             shutil.rmtree(results_dir, ignore_errors=True)  # no resume: never reuse stale results
+        qdir = bp.queue_dir(results_dir)
+        shutil.rmtree(qdir, ignore_errors=True)
+        os.makedirs(qdir, exist_ok=True)
+
+        # Canonical done-state: serial manifests (contiguous prefix per group),
+        # advanced by this sequencer as blocks complete in order. An unmodified
+        # serial run can resume from them later; out-of-order (fringe)
+        # completions live only in per-block result files until absorbed.
+        resume_states = self._build_resume_states(all_blocks) if resumable else [None] * len(all_blocks)
+
+        # per-group done sets: manifest prefix + fringe files from a prior run
+        done = {}
+        for g, blocks in enumerate(all_blocks):
+            prefix = resume_states[g].resume_index if resume_states[g] is not None else 0
+            done[g] = set(range(prefix))
+            done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
+
+        # producer jobs first: one per group, fast-forwarding from one block
+        # before the first undone block (so the first tune job's entry
+        # checkpoint gets published; index 0 uses the group's cached entry)
+        seq = 0
+        for g, blocks in enumerate(all_blocks):
+            undone = [k for k in range(len(blocks)) if k not in done[g]]
+            if not undone:
+                continue
+            bp.write_job(qdir, seq=seq, job_type="produce", group=g, start=max(0, undone[0] - 1),
+                         end=len(blocks))
+            seq += 1
+
+        n_todo = sum(len(all_blocks[g]) for g in done) - sum(len(d) for d in done.values())
         logger.info(
-            "block-parallel tuning: %d workers on GPUs %s; results/logs in %s%s",
-            len(spans),
-            gpu_ids[: len(spans)],
-            results_dir,
+            "block-parallel tuning: %d workers on GPUs %s, %d block(s) to tune, queue %s%s",
+            len(gpu_ids), gpu_ids, n_todo, qdir,
             " (resumable: rerun the same command to finish missing blocks)" if resumable else "",
         )
-        procs = bp.spawn_workers(sys.argv, spans, gpu_ids[: len(spans)], results_dir)
-        codes = bp.wait_workers(procs)
-        if any(code != 0 for code in codes):
-            missing = bp.missing_result_blocks(results_dir, all_blocks)
-            if resumable and not missing:
-                # all blocks tuned despite a worker's noisy exit (e.g. killed
-                # during teardown): results are complete, proceed
-                logger.warning("block-parallel tuning: worker exit codes %s, but all blocks have results", codes)
-            else:
+        env_extra = {"AR_BLOCK_PARALLEL_QUEUE_DIR": qdir, "AR_BLOCK_PARALLEL_RESULTS": results_dir}
+        procs = bp.spawn_workers(sys.argv, gpu_ids, log_dir=results_dir, extra_env=env_extra)
+
+        # in-group-order dispatch pointers: near-sequential completion lets the
+        # serial manifest prefix absorb work as fast as possible
+        pointer = {g: 0 for g in range(len(all_blocks))}
+        inflight = {}  # job seq -> (group, index)
+        cap = len(gpu_ids) + 2
+        seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
+
+        import time as _time
+
+        while any(pointer[g] < len(all_blocks[g]) for g in pointer):
+            _time.sleep(0.5)
+            # refresh done sets from result files
+            for g, blocks in enumerate(all_blocks):
+                done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
+            # absorb completed prefix blocks into the serial manifests
+            if resumable:
+                for g, blocks in enumerate(all_blocks):
+                    rs = resume_states[g]
+                    while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
+                        k = rs.resume_index
+                        rs.mark_block_done(blocks[k], None, _bp_load_chain_state(results_dir, g, k + 1,
+                                                                                device="cpu"))
+            # retire finished in-flight jobs
+            for jseq in list(inflight):
+                g, k = inflight[jseq]
+                if k in done[g]:
+                    inflight.pop(jseq)
+            # all workers dead with work left: requeue claimed-unfinished jobs, fail loudly
+            if all(proc.poll() is not None for proc in procs):
+                for fname in os.listdir(qdir):
+                    if ".claimed-" not in fname:
+                        continue
+                    claimed = os.path.join(qdir, fname)
+                    try:
+                        job = self._read_json(claimed)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    g, k = job.get("group"), job.get("index")
+                    if job.get("job_type") == "tune" and g is not None and k not in done.get(g, set()):
+                        bp.write_job(qdir, seq=seq, job_type="tune", group=g, index=k,
+                                     block_name=all_blocks[g][k])
+                        seq += 1
+                    try:
+                        os.remove(claimed)
+                    except OSError:
+                        pass
+                inflight.clear()
                 raise RuntimeError(
-                    f"block-parallel tuning: worker failure (exit codes {codes}); "
-                    f"{len(missing)} block(s) missing. Logs in {results_dir}. "
-                    + (
-                        "Rerun the same command to resume the missing blocks."
-                        if resumable
-                        else "Rerun with AR_ENABLE_BLOCK_PARALLEL_TUNING=0 for the serial path."
-                    )
+                    f"block-parallel tuning: workers exited before completion; logs in {results_dir}. "
+                    + ("Rerun the same command to resume the missing blocks." if resumable
+                       else "Rerun with AR_ENABLE_BLOCK_PARALLEL_TUNING=0 for the serial path.")
                 )
+            seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
+
+        bp.write_stop(qdir)
+        codes = bp.wait_workers(procs)
+        if resumable:
+            for g, blocks in enumerate(all_blocks):
+                rs = resume_states[g]
+                while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
+                    k = rs.resume_index
+                    rs.mark_block_done(blocks[k], None, _bp_load_chain_state(results_dir, g, k + 1,
+                                                                            device="cpu"))
+
         tuned = bp.load_all_block_results(results_dir)
         missing = bp.missing_result_blocks(results_dir, all_blocks)
-        if missing:
+        if missing or not tuned:
             raise RuntimeError(
                 f"block-parallel tuning: no results for {len(missing)} block(s) "
-                f"(first: {missing[0]}); logs in {results_dir}"
+                f"(first: {missing[0] if missing else 'n/a'}); logs in {results_dir}"
             )
-        if not tuned:
-            raise RuntimeError(
-                f"block-parallel tuning: no worker results produced; logs in {results_dir}. "
-                "Rerun with AR_ENABLE_BLOCK_PARALLEL_TUNING=0 for the serial path."
-            )
-        logger.info("block-parallel tuning: merged tuned results for %d layers", len(tuned))
+        logger.info(
+            "block-parallel tuning: merged tuned results for %d layers (worker exit codes %s)",
+            len(tuned), codes,
+        )
         self._apply_tuned_results(all_blocks, tuned)
+        if resumable:
+            # quantize_and_save clears these after a successful export (same as serial)
+            self._resume_states = resume_states
         return True
+
+    @staticmethod
+    def _read_json(path):
+        import json as _json
+
+        with open(path, encoding="utf-8") as f:
+            return _json.load(f)
+
+    @staticmethod
+    def _dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir):
+        """Write tune jobs for dispatchable blocks; advance pointers past done ones."""
+        from auto_round.compressors import block_parallel as bp
+
+        while len(inflight) < cap:
+            for g in list(pointer):
+                while pointer[g] < len(all_blocks[g]) and pointer[g] in done[g]:
+                    pointer[g] += 1
+            target = None
+            for g in sorted(pointer):
+                k = pointer[g]
+                if k >= len(all_blocks[g]):
+                    continue
+                if any(v == (g, k) for v in inflight.values()):
+                    continue
+                if k > 0 and not bp.chain_state_exists(results_dir, g, k):
+                    continue  # entry checkpoint not published yet (producer lag)
+                target = (g, k)
+                break
+            if target is None:
+                break
+            g, k = target
+            bp.write_job(qdir, seq=seq, job_type="tune", group=g, index=k, block_name=all_blocks[g][k])
+            inflight[seq] = (g, k)
+            seq += 1
+        return seq
+
+    def _serve_block_queue(self, all_blocks: list, all_inputs: dict, token_ids, pbar) -> None:
+        """Worker-side queue-serve loop for block-parallel tuning.
+
+        Consumes dispatch jobs until the parent writes STOP and the queue
+        drains. ``tune`` jobs restore their block's entry input from a chain
+        checkpoint (published by a ``produce`` job or a previous tuning pass)
+        and tune exactly one block; ``produce`` jobs fast-forward a block range
+        in original weights, publishing chain checkpoints for the tuners.
+        """
+        import time as _time
+
+        from auto_round.compressors import block_parallel as bp
+
+        qdir = envs.AR_BLOCK_PARALLEL_QUEUE_DIR
+        results_dir = envs.AR_BLOCK_PARALLEL_RESULTS
+        if not qdir or not results_dir:
+            raise RuntimeError("block-parallel worker is missing its queue/results environment")
+        while True:
+            job = bp.claim_next_job(qdir)
+            if job is None:
+                if bp.read_stop(qdir):
+                    break
+                _time.sleep(0.5)
+                continue
+            try:
+                g = job["group"]
+                blocks = all_blocks[g]
+                resume_entry = None
+                if job["job_type"] == "produce":
+                    start, end = job["start"], job["end"]
+                    if start > 0:
+                        resume_entry = _bp_load_chain_state(
+                            results_dir, g, start, device=self.compress_context.cache_device
+                        )
+                        if resume_entry is None:
+                            start = 0  # checkpoint lost: replay the whole prefix
+                    self._quantize_blocks(
+                        self.model_context.model,
+                        all_inputs[blocks[0]],
+                        blocks,
+                        nblocks=1,
+                        pbar=pbar,
+                        input_others_extra_blocks=dict(all_inputs),
+                        token_ids=token_ids,
+                        group_idx=g,
+                        bp_results_dir=results_dir,
+                        start_block_idx=start,
+                        produce_only=(start, end),
+                        resume_input_ids=resume_entry,
+                    )
+                else:
+                    k = job["index"]
+                    entry = _bp_load_chain_state(
+                        results_dir, g, k, device=self.compress_context.cache_device
+                    )
+                    if entry is None:
+                        raise RuntimeError(f"missing chain checkpoint for {blocks[k]} (group {g} block {k})")
+                    self._quantize_blocks(
+                        self.model_context.model,
+                        all_inputs[blocks[0]],
+                        blocks,
+                        nblocks=1,
+                        pbar=pbar,
+                        input_others_extra_blocks=dict(all_inputs),
+                        token_ids=token_ids,
+                        span=(k, k + 1),
+                        group_idx=g,
+                        bp_results_dir=results_dir,
+                        start_block_idx=k,
+                        resume_input_ids=entry,
+                    )
+                bp.job_done(qdir, job)
+            except Exception as err:  # noqa: BLE001
+                bp.job_failed(qdir, job, repr(err))
+                logger.error("block-parallel worker: job %s failed: %r", job.get("seq"), err)
 
     def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
         """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
@@ -629,19 +864,20 @@ class CompressionOrchestrator(BaseOrchestrator):
             }
         return results
 
-    def _dump_parallel_worker_results(self, all_blocks: list, group_spans: dict) -> None:
-        """Worker-side safety net: persist any tuned span blocks not yet saved.
+    def _dump_parallel_worker_results(self, all_blocks: list) -> None:
+        """Worker-side safety net: persist any tuned blocks not yet saved.
 
         Blocks are normally saved right after tuning inside ``_quantize_blocks``
-        (resumable unit); this end-of-run pass only covers blocks whose in-loop
-        save was skipped (resume disabled mid-run, legacy paths).
+        (the resumable unit); this end-of-run pass only covers blocks whose
+        in-loop save was somehow skipped. Blocks this worker never touched have
+        no tuned attributes and contribute nothing.
         """
         out_dir = envs.AR_BLOCK_PARALLEL_RESULTS
         if not out_dir:
             raise RuntimeError("AR_BLOCK_PARALLEL_WORKER is set but AR_BLOCK_PARALLEL_RESULTS is missing")
         saved = 0
-        for group_idx, (start, end) in group_spans.items():
-            for block_name in all_blocks[group_idx][start:end]:
+        for blocks in all_blocks:
+            for block_name in blocks:
                 if _bp_has_block_results(out_dir, block_name):
                     continue
                 results = self._collect_tuned_layers(block_name)
@@ -649,9 +885,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _bp_save_block_results(out_dir, block_name, results)
                     saved += 1
         logger.info(
-            "block-parallel worker: results dir %s (%d blocks saved by the end-of-run net)",
-            out_dir,
-            saved,
+            "block-parallel worker: results dir %s (%d blocks saved by the end-of-run net)", out_dir, saved
         )
 
     def quantize(self) -> tuple[torch.nn.Module, dict[str, Any]]:
@@ -910,17 +1144,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         # not quantized outputs), and dump tuned scale/zp. The parent merges
         # the dumps and packs/saves through the ordinary immediate flow. The
         # serial loop below remains the default and the fallback.
-        worker_group_spans = None
-        if envs.AR_BLOCK_PARALLEL_WORKER:
-            from auto_round.compressors.block_parallel import spans_from_json
-
-            worker_spans = [span for worker in spans_from_json(envs.AR_BLOCK_PARALLEL_SPANS or "[]") for span in worker]
-            worker_group_spans = {}
-            for group_idx, start, end in worker_spans:
-                if group_idx in worker_group_spans:
-                    raise ValueError(f"worker received multiple spans for group {group_idx}: unsupported")
-                worker_group_spans[group_idx] = (start, end)
-        parallel_applied = self._maybe_block_parallel_tune(all_blocks, worker_group_spans is not None)
+        parallel_applied = self._maybe_block_parallel_tune(all_blocks, bool(envs.AR_BLOCK_PARALLEL_WORKER))
 
         resume_states = None
         if envs.AR_RESUME_DIR and not parallel_applied and not envs.AR_BLOCK_PARALLEL_WORKER:
@@ -936,42 +1160,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "low_cpu_mem_usage=True (or a format= to quantize_and_save) "
                     "for resumability to be meaningful here."
                 )
-            from auto_round.utils.resume import ResumeState, compute_run_signature, layer_config_fingerprint
-
-            model_dir = getattr(self.model_context, "disk_stream_model_dir", None) or getattr(
-                getattr(self.model_context.model, "config", None), "_name_or_path", None
-            )
-            dataset_desc = str(getattr(self, "dataset", None))
-            # str(self.scheme) alone is bits-blind for AutoScheme runs: two runs
-            # with different avg_bits share it, so include the resolved
-            # per-layer allocation (see layer_config_fingerprint docstring).
-            scheme_desc = (
-                str(self.scheme)
-                + "|"
-                + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
-            )
-            resume_states = []
-            for group_idx, block_names in enumerate(all_blocks):
-                sig = compute_run_signature(
-                    model_dir,
-                    scheme_desc,
-                    dataset_desc,
-                    self.calibration_context.nsamples,
-                    self.calibration_context.seqlen,
-                    block_names,
-                )
-                resume_states.append(
-                    ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names)
-                )
+            resume_states = self._build_resume_states(all_blocks)
 
 
         try:
-            for group_idx, block_names in enumerate(all_blocks if not parallel_applied else []):
-                span = None
-                if worker_group_spans is not None:
-                    span = worker_group_spans.get(group_idx)
-                    if span is None:
-                        continue  # another worker owns this group
+            if envs.AR_BLOCK_PARALLEL_WORKER:
+                # queue-serve mode: consume dispatch jobs (tune / chain-produce)
+                # until the parent signals STOP and the queue is drained
+                self._serve_block_queue(all_blocks, all_inputs, input_ids_cache, pbar)
+            for group_idx, block_names in enumerate(
+                all_blocks if not parallel_applied and not envs.AR_BLOCK_PARALLEL_WORKER else []
+            ):
                 inputs = all_inputs[block_names[0]]
                 all_inputs.pop(block_names[0])
                 q_inputs = None
@@ -1026,11 +1225,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     token_ids=input_ids_cache,
                     resume_state=resume_state,
                     resume_input_ids=resume_input_ids,
-                    span=span,
-                    group_idx=group_idx,
-                    bp_results_dir=envs.AR_BLOCK_PARALLEL_RESULTS
-                    if envs.AR_BLOCK_PARALLEL_WORKER
-                    else None,
                 )
                 if self.compress_context.is_immediate_packing and len(self.formats) != 1:
                     raise ValueError(
@@ -1056,11 +1250,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             self.alg_composer.finalize_run()
         pbar.set_description("Quantizing done")
         pbar.close()
-        if worker_group_spans is not None:
-            # Worker process: its job ends with tuning its span and dumping
-            # scale/zp. Packing, saving, outside-block layers and model reloads
-            # all belong to the parent.
-            self._dump_parallel_worker_results(all_blocks, worker_group_spans)
+        if envs.AR_BLOCK_PARALLEL_WORKER:
+            # Worker process: its job ends with serving queue jobs. Packing,
+            # saving, outside-block layers and model reloads belong to the parent.
+            self._dump_parallel_worker_results(all_blocks)
             return self.model_context.model, self.layer_config
         if self.compress_context.low_cpu_mem_usage:
             if envs.AR_RESUME_DIR and not self.compress_context.is_immediate_saving:

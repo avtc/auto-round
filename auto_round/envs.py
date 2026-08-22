@@ -35,8 +35,9 @@ if TYPE_CHECKING:
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
     AR_ENABLE_BLOCK_PARALLEL_TUNING: bool = False
     AR_BLOCK_PARALLEL_WORKER: bool = False
-    AR_BLOCK_PARALLEL_SPANS: Optional[str] = None
+    AR_BLOCK_PARALLEL_QUEUE_DIR: Optional[str] = None
     AR_BLOCK_PARALLEL_RESULTS: Optional[str] = None
+    AR_BLOCK_PARALLEL_RESUME: bool = True
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -147,11 +148,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tuning; prevents workers from spawning further parallel runs.
     "AR_BLOCK_PARALLEL_WORKER": lambda: os.getenv("AR_BLOCK_PARALLEL_WORKER", "0").lower()
     in ("1", "true", "yes"),
-    # Internal: worker-restricted block spans, JSON list of [group_idx, start, end)
-    # triples; consumed by the orchestrator's tuning loop.
-    "AR_BLOCK_PARALLEL_SPANS": lambda: os.getenv("AR_BLOCK_PARALLEL_SPANS", None),
+    # Internal: directory of the file-based dispatch queue consumed by
+    # block-parallel tuning workers in serve mode.
+    "AR_BLOCK_PARALLEL_QUEUE_DIR": lambda: os.getenv("AR_BLOCK_PARALLEL_QUEUE_DIR", None),
     # Internal: directory where parallel tuning workers dump tuned scale/zp.
     "AR_BLOCK_PARALLEL_RESULTS": lambda: os.getenv("AR_BLOCK_PARALLEL_RESULTS", None),
+    # When enabled (default), block-parallel tuning workers checkpoint their
+    # per-block tuned scale/zp plus the chained hidden state after every
+    # completed block, so an interrupted run resumes from the first missing
+    # block instead of restarting the whole span.
+    "AR_BLOCK_PARALLEL_RESUME": lambda: os.getenv("AR_BLOCK_PARALLEL_RESUME", "1").lower()
+    not in ("0", "false", "no", "off"),
 }
 
 
