@@ -709,6 +709,35 @@ def _prepare_replay_input(block_input_args, block_input_kwargs, block_name):
     raise RuntimeError(f"No floating replay input found for block {block_name}")
 
 
+def _vram_inventory(tag: str, top_k: int = 12):
+    """Env-gated (AR_SCHEME_MEM_INVENTORY=1) per-device live-tensor census:
+    resident CUDA tensors grouped by (shape, dtype) signature, largest first --
+    used to spot unreleased module weights or retained graphs during streamed
+    scoring (block shapes are recognizable: e.g. [5120, 17408] = mlp.down)."""
+    import gc as _gc
+    import os as _os
+    from collections import defaultdict
+
+    if _os.getenv("AR_SCHEME_MEM_INVENTORY", "0") != "1":
+        return
+    groups = defaultdict(lambda: [0, 0])
+    for obj in _gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda:
+                key = (tuple(obj.shape), str(obj.dtype))
+                groups[key][0] += 1
+                groups[key][1] += obj.element_size() * obj.numel()
+        except Exception:  # noqa: BLE001
+            continue
+    ranked = sorted(groups.items(), key=lambda kv: -kv[1][1])[:top_k]
+    total = sum(v[1] for v in groups.values())
+    alloc = torch.cuda.memory_allocated() / 2**30
+    print(f"[mem-inv] {tag}: live tensors {total / 2**30:.2f} GiB "
+          f"(allocator {alloc:.2f} GiB)", flush=True)
+    for (shape, dtype), (cnt, nb) in ranked:
+        print(f"[mem-inv]   {nb / 2**30:6.2f} GiB x{cnt:<4} {dtype} {shape}", flush=True)
+
+
 def model_forward_low_gpu(model, dataloader, major_device="cuda", pbar=None, scheme_tag=None, disk_index=None):
     """Run one full scoring pass (all calibration batches) in low-GPU-memory mode.
 
@@ -857,6 +886,8 @@ def model_forward_low_gpu(model, dataloader, major_device="cuda", pbar=None, sch
 
             if pbar is not None:
                 pbar.update(1)
+
+        _vram_inventory(f"scheme={scheme_tag} batch={batch_idx}/{total_batches} post-replay")
 
         _log_batch_avg_loss(
             model,
