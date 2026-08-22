@@ -313,9 +313,14 @@ def save_chain_state(results_dir: str, group: int, block_idx: int, hidden) -> No
     """
     os.makedirs(results_dir, exist_ok=True)
     payload = {"hidden": _to_cpu_recursive(hidden)}
-    tmp = _chain_state_path(results_dir, group, block_idx) + ".tmp"
+    # unique temp suffix: concurrent replays of the same prefix (several
+    # workers rebuilding the chain from the group entry) publish identical
+    # checkpoint names; a shared temp file would race between one worker's
+    # torch.save and another's os.replace
+    path = _chain_state_path(results_dir, group, block_idx)
+    tmp = f"{path}.tmp.{os.getpid()}"
     torch.save(payload, tmp)
-    os.replace(tmp, _chain_state_path(results_dir, group, block_idx))
+    os.replace(tmp, path)
 
 
 def load_chain_state(results_dir: str, group: int, block_idx: int, device: str):

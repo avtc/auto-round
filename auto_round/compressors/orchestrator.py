@@ -1017,9 +1017,18 @@ class CompressionOrchestrator(BaseOrchestrator):
                         produce_only=(prefix, k),
                         resume_input_ids=frontier_entry,
                     )
-                entry = _bp_load_chain_state(
-                    results_dir, g, k, device=self.compress_context.cache_device
-                )
+                # a sibling worker replaying the same prefix may still be mid-
+                # publish of this checkpoint -- retry briefly before failing
+                import time as _t
+
+                entry = None
+                for _attempt in range(60):
+                    entry = _bp_load_chain_state(
+                        results_dir, g, k, device=self.compress_context.cache_device
+                    )
+                    if entry is not None:
+                        break
+                    _t.sleep(0.5)
                 if entry is None:
                     raise RuntimeError(f"chain entry for block {k} missing after replay")
 
