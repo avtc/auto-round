@@ -732,14 +732,30 @@ class CompressionOrchestrator(BaseOrchestrator):
             "AR_BLOCK_PARALLEL_SHARED_NONBLOCKS": nonblocks_path,
             "AR_BLOCK_PARALLEL_SHARED_INPUTS": inputs_path,
         }
+        import time as _t0
+
+        _spawn_t0 = _t0.time()
         procs = bp.spawn_workers(sys.argv, gpu_ids, log_dir=results_dir, extra_env=env_extra)
+        logger.info(
+            "[bp-trace] spawn complete in %.1fs (pids %s); initial dispatch next",
+            _t0.time() - _spawn_t0,
+            [proc.pid for proc in procs],
+        )
 
         # in-group-order dispatch pointers: near-sequential completion lets the
         # serial manifest prefix absorb work as fast as possible
         pointer = {g: 0 for g in range(len(all_blocks))}
         inflight = {}  # job seq -> (group, index)
         cap = len(gpu_ids) + 2
+        logger.info(
+            "[bp-trace] pre-dispatch state: done=%s pointer=%s inflight=%d cap=%d",
+            {g: len(d) for g, d in done.items()}, dict(pointer), len(inflight), cap,
+        )
         seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
+        logger.info(
+            "[bp-trace] initial dispatch finished: seq=%d inflight=%s queue_pending=%s",
+            seq, dict(inflight), bp.list_pending(qdir),
+        )
 
         import time as _time
 
@@ -788,6 +804,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             rss_tick += 1
             if rss_tick % 60 == 0:  # ~30s
                 bp.log_worker_rss(procs)
+            if rss_tick % 10 == 0:  # ~5s
+                logger.info(
+                    "[bp-trace] tick %d: done=%s ptr=%s inflight=%s queue_pending=%s procs_alive=%d",
+                    rss_tick,
+                    {g: len(d) for g, d in done.items()},
+                    dict(pointer),
+                    sorted(inflight.values()),
+                    bp.list_pending(qdir),
+                    sum(1 for proc in procs if proc.poll() is None),
+                )
             seq = self._dispatch_ready(qdir, all_blocks, done, pointer, inflight, seq, cap, results_dir)
 
         bp.write_stop(qdir)
@@ -826,6 +852,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             for g in list(pointer):
                 while pointer[g] < len(all_blocks[g]) and pointer[g] in done[g]:
                     pointer[g] += 1
+            if logger.isEnabledFor(10):  # DEBUG-and-below detail only
+                logger.debug("[bp-trace] dispatch scan: ptr=%s inflight=%s", dict(pointer), dict(inflight))
             target = None
             for g in sorted(pointer):
                 k = pointer[g]
