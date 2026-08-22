@@ -494,6 +494,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             str(self.scheme)
             + "|"
             + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
+            + "|qi="
+            + str(bool(self.alg_composer.need_quanted_input()))
         )
         states = []
         for group_idx, block_names in enumerate(all_blocks):
@@ -556,7 +558,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 model_dir,
                 str(self.scheme)
                 + "|"
-                + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None)),
+                + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
+                + "|qi="
+                + str(bool(self.alg_composer.need_quanted_input())),
                 str(getattr(self, "dataset", None)),
                 self.calibration_context.nsamples,
                 self.calibration_context.seqlen,
