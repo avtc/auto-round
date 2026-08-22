@@ -760,7 +760,11 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         assigned = {}  # rank -> (group, index); absent == worker idle/finished
         stopped = set()
-        seen_results = set()
+        seen_results = {
+            (g, k) for g, blocks in enumerate(all_blocks) for k in range(len(blocks)) if k in done[g]
+        }  # startup done-blocks are already accounted for -- the loop must not
+        # re-process them as fresh results (which re-assigned their old ranks
+        # and queued duplicate tune lines onto live workers)
         sticky_pref = {}  # rank -> (g, k+1) the worker holds the entry for
         finished_ranks = set()  # ranks that reported a result since last pass
 
@@ -1000,6 +1004,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if prefix > k:
                     prefix = 0  # stale/odd manifest: replay from the group entry
                     frontier_entry = None
+                import time as _t
+
+                entry = None
                 if prefix < k:
                     # replay prefix..k-1 (publishes entries the parent can
                     # consume for manifest absorption on the way)
@@ -1017,20 +1024,24 @@ class CompressionOrchestrator(BaseOrchestrator):
                         produce_only=(prefix, k),
                         resume_input_ids=frontier_entry,
                     )
-                # a sibling worker replaying the same prefix may still be mid-
-                # publish of this checkpoint -- retry briefly before failing
-                import time as _t
-
-                entry = None
-                for _attempt in range(60):
-                    entry = _bp_load_chain_state(
-                        results_dir, g, k, device=self.compress_context.cache_device
-                    )
-                    if entry is not None:
-                        break
-                    _t.sleep(0.5)
-                if entry is None:
-                    raise RuntimeError(f"chain entry for block {k} missing after replay")
+                    # a sibling replaying the same prefix may still be mid-
+                    # publish of this checkpoint -- retry briefly before failing
+                    for _attempt in range(60):
+                        entry = _bp_load_chain_state(
+                            results_dir, g, k, device=self.compress_context.cache_device
+                        )
+                        if entry is not None:
+                            break
+                        _t.sleep(0.5)
+                    if entry is None:
+                        raise RuntimeError(f"chain entry for block {k} missing after replay")
+                elif frontier_entry is not None:
+                    # the manifest frontier IS this block's entry (the parent
+                    # consumed-and-deleted the checkpoint file when absorbing)
+                    entry = frontier_entry
+                # else prefix == k == 0 with no manifest: entry stays None and
+                # the tune naturally uses the group's cached entry (serial
+                # block-0 semantics)
             if isinstance(entry, list) and any(t is None for t in entry):
                 bad = [i for i, t in enumerate(entry) if t is None][:4]
                 raise RuntimeError(
