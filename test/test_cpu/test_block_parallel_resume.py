@@ -64,6 +64,26 @@ class TestChainCheckpoints(unittest.TestCase):
             self.assertTrue(torch.equal(restored, hidden))
             self.assertIsNone(block_parallel.load_chain_state(d, group=0, block_idx=6, device="cpu"))
 
+    def test_roundtrip_per_sample_list(self):
+        # block replay formats chain per-sample lists (and dicts), not plain
+        # tensors -- the save must not silently skip them
+        with tempfile.TemporaryDirectory() as d:
+            hidden = [torch.randn(1, 3, 4) for _ in range(2)]
+            block_parallel.save_chain_state(d, group=0, block_idx=3, hidden=hidden)
+            restored = block_parallel.load_chain_state(d, group=0, block_idx=3, device="cpu")
+            self.assertIsInstance(restored, list)
+            self.assertEqual(len(restored), 2)
+            for a, b in zip(restored, hidden):
+                self.assertTrue(torch.equal(a, b))
+
+    def test_roundtrip_dict_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            hidden = {"hidden_states": torch.randn(2, 3), "extra": [torch.ones(1), torch.ones(1)]}
+            block_parallel.save_chain_state(d, group=1, block_idx=0, hidden=hidden)
+            restored = block_parallel.load_chain_state(d, group=1, block_idx=0, device="cpu")
+            self.assertTrue(torch.equal(restored["hidden_states"], hidden["hidden_states"]))
+            self.assertEqual(len(restored["extra"]), 2)
+
     def test_keys_are_group_scoped(self):
         with tempfile.TemporaryDirectory() as d:
             block_parallel.save_chain_state(d, group=2, block_idx=1, hidden=torch.zeros(1))
