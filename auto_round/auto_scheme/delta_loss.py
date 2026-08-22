@@ -1935,8 +1935,12 @@ def _load_disk_stream_scheme_worker_model(model_name, use_model_replacements=Fal
 
 
 def _prefer_disk_stream_scheme_worker(model_id, is_vlm, low_gpu_mem_usage):
-    """Prefer block-wise disk streaming whenever the worker scoring path supports it."""
-    return model_id is not None and not is_vlm and low_gpu_mem_usage
+    """Prefer block-wise disk streaming whenever the worker scoring path supports it.
+
+    Multimodal archs are covered: build_meta_model resolves the class from
+    config.architectures and the workers materialize non-block params (vision
+    tower included) via materialize_non_block_params."""
+    return model_id is not None and low_gpu_mem_usage
 
 
 def _score_scheme_worker(args):
