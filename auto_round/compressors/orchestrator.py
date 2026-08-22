@@ -863,15 +863,22 @@ class CompressionOrchestrator(BaseOrchestrator):
                 logger.debug("[bp-trace] dispatch scan: ptr=%s inflight=%s", dict(pointer), dict(inflight))
             target = None
             for g in sorted(pointer):
-                k = pointer[g]
-                if k >= len(all_blocks[g]):
-                    continue
-                if any(v == (g, k) for v in inflight.values()):
-                    continue
-                if k > 0 and not bp.chain_state_exists(results_dir, g, k):
-                    continue  # entry checkpoint not published yet (producer lag)
-                target = (g, k)
-                break
+                # frontier walk: consider every block from the pointer upward,
+                # not just the pointer itself -- several blocks of a group must
+                # be tunable concurrently or the pool degrades to one tuner
+                # (pointer only advances past DONE blocks, so while block k is
+                # in flight it blocked k+1, k+2, ... whose checkpoints exist)
+                for k in range(pointer[g], len(all_blocks[g])):
+                    if k in done[g]:
+                        continue
+                    if any(v == (g, k) for v in inflight.values()):
+                        continue
+                    if k > 0 and not bp.chain_state_exists(results_dir, g, k):
+                        break  # checkpoints arrive in order; nothing later is ready
+                    target = (g, k)
+                    break
+                if target is not None:
+                    break
             if target is None:
                 break
             g, k = target
