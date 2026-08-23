@@ -1188,7 +1188,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if entry is None or not hasattr(sub, "weight"):
                         continue
                     sub.scale = entry["scale"].to(sub.weight.device)
-                    sub.zp = entry["zp"].to(sub.weight.device) if entry["zp"] is not None else entry["zp"]
+                    zp = entry["zp"]
+                    # symmetric layers keep zp as a plain int (typically 0) --
+                    # mirror _collect_tuned_layers: only tensors move devices
+                    sub.zp = zp.to(sub.weight.device) if isinstance(zp, torch.Tensor) else zp
                     applied += 1
                 for sub_name, sub in block.named_modules():
                     if hasattr(sub, "bits") and check_to_quantized(sub):
