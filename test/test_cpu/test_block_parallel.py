@@ -123,7 +123,6 @@ class TestOrchestratorMethodRoster(unittest.TestCase):
             "_maybe_block_parallel_tune",
             "_apply_tuned_results",
             "_collect_tuned_layers",
-            "_dump_parallel_worker_results",
             "_serve_block_queue",
             "_manifest_frontier",
             "_ff_one_block",

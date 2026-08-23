@@ -210,8 +210,9 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         The manifest is the shared cross-mode resume contract: written by the
         serial loop and by the parallel sequencer alike, holding the chained
-        entry at the contiguous done-prefix. Used by workers to obtain a replay
-        starting point without any parallel-specific state.
+        entry at the contiguous done-prefix. Workers read it for the resumed
+        run's frontier entry (the ramp-start block's input) without any
+        parallel-specific state.
         """
         import json as _json
 
@@ -229,9 +230,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             completed = data.get("completed_blocks", [])
             entry = torch.load(input_ids, map_location="cpu", weights_only=True)
             if entry is None:
-                # prefix without a usable entry (e.g. absorption consumed a
-                # missing handoff): replay from the group entry instead of
-                # chaining from a wrong starting state
+                # prefix without a usable entry: report (0, None) so callers
+                # fall back to the group's cached calibration entry
                 return 0, None
             from auto_round.compressors.block_parallel import _to_device_recursive
 
@@ -255,7 +255,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         group_idx: int = 0,
         bp_results_dir: Optional[str] = None,
         start_block_idx: Optional[int] = None,
-        produce_only: Optional[tuple] = None,
     ):
         """Quantize and dequantize the weights of the specified blocks in the model.
 
@@ -308,13 +307,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # queue mode: the caller restored this block's entry input from a
             # chain checkpoint -- start here directly, no fast-forward replay
             start_index = start_block_idx
-        if produce_only is not None:
-            # queue mode producer job: fast-forward-only pass publishing chain
-            # checkpoints; nothing is tuned and no results are written
-            start_index = produce_only[0]
         for i in range(start_index, len(block_names), nblocks):
-            if produce_only is not None and i >= produce_only[1]:
-                break
             if span is not None and i >= span[1]:
                 break  # span restriction: remaining blocks belong to another worker
             if (
@@ -342,7 +335,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 input_others_extra_blocks.pop(block_names[i])
             if i != 0:
                 pbar.update(1)
-            if produce_only is not None or span is not None and (
+            if span is not None and (
                 i < span[0]
                 or (
                     bp_results_dir
@@ -1028,9 +1021,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             if held is not None and held[0] == g and held[1] == k:
                 entry = held[2]  # single-worker pools: held entry IS the frontier
             else:
-                # strict-frontier assignments always have their entry published
-                # (the previous assignee forwards before tuning) -- direct read
-                # first; replay is only for stale/missing files
+                # the parent dispatches k only after its checkpoint exists;
+                # the retry covers filesystem visibility, not recovery
                 import time as _t_direct
 
                 for _attempt in range(4):
@@ -1041,39 +1033,20 @@ class CompressionOrchestrator(BaseOrchestrator):
                         break
                     _t_direct.sleep(0.5)
                 if entry is None:
-                    # fallback: manifest frontier + bounded replay
                     prefix, frontier_entry = self._manifest_frontier(g)
-                    if prefix > k:
-                        prefix = 0  # stale/odd manifest: replay from the group entry
-                        frontier_entry = None
-                    import time as _t
-
-                    if prefix < k:
-                        # in-RAM replay prefix..k-1: no checkpoint publishes --
-                        # only the assigned forward is ever saved; the chained
-                        # result comes back directly
-                        entry = self._quantize_blocks(
-                            self.model_context.model,
-                            _group_entry(blocks),
-                            blocks,
-                            nblocks=1,
-                            pbar=pbar,
-                            input_others_extra_blocks=dict(all_inputs),
-                            token_ids=token_ids,
-                            group_idx=g,
-                            bp_results_dir=None,
-                            start_block_idx=prefix,
-                            produce_only=(prefix, k),
-                            resume_input_ids=frontier_entry,
-                        )
-                        if entry is None:
-                            raise RuntimeError(f"chain entry for block {k} missing after replay")
-                    elif frontier_entry is not None:
-                        # the manifest frontier IS this block's entry
+                    if k > 0 and prefix == k and frontier_entry is not None:
+                        # resumed run: the manifest frontier IS this block's entry
                         entry = frontier_entry
-                    # else prefix == k == 0 with no manifest: entry stays None
-                    # and the tune naturally uses the group's cached entry
-                    # (serial block-0 semantics)
+                    elif k > 0:
+                        # a non-frontier block without a checkpoint means the
+                        # publish never happened; surface it, never rebuild it
+                        raise RuntimeError(
+                            f"block-parallel worker {rank}: chain entry for block {k} "
+                            f"unreadable after 4 reads (manifest prefix {prefix}) -- "
+                            "checkpoint was not published; see worker logs"
+                        )
+                    # k == 0: entry stays None and the tune uses the group's
+                    # cached calibration entry (serial block-0 semantics)
             if isinstance(entry, list) and any(t is None for t in entry):
                 bad = [i for i, t in enumerate(entry) if t is None][:4]
                 raise RuntimeError(
@@ -1210,30 +1183,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "zp": sub.zp.detach().cpu() if isinstance(sub.zp, torch.Tensor) else sub.zp,
             }
         return results
-
-    def _dump_parallel_worker_results(self, all_blocks: list) -> None:
-        """Worker-side safety net: persist any tuned blocks not yet saved.
-
-        Blocks are normally saved right after tuning inside ``_quantize_blocks``
-        (the resumable unit); this end-of-run pass covers any block whose
-        in-loop save did not land. Blocks this worker never touched have
-        no tuned attributes and contribute nothing.
-        """
-        out_dir = envs.AR_BLOCK_PARALLEL_RESULTS
-        if not out_dir:
-            raise RuntimeError("AR_BLOCK_PARALLEL_WORKER is set but AR_BLOCK_PARALLEL_RESULTS is missing")
-        saved = 0
-        for blocks in all_blocks:
-            for block_name in blocks:
-                if _bp_block_results_complete(out_dir, block_name):
-                    continue  # only skip blocks with real results; empty files get re-dumped
-                results = self._collect_tuned_layers(block_name)
-                if results:
-                    _bp_save_block_results(out_dir, block_name, results)
-                    saved += 1
-        logger.info(
-            "block-parallel worker: results dir %s (%d blocks saved by the end-of-run net)", out_dir, saved
-        )
 
     def quantize(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Quantize the model and return the quantized model along with layer configurations.The entry of AutoRound.
@@ -1627,7 +1576,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         if envs.AR_BLOCK_PARALLEL_WORKER:
             # Worker process: its job ends with serving queue jobs. Packing,
             # saving, outside-block layers and model reloads belong to the parent.
-            self._dump_parallel_worker_results(all_blocks)
             return self.model_context.model, self.layer_config
         if self.compress_context.low_cpu_mem_usage:
             if envs.AR_RESUME_DIR and not self.compress_context.is_immediate_saving:
