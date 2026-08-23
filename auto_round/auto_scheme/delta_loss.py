@@ -2132,8 +2132,13 @@ def _score_scheme_worker(args):
     for layer_name in quant_layer_names:
         layer = _get_module(model, layer_name)
         if layer is None:
+            parent_name = layer_name.rsplit(".", 1)[0]
+            parent = _get_module(model, parent_name)
+            expert_containers = sum(1 for _, m in model.named_modules() if m.__class__.__name__ == "_ExpertContainer")
             raise RuntimeError(
-                f"_score_scheme_worker[{index}]: layer {layer_name!r} is missing after model preprocessing"
+                f"_score_scheme_worker[{index}]: layer {layer_name!r} is missing after model preprocessing "
+                f"(parent {parent_name!r} resolves to {type(parent).__name__ if parent is not None else None}; "
+                f"expert containers in model: {expert_containers}; disk-stream build: {disk_index is not None})"
             )
         if not hasattr(layer, "tuning_device"):
             layer.tuning_device = worker_device
