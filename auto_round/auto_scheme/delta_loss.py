@@ -2024,9 +2024,7 @@ def _load_disk_stream_scheme_worker_model(model_name, use_model_replacements=Fal
     from auto_round.modeling.fused_moe.replace_modules import _handle_moe_modules
 
     unfused = _handle_moe_modules(model)
-    logger.info(
-        "disk-stream scoring worker: structural MoE unfuse produced %d unfused experts modules", len(unfused)
-    )
+    logger.info("disk-stream scoring worker: structural MoE unfuse produced %d unfused experts modules", len(unfused))
     if use_model_replacements:
         from auto_round.special_model_handler import _handle_special_model, update_module
 
