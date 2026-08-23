@@ -348,7 +348,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 or (
                     bp_results_dir
                     and i >= span[0]
-                    and _bp_has_block_results(bp_results_dir, block_names[i])
+                    and _bp_block_results_complete(bp_results_dir, block_names[i])
                     and _bp_load_chain_state(bp_results_dir, group_idx, i + 1, device="cpu") is None
                 )
             ):
