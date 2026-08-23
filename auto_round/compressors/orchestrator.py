@@ -1581,6 +1581,16 @@ class CompressionOrchestrator(BaseOrchestrator):
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
+        # block-parallel scratch (tuned results, chain checkpoints, worker
+        # logs) is dead weight once the export finalizes -- several GB per run
+        bp_results = getattr(self, "_bp_results_to_clean", None)
+        if bp_results:
+            import shutil as _shutil
+
+            _shutil.rmtree(bp_results, ignore_errors=True)
+            self._bp_results_to_clean = None
+            logger.info("block-parallel tuning: removed scratch results in %s", bp_results)
+
         end_time = time.time()
         cost_time = end_time - start_time
         logger.info(f"quantization tuning time {cost_time}")
