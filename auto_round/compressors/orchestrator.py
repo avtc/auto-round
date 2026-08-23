@@ -731,14 +731,17 @@ class CompressionOrchestrator(BaseOrchestrator):
         # completions live only in per-block result files until absorbed.
         resume_states = self._build_resume_states(all_blocks) if resumable else [None] * len(all_blocks)
 
-        # done sets: manifest prefix + result files from a prior run (works
-        # after a serial run too -- manifests carry the prefix, no result files
-        # needed -- and regardless of how many workers produced them)
+        # done sets: COMPLETE per-block result files only. The serial manifest
+        # prefix proves the chain advanced, not that tuned scale/zp were
+        # durably dumped (absorption consumes the chain entry, not the results)
+        # -- and the apply pass packs exclusively from result files, so they
+        # are the sole source of truth for "tuned". A block whose file is
+        # missing or empty gets re-tuned (cheap), whatever the manifest says.
+        # The manifest keeps its other roles: chain entries for ramp/replay,
+        # and cross-mode serial resume.
         done = {}
         for g, blocks in enumerate(all_blocks):
-            prefix = resume_states[g].resume_index if resume_states[g] is not None else 0
-            done[g] = set(range(prefix))
-            done[g] |= {k for k, b in enumerate(blocks) if bp.block_results_complete(results_dir, b)}
+            done[g] = {k for k, b in enumerate(blocks) if bp.block_results_complete(results_dir, b)}
         total_blocks = sum(len(blocks) for blocks in all_blocks)
         n_todo = total_blocks - sum(len(d) for d in done.values())
 
