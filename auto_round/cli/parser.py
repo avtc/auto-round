@@ -140,8 +140,28 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         help="AutoScheme options. Accepts comma-separated ('W4A16,W8A16') or space-separated (W4A16 W8A16).",
     )
     rt.add_argument(
-        "--low_gpu_mem_usage", action="store_true", help="Enable memory-efficient mode by offloading features to CPU."
+        "--enable_block_parallel_tuning",
+        action="store_true",
+        help=(
+            "Tune transformer blocks in parallel across the GPUs in --device_map "
+            "(experimental; same as setting AR_ENABLE_BLOCK_PARALLEL_TUNING=1)."
+        ),
     )
+    low_gpu_mutex = parser.add_mutually_exclusive_group()
+    low_gpu_mutex.add_argument(
+        "--low_gpu_mem_usage",
+        action="store_true",
+        dest="low_gpu_mem_usage",
+        help="Enable memory-efficient mode by offloading features to CPU.",
+    )
+    low_gpu_mutex.add_argument(
+        "--no-low_gpu_mem_usage",
+        "--disable_low_gpu_mem_usage",
+        action="store_false",
+        dest="low_gpu_mem_usage",
+        help="Keep model features resident on GPU (needs more VRAM).",
+    )
+    parser.set_defaults(low_gpu_mem_usage=False)
     rt.add_argument(
         "--low_cpu_mem_usage",
         action="store_true",
