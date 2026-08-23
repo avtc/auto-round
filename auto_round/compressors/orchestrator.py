@@ -1100,8 +1100,11 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             if entry is None:
                 # k == 0 with no chain checkpoint: the block's entry is the
-                # group's cached calibration entry (serial block-0 semantics)
-                entry = _group_entry(blocks)
+                # group's cached calibration entry, in PREPROCESSED (block-
+                # consumable) form -- the tail forwards it directly, while the
+                # tune path derives the same input internally (serial block-0
+                # semantics)
+                entry = self._preprocess_block_inputs(_group_entry(blocks))[0]
 
             # extend the chain BEFORE tuning: the ff consumes the pristine
             # entry; whatever the tuning pipeline does to the list afterward
