@@ -757,6 +757,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self._resume_states = resume_states
             return True
 
+        gpu_ids = gpu_ids[:n_todo]  # never spawn more workers than blocks left
         logger.info(
             "block-parallel tuning: %d workers on GPUs %s, %d block(s) to tune, results %s%s",
             len(gpu_ids), gpu_ids, n_todo, results_dir,
@@ -1151,8 +1152,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             raise RuntimeError(
                 f"block-parallel apply: {len(missing)} to-pack layer(s) missing from worker "
                 f"results (first: {missing[:5]}; sample of available keys: {sample_avail}). "
-                f"Key mismatch between worker dumps and parent modules -- rerun with fresh "
-                f"block results (delete {''} block result files for affected blocks)."
+                f"Key mismatch between worker dumps and parent modules, or an empty result "
+                f"file -- rerun after deleting the result files of the affected blocks."
             )
 
         n_blocks = sum(len(group) for group in all_blocks)
