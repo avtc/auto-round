@@ -742,6 +742,21 @@ class CompressionOrchestrator(BaseOrchestrator):
         total_blocks = sum(len(blocks) for blocks in all_blocks)
         n_todo = total_blocks - sum(len(d) for d in done.values())
 
+        if n_todo == 0:
+            # everything already tuned (resume): applying + packing is a pure
+            # parent-side job -- spawning model-loading workers would be pure waste
+            logger.info(
+                "block-parallel tuning: all %d block(s) already tuned; packing from %s",
+                total_blocks, results_dir,
+            )
+            tuned = bp.load_all_block_results(results_dir)
+            if not tuned:
+                raise RuntimeError(f"block-parallel tuning: no block results found in {results_dir}")
+            self._apply_tuned_results(all_blocks, tuned)
+            if resumable:
+                self._resume_states = resume_states
+            return True
+
         logger.info(
             "block-parallel tuning: %d workers on GPUs %s, %d block(s) to tune, results %s%s",
             len(gpu_ids), gpu_ids, n_todo, results_dir,
@@ -1117,6 +1132,28 @@ class CompressionOrchestrator(BaseOrchestrator):
     def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
         """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
         from auto_round.compressors.utils import immediate_pack as _immediate_pack
+
+        # pre-validate key coverage before touching any module: every module
+        # the pack loop will touch must have a tuned entry -- a mismatch fails
+        # here with names, instead of an AttributeError in the export stack
+        expected = set()
+        for group in all_blocks:
+            for block_name in group:
+                block = get_module(self.model_context.model, block_name)
+                for sub_name, sub in block.named_modules():
+                    if hasattr(sub, "bits") and check_to_quantized(sub):
+                        expected.add(
+                            getattr(sub, "global_name", None) or f"{block_name}.{sub_name}" or block_name
+                        )
+        missing = sorted(expected - set(tuned))
+        if missing:
+            sample_avail = sorted(tuned)[:5]
+            raise RuntimeError(
+                f"block-parallel apply: {len(missing)} to-pack layer(s) missing from worker "
+                f"results (first: {missing[:5]}; sample of available keys: {sample_avail}). "
+                f"Key mismatch between worker dumps and parent modules -- rerun with fresh "
+                f"block results (delete {''} block result files for affected blocks)."
+            )
 
         n_blocks = sum(len(group) for group in all_blocks)
         pbar = tqdm(range(n_blocks))
