@@ -738,7 +738,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         for g, blocks in enumerate(all_blocks):
             prefix = resume_states[g].resume_index if resume_states[g] is not None else 0
             done[g] = set(range(prefix))
-            done[g] |= {k for k, b in enumerate(blocks) if bp.has_block_results(results_dir, b)}
+            done[g] |= {k for k, b in enumerate(blocks) if bp.block_results_complete(results_dir, b)}
         total_blocks = sum(len(blocks) for blocks in all_blocks)
         n_todo = total_blocks - sum(len(d) for d in done.values())
 

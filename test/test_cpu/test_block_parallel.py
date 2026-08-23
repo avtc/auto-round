@@ -134,3 +134,16 @@ class TestOrchestratorMethodRoster(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBlockResultsComplete(unittest.TestCase):
+    def test_empty_file_is_not_complete(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            block_parallel.save_block_results(d, "blk", {})  # empty payload + _worker_rank
+            self.assertTrue(block_parallel.has_block_results(d, "blk"))
+            self.assertFalse(block_parallel.block_results_complete(d, "blk"))
+            block_parallel.save_block_results(d, "blk2", {"l": {"scale": torch.ones(2), "zp": None}})
+            self.assertTrue(block_parallel.block_results_complete(d, "blk2"))
+            self.assertFalse(block_parallel.block_results_complete(d, "missing"))

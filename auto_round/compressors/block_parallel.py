@@ -242,6 +242,25 @@ def has_block_results(results_dir: str, block_name: str) -> bool:
     return os.path.exists(_block_results_path(results_dir, block_name))
 
 
+def block_results_complete(results_dir: str, block_name: str) -> bool:
+    """File exists AND carries at least one tuned layer.
+
+    An existing-but-empty file is a broken artifact (observed once from a
+    pre-relay-era run: the file made has_block_results treat the block as
+    done, and packing later crashed on its very first layer). Treat it as
+    not-done so a rerun re-tunes the block instead of erroring at pack time.
+    Cheap existence checks (polling loops) keep using has_block_results.
+    """
+    path = _block_results_path(results_dir, block_name)
+    if not os.path.exists(path):
+        return False
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:  # noqa: BLE001  corrupt file: same treatment as empty
+        return False
+    return any(not k.startswith("_") for k in data)
+
+
 def load_all_block_results(results_dir: str) -> dict:
     """Merge every per-block result file into one {layer_name: {scale, zp}} dict."""
     merged: dict = {}
