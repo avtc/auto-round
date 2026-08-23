@@ -864,8 +864,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     done[g].add(k)
                     # the block is complete: its entry checkpoint was consumed
                     # by the assignee and the manifest absorbed the block --
-                    # nothing can read it again (replays rebuild from the
-                    # manifest, never from files)
+                    # nothing reads that checkpoint again
                     _bp_delete_chain_state(results_dir, g, k)
                     rank = bp.read_result_rank(results_dir, b)
                     if rank >= 0:
@@ -1063,21 +1062,28 @@ class CompressionOrchestrator(BaseOrchestrator):
                 entry = self._preprocess_block_inputs(_group_entry(blocks))[0]
 
             # extend the chain BEFORE tuning: the ff consumes the pristine
-            # entry; whatever the tuning pipeline does to the list afterward
-            # no longer matters (nothing reads it again). The block's original
+            # entry; nothing reads the list afterward. The block's original
             # weights are streamed from the checkpoint either way.
             if k + 1 < len(blocks):
-                _others = self._preprocess_block_inputs(_group_entry(blocks))[1]
-                next_entry = self._ff_one_block(
-                    self.model_context.model,
-                    blocks[k],
-                    entry,
-                    _others,
-                    g,
-                    k + 1,
-                    results_dir,
+                existing = bp.maybe_load_chain_state(
+                    results_dir, g, k + 1, device=self.compress_context.cache_device
                 )
-                held = (g, k + 1, next_entry)
+                if existing is not None:
+                    # resume: a prior run already published this checkpoint;
+                    # recompute would be identical, so reuse it
+                    held = (g, k + 1, existing)
+                else:
+                    _others = self._preprocess_block_inputs(_group_entry(blocks))[1]
+                    next_entry = self._ff_one_block(
+                        self.model_context.model,
+                        blocks[k],
+                        entry,
+                        _others,
+                        g,
+                        k + 1,
+                        results_dir,
+                    )
+                    held = (g, k + 1, next_entry)
             else:
                 held = None
 

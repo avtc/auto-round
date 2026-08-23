@@ -278,6 +278,18 @@ def missing_result_blocks(results_dir: str, all_blocks: "Sequence[list]") -> "Li
     return [block for group in all_blocks for block in group if not has_block_results(results_dir, block)]
 
 
+def maybe_load_chain_state(results_dir: str, group: int, block_idx: int, device=None):
+    """Return the published entry for ``block_idx`` if its checkpoint exists.
+
+    On resume, checkpoints published by a crashed run are still valid (the
+    forward is deterministic over original weights), so callers reuse them
+    instead of recomputing.
+    """
+    if not chain_state_exists(results_dir, group, block_idx):
+        return None
+    return load_chain_state(results_dir, group, block_idx, device=device)
+
+
 def chain_state_exists(results_dir: str, group: int, block_idx: int) -> bool:
     return os.path.exists(_chain_state_path(results_dir or "", group, block_idx))
 

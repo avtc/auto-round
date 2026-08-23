@@ -171,3 +171,20 @@ class TestSharedInputs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResumeReusesExistingCheckpoints(unittest.TestCase):
+    def test_maybe_load_chain_state(self):
+        """Resume must reuse an already-published entry instead of recomputing:
+        returns the saved payload when present, None when absent."""
+        import tempfile
+
+        from auto_round.compressors import block_parallel as bp
+
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(bp.maybe_load_chain_state(d, 0, 5, device="cpu"))
+            payload = {"hidden": torch.ones(2, 3)}
+            bp.save_chain_state(d, 0, 5, payload)
+            got = bp.maybe_load_chain_state(d, 0, 5, device="cpu")
+            self.assertEqual(got["hidden"].shape, (2, 3))
+            self.assertIsNone(bp.maybe_load_chain_state(d, 0, 6, device="cpu"))
