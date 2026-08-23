@@ -873,6 +873,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 for k, b in enumerate(blocks):
                     if (g, k) in seen_results or not bp.has_block_results(results_dir, b):
                         continue
+                    if not bp.block_results_complete(results_dir, b):
+                        continue  # exists but empty/corrupt: not a result
                     seen_results.add((g, k))
                     done[g].add(k)
                     # the block is complete: its entry checkpoint was consumed
@@ -1095,6 +1097,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     f"chain entry for block {k} contains None samples at indices {bad} -- "
                     "the checkpoint file is corrupt; delete it and rerun"
                 )
+
+            if entry is None:
+                # k == 0 with no chain checkpoint: the block's entry is the
+                # group's cached calibration entry (serial block-0 semantics)
+                entry = _group_entry(blocks)
 
             # extend the chain BEFORE tuning: the ff consumes the pristine
             # entry; whatever the tuning pipeline does to the list afterward
