@@ -147,3 +147,70 @@ class TestBlockResultsComplete(unittest.TestCase):
             block_parallel.save_block_results(d, "blk2", {"l": {"scale": torch.ones(2), "zp": None}})
             self.assertTrue(block_parallel.block_results_complete(d, "blk2"))
             self.assertFalse(block_parallel.block_results_complete(d, "missing"))
+
+
+class TestPackEquivalenceOriginalVsQdqWeight(unittest.TestCase):
+    """Serial packing runs on qdq weights (the unwrapper overwrites weight.data with the
+    fake-quant reconstruction); the parallel apply packs ORIGINAL weights and sets only
+    scale/zp. Both feed the same packer, which re-quantizes with round(W/s + z) -- so the
+    packed codes are identical iff quantization is idempotent on its own grid: dequantized
+    values are grid points, and re-quantizing a grid point (plus float roundtrip error far
+    below the 0.5 rounding boundary) returns the same integer. This pins that property with
+    the affine formula both pack paths use, across sym/asym, group sizes, and dtypes."""
+
+    QMAX = 15  # int4 unsigned codes
+
+    @staticmethod
+    def _codes(w, s, z):
+        return torch.clamp(torch.round(w / s) + z, 0, 15)
+
+    def test_grid_idempotency(self):
+        torch.manual_seed(0)
+        n_elem = 256 * 1024
+        for group in (None, 128):
+            for sym in (True, False):
+                for dtype in (torch.float32, torch.bfloat16):
+                    w = (torch.randn(n_elem) * 0.02).to(dtype)
+                    if group is None:
+                        wg = w.reshape(1, -1)
+                        s = (wg.abs().amax() / 7.0).clamp(min=1e-6).reshape(1, 1)
+                        z = torch.full_like(s, 8.0 if sym else 7.5)
+                    else:
+                        wg = w.reshape(-1, group)
+                        s = (wg.abs().amax(dim=1, keepdim=True) / 7.0).clamp(min=1e-6)
+                        z = (
+                            torch.full_like(s, 8.0)
+                            if sym
+                            else (-wg.min(dim=1, keepdim=True).values / s).round().clamp(0, 15)
+                        )
+                    c1 = self._codes(wg, s, z)
+                    self.assertTrue((c1 >= 0).all() and (c1 <= 15).all())
+                    # qdq reconstruction (what the serial unwrapper leaves in weight.data),
+                    # computed in the storage dtype -- includes the bf16 roundtrip error
+                    w2 = (s * (c1 - z)).to(dtype)
+                    c2 = self._codes(w2, s, z)
+                    self.assertTrue(
+                        torch.equal(c1, c2),
+                        f"non-idempotent codes: group={group} sym={sym} dtype={dtype}, "
+                        f"{(c1 != c2).sum().item()} mismatches",
+                    )
+
+    def test_apply_vs_serial_packed_codes(self):
+        """End-to-end flavor: one Linear packed from original vs qdq weight, identical
+        scale/zp -> identical codes (the property _apply_tuned_results relies on)."""
+        torch.manual_seed(1)
+        dtype = torch.bfloat16
+        w = (torch.randn(64, 256) * 0.02).to(dtype)
+        wg = w.reshape(-1, 128)
+        s = (wg.abs().amax(dim=1, keepdim=True) / 7.0).clamp(min=1e-6)
+        z = torch.full_like(s, 8.0)  # sym int4 in unsigned code space
+        lin_orig = torch.nn.Linear(256, 64, bias=False, dtype=dtype)
+        with torch.no_grad():
+            lin_orig.weight.copy_(w)
+        c_orig = self._codes(lin_orig.weight.reshape(-1, 128), s, z)
+        w_qdq = (s * (c_orig - z)).reshape(lin_orig.weight.shape).to(dtype)
+        lin_qdq = torch.nn.Linear(256, 64, bias=False, dtype=dtype)
+        with torch.no_grad():
+            lin_qdq.weight.copy_(w_qdq)
+        c_qdq = self._codes(lin_qdq.weight.reshape(-1, 128), s, z)
+        self.assertTrue(torch.equal(c_orig, c_qdq))
