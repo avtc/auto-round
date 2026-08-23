@@ -458,6 +458,7 @@ def launch_is_reexecutable(argv: Optional[Sequence[str]]) -> bool:
 
 def block_parallel_tuning_enabled(
     *,
+    enabled: bool,
     need_quanted_input: bool,
     super_group_size: Optional[int],
     nblocks: int,
@@ -469,17 +470,17 @@ def block_parallel_tuning_enabled(
 ) -> Optional[str]:
     """Decide whether block-parallel tuning may run in this process.
 
-    Returns ``None`` when enabled, the string ``"env"`` when the feature flag
+    Returns ``None`` when enabled, the string ``"disabled"`` when the feature
     is simply off (normal serial path -- never an error), or a human-readable
-    reason when the flag is ON but a guard blocks execution (the caller should
-    fail loudly rather than silently fall back to serial).
+    reason when it is ON but a guard blocks execution (the caller should fail
+    loudly rather than silently fall back to serial).
 
     Parallel tuning re-execs the same CLI in worker processes, so it requires
     a reconstructible command line (CLI usage). All conditions that make blocks
     order-dependent or the save path non-mergeable block it.
     """
-    if not envs.AR_ENABLE_BLOCK_PARALLEL_TUNING:
-        return "env"
+    if not enabled:
+        return "disabled"
     if envs.AR_BLOCK_PARALLEL_WORKER:
         return "worker process (no recursive parallelism)"
     if not launch_is_reexecutable(argv):

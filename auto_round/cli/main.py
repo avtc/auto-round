@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import os
 import sys
 
 from auto_round import envs
@@ -61,6 +60,7 @@ def _build_entry_base_kwargs(args, *, low_cpu_mem_usage, enable_torch_compile, l
         "nsamples": args.nsamples,
         "batch_size": args.batch_size,
         "low_gpu_mem_usage": args.low_gpu_mem_usage,
+        "enable_block_parallel_tuning": getattr(args, "enable_block_parallel_tuning", False),
         "low_cpu_mem_usage": low_cpu_mem_usage,
         "device_map": args.device_map,
         "enable_torch_compile": enable_torch_compile,
@@ -242,16 +242,6 @@ def start(recipe="default", argv=None):
     tune(args)
 
 
-def _apply_block_parallel_flag(args) -> None:
-    """Mirror the ``--enable_block_parallel_tuning`` flag into the env gate.
-
-    The env var stays the single switch the runtime reads, keeping CI and
-    API-script users on the same mechanism as the CLI.
-    """
-    if getattr(args, "enable_block_parallel_tuning", False):
-        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "1"
-
-
 def tune(args):
     assert args.model or args.model_name, "[model] or --model MODEL_NAME should be set."
     if args.model is None:
@@ -300,8 +290,6 @@ def tune(args):
 
     if args.enable_torch_compile is False:
         logger.info("`torch.compile` is explicitly disabled with `--disable_torch_compile`.")
-
-    _apply_block_parallel_flag(args)
 
     model_name = args.model
     if model_name[-1] == "/":

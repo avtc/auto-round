@@ -51,20 +51,14 @@ class TestEnableBlockParallelTuningFlag(unittest.TestCase):
         self.assertFalse(_parse([]).enable_block_parallel_tuning)
         self.assertTrue(_parse(["--enable_block_parallel_tuning"]).enable_block_parallel_tuning)
 
-    def test_flag_mirrors_into_env_gate(self):
-        from types import SimpleNamespace
+    def test_flag_flows_into_entry_kwargs(self):
+        from auto_round.cli.main import _build_entry_base_kwargs
 
-        from auto_round.cli.main import _apply_block_parallel_flag
+        def kw(args):
+            return _build_entry_base_kwargs(args, low_cpu_mem_usage=True, enable_torch_compile=None, layer_config=None)
 
-        env = "AR_ENABLE_BLOCK_PARALLEL_TUNING"
-        try:
-            os.environ.pop(env, None)
-            _apply_block_parallel_flag(SimpleNamespace(enable_block_parallel_tuning=False))
-            self.assertNotIn(env, os.environ)
-            _apply_block_parallel_flag(SimpleNamespace(enable_block_parallel_tuning=True))
-            self.assertEqual(os.environ.get(env), "1")
-        finally:
-            os.environ.pop(env, None)
+        self.assertFalse(kw(_parse([]))["enable_block_parallel_tuning"])
+        self.assertTrue(kw(_parse(["--enable_block_parallel_tuning"]))["enable_block_parallel_tuning"])
 
 
 if __name__ == "__main__":

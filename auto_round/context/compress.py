@@ -42,6 +42,7 @@ class CompressContext(BaseContext):
         static_attention_dtype: Optional[torch.dtype] = None,
         static_kv_granularity: str = "tensor",
         static_attention_granularity: str = "tensor",
+        enable_block_parallel_tuning: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -62,6 +63,7 @@ class CompressContext(BaseContext):
         self.static_attention_dtype = static_attention_dtype
         self.static_kv_granularity = static_kv_granularity
         self.static_attention_granularity = static_attention_granularity
+        self.enable_block_parallel_tuning = enable_block_parallel_tuning
 
     def clear_memory(self, tensor=None):
         """Clear GPU/CPU memory only when ``low_gpu_mem_usage`` is enabled."""

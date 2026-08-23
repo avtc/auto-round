@@ -60,9 +60,10 @@ class TestWorkerCommand(unittest.TestCase):
 
 
 class TestGuardReasons(unittest.TestCase):
-    """Guard returns None (ok), 'env' (flag off), or a reason (flag on, blocked)."""
+    """Guard returns None (ok), 'disabled' (off), or a reason (on, blocked)."""
 
     BASE = dict(
+        enabled=True,
         need_quanted_input=False,
         super_group_size=None,
         nblocks=1,
@@ -74,19 +75,14 @@ class TestGuardReasons(unittest.TestCase):
     )
 
     def setUp(self):
-        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "1"
         os.environ.pop("AR_BLOCK_PARALLEL_WORKER", None)
         os.environ.pop("AR_RESUME_DIR", None)
-
-    def tearDown(self):
-        os.environ.pop("AR_ENABLE_BLOCK_PARALLEL_TUNING", None)
 
     def test_enabled_returns_none(self):
         self.assertIsNone(block_parallel.block_parallel_tuning_enabled(**self.BASE))
 
-    def test_flag_off_returns_env(self):
-        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "0"
-        self.assertEqual(block_parallel.block_parallel_tuning_enabled(**self.BASE), "env")
+    def test_disabled_returns_disabled(self):
+        self.assertEqual(block_parallel.block_parallel_tuning_enabled(**{**self.BASE, "enabled": False}), "disabled")
 
     def test_quanted_input_reason_mentions_flag(self):
         reason = block_parallel.block_parallel_tuning_enabled(**{**self.BASE, "need_quanted_input": True})
@@ -270,21 +266,18 @@ class TestLaunchIsReexecutable(unittest.TestCase):
         self.assertFalse(block_parallel.launch_is_reexecutable(None))
 
     def test_enabled_reason_mentions_launcher_for_foreign_argv(self):
-        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "1"
         os.environ.pop("AR_BLOCK_PARALLEL_WORKER", None)
-        try:
-            reason = block_parallel.block_parallel_tuning_enabled(
-                need_quanted_input=False,
-                super_group_size=None,
-                nblocks=1,
-                n_block_groups=2,
-                is_immediate_packing=True,
-                is_immediate_saving=True,
-                n_blocks_total=4,
-                argv=["pytest", "-q"],
-            )
-        finally:
-            os.environ.pop("AR_ENABLE_BLOCK_PARALLEL_TUNING", None)
+        reason = block_parallel.block_parallel_tuning_enabled(
+            enabled=True,
+            need_quanted_input=False,
+            super_group_size=None,
+            nblocks=1,
+            n_block_groups=2,
+            is_immediate_packing=True,
+            is_immediate_saving=True,
+            n_blocks_total=4,
+            argv=["pytest", "-q"],
+        )
         self.assertIsNotNone(reason)
         self.assertIn("launcher", reason)
 

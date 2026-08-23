@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     AR_RESUME_DIR: Optional[str] = None
     AR_FORCE_MOE_ROUTING_ALL_EXPERTS: bool = False
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
-    AR_ENABLE_BLOCK_PARALLEL_TUNING: bool = False
     AR_BLOCK_PARALLEL_WORKER: bool = False
     AR_BLOCK_PARALLEL_RANK: int = -1
     AR_BLOCK_PARALLEL_RESULTS: Optional[str] = None
@@ -140,12 +139,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight global scale. Disable only for runtimes without that requirement.
     "AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE": lambda: os.getenv("AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE", "1").lower()
     not in ("0", "false", "no", "off"),
-    # Enables block-parallel tuning: transformer blocks are tuned concurrently
-    # by re-exec'd worker processes, one per eligible GPU, fed block
-    # assignments through a strict-frontier relay. Experimental (default off); the serial
-    # block-wise loop remains the default until validated broadly.
-    "AR_ENABLE_BLOCK_PARALLEL_TUNING": lambda: os.getenv("AR_ENABLE_BLOCK_PARALLEL_TUNING", "0").lower()
-    in ("1", "true", "yes"),
     # Internal sentinel set in worker processes spawned for block-parallel
     # tuning; prevents workers from spawning further parallel runs.
     "AR_BLOCK_PARALLEL_WORKER": lambda: os.getenv("AR_BLOCK_PARALLEL_WORKER", "0").lower() in ("1", "true", "yes"),

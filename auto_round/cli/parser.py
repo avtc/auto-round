@@ -142,10 +142,7 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
     rt.add_argument(
         "--enable_block_parallel_tuning",
         action="store_true",
-        help=(
-            "Tune transformer blocks in parallel across the GPUs in --device_map "
-            "(experimental; same as setting AR_ENABLE_BLOCK_PARALLEL_TUNING=1)."
-        ),
+        help=("Tune transformer blocks in parallel across the GPUs in --device_map (experimental)."),
     )
     low_gpu_mutex = parser.add_mutually_exclusive_group()
     low_gpu_mutex.add_argument(

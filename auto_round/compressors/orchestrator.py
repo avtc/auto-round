@@ -695,14 +695,15 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         def _fail_if_requested(reason: str) -> bool:
             # Explicitly requested but cannot run: fail loudly instead of
-            # silently burning hours in the serial loop. Want serial? Don't set
-            # the parallel flag.
+            # silently burning hours in the serial loop. Want serial? Leave
+            # block-parallel tuning off.
             raise RuntimeError(
-                f"AR_ENABLE_BLOCK_PARALLEL_TUNING=1 was requested but block-parallel tuning "
-                f"cannot run: {reason}. Fix the condition, or unset the flag for serial tuning."
+                f"Block-parallel tuning was requested (enable_block_parallel_tuning) but cannot "
+                f"run: {reason}. Fix the condition, or leave it off for serial tuning."
             )
 
         reason = bp.block_parallel_tuning_enabled(
+            enabled=self.compress_context.enable_block_parallel_tuning,
             need_quanted_input=bool(self.alg_composer.need_quanted_input()),
             super_group_size=self.super_group_size,
             nblocks=self.nblocks,
@@ -712,7 +713,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             n_blocks_total=sum(len(group) for group in all_blocks),
             argv=sys.argv,
         )
-        if reason == "env":
+        if reason == "disabled":
             return False
         if reason is not None:
             logger.info("block-parallel tuning disabled: %s", reason)
@@ -1524,7 +1525,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         # for text-only dense models) when AR_RESUME_DIR is set, so a
         # crash/kill mid-tuning can resume from the first not-yet-quantized
         # block instead of restarting from block 0. See auto_round/utils/resume.py.
-        # ── Block-parallel tuning (AR_ENABLE_BLOCK_PARALLEL_TUNING, experimental) ──
+        # ── Block-parallel tuning (enable_block_parallel_tuning, experimental) ──
         # Worker processes re-exec the same CLI pinned to one GPU each, tune
         # relay-assigned blocks against the original-weights input chain
         # (blocks are independent: the serial loop chains reference outputs,
