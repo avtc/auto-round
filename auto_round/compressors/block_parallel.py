@@ -68,21 +68,6 @@ def eligible_gpus(required_free_bytes: int, allowed_indices: Optional[List[int]]
             out.append(index)
     return out
 
-def _available_ram_gb() -> Optional[float]:
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return float(line.split()[1]) / (1024**2)
-    except OSError:
-        pass
-    try:
-        import psutil  # noqa: PLC0415
-
-        return psutil.virtual_memory().available / (1024**3)
-    except Exception:  # noqa: BLE001
-        return None
-
 
 def worker_command(argv: Sequence[str], device: Optional[int] = None) -> List[str]:
     """Re-exec command for a worker: same CLI invocation as the parent.
@@ -145,9 +130,7 @@ def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_e
         env["AR_ENABLE_AUTO_SCHEME_PARALLEL"] = "0"  # single-GPU workers never fan out
         env.update(extra_env)
         log_path = os.path.join(log_dir, f"worker_{rank}.log")
-        logger.info(
-            "block-parallel tuning: worker %d -> gpu %d (log %s)", rank, gpu, log_path
-        )
+        logger.info("block-parallel tuning: worker %d -> gpu %d (log %s)", rank, gpu, log_path)
         log_file = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
         procs.append(
             subprocess.Popen(  # noqa: S603
@@ -198,6 +181,11 @@ def _block_results_path(results_dir: str, block_name: str) -> str:
     return os.path.join(results_dir, f"block_{_sanitize(block_name)}.pt")
 
 
+def block_result_path(results_dir: str, block_name: str) -> str:
+    """Path of a block's tuned-result file (see ``save_block_results``)."""
+    return _block_results_path(results_dir, block_name)
+
+
 def _chain_state_path(results_dir: str, group: int, block_idx: int) -> str:
     return os.path.join(results_dir, f"chain_g{group}_b{block_idx}.pt")
 
@@ -224,23 +212,34 @@ def has_block_results(results_dir: str, block_name: str) -> bool:
     return os.path.exists(_block_results_path(results_dir, block_name))
 
 
-def block_results_complete(results_dir: str, block_name: str) -> bool:
-    """File exists AND loads as a result dict.
+def read_block_result(results_dir: str, block_name: str):
+    """Load a block's result dict, or ``None`` when it is not usable yet.
 
+    ``None`` covers missing, still-being-written (unloadable), corrupt, and
+    non-dict files alike: all mean "not a result" to polling callers.
     An empty layer dict is a valid completion: blocks whose every layer is
     excluded from quantization tune to nothing and legitimately save an empty
-    result. Only an unloadable file (corrupt artifact) counts as not-done, so
-    a rerun re-tunes the block instead of erroring at pack time. Cheap
-    existence checks (polling loops) keep using has_block_results.
+    result. Prefer this over a load-then-load-again pair when the caller also
+    needs the payload (e.g. the advisory worker rank).
     """
     path = _block_results_path(results_dir, block_name)
     if not os.path.exists(path):
-        return False
+        return None
     try:
         data = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception:  # noqa: BLE001  corrupt file: not a result
-        return False
-    return isinstance(data, dict)
+    except Exception:  # noqa: BLE001  corrupt or half-written file: not a result
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def block_results_complete(results_dir: str, block_name: str) -> bool:
+    """File exists AND loads as a result dict (see ``read_block_result``).
+
+    Only an unloadable file (corrupt artifact) counts as not-done, so a rerun
+    re-tunes the block instead of erroring at pack time. Cheap existence
+    checks (polling loops) keep using has_block_results.
+    """
+    return read_block_result(results_dir, block_name) is not None
 
 
 def load_all_block_results(results_dir: str) -> dict:
@@ -261,14 +260,8 @@ def load_all_block_results(results_dir: str) -> dict:
 
 def read_result_rank(results_dir: str, block_name: str) -> int:
     """Advisory worker rank recorded in a block result, or -1."""
-    path = _block_results_path(results_dir, block_name)
-    if not os.path.exists(path):
-        return -1
-    try:
-        data = torch.load(path, map_location="cpu", weights_only=True)
-        return int(data.get("_worker_rank", -1))
-    except Exception:  # noqa: BLE001
-        return -1
+    data = read_block_result(results_dir, block_name)
+    return int(data.get("_worker_rank", -1)) if data else -1
 
 
 def missing_result_blocks(results_dir: str, all_blocks: "Sequence[list]") -> "List[str]":
@@ -292,6 +285,11 @@ def maybe_load_chain_state(results_dir: str, group: int, block_idx: int, device=
 
 def chain_state_exists(results_dir: str, group: int, block_idx: int) -> bool:
     return os.path.exists(_chain_state_path(results_dir or "", group, block_idx))
+
+
+def chain_state_path(results_dir: str, group: int, block_idx: int) -> str:
+    """Path of a chain-entry checkpoint (see ``save_chain_state``)."""
+    return _chain_state_path(results_dir or "", group, block_idx)
 
 
 def _to_cpu_recursive(obj):
@@ -361,6 +359,7 @@ def load_chain_state(results_dir: str, group: int, block_idx: int, device: str):
     payload = torch.load(path, map_location="cpu", weights_only=True)
     return _to_device_recursive(payload["hidden"], device)
 
+
 def save_signature(results_dir: str, signature: str) -> None:
     """Persist the run signature the results were produced under."""
     os.makedirs(results_dir, exist_ok=True)
@@ -409,14 +408,12 @@ def apply_shared_nonblocks(model, block_prefixes, path: str) -> int:
     from accelerate.utils import set_module_tensor_to_device  # noqa: PLC0415
 
     payload = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    module_tensors = dict(model.named_parameters()) | dict(model.named_buffers())
     applied = 0
     for name, value in payload.items():
-        module_tensors = dict(model.named_parameters()) | dict(model.named_buffers())
         current = module_tensors.get(name)
         if current is None or current.device.type == "meta":
-            set_module_tensor_to_device(
-                model, name, "cpu", value=value, dtype=value.dtype
-            )
+            set_module_tensor_to_device(model, name, "cpu", value=value, dtype=value.dtype)
             applied += 1
     return applied
 
@@ -430,10 +427,33 @@ def save_shared_inputs(payload: dict, path: str) -> None:
 
 
 def load_shared_inputs(path: str) -> dict:
-    """Mmap-load the shared calibration inputs (tensors share pages)."""
+    """Mmap-load the shared calibration inputs (tensors share pages).
+
+    ``weights_only=True`` suffices: the payload is tensors and primitives
+    (see ``_snapshot_calib_state``)."""
     import torch  # noqa: PLC0415
 
-    return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    return torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+
+
+def launch_is_reexecutable(argv: Optional[Sequence[str]]) -> bool:
+    """Whether re-running ``argv`` rebuilds this process's quantize entry.
+
+    Workers are spawned by re-executing the parent's command line, so only
+    launch forms that rebuild the auto-round entry point may enable parallel
+    tuning: the package's own ``-m auto_round`` main script or a Python driver
+    script (the re-executed script rebuilds AutoRound and the worker env
+    branch routes it into queue-serve mode). Foreign launchers (pytest,
+    jupyter, shell wrappers) re-run an unrelated program and are rejected.
+    """
+    if not argv:
+        return False
+    argv0 = str(argv[0])
+    if argv0.endswith("__main__.py"):
+        from pathlib import PurePath
+
+        return PurePath(argv0).parent.name == "auto_round"
+    return argv0.endswith(".py")
 
 
 def block_parallel_tuning_enabled(
@@ -462,8 +482,8 @@ def block_parallel_tuning_enabled(
         return "env"
     if envs.AR_BLOCK_PARALLEL_WORKER:
         return "worker process (no recursive parallelism)"
-    if argv is None or len(argv) == 0:
-        return "no reconstructible command line (API usage)"
+    if not launch_is_reexecutable(argv):
+        return "no reconstructible command line (API usage or a launcher that cannot re-run auto-round)"
     if need_quanted_input:
         return (
             "quantized-input chain (sequential replay) is active; blocks are order-dependent. "

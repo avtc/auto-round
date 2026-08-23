@@ -164,3 +164,35 @@ class TestLayerConfigFingerprint:
         cfg_with_tensor = {"layer.0": {"bits": 4, "weight": torch.ones(2, 2)}}
         cfg_without_tensor = {"layer.0": {"bits": 4}}
         assert layer_config_fingerprint(cfg_with_tensor) == layer_config_fingerprint(cfg_without_tensor)
+
+
+
+class TestMarkBlockDoneFromFile:
+    def _rs(self, d, names=("b0", "b1")):
+        return ResumeState(d, "sig", list(names))
+
+    def test_handoff_writes_same_bytes_and_manifest(self, tmp_path):
+        import json
+
+        from auto_round.compressors import block_parallel
+
+        src_dir = str(tmp_path / "parallel")
+        entry = [{"h": torch.arange(4, dtype=torch.float32)}]
+        block_parallel.save_chain_state(src_dir, 0, 1, entry)
+        rs = self._rs(str(tmp_path))
+        rs.mark_block_done_from_file("b0", block_parallel.chain_state_path(src_dir, 0, 1))
+        assert rs.completed_blocks == ["b0"]
+        restored = torch.load(rs.input_ids_path, map_location="cpu", weights_only=True)
+        # the checkpoint payload wrapper is preserved verbatim
+        assert restored["hidden"][0]["h"].tolist() == [0.0, 1.0, 2.0, 3.0]
+        with open(rs.manifest_path) as f:
+            assert json.load(f)["completed_blocks"] == ["b0"]
+
+    def test_out_of_order_handoff_is_rejected(self, tmp_path):
+        from auto_round.compressors import block_parallel
+
+        src_dir = str(tmp_path / "parallel")
+        block_parallel.save_chain_state(src_dir, 0, 0, [{"h": torch.zeros(1)}])
+        rs = self._rs(str(tmp_path))
+        with pytest.raises(AssertionError):
+            rs.mark_block_done_from_file("b1", block_parallel.chain_state_path(src_dir, 0, 0))

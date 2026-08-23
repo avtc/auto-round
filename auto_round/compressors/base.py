@@ -21,8 +21,8 @@ from typing import Any, Optional, Union
 import torch
 from transformers import AutoConfig, set_seed
 
-from auto_round.algorithms.quantization import BaseQuantizer, QuantizationConfig
 from auto_round import envs
+from auto_round.algorithms.quantization import BaseQuantizer, QuantizationConfig
 from auto_round.algorithms.transforms import (
     BaseRotationConfig,
     apply_rotation,

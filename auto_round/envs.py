@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     AR_BLOCK_PARALLEL_RESULTS: Optional[str] = None
     AR_BLOCK_PARALLEL_SHARED_NONBLOCKS: Optional[str] = None
     AR_BLOCK_PARALLEL_SHARED_INPUTS: Optional[str] = None
+    AR_SCHEME_MEM_INVENTORY: bool = False
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -147,8 +148,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     in ("1", "true", "yes"),
     # Internal sentinel set in worker processes spawned for block-parallel
     # tuning; prevents workers from spawning further parallel runs.
-    "AR_BLOCK_PARALLEL_WORKER": lambda: os.getenv("AR_BLOCK_PARALLEL_WORKER", "0").lower()
-    in ("1", "true", "yes"),
+    "AR_BLOCK_PARALLEL_WORKER": lambda: os.getenv("AR_BLOCK_PARALLEL_WORKER", "0").lower() in ("1", "true", "yes"),
     # Internal: advisory worker rank for live assignment targeting; injected
     # by the parent into worker envs, recorded in block result payloads.
     "AR_BLOCK_PARALLEL_RANK": lambda: int(os.getenv("AR_BLOCK_PARALLEL_RANK", "-1")),
@@ -158,9 +158,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the parent and consumed by workers (and by the parent on resume).
     "AR_BLOCK_PARALLEL_SHARED_NONBLOCKS": lambda: os.getenv("AR_BLOCK_PARALLEL_SHARED_NONBLOCKS", None),
     "AR_BLOCK_PARALLEL_SHARED_INPUTS": lambda: os.getenv("AR_BLOCK_PARALLEL_SHARED_INPUTS", None),
-    # When enabled (default), block-parallel tuning workers checkpoint their
-    # per-block tuned scale/zp plus the chained hidden state after every
-    # completed block, so an interrupted run resumes from the first missing
+    # Logs a per-device live-tensor census during AutoScheme scoring (debug
+    # aid for memory-driven worker placement).
+    "AR_SCHEME_MEM_INVENTORY": lambda: os.getenv("AR_SCHEME_MEM_INVENTORY", "0").lower() in ("1", "true", "yes"),
 }
 
 

@@ -25,18 +25,16 @@ from accelerate.big_modeling import dispatch_model
 from tqdm import tqdm
 
 from auto_round import envs
-from auto_round.compressors.block_parallel import (
-    load_chain_state as _bp_load_chain_state,
-    save_block_results as _bp_save_block_results,
-    save_chain_state as _bp_save_chain_state,
-    delete_chain_state as _bp_delete_chain_state,
-    block_results_complete as _bp_block_results_complete,
-)
 from auto_round.calibration import CalibrationContext
 from auto_round.calibration.utils import (
     _update_inputs,
 )
 from auto_round.compressors.base import BaseOrchestrator
+from auto_round.compressors.block_parallel import chain_state_exists as _bp_chain_state_exists
+from auto_round.compressors.block_parallel import delete_chain_state as _bp_delete_chain_state
+from auto_round.compressors.block_parallel import load_chain_state as _bp_load_chain_state
+from auto_round.compressors.block_parallel import save_block_results as _bp_save_block_results
+from auto_round.compressors.block_parallel import save_chain_state as _bp_save_chain_state
 from auto_round.compressors.utils import (
     _get_quantized_layer_names_outside_blocks,
     immediate_pack,
@@ -73,6 +71,41 @@ if TYPE_CHECKING:
 
 
 # TODO wenhuach align all the API args
+def _tuned_layer_key(block_name: str, sub_name: str, sub) -> str:
+    """Key of a tuned layer in the block-results files: the layer's
+    ``global_name`` when set, else its path below the block (the bare block
+    name for the root submodule). Both sides of the worker->parent handoff
+    (collect and apply) must build it identically."""
+    return getattr(sub, "global_name", None) or (f"{block_name}.{sub_name}" if sub_name else block_name)
+
+
+def _ordered_undone_blocks(all_blocks, done, assigned):
+    """All blocks not yet done and not currently assigned, group order then index."""
+    return [
+        (g, k)
+        for g, blocks in enumerate(all_blocks)
+        for k in range(len(blocks))
+        if k not in done[g] and (g, k) not in assigned.values()
+    ]
+
+
+def _dispatch_candidate(all_blocks, done, assigned, ramp_start, results_dir):
+    """Next block to tune, or ``None`` when none is dispatchable.
+
+    Strict sequential relay: the lowest undone, unassigned block whose entry
+    is available. A group's ramp-start block's entry comes from the serial
+    manifest or the group cache; every later block's entry checkpoint is
+    published by the previous assignee's chain forward, so gating on it
+    cascades the ramp regardless of worker count. ``None`` distinguishes
+    "entries not published yet" (retried next tick) from an empty ``blocks``
+    list (caller stops the worker).
+    """
+    undone = _ordered_undone_blocks(all_blocks, done, assigned)
+    if not undone:
+        return []
+    return [(g, k) for (g, k) in undone if k == ramp_start[g] or _bp_chain_state_exists(results_dir, g, k)]
+
+
 class CompressionOrchestrator(BaseOrchestrator):
 
     def __init__(
@@ -204,6 +237,41 @@ class CompressionOrchestrator(BaseOrchestrator):
         m_ff.to("meta")
         clear_memory(device_list=device_manager.device_list)
         return ff_output
+
+    def _resolve_chain_entry(self, g: int, k: int, held, results_dir: str, rank: int):
+        """Entry for tuning block ``k`` of group ``g``.
+
+        Resolution order: the held chain step when the assignment is sticky
+        (zero cost), else the block's checkpoint (retried briefly for filesystem
+        visibility), else the serial manifest frontier on a resumed run.
+        Returns ``None`` only for ``k == 0`` with no checkpoint (serial block-0
+        semantics: the tune uses the group's cached calibration entry). A
+        non-frontier block without a checkpoint means the publish never
+        happened; surfaced, never rebuilt.
+        """
+        if held is not None and held[0] == g and held[1] == k:
+            return held[2]  # single-worker pools: held entry IS the frontier
+        import time as _t_direct
+
+        entry = None
+        for _attempt in range(4):
+            entry = _bp_load_chain_state(results_dir, g, k, device=self.compress_context.cache_device)
+            if entry is not None:
+                break
+            _t_direct.sleep(0.5)
+        if entry is not None:
+            return entry
+        prefix, frontier_entry = self._manifest_frontier(g)
+        if k > 0 and prefix == k and frontier_entry is not None:
+            # resumed run: the manifest frontier IS this block's entry
+            return frontier_entry
+        if k > 0:
+            raise RuntimeError(
+                f"block-parallel worker {rank}: chain entry for block {k} "
+                f"unreadable after 4 reads (manifest prefix {prefix}) -- "
+                "checkpoint was not published; see worker logs"
+            )
+        return None
 
     def _manifest_frontier(self, group_idx: int):
         """(prefix, entry) from the serial manifest, or (0, None).
@@ -428,9 +496,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # resumable unit complete: persist this block's tuned scale/zp
                 # (the chain checkpoint is NOT written here -- the assigned
                 # forward's pre-tune tail already published it)
-                _bp_save_block_results(
-                    bp_results_dir, block_names[i], self._collect_tuned_layers(block_names[i])
-                )
+                _bp_save_block_results(bp_results_dir, block_names[i], self._collect_tuned_layers(block_names[i]))
 
             if self.compress_context.is_immediate_saving and not is_bp_worker:
                 self.shard_writer.write(m, is_finalize=False)
@@ -488,7 +554,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         clear_memory()
         return chained_input
 
-
     def _build_resume_states(self, all_blocks: list) -> list:
         """Build one ResumeState per block group under AR_RESUME_DIR.
 
@@ -523,9 +588,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self.calibration_context.seqlen,
                 block_names,
             )
-            states.append(
-                ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names)
-            )
+            states.append(ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names))
         return states
 
     def _parent_shared_inputs_path(self) -> Optional[str]:
@@ -573,6 +636,47 @@ class CompressionOrchestrator(BaseOrchestrator):
         for comp, ga in zip(self._bp_compressor_list(), state.get("ga_steps", [])):
             if ga is not None and hasattr(comp, "gradient_accumulate_steps"):
                 comp.gradient_accumulate_steps = ga
+
+    def _cleanup_block_parallel_scratch(self) -> None:
+        """Remove block-parallel scratch once the export has finalized.
+
+        Tuned results, chain checkpoints, and worker logs only serve resuming
+        an interrupted run; after the shards are final they are dead weight
+        (several GB per run).
+        """
+        bp_results = getattr(self, "_bp_results_to_clean", None)
+        if not bp_results:
+            return
+        import shutil
+
+        shutil.rmtree(bp_results, ignore_errors=True)
+        self._bp_results_to_clean = None
+        logger.info("block-parallel tuning: removed scratch results in %s", bp_results)
+
+    def _parallel_run_signature(self, all_blocks: list) -> str:
+        """Signature binding resume artifacts to this run's semantics.
+
+        Guards block results, chain checkpoints, and the shared calibration
+        inputs: any change to model, scheme, layer config, chain mode, dataset,
+        or sampling shape must invalidate artifacts from a prior run.
+        """
+        from auto_round.utils.resume import compute_run_signature, layer_config_fingerprint
+
+        model_dir = getattr(self.model_context, "disk_stream_model_dir", None) or getattr(
+            getattr(self.model_context.model, "config", None), "_name_or_path", None
+        )
+        return compute_run_signature(
+            model_dir,
+            str(self.scheme)
+            + "|"
+            + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
+            + "|qi="
+            + str(bool(self.alg_composer.need_quanted_input())),
+            str(getattr(self, "dataset", None)),
+            self.calibration_context.nsamples,
+            self.calibration_context.seqlen,
+            flatten_list(all_blocks),
+        )
 
     def _maybe_block_parallel_tune(
         self, all_blocks: list, is_worker: bool, all_inputs: dict = None, input_ids_cache=None, pbar=None
@@ -632,8 +736,26 @@ class CompressionOrchestrator(BaseOrchestrator):
                     continue
                 nbytes = sum(p.numel() * p.element_size() for p in block.parameters())
                 largest_block_bytes = max(largest_block_bytes, nbytes)
-        required_vram_bytes = int(largest_block_bytes * 3) + (4 * 1024**3)
+        # activation margin: each worker holds the block entry, the preprocessed
+        # inputs, and tune-time intermediate activations, all scaling with
+        # nsamples x seqlen x hidden; the weights-only formula below would OOM
+        # edge configs (large nsamples/seqlen) at tune time
+        entry_bytes = 0
+        try:
+            hidden = getattr(getattr(self.model_context.model, "config", None), "hidden_size", 0) or 0
+        except Exception:  # noqa: BLE001  config-less stub models
+            hidden = 0
+        if hidden:
+            per_sample = self.calibration_context.nsamples * self.calibration_context.seqlen * hidden
+            entry_bytes = int(per_sample * 2 * 4 * 2)  # fp tensors x (entry + preprocessed)
+        required_vram_bytes = int(largest_block_bytes * 3) + (4 * 1024**3) + entry_bytes
         gpu_ids = bp.eligible_gpus(required_vram_bytes, allowed_indices=allowed or None)
+        if not gpu_ids:
+            raise RuntimeError(
+                "block-parallel tuning: no eligible GPU. Each worker needs the largest block's "
+                f"weights x3 plus activation margin (~{required_vram_bytes / 1024**3:.1f} GiB free "
+                "per GPU). Widen --device_map or free VRAM."
+            )
 
         # Resume storage reuses the serial flag: AR_RESUME_DIR set -> per-block
         # result files + chain checkpoints under <AR_RESUME_DIR>/block_parallel,
@@ -643,23 +765,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         import shutil
 
         if resumable:
-            from auto_round.utils.resume import compute_run_signature, layer_config_fingerprint
-
-            model_dir = getattr(self.model_context, "disk_stream_model_dir", None) or getattr(
-                getattr(self.model_context.model, "config", None), "_name_or_path", None
-            )
-            signature = compute_run_signature(
-                model_dir,
-                str(self.scheme)
-                + "|"
-                + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
-                + "|qi="
-                + str(bool(self.alg_composer.need_quanted_input())),
-                str(getattr(self, "dataset", None)),
-                self.calibration_context.nsamples,
-                self.calibration_context.seqlen,
-                flatten_list(all_blocks),
-            )
+            signature = self._parallel_run_signature(all_blocks)
             if os.path.isdir(results_dir) and not bp.signature_matches(results_dir, signature):
                 logger.warning(
                     "block-parallel tuning: results in %s were produced under a different run "
@@ -672,6 +778,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             output_root = getattr(self.compress_context, "output_dir", None) or "tmp_autoround"
             results_dir = os.path.join(output_root, "block_parallel_results")
             shutil.rmtree(results_dir, ignore_errors=True)  # no resume: never reuse stale results
+        # removed after the export finalizes (scratch and resume-dir alike):
+        # result files, checkpoints, and worker logs are worthless once the
+        # shards exist and only resume an interrupted run
+        self._bp_results_to_clean = results_dir
         sdir = bp.shared_dir(results_dir)
         nonblocks_path = os.path.join(sdir, "nonblocks.pt")
         inputs_path = os.path.join(sdir, "calib_inputs.pt")
@@ -711,7 +821,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             # parent-side job -- spawning model-loading workers would be pure waste
             logger.info(
                 "block-parallel tuning: all %d block(s) already tuned; packing from %s",
-                total_blocks, results_dir,
+                total_blocks,
+                results_dir,
             )
             tuned = bp.load_all_block_results(results_dir)
             if not tuned:
@@ -724,7 +835,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         gpu_ids = gpu_ids[:n_todo]  # never spawn more workers than blocks left
         logger.info(
             "block-parallel tuning: %d workers on GPUs %s, %d block(s) to tune, results %s%s",
-            len(gpu_ids), gpu_ids, n_todo, results_dir,
+            len(gpu_ids),
+            gpu_ids,
+            n_todo,
+            results_dir,
             " (resumable: rerun the same command to finish missing blocks)" if resumable else "",
         )
         env_extra = {
@@ -735,8 +849,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         procs = bp.spawn_workers(sys.argv, gpu_ids, log_dir=results_dir, extra_env=env_extra)
 
         def _ordered_undone():
-            return [(g, k) for g, blocks in enumerate(all_blocks) for k, b in enumerate(blocks)
-                    if k not in done[g] and (g, k) not in assigned.values()]
+            return _ordered_undone_blocks(all_blocks, done, assigned)
 
         ramp_start = {
             g: next((k for k in range(len(blocks)) if k not in done[g]), len(blocks))
@@ -747,9 +860,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _bp_delete_chain_state(results_dir, g, k)  # stale crash leftovers
         assigned = {}  # rank -> (group, index); absent == worker idle/finished
         stopped = set()
+        dispatched = {}  # (g, k) -> dispatch count; caps re-tunes of a block
+        # whose result file never becomes loadable (e.g. a full disk): without
+        # the cap the loop re-dispatches it forever while workers stay alive
+        _max_dispatches_per_block = 2
         seen_results = {
             (g, k) for g, blocks in enumerate(all_blocks) for k in range(len(blocks)) if k in done[g]
         }  # startup done-blocks are already accounted for -- the loop must not
+
         # re-process them as fresh results (which re-assigned their old ranks
         # and queued duplicate tune lines onto live workers)
         def _send(rank: int, message: str) -> None:
@@ -762,27 +880,27 @@ class CompressionOrchestrator(BaseOrchestrator):
             except (BrokenPipeError, ValueError):
                 pass  # worker death is handled by the liveness check
 
-        def _entry_available(target) -> bool:
-            g, k = target
-            if k == ramp_start[g]:
-                return True  # the run's starting frontier: manifest/group entry
-            return bp.chain_state_exists(results_dir, g, k)
-
         def _assign_next(rank: int) -> None:
-            """Push the next assignment to ``rank``: the lowest undone,
-            unassigned block whose entry is available. Strict sequential relay,
-            including at initialization: a block's entry checkpoint is published
-            by the previous assignee's chain forward (which runs before its
-            tune), so gating on it cascades the ramp -- worker n starts once
+            """Push the next assignment to ``rank`` (see ``_dispatch_candidate``).
+            The strict-frontier gating cascades the ramp: worker n starts once
             worker n-1's forward landed, reading instead of replaying. Worker
             count never matters."""
-            candidates = [c for c in _ordered_undone() if _entry_available(c)]
+            candidates = _dispatch_candidate(all_blocks, done, assigned, ramp_start, results_dir)
             if not candidates:
                 if not _ordered_undone():
                     stopped.add(rank)
                     _send(rank, "stop")
                 return  # entries not published yet; retried next tick
             target = candidates[0]
+            if dispatched.get(target, 0) >= _max_dispatches_per_block:
+                g, k = target
+                raise RuntimeError(
+                    f"block-parallel tuning: block {all_blocks[g][k]} produced no loadable result "
+                    f"after {_max_dispatches_per_block} dispatches "
+                    f"(result file: {bp.block_result_path(results_dir, all_blocks[g][k])}); "
+                    f"see worker logs in {results_dir}"
+                )
+            dispatched[target] = dispatched.get(target, 0) + 1
             assigned[rank] = target
             _send(rank, f"tune {target[0]} {target[1]}")
             logger.debug("block-parallel tuning: assigned g%d k%d to worker %d", target[0], target[1], rank)
@@ -826,15 +944,16 @@ class CompressionOrchestrator(BaseOrchestrator):
                 for k, b in enumerate(blocks):
                     if (g, k) in seen_results or not bp.has_block_results(results_dir, b):
                         continue
-                    if not bp.block_results_complete(results_dir, b):
-                        continue  # exists but unreadable (corrupt): not a result
+                    data = bp.read_block_result(results_dir, b)
+                    if data is None:
+                        continue  # exists but not loadable yet (corrupt/half-written): not a result
                     seen_results.add((g, k))
                     done[g].add(k)
                     # the block is complete: its entry checkpoint was consumed
                     # by the assignee and the manifest absorbed the block --
                     # nothing reads that checkpoint again
                     _bp_delete_chain_state(results_dir, g, k)
-                    rank = bp.read_result_rank(results_dir, b)
+                    rank = int(data.get("_worker_rank", -1))
                     if rank >= 0:
                         assigned.pop(rank, None)
             # ordered commit into the serial manifests, consuming the entry
@@ -844,8 +963,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     rs = resume_states[g]
                     while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
                         k = rs.resume_index
-                        entry_next = _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
-                        rs.mark_block_done(blocks[k], None, entry_next)
+                        rs.mark_block_done_from_file(blocks[k], bp.chain_state_path(results_dir, g, k + 1))
                         # no delete here: ckpt(k+1) is the frontier assignee's
                         # entry until block k+1 completes; the results loop
                         # above prunes it then (exact visibility window)
@@ -867,8 +985,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 rs = resume_states[g]
                 while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
                     k = rs.resume_index
-                    entry_next = _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
-                    rs.mark_block_done(blocks[k], None, entry_next)
+                    rs.mark_block_done_from_file(blocks[k], bp.chain_state_path(results_dir, g, k + 1))
 
         tuned = bp.load_all_block_results(results_dir)
         missing = bp.missing_result_blocks(results_dir, all_blocks)
@@ -879,7 +996,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         logger.info(
             "block-parallel tuning: merged tuned results for %d layers (worker exit codes %s)",
-            len(tuned), codes,
+            len(tuned),
+            codes,
         )
         self._apply_tuned_results(all_blocks, tuned)
         if resumable:
@@ -971,6 +1089,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             return entry
 
         held = None  # (group, next_index, entry)
+        group_preprocessed = None  # memo: one preprocess per assignment covers
+        # both the k==0 entry and the ff others (same group input; halves the
+        # GB-scale cache_device copies the two half-used passes would do)
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -979,41 +1100,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                 break
             _cmd, g, k = line.split()
             g, k = int(g), int(k)
-            logger.info("[bp-worker %d] assignment: %s", rank, line)
+            logger.info("block-parallel worker %d: assignment: %s", rank, line)
             blocks = all_blocks[g]
             if k >= len(blocks):
                 raise RuntimeError(f"assignment out of range: {line}")
 
             entry = None
-            if held is not None and held[0] == g and held[1] == k:
-                entry = held[2]  # single-worker pools: held entry IS the frontier
-            else:
-                # the parent dispatches k only after its checkpoint exists;
-                # the retry covers filesystem visibility, not recovery
-                import time as _t_direct
-
-                for _attempt in range(4):
-                    entry = _bp_load_chain_state(
-                        results_dir, g, k, device=self.compress_context.cache_device
-                    )
-                    if entry is not None:
-                        break
-                    _t_direct.sleep(0.5)
-                if entry is None:
-                    prefix, frontier_entry = self._manifest_frontier(g)
-                    if k > 0 and prefix == k and frontier_entry is not None:
-                        # resumed run: the manifest frontier IS this block's entry
-                        entry = frontier_entry
-                    elif k > 0:
-                        # a non-frontier block without a checkpoint means the
-                        # publish never happened; surface it, never rebuild it
-                        raise RuntimeError(
-                            f"block-parallel worker {rank}: chain entry for block {k} "
-                            f"unreadable after 4 reads (manifest prefix {prefix}) -- "
-                            "checkpoint was not published; see worker logs"
-                        )
-                    # k == 0: entry stays None and the tune uses the group's
-                    # cached calibration entry (serial block-0 semantics)
+            entry = self._resolve_chain_entry(g, k, held, results_dir, rank)
             if isinstance(entry, list) and any(t is None for t in entry):
                 bad = [i for i, t in enumerate(entry) if t is None][:4]
                 raise RuntimeError(
@@ -1021,27 +1114,27 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "the checkpoint file is corrupt; delete it and rerun"
                 )
 
+            if group_preprocessed is None:
+                group_preprocessed = self._preprocess_block_inputs(_group_entry(blocks))
             if entry is None:
                 # k == 0 with no chain checkpoint: the block's entry is the
                 # group's cached calibration entry, in PREPROCESSED (block-
                 # consumable) form -- the tail forwards it directly, while the
                 # tune path derives the same input internally (serial block-0
                 # semantics)
-                entry = self._preprocess_block_inputs(_group_entry(blocks))[0]
+                entry = group_preprocessed[0]
 
             # extend the chain BEFORE tuning: the ff consumes the pristine
             # entry; nothing reads the list afterward. The block's original
             # weights are streamed from the checkpoint either way.
             if k + 1 < len(blocks):
-                existing = bp.maybe_load_chain_state(
-                    results_dir, g, k + 1, device=self.compress_context.cache_device
-                )
+                existing = bp.maybe_load_chain_state(results_dir, g, k + 1, device=self.compress_context.cache_device)
                 if existing is not None:
                     # resume: a prior run already published this checkpoint;
                     # recompute would be identical, so reuse it
                     held = (g, k + 1, existing)
                 else:
-                    _others = self._preprocess_block_inputs(_group_entry(blocks))[1]
+                    _others = group_preprocessed[1]
                     next_entry = self._ff_one_block(
                         self.model_context.model,
                         blocks[k],
@@ -1071,7 +1164,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 start_block_idx=k,
                 resume_input_ids=entry,
             )
-            logger.info("[bp-worker %d] block %s done", rank, blocks[k])
+            logger.info("block-parallel worker %d: block %s done", rank, blocks[k])
 
     def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
         """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
@@ -1086,9 +1179,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block = get_module(self.model_context.model, block_name)
                 for sub_name, sub in block.named_modules():
                     if hasattr(sub, "bits") and check_to_quantized(sub):
-                        expected.add(
-                            getattr(sub, "global_name", None) or f"{block_name}.{sub_name}" or block_name
-                        )
+                        expected.add(_tuned_layer_key(block_name, sub_name, sub))
         missing = sorted(expected - set(tuned))
         if missing:
             sample_avail = sorted(tuned)[:5]
@@ -1111,10 +1202,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 convert_module_to_hp_if_necessary(block, self.model_context.amp_dtype, device_manager.device)
                 applied = 0
                 for sub_name, sub in block.named_modules():
-                    layer_name = getattr(sub, "global_name", None) or (
-                        f"{block_name}.{sub_name}" if sub_name else block_name
-                    )
-                    entry = tuned.get(layer_name)
+                    entry = tuned.get(_tuned_layer_key(block_name, sub_name, sub))
                     if entry is None or not hasattr(sub, "weight"):
                         continue
                     sub.scale = entry["scale"].to(sub.weight.device)
@@ -1151,8 +1239,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         for sub_name, sub in block.named_modules():
             if not hasattr(sub, "scale"):
                 continue
-            layer_name = getattr(sub, "global_name", None) or (f"{block_name}.{sub_name}" if sub_name else block_name)
-            results[layer_name] = {
+            results[_tuned_layer_key(block_name, sub_name, sub)] = {
                 "scale": sub.scale.detach().cpu() if isinstance(sub.scale, torch.Tensor) else sub.scale,
                 "zp": sub.zp.detach().cpu() if isinstance(sub.zp, torch.Tensor) else sub.zp,
             }
@@ -1340,10 +1427,20 @@ class CompressionOrchestrator(BaseOrchestrator):
         else:
             logger.info("start to cache block inputs")
         _shared_inputs_path = (
-            envs.AR_BLOCK_PARALLEL_SHARED_INPUTS
-            if envs.AR_BLOCK_PARALLEL_WORKER
-            else self._parent_shared_inputs_path()
+            envs.AR_BLOCK_PARALLEL_SHARED_INPUTS if envs.AR_BLOCK_PARALLEL_WORKER else self._parent_shared_inputs_path()
         )
+        _parent_restore = not envs.AR_BLOCK_PARALLEL_WORKER and _shared_inputs_path
+        if _parent_restore:
+            # a prior run's inputs are only valid under the same signature that
+            # guards its block results; otherwise cache fresh below
+            from auto_round.compressors import block_parallel as _bp_gate
+
+            _results_dir = _bp_gate.parallel_results_dir()
+            _shared_inputs_path = (
+                _shared_inputs_path
+                if _results_dir and _bp_gate.signature_matches(_results_dir, self._parallel_run_signature(all_blocks))
+                else None
+            )
         if _shared_inputs_path and os.path.isfile(_shared_inputs_path):
             # block-parallel worker (or parent resuming a prior parallel run):
             # reuse the parent-saved calibration inputs + synced context
@@ -1457,7 +1554,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "for resumability to be meaningful here."
                 )
             resume_states = self._build_resume_states(all_blocks)
-
 
         try:
             if envs.AR_BLOCK_PARALLEL_WORKER:
@@ -1581,15 +1677,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
-        # block-parallel scratch (tuned results, chain checkpoints, worker
-        # logs) is dead weight once the export finalizes -- several GB per run
-        bp_results = getattr(self, "_bp_results_to_clean", None)
-        if bp_results:
-            import shutil as _shutil
-
-            _shutil.rmtree(bp_results, ignore_errors=True)
-            self._bp_results_to_clean = None
-            logger.info("block-parallel tuning: removed scratch results in %s", bp_results)
+        self._cleanup_block_parallel_scratch()
 
         end_time = time.time()
         cost_time = end_time - start_time

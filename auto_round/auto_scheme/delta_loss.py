@@ -718,7 +718,9 @@ def _vram_inventory(tag: str, top_k: int = 12):
     import os as _os
     from collections import defaultdict
 
-    if _os.getenv("AR_SCHEME_MEM_INVENTORY", "0") != "1":
+    from auto_round import envs as _envs
+
+    if not _envs.AR_SCHEME_MEM_INVENTORY:
         return
     groups = defaultdict(lambda: [0, 0])
     for obj in _gc.get_objects():
@@ -732,8 +734,7 @@ def _vram_inventory(tag: str, top_k: int = 12):
     ranked = sorted(groups.items(), key=lambda kv: -kv[1][1])[:top_k]
     total = sum(v[1] for v in groups.values())
     alloc = torch.cuda.memory_allocated() / 2**30
-    print(f"[mem-inv] {tag}: live tensors {total / 2**30:.2f} GiB "
-          f"(allocator {alloc:.2f} GiB)", flush=True)
+    print(f"[mem-inv] {tag}: live tensors {total / 2**30:.2f} GiB " f"(allocator {alloc:.2f} GiB)", flush=True)
     for (shape, dtype), (cnt, nb) in ranked:
         print(f"[mem-inv]   {nb / 2**30:6.2f} GiB x{cnt:<4} {dtype} {shape}", flush=True)
 
@@ -1165,8 +1166,14 @@ def get_score_for_scheme(
                     "Provide a `processor` and a multimodal `dataset`."
                 )
             model_forward_low_gpu(
-                model, mllm_loader, major_device=major_device, pbar=pbar, scheme_tag=scheme_tag, disk_index=disk_index,
-                skip_batches=skip_batches, batch_checkpoint=batch_checkpoint,
+                model,
+                mllm_loader,
+                major_device=major_device,
+                pbar=pbar,
+                scheme_tag=scheme_tag,
+                disk_index=disk_index,
+                skip_batches=skip_batches,
+                batch_checkpoint=batch_checkpoint,
             )
         else:
             try:
@@ -1704,6 +1711,9 @@ def _inject_score_accumulators(model, state):
     for n, m in model.named_modules():
         if n in state and hasattr(m, "mix_score"):
             m.act_score, m.weight_score, m.act_cnt = state[n]
+            # mix_score is derived: hooks only update it on fresh accumulation, so a
+            # layer that sees no further batches would otherwise report its init value
+            m.mix_score = m.act_score + m.weight_score
 
 
 def _partial_scores_path(cache_path):
@@ -2144,9 +2154,7 @@ def _score_scheme_worker(args):
             )
 
         def batch_checkpoint(batch_idx, total_batches):
-            _save_partial_scores(
-                worker_cache_path, batch_idx, total_batches, _extract_score_accumulators(model)
-            )
+            _save_partial_scores(worker_cache_path, batch_idx, total_batches, _extract_score_accumulators(model))
 
     is_bf16 = isinstance(scheme, str) and scheme.upper() == "BF16"
     if isinstance(scheme, dict):
@@ -3311,6 +3319,8 @@ def gen_layer_config(
 
             accelerate.hooks.remove_hook_from_submodules(model)
             delattr(model, "hf_device_map")
+        # retry ON THE CPU as promised: passing the original major_device back
+        # would push the non-block modules onto the same full GPU and re-raise
         res = _gen_layer_config(
             auto_scheme,
             model,
@@ -3321,7 +3331,7 @@ def gen_layer_config(
             model_name=model_name,
             enable_torch_compile=enable_torch_compile,
             device_map=device_map,
-            major_device=major_device,
+            major_device="cpu",
             device_list=device_list,
             min_avg_bit_scheme=min_avg_bit_scheme,
             processor=processor,

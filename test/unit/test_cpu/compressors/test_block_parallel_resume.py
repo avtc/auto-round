@@ -47,9 +47,7 @@ class TestBlockResults(unittest.TestCase):
             all_blocks = [["model.layers.0", "model.layers.1"], ["model.layers.2"]]
             missing = block_parallel.missing_result_blocks(d, all_blocks)
             self.assertEqual(missing, ["model.layers.0", "model.layers.1", "model.layers.2"])
-            block_parallel.save_block_results(
-                d, "model.layers.1", {"x": {"scale": torch.tensor([1.0]), "zp": None}}
-            )
+            block_parallel.save_block_results(d, "model.layers.1", {"x": {"scale": torch.tensor([1.0]), "zp": None}})
             missing = block_parallel.missing_result_blocks(d, all_blocks)
             self.assertEqual(missing, ["model.layers.0", "model.layers.2"])
 
@@ -166,11 +164,11 @@ class TestSharedInputs(unittest.TestCase):
             back = block_parallel.load_shared_inputs(path)
             self.assertEqual(back["batch_size"], 2)
             self.assertEqual(back["ga_steps"], [8, None])
-            self.assertTrue(torch.equal(back["inputs"]["model.layers.0"]["input_ids"], payload["inputs"]["model.layers.0"]["input_ids"]))
-
-
-if __name__ == "__main__":
-    unittest.main()
+            self.assertTrue(
+                torch.equal(
+                    back["inputs"]["model.layers.0"]["input_ids"], payload["inputs"]["model.layers.0"]["input_ids"]
+                )
+            )
 
 
 class TestResumeReusesExistingCheckpoints(unittest.TestCase):
@@ -188,3 +186,7 @@ class TestResumeReusesExistingCheckpoints(unittest.TestCase):
             got = bp.maybe_load_chain_state(d, 0, 5, device="cpu")
             self.assertEqual(got["hidden"].shape, (2, 3))
             self.assertIsNone(bp.maybe_load_chain_state(d, 0, 6, device="cpu"))
+
+
+if __name__ == "__main__":
+    unittest.main()

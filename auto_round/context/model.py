@@ -322,9 +322,7 @@ class ModelContext(BaseContext):
             from auto_round.compressors.block_parallel import apply_shared_nonblocks
 
             applied = apply_shared_nonblocks(self.model, block_prefixes, shared_path)
-            logger.info(
-                "block-parallel worker: mmap-shared %d non-block tensors from %s", applied, shared_path
-            )
+            logger.info("block-parallel worker: mmap-shared %d non-block tensors from %s", applied, shared_path)
         else:
             materialize_non_block_params(self.model, block_prefixes, self._disk_stream_index, device="cpu")
 

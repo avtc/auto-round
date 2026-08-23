@@ -15,13 +15,16 @@
 """Tests for auto_round.compressors.block_parallel (pure helpers)."""
 
 import os
+import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
 os.environ.setdefault("AR_AUTO_SCHEME_CACHE", os.path.join(os.path.dirname(__file__), "cache"))
 
 from auto_round.compressors import block_parallel  # noqa: E402
+from auto_round.compressors import orchestrator  # noqa: E402
 
 
 class TestWorkerCommand(unittest.TestCase):
@@ -67,7 +70,7 @@ class TestGuardReasons(unittest.TestCase):
         is_immediate_packing=True,
         is_immediate_saving=True,
         n_blocks_total=64,
-        argv=["auto-round", "--a"],
+        argv=["C:/repo/auto_round/__main__.py", "--a"],
     )
 
     def setUp(self):
@@ -112,9 +115,10 @@ class TestDeleteChainState(unittest.TestCase):
 
 
 class TestOrchestratorMethodRoster(unittest.TestCase):
-    """The parent parallel path calls these on CompressionOrchestrator; a
-    call-site-without-def slipped through once (method lost in a refactor,
-    surfaced only on the server at Packing time) and killed a finished run."""
+    """The parent parallel path calls these methods on CompressionOrchestrator;
+    every call site needs a definition present on the class (a refactor can
+    move a method out from under a live call site, and workers only exercise
+    these paths at run time, not at import)."""
 
     def test_parent_path_methods_exist(self):
         from auto_round.compressors.orchestrator import CompressionOrchestrator
@@ -129,10 +133,6 @@ class TestOrchestratorMethodRoster(unittest.TestCase):
             "_quantize_blocks",
         ):
             self.assertTrue(hasattr(CompressionOrchestrator, name), name)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestBlockResultsComplete(unittest.TestCase):
@@ -227,3 +227,202 @@ class TestPackEquivalenceOriginalVsQdqWeight(unittest.TestCase):
         c_qdq = self._codes(lin_qdq.weight.reshape(-1, 128), s, z)
         self.assertTrue(torch.equal(c_orig, c_qdq))
 
+
+class TestScratchCleanup(unittest.TestCase):
+    def test_cleanup_removes_dir_and_resets(self):
+        """After the export finalizes the scratch dir (results, checkpoints,
+        worker logs) must be removed and the stash cleared."""
+        import tempfile
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        with tempfile.TemporaryDirectory() as d:
+            scratch = os.path.join(d, "block_parallel_results")
+            os.makedirs(scratch, exist_ok=True)
+            with open(os.path.join(scratch, "worker_0.log"), "w", encoding="utf-8") as f:
+                f.write("log")
+            orch._bp_results_to_clean = scratch
+            orch._cleanup_block_parallel_scratch()
+            self.assertFalse(os.path.exists(scratch))
+            self.assertIsNone(orch._bp_results_to_clean)
+
+    def test_cleanup_without_stash_is_noop(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch._cleanup_block_parallel_scratch()  # must not raise
+
+
+class TestLaunchIsReexecutable(unittest.TestCase):
+    def test_m_package_main_is_reexecutable(self):
+        self.assertTrue(block_parallel.launch_is_reexecutable(["/repo/auto_round/__main__.py", "--device_map", "0,1"]))
+
+    def test_python_driver_script_is_reexecutable(self):
+        self.assertTrue(block_parallel.launch_is_reexecutable(["driver.py", "--device_map", "0,1"]))
+
+    def test_foreign_launcher_is_rejected(self):
+        # foreign -m packages, console binaries, and empty argv must not re-exec
+        self.assertFalse(block_parallel.launch_is_reexecutable(["/venv/bin/pytest/__main__.py", "-q"]))
+        self.assertFalse(block_parallel.launch_is_reexecutable(["pytest", "-q"]))
+        self.assertFalse(block_parallel.launch_is_reexecutable(["jupyter", "notebook"]))
+        self.assertFalse(block_parallel.launch_is_reexecutable([]))
+        self.assertFalse(block_parallel.launch_is_reexecutable(None))
+
+    def test_enabled_reason_mentions_launcher_for_foreign_argv(self):
+        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "1"
+        os.environ.pop("AR_BLOCK_PARALLEL_WORKER", None)
+        try:
+            reason = block_parallel.block_parallel_tuning_enabled(
+                need_quanted_input=False,
+                super_group_size=None,
+                nblocks=1,
+                n_block_groups=2,
+                is_immediate_packing=True,
+                is_immediate_saving=True,
+                n_blocks_total=4,
+                argv=["pytest", "-q"],
+            )
+        finally:
+            os.environ.pop("AR_ENABLE_BLOCK_PARALLEL_TUNING", None)
+        self.assertIsNotNone(reason)
+        self.assertIn("launcher", reason)
+
+
+class TestDispatchCandidate(unittest.TestCase):
+    """Strict-frontier gating: a block is dispatchable only at its group's
+    ramp start or once its entry checkpoint exists; lowest block wins."""
+
+    def _run(self, done, assigned, ramp_start, existing, all_blocks=None):
+        all_blocks = all_blocks or [["b0", "b1", "b2"], ["c0", "c1"]]
+        with mock.patch.object(orchestrator, "_bp_chain_state_exists", side_effect=lambda r, g, k: (g, k) in existing):
+            return orchestrator._dispatch_candidate(all_blocks, done, assigned, ramp_start, "results")
+
+    def test_ramp_start_always_available_without_checkpoints(self):
+        # fresh run: both group heads dispatchable, nothing else
+        self.assertEqual(self._run([set(), set()], {}, {0: 0, 1: 0}, set()), [(0, 0), (1, 0)])
+
+    def test_later_block_waits_for_its_checkpoint(self):
+        # (0,1) published -> it becomes the next candidate after (0,0) assigned
+        assigned = {0: (0, 0)}
+        self.assertEqual(self._run([set(), set()], assigned, {0: 0, 1: 0}, {(0, 1)}), [(0, 1), (1, 0)])
+
+    def test_no_candidate_when_entries_not_published(self):
+        # only non-ramp blocks remain and none has a checkpoint: empty (retry)
+        done = [{0}, set()]
+        self.assertEqual(self._run(done, {0: (0, 1)}, {0: 0, 1: 0}, set()), [(1, 0)])
+
+    def test_empty_when_all_done_or_assigned(self):
+        done = [{0, 1, 2}, {0}]
+        assigned = {0: (1, 1)}
+        self.assertEqual(self._run(done, assigned, {0: 3, 1: 1}, set()), [])
+
+    def test_resume_ramp_start_is_the_manifest_frontier(self):
+        # blocks 0-1 done in group 0: ramp start is 2 and dispatches checkpoint-free
+        done = [{0, 1}, set()]
+        self.assertEqual(self._run(done, {}, {0: 2, 1: 0}, set()), [(0, 2), (1, 0)])
+
+
+class TestResolveChainEntry(unittest.TestCase):
+    """Worker-side entry resolution matrix."""
+
+    def _orch(self, manifest_frontier=(0, None), loaded=None):
+        import types
+
+        orch = orchestrator.CompressionOrchestrator.__new__(orchestrator.CompressionOrchestrator)
+        orch._manifest_frontier = lambda g: manifest_frontier
+        orch.compress_context = types.SimpleNamespace(cache_device="cpu")
+        self._loaded_calls = []
+        orch_loaded = self._loaded_calls
+
+        def fake_load(results_dir, g, k, device=None):
+            orch_loaded.append((g, k))
+            return loaded
+
+        patcher = mock.patch.object(orchestrator, "_bp_load_chain_state", side_effect=fake_load)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with mock.patch("time.sleep"):
+            return orch
+
+    def test_held_entry_returned_without_io(self):
+        orch = self._orch()
+        held = (0, 3, "entry-tensor")
+        self.assertIs(orch._resolve_chain_entry(0, 3, held, "results", rank=1), "entry-tensor")
+        self.assertEqual(self._loaded_calls, [])
+
+    def test_checkpoint_entry_loaded_when_present(self):
+        orch = self._orch(loaded="ckpt-entry")
+        self.assertIs(orch._resolve_chain_entry(0, 2, None, "results", rank=1), "ckpt-entry")
+
+    def test_manifest_frontier_used_for_resumed_ramp_block(self):
+        orch = self._orch(manifest_frontier=(2, "frontier-entry"), loaded=None)
+        self.assertIs(orch._resolve_chain_entry(0, 2, None, "results", rank=1), "frontier-entry")
+
+    def test_missing_nonfrontier_checkpoint_raises(self):
+        orch = self._orch(manifest_frontier=(2, "frontier-entry"), loaded=None)
+        with self.assertRaisesRegex(RuntimeError, "not published"):
+            orch._resolve_chain_entry(0, 3, None, "results", rank=1)
+
+    def test_first_block_without_checkpoint_returns_none(self):
+        orch = self._orch(loaded=None)
+        # k == 0: serial block-0 semantics, caller falls back to the group entry
+        self.assertIsNone(orch._resolve_chain_entry(1, 0, None, "results", rank=1))
+
+
+class TestReadBlockResult(unittest.TestCase):
+    def _save(self, d, name, payload):
+        rank = payload.pop("_worker_rank", None)
+        if rank is not None:
+            os.environ["AR_BLOCK_PARALLEL_RANK"] = str(rank)
+        try:
+            block_parallel.save_block_results(d, name, payload)
+        finally:
+            if rank is not None:
+                os.environ.pop("AR_BLOCK_PARALLEL_RANK", None)
+        return d
+
+    def test_returns_payload_for_valid_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._save(d, "blk", {"scale": 1, "_worker_rank": 2})
+            data = block_parallel.read_block_result(d, "blk")
+            self.assertEqual(data["_worker_rank"], 2)
+
+    def test_empty_layer_dict_is_a_valid_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._save(d, "blk", {})
+            # save_block_results injects the advisory rank into every payload
+            self.assertEqual(block_parallel.read_block_result(d, "blk"), {"_worker_rank": -1})
+
+    def test_none_for_missing_corrupt_and_nondict(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(block_parallel.read_block_result(d, "missing"))
+            bad = os.path.join(d, "block_bad.pt")
+            with open(bad, "wb") as f:
+                f.write(b"not-a-torch-file")
+            self.assertIsNone(block_parallel.read_block_result(d, "bad"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestTunedLayerKey(unittest.TestCase):
+    def test_global_name_wins_then_path_then_block(self):
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import _tuned_layer_key
+
+        sub = nn.Linear(2, 2)
+        self.assertEqual(_tuned_layer_key("blk", "mlp", sub), "blk.mlp")
+        sub.global_name = "custom.name"
+        self.assertEqual(_tuned_layer_key("blk", "mlp", sub), "custom.name")
+        self.assertEqual(_tuned_layer_key("blk", "", sub), "custom.name")
+        # without global_name, the root submodule keys to the bare block name
+        # -- collect and apply must agree here or the parent rejects the block
+        plain = nn.Linear(2, 2)
+        self.assertEqual(_tuned_layer_key("blk", "", plain), "blk")
+
+
+if __name__ == "__main__":
+    unittest.main()

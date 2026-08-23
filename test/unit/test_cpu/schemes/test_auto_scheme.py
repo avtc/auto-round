@@ -884,17 +884,33 @@ def test_parallel_scheme_scoring_supports_disk_stream_model():
     assert _can_parallel_scheme_scoring(True, "local-model", 1, 2, False, True, False)
 
 
-def test_parallel_scheme_scoring_rejects_disk_stream_vlm():
+def test_parallel_scheme_scoring_allows_vlm_text_tower():
+    """VLM language-tower scoring streams blocks like a text model."""
     from auto_round.auto_scheme.delta_loss import _can_parallel_scheme_scoring
 
-    assert not _can_parallel_scheme_scoring(True, "local-model", 1, 2, False, True, True)
+    assert _can_parallel_scheme_scoring(True, "local-model", 1, 2, False, True, is_vlm=True)
+
+
+def test_parallel_scheme_scoring_rejects_vision_scoring_with_disk_stream():
+    """Vision scoring (force_mllm) needs a full-model backward and cannot run
+    on the block-wise materialize/free disk-stream path."""
+    from auto_round.auto_scheme.delta_loss import _can_parallel_scheme_scoring
+
+    assert not _can_parallel_scheme_scoring(True, "local-model", 1, 2, False, True, is_vlm=True, force_mllm=True)
+
+
+def test_parallel_scheme_scoring_requires_parallel_and_cached_baseline():
+    from auto_round.auto_scheme.delta_loss import _can_parallel_scheme_scoring
+
+    assert not _can_parallel_scheme_scoring(False, "local-model", 1, 2, False, True, is_vlm=False)
+    assert not _can_parallel_scheme_scoring(True, "local-model", 1, 1, False, True, is_vlm=False)
 
 
 @pytest.mark.parametrize(
     "model_id,is_vlm,low_gpu_mem_usage,expected",
     [
         ("local-model", False, True, True),
-        ("local-model", True, True, False),
+        ("local-model", True, True, True),
         ("local-model", False, False, False),
         (None, False, True, False),
     ],
@@ -1053,3 +1069,66 @@ def test_replacement_wrapper_without_tuning_device_uses_major_device():
     move_module_to_tuning_device(wrapper, major_device="cpu")
 
     assert wrapper.orig_layer.weight.device.type == "cpu"
+
+
+def test_inject_score_accumulators_recomputes_mix_score():
+    """Restored layers must report the resumed sum even if they never
+    accumulate again (hooks only update mix_score on fresh batches)."""
+    import torch.nn as nn
+
+    from auto_round.auto_scheme.delta_loss import _extract_score_accumulators, _inject_score_accumulators
+
+    class _Accum(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.act_score = 0.0
+            self.weight_score = 0.0
+            self.act_cnt = 0
+            self.mix_score = 0.0
+
+    model = nn.Sequential()
+    model.add_module("layer", _Accum())
+    model.layer.act_score = 2.5
+    model.layer.weight_score = 1.5
+    model.layer.act_cnt = 7
+    model.layer.mix_score = 4.0
+
+    state = _extract_score_accumulators(model)
+
+    fresh = nn.Sequential()
+    fresh.add_module("layer", _Accum())
+    _inject_score_accumulators(fresh, state)
+
+    assert fresh.layer.mix_score == 4.0
+    assert fresh.layer.act_cnt == 7
+
+
+def test_scheme_gen_oom_fallback_retries_on_cpu(monkeypatch):
+    """After a GPU OOM the promised CPU fallback must actually retry on CPU:
+    re-passing the original major_device re-raises on the same full GPU."""
+    import torch
+    import torch.nn as nn
+
+    from auto_round.auto_scheme import delta_loss
+
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    calls = []
+
+    def fake_gen(auto_scheme, m, quant_layer_names, fixed_layer_scheme, **kwargs):
+        calls.append(kwargs.get("major_device"))
+        if len(calls) == 1:
+            raise torch.OutOfMemoryError("simulated GPU OOM")
+        return "layer-config"
+
+    monkeypatch.setattr(delta_loss, "_gen_layer_config", fake_gen)
+    out = delta_loss.gen_layer_config(
+        auto_scheme=type("AS", (), {"low_cpu_mem_usage": True, "low_gpu_mem_usage": True})(),
+        model=model,
+        quant_layer_names=["0"],
+        fixed_layer_scheme={},
+        dataset=None,
+        device_map=None,
+    )
+    assert out == "layer-config"
+    assert len(calls) == 2
+    assert calls[1] == "cpu"  # the retry must land on CPU, not the same full GPU

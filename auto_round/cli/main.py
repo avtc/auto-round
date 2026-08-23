@@ -17,7 +17,6 @@ import difflib
 import sys
 
 from auto_round import envs
-
 from auto_round.cli.algorithms import AlgorithmHandler
 from auto_round.cli.parser import (
     add_common_quantization_arguments,

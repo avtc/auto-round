@@ -49,14 +49,12 @@ class TestResultRank(unittest.TestCase):
 class TestCountAgnosticState(unittest.TestCase):
     """Durable state must not depend on worker count (rerun with any N)."""
 
-    def test_done_from_manifest_prefix_without_result_files(self):
-        # serial-after-serial produces manifests and no block files; a parallel
-        # rerun must still initialize done-sets from the prefix alone
+    def test_missing_result_blocks_reflects_only_completed_files(self):
+        # a rerun's remaining work is exactly the blocks without result files:
+        # completed blocks (from this run or a prior one) drop out, others stay
         with tempfile.TemporaryDirectory() as d:
-            # simulate: two blocks completed serially -> result files absent
-            # (verified indirectly: has_block_results is the only other source)
-            self.assertFalse(block_parallel.has_block_results(d, "model.layers.0"))
-            self.assertEqual(block_parallel.missing_result_blocks(d, [["b0", "b1", "b2"]]), ["b0", "b1", "b2"])
+            block_parallel.save_block_results(d, "b1", {})
+            self.assertEqual(block_parallel.missing_result_blocks(d, [["b0", "b1", "b2"]]), ["b0", "b2"])
 
 
 if __name__ == "__main__":

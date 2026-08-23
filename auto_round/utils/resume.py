@@ -101,7 +101,7 @@ class ResumeState:
             logger.warning(f"ResumeState: failed to read {self.manifest_path}: {e}; starting fresh.")
             return
         if data.get("signature") != self.signature:
-            logger.info(
+            logger.warning(
                 "ResumeState: existing resume manifest is for a different run "
                 "(model/scheme/dataset/block list changed); ignoring it and starting fresh."
             )
@@ -152,6 +152,42 @@ class ResumeState:
         # when enable_quanted_input=False) -- the FP reference chain always
         # exists.
         torch.save(_to_cpu_recursive(input_ids), self.input_ids_path)
+        self.completed_blocks.append(block_name)
+        _atomic_write_json(
+            self.manifest_path,
+            {"signature": self.signature, "completed_blocks": self.completed_blocks},
+        )
+
+    def mark_block_done_from_file(self, block_name: str, entry_src: str) -> None:
+        """``mark_block_done`` with the entry handed over as a file path.
+
+        The source holds exactly the payload the serial manifest persists
+        (already torch.save'd CPU tensors), so the handoff is a link/rename
+        instead of a deserialize + re-serialize round trip of a multi-GB
+        entry inside a polling loop. Falls back to a byte copy across
+        filesystems.
+        """
+        import shutil
+
+        expected = self.block_names[len(self.completed_blocks)]
+        assert (
+            block_name == expected
+        ), f"ResumeState.mark_block_done called out of order: expected {expected!r}, got {block_name!r}"
+        if self.q_input_path.exists():
+            self.q_input_path.unlink()
+        tmp = str(self.input_ids_path) + ".tmp"
+        try:
+            try:
+                os.link(entry_src, tmp)
+            except OSError:  # cross-device or unsupported: byte copy
+                shutil.copyfile(entry_src, tmp)
+            os.replace(tmp, self.input_ids_path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         self.completed_blocks.append(block_name)
         _atomic_write_json(
             self.manifest_path,
