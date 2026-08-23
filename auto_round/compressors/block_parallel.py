@@ -323,6 +323,21 @@ def save_chain_state(results_dir: str, group: int, block_idx: int, hidden) -> No
     os.replace(tmp, path)
 
 
+def delete_chain_state(results_dir: str, group: int, block_idx: int) -> None:
+    """Remove a chain checkpoint once its block is done.
+
+    Called by the parent when block ``block_idx`` completes: by then the
+    assignee has consumed the entry and the manifest has absorbed the block,
+    so nothing can read the file again (replays rebuild from the manifest,
+    never from files). Missing files are a no-op.
+    """
+    path = _chain_state_path(results_dir, group, block_idx)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
 def load_chain_state(results_dir: str, group: int, block_idx: int, device: str):
     """Restore a chained hidden state, or ``None`` when absent."""
     if not results_dir:

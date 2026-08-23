@@ -17,6 +17,8 @@
 import os
 import unittest
 
+import torch
+
 os.environ.setdefault("AR_AUTO_SCHEME_CACHE", os.path.join(os.path.dirname(__file__), "cache"))
 
 from auto_round.compressors import block_parallel  # noqa: E402
@@ -93,6 +95,20 @@ class TestGuardReasons(unittest.TestCase):
 
     def test_api_usage_reason(self):
         self.assertIn("command line", block_parallel.block_parallel_tuning_enabled(**{**self.BASE, "argv": None}))
+
+
+class TestDeleteChainState(unittest.TestCase):
+    def test_removes_and_tolerates_missing(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            block_parallel.save_chain_state(d, 0, 5, {"h": torch.zeros(2)})
+            self.assertTrue(block_parallel.chain_state_exists(d, 0, 5))
+            block_parallel.delete_chain_state(d, 0, 5)
+            self.assertFalse(block_parallel.chain_state_exists(d, 0, 5))
+            # missing file is a no-op, not an error (double prune, crash leftovers)
+            block_parallel.delete_chain_state(d, 0, 5)
+            block_parallel.delete_chain_state(d, 3, 7)
 
 
 if __name__ == "__main__":

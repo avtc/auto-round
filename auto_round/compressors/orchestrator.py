@@ -30,6 +30,7 @@ from auto_round.compressors.block_parallel import (
     load_chain_state as _bp_load_chain_state,
     save_block_results as _bp_save_block_results,
     save_chain_state as _bp_save_chain_state,
+    delete_chain_state as _bp_delete_chain_state,
 )
 from auto_round.calibration import CalibrationContext
 from auto_round.calibration.utils import (
@@ -768,6 +769,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             g: next((k for k in range(len(blocks)) if k not in done[g]), len(blocks))
             for g, blocks in enumerate(all_blocks)
         }  # per-group starting frontier: its entry comes from manifest/group cache
+        for g, blocks in enumerate(all_blocks):
+            for k in done[g]:
+                _bp_delete_chain_state(results_dir, g, k)  # stale crash leftovers
         assigned = {}  # rank -> (group, index); absent == worker idle/finished
         stopped = set()
         seen_results = {
@@ -846,6 +850,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                         continue
                     seen_results.add((g, k))
                     done[g].add(k)
+                    # the block is complete: its entry checkpoint was consumed
+                    # by the assignee and the manifest absorbed the block --
+                    # nothing can read it again (replays rebuild from the
+                    # manifest, never from files)
+                    _bp_delete_chain_state(results_dir, g, k)
                     rank = bp.read_result_rank(results_dir, b)
                     if rank >= 0:
                         assigned.pop(rank, None)
@@ -858,9 +867,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                         k = rs.resume_index
                         entry_next = _bp_load_chain_state(results_dir, g, k + 1, device="cpu")
                         rs.mark_block_done(blocks[k], None, entry_next)
-                        # no delete: the frontier assignee may still need this
-                        # entry file; prune-on-done removes it once block k+1
-                        # completes (exactly the right window)
+                        # no delete here: ckpt(k+1) is the frontier assignee's
+                        # entry until block k+1 completes; the results loop
+                        # above prunes it then (exact visibility window)
             # assign any idle rank whose next block's entry has appeared
             # (result events AND newly published ramp tails both land here)
             for rank in range(len(procs)):
