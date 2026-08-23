@@ -26,7 +26,6 @@ from tqdm import tqdm
 
 from auto_round import envs
 from auto_round.compressors.block_parallel import (
-    has_block_results as _bp_has_block_results,
     load_chain_state as _bp_load_chain_state,
     save_block_results as _bp_save_block_results,
     save_chain_state as _bp_save_chain_state,
@@ -1240,8 +1239,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         saved = 0
         for blocks in all_blocks:
             for block_name in blocks:
-                if _bp_has_block_results(out_dir, block_name):
-                    continue
+                if _bp_block_results_complete(out_dir, block_name):
+                    continue  # only skip blocks with real results; empty files get re-dumped
                 results = self._collect_tuned_layers(block_name)
                 if results:
                     _bp_save_block_results(out_dir, block_name, results)
