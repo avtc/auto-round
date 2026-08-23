@@ -18,12 +18,12 @@ The serial block-wise tuning loop chains each block's input from the previous
 block's *reference* (original-weights) output, so blocks are independent of each
 other's quantization state: any block's input equals the original model's
 activation at that depth. This module exploits that by re-exec'ing the same CLI
-command in worker processes, each pinned to one GPU and restricted to a
-contiguous span of blocks; workers fast-forward through their span's prefix
-with no-grad original-weights forwards (faithful to the serial chain and ~1000x
-cheaper than tuning) and dump tuned ``scale``/``zp`` per layer instead of
-writing shards. The parent merges the dumps and runs the ordinary
-immediate-pack/save flow.
+command in worker processes pinned one per GPU. A strict-frontier relay
+feeds each worker the next unassigned block whose entry checkpoint exists;
+the assignee extends the chain with one no-grad original-weights forward
+(faithful to the serial chain and ~1000x cheaper than tuning) before tuning,
+and dumps tuned ``scale``/``zp`` per layer instead of writing shards. The
+parent merges the dumps and runs the ordinary immediate-pack/save flow.
 
 Only valid while the quantized-input chain is dormant (``need_quanted_input`` --
 GGUF's sequential replay makes blocks order-dependent); see

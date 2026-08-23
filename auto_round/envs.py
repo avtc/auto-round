@@ -140,8 +140,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE": lambda: os.getenv("AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE", "1").lower()
     not in ("0", "false", "no", "off"),
     # Enables block-parallel tuning: transformer blocks are tuned concurrently
-    # by re-exec'd worker processes, one per eligible GPU, each restricted to a
-    # contiguous span of blocks. Experimental (default off); the serial
+    # by re-exec'd worker processes, one per eligible GPU, fed block
+    # assignments through a strict-frontier relay. Experimental (default off); the serial
     # block-wise loop remains the default until validated broadly.
     "AR_ENABLE_BLOCK_PARALLEL_TUNING": lambda: os.getenv("AR_ENABLE_BLOCK_PARALLEL_TUNING", "0").lower()
     in ("1", "true", "yes"),

@@ -1258,8 +1258,8 @@ class BaseOrchestrator(object):
 
         self._hardware_setup()
 
-        # BlockForwardRunner is now created inside AlgorithmComposer.__init__,
-        # so _build_composer must run first.
+        # AlgorithmComposer.__init__ builds the BlockForwardRunner; the
+        # composer must exist before the hardware setup below uses it.
         self._build_composer()
 
         # Set block_forward torch compile for block forward

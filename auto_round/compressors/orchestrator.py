@@ -619,10 +619,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         """Run block-parallel tuning when enabled; returns True if results were applied.
 
         Parent-side: spawns one worker process per eligible GPU (each pinned via
-        CUDA_VISIBLE_DEVICES and restricted to a contiguous span of blocks), waits,
-        merges the workers' tuned scale/zp dumps, and applies them through the
-        ordinary immediate-pack/save flow. Workers themselves (``is_worker``)
-        take the span-restricted serial loop instead.
+        CUDA_VISIBLE_DEVICES), relays strict-frontier block assignments over
+        their stdin, waits, merges the workers' tuned scale/zp dumps, and
+        applies them through the ordinary immediate-pack/save flow. Workers
+        themselves (``is_worker``) serve the assignment queue instead.
         """
         if is_worker:
             return False
@@ -1460,8 +1460,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     to_cache_layer_names,
                     last_cache_name=_last_cache_name,
                 )
-        # Remove accelerate dispatch hooks before moving parameters.
-        # hf_device_map is kept for reference but hooks are no longer needed.
+        # Remove accelerate dispatch hooks before moving parameters; the
+        # quantize loop drives devices itself, hf_device_map stays as reference.
         if hasattr(self.model_context.model, "hf_device_map") and len(self.model_context.model.hf_device_map) > 1:
             accelerate.hooks.remove_hook_from_submodules(self.model_context.model)
         self.model_context.model = mv_module_from_gpu(self.model_context.model)
@@ -1505,8 +1505,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         # crash/kill mid-tuning can resume from the first not-yet-quantized
         # block instead of restarting from block 0. See auto_round/utils/resume.py.
         # ── Block-parallel tuning (AR_ENABLE_BLOCK_PARALLEL_TUNING, experimental) ──
-        # Worker processes re-exec the same CLI pinned to one GPU each, tune a
-        # contiguous span of blocks against the original-weights input chain
+        # Worker processes re-exec the same CLI pinned to one GPU each, tune
+        # relay-assigned blocks against the original-weights input chain
         # (blocks are independent: the serial loop chains reference outputs,
         # not quantized outputs), and dump tuned scale/zp. The parent merges
         # the dumps and packs/saves through the ordinary immediate flow. The
