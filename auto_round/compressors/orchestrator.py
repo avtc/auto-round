@@ -830,10 +830,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             if undone_left == 0 and not assigned:
                 break
             _time.sleep(0.5)
-            # fatal-fast liveness: any worker exit while work remains aborts
+            # fatal-fast liveness: any worker exit while work remains aborts.
+            # Exception: ranks the parent deliberately stopped during the
+            # drain phase (their clean exit is expected, not a crash -- the
+            # process lingers in teardown for tens of seconds after logging
+            # "done", so poll() reports them well after the stop was sent)
             for widx, proc in enumerate(procs):
                 code = proc.poll()
                 if code is None:
+                    continue
+                if code == 0 and widx in stopped:
                     continue
                 for sibling in procs:
                     if sibling.poll() is None:
