@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import sys
 
 from auto_round import envs
@@ -241,6 +242,16 @@ def start(recipe="default", argv=None):
     tune(args)
 
 
+def _apply_block_parallel_flag(args) -> None:
+    """Mirror the ``--enable_block_parallel_tuning`` flag into the env gate.
+
+    The env var stays the single switch the runtime reads, keeping CI and
+    API-script users on the same mechanism as the CLI.
+    """
+    if getattr(args, "enable_block_parallel_tuning", False):
+        os.environ["AR_ENABLE_BLOCK_PARALLEL_TUNING"] = "1"
+
+
 def tune(args):
     assert args.model or args.model_name, "[model] or --model MODEL_NAME should be set."
     if args.model is None:
@@ -289,6 +300,8 @@ def tune(args):
 
     if args.enable_torch_compile is False:
         logger.info("`torch.compile` is explicitly disabled with `--disable_torch_compile`.")
+
+    _apply_block_parallel_flag(args)
 
     model_name = args.model
     if model_name[-1] == "/":
@@ -381,6 +394,9 @@ def tune(args):
             avg_bits=args.avg_bits,
             shared_layers=args.shared_layers,
             ignore_scale_zp_bits=args.ignore_scale_zp_bits,
+            # scheme scoring always runs the low-GPU path: it materializes one
+            # block at a time, so the --low_gpu_mem_usage flag governs the
+            # tuning/quantize side only (see parser.py)
             low_gpu_mem_usage=True,
             low_cpu_mem_usage=low_cpu_mem_usage,
         )
