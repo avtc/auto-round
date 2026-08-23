@@ -117,6 +117,7 @@ class TestDiskStreamWorkerModelPrep:
 
         def _fake_handle_moe(model):
             seen["model"] = model
+            return []
 
         monkeypatch.setattr("auto_round.utils.disk_stream_util.build_meta_model", _fake_build_meta_model)
         monkeypatch.setattr("auto_round.modeling.fused_moe.replace_modules._handle_moe_modules", _fake_handle_moe)
