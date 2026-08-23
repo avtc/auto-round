@@ -214,3 +214,4 @@ class TestPackEquivalenceOriginalVsQdqWeight(unittest.TestCase):
             lin_qdq.weight.copy_(w_qdq)
         c_qdq = self._codes(lin_qdq.weight.reshape(-1, 128), s, z)
         self.assertTrue(torch.equal(c_orig, c_qdq))
+

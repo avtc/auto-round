@@ -163,24 +163,6 @@ def spawn_workers(argv: Sequence[str], gpu_ids: List[int], log_dir: str, extra_e
     return procs
 
 
-def log_worker_rss(procs: List[subprocess.Popen], tag: str = "") -> None:
-    """Best-effort per-worker RSS log line (Linux /proc; silent elsewhere)."""
-    parts = []
-    for idx, proc in enumerate(procs):
-        if proc.poll() is not None:
-            parts.append(f"w{idx}=dead")
-            continue
-        try:
-            with open(f"/proc/{proc.pid}/status", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        parts.append(f"w{idx}={int(line.split()[1]) / 1024**2:.2f}GiB")
-                        break
-        except OSError:
-            return  # non-Linux or proc gone; skip silently
-    if parts:
-        logger.info("block-parallel worker RSS%s: %s", f" [{tag}]" if tag else "", " ".join(parts))
-
 def wait_workers(procs: List[subprocess.Popen]) -> List[int]:
     """Wait for all workers; returns exit codes (nonzero entries logged)."""
     codes = []

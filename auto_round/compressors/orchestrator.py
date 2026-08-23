@@ -771,14 +771,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             "AR_BLOCK_PARALLEL_SHARED_NONBLOCKS": nonblocks_path,
             "AR_BLOCK_PARALLEL_SHARED_INPUTS": inputs_path,
         }
-        import time as _t0
-
-        _spawn_t0 = _t0.time()
         procs = bp.spawn_workers(sys.argv, gpu_ids, log_dir=results_dir, extra_env=env_extra)
-        logger.info(
-            "[bp-trace] spawn complete in %.1fs (pids %s); pushing initial assignments",
-            _t0.time() - _spawn_t0, [proc.pid for proc in procs],
-        )
 
         def _ordered_undone():
             return [(g, k) for g, blocks in enumerate(all_blocks) for k, b in enumerate(blocks)
@@ -840,10 +833,9 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         shown_done = sum(len(d) for d in done.values())
         if pbar is not None:
-            pbar.set_description("Tuning blocks (parallel)")
+            pbar.set_description("Quantizing")
             pbar.n = shown_done  # resume: reflect blocks already complete
             pbar.refresh()
-        rss_tick = 0
         while True:
             undone_left = total_blocks - sum(len(d) for d in done.values())
             if undone_left == 0 and not assigned:
@@ -906,15 +898,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             if pbar is not None and done_now != shown_done:
                 pbar.update(done_now - shown_done)
                 shown_done = done_now
-            rss_tick += 1
-            if rss_tick % 60 == 0:
-                bp.log_worker_rss(procs)
-            if rss_tick % 10 == 0:
-                logger.info(
-                    "[bp-trace] tick %d: done=%d/%d assigned=%s idle=%d",
-                    rss_tick, done_now, total_blocks,
-                    dict(assigned), sum(1 for r in range(len(procs)) if r not in assigned and r not in stopped),
-                )
 
         for rank in range(len(procs)):
             _send(rank, "stop")
@@ -1141,7 +1124,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 start_block_idx=k,
                 resume_input_ids=entry,
             )
-            logger.info("[bp-worker %d] block %s done (rank holds %s)", rank, blocks[k], held[1] if held else "-")
+            logger.info("[bp-worker %d] block %s done", rank, blocks[k])
 
     def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
         """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
