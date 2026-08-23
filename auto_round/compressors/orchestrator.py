@@ -463,12 +463,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             input_ids = next_input_ids
 
             if span is not None and bp_results_dir and i >= span[0]:
-                # resumable unit complete: this block's tuned scale/zp plus the
-                # chain state entering the next block
+                # resumable unit complete: persist this block's tuned scale/zp
+                # (the chain checkpoint is NOT written here -- the assigned
+                # forward's pre-tune tail already published it)
                 _bp_save_block_results(
                     bp_results_dir, block_names[i], self._collect_tuned_layers(block_names[i])
                 )
-                _bp_save_chain_state(bp_results_dir, group_idx, i + 1, input_ids)
 
             if self.compress_context.is_immediate_saving and not is_bp_worker:
                 self.shard_writer.write(m, is_finalize=False)
@@ -818,6 +818,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         shown_done = sum(len(d) for d in done.values())
         if pbar is not None:
             pbar.set_description("Tuning blocks (parallel)")
+            pbar.n = shown_done  # resume: reflect blocks already complete
             pbar.refresh()
         rss_tick = 0
         while True:
@@ -1080,6 +1081,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             else:
                 held = None
 
+            if pbar is not None:
+                pbar.n = k  # absolute block position, not per-worker count
             self._quantize_blocks(
                 self.model_context.model,
                 _group_entry(blocks),
