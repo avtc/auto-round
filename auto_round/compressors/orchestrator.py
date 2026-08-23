@@ -866,7 +866,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if (g, k) in seen_results or not bp.has_block_results(results_dir, b):
                         continue
                     if not bp.block_results_complete(results_dir, b):
-                        continue  # exists but empty/corrupt: not a result
+                        continue  # exists but unreadable (corrupt): not a result
                     seen_results.add((g, k))
                     done[g].add(k)
                     # the block is complete: its entry checkpoint was consumed
@@ -1215,8 +1215,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         """Worker-side safety net: persist any tuned blocks not yet saved.
 
         Blocks are normally saved right after tuning inside ``_quantize_blocks``
-        (the resumable unit); this end-of-run pass only covers blocks whose
-        in-loop save was somehow skipped. Blocks this worker never touched have
+        (the resumable unit); this end-of-run pass covers any block whose
+        in-loop save did not land. Blocks this worker never touched have
         no tuned attributes and contribute nothing.
         """
         out_dir = envs.AR_BLOCK_PARALLEL_RESULTS

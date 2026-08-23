@@ -137,16 +137,29 @@ if __name__ == "__main__":
 
 
 class TestBlockResultsComplete(unittest.TestCase):
-    def test_empty_file_is_not_complete(self):
+    def test_empty_file_is_complete(self):
+        """A block whose every layer is excluded from quantization tunes to
+        nothing; its empty result file is a valid completion, not corruption."""
         import tempfile
 
         with tempfile.TemporaryDirectory() as d:
             block_parallel.save_block_results(d, "blk", {})  # empty payload + _worker_rank
             self.assertTrue(block_parallel.has_block_results(d, "blk"))
-            self.assertFalse(block_parallel.block_results_complete(d, "blk"))
+            self.assertTrue(block_parallel.block_results_complete(d, "blk"))
             block_parallel.save_block_results(d, "blk2", {"l": {"scale": torch.ones(2), "zp": None}})
             self.assertTrue(block_parallel.block_results_complete(d, "blk2"))
             self.assertFalse(block_parallel.block_results_complete(d, "missing"))
+
+    def test_unloadable_file_is_not_complete(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, block_parallel._block_results_path(d, "blk"))
+            with open(path, "wb") as f:
+                f.write(b"not a torch file")
+            self.assertTrue(block_parallel.has_block_results(d, "blk"))
+            self.assertFalse(block_parallel.block_results_complete(d, "blk"))
 
 
 class TestPackEquivalenceOriginalVsQdqWeight(unittest.TestCase):

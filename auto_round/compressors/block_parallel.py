@@ -225,22 +225,22 @@ def has_block_results(results_dir: str, block_name: str) -> bool:
 
 
 def block_results_complete(results_dir: str, block_name: str) -> bool:
-    """File exists AND carries at least one tuned layer.
+    """File exists AND loads as a result dict.
 
-    An existing-but-empty file is a broken artifact (observed once from a
-    pre-relay-era run: the file made has_block_results treat the block as
-    done, and packing later crashed on its very first layer). Treat it as
-    not-done so a rerun re-tunes the block instead of erroring at pack time.
-    Cheap existence checks (polling loops) keep using has_block_results.
+    An empty layer dict is a valid completion: blocks whose every layer is
+    excluded from quantization tune to nothing and legitimately save an empty
+    result. Only an unloadable file (corrupt artifact) counts as not-done, so
+    a rerun re-tunes the block instead of erroring at pack time. Cheap
+    existence checks (polling loops) keep using has_block_results.
     """
     path = _block_results_path(results_dir, block_name)
     if not os.path.exists(path):
         return False
     try:
         data = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception:  # noqa: BLE001  corrupt file: same treatment as empty
+    except Exception:  # noqa: BLE001  corrupt file: not a result
         return False
-    return any(not k.startswith("_") for k in data)
+    return isinstance(data, dict)
 
 
 def load_all_block_results(results_dir: str) -> dict:
