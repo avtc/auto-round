@@ -304,50 +304,18 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         start_index = resume_state.resume_index if resume_state is not None and nblocks == 1 else 0
         if start_block_idx is not None:
-            # queue mode: the caller restored this block's entry input from a
-            # chain checkpoint -- start here directly, no fast-forward replay
+            # worker tune call: the entry input was restored by the caller;
+            # process only the assigned block (span restricts the range)
             start_index = start_block_idx
         for i in range(start_index, len(block_names), nblocks):
             if span is not None and i >= span[1]:
                 break  # span restriction: remaining blocks belong to another worker
-            if (
-                span is not None
-                and bp_results_dir
-                and i >= span[0]
-                and _bp_block_results_complete(bp_results_dir, block_names[i])
-            ):
-                # resume: this block was tuned in a previous run. With a chain
-                # checkpoint for the next boundary the skip costs nothing;
-                # without one, fall through to the fast-forward replay below.
-                restored = _bp_load_chain_state(
-                    bp_results_dir,
-                    group_idx,
-                    i + 1,
-                    device=input_ids.device if isinstance(input_ids, torch.Tensor) else "cpu",
-                )
-                if restored is not None:
-                    input_ids = restored
-                    pbar.update(1)
-                    continue
             if input_others_extra_blocks and block_names[i] in input_others_extra_blocks:
                 input_others = input_others_extra_blocks[block_names[i]]
                 _, input_others = self._preprocess_block_inputs(input_others)
                 input_others_extra_blocks.pop(block_names[i])
             if i != 0:
                 pbar.update(1)
-            if span is not None and (
-                i < span[0]
-                or (
-                    bp_results_dir
-                    and i >= span[0]
-                    and _bp_block_results_complete(bp_results_dir, block_names[i])
-                    and _bp_load_chain_state(bp_results_dir, group_idx, i + 1, device="cpu") is None
-                )
-            ):
-                input_ids = self._ff_one_block(
-                    model, block_names[i], input_ids, input_others, group_idx, i + 1, bp_results_dir
-                )
-                continue
             if nblocks == 1:
                 n = block_names[i]
                 pbar.set_description(f"Quantizing {n}")
@@ -817,7 +785,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             target = candidates[0]
             assigned[rank] = target
             _send(rank, f"tune {target[0]} {target[1]}")
-            logger.info("block-parallel tuning: assigned g%d k%d to worker %d", target[0], target[1], rank)
+            logger.debug("block-parallel tuning: assigned g%d k%d to worker %d", target[0], target[1], rank)
 
         for rank in range(len(procs)):
             _assign_next(rank)
