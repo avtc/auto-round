@@ -1901,6 +1901,21 @@ def _refresh_cached_layer_bits(
     return refreshed_scores
 
 
+def _parallel_scoring_must_raise(parallel_error: Exception) -> bool:
+    """Decide whether a parallel-scoring failure aborts instead of falling back to serial.
+
+    Set AR_AUTO_SCHEME_NO_SERIAL_FALLBACK=1 to fail fast: the serial fallback is
+    ~workers-count times slower and, on models where it cannot run at all, only
+    burns hours before crashing.  Schemes lost with their worker always raise
+    regardless of the env, since their scores are unrecoverable.
+    """
+    from auto_round import envs as _envs
+
+    if "was lost with its worker" in str(parallel_error):
+        return True
+    return bool(_envs.AR_AUTO_SCHEME_NO_SERIAL_FALLBACK)
+
+
 def _assign_scheme_worker_devices(worker_count, available_devices):
     """Assign workers round-robin within the devices selected by the caller."""
     if not available_devices:
@@ -2833,7 +2848,14 @@ def _gen_layer_config(
                 logger.info("AutoScheme: parallel scoring completed.")
                 post_scoring_started = time.perf_counter()
             except Exception as parallel_error:  # noqa: BLE001
-                if "was lost with its worker" in str(parallel_error):
+                if _parallel_scoring_must_raise(parallel_error):
+                    logger.error(
+                        "AutoScheme: keeping the parallel scoring failure as a hard error "
+                        "(AR_AUTO_SCHEME_NO_SERIAL_FALLBACK is set, or a scheme was lost with its worker); "
+                        "completed schemes and batches are persisted in the per-scheme cache -- "
+                        "rerun to score only the failed parts, e.g. with a smaller "
+                        "AR_AUTO_SCHEME_BATCH_SIZE / AR_AUTO_SCHEME_NSAMPLES."
+                    )
                     raise
                 logger.warning(
                     "AutoScheme: parallel scoring failed, falling back to serial: %s. "

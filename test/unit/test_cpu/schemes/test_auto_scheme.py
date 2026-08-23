@@ -5,6 +5,7 @@ import shutil
 import pytest
 
 from auto_round import AutoRound, AutoScheme
+from auto_round.auto_scheme.delta_loss import _parallel_scoring_must_raise
 from auto_round.auto_scheme.utils import _build_layer_config_header_rows, _short_summary_name
 
 
@@ -1132,3 +1133,25 @@ def test_scheme_gen_oom_fallback_retries_on_cpu(monkeypatch):
     assert out == "layer-config"
     assert len(calls) == 2
     assert calls[1] == "cpu"  # the retry must land on CPU, not the same full GPU
+
+
+def test_env_ar_auto_scheme_no_serial_fallback(monkeypatch):
+    import auto_round.envs as envs
+
+    monkeypatch.delenv("AR_AUTO_SCHEME_NO_SERIAL_FALLBACK", raising=False)
+    assert envs.AR_AUTO_SCHEME_NO_SERIAL_FALLBACK is False
+    monkeypatch.setenv("AR_AUTO_SCHEME_NO_SERIAL_FALLBACK", "1")
+    assert envs.AR_AUTO_SCHEME_NO_SERIAL_FALLBACK is True
+
+
+def test_parallel_error_must_raise_respects_env_and_lost_worker(monkeypatch):
+    import auto_round.envs as envs
+
+    monkeypatch.delenv("AR_AUTO_SCHEME_NO_SERIAL_FALLBACK", raising=False)
+    # plain failure, env off -> serial fallback proceeds
+    assert not _parallel_scoring_must_raise(RuntimeError("CUDA out of memory"))
+    # scheme lost with its worker always raises
+    assert _parallel_scoring_must_raise(RuntimeError("scheme 2 (W4A16) was lost with its worker"))
+    # env on -> any failure raises
+    monkeypatch.setenv("AR_AUTO_SCHEME_NO_SERIAL_FALLBACK", "1")
+    assert _parallel_scoring_must_raise(RuntimeError("CUDA out of memory"))
