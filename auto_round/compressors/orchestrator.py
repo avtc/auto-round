@@ -31,6 +31,7 @@ from auto_round.compressors.block_parallel import (
     save_block_results as _bp_save_block_results,
     save_chain_state as _bp_save_chain_state,
     delete_chain_state as _bp_delete_chain_state,
+    block_results_complete as _bp_block_results_complete,
 )
 from auto_round.calibration import CalibrationContext
 from auto_round.calibration.utils import (
@@ -321,7 +322,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 span is not None
                 and bp_results_dir
                 and i >= span[0]
-                and _bp_has_block_results(bp_results_dir, block_names[i])
+                and _bp_block_results_complete(bp_results_dir, block_names[i])
             ):
                 # resume: this block was tuned in a previous run. With a chain
                 # checkpoint for the next boundary the skip costs nothing;
