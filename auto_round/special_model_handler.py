@@ -507,6 +507,32 @@ def _get_glm_image_multimodal_block(model, quant_vision=False):
     return block_names
 
 
+def _get_qwen3_5_multimodal_block(model, quant_vision=False):
+    """Get block names for Qwen3.5/3.6 omni models (model_type ``qwen3_5``).
+
+    Structure (Qwen3_5ForConditionalGeneration):
+    - model.visual.blocks: vision tower
+    - model.language_model.layers: text decoder (the quantization target)
+
+    By default only the text decoder is quantized; vision-tower blocks join
+    under ``quant_vision=True``. Audio tower, when a release ships one, stays
+    excluded: calibration data carries no audio.
+    """
+    block_names = []
+
+    if quant_vision and hasattr(model, "model") and hasattr(model.model, "visual"):
+        if hasattr(model.model.visual, "blocks"):
+            block_names.append([f"model.visual.blocks.{i}" for i in range(len(model.model.visual.blocks))])
+
+    if hasattr(model, "model") and hasattr(model.model, "language_model"):
+        if hasattr(model.model.language_model, "layers"):
+            block_names.append(
+                [f"model.language_model.layers.{i}" for i in range(len(model.model.language_model.layers))]
+            )
+
+    return block_names
+
+
 def _get_mimo_audio_multimodal_block(model, quant_vision=False):
     """Get block names for MiMo-Audio model.
 
@@ -592,6 +618,7 @@ SPECIAL_MULTIMODAL_BLOCK = {
     "deepseek_vl_v2": _get_deepseek_vl2_multimodal_block,
     "qwen2_5_omni": _get_qwen2_5_omni_multimodal_block,
     "qwen3_omni_moe": _get_qwen3_omni_moe_multimodal_block,
+    "qwen3_5": _get_qwen3_5_multimodal_block,
     "glm_image": _get_glm_image_multimodal_block,
     "mimo_audio": _get_mimo_audio_multimodal_block,
     "qwen3_tts": _get_qwen3_tts_multimodal_block,
