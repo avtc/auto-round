@@ -111,5 +111,26 @@ class TestDeleteChainState(unittest.TestCase):
             block_parallel.delete_chain_state(d, 3, 7)
 
 
+class TestOrchestratorMethodRoster(unittest.TestCase):
+    """The parent parallel path calls these on CompressionOrchestrator; a
+    call-site-without-def slipped through once (method lost in a refactor,
+    surfaced only on the server at Packing time) and killed a finished run."""
+
+    def test_parent_path_methods_exist(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        for name in (
+            "_maybe_block_parallel_tune",
+            "_apply_tuned_results",
+            "_collect_tuned_layers",
+            "_dump_parallel_worker_results",
+            "_serve_block_queue",
+            "_manifest_frontier",
+            "_ff_one_block",
+            "_quantize_blocks",
+        ):
+            self.assertTrue(hasattr(CompressionOrchestrator, name), name)
+
+
 if __name__ == "__main__":
     unittest.main()

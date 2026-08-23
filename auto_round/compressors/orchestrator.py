@@ -1114,6 +1114,48 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             logger.info("[bp-worker %d] block %s done (rank holds %s)", rank, blocks[k], held[1] if held else "-")
 
+    def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
+        """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
+        from auto_round.compressors.utils import immediate_pack as _immediate_pack
+
+        n_blocks = sum(len(group) for group in all_blocks)
+        pbar = tqdm(range(n_blocks))
+        for group in all_blocks:
+            for block_name in group:
+                pbar.set_description(f"Packing {block_name}")
+                if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+                    self._offloader.reload(self.model_context.model, block_name)
+                block = get_module(self.model_context.model, block_name)
+                materialize_model_(block)
+                convert_module_to_hp_if_necessary(block, self.model_context.amp_dtype, device_manager.device)
+                applied = 0
+                for sub_name, sub in block.named_modules():
+                    layer_name = getattr(sub, "global_name", None) or (
+                        f"{block_name}.{sub_name}" if sub_name else block_name
+                    )
+                    entry = tuned.get(layer_name)
+                    if entry is None or not hasattr(sub, "weight"):
+                        continue
+                    sub.scale = entry["scale"].to(sub.weight.device)
+                    sub.zp = entry["zp"].to(sub.weight.device) if entry["zp"] is not None else entry["zp"]
+                    applied += 1
+                for sub_name, sub in block.named_modules():
+                    if hasattr(sub, "bits") and check_to_quantized(sub):
+                        module_name = getattr(sub, "global_name", None) or (
+                            f"{block_name}.{sub_name}" if sub_name else None
+                        )
+                        if module_name is None:
+                            continue
+                        _immediate_pack(module_name, self.layer_config)
+                if self.compress_context.is_immediate_saving:
+                    self.shard_writer.write(block, is_finalize=False)
+                if self.compress_context.low_cpu_mem_usage:
+                    self._offloader(self.model_context.model, block_name, overwrite=True)
+                pbar.update(1)
+                if applied == 0:
+                    logger.debug("block %s: no worker-tuned layers (kept as-is)", block_name)
+        pbar.close()
+
     def _collect_tuned_layers(self, block_name: str) -> dict:
         """Extract this block's tuned {layer_name: {scale, zp}} from live modules.
 
