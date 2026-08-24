@@ -201,6 +201,36 @@ export AR_AUTO_SCHEME_CACHE=/path/to/auto_scheme_cache
 export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 ```
 
+### AR_DISABLE_NEUQI
+- **描述**：在非对称 int 路径（`asym_search="auto"`/`"neuqi"`）上禁用 NeUQI 联合 scale/零点搜索，回退到普通 min/max 缩放。
+- **默认值**：`"0"`（在适用的地方启用 NeUQI）
+- **有效值**：`"1"`、`"true"`、`"yes"` 表示禁用；其他任意值保持搜索启用
+- **用法**：用于对搜索贡献的 A/B 对比实验
+
+```bash
+export AR_DISABLE_NEUQI=1
+```
+
+### AR_NEUQI_COARSE
+- **描述**：NeUQI 搜索在精细加性细化之前探索的粗粒度（对数间隔）scale 候选数量。
+- **默认值**：`"64"`
+- **有效值**：任意正整数
+- **用法**：调低可加速搜索，调高可进行更穷举的 scale 扫描
+
+```bash
+export AR_NEUQI_COARSE=64
+```
+
+### AR_NEUQI_FINE
+- **描述**：NeUQI 搜索中每个粗粒度候选对应的精细（加性）scale 细化候选数量。
+- **默认值**：`"32"`
+- **有效值**：任意正整数
+- **用法**：调低可加速搜索，调高可提升 scale 分辨率
+
+```bash
+export AR_NEUQI_FINE=32
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **描述**：控制 `NVFP4E5M3QuantLinear` 是否在首次前向后缓存解量化得到的高精度权重，而不是每次调用都从打包的 FP4 权重重新解量化。
 - **默认值**：`False`（等价于 `"0"`）

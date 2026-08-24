@@ -201,6 +201,36 @@ export AR_AUTO_SCHEME_CACHE=/path/to/auto_scheme_cache
 export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 ```
 
+### AR_DISABLE_NEUQI
+- **Description**: Disables the NeUQI joint scale/zero-point search on the asymmetric int path (`asym_search="auto"`/`"neuqi"`), reverting it to plain min/max scaling.
+- **Default**: `"0"` (NeUQI engaged where applicable)
+- **Valid Values**: `"1"`, `"true"`, `"yes"` disable; any other value leaves the search active
+- **Usage**: Set for A/B comparisons of the search's contribution
+
+```bash
+export AR_DISABLE_NEUQI=1
+```
+
+### AR_NEUQI_COARSE
+- **Description**: Number of coarse (log-spaced) scale candidates explored by the NeUQI search before the fine additive refinement.
+- **Default**: `"64"`
+- **Valid Values**: any positive integer
+- **Usage**: Lower for faster searches, raise for exhaustive scale sweeps
+
+```bash
+export AR_NEUQI_COARSE=64
+```
+
+### AR_NEUQI_FINE
+- **Description**: Number of fine (additive) scale refinement candidates per coarse candidate in the NeUQI search.
+- **Default**: `"32"`
+- **Valid Values**: any positive integer
+- **Usage**: Lower for faster searches, raise for finer scale resolution
+
+```bash
+export AR_NEUQI_FINE=32
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **Description**: Controls whether `NVFP4E5M3QuantLinear` caches a dequantized high-precision weight after the first forward pass, instead of dequantizing the packed FP4 weight on every call.
 - **Default**: `False` (equivalent to `"0"`)
