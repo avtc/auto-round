@@ -665,7 +665,7 @@ class TestLazyMoEMaterialization:
 
             @classmethod
             def original_module_class(cls):
-                return "TinyMLP"
+                return "TinyMLPLazy"
 
             @classmethod
             def from_original(cls, original, config):
