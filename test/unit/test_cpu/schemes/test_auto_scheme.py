@@ -5,7 +5,10 @@ import shutil
 import pytest
 
 from auto_round import AutoRound, AutoScheme
-from auto_round.auto_scheme.delta_loss import _parallel_scoring_must_raise
+import torch
+
+from auto_round.auto_scheme.delta_loss import _parallel_scoring_must_raise, _restrict_worker_gpu_visibility
+from auto_round.auto_scheme.delta_loss import AutoSchemeWrapperLinear
 from auto_round.auto_scheme.utils import _build_layer_config_header_rows, _short_summary_name
 
 
@@ -1155,3 +1158,100 @@ def test_parallel_error_must_raise_respects_env_and_lost_worker(monkeypatch):
     # env on -> any failure raises
     monkeypatch.setenv("AR_AUTO_SCHEME_NO_SERIAL_FALLBACK", "1")
     assert _parallel_scoring_must_raise(RuntimeError("CUDA out of memory"))
+
+
+class TestRestrictWorkerGpuVisibility:
+    def test_masks_env_and_translates_cuda_index(self, monkeypatch):
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        out = _restrict_worker_gpu_visibility("cuda:2")
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "2"
+        assert str(out) == "cuda:0"
+
+    def test_non_cuda_devices_pass_through_untouched(self, monkeypatch):
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        for dev in ("xpu:0", "hpu:1", "cpu", "cuda"):
+            assert _restrict_worker_gpu_visibility(dev) == dev
+            assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+    def test_already_initialized_cuda_leaves_env_alone(self, monkeypatch):
+        import torch
+
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+        assert _restrict_worker_gpu_visibility("cuda:3") == "cuda:3"
+        assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+class TestQdqWeightCheckpoint:
+    def _make_wrapper(self):
+        """Minimal scoring wrapper: a Linear with the attributes _qdq_weight reads."""
+        layer = torch.nn.Linear(8, 8, bias=False)
+        layer.bits, layer.group_size, layer.sym = 4, 8, True
+        layer.scale_dtype = None
+        layer.data_type = "int"
+        wrapper = AutoSchemeWrapperLinear.__new__(AutoSchemeWrapperLinear)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.orig_layer = layer
+        wrapper.device = "cpu"
+        wrapper.data_type = "int"
+        wrapper.q_scale_thresh = None
+        wrapper.grad_mode = True
+        wrapper.need_weight_grad = True
+        wrapper.enable_act_quant = False
+        wrapper.minmax_scale_bound = (1e-4, 1e3)
+        wrapper.weight_min = None
+        wrapper.weight_max = None
+        from auto_round.wrapper import WrapperLinear
+
+        wrapper.super_qdq_func = WrapperLinear._qdq_weight.__get__(wrapper)
+        wrapper.act_score = 0.0
+        wrapper.avg_act_score = 0.0
+        wrapper.act_cnt = 0.0
+        wrapper.weight_score = 0.0
+        wrapper.mix_score = 0.0
+        wrapper.max_act_value = 0
+
+        def _fake_quant(weight, **kwargs):
+            # differentiable stand-in: a fake-quant chain whose intermediates
+            # would be saved for backward without checkpointing
+            grouped = weight.view(-1, 8)
+            scale = grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-4) / 7.0
+            q = (grouped / scale).clamp(-7, 7)
+            return ((q * 0.9 + 0.1 * q.pow(3) / 49.0) * scale).view_as(weight), scale, None
+
+        wrapper.weight_quant_func = _fake_quant
+        layer.weight.requires_grad = True
+        return wrapper, layer
+
+    def test_grad_mode_qdq_weight_runs_under_checkpoint(self, monkeypatch):
+        wrapper, layer = self._make_wrapper()
+        calls = {"n": 0}
+        real_checkpoint = torch.utils.checkpoint.checkpoint
+
+        def spy(fn, *a, **k):
+            calls["n"] += 1
+            return real_checkpoint(fn, *a, **k)
+
+        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._CHECKPOINT_QDQ_WEIGHT", True)
+        monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", spy)
+        qdq_w, scale, zp = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        assert calls["n"] == 1
+        assert qdq_w.requires_grad
+
+    def test_qdq_weight_checkpoint_matches_uncheckpointed_values_and_grads(self, monkeypatch):
+        torch.manual_seed(0)
+        wrapper, layer = self._make_wrapper()
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn(8, 8))
+        args = (torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+
+        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._CHECKPOINT_QDQ_WEIGHT", True)
+        out_cp, _, _ = wrapper._qdq_weight(*args)
+        g_cp = torch.autograd.grad(out_cp.sum(), layer.weight, retain_graph=True)[0].clone()
+
+        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._CHECKPOINT_QDQ_WEIGHT", False)
+        out_ref, _, _ = wrapper._qdq_weight(*args)
+        g_ref = torch.autograd.grad(out_ref.sum(), layer.weight)[0]
+
+        assert torch.allclose(out_cp, out_ref)
+        assert torch.allclose(g_cp, g_ref)

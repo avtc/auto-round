@@ -175,9 +175,24 @@ class AutoSchemeWrapperLinear(WrapperLinear):
 
             return qdq_w, 1.0, None
 
-        qdq_w, scale, zp = super()._qdq_weight(
-            torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
-        )
+        base_qdq = super()._qdq_weight
+
+        def _qdq():
+            return base_qdq(
+                torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
+            )
+
+        # The quant-dequant chain over the weight runs inside the autograd graph
+        # (need_weight_grad) and its weight-sized intermediates are saved for
+        # backward on every wrapped layer.  Across a full streaming forward pass
+        # they accumulate faster than the reverse replay releases them, which is
+        # what pushes workers OOM mid-pass on expert-heavy blocks.  Recompute-on-
+        # backward checkpointing keeps the saved state to the weight reference
+        # and the small tuning tensors instead.
+        if _CHECKPOINT_QDQ_WEIGHT and self.grad_mode and torch.is_grad_enabled():
+            qdq_w, scale, zp = torch.utils.checkpoint.checkpoint(_qdq, use_reentrant=False)
+        else:
+            qdq_w, scale, zp = _qdq()
 
         if self.grad_mode:
 
@@ -1951,9 +1966,16 @@ def _drain_progress_queue(progress_queue, pbar):
             pbar.write(payload)
 
 
-def _get_worker_memory_report(worker_device):
-    """Return this worker's peak RAM and VRAM for its assigned logical device."""
-    memory_monitor.update(device_list=worker_device)
+def _get_worker_memory_report(worker_device, compute_device=None):
+    """Return this worker's peak RAM and VRAM for its assigned logical device.
+
+    ``compute_device`` is the device the worker actually ran on; it can differ
+    from ``worker_device`` when the worker masked ``CUDA_VISIBLE_DEVICES`` down
+    to a single GPU (the assigned GPU is renumbered to ``cuda:0`` inside the
+    process).  Peaks are queried on the compute device but reported under the
+    logical device key the parent understands.
+    """
+    memory_monitor.update(device_list=compute_device if compute_device is not None else worker_device)
     device_key = str(worker_device).split(":")[-1]
     return {
         "device": device_key,
@@ -1978,6 +2000,29 @@ def _merge_worker_memory_reports(monitor, reports):
         worker_peaks[device] = worker_peaks.get(device, 0.0) + report["peak_vram"]
     for device, peak_vram in worker_peaks.items():
         monitor.peak_vram[device] = max(monitor.peak_vram.get(device, 0.0), peak_vram)
+
+
+_CHECKPOINT_QDQ_WEIGHT = True
+
+
+def _restrict_worker_gpu_visibility(worker_device):
+    """Pin this worker process to its assigned CUDA GPU before CUDA initializes.
+
+    Without the mask, every spawned scoring worker creates a small CUDA context
+    on ``cuda:0`` in addition to its assigned device (early default-device
+    touches), silently shaving roughly a quarter GB per sibling off the
+    resident worker's budget.  Non-CUDA device strings pass through untouched,
+    and an already-initialized CUDA runtime leaves the environment alone.
+    Returns the compute device to use inside the worker: the assigned GPU
+    renumbered to ``cuda:0`` when masking applies.
+    """
+    import re as _re
+
+    matched = _re.match(r"^cuda:(\d+)$", str(worker_device))
+    if matched is None or torch.cuda.is_initialized():
+        return worker_device
+    os.environ["CUDA_VISIBLE_DEVICES"] = matched.group(1)
+    return "cuda:0"
 
 
 def _get_scheme_worker_count(num_schemes, num_gpus):
@@ -2092,6 +2137,9 @@ def _score_scheme_worker(args):
     from auto_round.utils import get_block_names as _get_block_names
     from auto_round.utils import get_module as _get_module
 
+    report_device = worker_device
+    worker_device = _restrict_worker_gpu_visibility(worker_device)
+
     disk_index = None
     if disk_stream_model:
         try:
@@ -2195,7 +2243,7 @@ def _score_scheme_worker(args):
                 continue
             layer_bits, _ = _compute_layer_bits(_get_module(model, layer_name), ignore_scale_zp_bits)
             scores[layer_name] = [layer_bits, 0.0]
-        return index, scores, _get_worker_memory_report(worker_device)
+        return index, scores, _get_worker_memory_report(report_device, compute_device=worker_device)
 
     from auto_round.auto_scheme.delta_loss import get_score_for_scheme
 
@@ -2224,7 +2272,7 @@ def _score_scheme_worker(args):
         scheme_tag=f"{index + 1}/{total_schemes} {_short_name(scheme)}",
         disk_index=disk_index,
     )
-    return index, scores, _get_worker_memory_report(worker_device)
+    return index, scores, _get_worker_memory_report(report_device, compute_device=worker_device)
 
 
 def _gen_layer_config(
