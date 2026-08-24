@@ -727,6 +727,47 @@ def _prepare_replay_input(block_input_args, block_input_kwargs, block_name):
     raise RuntimeError(f"No floating replay input found for block {block_name}")
 
 
+def _vram_inventory_text(top_k: int = 12) -> str:
+    """Return the live-CUDA-tensor census as text (see ``_vram_inventory``).
+
+    Grouped by (shape, dtype) signature, largest first -- block weight shapes
+    are recognizable, which is what makes an at-failure census actionable.
+    """
+    import gc as _gc
+    from collections import defaultdict
+
+    if not torch.cuda.is_available():
+        return "cuda unavailable; no census"
+    groups = defaultdict(lambda: [0, 0])
+    for obj in _gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda:
+                key = (tuple(obj.shape), str(obj.dtype))
+                groups[key][0] += 1
+                groups[key][1] += obj.element_size() * obj.numel()
+        except Exception:  # noqa: BLE001
+            continue
+    ranked = sorted(groups.items(), key=lambda kv: -kv[1][1])[:top_k]
+    total = sum(v[1] for v in groups.values())
+    alloc = torch.cuda.memory_allocated() / 2**30
+    lines = [f"live tensors {total / 2**30:.2f} GiB (allocator {alloc:.2f} GiB)"]
+    for (shape, dtype), (cnt, nb) in ranked:
+        lines.append(f"  {nb / 2**30:6.2f} GiB x{cnt:<4} {dtype} {shape}")
+    return "\n".join(lines)
+
+
+def _annotate_worker_oom(worker_index, exc):
+    """Attach a live-tensor census to a CUDA OOM raised inside a scoring worker."""
+    try:
+        census = _vram_inventory_text(top_k=20)
+    except Exception:  # noqa: BLE001  the census must never mask the OOM
+        census = "census unavailable"
+    return RuntimeError(
+        f"_score_scheme_worker[{worker_index}] CUDA OOM during scoring. "
+        f"Live-tensor census at failure:\n{census}\nOriginal error: {exc}"
+    )
+
+
 def _vram_inventory(tag: str, top_k: int = 12):
     """Env-gated (AR_SCHEME_MEM_INVENTORY=1) per-device live-tensor census:
     resident CUDA tensors grouped by (shape, dtype) signature, largest first --
@@ -2220,31 +2261,36 @@ def _score_scheme_worker(args):
 
     from auto_round.auto_scheme.delta_loss import get_score_for_scheme
 
-    scores = get_score_for_scheme(
-        model,
-        tokenizer,
-        quant_layer_names,
-        fixed_layer_scheme,
-        dataset,
-        ignore_scale_zp_bits=ignore_scale_zp_bits,
-        pbar=_ProgressQueueProxy(progress_queue),
-        nsamples=nsamples,
-        seqlen=seqlen,
-        skip_batches=skip_batches,
-        batch_checkpoint=batch_checkpoint,
-        need_weight_grad=need_weight_grad,
-        enable_torch_compile=enable_torch_compile,
-        low_gpu_mem_usage=low_gpu_mem_usage,
-        major_device=worker_device,
-        batch_size=batch_size,
-        offload_context=None,
-        processor=processor,
-        is_vlm=is_vlm,
-        force_mllm=force_mllm,
-        model_name=model_name,
-        scheme_tag=f"{index + 1}/{total_schemes} {_short_name(scheme)}",
-        disk_index=disk_index,
-    )
+    try:
+        scores = get_score_for_scheme(
+            model,
+            tokenizer,
+            quant_layer_names,
+            fixed_layer_scheme,
+            dataset,
+            ignore_scale_zp_bits=ignore_scale_zp_bits,
+            pbar=_ProgressQueueProxy(progress_queue),
+            nsamples=nsamples,
+            seqlen=seqlen,
+            skip_batches=skip_batches,
+            batch_checkpoint=batch_checkpoint,
+            need_weight_grad=need_weight_grad,
+            enable_torch_compile=enable_torch_compile,
+            low_gpu_mem_usage=low_gpu_mem_usage,
+            major_device=worker_device,
+            batch_size=batch_size,
+            offload_context=None,
+            processor=processor,
+            is_vlm=is_vlm,
+            force_mllm=force_mllm,
+            model_name=model_name,
+            scheme_tag=f"{index + 1}/{total_schemes} {_short_name(scheme)}",
+            disk_index=disk_index,
+        )
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        raise _annotate_worker_oom(index, exc) from exc
     return index, scores, _get_worker_memory_report(worker_device)
 
 

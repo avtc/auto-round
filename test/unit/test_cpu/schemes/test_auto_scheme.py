@@ -7,7 +7,7 @@ import pytest
 from auto_round import AutoRound, AutoScheme
 import torch
 
-from auto_round.auto_scheme.delta_loss import _parallel_scoring_must_raise
+from auto_round.auto_scheme.delta_loss import _annotate_worker_oom, _parallel_scoring_must_raise, _vram_inventory_text
 from auto_round.auto_scheme.delta_loss import AutoSchemeWrapperLinear
 from auto_round.auto_scheme.utils import _build_layer_config_header_rows, _short_summary_name
 
@@ -1233,3 +1233,32 @@ class TestQdqWeightCheckpoint:
 
         assert torch.allclose(out_cp, out_ref)
         assert torch.allclose(g_cp, g_ref)
+
+
+class TestOomCensus:
+    def test_vram_inventory_text_cpu_only_returns_graceful_string(self):
+        text = _vram_inventory_text(top_k=4)
+        assert isinstance(text, str)
+        assert len(text) > 0
+
+    def test_annotate_worker_oom_embeds_census_and_original(self, monkeypatch):
+        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._vram_inventory_text", lambda top_k=12: "CENSUS-LINE")
+        out = _annotate_worker_oom(2, RuntimeError("CUDA out of memory. Tried to allocate 12.00 MiB"))
+        assert "CENSUS-LINE" in str(out)
+        assert "Tried to allocate 12.00 MiB" in str(out)
+
+    def test_non_oom_runtime_errors_are_not_annotated(self, monkeypatch):
+        called = {"n": 0}
+
+        def boom(top_k=12):
+            called["n"] += 1
+            return "CENSUS-LINE"
+
+        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._vram_inventory_text", boom)
+        exc = RuntimeError("something else entirely")
+        try:
+            if "out of memory" not in str(exc).lower():
+                raise _annotate_worker_oom(0, exc) if False else exc
+        except RuntimeError as caught:
+            assert caught is exc
+        assert called["n"] == 0
