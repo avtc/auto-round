@@ -1353,3 +1353,108 @@ class TestReplayRetainGraph:
         torch.autograd.backward(out, retain_graph=False)
         assert x.grad is not None
         assert x.grad.abs().sum() > 0
+
+
+class TestScoreLinearRecompute:
+    """The scoring forward runs the linear through a custom Function that saves
+    only the input activation: the weight is re-transferred from the CPU cache
+    in backward, so the block graph never retains weight-shaped copies."""
+
+    def _make_wrapper(self):
+        layer = torch.nn.Linear(8, 6, bias=False)
+        layer.bits, layer.group_size, layer.sym = 4, 8, True
+        layer.scale_dtype = None
+        layer.data_type = "int"
+        wrapper = AutoSchemeWrapperLinear.__new__(AutoSchemeWrapperLinear)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.orig_layer = layer
+        wrapper.device = "cpu"
+        wrapper.output_device = "cpu"
+        wrapper.data_type = "int"
+        wrapper.q_scale_thresh = None
+        wrapper.grad_mode = True
+        wrapper.need_weight_grad = True
+        wrapper.enable_act_quant = False
+        wrapper.enable_norm_bias_tuning = False
+        wrapper.minmax_scale_bound = (1e-4, 1e3)
+        wrapper.weight_min = None
+        wrapper.weight_max = None
+        from auto_round.wrapper import WrapperLinear
+
+        wrapper.super_qdq_func = WrapperLinear._qdq_weight.__get__(wrapper)
+        wrapper.act_qdq_func = WrapperLinear._qdq_act.__get__(wrapper)
+        wrapper.act_score = 0.0
+        wrapper.avg_act_score = 0.0
+        wrapper.act_cnt = 0.0
+        wrapper.weight_score = 0.0
+        wrapper.mix_score = 0.0
+        wrapper.max_act_value = 0
+        wrapper._score_qdq_cpu = None
+        wrapper._custom_score_forward = True
+        wrapper.orig_forward = torch.nn.functional.linear
+        wrapper.value = torch.tensor(0.0)
+        wrapper.min_scale = torch.tensor(1.0)
+        wrapper.max_scale = torch.tensor(1.0)
+
+        def _fake_quant(weight, **kwargs):
+            scale = weight.abs().amax().clamp(min=1e-4) / 7.0
+            return (weight / scale).round().clamp(-7, 7) * scale, scale, None
+
+        wrapper.weight_quant_func = _fake_quant
+        layer.weight.requires_grad = True
+        return wrapper, layer
+
+    def test_forward_matches_reference_linear(self):
+        torch.manual_seed(0)
+        wrapper, layer = self._make_wrapper()
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn(6, 8) * 0.5)
+        x = torch.randn(4, 8, requires_grad=True)
+        out = wrapper.forward(x)
+        ref_w, _, _ = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        ref = torch.nn.functional.linear(x, ref_w.detach())
+        assert torch.equal(out, ref)
+
+    def test_input_grads_match_reference(self):
+        torch.manual_seed(0)
+        wrapper, layer = self._make_wrapper()
+        x = torch.randn(4, 8, requires_grad=True)
+        out = wrapper.forward(x)
+        grad_out = torch.randn_like(out)
+        out.backward(grad_out)
+        ref_w = wrapper._score_qdq_cpu
+        ref_x = x.detach().clone().requires_grad_(True)
+        ref = torch.nn.functional.linear(ref_x, ref_w)
+        ref.backward(grad_out)
+        assert torch.allclose(x.grad, ref_x.grad, atol=1e-6)
+
+    def test_weight_score_accumulated_in_backward(self):
+        torch.manual_seed(0)
+        wrapper, layer = self._make_wrapper()
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn(6, 8) * 0.5)
+        x = torch.randn(4, 8, requires_grad=True)
+        out = wrapper.forward(x)
+        grad_out = torch.randn_like(out)
+        out.backward(grad_out)
+        qdq_w = wrapper._score_qdq_cpu
+        grad_w = grad_out.t() @ x.detach()
+        expected = (grad_w.abs() * (layer.weight - qdq_w).abs()).sum().item()
+        assert wrapper.weight_score > 0
+        assert abs(wrapper.weight_score - expected) / expected < 1e-5
+
+    def test_weight_refetched_in_backward_and_no_weight_grad(self):
+        wrapper, layer = self._make_wrapper()
+        x = torch.randn(4, 8, requires_grad=True)
+        wrapper.forward(x).sum().backward()
+        assert layer.weight.grad is None
+        assert wrapper.weight_score > 0
+
+    def test_capture_mode_uses_base_forward(self):
+        torch.manual_seed(1)
+        wrapper, layer = self._make_wrapper()
+        wrapper.grad_mode = False
+        x = torch.randn(4, 8)
+        out = wrapper.forward(x)
+        assert not out.requires_grad
+        assert wrapper._score_qdq_cpu is None

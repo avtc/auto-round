@@ -84,6 +84,43 @@ from auto_round.wrapper import WrapperLinear
 __all__ = ["gen_layer_config"]
 
 
+class _ScoreLinear(torch.autograd.Function):
+    """Linear for scoring passes whose weight lives in the wrapper's CPU cache.
+
+    Saves only the input activation: the dequantized weight is transferred
+    from the cache again wherever needed, so the block's autograd graph holds
+    no weight-shaped tensors. The weight score is accumulated from the
+    explicit gradient instead of a tensor hook.
+    """
+
+    @staticmethod
+    def forward(ctx, x, wrapper, bias):  # pylint: disable=arguments-differ
+        ctx.wrapper = wrapper
+        ctx.save_for_backward(x)
+        weight = wrapper._score_weight_for_device(x.device)
+        return torch.nn.functional.linear(x, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_out):  # pylint: disable=arguments-differ
+        (x,) = ctx.saved_tensors
+        wrapper = ctx.wrapper
+        weight = wrapper._score_weight_for_device(x.device)
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            grad_x = torch.matmul(grad_out, weight)
+        if wrapper.grad_mode and wrapper.need_weight_grad:
+            grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1])
+            x_2d = x.reshape(-1, x.shape[-1])
+            grad_w = torch.mm(grad_out_2d.t(), x_2d)
+            weight_ref = wrapper.orig_layer.weight
+            if weight_ref.device.type == "meta":
+                weight_ref = wrapper.orig_layer.get_weight().to(x.device)
+            w_diff = weight_ref.to(x.device) - weight
+            wrapper.weight_score += torch.abs(grad_w * w_diff).sum().item()
+            wrapper.mix_score = wrapper.weight_score + wrapper.act_score
+        return grad_x, None, None
+
+
 class AutoSchemeWrapperLinear(WrapperLinear):
 
     def __init__(
@@ -125,6 +162,8 @@ class AutoSchemeWrapperLinear(WrapperLinear):
         # visit and stored on CPU; bounded to the block being replayed so
         # parallel workers' caches stay within host RAM
         self._score_qdq_cpu = None
+        # use the recompute-weight scoring forward (see _ScoreLinear)
+        self._custom_score_forward = True
 
     def _qdq_act(self, x, act_min_scale=1.0, act_max_scale=1.0, act_max=None):
         """Quant-dequant the activation and, in ``grad_mode``, register a backward hook that
@@ -165,6 +204,42 @@ class AutoSchemeWrapperLinear(WrapperLinear):
                 qdq_x.register_hook(save_grad)
         return qdq_x, scale, zp
 
+    def _ensure_score_cache(self):
+        """Build the per-visit CPU cache of the dequantized weight (scoring layers only)."""
+        if self._score_qdq_cpu is not None:
+            return
+        device = self.device
+        with torch.no_grad():
+            qdq_w, _, _ = super(AutoSchemeWrapperLinear, self)._qdq_weight(
+                torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
+            )
+        self._score_qdq_cpu = qdq_w.detach().to("cpu")
+
+    def _score_weight_for_device(self, device):
+        """Return the cached dequantized weight on ``device`` (transfers from the CPU cache)."""
+        self._ensure_score_cache()
+        return self._score_qdq_cpu.to(device)
+
+    def forward(self, x):
+        """In the scoring replay, run the linear through ``_ScoreLinear`` so the block's
+        autograd graph saves activations only; every other phase uses the base forward."""
+        if getattr(self, "_custom_score_forward", False) and self.grad_mode and torch.is_grad_enabled():
+            x = x.to(self.device)
+            for hook in self.orig_layer._forward_pre_hooks.values():
+                result = hook(self.orig_layer, (x,))
+                if result is not None:
+                    x = result[0] if isinstance(result, tuple) else result
+            bias = self.orig_layer.bias
+            if bias is not None and bias.device.type == "meta":
+                bias = self.orig_layer.get_bias().to(self.device)
+            output = _ScoreLinear.apply(x, self, bias)
+            for hook in self.orig_layer._forward_hooks.values():
+                hook_result = hook(self.orig_layer, (x,), output)
+                if hook_result is not None:
+                    output = hook_result
+            return output.to(self.output_device)
+        return super().forward(x)
+
     def _qdq_weight(self, value, min_scale, max_scale):
         """Quant-dequant the weight once per scoring pass, cache the result, and, in
         ``grad_mode``, route the score hook through a scalar anchor.
@@ -191,13 +266,7 @@ class AutoSchemeWrapperLinear(WrapperLinear):
                     torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
                 )
 
-        if self._score_qdq_cpu is None:
-            with torch.no_grad():
-                qdq_w, _, _ = super()._qdq_weight(
-                    torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
-                )
-                self._score_qdq_cpu = qdq_w.detach().to("cpu")
-
+        self._ensure_score_cache()
         qdq_w = self._score_qdq_cpu.to(device)
         if scoring:
             anchor = torch.zeros((), dtype=qdq_w.dtype, device=qdq_w.device, requires_grad=True)
@@ -261,6 +330,7 @@ class AutoSchemeWrapperLinearIMatrix(WrapperLinear):
             group_size=orig_layer.group_size,
             iters=0,
         )
+        self._custom_score_forward = False
         self.post_init_qdqw(device)
 
     @torch.no_grad()
@@ -363,6 +433,7 @@ class AutoSchemeWrapperLinearForGGUFK(AutoSchemeWrapperLinear):
             need_weight_grad,
             **kwargs,
         )
+        self._custom_score_forward = False
         self.post_init_qdqw(device)
 
     @torch.no_grad()
@@ -421,6 +492,7 @@ class AutoSchemeWrapperLinearForGGUFKImatrix(AutoSchemeWrapperLinear):
             enable_torch_compile=enable_torch_compile,
             **kwargs,
         )
+        self._custom_score_forward = False
         self.post_init_qdqw(device)
 
     @torch.no_grad()
