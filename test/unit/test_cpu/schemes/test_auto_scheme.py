@@ -7,7 +7,7 @@ import pytest
 from auto_round import AutoRound, AutoScheme
 import torch
 
-from auto_round.auto_scheme.delta_loss import _parallel_scoring_must_raise, _restrict_worker_gpu_visibility
+from auto_round.auto_scheme.delta_loss import _parallel_scoring_must_raise
 from auto_round.auto_scheme.delta_loss import AutoSchemeWrapperLinear
 from auto_round.auto_scheme.utils import _build_layer_config_header_rows, _short_summary_name
 
@@ -1158,28 +1158,6 @@ def test_parallel_error_must_raise_respects_env_and_lost_worker(monkeypatch):
     # env on -> any failure raises
     monkeypatch.setenv("AR_AUTO_SCHEME_NO_SERIAL_FALLBACK", "1")
     assert _parallel_scoring_must_raise(RuntimeError("CUDA out of memory"))
-
-
-class TestRestrictWorkerGpuVisibility:
-    def test_masks_env_and_translates_cuda_index(self, monkeypatch):
-        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-        out = _restrict_worker_gpu_visibility("cuda:2")
-        assert os.environ["CUDA_VISIBLE_DEVICES"] == "2"
-        assert str(out) == "cuda:0"
-
-    def test_non_cuda_devices_pass_through_untouched(self, monkeypatch):
-        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-        for dev in ("xpu:0", "hpu:1", "cpu", "cuda"):
-            assert _restrict_worker_gpu_visibility(dev) == dev
-            assert "CUDA_VISIBLE_DEVICES" not in os.environ
-
-    def test_already_initialized_cuda_leaves_env_alone(self, monkeypatch):
-        import torch
-
-        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
-        assert _restrict_worker_gpu_visibility("cuda:3") == "cuda:3"
-        assert "CUDA_VISIBLE_DEVICES" not in os.environ
 
 
 class TestQdqWeightCheckpoint:
