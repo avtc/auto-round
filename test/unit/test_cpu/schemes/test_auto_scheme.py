@@ -1284,3 +1284,20 @@ class TestVramReferrerTrace:
         snippet = _tensor_referrer_snippet(t, max_depth=3)
         assert isinstance(snippet, str)
         assert "list" in snippet or "dict" in snippet
+
+
+class TestReferrerAttributeNaming:
+    def test_module_referrer_names_the_holding_attribute(self):
+        import torch.nn as nn
+
+        class Holder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cache_box = []
+
+        t = torch.zeros(2, 2)
+        holder = Holder()
+        holder.cache_box.append(t)
+        snippet = _tensor_referrer_snippet(t, max_depth=3)
+        assert "Holder" in snippet
+        assert "cache_box" in snippet

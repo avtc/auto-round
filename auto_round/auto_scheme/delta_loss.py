@@ -755,13 +755,12 @@ def _vram_inventory_text(top_k: int = 12) -> str:
         lines.append(f"  {nb / 2**30:6.2f} GiB x{cnt:<4} {dtype} {shape}")
     # name the retaining objects for the largest group so the census points at
     # the retainer, not only the retained shape
-    if ranked:
-        top_shape = ranked[0][0][0]
+    for rank, ((shape, dtype), _) in enumerate(ranked[:2]):
         target = None
         objs = _gc.get_objects()
         for obj in objs:
             try:
-                if torch.is_tensor(obj) and obj.is_cuda and tuple(obj.shape) == top_shape:
+                if torch.is_tensor(obj) and obj.is_cuda and tuple(obj.shape) == shape:
                     target = obj
                     break
             except Exception:  # noqa: BLE001
@@ -772,7 +771,7 @@ def _vram_inventory_text(top_k: int = 12) -> str:
         if target is not None:
             trace = _tensor_referrer_snippet(target)
             if trace:
-                lines.append(f"  top-group referrers {top_shape}:\n{trace}")
+                lines.append(f"  group#{rank} referrers {shape}:\n{trace}")
     return "\n".join(lines)
 
 
@@ -785,9 +784,9 @@ def _tensor_referrer_snippet(tensor, max_depth: int = 3, max_entries: int = 4) -
     """
     import gc as _gc
 
-    def _describe(obj):
-        import torch.nn as _nn
+    import torch.nn as _nn
 
+    def _describe(obj, refers_to=None):
         if isinstance(obj, (list, tuple)):
             return f"{type(obj).__name__}[{len(obj)}]"
         if isinstance(obj, dict):
@@ -795,7 +794,18 @@ def _tensor_referrer_snippet(tensor, max_depth: int = 3, max_entries: int = 4) -
             shown = [k if isinstance(k, str) else type(k).__name__ for k in keys]
             return "dict{" + ", ".join(map(str, shown)) + "}"
         if isinstance(obj, _nn.Module):
-            return f"module:{type(obj).__name__}"
+            desc = f"module:{type(obj).__name__}"
+            if refers_to is not None:
+                for store_name in ("_parameters", "_buffers", "_modules"):
+                    store = getattr(obj, store_name, None)
+                    if isinstance(store, dict):
+                        for attr_name, value in store.items():
+                            if value is refers_to:
+                                return f"{desc}.{store_name}[{attr_name!r}]"
+                for attr_name, value in obj.__dict__.items():
+                    if value is refers_to:
+                        return f"{desc}.{attr_name}"
+            return desc
         return type(obj).__name__
 
     seen = {id(tensor)}
@@ -819,7 +829,7 @@ def _tensor_referrer_snippet(tensor, max_depth: int = 3, max_entries: int = 4) -
                     # giant containers at this depth are bookkeeping artifacts
                     # (object registries, gc internals), not model state
                     continue
-                lines.append(f"  depth{_depth + 1} <- {desc}")
+                lines.append(f"  depth{_depth + 1} <- {_describe(ref, refers_to=obj)}")
                 if isinstance(ref, (list, tuple, dict)):
                     next_frontier.append(ref)
             if len(lines) >= max_entries * 3:
