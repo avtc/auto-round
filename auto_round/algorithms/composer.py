@@ -714,4 +714,3 @@ class AlgorithmComposer:
     def has_layerwise_rotation(self) -> bool:
         """Whether layer-wise rotation transforms are active."""
         return bool(self._rotation_transforms)
-

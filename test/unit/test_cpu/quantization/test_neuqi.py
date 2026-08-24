@@ -258,9 +258,7 @@ class TestAsymSearchAPI:
     def test_minmax_output_matches_plain_quant(self):
         torch.manual_seed(7)
         data = _heavy_tailed_data(n_groups=8, group_size=64, seed=7)
-        func, _ = get_quant_func(
-            "int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search="minmax"
-        )
+        func, _ = get_quant_func("int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search="minmax")
         from auto_round.data_type.int import quant_tensor_asym
 
         expected = quant_tensor_asym(data.clone(), bits=4, group_size=64)

@@ -30,7 +30,6 @@ import torch
 
 from auto_round.logger import logger
 
-
 # Checkpoint-name fragment -> module-name fragment, applied only when the
 # direct spelling misses (never shadows an exact match). Covers checkpoints
 # whose block spellings differ from the modeling code: hyv3 stores
@@ -57,10 +56,21 @@ def to_checkpoint_name(name: str) -> str:
 
 
 _DTYPE_BYTES = {
-    "BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
-    "I16": 2, "U16": 2, "F16": 2, "BF16": 2,
-    "I32": 4, "U32": 4, "F32": 4,
-    "I64": 8, "U64": 8, "F64": 8,
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
 }
 
 
@@ -231,16 +241,12 @@ class CheckpointStreamer:
                             rescue_logged = True
                         return torch.device("cpu")
             if not rescue_logged and rescue_allowed:
-                logger.info(
-                    "[stream] staging GPUs below block+headroom watermarks; waiting for VRAM"
-                )
+                logger.info("[stream] staging GPUs below block+headroom watermarks; waiting for VRAM")
                 rescue_logged = True
             time.sleep(0.5)
         return None
 
-    def start_prefetch(
-        self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None
-    ) -> None:
+    def start_prefetch(self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None) -> None:
         """Stream whole module prefixes ahead of the consumer on a background
         thread.
 
@@ -265,9 +271,7 @@ class CheckpointStreamer:
         self._prefetch_depth = max(1, int(depth))
         self._prefetch_stop = False
         self._prefetch_err = None
-        self._prefetch_stage_devices = (
-            [torch.device(d) for d in stage_devices] if stage_devices else None
-        )
+        self._prefetch_stage_devices = [torch.device(d) for d in stage_devices] if stage_devices else None
         self._prefetch_stage_dev = {}  # prefix -> device it was staged on
         self._prefetch_cpu_staged = 0  # outstanding rescue-buffered prefixes
 

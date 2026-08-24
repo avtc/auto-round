@@ -1455,7 +1455,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _t_write = _time.perf_counter() - _t_write
                     logger.info(
                         "[stream] block timings: load %.1fs pack %.1fs write %.1fs",
-                        _t_load, _t_pack, _t_write,
+                        _t_load,
+                        _t_pack,
+                        _t_write,
                     )
                 else:
                     mv_module_from_gpu(block)
@@ -1526,9 +1528,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # to quantize or write; pass their tensors through verbatim so the
             # export stays complete.
             claimed_blocks = {b for block in all_blocks for b in block}
-            ckpt_layer_ids = {
-                n.split(".")[2] for n in streamer.tensor_names if n.startswith("model.layers.")
-            }
+            ckpt_layer_ids = {n.split(".")[2] for n in streamer.tensor_names if n.startswith("model.layers.")}
             for layer_id in sorted(ckpt_layer_ids):
                 blk = f"model.layers.{layer_id}"
                 if blk in claimed_blocks:
@@ -1537,8 +1537,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if not names:
                     continue
                 logger.info(
-                    f"[stream] {blk} has no module counterpart; "
-                    f"writing {len(names)} checkpoint tensors verbatim"
+                    f"[stream] {blk} has no module counterpart; " f"writing {len(names)} checkpoint tensors verbatim"
                 )
                 for n in names:
                     self.shard_writer.save_tensor(n, streamer.fetch(n))

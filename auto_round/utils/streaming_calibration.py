@@ -155,9 +155,7 @@ def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0, seed=42, nsamples=12
     if isinstance(dataset, str):
         from auto_round.calib_dataset import get_dataloader
 
-        dataset = get_dataloader(
-            tokenizer, seqlen, dataset.replace(" ", ""), seed=seed, bs=bs, nsamples=nsamples
-        )
+        dataset = get_dataloader(tokenizer, seqlen, dataset.replace(" ", ""), seed=seed, bs=bs, nsamples=nsamples)
     for data in dataset:
         if data.__class__.__name__ == "BatchEncoding":
             data = data.data

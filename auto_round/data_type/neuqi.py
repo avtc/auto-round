@@ -160,6 +160,7 @@ def _loss_all_zp_hist(data, qw, scale, maxq):
 
     return best_loss, best_zp
 
+
 def _best_zp_for_scale(data, qw, scale, maxq):
     """Evaluate all integer zero points for one per-group scale candidate.
 

@@ -499,8 +499,10 @@ def iter_transformer_layers(model: nn.Module):
     for name, module in model.named_modules():
         if name.endswith(".layers") or name == "layers":
             children = list(module.children()) if isinstance(module, nn.Module) else []
-            if children and hasattr(children[0], "input_layernorm") and hasattr(
-                children[0], "post_attention_layernorm"
+            if (
+                children
+                and hasattr(children[0], "input_layernorm")
+                and hasattr(children[0], "post_attention_layernorm")
             ):
                 yield from module
                 return

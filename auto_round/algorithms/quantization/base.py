@@ -215,8 +215,10 @@ class BaseQuantizer(BaseAlgorithm):
     ) -> None:
         """Quantize one layer with RTN (with optional optimized scale/zp search)."""
         layer_name = layer.global_name
-        tuning_device = device_override if device_override is not None else (
-            layer.tuning_device if hasattr(layer, "tuning_device") else device_manager.device
+        tuning_device = (
+            device_override
+            if device_override is not None
+            else (layer.tuning_device if hasattr(layer, "tuning_device") else device_manager.device)
         )
         layer = convert_module_to_hp_if_necessary(layer, self.model_context.amp_dtype, tuning_device)
         if not hasattr(self, "_set_module_lock"):
