@@ -182,6 +182,15 @@ class AutoSchemeWrapperLinear(WrapperLinear):
                 torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
             )
 
+        scoring = self.grad_mode and self.need_weight_grad
+        if not scoring:
+            # one-shot layers (capture pass, non-grad phases) never reuse the
+            # result, so do not grow a CPU-side cache for them
+            with torch.no_grad():
+                return super()._qdq_weight(
+                    torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
+                )
+
         if self._score_qdq_cpu is None:
             with torch.no_grad():
                 qdq_w, _, _ = super()._qdq_weight(
@@ -194,7 +203,7 @@ class AutoSchemeWrapperLinear(WrapperLinear):
                 self._score_wdiff_cpu = (weight.to(qdq_w.device) - qdq_w).detach().to("cpu")
 
         qdq_w = self._score_qdq_cpu.to(device)
-        if self.grad_mode and self.need_weight_grad:
+        if scoring:
             anchor = torch.zeros((), dtype=qdq_w.dtype, device=qdq_w.device, requires_grad=True)
             qdq_w = qdq_w + 0.0 * anchor
 
@@ -711,6 +720,19 @@ def model_forward(model, data, **forward_kwargs):
     return model(**prepared, **forward_kwargs), prepared
 
 
+def _clear_wrapper_score_caches(block_module):
+    """Drop the per-wrapper scoring caches of every layer in ``block_module`."
+
+    Wrappers persist for a whole scoring pass while their caches are only valid
+    while the owning layer's weights are materialized; without this the CPU-side
+    caches accumulate across blocks of the model.
+    """
+    for module in block_module.modules():
+        if getattr(module, "_score_qdq_cpu", None) is not None:
+            module._score_qdq_cpu = None
+            module._score_wdiff_cpu = None
+
+
 def _replay_retain_graph(block_module) -> bool:
     """Whether this block's backward must keep its autograd graph alive.
 
@@ -1054,6 +1076,7 @@ def model_forward_low_gpu(
             finally:
                 for parameter in block_module.parameters():
                     parameter.grad = None
+                _clear_wrapper_score_caches(block_module)
                 if disk_index is not None and materialized:
                     from auto_round.utils.disk_stream_util import free_module
 

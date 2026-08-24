@@ -8,7 +8,12 @@ from auto_round import AutoRound, AutoScheme
 import torch
 
 from auto_round.auto_scheme.delta_loss import _annotate_worker_oom, _parallel_scoring_must_raise
-from auto_round.auto_scheme.delta_loss import _replay_retain_graph, _tensor_referrer_snippet, _vram_inventory_text
+from auto_round.auto_scheme.delta_loss import (
+    _clear_wrapper_score_caches,
+    _replay_retain_graph,
+    _tensor_referrer_snippet,
+    _vram_inventory_text,
+)
 from auto_round.auto_scheme.delta_loss import AutoSchemeWrapperLinear
 from auto_round.auto_scheme.utils import _build_layer_config_header_rows, _short_summary_name
 
@@ -1242,13 +1247,23 @@ class TestScoreAnchorWeightScoring:
         torch.nn.functional.linear(torch.randn(2, 8), qdq_w).sum().backward()
         assert layer.weight.grad is None
 
-    def test_capture_mode_returns_cached_tensor_without_grad(self):
+    def test_capture_mode_returns_fresh_tensor_without_cache(self):
         wrapper, layer = self._make_wrapper()
         wrapper.grad_mode = False
         out, _, _ = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
         assert not out.requires_grad
-        out2, _, _ = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
-        assert torch.equal(out, out2)
+        assert wrapper._score_qdq_cpu is None  # one-shot phases must not grow CPU caches
+
+    def test_clear_wrapper_score_caches_drops_block_cache(self):
+        import torch.nn as nn
+
+        wrapper, layer = self._make_wrapper()
+        block = nn.Sequential(wrapper)
+        wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        assert wrapper._score_qdq_cpu is not None
+        _clear_wrapper_score_caches(block)
+        assert wrapper._score_qdq_cpu is None
+        assert wrapper._score_wdiff_cpu is None
 
 
 class TestOomCensus:
