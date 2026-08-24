@@ -1353,6 +1353,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             streamer.start_prefetch(flat_prefixes, depth=prefetch_depth, stage_devices=stage_devices)
 
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
+        stream_block_idx = 0
         for block_names in all_blocks:
             for block_name in block_names:
                 pbar.set_description(f"Quantizing {block_name}")
@@ -1362,7 +1363,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if streamer is not None:
                     if stage_devices:
                         # round-robin home: the block was staged here, quantize in place
-                        load_device = stage_devices[_zs_block_idx % len(stage_devices)]
+                        load_device = stage_devices[stream_block_idx % len(stage_devices)]
                     else:
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
@@ -1418,6 +1419,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                 clear_memory()
                 memory_monitor.log_summary()
+                stream_block_idx += 1
                 pbar.update(1)
 
         # ── Pipeline lifecycle: model-level teardown (also finalizes rotation) ─
