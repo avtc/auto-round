@@ -158,12 +158,6 @@ class TestStreamQuantizeEquivalence:
         ar.quantize_and_save(out_dir, format="auto_round")
         return ar.output_dir  # resolved export dir (may add a name/scheme suffix)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="requires the layer-wise rotation protocol wiring (per-block transform lifecycle), "
-        "which lands in an immediate follow-up commit",
-    )
-
     def test_streamed_export_matches_normal(self, tiny_checkpoint, tmp_path):
         """Streamed zero-shot export must match the normal (data-driven) run on
         everything the streaming mode controls: tensor inventory, all
@@ -216,12 +210,6 @@ class TestStreamQuantizeEquivalence:
         with open(os.path.join(streamed, "quantization_config.json")) as f:
             cs = json.load(f)
         assert cn == cs
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="requires the layer-wise rotation protocol wiring (per-block transform lifecycle), "
-        "which lands in an immediate follow-up commit",
-    )
 
     def test_search_runs_under_streaming(self, tiny_checkpoint, tmp_path):
         """Zero-shot streaming must still run the optimized clip search:
