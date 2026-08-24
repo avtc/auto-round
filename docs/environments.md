@@ -59,6 +59,16 @@ export AR_USE_MODELSCOPE=true
 export AR_WORK_SPACE=/path/to/custom/workspace
 ```
 
+### AR_ROTATION_FIX_LINEAR_ATTN
+- **Description**: Gate for the linear-attention offline-R1 fix used by rotation transforms (SpinQuant) on hybrid-attention models. When enabled, `layer.linear_attn` projections absorb R1 and `input_layernorm` gamma is folded into them, keeping offline R1 mathematically equivalent. Default off preserves the legacy behavior. Only read by rotation-transform code paths.
+- **Default**: `"0"`
+- **Valid Values**: `"1"`, `"true"`, `"yes"`, `"on"` (case-insensitive) enable; any other value disables
+- **Usage**: Enable for offline-R1 rotation runs on hybrid linear-attention architectures
+
+```bash
+export AR_ROTATION_FIX_LINEAR_ATTN=1
+```
+
 ### AR_DISABLE_OFFLOAD
 - **Description**: Forcibly disables the weight offloading feature in `OffloadManager`. Useful during development and debugging to skip all offload/reload overhead.
 - **Default**: `False` (equivalent to `"0"`)

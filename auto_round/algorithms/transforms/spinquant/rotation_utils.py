@@ -13,6 +13,7 @@ linear-algebra helpers.
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -184,7 +185,334 @@ __all__ = [
     "apply_hadamard_to_linear",
     "get_model_arch_info",
     "InputRotationWrapperHadamard",
+    "get_proj",
+    "iter_mlp_blocks",
+    "iter_layer_mlp_blocks",
+    "get_router_linears",
+    "get_mlp_module",
+    "dedupe_modules",
+    "iter_transformer_layers",
+    "find_embed_tokens",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Architecture-generic traversal helpers.
+#
+# A decoder layer's MLP submodule may be named ``mlp`` (most models),
+# ``feed_forward`` (Llama4) or ``block_sparse_moe`` (Granite MoE).  Inside it,
+# experts may live in ``mlp.experts`` either as an ``nn.ModuleList`` of
+# per-expert MLPs (HF style) or as numbered ``_ExpertContainer`` children
+# holding ``nn.Linear`` projections (auto-round's unfused layout, see
+# ``modeling.fused_moe``); shared experts may sit inside the MoE block
+# (``mlp.shared_expert(s)``) or directly on the decoder layer
+# (``layer.shared_mlp``, GraniteMoEShared).
+#
+# Projection name aliases:
+#   gate/up : ``gate_proj``/``up_proj`` (HF), ``w1``/``w3`` (Mixtral),
+#             ``input_linear`` (Granite, fused gate+up), ``gate_up_proj``
+#             (fused gate+up, e.g. MiniMax shared experts)
+#   down    : ``down_proj``, ``w2``, ``output_linear`` (Granite)
+# For fused gate+up projections, ``get_proj(block, "gate")`` and
+# ``get_proj(block, "up")`` return the SAME module — callers must deduplicate
+# by module identity before applying transforms.
+# ---------------------------------------------------------------------------
+
+_PROJ_NAME_ALIASES = {
+    "gate": ("gate_proj", "w1", "input_linear", "gate_up_proj"),
+    "up": ("up_proj", "w3", "input_linear", "gate_up_proj"),
+    "down": ("down_proj", "w2", "output_linear"),
+}
+_ROUTER_NAMES = ("gate", "router", "shared_expert_gate")
+_SHARED_EXPERT_NAMES = ("shared_expert", "shared_experts", "shared_mlp")
+_MLP_ATTR_NAMES = ("mlp", "feed_forward", "block_sparse_moe", "ffn")
+_LAYER_SHARED_MLP_NAMES = ("shared_mlp",)
+
+# ---------------------------------------------------------------------------
+# Gated linear-attention (GatedDeltaNet) support — qwen3_next / qwen3_5.
+#
+# Hybrid-attention models interleave ``full_attention`` layers (``self_attn``)
+# with ``linear_attention`` layers whose token mixer is a GatedDeltaNet exposed
+# as ``layer.linear_attn`` (no ``self_attn``).  Offline R1 rotates the whole
+# residual stream, so every consumer/producer of that stream on the
+# linear-attention layers must also absorb the rotation — otherwise R1 is
+# silently broken on those layers.
+#
+# GatedDeltaNet touches the residual stream only via its input projections
+# (which read ``input_layernorm`` output) and its ``out_proj`` (which writes
+# back into the residual).  Internal state (conv1d / delta rule) lives in the
+# projected space and is rotation-invariant, so absorbing R1 on the linear
+# projections keeps offline R1 mathematically exact.
+#
+# Two naming conventions exist:
+#   - qwen3_next: ``in_proj_qkvz``, ``in_proj_ba``          (2 fused projections)
+#   - qwen3_5:    ``in_proj_qkv``, ``in_proj_z``,
+#                 ``in_proj_a``,  ``in_proj_b``             (4 split projections)
+# We tolerate both by listing every name and skipping absent ones.
+# ---------------------------------------------------------------------------
+
+_LINEAR_ATTN_INPUT_PROJS = ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "in_proj_qkvz", "in_proj_ba")
+
+
+def _linear_attn_fix_enabled() -> bool:
+    """Whether the gated linear-attention offline-R1 fix is active.
+
+    When enabled, ``layer.linear_attn`` projections absorb R1 (input
+    projections → R1^-1, ``out_proj`` → R1) and ``input_layernorm`` gamma is
+    folded into them, keeping offline R1 mathematically equivalent on
+    hybrid-attention models (qwen3_next / qwen3_5).  Default OFF preserves the
+    legacy refusal (``_validate_offline_r1_support``), enabling a clean
+    before/after A/B comparison.
+
+    Set ``AR_ROTATION_FIX_LINEAR_ATTN=1`` to enable.
+    """
+    return os.environ.get("AR_ROTATION_FIX_LINEAR_ATTN", "0").lower() in ("1", "true", "yes", "on")
+
+
+# RMSNorm weight conventions.  Most models use ``output = pure_norm(x) * weight``
+# (``weight`` initialised to 1).  But Qwen3Next / Qwen3_5 (and Gemma) use
+# ``output = pure_norm(x) * (1 + weight)`` with ``weight`` zero-initialised —
+# the stored ``weight`` is a 0-centred delta, NOT the multiplicative gain.
+# Folding that delta (≈0) into linear weights would silently zero the
+# projection.  We detect the convention with an architecture-agnostic
+# functional probe and expose the true gain + reset value.
+_ONE_PLUS_WEIGHT_PROBE_CACHE: dict = {}
+
+
+def _is_one_plus_weight_norm(norm: nn.Module) -> bool:
+    """Detect the ``output * (1 + weight)`` RMSNorm convention via a probe.
+
+    Saves/restores ``norm.weight``.  Standard RMSNorm: ``weight=0`` zeroes the
+    output; ``(1 + weight)`` RMSNorm: ``weight=0`` leaves it unchanged and
+    ``weight=1`` doubles it.  Result is cached per norm class.
+    """
+    cls = type(norm)
+    cached = _ONE_PLUS_WEIGHT_PROBE_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    result = False
+    weight = getattr(norm, "weight", None)
+    if isinstance(weight, nn.Parameter) and weight.dim() == 1 and weight.numel() > 0:
+        orig = weight.data.clone()
+        try:
+            with torch.no_grad():
+                x = torch.randn(1, weight.numel(), device=weight.device, dtype=torch.float32)
+                weight.data.zero_()
+                y0 = norm(x).float().norm().item()
+                weight.data.fill_(1.0)
+                y1 = norm(x).float().norm().item()
+            # standard: y0 ~ 0 (gain == weight == 0); (1+weight): y1 == 2*y0.
+            result = y0 > 1e-5 and abs(y1 - 2.0 * y0) < 0.15 * y0
+        except Exception:
+            result = False
+        finally:
+            weight.data.copy_(orig)
+    _ONE_PLUS_WEIGHT_PROBE_CACHE[cls] = result
+    return result
+
+
+def _norm_effective_gamma_and_reset(norm: nn.Module) -> Tuple[torch.Tensor, float]:
+    """Return ``(effective_gamma_float64, reset_scalar)`` for an RMSNorm.
+
+    ``effective_gamma`` is the true per-channel gain to fold into the following
+    linear weights; ``reset_scalar`` is the value written back into
+    ``norm.weight`` so the gain becomes 1 (``1.0`` for standard norms, ``0.0``
+    for the ``(1 + weight)`` convention).
+
+    The ``(1 + weight)`` handling is gated behind
+    :func:`_linear_attn_fix_enabled`; when disabled this returns the legacy
+    ``(weight, 1.0)`` behaviour byte-for-byte.
+    """
+    w = norm.weight.data
+    if _linear_attn_fix_enabled() and _is_one_plus_weight_norm(norm):
+        return (w.to(torch.float64) + 1.0), 0.0
+    return w.to(torch.float64), 1.0
+
+
+def get_mlp_module(layer: nn.Module) -> Optional[nn.Module]:
+    """Return the layer's MLP/MoE submodule, tolerating naming differences."""
+    for name in _MLP_ATTR_NAMES:
+        mod = getattr(layer, name, None)
+        if isinstance(mod, nn.Module):
+            return mod
+    return None
+
+
+def get_proj(block: nn.Module, kind: str) -> Optional[nn.Linear]:
+    """Resolve a projection Linear from an MLP / expert block.
+
+    Args:
+        block: The MLP-like module (dense MLP, single expert, shared expert).
+        kind: One of ``"gate"``, ``"up"``, ``"down"``.
+
+    Returns:
+        The ``nn.Linear`` projection, or None if the block has none.
+        Note: for fused gate+up projections (``input_linear`` /
+        ``gate_up_proj``), kinds ``"gate"`` and ``"up"`` return the same
+        module — deduplicate by identity before transforming.
+    """
+    for name in _PROJ_NAME_ALIASES[kind]:
+        proj = getattr(block, name, None)
+        if isinstance(proj, nn.Linear):
+            return proj
+    return None
+
+
+def dedupe_modules(modules) -> list:
+    """Deduplicate modules by identity, preserving order."""
+    seen = set()
+    out = []
+    for m in modules:
+        if id(m) not in seen:
+            seen.add(id(m))
+            out.append(m)
+    return out
+
+
+def iter_mlp_blocks(mlp: nn.Module):
+    """Yield ``(block, kind)`` for every MLP-like block inside ``mlp``.
+
+    ``kind`` is one of ``"dense"`` (the mlp module itself), ``"expert"``
+    (each routed expert), or ``"shared"`` (shared expert modules).  Blocks
+    that do not expose ``nn.Linear`` projections (e.g. still-fused 3D expert
+    parameters) are silently skipped — callers that need them should unfuse
+    first (auto-round's ``_patch_model`` does this before rotation).
+    """
+    if any(get_proj(mlp, k) is not None for k in ("gate", "up", "down")):
+        yield mlp, "dense"
+
+    experts = getattr(mlp, "experts", None)
+    if experts is not None:
+        if isinstance(experts, nn.ModuleList):
+            # HF style: mlp.experts[i] is a per-expert MLP module.
+            for expert in experts:
+                yield expert, "expert"
+        elif isinstance(experts, nn.Module):
+            # auto-round unfused layout: mlp.experts.<idx> containers.
+            for child_name, child in experts.named_children():
+                if child_name.isdigit():
+                    yield child, "expert"
+
+    for shared_name in _SHARED_EXPERT_NAMES:
+        shared = getattr(mlp, shared_name, None)
+        if shared is not None and any(get_proj(shared, k) is not None for k in ("gate", "up", "down")):
+            yield shared, "shared"
+
+
+def iter_layer_mlp_blocks(layer: nn.Module):
+    """Yield ``(block, kind)`` for every MLP-like block of a decoder layer.
+
+    Covers the layer's MLP/MoE module (any supported attribute name) plus
+    shared-expert MLPs that hang directly off the layer (``layer.shared_mlp``).
+    """
+    mlp = get_mlp_module(layer)
+    if mlp is not None:
+        yield from iter_mlp_blocks(mlp)
+    for name in _LAYER_SHARED_MLP_NAMES:
+        shared = getattr(layer, name, None)
+        if shared is not None and any(get_proj(shared, k) is not None for k in ("gate", "up", "down")):
+            yield shared, "shared"
+
+
+def get_router_linears(mlp: nn.Module) -> list:
+    """Return router / gating modules that consume the (normed) residual stream.
+
+    Accepts ``nn.Linear`` routers (older HF modeling, e.g. Qwen2Moe's
+    ``mlp.gate``), routers holding a bare 2D ``weight`` parameter applied
+    via ``F.linear`` (transformers 5.x ``*TopKRouter`` modules), and nested
+    containers whose ``.gate`` child is the routing Linear (HYV3's
+    ``mlp.router.gate``).  Only ``.weight`` is ever accessed by rotation /
+    norm-fusion code, so all forms are handled identically.
+    """
+    routers = []
+    for name in _ROUTER_NAMES:
+        mod = getattr(mlp, name, None)
+        if mod is None:
+            continue
+        if isinstance(mod, nn.Linear):
+            routers.append(mod)
+        elif isinstance(getattr(mod, "weight", None), nn.Parameter) and mod.weight.dim() == 2:
+            routers.append(mod)
+        elif isinstance(getattr(mod, "gate", None), nn.Linear):
+            # nested router container, e.g. hy_v3 ``mlp.router.gate``
+            routers.append(mod.gate)
+    return routers
+
+
+# ---------------------------------------------------------------------------
+# Text-backbone location helpers (VL-safe).
+#
+# Vision-language models nest the text backbone under ``language_model`` /
+# ``text_model`` while vision towers expose their own ``layers`` containers.
+# Rotation only targets the text part, so explicit preferred paths are
+# resolved first; the generic fallback additionally requires children to
+# look like LLM decoder layers (input_layernorm + post_attention_layernorm).
+# ---------------------------------------------------------------------------
+
+_LAYER_CONTAINER_PATHS = (
+    "model.language_model.layers",
+    "language_model.layers",
+    "model.text_model.layers",
+    "text_model.layers",
+    "model.model.layers",
+    "model.layers",
+    "layers",
+    "transformer.h",
+    "model.decoder.layers",
+)
+
+_EMBED_TOKEN_PATHS = (
+    "model.language_model.embed_tokens",
+    "language_model.embed_tokens",
+    "model.text_model.embed_tokens",
+    "text_model.embed_tokens",
+    "model.model.embed_tokens",
+    "model.embed_tokens",
+    "embed_tokens",
+    "transformer.wte",
+    "decoder.embed_tokens",
+)
+
+
+def _resolve_attr_path(obj: nn.Module, path: str):
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def iter_transformer_layers(model: nn.Module):
+    """Yield decoder layers of the TEXT backbone, VL-safe.
+
+    Preferred explicit paths are tried first (covering VL nesting such as
+    ``model.language_model.layers``); the fallback picks the first
+    ``*.layers`` container whose children look like LLM decoder layers, so
+    vision towers are not mistaken for the text backbone.
+    """
+    for path in _LAYER_CONTAINER_PATHS:
+        container = _resolve_attr_path(model, path)
+        if container is not None and hasattr(container, "__iter__"):
+            yield from container
+            return
+    # Fallback: first *.layers container with decoder-layer-looking children.
+    for name, module in model.named_modules():
+        if name.endswith(".layers") or name == "layers":
+            children = list(module.children()) if isinstance(module, nn.Module) else []
+            if children and hasattr(children[0], "input_layernorm") and hasattr(
+                children[0], "post_attention_layernorm"
+            ):
+                yield from module
+                return
+
+
+def find_embed_tokens(model: nn.Module) -> Optional[nn.Module]:
+    """Locate the input embedding module of the text backbone, VL-safe."""
+    for path in _EMBED_TOKEN_PATHS:
+        embed = _resolve_attr_path(model, path)
+        if embed is not None:
+            return embed
+    return None
 
 
 # ---------------------------------------------------------------------------

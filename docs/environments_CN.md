@@ -59,6 +59,16 @@ export AR_USE_MODELSCOPE=true
 export AR_WORK_SPACE=/path/to/custom/workspace
 ```
 
+### AR_ROTATION_FIX_LINEAR_ATTN
+- **描述**：控制旋转变换（SpinQuant）在混合注意力模型上使用的线性注意力离线 R1 修复开关。启用时，`layer.linear_attn` 投影会吸收 R1，并将 `input_layernorm` 的 gamma 折叠到其中，以保持离线 R1 的数学等价性。默认关闭以保持旧行为。仅由旋转变换代码路径读取。
+- **默认值**：`"0"`
+- **有效值**：`"1"`、`"true"`、`"yes"`、`"on"`（不区分大小写）表示启用；其他任意值表示禁用
+- **用法**：在混合线性注意力架构上运行离线 R1 旋转时启用
+
+```bash
+export AR_ROTATION_FIX_LINEAR_ATTN=1
+```
+
 ### AR_DISABLE_OFFLOAD
 - **描述**：强制禁用 `OffloadManager` 中的权重卸载功能。在开发和调试时可跳过所有卸载/重载开销。
 - **默认值**：`False`（等价于 `"0"`）
