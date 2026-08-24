@@ -231,6 +231,16 @@ export AR_NEUQI_COARSE=64
 export AR_NEUQI_FINE=32
 ```
 
+### AR_NEUQI_SWEEP
+- **描述**：NeUQI 搜索的零点扫描策略。`brute` 直接遍历所有网格候选；`hist` 只累计一次每分组直方图并从中推导选择（内存有界、对 CPU 友好，但在 GPU 上受原子操作限制反而更慢）。
+- **默认值**：`"brute"`
+- **有效值**：`"brute"`、`"hist"`
+- **用法**：在内存受限的 CPU 搜索中设置为 `hist`
+
+```bash
+export AR_NEUQI_SWEEP=brute
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **描述**：控制 `NVFP4E5M3QuantLinear` 是否在首次前向后缓存解量化得到的高精度权重，而不是每次调用都从打包的 FP4 权重重新解量化。
 - **默认值**：`False`（等价于 `"0"`）

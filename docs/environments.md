@@ -231,6 +231,16 @@ export AR_NEUQI_COARSE=64
 export AR_NEUQI_FINE=32
 ```
 
+### AR_NEUQI_SWEEP
+- **Description**: Zero-point sweep strategy for the NeUQI search. `brute` walks every grid candidate directly; `hist` accumulates a per-group histogram once and derives selections from it (bounded memory, CPU-friendly, but slower on GPU where atomics dominate).
+- **Default**: `"brute"`
+- **Valid Values**: `"brute"`, `"hist"`
+- **Usage**: Set `hist` for memory-bound CPU searches
+
+```bash
+export AR_NEUQI_SWEEP=brute
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **Description**: Controls whether `NVFP4E5M3QuantLinear` caches a dequantized high-precision weight after the first forward pass, instead of dequantizing the packed FP4 weight on every call.
 - **Default**: `False` (equivalent to `"0"`)
