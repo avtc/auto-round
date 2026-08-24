@@ -841,14 +841,21 @@ def _tensor_referrer_snippet(tensor, max_depth: int = 3, max_entries: int = 4) -
 
 
 def _annotate_worker_oom(worker_index, exc):
-    """Attach a live-tensor census to a CUDA OOM raised inside a scoring worker."""
+    """Attach a live-tensor census and the failing op to a CUDA OOM in a worker."""
+    import traceback as _tb
+
     try:
         census = _vram_inventory_text(top_k=20)
     except Exception:  # noqa: BLE001  the census must never mask the OOM
         census = "census unavailable"
+    tb_lines = _tb.format_exc().splitlines()
+    tb_head = "\n".join(tb_lines[:4])
+    tb_tail = "\n".join(tb_lines[-8:])
     return RuntimeError(
         f"_score_scheme_worker[{worker_index}] CUDA OOM during scoring. "
-        f"Live-tensor census at failure:\n{census}\nOriginal error: {exc}"
+        f"Live-tensor census at failure:\n{census}\n\n"
+        f"Traceback head:\n{tb_head}\n...\nTraceback tail:\n{tb_tail}"
+        f"Original error: {exc}"
     )
 
 
