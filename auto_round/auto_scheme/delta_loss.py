@@ -713,6 +713,22 @@ def model_forward(model, data, **forward_kwargs):
     return model(**prepared, **forward_kwargs), prepared
 
 
+def _replay_retain_graph(block_module) -> bool:
+    """Whether this block's backward must keep its autograd graph alive.
+
+    MX-family data types re-run quantization code inside backward hooks that
+    expect the block graph to still exist.  Every other data type frees the
+    graph per block: the reverse replay holds one block's saved activations at
+    a time, and retaining graphs across blocks accumulates them for the whole
+    pass, which is what pushes streamed scoring workers OOM mid-pass.
+    """
+    for _, module in block_module.named_modules():
+        data_type = getattr(module, "data_type", None)
+        if isinstance(data_type, str) and data_type.startswith("mx"):
+            return True
+    return False
+
+
 def _prepare_replay_input(block_input_args, block_input_kwargs, block_name):
     """Find the floating hidden-state tensor whose gradient feeds the preceding block."""
     candidates = []
@@ -1030,7 +1046,7 @@ def model_forward_low_gpu(
                 torch.autograd.backward(
                     tensors=main_output,
                     grad_tensors=current_grad,
-                    retain_graph=True,  # False may lead to zero gradients for some cases (e.g., MXFP4)
+                    retain_graph=_replay_retain_graph(block_module),
                 )
 
                 if replay_input.grad is None:

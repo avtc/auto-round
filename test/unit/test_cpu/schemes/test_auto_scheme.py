@@ -8,7 +8,7 @@ from auto_round import AutoRound, AutoScheme
 import torch
 
 from auto_round.auto_scheme.delta_loss import _annotate_worker_oom, _parallel_scoring_must_raise
-from auto_round.auto_scheme.delta_loss import _tensor_referrer_snippet, _vram_inventory_text
+from auto_round.auto_scheme.delta_loss import _replay_retain_graph, _tensor_referrer_snippet, _vram_inventory_text
 from auto_round.auto_scheme.delta_loss import AutoSchemeWrapperLinear
 from auto_round.auto_scheme.utils import _build_layer_config_header_rows, _short_summary_name
 
@@ -1301,3 +1301,27 @@ class TestReferrerAttributeNaming:
         snippet = _tensor_referrer_snippet(t, max_depth=3)
         assert "Holder" in snippet
         assert "cache_box" in snippet
+
+
+class TestReplayRetainGraph:
+    def test_int_data_type_frees_graph(self):
+        import torch.nn as nn
+
+        block = nn.Sequential(nn.Linear(4, 4))
+        block[0].data_type = "int"
+        assert _replay_retain_graph(block) is False
+
+    def test_mx_family_data_type_retains_graph(self):
+        import torch.nn as nn
+
+        block = nn.Sequential(nn.Linear(4, 4))
+        block[0].data_type = "mxfp4"
+        assert _replay_retain_graph(block) is True
+
+    def test_grads_flow_with_freed_graph(self):
+        lin = torch.nn.Linear(4, 4)
+        x = torch.randn(2, 4, requires_grad=True)
+        out = lin(x).sum()
+        torch.autograd.backward(out, retain_graph=False)
+        assert x.grad is not None
+        assert x.grad.abs().sum() > 0
