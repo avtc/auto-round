@@ -121,6 +121,10 @@ class AutoSchemeWrapperLinear(WrapperLinear):
         self.grad_mode = False
         if self.need_weight_grad:
             self.orig_layer.weight.requires_grad = True
+        # scoring caches: the quantized weight and its diff to the original,
+        # computed once per wrapper lifetime (one scoring pass), stored on CPU
+        self._score_qdq_cpu = None
+        self._score_wdiff_cpu = None
 
     def _qdq_act(self, x, act_min_scale=1.0, act_max_scale=1.0, act_max=None):
         """Quant-dequant the activation and, in ``grad_mode``, register a backward hook that
@@ -162,52 +166,46 @@ class AutoSchemeWrapperLinear(WrapperLinear):
         return qdq_x, scale, zp
 
     def _qdq_weight(self, value, min_scale, max_scale):
-        """Quant-dequant the weight and, in ``grad_mode``, register a backward hook that
-        accumulates ``weight_score`` from ``|grad * (weight - qdq_w)|``. Weight quantization
-        for the hook is only recomputed lazily inside the hook itself, so layers whose
-        forward never runs (e.g. unrouted MoE experts) never pay this cost.
+        """Quant-dequant the weight once per scoring pass, cache the result, and, in
+        ``grad_mode``, route the score hook through a scalar anchor.
+
+        The cached quantization is recomputed lazily on the first call, so layers
+        whose forward never runs (e.g. unrouted MoE experts) never pay this cost.
+        In ``grad_mode`` the anchor makes the returned tensor a graph node whose
+        gradient is exactly d(loss)/d(qdq_w): the score hook fires without building
+        the quant chain into the graph and without materializing weight-shaped
+        gradient buffers, which on expert-heavy blocks dominated replay VRAM.
         """
         device = self.device
-        if self.orig_layer.bits > 8 or not self.need_weight_grad:
-            qdq_w, scale, zp = super()._qdq_weight(
+        if self.orig_layer.bits > 8:
+            return super()._qdq_weight(
                 torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
             )
 
-            return qdq_w, 1.0, None
+        if self._score_qdq_cpu is None:
+            with torch.no_grad():
+                qdq_w, _, _ = super()._qdq_weight(
+                    torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
+                )
+                weight = self.orig_layer.weight
+                if weight.device.type == "meta":
+                    weight = self.orig_layer.get_weight().to(device)
+                self._score_qdq_cpu = qdq_w.detach().to("cpu")
+                self._score_wdiff_cpu = (weight.to(qdq_w.device) - qdq_w).detach().to("cpu")
 
-        base_qdq = super()._qdq_weight
-
-        def _qdq():
-            return base_qdq(
-                torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
-            )
-
-        # The quant-dequant chain over the weight runs inside the autograd graph
-        # (need_weight_grad) and its weight-sized intermediates are saved for
-        # backward on every wrapped layer.  Across a full streaming forward pass
-        # they accumulate faster than the reverse replay releases them, which is
-        # what pushes workers OOM mid-pass on expert-heavy blocks.  Recompute-on-
-        # backward checkpointing keeps the saved state to the weight reference
-        # and the small tuning tensors instead.
-        if _CHECKPOINT_QDQ_WEIGHT and self.grad_mode and torch.is_grad_enabled():
-            qdq_w, scale, zp = torch.utils.checkpoint.checkpoint(_qdq, use_reentrant=False)
-        else:
-            qdq_w, scale, zp = _qdq()
-
-        if self.grad_mode:
+        qdq_w = self._score_qdq_cpu.to(device)
+        if self.grad_mode and self.need_weight_grad:
+            anchor = torch.zeros((), dtype=qdq_w.dtype, device=qdq_w.device, requires_grad=True)
+            qdq_w = qdq_w + 0.0 * anchor
 
             def save_grad(grad):
                 """Backward hook: accumulate weight score from grad * (weight - qdq_w)."""
-                qdq_w, scale, zp = self.super_qdq_func(
-                    torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
-                )
-                w_diff = self.orig_layer.weight - qdq_w.to(self.orig_layer.weight.device)
-                self.weight_score += torch.abs((grad.to(w_diff.device) * w_diff)).sum().item()
+                w_diff = self._score_wdiff_cpu.to(grad.device)
+                self.weight_score += torch.abs(grad.to(w_diff.device) * w_diff).sum().item()
                 self.mix_score = self.weight_score + self.act_score
                 return None
 
-            if qdq_w.requires_grad:
-                qdq_w.register_hook(save_grad)
+            qdq_w.register_hook(save_grad)
         return qdq_w, 1.0, None
 
 
@@ -2144,9 +2142,6 @@ def _merge_worker_memory_reports(monitor, reports):
         worker_peaks[device] = worker_peaks.get(device, 0.0) + report["peak_vram"]
     for device, peak_vram in worker_peaks.items():
         monitor.peak_vram[device] = max(monitor.peak_vram.get(device, 0.0), peak_vram)
-
-
-_CHECKPOINT_QDQ_WEIGHT = True
 
 
 def _get_scheme_worker_count(num_schemes, num_gpus):

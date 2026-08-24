@@ -1161,7 +1161,11 @@ def test_parallel_error_must_raise_respects_env_and_lost_worker(monkeypatch):
     assert _parallel_scoring_must_raise(RuntimeError("CUDA out of memory"))
 
 
-class TestQdqWeightCheckpoint:
+class TestScoreAnchorWeightScoring:
+    """The scoring wrapper quantizes each layer once and routes the score hook
+    through a scalar anchor, so block backwards never materialize weight-shaped
+    gradients or re-run the quant search."""
+
     def _make_wrapper(self):
         """Minimal scoring wrapper: a Linear with the attributes _qdq_weight reads."""
         layer = torch.nn.Linear(8, 8, bias=False)
@@ -1189,51 +1193,62 @@ class TestQdqWeightCheckpoint:
         wrapper.weight_score = 0.0
         wrapper.mix_score = 0.0
         wrapper.max_act_value = 0
+        wrapper._score_qdq_cpu = None
+        wrapper._score_wdiff_cpu = None
 
         def _fake_quant(weight, **kwargs):
-            # differentiable stand-in: a fake-quant chain whose intermediates
-            # would be saved for backward without checkpointing
-            grouped = weight.view(-1, 8)
-            scale = grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-4) / 7.0
-            q = (grouped / scale).clamp(-7, 7)
-            return ((q * 0.9 + 0.1 * q.pow(3) / 49.0) * scale).view_as(weight), scale, None
+            scale = weight.abs().amax().clamp(min=1e-4) / 7.0
+            return ((weight / scale).round().clamp(-7, 7) * scale), scale, None
 
         wrapper.weight_quant_func = _fake_quant
         layer.weight.requires_grad = True
         return wrapper, layer
 
-    def test_grad_mode_qdq_weight_runs_under_checkpoint(self, monkeypatch):
+    def test_qdq_weight_quantizes_once_and_reuses_cache(self):
         wrapper, layer = self._make_wrapper()
         calls = {"n": 0}
-        real_checkpoint = torch.utils.checkpoint.checkpoint
+        real_quant = wrapper.weight_quant_func
 
-        def spy(fn, *a, **k):
+        def counting_quant(weight, **kwargs):
             calls["n"] += 1
-            return real_checkpoint(fn, *a, **k)
+            return real_quant(weight, **kwargs)
 
-        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._CHECKPOINT_QDQ_WEIGHT", True)
-        monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", spy)
-        qdq_w, scale, zp = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        wrapper.weight_quant_func = counting_quant
+        args = (torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        first, _, _ = wrapper._qdq_weight(*args)
+        second, _, _ = wrapper._qdq_weight(*args)
         assert calls["n"] == 1
-        assert qdq_w.requires_grad
+        assert torch.equal(first, second)
 
-    def test_qdq_weight_checkpoint_matches_uncheckpointed_values_and_grads(self, monkeypatch):
+    def test_score_anchor_accumulates_expected_weight_score(self):
         torch.manual_seed(0)
         wrapper, layer = self._make_wrapper()
         with torch.no_grad():
-            layer.weight.copy_(torch.randn(8, 8))
-        args = (torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+            layer.weight.copy_(torch.randn(8, 8) * 0.5)
+        x = torch.randn(4, 8)
+        qdq_w, _, _ = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        assert qdq_w.requires_grad
+        torch.nn.functional.linear(x, qdq_w).sum().backward()
+        # dL/d(qdq_w)[j, k] = sum_i x[i, k], so the expected score is
+        # sum_{j,k} |x.sum(0)[k]| * |w_diff[j, k]|
+        w_diff = layer.weight - wrapper._score_qdq_cpu
+        expected = (w_diff.abs().sum(dim=0) * x.sum(dim=0).abs()).sum().item()
+        assert wrapper.weight_score > 0
+        assert abs(wrapper.weight_score - expected) < 1e-5
 
-        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._CHECKPOINT_QDQ_WEIGHT", True)
-        out_cp, _, _ = wrapper._qdq_weight(*args)
-        g_cp = torch.autograd.grad(out_cp.sum(), layer.weight, retain_graph=True)[0].clone()
+    def test_orig_weight_gets_no_grad(self):
+        wrapper, layer = self._make_wrapper()
+        qdq_w, _, _ = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        torch.nn.functional.linear(torch.randn(2, 8), qdq_w).sum().backward()
+        assert layer.weight.grad is None
 
-        monkeypatch.setattr("auto_round.auto_scheme.delta_loss._CHECKPOINT_QDQ_WEIGHT", False)
-        out_ref, _, _ = wrapper._qdq_weight(*args)
-        g_ref = torch.autograd.grad(out_ref.sum(), layer.weight)[0]
-
-        assert torch.allclose(out_cp, out_ref)
-        assert torch.allclose(g_cp, g_ref)
+    def test_capture_mode_returns_cached_tensor_without_grad(self):
+        wrapper, layer = self._make_wrapper()
+        wrapper.grad_mode = False
+        out, _, _ = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        assert not out.requires_grad
+        out2, _, _ = wrapper._qdq_weight(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        assert torch.equal(out, out2)
 
 
 class TestOomCensus:
