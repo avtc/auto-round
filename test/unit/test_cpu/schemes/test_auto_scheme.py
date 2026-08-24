@@ -7,7 +7,8 @@ import pytest
 from auto_round import AutoRound, AutoScheme
 import torch
 
-from auto_round.auto_scheme.delta_loss import _annotate_worker_oom, _parallel_scoring_must_raise, _vram_inventory_text
+from auto_round.auto_scheme.delta_loss import _annotate_worker_oom, _parallel_scoring_must_raise
+from auto_round.auto_scheme.delta_loss import _tensor_referrer_snippet, _vram_inventory_text
 from auto_round.auto_scheme.delta_loss import AutoSchemeWrapperLinear
 from auto_round.auto_scheme.utils import _build_layer_config_header_rows, _short_summary_name
 
@@ -1262,3 +1263,24 @@ class TestOomCensus:
         except RuntimeError as caught:
             assert caught is exc
         assert called["n"] == 0
+
+
+class TestVramReferrerTrace:
+    def test_referrer_snippet_names_container_types(self):
+        import torch
+
+        holder = {"box": [torch.zeros(2, 3)]}
+
+        def _find():
+            import gc
+
+            for obj in gc.get_objects():
+                if torch.is_tensor(obj) and tuple(obj.shape) == (2, 3):
+                    return obj
+            return None
+
+        t = _find()
+        assert t is not None
+        snippet = _tensor_referrer_snippet(t, max_depth=3)
+        assert isinstance(snippet, str)
+        assert "list" in snippet or "dict" in snippet

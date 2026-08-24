@@ -753,7 +753,70 @@ def _vram_inventory_text(top_k: int = 12) -> str:
     lines = [f"live tensors {total / 2**30:.2f} GiB (allocator {alloc:.2f} GiB)"]
     for (shape, dtype), (cnt, nb) in ranked:
         lines.append(f"  {nb / 2**30:6.2f} GiB x{cnt:<4} {dtype} {shape}")
+    # name the retaining objects for the largest group so the census points at
+    # the retainer, not only the retained shape
+    if ranked:
+        top_shape = ranked[0][0][0]
+        for obj in _gc.get_objects():
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda and tuple(obj.shape) == top_shape:
+                    trace = _tensor_referrer_snippet(obj)
+                    if trace:
+                        lines.append(f"  top-group referrers {top_shape}:\n{trace}")
+                    break
+            except Exception:  # noqa: BLE001
+                continue
     return "\n".join(lines)
+
+
+def _tensor_referrer_snippet(tensor, max_depth: int = 3, max_entries: int = 4) -> str:
+    """Describe what holds ``tensor`` alive, as a compact referrer chain.
+
+    Walks ``gc.get_referrers`` breadth-first, reporting container types (list /
+    dict sizes, module class names) so a retention census names the retaining
+    object rather than only the retained shape.
+    """
+    import gc as _gc
+
+    def _describe(obj):
+        import torch.nn as _nn
+
+        if isinstance(obj, (list, tuple)):
+            return f"{type(obj).__name__}[{len(obj)}]"
+        if isinstance(obj, dict):
+            keys = list(obj.keys())[:max_entries]
+            shown = [k if isinstance(k, str) else type(k).__name__ for k in keys]
+            return "dict{" + ", ".join(map(str, shown)) + "}"
+        if isinstance(obj, _nn.Module):
+            return f"module:{type(obj).__name__}"
+        return type(obj).__name__
+
+    seen = {id(tensor)}
+    frontier = [tensor]
+    lines = []
+    for _depth in range(max_depth):
+        next_frontier = []
+        for obj in frontier:
+            try:
+                referrers = _gc.get_referrers(obj)
+            except Exception:  # noqa: BLE001
+                continue
+            for ref in referrers:
+                if id(ref) in seen:
+                    continue
+                seen.add(id(ref))
+                desc = _describe(ref)
+                if desc in ("frame", "builtin_function_or_method", "function"):
+                    continue
+                lines.append(f"  depth{_depth + 1} <- {desc}")
+                if isinstance(ref, (list, tuple, dict)):
+                    next_frontier.append(ref)
+            if len(lines) >= max_entries * 3:
+                break
+        frontier = next_frontier
+        if not frontier or len(lines) >= max_entries * 3:
+            break
+    return "\n".join(lines[: max_entries * 3]) if lines else "no external referrers found"
 
 
 def _annotate_worker_oom(worker_index, exc):
