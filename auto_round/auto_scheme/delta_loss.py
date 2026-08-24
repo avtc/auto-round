@@ -121,10 +121,10 @@ class AutoSchemeWrapperLinear(WrapperLinear):
         self.grad_mode = False
         if self.need_weight_grad:
             self.orig_layer.weight.requires_grad = True
-        # scoring caches: the quantized weight and its diff to the original,
-        # computed once per wrapper lifetime (one scoring pass), stored on CPU
+        # scoring cache: the dequantized weight, computed once per wrapper
+        # visit and stored on CPU; bounded to the block being replayed so
+        # parallel workers' caches stay within host RAM
         self._score_qdq_cpu = None
-        self._score_wdiff_cpu = None
 
     def _qdq_act(self, x, act_min_scale=1.0, act_max_scale=1.0, act_max=None):
         """Quant-dequant the activation and, in ``grad_mode``, register a backward hook that
@@ -196,11 +196,7 @@ class AutoSchemeWrapperLinear(WrapperLinear):
                 qdq_w, _, _ = super()._qdq_weight(
                     torch.tensor(0, device=device), torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)
                 )
-                weight = self.orig_layer.weight
-                if weight.device.type == "meta":
-                    weight = self.orig_layer.get_weight().to(device)
                 self._score_qdq_cpu = qdq_w.detach().to("cpu")
-                self._score_wdiff_cpu = (weight.to(qdq_w.device) - qdq_w).detach().to("cpu")
 
         qdq_w = self._score_qdq_cpu.to(device)
         if scoring:
@@ -209,7 +205,10 @@ class AutoSchemeWrapperLinear(WrapperLinear):
 
             def save_grad(grad):
                 """Backward hook: accumulate weight score from grad * (weight - qdq_w)."""
-                w_diff = self._score_wdiff_cpu.to(grad.device)
+                weight = self.orig_layer.weight
+                if weight.device.type == "meta":
+                    weight = self.orig_layer.get_weight().to(grad.device)
+                w_diff = weight.to(grad.device) - self._score_qdq_cpu.to(grad.device)
                 self.weight_score += torch.abs(grad.to(w_diff.device) * w_diff).sum().item()
                 self.mix_score = self.weight_score + self.act_score
                 return None
@@ -730,7 +729,6 @@ def _clear_wrapper_score_caches(block_module):
     for module in block_module.modules():
         if getattr(module, "_score_qdq_cpu", None) is not None:
             module._score_qdq_cpu = None
-            module._score_wdiff_cpu = None
 
 
 def _replay_retain_graph(block_module) -> bool:

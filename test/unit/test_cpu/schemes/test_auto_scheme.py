@@ -1199,7 +1199,6 @@ class TestScoreAnchorWeightScoring:
         wrapper.mix_score = 0.0
         wrapper.max_act_value = 0
         wrapper._score_qdq_cpu = None
-        wrapper._score_wdiff_cpu = None
 
         def _fake_quant(weight, **kwargs):
             scale = weight.abs().amax().clamp(min=1e-4) / 7.0
@@ -1263,7 +1262,6 @@ class TestScoreAnchorWeightScoring:
         assert wrapper._score_qdq_cpu is not None
         _clear_wrapper_score_caches(block)
         assert wrapper._score_qdq_cpu is None
-        assert wrapper._score_wdiff_cpu is None
 
 
 class TestOomCensus:
