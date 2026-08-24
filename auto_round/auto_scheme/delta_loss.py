@@ -611,9 +611,14 @@ def prepare_model_low_gpu(model, block_inputs: dict = None, pbar=None, major_dev
 
                 materialize_module(module, module_name, disk_index, device=major_device)
             move_module_to_tuning_device(module, major_device=major_device)
-            # for n,m in module.named_modules():
-            #     if hasattr(m, "post_init_qdqw"):
-            #         m.post_init_qdqw()
+            # The block now sits on major_device; its incoming tensors may have
+            # been emitted on another device (e.g. CPU-resident embeddings, or
+            # CPU-recorded replay inputs), so align them before the forward --
+            # a same-device .to() is a no-op reference return.
+            args = tuple(a.to(major_device) if isinstance(a, torch.Tensor) else a for a in args)
+            kwargs = {
+                k: v.to(major_device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
+            }
 
             # Call the original forward
             with torch.no_grad():
