@@ -757,15 +757,22 @@ def _vram_inventory_text(top_k: int = 12) -> str:
     # the retainer, not only the retained shape
     if ranked:
         top_shape = ranked[0][0][0]
-        for obj in _gc.get_objects():
+        target = None
+        objs = _gc.get_objects()
+        for obj in objs:
             try:
                 if torch.is_tensor(obj) and obj.is_cuda and tuple(obj.shape) == top_shape:
-                    trace = _tensor_referrer_snippet(obj)
-                    if trace:
-                        lines.append(f"  top-group referrers {top_shape}:\n{trace}")
+                    target = obj
                     break
             except Exception:  # noqa: BLE001
                 continue
+        # The enumeration list itself references every object it yielded; drop
+        # it before asking for referrers or it shadows the real retainers.
+        del objs
+        if target is not None:
+            trace = _tensor_referrer_snippet(target)
+            if trace:
+                lines.append(f"  top-group referrers {top_shape}:\n{trace}")
     return "\n".join(lines)
 
 
@@ -807,6 +814,10 @@ def _tensor_referrer_snippet(tensor, max_depth: int = 3, max_entries: int = 4) -
                 seen.add(id(ref))
                 desc = _describe(ref)
                 if desc in ("frame", "builtin_function_or_method", "function"):
+                    continue
+                if isinstance(ref, (list, tuple)) and len(ref) > 10000:
+                    # giant containers at this depth are bookkeeping artifacts
+                    # (object registries, gc internals), not model state
                     continue
                 lines.append(f"  depth{_depth + 1} <- {desc}")
                 if isinstance(ref, (list, tuple, dict)):
