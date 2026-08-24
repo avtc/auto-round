@@ -289,6 +289,33 @@ class TestLLMC:
         ), f"Invalid mixed precision quantization configuration: {quantization_config}"
 
 
+    def test_mixed_int_bits_llmcompressor_format(self, tiny_opt_model_path, tmp_path):
+        """Mixed int W5A16-W8A16 auto-scheme export with an unsupported-as-first-option scheme
+        leading the options (W5A16) must resolve and export through the llm_compressor backend
+        (compressed-tensors pack-quantized handles any int width in 2..8)."""
+        scheme = AutoScheme(
+            avg_bits=6.0,
+            options=("W5A16", "W6A16", "W7A16", "W8A16"),
+        )
+        ar = AutoRound(
+            model=tiny_opt_model_path,
+            iters=0,
+            disable_opt_rtn=True,
+            scheme=scheme,
+        )
+        _, tmp_path = ar.quantize_and_save(output_dir=tmp_path, format="auto_round:llm_compressor")
+        model = AutoModelForCausalLM.from_pretrained(tmp_path, torch_dtype="auto", trust_remote_code=True)
+        quantization_config = model.config.quantization_config.to_dict()
+        assert quantization_config["format"] == "pack-quantized"
+        assert quantization_config["config_groups"], "no quantized config groups were exported"
+        for group in quantization_config["config_groups"].values():
+            weights = group["weights"]
+            assert weights["num_bits"] in (5, 6, 7, 8), f"unexpected bit-width {weights['num_bits']}"
+            assert weights["type"] == "int"
+            assert weights["symmetric"] is True
+            assert group["input_activations"] is None  # weight-only quantization
+
+
 def test_llmcompressor_static_fp_export_packs_serially(tiny_opt_model_path, dataloader, tmp_path, monkeypatch):
     autoround = AutoRound(
         tiny_opt_model_path,

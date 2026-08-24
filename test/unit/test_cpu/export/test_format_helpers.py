@@ -200,6 +200,46 @@ class TestSchemeCompatibility:
 
 
 # ---------------------------------------------------------------------------
+# llm_compressor scheme gate for mixed int bit-widths (W5A16/W6A16/W7A16)
+# ---------------------------------------------------------------------------
+class TestLLMCompressorMixedIntBitGate:
+    @pytest.mark.parametrize("name", ["W2A16", "W3A16", "W4A16", "W5A16", "W6A16", "W7A16", "W8A16"])
+    def test_int_weight_only_presets_pass(self, name):
+        from auto_round.export.formats.backends.llm_compressor import LLMCompressorFormat
+        from auto_round.schemes import preset_name_to_scheme
+
+        scheme = preset_name_to_scheme(name)
+        # must pass regardless of the scheme's position in AutoScheme options
+        assert LLMCompressorFormat.check_scheme_args(scheme) is True
+        assert name in LLMCompressorFormat.support_schemes
+
+    @pytest.mark.parametrize("name,bits", [("W5A16", 5), ("W6A16", 6), ("W7A16", 7)])
+    def test_mixed_bit_presets_registered(self, name, bits):
+        from auto_round.schemes import PRESET_SCHEMES, preset_name_to_scheme
+
+        assert name in PRESET_SCHEMES
+        scheme = preset_name_to_scheme(name)
+        assert scheme.bits == bits
+        assert scheme.data_type == "int"
+        assert scheme.sym is True
+        assert scheme.group_size == 128
+        assert scheme.act_bits == 16
+
+    def test_unsupported_schemes_still_rejected(self):
+        from auto_round.export.formats.backends.llm_compressor import LLMCompressorFormat
+        from auto_round.schemes import QuantizationScheme
+
+        with pytest.raises(ValueError):
+            LLMCompressorFormat.check_scheme_args(
+                QuantizationScheme(bits=9, group_size=128, sym=True, data_type="int")
+            )
+        with pytest.raises(ValueError):
+            LLMCompressorFormat.check_scheme_args(
+                QuantizationScheme(bits=6, group_size=128, sym=True, data_type="fp")
+            )
+
+
+# ---------------------------------------------------------------------------
 # SUPPORTED_FORMATS presence
 # ---------------------------------------------------------------------------
 class TestSupportedFormatsRegistry:
