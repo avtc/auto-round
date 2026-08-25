@@ -593,6 +593,39 @@ class TestAsymSearchAPI:
         with pytest.raises(ValueError, match='asym_search="neuqi" requires the optimized-RTN path'):
             RTNConfig(bits=4, group_size=32, sym=False, disable_opt_rtn=True, asym_search="neuqi")
 
+    def test_coarse_grid_matches_logspace(self):
+        """The eager coarse-grid helper must be numerically identical to the
+        previous inline torch.logspace."""
+        import math
+
+        from auto_round.data_type.neuqi import _coarse_grid
+
+        for lo in (0.03125, 0.25):
+            got = _coarse_grid(lo, 64, torch.device("cpu"), torch.float32)
+            want = torch.logspace(math.log10(lo), 0.0, 64, dtype=torch.float32)
+            assert got.shape == want.shape
+            assert torch.equal(got, want)
+
+    def test_coarse_grid_is_dynamo_opaque(self):
+        """torch.logspace lowers to an fp64 libdevice.pow inside compiled
+        regions; inductor fused it into the batched sweep's index math where
+        Triton rejects fp64 ("unexpected type fp64") -- see the BPT worker
+        crash. The grid must be built eagerly and enter traced regions as a
+        plain tensor input (no logspace op in the traced graph)."""
+        import torch._dynamo as dynamo
+
+        from auto_round.data_type.neuqi import _coarse_grid
+
+        assert getattr(_coarse_grid, "_torchdynamo_disable", False) is True
+
+        def traced(x):
+            return _coarse_grid(0.25, 8, x.device, torch.float32) * x
+
+        ex = dynamo.explain(traced)(torch.ones(8))
+        op_names = [getattr(op, "__name__", str(op)) for ops in ex.ops_per_graph for op in ops]
+        assert not any("logspace" in n for n in op_names), f"logspace leaked into the traced graph: {op_names}"
+        assert any("mul" in n for n in op_names), "the sweep math itself should stay traced"
+
     def test_unknown_value_raises(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 

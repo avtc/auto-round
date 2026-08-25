@@ -58,6 +58,7 @@ fallback; every stage latches down permanently on failure (Triton -> compiled
 batched -> compiled per-candidate -> eager).
 """
 
+import functools
 import math
 from functools import lru_cache
 
@@ -78,6 +79,22 @@ _MAX_TMP_ELEMS = 2**25
 @lru_cache(maxsize=1)
 def _log_search_engaged(coarse_n: int, fine_n: int) -> None:
     logger.info("[NeUQI] joint (scale, zero-point) search active (coarse=%d, fine=%d)", coarse_n, fine_n)
+
+
+@torch.compiler.disable
+@functools.lru_cache(maxsize=None)
+def _coarse_grid(lo: float, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Log-spaced coarse scale fractions, always built eagerly.
+
+    torch.logspace lowers to an fp64 ``libdevice.pow`` inside compiled
+    regions, and inductor has been observed to fuse that into the batched
+    sweep's index-select math, where Triton rejects fp64 in the integer
+    index guards ("unexpected type fp64" -- BPT worker crash, first MoE
+    block under ``--enable_torch_compile``). Building the tiny [n] grid
+    eagerly keeps it a plain tensor input to any traced region; the cache
+    dedupes the per-chunk rebuilds (tensors are immutable here).
+    """
+    return torch.logspace(math.log10(lo), 0.0, n, device=device, dtype=dtype)
 
 
 def _zp_expr_last(data, qw, scale, zp_grid, maxq):
@@ -414,7 +431,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     s0 = ((wmax - wmin) / maxq).clamp_(min=q_scale_thresh)  # [N, 1] min-max scale
 
     lo = _lower_scale_ratio(bits)
-    coarse = torch.logspace(math.log10(lo), 0.0, coarse_n, device=data.device, dtype=torch.float32)
+    coarse = _coarse_grid(lo, coarse_n, data.device, torch.float32)
 
     best_loss = torch.full((data.shape[0],), float("inf"), device=data.device, dtype=torch.float32)
     best_frac = torch.ones(data.shape[0], device=data.device, dtype=torch.float32)
