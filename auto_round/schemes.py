@@ -514,6 +514,22 @@ def parse_scheme(
         # Map user overrides across all auto-scheme options
         scheme.options = [_override_scheme_with_user_specify(opt, user_scheme_overrides) for opt in scheme.options]
 
+        # --asym must never reach 8-bit options: int8-packed export formats
+        # cannot represent 8-bit asym (values span [0, 255] over torch.int8)
+        # and the serving kernels for W8 (vLLM GPTQ/Marlin) are sym-only.
+        # Pin such options back to symmetric, loudly.
+        import dataclasses
+
+        for opt_i, opt in enumerate(scheme.options):
+            if isinstance(opt, QuantizationScheme) and opt.sym is False and opt.bits == 8 and opt.data_type == "int":
+                scheme.options[opt_i] = dataclasses.replace(opt, sym=True)
+                logger.info(
+                    "AutoScheme option %s stays symmetric: 8-bit asymmetric quantization is "
+                    "not representable in int8-packed formats or W8 serving kernels (--asym "
+                    "applies to sub-8-bit options only)",
+                    opt_i,
+                )
+
         # Select the primary scheme for attribute binding (skipping BF16)
         default_scheme = scheme.options[0]
         for opt in scheme.options:

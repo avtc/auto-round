@@ -3505,6 +3505,9 @@ def _gen_layer_config(
 
     # print(best_loss, best_path)  # TODO better log
     layer_config = copy.deepcopy(fixed_layer_scheme)
+    # fixed pins (lm_head, MTP layer, ...) bypass the options-level sym rule
+    # in parse_scheme -- apply the same 8-bit-symmetric pinning here.
+    _pin_w8_layer_entries_symmetric(layer_config)
     options = list(copy.deepcopy(auto_scheme.options))
     # Replace scheme preset names with actual QuantizationScheme objects
     for index in range(len(options)):
@@ -3549,6 +3552,37 @@ def _gen_layer_config(
     if pbar is not None:
         pbar.close()
     return layer_config
+
+
+# Supports model with gradient clearing between iterations
+def _pin_w8_layer_entries_symmetric(layer_config: dict) -> int:
+    """Pin 8-bit int asym entries to sym, in place; returns how many.
+
+    Same rationale as the options-level rule in parse_scheme: 8-bit asym is
+    not representable in int8-packed formats nor servable by the W8 kernels,
+    and fixed layer_config pins (lm_head, MTP layer, ...) bypass options.
+    """
+    pinned = 0
+    for name, entry in layer_config.items():
+        # Only entries WITHOUT an explicit sym: those would silently inherit
+        # the global --asym. An explicit sym=False is user intent and is left
+        # alone (the pack-time int8 guard raises if it is unrepresentable).
+        if (
+            isinstance(entry, dict)
+            and entry.get("bits") == 8
+            and "sym" not in entry
+            and entry.get("data_type", "int") == "int"
+        ):
+            entry["sym"] = True
+            pinned += 1
+    if pinned:
+        logger.info(
+            "AutoScheme: pinned %d fixed layer_config entr%s to symmetric 8-bit "
+            "(8-bit asym is not representable in int8-packed formats or W8 kernels)",
+            pinned,
+            "y" if pinned == 1 else "ies",
+        )
+    return pinned
 
 
 # Supports model with gradient clearing between iterations

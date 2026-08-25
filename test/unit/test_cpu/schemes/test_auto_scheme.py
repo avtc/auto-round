@@ -1489,6 +1489,43 @@ def test_parallel_scheme_scoring_min_uncached_overrides_single_scheme():
     assert _can_parallel_scheme_scoring(True, "local-model", 1, 1, False, True, False, min_uncached=1)
 
 
+def test_fixed_layer_scheme_w8_entries_pinned_symmetric():
+    """fixed_layer_scheme entries (e.g. lm_head/layer-80 pinned to W8) bypass
+    the options override, so the 8-bit-sym rule must also apply where the
+    AutoScheme layer_config is assembled."""
+    import torch.nn as nn
+
+    from auto_round.auto_scheme.delta_loss import _pin_w8_layer_entries_symmetric
+
+    layer_config = {
+        # explicit user intent: must survive untouched (pack-time guard raises if truly unrepresentable)
+        "lm_head.weight": {"bits": 8, "sym": False, "data_type": "int", "group_size": 128},
+        # no sym key: would silently inherit the global --asym -> pinned
+        "model.layers.80.mlp.up_proj": {"bits": 8, "data_type": "int", "group_size": 128},
+        "model.layers.5.mlp.up_proj": {"bits": 4, "sym": False, "data_type": "int", "group_size": 128},
+    }
+    _pin_w8_layer_entries_symmetric(layer_config)
+    assert layer_config["lm_head.weight"]["sym"] is False, "explicit sym=False is user intent: keep it"
+    assert layer_config["model.layers.80.mlp.up_proj"]["sym"] is True, "implicit asym inheritance gets pinned"
+    assert layer_config["model.layers.5.mlp.up_proj"]["sym"] is False, "sub-8-bit entries keep asym"
+    assert isinstance(nn.Linear(2, 2), nn.Module)  # file import sanity
+
+
+def test_asym_override_never_applies_to_8bit_options():
+    """--asym maps to sym=False across AutoScheme options, but 8-bit asym is
+    unrepresentable downstream (int8-packed export; vLLM W8 kernels are
+    sym-only), so 8-bit options must stay symmetric while <8-bit stay asym."""
+    from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+    from auto_round.schemes import parse_scheme
+
+    scheme = AutoScheme(avg_bits=4.0, options=("W4A16", "W8A16"))
+    _, is_auto, _ = parse_scheme(scheme, {"sym": False})
+    assert is_auto is True
+    sym_flags = {opt.bits: opt.sym for opt in scheme.options}
+    assert sym_flags[4] is False, "sub-8-bit options keep the asym override"
+    assert sym_flags[8] is True, "8-bit options must stay symmetric"
+
+
 def test_serial_scoring_device_safe():
     """Serial full-model scoring is device-safe only on single-GPU/CPU models;
     any multi-GPU weight span is unsafe regardless of leftover hook markers
