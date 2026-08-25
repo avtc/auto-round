@@ -140,6 +140,73 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
             "quantizer (equivalent to listing 'presinq' in --algorithm)."
         ),
     )
+    rt.add_argument(
+        "--layerwise_rotation",
+        dest="layerwise_rotation",
+        default=False,
+        action="store_true",
+        help=(
+            "Apply rotation transforms (e.g. PreSINQ) per block inside the streaming "
+            "block loop instead of one whole-model pass. Required with rotation "
+            "transforms when the model is streamed (--stream_checkpoint / "
+            "AR_DISK_STREAM_MODEL=1)."
+        ),
+    )
+    rt.add_argument(
+        "--stream_checkpoint",
+        dest="stream_checkpoint",
+        default=False,
+        action="store_true",
+        help=(
+            "Stream block weights from the source checkpoint on demand (meta skeleton, "
+            "one resident block at a time) and pack/save progressively; for models "
+            "larger than host RAM. iters=0 runs weight-only; iters>0 additionally "
+            "needs --stream_calibration."
+        ),
+    )
+    rt.add_argument(
+        "--stream_calibration",
+        dest="stream_calibration",
+        default=False,
+        action="store_true",
+        help=(
+            "Chain calibration rows block-to-block under stream_checkpoint so "
+            "imatrix / tuning (iters>0) see real activations without a full model "
+            "load. Required for iters>0 and --imatrix_enabled true streaming runs."
+        ),
+    )
+    rt.add_argument(
+        "--stream_calibration_rows",
+        dest="stream_calibration_rows",
+        default=0,
+        type=int,
+        help=(
+            "Cap on chained calibration rows (0 = follow nsamples). Each chained row "
+            "costs one block forward per block; a modest cap is statistically fine "
+            "for the imatrix but tuning wants the full count."
+        ),
+    )
+    rt.add_argument(
+        "--stream_prefetch",
+        dest="stream_prefetch",
+        default=0,
+        type=int,
+        help=(
+            "Number of upcoming blocks the streaming reader stages ahead (memory is "
+            "bounded at depth x block size). ~1 staged+active block per GPU with the "
+            "NeUQI expert search (e.g. 3 on 4x3090, 7 on 8 GPUs); deeper without it."
+        ),
+    )
+    rt.add_argument(
+        "--stream_prefetch_devices",
+        dest="stream_prefetch_devices",
+        default=None,
+        type=str,
+        help=(
+            "Where staged blocks land: 'auto' (every CUDA device except the primary "
+            "quant device) or a comma list like 'cuda:0,cuda:2,cpu'. Unset = host RAM."
+        ),
+    )
     rt.add_argument("--output_dir", default="./tmp_autoround", type=str, help="Directory to save quantized artifacts.")
     rt.add_argument("--avg_bits", "--target_bits", default=None, type=float, help="Average target bits for AutoScheme.")
     rt.add_argument(

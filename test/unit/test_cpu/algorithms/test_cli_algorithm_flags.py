@@ -85,3 +85,89 @@ class TestEnablePreSINQFlag(unittest.TestCase):
         presinq = [c for c in configs if isinstance(c, PreSINQConfig)][0]
         self.assertEqual(presinq.group_size, 128)
         self.assertEqual(presinq.n_repeat, 5)
+
+
+class TestStreamingCliFlags(unittest.TestCase):
+    """Streaming/layerwise CLI flags must reach the AutoRound compressor kwargs."""
+
+    @staticmethod
+    def _compressor_kwargs(extra):
+        from auto_round.cli.main import _build_entry_compressor_kwargs
+
+        return _build_entry_compressor_kwargs(_parse(extra))
+
+    def test_streaming_flags_reach_kwargs(self):
+        kwargs = self._compressor_kwargs(
+            [
+                "--layerwise_rotation",
+                "--stream_checkpoint",
+                "--stream_calibration",
+                "--stream_prefetch",
+                "3",
+                "--stream_prefetch_devices",
+                "auto",
+                "--iters",
+                "0",
+            ]
+        )
+        self.assertIs(kwargs["layerwise_rotation"], True)
+        self.assertIs(kwargs["stream_checkpoint"], True)
+        self.assertIs(kwargs["stream_calibration"], True)
+        self.assertEqual(kwargs["stream_calibration_rows"], 0)
+        self.assertEqual(kwargs["stream_prefetch"], 3)
+        self.assertEqual(kwargs["stream_prefetch_devices"], "auto")
+
+    def test_prefetch_devices_list_parsed(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch_devices", "cuda:0,cpu"])
+        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:0", "cpu"])
+
+    def test_prefetch_devices_whitespace_tolerant(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch_devices", " cuda:1 , cpu ,"])
+        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:1", "cpu"])
+
+    def test_calibration_rows_flag(self):
+        kwargs = self._compressor_kwargs(["--stream_calibration_rows", "16"])
+        self.assertEqual(kwargs["stream_calibration_rows"], 16)
+
+    def test_defaults_are_api_neutral(self):
+        kwargs = self._compressor_kwargs([])
+        self.assertIs(kwargs["layerwise_rotation"], False)
+        self.assertIs(kwargs["stream_checkpoint"], False)
+        self.assertIs(kwargs["stream_calibration"], False)
+        self.assertEqual(kwargs["stream_calibration_rows"], 0)
+        self.assertEqual(kwargs["stream_prefetch"], 0)
+        self.assertIsNone(kwargs["stream_prefetch_devices"])
+
+
+class TestImatrixEnabledFlag(unittest.TestCase):
+    """--imatrix_enabled tri-state: the forced marker overrides the scheme
+    rules during config-class selection; auto leaves them in control."""
+
+    @staticmethod
+    def _rtn(extra):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        configs = _build(_parse([*extra, "--iters", "0"]))
+        return [c for c in configs if isinstance(c, RTNConfig)][0]
+
+    def test_auto_leaves_rules_in_control(self):
+        rtn = self._rtn(["--imatrix_enabled", "auto"])
+        self.assertNotIn("forced_imatrix", rtn.__dict__, "auto must not force an override")
+
+    def test_true_sets_forced_marker(self):
+        rtn = self._rtn(["--imatrix_enabled", "true"])
+        self.assertIs(rtn.forced_imatrix, True)
+
+    def test_false_sets_forced_marker(self):
+        rtn = self._rtn(["--imatrix_enabled", "false"])
+        self.assertIs(rtn.forced_imatrix, False)
+
+    def test_default_is_auto(self):
+        rtn = self._rtn([])
+        self.assertNotIn("forced_imatrix", rtn.__dict__)
+
+    def test_forced_true_survives_asym_scheme(self):
+        """asym resolves imatrix off by rule; the forced marker must stay set so
+        config-class selection (autoround.py) turns it back on."""
+        rtn = self._rtn(["--imatrix_enabled", "true", "--asym"])
+        self.assertIs(rtn.forced_imatrix, True)

@@ -278,12 +278,130 @@ class TestPlumbing:
         assert isinstance(rtn, OptimizedRTNConfig), "PreSINQ must not silently drop the optimized-RTN search"
         assert any(isinstance(c, PreSINQConfig) for c in configs)
 
+    def test_forced_imatrix_marker_honored_in_selection(self, monkeypatch):
+        """--imatrix_enabled true must survive the scheme rules: asym resolves
+
+        the imatrix off, but the forced marker keeps the OptimizedRTNConfig
+
+        class with the imatrix enabled (autoround selection honors it)."""
+
+        from auto_round.autoround import AutoRound as NewAutoRound
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator as Compressor
+
+        captured = {}
+
+        def _fake_init(self, config, **kwargs):
+
+            captured["config"] = config
+
+        monkeypatch.setattr(Compressor, "__init__", _fake_init)
+
+        monkeypatch.setattr("auto_round.utils.is_mllm_model", lambda *a, **k: False)
+
+        monkeypatch.setattr("auto_round.utils.is_diffusion_model", lambda *a, **k: False)
+
+        monkeypatch.setattr("auto_round.utils.model.detect_model_type", lambda *a, **k: "llm")
+
+        cfg = RTNConfig(group_size=32, sym=False, disable_opt_rtn=False)  # asym
+
+        cfg.forced_imatrix = True
+
+        NewAutoRound(
+            "dummy-model",
+            scheme="W4A16",
+            alg_configs=[cfg],
+            seqlen=8,
+            nsamples=1,
+        )
+
+        selected = captured["config"] if not isinstance(captured["config"], list) else captured["config"][0]
+
+        assert isinstance(selected, OptimizedRTNConfig), "forced imatrix must keep the optimized-RTN class"
+
+        assert selected.enable_imatrix is True
+
     def test_spinquant_mutual_exclusion(self):
         from auto_round.algorithms.composer import AlgorithmComposer
         from auto_round.algorithms.transforms.spinquant.preprocessor import SpinQuantConfig
 
         with pytest.raises(ValueError, match="[Pp]re-?SINQ.*SpinQuant"):
             AlgorithmComposer([PreSINQConfig(), SpinQuantConfig(r1=True), RTNConfig()])
+
+    def test_streamed_without_layerwise_raises(self):
+        from types import SimpleNamespace
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
+        composer._layerwise_rotation = False
+        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=True)
+        meta_model = nn.Sequential(nn.Linear(32, 32), nn.Linear(32, 32)).to("meta")
+        with pytest.raises(ValueError, match=r"layerwise_rotation=True.*--layerwise_rotation"):
+            composer.apply_model_transforms(meta_model)
+
+    def test_meta_params_without_stream_attr_raise(self):
+        # meta skeleton detection must not depend on the stream_checkpoint attr
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
+        composer._layerwise_rotation = False
+        composer._orchestrator_ref = None
+        meta_model = nn.Sequential(nn.Linear(32, 32)).to("meta")
+        with pytest.raises(ValueError, match="layerwise_rotation=True"):
+            composer.apply_model_transforms(meta_model)
+
+    def test_streamed_with_layerwise_defers_without_materializing(self):
+        from types import SimpleNamespace
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
+        composer._layerwise_rotation = True
+        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=True)
+        meta_model = nn.Sequential(nn.Linear(32, 32), nn.Linear(32, 32)).to("meta")
+        model = composer.apply_model_transforms(meta_model)
+        assert model is meta_model
+        assert any(p.device.type == "meta" for p in model.parameters()), "layerwise mode must not materialize"
+
+    def test_layerwise_fallback_to_full_rotation_guarded(self, monkeypatch):
+        """A rotation without layerwise support falls back to whole-model
+
+        rotation even in layerwise mode; on a streamed skeleton that fallback
+
+        must hit the same actionable guard instead of folding meta weights."""
+
+        from types import SimpleNamespace
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        from auto_round.algorithms.transforms.presinq.apply import PreSINQRotation
+
+        monkeypatch.setattr(PreSINQRotation, "supports_layerwise", False)
+
+        composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
+
+        composer._layerwise_rotation = True
+
+        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=True)
+
+        meta_model = nn.Sequential(nn.Linear(32, 32)).to("meta")
+
+        with pytest.raises(ValueError, match="layerwise_rotation=True"):
+
+            composer.apply_model_transforms(meta_model)
+
+    def test_unstreamed_full_rotation_still_runs(self):
+        from types import SimpleNamespace
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
+        composer._layerwise_rotation = False
+        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=False)
+        model = nn.Sequential(nn.Linear(32, 32), nn.Linear(32, 32))
+        out = composer.apply_model_transforms(model)
+        assert all(p.device.type != "meta" for p in out.parameters())
 
 
 # ---------------------------------------------------------------------------

@@ -374,16 +374,34 @@ class RTN(AlgorithmHandler):
                 "use the plain min/max initializer. Ignored for symmetric quantization."
             ),
         )
+        group.add_argument(
+            "--imatrix_enabled",
+            dest="imatrix_enabled",
+            default="auto",
+            choices=["auto", "true", "false"],
+            help=(
+                "Force the activation-imatrix weighting for the optimized-RTN search "
+                "on/off, overriding the scheme rules (sym int<8 -> on, asym -> off). "
+                "'auto' keeps the rules. Forcing it on under --stream_checkpoint also "
+                "requires --stream_calibration."
+            ),
+        )
 
     def build(self, args, common_kwargs: dict[str, Any]):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
         asym_search = "neuqi" if getattr(args, "enable_neuqi", False) else "auto"
-        return RTNConfig(
+        cfg = RTNConfig(
             disable_opt_rtn=getattr(args, "disable_opt_rtn", None),
             asym_search=asym_search,
             **common_kwargs,
         )
+        imatrix = getattr(args, "imatrix_enabled", "auto")
+        if imatrix == "true":
+            cfg.forced_imatrix = True
+        elif imatrix == "false":
+            cfg.forced_imatrix = False
+        return cfg
 
 
 class AutoRound(AlgorithmHandler):

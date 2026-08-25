@@ -151,6 +151,8 @@ def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0, seed=42, nsamples=12
     A string dataset follows the data-driven protocol (pile-10k, shuffle
     seed 42) tokenized with the MODEL's tokenizer, so ids are in-vocab by
     construction."""
+    if max_rows < 0:
+        raise ValueError(f"stream_calibration_rows must be >= 0, got {max_rows}")
     rows = []
     if isinstance(dataset, str):
         from auto_round.calib_dataset import get_dataloader
@@ -211,6 +213,7 @@ def prepare_streaming_calibration(
     rows = _normalize_rows(dataset, tokenizer, seqlen, max_rows, nsamples=nsamples)
     if not rows:
         raise ValueError("stream_calibration: no usable calibration rows (all shorter than seqlen?)")
+    logger.info("[stream_calibration] chaining %d calibration rows (nsamples=%d)", len(rows), nsamples)
 
     embed_name, embed_mod = _find_embedding(model, streamer)
     if embed_mod is None:
@@ -248,5 +251,6 @@ def prepare_streaming_calibration(
             pe_list.append((cos.cpu(), sin.cpu()))
         input_others["position_embeddings"] = pe_list
 
-    summary = {"rows": len(rows)}
+    # keep the raw token ids: SignRound's loss mask consumes them per block
+    summary = {"rows": len(rows), "token_ids": rows}
     return fp_inputs, input_others, summary

@@ -350,6 +350,120 @@ class TestCheckpointStreamer:
             _check_ids_in_vocab(bad, 120832)
 
 
+class TestStageDeviceResolution:
+    """stream_prefetch_devices kwarg + back-compat for the old _gpus spelling."""
+
+    def _resolve(self, **attrs):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        stub = SimpleNamespace(stream_prefetch=2, device="cpu", **attrs)
+        return CompressionOrchestrator._resolve_stream_stage_devices(stub)
+
+    def test_none_means_host_ram(self):
+        assert self._resolve(stream_prefetch_devices=None) is None
+
+    def test_cpu_list_resolves(self):
+        # explicit list accepts device strings incl. cpu (CPU quant device)
+        devices = self._resolve(stream_prefetch_devices=["cuda:0", "cpu"])
+        # cpu quant device + cuda entry -> falls back to host RAM by design
+        assert devices is None
+
+    def test_cpu_only_list_resolves_to_cpu(self):
+        devices = self._resolve(stream_prefetch_devices=["cpu"])
+        assert [str(d) for d in devices] == ["cpu"]
+
+    def test_int_list_with_cpu_quant_falls_back_to_ram(self):
+        # ints mean cuda:k; GPU staging with a CPU quant device buys nothing
+        assert self._resolve(stream_prefetch_devices=[0, 1]) is None
+
+    def test_meta_device_rejected(self):
+        with pytest.raises(ValueError, match="meta tensors hold no data"):
+            self._resolve(stream_prefetch_devices=["cpu", "meta"])
+
+
+class TestStreamingRoutingWaiver:
+    """Calibration-demand resolution under stream_checkpoint: RTN stays waived
+    (weight-only); SignRound (iters>0) is admitted only with the chained
+    calibration (stream_calibration) and hard-errors without it."""
+
+    def _needs(self, configs, **attrs):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.base import BaseCompressor
+
+        fields = dict(
+            quantize_config=object(),
+            _alg_configs=configs,
+            stream_checkpoint=False,
+            stream_calibration=False,
+            scheme="W4A16",
+            static_kv_dtype=None,
+            static_attention_dtype=None,
+            layer_config=None,
+        )
+        fields["_layer_config_needs_calibration"] = lambda check: False
+        fields.update(attrs)
+        return BaseCompressor._needs_calibration_data(SimpleNamespace(**fields))
+
+    def test_optimized_rtn_streamed_waived_without_calibration(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_checkpoint=True) is False
+
+    def test_signround_streamed_with_calibration_waived(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        stub = SignRoundConfig(group_size=16, iters=1)
+        assert self._needs([stub], stream_checkpoint=True, stream_calibration=True) is False
+
+    def test_mixed_rtn_signround_streamed_with_calibration_waived(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        configs = [OptimizedRTNConfig(group_size=16), SignRoundConfig(group_size=16, iters=1)]
+        assert self._needs(configs, stream_checkpoint=True, stream_calibration=True) is False
+
+    def test_signround_streamed_without_calibration_raises(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        with pytest.raises(ValueError, match="--stream_calibration"):
+            self._needs([SignRoundConfig(group_size=16, iters=1)], stream_checkpoint=True)
+
+    def test_signround_unstreamed_stays_data_driven(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        assert self._needs([SignRoundConfig(group_size=16, iters=1)]) is True
+
+    def test_unsupported_quantizer_streamed_stays_data_driven(self):
+        from auto_round.algorithms.transforms.awq.config import AWQConfig
+
+        assert self._needs([AWQConfig(group_size=16)], stream_checkpoint=True, stream_calibration=True) is True
+
+    def test_forced_imatrix_streamed_without_calibration_raises(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        cfg = OptimizedRTNConfig(group_size=16)
+        cfg.forced_imatrix = True
+        with pytest.raises(ValueError, match="--stream_calibration"):
+            self._needs([cfg], stream_checkpoint=True)
+
+    def test_forced_imatrix_streamed_with_calibration_waived(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        cfg = OptimizedRTNConfig(group_size=16)
+        cfg.forced_imatrix = True
+        assert self._needs([cfg], stream_checkpoint=True, stream_calibration=True) is False
+
+    def test_rule_enabled_imatrix_streamed_stays_waived_silently(self):
+        """imatrix on by scheme rules (no flag): the pre-existing weight-only
+        waiver applies -- no error, imatrix simply not collected."""
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_checkpoint=True) is False
+
+
 @pytest.mark.slow
 class TestStreamQuantizeEquivalence:
     """stream_checkpoint=True must produce the same export as the normal flow."""
@@ -396,7 +510,7 @@ class TestStreamQuantizeEquivalence:
         out_dir,
         stream,
         stream_prefetch=0,
-        stream_prefetch_gpus=None,
+        stream_prefetch_devices=None,
         stream_calibration=False,
         dataset=None,
     ):
@@ -419,7 +533,7 @@ class TestStreamQuantizeEquivalence:
             layerwise_rotation=True,
             stream_checkpoint=stream,
             stream_prefetch=stream_prefetch,
-            stream_prefetch_gpus=stream_prefetch_gpus,
+            stream_prefetch_devices=stream_prefetch_devices,
             stream_calibration=stream_calibration,
             **kwargs,
             format="auto_round",
@@ -575,6 +689,131 @@ class TestStreamQuantizeEquivalence:
         assert n_diff == 0, f"{n_diff} tensors differ beyond tolerance"
         assert n_exact + n_close == len(t_a)
 
+    def test_streamed_signround_qon_chains_quantized_inputs(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """iters>0 under stream_checkpoint routes into the streaming loop
+        (routing waiver) and chains each block's quantized outputs as the next
+        block's q_inputs (qon), mirroring the data-driven loop."""
+        import shutil
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.autoround import AutoRound
+
+        torch.manual_seed(11)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
+        ck = str(tmp_path / "ck_qon")
+        shutil.copytree(tiny_checkpoint, ck)
+
+        captured = []
+        returned = []
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            captured.append(kwargs.get("q_inputs", "absent"))
+            result = orig(self, block, fp_inputs, input_others, *args, **kwargs)
+            returned.append(result)
+            return result
+
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
+            layerwise_rotation=False,
+            stream_checkpoint=True,
+            stream_calibration=True,
+            dataset=rows,
+            seqlen=32,
+            nsamples=4,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        out_dir = ar.quantize_and_save(str(tmp_path / "qon"), format="auto_round")
+        assert out_dir, "streamed SignRound qon run must produce an export"
+        block_calls = [q for q in captured if q != "absent"]
+        assert len(block_calls) >= 2, f"expected >=2 chained block calls, got {len(block_calls)}"
+        assert block_calls[0] is None, "first block has no upstream quantized input"
+        assert any(q is not None for q in block_calls[1:]), "qon chain must feed quantized outputs downstream"
+        # identity: block k+1 receives exactly block k's returned quantized output
+        for k in range(min(len(block_calls), len(returned)) - 1):
+            if returned[k][0] is not None:
+                assert (
+                    block_calls[k + 1] is returned[k][0]
+                ), f"qon chain leak: block {k + 2} did not receive block {k + 1}'s quantized output"
+
+    def test_streamed_signround_qoff_keeps_q_inputs_none(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """enable_quanted_input=False (qoff): every block tunes against the
+        fp reference chain only; q_inputs must stay None block-to-block."""
+        import shutil
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.autoround import AutoRound
+
+        torch.manual_seed(11)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
+        ck = str(tmp_path / "ck_qoff")
+        shutil.copytree(tiny_checkpoint, ck)
+
+        captured = []
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            captured.append(kwargs.get("q_inputs", "absent"))
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
+            layerwise_rotation=False,
+            stream_checkpoint=True,
+            stream_calibration=True,
+            enable_quanted_input=False,
+            dataset=rows,
+            seqlen=32,
+            nsamples=4,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.quantize_and_save(str(tmp_path / "qoff"), format="auto_round")
+        block_calls = [q for q in captured if q != "absent"]
+        assert len(block_calls) >= 2
+        assert all(q is None for q in block_calls), "qoff must not chain quantized inputs"
+
+    def test_streamed_signround_without_calibration_raises(self, tiny_checkpoint, tmp_path):
+        """stream_checkpoint + iters>0 + stream_calibration=False must fail
+        with the actionable fix instead of silently skipping the tuning data."""
+        import shutil
+
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.autoround import AutoRound
+
+        ck = str(tmp_path / "ck_nocal")
+        shutil.copytree(tiny_checkpoint, ck)
+        # need_calib resolves during __init__, so the guard fires at construction
+        with pytest.raises(ValueError, match="--stream_calibration"):
+            AutoRound(
+                ck,
+                scheme="W4A16",
+                alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
+                layerwise_rotation=False,
+                stream_checkpoint=True,
+                stream_calibration=False,
+                format="auto_round",
+                disable_model_free=True,
+                device_map="cpu",
+                low_gpu_mem_usage=True,
+                low_cpu_mem_usage=True,
+            )
+
     def test_partial_layer_config_resolves_format(self, tiny_checkpoint, tmp_path):
         """layer_config entries are partial overrides: unset keys fall back to
         the global scheme. Format resolution must not assume every entry
@@ -653,7 +892,7 @@ class TestStreamQuantizeEquivalence:
         stage_devs = ["cpu"] if torch.cuda.device_count() < 2 else ["cuda:1"]
         plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
         staged = self._quantize(
-            ck_b, str(tmp_path / "staged"), stream=True, stream_prefetch=2, stream_prefetch_gpus=stage_devs
+            ck_b, str(tmp_path / "staged"), stream=True, stream_prefetch=2, stream_prefetch_devices=stage_devs
         )
 
         def load_all(d):

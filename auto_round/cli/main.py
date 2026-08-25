@@ -83,11 +83,20 @@ def _build_entry_route_kwargs(args) -> dict:
 
 
 def _build_entry_compressor_kwargs(args) -> dict:
+    devices = getattr(args, "stream_prefetch_devices", None)
+    if devices is not None and devices.strip() and devices.strip().lower() != "auto":
+        devices = [d.strip() for d in devices.split(",") if d.strip()]
     return {
         "scale_dtype": args.scale_dtype,
         "ignore_layers": args.ignore_layers,
         "quant_lm_head": args.quant_lm_head,
         "to_quant_block_names": args.to_quant_block_names,
+        "layerwise_rotation": getattr(args, "layerwise_rotation", False),
+        "stream_checkpoint": getattr(args, "stream_checkpoint", False),
+        "stream_calibration": getattr(args, "stream_calibration", False),
+        "stream_calibration_rows": getattr(args, "stream_calibration_rows", 0),
+        "stream_prefetch": getattr(args, "stream_prefetch", 0),
+        "stream_prefetch_devices": devices,
     }
 
 

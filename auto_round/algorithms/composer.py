@@ -138,6 +138,7 @@ class AlgorithmComposer:
         # stays rotation-agnostic.
         self._rotation_configs = [c for c in configs if isinstance(c, BaseRotationConfig)]
         self._layerwise_rotation = bool(getattr(orchestrator, "layerwise_rotation", False))
+        self._orchestrator_ref = orchestrator
 
         _algos = {getattr(c, "algorithm", None) for c in self._rotation_configs}
         if "presinq" in _algos and "spinquant" in _algos:
@@ -610,6 +611,37 @@ class AlgorithmComposer:
     # are driven internally so the orchestrator only calls the single generic
     # entry point :meth:`apply_model_transforms`.
 
+    _STREAMED_ROTATION_MSG = (
+        "Rotation transforms on a streamed model (stream_checkpoint / meta "
+        "skeleton) require layer-wise mode: pass layerwise_rotation=True "
+        "(--layerwise_rotation) so each block is folded inside the "
+        "streaming block loop instead of materializing the whole model."
+    )
+
+    def _model_has_meta(self, model) -> bool:
+        return any(p.device.type == "meta" for p in model.parameters()) or any(
+            b.device.type == "meta" for b in model.buffers()
+        )
+
+    def _assert_model_foldable_in_place(self, model) -> None:
+        """Refuse whole-model rotation on streamed skeletons with an actionable error.
+
+        Lazy-MoE replacement modules legitimately hold expert weights on meta
+        until materialized from their original module -- resolve those first
+        (skipping the call entirely when none exist, so a streamed skeleton does
+        not log thousands of leftover warnings). Any meta parameters or buffers
+        REMAINING afterwards belong to a streamed skeleton (no original to
+        materialize from) and must not be folded.
+        """
+        if getattr(self._orchestrator_ref, "stream_checkpoint", False):
+            raise ValueError(self._STREAMED_ROTATION_MSG)
+        from auto_round.modeling.fused_moe.replace_modules import ReplacementModuleBase, materialize_model_
+
+        if any(isinstance(m, ReplacementModuleBase) for m in model.modules()):
+            materialize_model_(model)
+        if self._model_has_meta(model):
+            raise ValueError(self._STREAMED_ROTATION_MSG)
+
     def _resolve_rotation_data_type(self) -> str:
         """Best-effort resolution of the quantization data_type for rotation dispatch."""
         if self.scheme is not None and getattr(self.scheme, "data_type", None):
@@ -655,9 +687,7 @@ class AlgorithmComposer:
         # materializes it, so the model must NOT be fully materialized here
         # (it may be intentionally larger than available memory).
         if not self._layerwise_rotation:
-            from auto_round.modeling.fused_moe import materialize_model_
-
-            materialize_model_(model)
+            self._assert_model_foldable_in_place(model)
 
         data_type = self._resolve_rotation_data_type()
         logger.info("Applying Hadamard transform to the model.")
@@ -679,6 +709,10 @@ class AlgorithmComposer:
                     f"[Rotation] {rotation.__class__.__name__} does not support "
                     f"layer-wise mode. Falling back to full-model rotation."
                 )
+                # The fallback is whole-model rotation: the streamed-model guard
+                # skipped earlier because layerwise mode was requested, but this
+                # transform cannot honor it -- re-check before folding.
+                self._assert_model_foldable_in_place(model)
             model = apply_rotation(model, rotation_cfg, data_type=data_type)
 
         self._rotation_prepared = True
