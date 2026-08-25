@@ -344,9 +344,10 @@ class BaseOrchestrator(object):
         # time is materialized, all calibration rows are pushed through, and
         # per-module statistics land on the modules for the clip search.
         # Matches the data-driven imatrix exactly for identical rows.
-        # Auto-engages when the streaming loop needs activations (iters > 0
-        # tuning or a forced imatrix) -- see _auto_engage_stream_features.
-        self.stream_calibration = kwargs.pop("stream_calibration", False)
+        # Derived, not a knob: the chain engages iff the streaming loop needs
+        # activations (iters > 0 tuning or an enabled imatrix) -- see
+        # _auto_engage_stream_features.
+        self.stream_calibration = False
         # Cap on chained calibration sequences for the streaming FP-input
         # cache; 0 = no cap (follow nsamples).
         self.stream_calibration_rows = kwargs.pop("stream_calibration_rows", 0)
@@ -561,9 +562,10 @@ class BaseOrchestrator(object):
            layerwise_rotation auto-enables whenever a rotation config is
            present. An explicit True/False from the caller wins.
         2. The activation chain engages automatically when the streaming loop
-           needs activations -- iters > 0 tuning (SignRound) or a forced
-           imatrix (--imatrix_enabled true). Weight-only runs (RTN, iters=0)
-           never consume activations and stay chain-free.
+           needs activations -- iters > 0 tuning (SignRound) or an enabled
+           imatrix (scheme rules or --imatrix_enabled true). Weight-only runs
+           (imatrix off / forced false, iters=0) never consume activations and
+           stay chain-free.
         """
         if self.layerwise_rotation is None:
             from auto_round.algorithms.transforms.base import BaseRotationConfig
@@ -577,14 +579,16 @@ class BaseOrchestrator(object):
         if self.stream_quantization and not self.stream_calibration:
             from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
-            needs_chain = any(isinstance(c, SignRoundConfig) for c in self._alg_configs) or any(
-                getattr(c, "forced_imatrix", None) is True for c in self._alg_configs
+            needs_chain = (
+                any(isinstance(c, SignRoundConfig) for c in self._alg_configs)
+                or any(getattr(c, "forced_imatrix", None) is True for c in self._alg_configs)
+                or any(getattr(c, "enable_imatrix", False) for c in self._alg_configs)
             )
             if needs_chain:
                 self.stream_calibration = True
                 logger.info(
                     "[stream_calibration] auto-engaged (streaming loop needs activations: "
-                    "iters > 0 tuning or forced imatrix)"
+                    "iters > 0 tuning or imatrix enabled)"
                 )
 
     def _needs_calibration_data(self) -> bool:
