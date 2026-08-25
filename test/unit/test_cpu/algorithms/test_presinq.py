@@ -270,11 +270,14 @@ class TestSinkhornBackend:
         from auto_round import envs
         from auto_round.algorithms.transforms.presinq.sinkhorn import _wants_compile
 
+        # "auto" stays eager everywhere: the fused graph measured at best on
+        # par and up to 20% slower than the eager loop on an RTX 3090.
         monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "auto")
-        assert _wants_compile("cuda") is True
+        assert _wants_compile("cuda") is False
         assert _wants_compile("cpu") is False
         monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "compile")
         assert _wants_compile("cpu") is True
+        assert _wants_compile("cuda") is True
         monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
         assert _wants_compile("cuda") is False
 

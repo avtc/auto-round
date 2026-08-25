@@ -242,10 +242,10 @@ export AR_NEUQI_LAYOUT=mid
 ```
 
 ### AR_PRESINQ_BACKEND
-- **Description**: Sinkhorn loop backend for the Pre-SINQ transform. `"auto"` (default) runs the sinkhorn iteration loop as a fused `torch.compile` graph on non-CPU devices — one fused kernel instead of ~25 launches per iteration, most impactful for the small per-expert folds of MoE models — and uses the eager reference loop on CPU. `"compile"` forces the compiled loop on any device; `"eager"` always uses the reference loop. Both sides evaluate identical fp64 math: the eager loop is bit-exact with the previous release (per-iteration stds are computed once and reused, and the unused scaled-matrix materialization is skipped — ~1.8x faster by itself), while the compiled loop agrees with it to ~1e-15 (its tracker uses a 1e-12 comparison slack so that exact-equality decisions — which eager makes exactly — cannot flip under compiled reduction-order noise). Any compile or runtime failure permanently reverts to the eager loop for the rest of the run.
+- **Description**: Sinkhorn loop backend for the Pre-SINQ transform. `"auto"` (default) and `"eager"` both use the eager reference loop — measured on an RTX 3090, the eager loop's std-once refactor is 1.75–1.87x faster than the original port and the fused `torch.compile` graph is at best on par (small expert folds) and up to 20% slower (large shapes: Inductor's fused fp64 middle-dim std reductions do not beat torch's hand-tuned kernels). `"compile"` forces the fused graph on any device for experimentation on other architectures; it evaluates the same fp64 math and agrees with the eager loop to ~1e-15 (its tracker uses a 1e-12 comparison slack so that exact-equality decisions — which eager makes exactly — cannot flip under compiled reduction-order noise). Any compile or runtime failure permanently reverts to the eager loop for the rest of the run.
 - **Default**: `"auto"`
-- **Valid Values**: `"auto"`, `"compile"`, `"eager"` (unrecognized values are treated as `"eager"`)
-- **Usage**: Force the reference loop for A/B comparisons, or fuse on CPU for experimentation
+- **Valid Values**: `"auto"`, `"eager"`, `"compile"` (`"auto"`/`"eager"` behave identically; unrecognized values are treated as `"eager"`)
+- **Usage**: Force the fused graph on other GPU architectures, or pin explicitly for clarity
 
 ```bash
 export AR_PRESINQ_BACKEND=eager

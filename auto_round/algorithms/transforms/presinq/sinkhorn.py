@@ -23,9 +23,11 @@ for auto-round:
   (the original port recomputed them), and the scaled-matrix
   materialization is skipped when only the scales are needed — both changes
   are bit-exact and roughly halve the sinkhorn's time (~1.8x measured);
-* on non-CPU devices the loop runs as a fused ``torch.compile`` graph by
-  default (``AR_PRESINQ_BACKEND``), agreeing with the eager loop to ~1e-15
-  in fp64, with a permanent fallback to the eager loop on any failure;
+* on non-CPU devices the loop can additionally run as a fused ``torch.compile`` graph
+  (``AR_PRESINQ_BACKEND=compile``; opt-in — on an RTX 3090 the fused graph measured
+  at best on par and up to 20% slower than the eager loop, so the default stays
+  eager), agreeing with the eager loop to ~1e-15 in fp64, with a permanent
+  fallback to the eager loop on any failure;
 * **batched over leading dimensions**: column tiles are processed as a
   ``[n_tiles, H, block]`` batch (in groups), so a single op set engages all
   CPU cores via torch's intra-op parallelism — or runs on the GPU when the
@@ -52,13 +54,15 @@ _TILE_GROUP = 16  # tiles processed per batched call (bounds fp64 temporaries)
 
 
 def _wants_compile(device_type: str) -> bool:
-    """Whether the sinkhorn loop should run compiled, per ``AR_PRESINQ_BACKEND``."""
-    backend = envs.AR_PRESINQ_BACKEND
-    if backend == "compile":
-        return True
-    if backend == "auto":
-        return device_type != "cpu"  # fused kernels & fewer launches help most on GPU
-    return False  # "eager" (and any unrecognized value): the eager reference loop
+    """Whether the sinkhorn loop should run compiled, per ``AR_PRESINQ_BACKEND``.
+
+    "auto" stays on the eager loop everywhere: measured on an RTX 3090 the
+    fused graph is at best on par with the eager loop (small expert folds) and
+    up to 20% slower on the large shapes (Inductor's fused fp64 middle-dim
+    std reductions do not beat torch's hand-tuned kernels). "compile" forces
+    the fused graph for experimentation on other architectures.
+    """
+    return envs.AR_PRESINQ_BACKEND == "compile"
 
 
 # Compiled-loop state: lazily built compiled callable plus a permanent
@@ -156,9 +160,9 @@ def sinkhorn_log(
     the imbalance measure and the clamped update targets, and
     ``want_scaled=False`` skips the final scaled-matrix materialization when
     only the scales are needed (both are bit-exact optimizations over the
-    original port). On non-CPU devices the loop can additionally run as a
-    fused ``torch.compile`` graph (``AR_PRESINQ_BACKEND``), agreeing with the
-    eager loop to ~1e-15 in fp64.
+    original port). The loop can additionally run as a fused ``torch.compile``
+    graph (``AR_PRESINQ_BACKEND=compile``; opt-in), agreeing with the eager
+    loop to ~1e-15 in fp64.
 
     Returns:
         ``(scaled, mu1, mu2)`` where ``scaled = matrix / mu1 / mu2``
