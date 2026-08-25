@@ -726,6 +726,25 @@ class CompressionOrchestrator(BaseOrchestrator):
         # + forward/backward transients + compile/context margin
         return int(largest_block_bytes * 5 + act_bytes + 2 * gib)
 
+    @staticmethod
+    def _bp_prune_chain_entry(k: int, *, resumable: bool, resume_index: int) -> bool:
+        """Whether ``chain_g{g}_b{k}.pt`` may be pruned now.
+
+        ``chain_g{g}_b{k}`` is the resume manifest's source file for the
+        commit of block ``k - 1`` (``mark_block_done_from_file`` hard-links
+        it into ``resume_input_ids.pt``). Pruning on block completion alone
+        races the in-order manifest: adjacent blocks can finish in the same
+        poll tick, so the commit for ``k - 1`` can run in the same tick as
+        (or a later tick than) the completion of ``k`` and finds its source
+        deleted. Only prune once the frontier has committed through it
+        (``resume_index > k - 1``). Without a resume manifest the chain
+        files only serve assignment-time entry loads, which precede
+        completion, so pruning on completion is safe.
+        """
+        if not resumable:
+            return True
+        return k <= resume_index
+
     def _maybe_block_parallel_tune(
         self, all_blocks: list, is_worker: bool, all_inputs: dict = None, input_ids_cache=None, pbar=None
     ) -> bool:
@@ -907,7 +926,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         }  # per-group starting frontier: its entry comes from manifest/group cache
         for g, blocks in enumerate(all_blocks):
             for k in done[g]:
-                _bp_delete_chain_state(results_dir, g, k)  # stale crash leftovers
+                _rs_g = resume_states[g] if resumable else None
+                if self._bp_prune_chain_entry(
+                    k, resumable=resumable, resume_index=_rs_g.resume_index if _rs_g is not None else 0
+                ):
+                    _bp_delete_chain_state(results_dir, g, k)  # stale crash leftovers
         assigned = {}  # rank -> (group, index); absent == worker idle/finished
         stopped = set()
         dispatched = {}  # (g, k) -> dispatch count; caps re-tunes of a block
@@ -999,10 +1022,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                         continue  # exists but not loadable yet (corrupt/half-written): not a result
                     seen_results.add((g, k))
                     done[g].add(k)
-                    # the block is complete: its entry checkpoint was consumed
-                    # by the assignee and the manifest absorbed the block --
-                    # nothing reads that checkpoint again
-                    _bp_delete_chain_state(results_dir, g, k)
+                    # prune the consumed entry only when the resume manifest
+                    # no longer needs it (see _bp_prune_chain_entry -- the
+                    # in-order commit for k-1 hard-links exactly this file);
+                    # the commit loop below prunes it right after linking
+                    _rs_scan = resume_states[g] if resumable else None
+                    if self._bp_prune_chain_entry(
+                        k, resumable=resumable, resume_index=_rs_scan.resume_index if _rs_scan is not None else 0
+                    ):
+                        _bp_delete_chain_state(results_dir, g, k)
                     rank = int(data.get("_worker_rank", -1))
                     if rank >= 0:
                         assigned.pop(rank, None)
@@ -1014,9 +1042,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
                         k = rs.resume_index
                         rs.mark_block_done_from_file(blocks[k], bp.chain_state_path(results_dir, g, k + 1))
-                        # no delete here: ckpt(k+1) is the frontier assignee's
-                        # entry until block k+1 completes; the results loop
-                        # above prunes it then (exact visibility window)
+                        # the just-committed block's own entry is superseded
+                        # now (resume_input_ids holds the k+1 entry); prune it
+                        # here so the disk stays bounded even when completions
+                        # outrun the manifest frontier
+                        _bp_delete_chain_state(results_dir, g, k)
             # assign any idle rank whose next block's entry has appeared
             # (result events AND newly published ramp tails both land here)
             for rank in range(len(procs)):

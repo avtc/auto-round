@@ -335,12 +335,13 @@ def save_chain_state(results_dir: str, group: int, block_idx: int, hidden) -> No
 
 
 def delete_chain_state(results_dir: str, group: int, block_idx: int) -> None:
-    """Remove a chain checkpoint once its block is done.
+    """Remove a chain checkpoint.
 
-    Called by the parent when block ``block_idx`` completes: by then the
-    assignee has consumed the entry and the manifest has absorbed the block,
-    so nothing can read the file again (replays rebuild from the manifest,
-    never from files). Missing files are a no-op.
+    Callers must ensure the resume manifest no longer needs it (see
+    ``CompressionOrchestrator._bp_prune_chain_entry``): ``chain_g{g}_b{k}``
+    is the hard-link source for the commit of block ``k - 1``, so it may
+    only be deleted once the manifest frontier has committed through it.
+    Missing files are a no-op.
     """
     path = _chain_state_path(results_dir, group, block_idx)
     try:

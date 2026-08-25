@@ -162,6 +162,35 @@ class TestImmediatePackingWithOutsideBlockQlayer(unittest.TestCase):
         assert ctx.is_immediate_packing is True
 
 
+class TestBPChainPruneGate(unittest.TestCase):
+    """Regression: adjacent blocks 2 and 3 finished in the same poll tick;
+    the results scan pruned chain_g0_b3.pt on block 3's completion, and the
+    in-order manifest commit for block 2 -- which hard-links exactly that
+    file -- then died with FileNotFoundError. chain_g{k} may only be pruned
+    once the manifest frontier has consumed it (block k-1 committed)."""
+
+    def test_not_pruned_before_manifest_consumes_it(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        # the exact crash state: manifest at block 2, block 3 completed
+        assert CompressionOrchestrator._bp_prune_chain_entry(3, resumable=True, resume_index=2) is False
+
+    def test_pruned_after_manifest_passes(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        # frontier committed through block 3 -> chain_g0_b3 was linked at the
+        # commit of block 2 and again consumed; safe to prune
+        assert CompressionOrchestrator._bp_prune_chain_entry(3, resumable=True, resume_index=4) is True
+        # boundary: committing block 2 (frontier becomes 3) links chain_g0_b3
+        assert CompressionOrchestrator._bp_prune_chain_entry(3, resumable=True, resume_index=3) is True
+
+    def test_pruned_immediately_when_not_resumable(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        # no manifest exists: chain files only serve assignment-time loads
+        assert CompressionOrchestrator._bp_prune_chain_entry(3, resumable=False, resume_index=0) is True
+
+
 class TestBPRequiredVRAMEstimate(unittest.TestCase):
     """The per-worker VRAM requirement must match what the worker executes.
 
