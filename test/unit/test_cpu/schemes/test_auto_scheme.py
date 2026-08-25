@@ -1528,6 +1528,19 @@ def test_serial_scoring_device_safe():
     assert _serial_scoring_device_safe(StreamedSkeleton(), visible_cuda_devices=["cuda:0"]) is True
     assert _serial_scoring_device_safe(Tiny(), visible_cuda_devices=["cuda:0", "cuda:1"]) is True
 
+    # stream_quantization (never-materialize) skeleton: params live on meta with
+    # NO offloader attached (no _disk_stream_index), so no in-process forward can
+    # materialize blocks -- serial scoring is unsafe even with a single visible
+    # GPU; scoring routes through the disk-stream workers instead
+    class FlagPathSkeleton(Tiny):
+        def __init__(self):
+            super().__init__()
+            with torch.device("meta"):
+                self.fc2 = nn.Linear(4, 4)
+
+    assert _serial_scoring_device_safe(FlagPathSkeleton()) is False
+    assert _serial_scoring_device_safe(FlagPathSkeleton(), visible_cuda_devices=["cuda:0"]) is False
+
     assert _weights_span_multiple_gpus([torch.device("cuda:0"), torch.device("cuda:0")]) is False
     assert _weights_span_multiple_gpus([torch.device("cuda:0"), torch.device("cuda:3")]) is True
     assert _weights_span_multiple_gpus([torch.device("cpu"), torch.device("cpu")]) is False

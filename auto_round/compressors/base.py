@@ -363,7 +363,7 @@ class BaseOrchestrator(object):
         model_dtype = kwargs.pop("model_dtype", None)
         trust_remote_code = kwargs.pop("trust_remote_code") if "trust_remote_code" in kwargs else True
         quant_nontext_module = kwargs.pop("quant_nontext_module", False)
-        self._validate_stream_options(quant_nontext_module)
+        self._validate_stream_options(quant_nontext_module, enable_block_parallel_tuning=enable_block_parallel_tuning)
         device = kwargs.pop("device", None)
         if device is not None:
             logger.warning("`device` is deprecated, please use `device_map` instead")
@@ -552,7 +552,7 @@ class BaseOrchestrator(object):
             return True
         return self._needs_calibration_data()
 
-    def _validate_stream_options(self, quant_nontext_module: bool) -> None:
+    def _validate_stream_options(self, quant_nontext_module: bool, enable_block_parallel_tuning: bool = False) -> None:
         """Reject option combinations the streaming loop cannot honor."""
         if quant_nontext_module and self.stream_quantization:
             raise ValueError(
@@ -562,6 +562,14 @@ class BaseOrchestrator(object):
                 "garbage), and the path is unvalidated. Non-text layers pass "
                 "through at full precision under streaming; to quantize them use "
                 "the ordinary (non-streaming) path."
+            )
+        if enable_block_parallel_tuning and self.stream_quantization:
+            raise ValueError(
+                "enable_block_parallel_tuning cannot run under stream_quantization: "
+                "block-parallel tuning is a data-driven-path feature (workers re-exec "
+                "the CLI against the reference chain) while the streaming loop is "
+                "zero-shot. Drop --enable_block_parallel_tuning; AutoScheme scoring "
+                "keeps its own parallelism (AR_ENABLE_AUTO_SCHEME_PARALLEL)."
             )
 
     def _auto_engage_stream_features(self) -> None:
@@ -581,9 +589,15 @@ class BaseOrchestrator(object):
             from auto_round.algorithms.transforms.base import BaseRotationConfig
 
             has_rotations = any(isinstance(c, BaseRotationConfig) for c in self._alg_configs)
-            self.layerwise_rotation = bool(self.stream_quantization and has_rotations)
+            # Both streaming modes build a meta skeleton: the never-materialize
+            # loop (--stream_quantization) and the data-driven offloader
+            # (AR_DISK_STREAM_MODEL). Whole-model rotation would materialize
+            # the model in either, so defer layer-wise wherever rotations exist.
+            streaming_mode = self.stream_quantization or bool(envs.AR_DISK_STREAM_MODEL)
+            self.layerwise_rotation = bool(streaming_mode and has_rotations)
             if self.layerwise_rotation:
-                logger.info("[stream_quantization] layerwise_rotation auto-enabled (rotation transforms present)")
+                mode = "stream_quantization" if self.stream_quantization else "AR_DISK_STREAM_MODEL"
+                logger.info(f"[{mode}] layerwise_rotation auto-enabled (rotation transforms present)")
         else:
             self.layerwise_rotation = bool(self.layerwise_rotation)
         if self.stream_quantization and not self.stream_calibration:
@@ -642,8 +656,12 @@ class BaseOrchestrator(object):
                 "demand (weight-only search and/or stream_calibration chained rows)."
             )
 
-        # AutoScheme needs data for delta-loss scheme selection
-        if isinstance(self.scheme, AutoScheme):
+        # AutoScheme needs data for delta-loss scheme selection -- unless the
+        # run streams: scoring happens in disk-stream workers / from the scheme
+        # cache and the parent never forwards, so under stream_quantization the
+        # streaming loop governs quantization and the scheme itself adds no
+        # calibration demand.
+        if isinstance(self.scheme, AutoScheme) and not self.stream_quantization:
             return True
 
         # Check if activation calibration is needed
