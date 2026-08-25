@@ -35,29 +35,11 @@ def _mse(x, y):
 
 
 class TestNeuqiSearch:
-    def test_hist_sweep_matches_brute_force(self):
-        """The histogram zero-point sweep selects (scale, zp) with losses equal
-        to the brute-force grid within float noise; near-ties may flip but both
-        choices are optimal to ~1e-5 relative loss."""
-        from auto_round.data_type.neuqi import _best_zp_for_scale, _loss_all_zp_hist
-
-        torch.manual_seed(5)
-        maxq = 15
-        for qw_on in (True, False):
-            data = torch.randn(4096, 64) * 0.05
-            qw = torch.rand(4096, 64) + 0.1 if qw_on else None
-            scale = data.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) * (torch.rand(4096, 1) * 1.4 + 0.05)
-            bl, bz = _best_zp_for_scale(data, qw, scale, maxq)
-            hl, hz = _loss_all_zp_hist(data, qw, scale, maxq)
-            assert torch.allclose(bl, hl, rtol=1e-4, atol=1e-8)
-            # wherever they disagree the histogram choice must be no worse
-            assert (hl <= bl + 1e-4 * bl.abs() + 1e-8).all().item()
-
-    def test_brute_force_available_via_env(self, monkeypatch):
-        """AR_NEUQI_SWEEP=brute restores the reference grid sweep."""
+    def test_search_returns_valid_scale_and_zp(self):
+        """The brute-force grid sweep is the only sweep: it must return a valid
+        (scale, zp) pair for weighted data."""
         import auto_round.data_type.neuqi as N
 
-        monkeypatch.setattr(N.envs, "AR_NEUQI_SWEEP", "brute")
         torch.manual_seed(5)
         data = torch.randn(512, 64) * 0.05
         qw = torch.rand(512, 64) + 0.1
@@ -175,21 +157,6 @@ class TestNeuqiLogging:
             ar_logger.removeHandler(cap)
         assert any("[NeUQI]" in m and "search active" in m for m in cap.records)
 
-    def test_disabled_log_line(self, monkeypatch):
-        from auto_round.data_type.neuqi import _log_disabled
-
-        monkeypatch.setenv("AR_DISABLE_NEUQI", "1")
-        _log_disabled.cache_clear()
-        cap = _LogCapture()
-        ar_logger = logging.getLogger("autoround")
-        ar_logger.addHandler(cap)
-        try:
-            quant_tensor_opt_rtn_asym(_heavy_tailed_data(n_groups=4).clone(), bits=4, group_size=128)
-        finally:
-            ar_logger.removeHandler(cap)
-        assert any("[NeUQI]" in m and "disabled" in m for m in cap.records)
-        monkeypatch.delenv("AR_DISABLE_NEUQI")
-
 
 class TestNeuqiIntegration:
     def test_registration_and_dispatch(self):
@@ -203,14 +170,12 @@ class TestNeuqiIntegration:
         _, sym_name = get_quant_func("int", 4, True, disable_opt_rtn=False, group_size=None, iters=0)
         assert sym_name == "opt_rtn_int_sym"
 
-    def test_disable_env_reverts_to_plain_asym(self, monkeypatch):
-        monkeypatch.setenv("AR_DISABLE_NEUQI", "1")
+    def test_search_beats_plain_minmax(self):
+        """With NeUQI opted in (the only way it runs now), the joint search must
+        beat the plain min/max initializer on heavy-tailed groups."""
         data = _heavy_tailed_data(n_groups=16)
-        qdq_disabled, _, _ = quant_tensor_opt_rtn_asym(data.clone(), bits=4, group_size=128)
-        qdq_plain, _, _ = quant_tensor_asym(data.clone(), bits=4, group_size=128)
-        assert torch.equal(qdq_disabled, qdq_plain)
-        monkeypatch.delenv("AR_DISABLE_NEUQI")
         qdq_enabled, _, _ = quant_tensor_opt_rtn_asym(data.clone(), bits=4, group_size=128)
+        qdq_plain, _, _ = quant_tensor_asym(data.clone(), bits=4, group_size=128)
         assert _mse(qdq_enabled, data) < _mse(qdq_plain, data)
 
     def test_imatrix_weighting_improves_weighted_mse(self):

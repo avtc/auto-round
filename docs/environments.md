@@ -201,16 +201,6 @@ export AR_AUTO_SCHEME_CACHE=/path/to/auto_scheme_cache
 export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 ```
 
-### AR_DISABLE_NEUQI
-- **Description**: Disables the NeUQI joint scale/zero-point search on the asymmetric int path (`asym_search="auto"`/`"neuqi"`), reverting it to plain min/max scaling.
-- **Default**: `"0"` (NeUQI engaged where applicable)
-- **Valid Values**: `"1"`, `"true"`, `"yes"` disable; any other value leaves the search active
-- **Usage**: Set for A/B comparisons of the search's contribution
-
-```bash
-export AR_DISABLE_NEUQI=1
-```
-
 ### AR_NEUQI_COARSE
 - **Description**: Number of coarse (log-spaced) scale candidates explored by the NeUQI search before the fine additive refinement.
 - **Default**: `"64"`
@@ -229,16 +219,6 @@ export AR_NEUQI_COARSE=64
 
 ```bash
 export AR_NEUQI_FINE=32
-```
-
-### AR_NEUQI_SWEEP
-- **Description**: Zero-point sweep strategy for the NeUQI search. `brute` walks every grid candidate directly; `hist` accumulates a per-group histogram once and derives selections from it (bounded memory, CPU-friendly, but slower on GPU where atomics dominate).
-- **Default**: `"brute"`
-- **Valid Values**: `"brute"`, `"hist"`
-- **Usage**: Set `hist` for memory-bound CPU searches
-
-```bash
-export AR_NEUQI_SWEEP=brute
 ```
 
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT

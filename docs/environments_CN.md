@@ -201,16 +201,6 @@ export AR_AUTO_SCHEME_CACHE=/path/to/auto_scheme_cache
 export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 ```
 
-### AR_DISABLE_NEUQI
-- **描述**：在非对称 int 路径（`asym_search="auto"`/`"neuqi"`）上禁用 NeUQI 联合 scale/零点搜索，回退到普通 min/max 缩放。
-- **默认值**：`"0"`（在适用的地方启用 NeUQI）
-- **有效值**：`"1"`、`"true"`、`"yes"` 表示禁用；其他任意值保持搜索启用
-- **用法**：用于对搜索贡献的 A/B 对比实验
-
-```bash
-export AR_DISABLE_NEUQI=1
-```
-
 ### AR_NEUQI_COARSE
 - **描述**：NeUQI 搜索在精细加性细化之前探索的粗粒度（对数间隔）scale 候选数量。
 - **默认值**：`"64"`
@@ -229,16 +219,6 @@ export AR_NEUQI_COARSE=64
 
 ```bash
 export AR_NEUQI_FINE=32
-```
-
-### AR_NEUQI_SWEEP
-- **描述**：NeUQI 搜索的零点扫描策略。`brute` 直接遍历所有网格候选；`hist` 只累计一次每分组直方图并从中推导选择（内存有界、对 CPU 友好，但在 GPU 上受原子操作限制反而更慢）。
-- **默认值**：`"brute"`
-- **有效值**：`"brute"`、`"hist"`
-- **用法**：在内存受限的 CPU 搜索中设置为 `hist`
-
-```bash
-export AR_NEUQI_SWEEP=brute
 ```
 
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT

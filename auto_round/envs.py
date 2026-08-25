@@ -84,16 +84,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_SEARCH_SCALE_RATIO": lambda: (
         float(os.getenv("AR_SEARCH_SCALE_RATIO")) if os.getenv("AR_SEARCH_SCALE_RATIO") is not None else None
     ),
-    # Disable the NeUQI joint (scale, zero-point) search used by the optimized
-    # asymmetric int path (``opt_rtn_int_asym``), reverting it to plain min/max.
-    "AR_DISABLE_NEUQI": lambda: os.getenv("AR_DISABLE_NEUQI", "0").lower() in ("1", "true", "yes"),
     # Number of coarse (log-spaced) and fine (additive) scale candidates for the
     # NeUQI search in ``auto_round.data_type.neuqi``.
     "AR_NEUQI_COARSE": lambda: int(os.getenv("AR_NEUQI_COARSE", "64")),
     "AR_NEUQI_FINE": lambda: int(os.getenv("AR_NEUQI_FINE", "32")),
-    "AR_NEUQI_SWEEP": lambda: os.getenv(
-        "AR_NEUQI_SWEEP", "brute"
-    ),  # brute | hist zero-point sweep (hist: CPU-friendly, GPU-atomic-bound)
     # Minimum value to which torch._dynamo cache_size_limit /
     # accumulated_cache_size_limit / recompile_limit are bumped when
     # ``enable_torch_compile`` is used. The default of 16 is enough to cover

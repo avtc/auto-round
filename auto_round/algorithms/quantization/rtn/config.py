@@ -57,10 +57,8 @@ class RTNConfig(QuantizationConfig):
                 Scope: asymmetric zero-shot RTN only. Other quantizers
                 (SignRound at ``iters > 0``, Qronos, AWQ) perform their own
                 parameter search and ignore this field; the symmetric path
-                uses its own scale grid search. The ``AR_DISABLE_NEUQI``
-                environment variable overrides any setting globally; the
-                search grid sizes are tunable via ``AR_NEUQI_COARSE`` and
-                ``AR_NEUQI_FINE``.
+                uses its own scale grid search. The search grid sizes are
+                tunable via ``AR_NEUQI_COARSE`` and ``AR_NEUQI_FINE``.
             **kwargs: Common quantization arguments forwarded to
                 QuantizationConfig, such as bits, group_size, sym,
                 data_type, and activation quantization fields.
