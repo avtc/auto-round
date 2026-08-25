@@ -912,6 +912,32 @@ class TestStreamQuantizeEquivalence:
             qconf = json.load(f)["quantization_config"]
         assert qconf["quant_method"] == "auto-round"
 
+    def test_auto_scheme_streaming_uncached_no_workers_raises(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """Single-run streaming + uncached schemes on a box with no CUDA scoring
+        workers: must fail with an actionable error, never attempt in-process
+        scoring on the meta skeleton (meta tensor copy)."""
+        from auto_round import envs
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.autoround import AutoRound
+
+        monkeypatch.setattr(envs, "AR_AUTO_SCHEME_CACHE", str(tmp_path / "empty_cache"))
+        scheme = AutoScheme(avg_bits=5.0, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
+
+        with pytest.raises(RuntimeError, match="AutoScheme scoring cannot run in-process"):
+            AutoRound(
+                tiny_checkpoint,
+                scheme=scheme,
+                iters=0,
+                nsamples=1,
+                seqlen=32,
+                stream_quantization=True,
+                format="auto_round",
+                disable_model_free=True,
+                device_map="cpu",
+                low_gpu_mem_usage=True,
+                low_cpu_mem_usage=True,
+            ).quantize_and_save(str(tmp_path / "out"), format="auto_round")
+
     def test_streamed_export_matches_normal(self, tiny_checkpoint, tmp_path):
         """Streamed zero-shot export must match the normal (data-driven) run on
         everything the streaming mode controls: tensor inventory, all

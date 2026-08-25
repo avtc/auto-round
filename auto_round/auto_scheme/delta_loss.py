@@ -2955,12 +2955,6 @@ def _gen_layer_config(
             if offload_context is not None:
                 offload_context.add_offload_hooks(model, block_name)
 
-            # Non-block modules stage onto the scoring device only now: with a
-            # fully-cached resolution this .to() would copy meta tensors.
-            if auto_scheme.low_gpu_mem_usage:
-                for n, m in model.named_modules():
-                    if len(list(m.children())) == 0 and not getattr(m, "in_block", False):
-                        m.to(major_device)
         else:
             pbar.update(pbar_cnt)  # everything cached: complete the bar
         worker_device_pool = [device for device in device_list if str(device).startswith("cuda:")]
@@ -2975,6 +2969,14 @@ def _gen_layer_config(
         # a single uncached scheme is scored through a worker instead of the
         # broken in-process pass.
         serial_device_safe = _serial_scoring_device_safe(model, visible_cuda_devices=worker_device_pool)
+        # Non-block modules stage onto the scoring device only for in-process
+        # scoring: a stream_quantization parent (meta skeleton, no offloader)
+        # never scores in-process -- staging there would copy meta tensors --
+        # and a fully-cached resolution needs no scoring at all.
+        if uncached_indices and serial_device_safe and auto_scheme.low_gpu_mem_usage:
+            for n, m in model.named_modules():
+                if len(list(m.children())) == 0 and not getattr(m, "in_block", False):
+                    m.to(major_device)
         min_uncached = 2
         if not serial_device_safe and worker_disk_stream_model:
             min_uncached = 1
