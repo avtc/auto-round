@@ -278,6 +278,22 @@ class TestPlumbing:
         assert isinstance(rtn, OptimizedRTNConfig), "PreSINQ must not silently drop the optimized-RTN search"
         assert any(isinstance(c, PreSINQConfig) for c in configs)
 
+    def test_forced_imatrix_asym_without_neuqi_raises(self, monkeypatch):
+        """asym + forced imatrix without the NeUQI joint search: get_quant_func
+        resolves the plain min/max rtn_*_asym function which never consumes the
+        imatrix -- must stop at validation with the --enable_neuqi fix."""
+        from auto_round.autoround import AutoRound as NewAutoRound
+        from auto_round.compressors.orchestrator import CompressionOrchestrator as Compressor
+
+        monkeypatch.setattr(Compressor, "__init__", lambda self, config, **kw: None)
+        monkeypatch.setattr("auto_round.utils.is_mllm_model", lambda *a, **k: False)
+        monkeypatch.setattr("auto_round.utils.is_diffusion_model", lambda *a, **k: False)
+        monkeypatch.setattr("auto_round.utils.model.detect_model_type", lambda *a, **k: "llm")
+        cfg = RTNConfig(group_size=32, sym=False, disable_opt_rtn=False)  # asym_search=auto
+        cfg.forced_imatrix = True
+        with pytest.raises(ValueError, match="enable_neuqi"):
+            NewAutoRound("dummy-model", scheme="W4A16", alg_configs=[cfg], seqlen=8, nsamples=1)
+
     def test_forced_imatrix_with_opt_rtn_disabled_raises(self, monkeypatch):
         """--imatrix_enabled true x --disable_opt_rtn is inconsistent: the
 
@@ -349,7 +365,7 @@ class TestPlumbing:
 
         monkeypatch.setattr("auto_round.utils.model.detect_model_type", lambda *a, **k: "llm")
 
-        cfg = RTNConfig(group_size=32, sym=False, disable_opt_rtn=False)  # asym
+        cfg = RTNConfig(group_size=32, sym=False, asym_search="neuqi", disable_opt_rtn=False)  # asym + NeUQI
 
         cfg.forced_imatrix = True
 
