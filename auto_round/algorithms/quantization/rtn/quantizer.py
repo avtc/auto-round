@@ -217,7 +217,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             return False
         if getattr(cfg, "orig_disable_opt_rtn", None) is None and getattr(self.model_context, "is_moe_model", False):
             return False
-        return getattr(cfg, "asym_search", "auto") != "minmax"
+        return getattr(cfg, "asym_search", "auto") == "neuqi"
 
     def _quantize_expert_batch(self, mods: list, device) -> bool:
         """Quantize same-shape expert projections in one stacked search call.

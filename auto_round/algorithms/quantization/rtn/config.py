@@ -45,16 +45,14 @@ class RTNConfig(QuantizationConfig):
                 forces the serial single-device path. Per-module results are
                 identical either way.
             asym_search: How the per-group scale and integer zero point are
-                initialized on the asymmetric zero-shot optimized-RTN path:
+                initialized on the asymmetric zero-shot optimized-RTN path
+                (the joint NeUQI search is opt-in):
 
-                * ``"auto"`` (default): use the best available initializer -
-                  the joint (scale, zero-point) search (NeUQI) when the
-                  optimized path runs, plain min/max otherwise.
-                * ``"neuqi"``: force the joint (scale, integer zero-point)
+                * ``"auto"`` (default) and ``"minmax"``: plain min/max
+                  initialization, even on the optimized path.
+                * ``"neuqi"``: opt into the joint (scale, integer zero-point)
                   search (arXiv 2505.17595). Requires ``sym=False`` and the
                   optimized path (``disable_opt_rtn`` not forced True).
-                * ``"minmax"``: plain min/max initialization even on the
-                  optimized path.
 
                 Scope: asymmetric zero-shot RTN only. Other quantizers
                 (SignRound at ``iters > 0``, Qronos, AWQ) perform their own

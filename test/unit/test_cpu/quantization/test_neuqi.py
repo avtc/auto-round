@@ -194,7 +194,9 @@ class TestNeuqiLogging:
 class TestNeuqiIntegration:
     def test_registration_and_dispatch(self):
         assert "opt_rtn_int_asym" in QUANT_FUNC_WITH_DTYPE
-        func, name = get_quant_func("int", 4, False, disable_opt_rtn=False, group_size=None, iters=0)
+        func, name = get_quant_func(
+            "int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search="neuqi"
+        )
         assert name == "opt_rtn_int_asym"
         assert func is QUANT_FUNC_WITH_DTYPE["opt_rtn_int_asym"]
         # symmetric path must remain untouched
@@ -233,11 +235,25 @@ class TestNeuqiIntegration:
 
 
 class TestAsymSearchAPI:
-    """RTNConfig(asym_search) enum: auto | neuqi | minmax (asym path only)."""
+    """RTNConfig(asym_search) enum: auto | neuqi | minmax (asym path only).
 
-    def test_default_auto_resolves_neuqi(self):
+    The joint NeUQI search is opt-in: only 'neuqi' resolves the optimized
+    asym initializer; 'auto' (default) and 'minmax' use plain min/max."""
+
+    def test_default_auto_resolves_plain_minmax(self):
+        from auto_round.data_type.int import quant_tensor_asym as plain_asym
+
         func, name = get_quant_func("int", 4, False, disable_opt_rtn=False, group_size=None, iters=0)
+        assert "opt_rtn" not in name
+        assert name.endswith("_asym")
+        assert func is plain_asym
+
+    def test_neuqi_opt_in_resolves_joint_search(self):
+        func, name = get_quant_func(
+            "int", 4, False, disable_opt_rtn=False, group_size=None, iters=0, asym_search="neuqi"
+        )
         assert name == "opt_rtn_int_asym"
+        assert func is QUANT_FUNC_WITH_DTYPE["opt_rtn_int_asym"]
 
     def test_minmax_resolves_plain_asym(self):
         from auto_round.data_type.int import quant_tensor_asym as plain_asym

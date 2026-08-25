@@ -151,7 +151,9 @@ class TestExpertBatching:
     def test_batches_are_scheduled_as_single_jobs(self, caplog):
         import logging
 
-        q = _RecordingQuantizer(RTNConfig(), batch=True)
+        # expert batching only pays off when the NeUQI search actually runs,
+        # so the gate requires the explicit opt-in
+        q = _RecordingQuantizer(RTNConfig(asym_search="neuqi"), batch=True)
         ar_logger = logging.getLogger("autoround")
         ar_logger.addHandler(caplog.handler)  # autoround logger has propagate=False
         try:
@@ -164,6 +166,15 @@ class TestExpertBatching:
         assert len(q.calls) == 2  # dense modules as singles
         # the fan-out timing summary must be logged
         assert any("fan-out done in" in r.getMessage() for r in caplog.records)
+
+    def test_default_auto_skips_expert_batching(self):
+        """Without --enable_neuqi the plain min/max initializer needs no search,
+        so experts are quantized as singles and no batch job is scheduled."""
+        q = _RecordingQuantizer(RTNConfig(), batch=True)
+        with mock.patch("torch.cuda.device_count", return_value=2):
+            q._quantize_targets(self._experts(4))
+        assert q.batches == []
+        assert len(q.calls) == 4
 
     def test_batched_matches_per_module_search_no_imatrix(self):
         """imatrix-free (uniform weight) batching skips materializing a ones

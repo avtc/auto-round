@@ -118,11 +118,11 @@ def get_quant_func(
         disable_opt_rtn(bool): whether to disable optimized rtn.
         group_size (tuple): The block size for weight quantization (e.g., (128, 128)).
         asym_search (str): Asymmetric initializer selection, one of
-            ``"auto" | "neuqi" | "minmax"``. ``"minmax"`` with ``sym=False``
-            skips the ``opt_rtn_*_asym`` candidates so the plain min/max
-            ``rtn_*_asym`` function resolves instead of the joint
-            (scale, zero-point) search. ``"auto"`` and ``"neuqi"`` keep the
-            joint-search candidates. Ignored for ``sym=True``.
+            ``"auto" | "neuqi" | "minmax"``. The joint (scale, zero-point)
+            NeUQI search is opt-in: only ``"neuqi"`` considers the
+            ``opt_rtn_*_asym`` candidates; ``"auto"`` (default) and
+            ``"minmax"`` resolve the plain min/max ``rtn_*_asym`` function
+            for ``sym=False``. Ignored for ``sym=True``.
 
     Returns:
         function: The quantization function corresponding to the specified parameters.
@@ -142,7 +142,7 @@ def get_quant_func(
     if not disable_opt_rtn and iters == 0:
         rtn_data_type = "opt_rtn_" + dtype
         data_types = [rtn_data_type, pad_bits(rtn_data_type), pad_sym(rtn_data_type), pad_sym(pad_bits(rtn_data_type))]
-        if asym_search == "minmax" and not sym:
+        if asym_search != "neuqi" and not sym:
             data_types = [dt for dt in data_types if not dt.endswith("_asym") and not dt.endswith(f"_asym{bits}")]
         for data_type in data_types:
             from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
