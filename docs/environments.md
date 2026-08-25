@@ -241,6 +241,16 @@ export AR_NEUQI_BACKEND=eager
 export AR_NEUQI_LAYOUT=mid
 ```
 
+### AR_PRESINQ_BACKEND
+- **Description**: Sinkhorn loop backend for the Pre-SINQ transform. `"auto"` (default) runs the sinkhorn iteration loop as a fused `torch.compile` graph on non-CPU devices — one fused kernel instead of ~25 launches per iteration, most impactful for the small per-expert folds of MoE models — and uses the eager reference loop on CPU. `"compile"` forces the compiled loop on any device; `"eager"` always uses the reference loop. Both sides evaluate identical fp64 math: the eager loop is bit-exact with the previous release (per-iteration stds are computed once and reused, and the unused scaled-matrix materialization is skipped — ~1.8x faster by itself), while the compiled loop agrees with it to ~1e-15 (fp64 reduction-order effects; ties in the best-so-far tracker may resolve to a different, equally-balanced iteration). Any compile or runtime failure permanently reverts to the eager loop for the rest of the run.
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"compile"`, `"eager"` (unrecognized values are treated as `"eager"`)
+- **Usage**: Force the reference loop for A/B comparisons, or fuse on CPU for experimentation
+
+```bash
+export AR_PRESINQ_BACKEND=eager
+```
+
 ### AR_NEUQI_BATCH
 - **Description**: All-candidates batched zero-point sweep. `"auto"` (default) folds every coarse and fine scale candidate of a pass into a single fused kernel per group chunk on CUDA (the per-candidate fused sweep spends most of its remaining wall time in per-candidate dispatch and bookkeeping launches); `"on"` forces the batched sweep on any fused-capable device (e.g. for A/B or tests); `"off"` keeps the per-candidate loop. The batched kernel computes the min over zero points in-kernel and emits only `[groups, candidates]` best losses and winning zero points per launch. Selections follow the same first-minimum tie rule as the sequential sweep; after the single-candidate fusion this is the second speedup stage on top of the same candidate grid (21x measured for the first stage on an RTX 3090). Any failure of a batched call (e.g. out of memory from the larger symbolic intermediate) permanently latches the process back to the per-candidate fused sweep for the remaining candidates.
 - **Default**: `"auto"`

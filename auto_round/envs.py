@@ -103,6 +103,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CUDA, "on" forces it on any fused-capable device, "off" keeps the
     # per-candidate loop.
     "AR_NEUQI_BATCH": lambda: os.getenv("AR_NEUQI_BATCH", "auto").lower(),
+    # Sinkhorn loop backend for the Pre-SINQ transform: "auto" runs the loop
+    # as a fused torch.compile graph on non-CPU devices (fewer kernel
+    # launches, results within ~1e-15 of the eager fp64 loop) and eager
+    # elsewhere; "compile" forces it on any device, "eager" always uses the
+    # reference loop. Any compile failure permanently reverts to eager.
+    "AR_PRESINQ_BACKEND": lambda: os.getenv("AR_PRESINQ_BACKEND", "auto").lower(),
     # Minimum value to which torch._dynamo cache_size_limit /
     # accumulated_cache_size_limit / recompile_limit are bumped when
     # ``enable_torch_compile`` is used. The default of 16 is enough to cover

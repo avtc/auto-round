@@ -194,6 +194,129 @@ class TestSinkhorn:
         t = column_scales([torch.randn(8, 60)], group_size=64, n_iter=1)
         assert t.shape == (60,)
 
+    @staticmethod
+    def _reference_impl(matrix, order, clip_min, clip_max, eps, stop):
+        """The original per-iteration loop (std recomputed inside imbalance and
+        again for the update; scaled always computed) — the bit-exactness oracle."""
+        m = matrix.to(torch.float64)
+
+        def imbalance(mat):
+            s1 = mat.std(dim=-1)
+            s2 = mat.std(dim=-2)
+            s_min = torch.minimum(s1.amin(dim=-1), s2.amin(dim=-1)).clamp_min(1e-12)
+            s_max = torch.maximum(s1.amax(dim=-1), s2.amax(dim=-1))
+            return s_max / s_min
+
+        imb_min = torch.full(m.shape[:-2], float("inf"), dtype=torch.float64, device=m.device)
+        tgt_small = (
+            torch.minimum(m.std(-1).clamp(clip_min, clip_max).amin(-1), m.std(-2).clamp(clip_min, clip_max).amin(-1))
+            + eps
+        )
+        log_mu1 = torch.zeros(*m.shape[:-2], m.shape[-1], dtype=torch.float64, device=m.device)
+        log_mu2 = torch.zeros(*m.shape[:-2], m.shape[-2], 1, dtype=torch.float64, device=m.device)
+        mu1_star = log_mu1.exp().clone()
+        mu2_star = log_mu2.exp().clone()
+        imb_min = torch.minimum(imb_min, imbalance(m))
+        gate = torch.zeros_like(imb_min)
+        for _ in range(order):
+            cur = (m / log_mu1.exp().unsqueeze(-2)) / log_mu2.exp()
+            ib = imbalance(cur)
+            better = ib <= imb_min
+            imb_min = torch.minimum(imb_min, ib)
+            mu1_star = torch.where(better.unsqueeze(-1), log_mu1.exp(), mu1_star)
+            mu2_star = torch.where(better.unsqueeze(-1).unsqueeze(-1), log_mu2.exp(), mu2_star)
+            if stop:
+                rising = (ib > imb_min).to(torch.float64)
+                gate = torch.clip(gate + rising, max=1.0)
+            g = 1.0 - gate
+            std_r = cur.std(dim=-1).clamp(clip_min, clip_max)
+            std_c = cur.std(dim=-2).clamp(clip_min, clip_max)
+            sal_col = (std_c / tgt_small.unsqueeze(-1)).clamp(0.7, 2.0).log()
+            sal_row = (std_r / tgt_small.unsqueeze(-1)).clamp(0.7, 2.0).log()
+            log_mu1 = (log_mu1 + sal_col * g.unsqueeze(-1)).clip(-0.3, 10.0)
+            log_mu2 = (log_mu2 + sal_row.unsqueeze(-1) * g.unsqueeze(-1).unsqueeze(-1)).clip(-0.3, 10.0)
+        scaled = m / mu1_star.unsqueeze(-2) / mu2_star
+        return scaled, mu1_star, mu2_star
+
+    def test_optimized_loop_is_bit_exact(self):
+        """The std-once / exp-hoisted refactor must reproduce the original loop
+        bit-for-bit on every return value."""
+        torch.manual_seed(1)
+        cases = [
+            (torch.randn(128, 64) * torch.logspace(-2, 2, 64), 4),
+            (torch.randn(3, 96, 48) * torch.logspace(-2, 2, 48), 8),
+            (torch.randn(32, 100), 0),
+        ]
+        for W, order in cases:
+            for stop in (True, False):
+                ref = self._reference_impl(W, order, 1e-3, 1e3, 1e-6, stop)
+                got = sinkhorn_log(W, order=order, stop_on_increasing_imbalance=stop)
+                for r, gv in zip(ref, got):
+                    assert torch.equal(r, gv), f"order={order} stop={stop} {tuple(W.shape)}"
+
+    def test_want_scaled_false(self):
+        torch.manual_seed(2)
+        W = torch.randn(64, 48) * torch.logspace(-2, 2, 48)
+        ref_scaled, ref_mu1, ref_mu2 = sinkhorn_log(W, order=4)
+        scaled, mu1, mu2 = sinkhorn_log(W, order=4, want_scaled=False)
+        assert scaled is None
+        assert torch.equal(mu1, ref_mu1) and torch.equal(mu2, ref_mu2)
+
+
+class TestSinkhornBackend:
+    """AR_PRESINQ_BACKEND compile arm: same math fused via torch.compile."""
+
+    def test_policy(self, monkeypatch):
+        from auto_round import envs
+        from auto_round.algorithms.transforms.presinq.sinkhorn import _wants_compile
+
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "auto")
+        assert _wants_compile("cuda") is True
+        assert _wants_compile("cpu") is False
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "compile")
+        assert _wants_compile("cpu") is True
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
+        assert _wants_compile("cuda") is False
+
+    @pytest.mark.enable_torch_compile
+    def test_compiled_close_to_eager(self, monkeypatch):
+        pytest.importorskip("torch._inductor")
+        from auto_round import envs
+        from auto_round.algorithms.transforms.presinq.sinkhorn import column_scales as cs
+
+        torch.manual_seed(3)
+        W = [torch.randn(96, 128) * torch.logspace(-1, 1, 128)]
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
+        t_ref = cs(W, group_size=32, n_iter=4)
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "compile")
+        import auto_round.algorithms.transforms.presinq.sinkhorn as S
+
+        S._compiled_broken = False
+        S._compiled_body = None
+        t_c = cs(W, group_size=32, n_iter=4)
+        if S._compiled_broken:
+            pytest.skip("torch.compile/inductor unavailable in this environment")
+        torch.testing.assert_close(t_c, t_ref, rtol=1e-10, atol=1e-12)
+
+    def test_compile_failure_latches(self, monkeypatch):
+        from auto_round import envs
+        import auto_round.algorithms.transforms.presinq.sinkhorn as S
+        from auto_round.algorithms.transforms.presinq.sinkhorn import column_scales as cs
+
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "compile")
+
+        def boom(*a, **k):
+            raise RuntimeError("simulated compile failure")
+
+        monkeypatch.setattr(S, "_compiled_body", boom)
+        monkeypatch.setattr(S, "_compiled_broken", False)
+        torch.manual_seed(4)
+        W = [torch.randn(64, 64)]
+        t_fb = cs(W, group_size=32, n_iter=2)
+        assert S._compiled_broken is True
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
+        torch.testing.assert_close(t_fb, cs(W, group_size=32, n_iter=2))
+
 
 # ---------------------------------------------------------------------------
 # fold exactness
