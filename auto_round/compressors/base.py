@@ -1709,9 +1709,8 @@ class BaseOrchestrator(object):
           - Re-evaluates ``torch.compile`` eligibility now that ``data_type`` is
             resolved and writes the result back to ``compress_context``.
           - Resets the offload manager when ``low_cpu_mem_usage`` is active.
-          - Disables ``self.inplace`` when quantized layers live outside
-            transformer blocks (incompatible with in-place rewriting).
-          - Calls :meth:`_adjust_immediate_packing_and_saving` to decide whether
+          - ``self.inplace`` is kept for outside-block quantized layers on the
+            data-driven path (legacy rule removed); ``compress_context.is_immediate_packing`` /
             layers should be packed / written immediately after each block.
 
         Postconditions:
@@ -1726,17 +1725,13 @@ class BaseOrchestrator(object):
         if self.compress_context.low_cpu_mem_usage:
             self._offloader.reset()
 
-        # Disable inplace when quantized layers live outside transformer blocks.
-        # gguf lm-head used rtn in version>=0.13
-        if (
-            self.has_qlayer_outside_block
-            and self.need_calib
-            and (
-                self.compress_context.formats is None
-                or "gguf" not in self.compress_context.formats[0].__class__.__name__.lower()
-            )
-        ):
-            self.inplace = False
+        # NOTE: a legacy rule used to disable ``self.inplace`` here when
+        # quantized layers lived outside the decoder blocks (e.g. a pinned
+        # lm_head) on the data-driven path. ``inplace`` has a single consumer
+        # -- the ``packing = True`` gate in :meth:`_adjust_immediate_packing_and_saving`
+        # -- so the rule only ever starved immediate packing/saving for exactly
+        # the configuration the streaming flow already supports (outside-block
+        # layers quantize after the block loop and pack/save at export).
 
         if not hasattr(self, "formats"):
             logger.warning("this API is deprecated, please use `quantize_and_save` instead")

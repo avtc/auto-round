@@ -110,6 +110,53 @@ class TestImmediatePackingWithOutsideBlockQlayer(unittest.TestCase):
         assert ctx.is_immediate_packing is True, "outside-block qlayers must not disable immediate packing"
         assert ctx.is_immediate_saving is True
 
+    def test_data_driven_outside_block_qlayer_keeps_inplace(self):
+        """The phase-4 method itself must not flip inplace=False for the same
+        configuration _adjust_immediate_packing_and_saving handles: outside-block
+        qlayers + need_calib (data-driven AutoScheme run with a pinned lm_head).
+        inplace=False starves the packing=True assignment and blocks BPT with
+        'requires immediate packing and saving'."""
+        from types import SimpleNamespace
+
+        from auto_round.compressors.base import BaseCompressor
+
+        fmt = SimpleNamespace(
+            is_fake=lambda: False,
+            is_gguf=lambda: False,
+            is_supported_immediate_packing=lambda: True,
+            is_supported_immediate_saving=lambda: True,
+        )
+        ctx = SimpleNamespace(is_immediate_packing=False, is_immediate_saving=False, low_cpu_mem_usage=True)
+        stub = SimpleNamespace(
+            formats=[fmt],
+            inplace=True,
+            has_qlayer_outside_block=property(lambda self: True),
+            need_calib=True,
+            compress_context=ctx,
+            model_context=SimpleNamespace(
+                model=SimpleNamespace(
+                    __class__=type("Qwen2ForCausalLM", (), {}),
+                    _tied_weight_keys={},
+                ),
+                is_mllm=False,
+            ),
+            quantize_config=_RealRTNConfig(),
+            disable_opt_rtn=False,
+            output_dir="out",
+        )
+        stub._ensure_shard_writer = lambda: None
+        stub._offloader = SimpleNamespace(reset=lambda: None)
+        stub._finalize_torch_compile = lambda: None
+        stub.enable_torch_compile = False
+        stub._adjust_immediate_packing_and_saving = lambda: BaseCompressor._adjust_immediate_packing_and_saving(stub)
+        import auto_round.compressors.base as base_mod
+
+        base_mod.set_non_auto_device_map(stub.model_context.model, None)
+        BaseCompressor._hardware_setup(stub)
+        assert stub.inplace is True, "data-driven outside-block qlayers must not disable inplace"
+        assert ctx.is_immediate_packing is True
+        assert ctx.is_immediate_saving is True
+
     def test_no_qlayer_outside_block_still_packs(self):
         ctx = self._adjust(need_calib=True, has_qlayer_outside_block=False)
         assert ctx.is_immediate_packing is True
