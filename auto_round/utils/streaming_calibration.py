@@ -31,7 +31,7 @@ lm_head) receive no cached inputs; the quantizer falls back to unweighted
 search there.
 
 Memory: the cache holds one tensor per row per block on the host
-(rows x blocks x seqlen x hidden). ``max_rows`` bounds it by subsampling —
+(rows x blocks x seqlen x hidden). ``nsamples`` bounds it —
 the imatrix is a column statistic, so a modest row count is statistically
 sufficient.
 """
@@ -143,7 +143,7 @@ def _find_model_rotary(model, cfg, device):
     return _ensure_real_rotary(rotary, cfg, device)
 
 
-def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0, seed=42, nsamples=128, bs=1):
+def _normalize_rows(dataset, tokenizer, seqlen, seed=42, nsamples=128, bs=1):
     """Flatten the calibration dataset into a list of input_ids batches
     (tensors), applying the data-driven skip rule (shorter than seqlen) and an
     optional row cap.
@@ -151,8 +151,6 @@ def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0, seed=42, nsamples=12
     A string dataset follows the data-driven protocol (pile-10k, shuffle
     seed 42) tokenized with the MODEL's tokenizer, so ids are in-vocab by
     construction."""
-    if max_rows < 0:
-        raise ValueError(f"stream_calibration_rows must be >= 0, got {max_rows}")
     rows = []
     if isinstance(dataset, str):
         from auto_round.calib_dataset import get_dataloader
@@ -176,9 +174,11 @@ def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0, seed=42, nsamples=12
         if input_ids.shape[-1] < seqlen:
             continue
         rows.append(input_ids)
-    if max_rows and len(rows) > max_rows:
-        rows = rows[:max_rows]
-        logger.info("[stream_calibration] capping calibration rows to %d", max_rows)
+    # nsamples caps list datasets too (the data-driven calibrator stops at
+    # nsamples for every dataset type; the chain matches that semantics).
+    if nsamples and len(rows) > nsamples:
+        rows = rows[:nsamples]
+        logger.info("[stream_calibration] capping calibration rows to %d (nsamples)", nsamples)
     return rows
 
 
@@ -195,7 +195,7 @@ def _check_ids_in_vocab(rows, vocab):
 
 
 def prepare_streaming_calibration(
-    model, streamer, dataset, device, seqlen, tokenizer=None, max_rows=0, first_block=None, nsamples=128
+    model, streamer, dataset, device, seqlen, tokenizer=None, first_block=None, nsamples=128
 ):
     """Initialize the streaming calibration chain.
 
@@ -210,7 +210,7 @@ def prepare_streaming_calibration(
     Returns ``(fp_inputs, input_others, summary)``: the initial per-row hidden
     states, the shared kwargs cache, and a small summary dict.
     """
-    rows = _normalize_rows(dataset, tokenizer, seqlen, max_rows, nsamples=nsamples)
+    rows = _normalize_rows(dataset, tokenizer, seqlen, nsamples=nsamples)
     if not rows:
         raise ValueError("stream_calibration: no usable calibration rows (all shorter than seqlen?)")
     logger.info("[stream_calibration] chaining %d calibration rows (nsamples=%d)", len(rows), nsamples)

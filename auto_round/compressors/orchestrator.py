@@ -1366,7 +1366,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 device=str(self.device),
                 seqlen=self.calibration_context.seqlen,
                 tokenizer=self.tokenizer,
-                max_rows=int(getattr(self, "stream_calibration_rows", 0) or 0),
                 first_block=get_module(self.model, flat_block_names[0]) if flat_block_names else None,
                 nsamples=int(getattr(self.calibration_context, "nsamples", 128) or 128),
             )
