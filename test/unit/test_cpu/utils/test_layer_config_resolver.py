@@ -23,6 +23,36 @@ from auto_round.compressors.layer_config import (
 from auto_round.schemes import QuantizationScheme
 
 
+def test_resolver_skips_non_2d_weights_in_divisibility_rule():
+    """Regression (hy3 streaming run): a module matching the supported-type
+    filter carried a 1-D weight on the server build; the 32-divisibility rule
+    indexed weight.shape[1] unconditionally and crashed with IndexError. The
+    rule is only meaningful for per-channel int quantization (2-D weights);
+    non-2-D matches must be skipped with a warning naming the module."""
+    import torch
+
+    class CompressedLinear(nn.Module):  # matches INNER_SUPPORTED_LAYER_TYPES by name
+        def __init__(self, n):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(n))  # 1-D
+
+    model = nn.Sequential(nn.Linear(64, 64), CompressedLinear(8))
+    scheme = ResolvedScheme.from_scheme(QuantizationScheme(act_bits=16, act_data_type="float"))
+
+    resolved = resolve_layer_config(
+        model=model,
+        scheme=scheme,
+        layer_config={"0": {"bits": 4}},
+        supported_types=(nn.Linear,),
+        inner_supported_types=("CompressedLinear",),
+    )
+
+    # the ordinary Linear is resolved normally...
+    assert "0" in resolved
+    # ...and the 1-D match got no divisibility-forced fp16 override
+    assert "1" not in resolved
+
+
 def test_resolver_does_not_write_quantization_attributes_to_modules():
     model = nn.Sequential(nn.Linear(32, 32))
     scheme = ResolvedScheme.from_scheme(QuantizationScheme(act_bits=16, act_data_type="float"))

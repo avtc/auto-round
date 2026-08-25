@@ -68,7 +68,15 @@ def apply_layer_config_special_cases(
     if default_dict["data_type"] == "int" and default_dict["act_bits"] >= 16 and not gguf_name:
         for n, m in model.named_modules():
             if type(m) in supported_types or m.__class__.__name__ in inner_supported_types:
-                if m.weight.shape[0] % 32 or m.weight.shape[1] % 32:
+                weight = m.weight
+                if weight.dim() != 2:
+                    logger.warning_once(
+                        f"layer {n} ({type(m).__name__}) matched the quantizable-type filter but has a "
+                        f"{weight.dim()}-D weight; the shape-divisibility rule only applies to 2-D "
+                        "per-channel weights -- skipping it"
+                    )
+                    continue
+                if weight.shape[0] % 32 or weight.shape[1] % 32:
                     layer_config.setdefault(n, copy.deepcopy(default_dict))
                     layer_config[n].update({"bits": 16, "data_type": "fp", "fixed_by_user": True})
 
@@ -76,7 +84,7 @@ def apply_layer_config_special_cases(
         skipped_layers = []
         for n, m in model.named_modules():
             if type(m) in supported_types or m.__class__.__name__ in inner_supported_types:
-                if m.weight.shape[1] % default_dict["group_size"]:
+                if m.weight.dim() != 2 or m.weight.shape[1] % default_dict["group_size"]:
                     layer_config.setdefault(n, copy.deepcopy(default_dict))
                     layer_config[n].update(
                         {"bits": 16, "data_type": "fp", "act_bits": 16, "act_data_type": "fp", "fixed_by_user": True}
