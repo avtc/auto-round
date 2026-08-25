@@ -504,11 +504,39 @@ class TestStreamModeExclusivity:
         with pytest.raises(ValueError, match="mutually exclusive"):
             self._make_context(monkeypatch, env_disk_stream=True)
 
-    def test_stream_quantization_with_mllm_raises(self, monkeypatch):
+    def test_stream_quantization_with_mllm_routes_to_meta_loader(self, monkeypatch):
+        """Multimodal + streaming no longer errors: the mllm branch routes into
+        _load_model_on_meta (arch-resolved skeleton + processor stack; vision
+        tower stays meta for the export pass-through)."""
+        import torch.nn as nn
+
+        from auto_round.context.model import ModelContext
+
+        called = {"meta": 0}
+
+        class _TinyModule(nn.Module):
+            dtype = torch.float32  # _set_amp_dtype reads it
+            config = None
+
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 4)
+
+        def _fake_meta(self):
+            called["meta"] += 1
+            self.model = _TinyModule()  # minimal module so the __init__ tail survives
+            self.tokenizer = None
+
+        monkeypatch.setattr(ModelContext, "_load_model_on_meta", _fake_meta)
+        ctx = self._make_context(monkeypatch, mllm=True)
+        assert called["meta"] == 1, "mllm + stream_quantization must use the streaming loader"
+        assert ctx.is_mllm is True
+
+    def test_stream_quantization_with_mllm_and_env_var_still_raises(self, monkeypatch):
         import pytest
 
-        with pytest.raises(ValueError, match="multimodal"):
-            self._make_context(monkeypatch, mllm=True)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._make_context(monkeypatch, mllm=True, env_disk_stream=True)
 
     def test_text_path_without_env_proceeds_to_meta_load(self, monkeypatch):
         """Sanity: the guards must not fire on the normal text streaming path

@@ -1968,6 +1968,10 @@ class BaseOrchestrator(object):
                         original_block_name, reverted_block_name
                     )
 
+            if getattr(self.model_context, "processor", None) is not None:
+                kwargs.setdefault("processor", self.model_context.processor)
+            if getattr(self.model_context, "image_processor", None) is not None:
+                kwargs.setdefault("image_processor", self.model_context.image_processor)
             compressed_model = format.save_quantized(
                 save_folder,
                 model=self.model_context.model,
