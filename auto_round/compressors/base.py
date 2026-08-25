@@ -1840,8 +1840,11 @@ class BaseOrchestrator(object):
         ):
             self.compress_context.is_immediate_packing = True
 
-        if self.has_qlayer_outside_block and self.need_calib and not has_single_gguf_format:
-            self.compress_context.is_immediate_packing = False
+        # Quant layers outside blocks (e.g. an lm_head kept at W8) no longer
+        # disable immediate packing: they are quantized AFTER the block loop
+        # (see _quantize_layers_outside_blocks / the streaming pass-through)
+        # and packed/saved at export, so the block loop may pack and flush
+        # blocks as usual.
         if not ("causallm" in self.model_context.model.__class__.__name__.lower() and not self.model_context.is_mllm):
             # TODO For tied keys, there may some issues, we haven't not verified this
             tied_weight_keys = getattr(self.model_context.model, "_tied_weight_keys", {})

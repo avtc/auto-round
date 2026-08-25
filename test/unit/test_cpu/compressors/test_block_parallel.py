@@ -59,6 +59,62 @@ class TestWorkerCommand(unittest.TestCase):
         )
 
 
+def _RealRTNConfig():
+    from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+    return RTNConfig(bits=4, group_size=32, data_type="int")
+
+
+class TestImmediatePackingWithOutsideBlockQlayer(unittest.TestCase):
+    """Quant layers outside blocks (e.g. lm_head W8) must no longer disable
+    immediate packing on the data-driven path: the outside-block loop runs
+    after the block loop and packs/saves at export (proven by the streaming
+    flow with the same configuration). The old rule also made BPT impossible
+    and forced env-var hy3 runs into a full-model reload at final assembly."""
+
+    def _adjust(self, need_calib, has_qlayer_outside_block, inplace=True):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.base import BaseCompressor
+
+        fmt = SimpleNamespace(
+            is_fake=lambda: False,
+            is_gguf=lambda: False,
+            is_supported_immediate_packing=lambda: True,
+            is_supported_immediate_saving=lambda: True,
+        )
+        ctx = SimpleNamespace(is_immediate_packing=False, is_immediate_saving=False, low_cpu_mem_usage=True)
+        stub = SimpleNamespace(
+            formats=[fmt],
+            inplace=inplace,
+            has_qlayer_outside_block=property(lambda self: has_qlayer_outside_block),
+            need_calib=need_calib,
+            compress_context=ctx,
+            model_context=SimpleNamespace(
+                model=SimpleNamespace(
+                    __class__=type("Qwen2ForCausalLM", (), {}),
+                    _tied_weight_keys={},
+                ),
+                is_mllm=False,
+            ),
+            quantize_config=_RealRTNConfig(),
+            disable_opt_rtn=False,
+            output_dir="out",
+        )
+        stub._ensure_shard_writer = lambda: None
+        BaseCompressor._adjust_immediate_packing_and_saving(stub)
+        return ctx
+
+    def test_data_driven_outside_block_qlayer_keeps_immediate_packing(self):
+        ctx = self._adjust(need_calib=True, has_qlayer_outside_block=True)
+        assert ctx.is_immediate_packing is True, "outside-block qlayers must not disable immediate packing"
+        assert ctx.is_immediate_saving is True
+
+    def test_no_qlayer_outside_block_still_packs(self):
+        ctx = self._adjust(need_calib=True, has_qlayer_outside_block=False)
+        assert ctx.is_immediate_packing is True
+
+
 class TestGuardReasons(unittest.TestCase):
     """Guard returns None (ok), 'disabled' (off), or a reason (on, blocked)."""
 
