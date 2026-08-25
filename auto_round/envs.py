@@ -88,6 +88,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NeUQI search in ``auto_round.data_type.neuqi``.
     "AR_NEUQI_COARSE": lambda: int(os.getenv("AR_NEUQI_COARSE", "64")),
     "AR_NEUQI_FINE": lambda: int(os.getenv("AR_NEUQI_FINE", "32")),
+    # Zero-point sweep backend for the NeUQI search: "auto" fuses the sweep into a
+    # single torch.compile kernel on CUDA (reference eager sweep elsewhere),
+    # "compile" forces the fused sweep on any device, "eager" always uses the
+    # reference chunked sweep.
+    "AR_NEUQI_BACKEND": lambda: os.getenv("AR_NEUQI_BACKEND", "auto").lower(),
+    # Memory layout of the fused zero-point sweep expression: "auto" picks by
+    # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
+    # "last"/"mid" force one layout for A/B measurements.
+    "AR_NEUQI_LAYOUT": lambda: os.getenv("AR_NEUQI_LAYOUT", "auto").lower(),
     # Minimum value to which torch._dynamo cache_size_limit /
     # accumulated_cache_size_limit / recompile_limit are bumped when
     # ``enable_torch_compile`` is used. The default of 16 is enough to cover

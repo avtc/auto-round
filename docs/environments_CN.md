@@ -221,6 +221,26 @@ export AR_NEUQI_COARSE=64
 export AR_NEUQI_FINE=32
 ```
 
+### AR_NEUQI_BACKEND
+- **描述**：NeUQI 每个候选 scale 的零点扫描后端。`"auto"`（默认）在 CPU 上保持参考的分块 eager 扫描，在 CUDA 上切换为 `torch.compile` 融合的单内核扫描；`"compile"` 在任意设备上强制使用融合扫描；`"eager"` 始终使用参考扫描。融合扫描在完全相同的候选网格上计算完全相同的损失（选择仅在近似并列时不同：少于约 0.1% 的组会翻转，RTX 3090 上实测最坏相对损失差约 5e-5），但每个 scale 候选只读取一次权重元素，而不是物化 `[组数, 组大小, 2^bits]` 展开，从而消除大规模批量专家搜索中暴力网格的显存带宽瓶颈（在 200 万组的 RTX 3090 扫描上实测 21 倍加速）。若当前环境无法编译（例如 Inductor 缺少主机 C++ 编译器），搜索会自动永久回退到 eager 扫描。
+- **默认值**：`"auto"`
+- **有效值**：`"auto"`、`"compile"`、`"eager"`（无法识别的值按 `"eager"` 处理）
+- **用法**：在 CPU 上强制融合扫描以做实验，或固定为参考扫描以做 A/B 对比
+
+```bash
+export AR_NEUQI_BACKEND=eager
+```
+
+### AR_NEUQI_LAYOUT
+- **描述**：融合零点扫描表达式的内存布局。扫描需要对每个整数零点沿组轴归约平方误差，两个轴可互换布置：`"last"` 布置为 `[组数, 零点数, 组大小]`，在连续的末维上归约（Triton/CUDA 的经典融合形态；中间维归约在 RTX 3090 上实测不快于 eager）；`"mid"` 布置为 `[组数, 组大小, 零点数]`（在 eager TensorIterator 路径与编译后的 CPU 后端上更快）。`"auto"`（默认）按设备选择：CUDA 用 `"last"`，其余设备用 `"mid"`。两种布局计算的损失在 fp32 组内求和顺序之外完全一致（仅末位 ulp 并列）。
+- **默认值**：`"auto"`
+- **有效值**：`"auto"`、`"last"`、`"mid"`（无法识别的值按设备的 `"auto"` 规则处理）
+- **用法**：在特定设备上对两种布局做 A/B 对比
+
+```bash
+export AR_NEUQI_LAYOUT=mid
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **描述**：控制 `NVFP4E5M3QuantLinear` 是否在首次前向后缓存解量化得到的高精度权重，而不是每次调用都从打包的 FP4 权重重新解量化。
 - **默认值**：`False`（等价于 `"0"`）

@@ -199,6 +199,159 @@ class TestNeuqiIntegration:
         assert qdq.shape == data.shape
 
 
+class TestNeuqiFusedSweep:
+    """The torch.compile-fused zero-point sweep must reproduce the eager reference.
+
+    ``AR_NEUQI_BACKEND=compile`` routes every chunk through the fused expression.
+    Selections must match the eager sweep; when compilation is unavailable in the
+    environment (e.g. no host C++ compiler for Inductor) the dispatch must fall
+    back to the eager expression and still return correct results."""
+
+    @staticmethod
+    def _oracle_loss_fp64(data, qw, scale, zp, maxq):
+        r = torch.round(data.double() / scale.double()).clamp_(min=-maxq - 1, max=2 * maxq + 1)
+        q = (r + zp.double()).clamp_(0, maxq)
+        deq = scale.double() * (q - zp.double())
+        loss = (deq - data.double()) ** 2
+        if qw is not None:
+            loss = loss * qw.double()
+        return loss.sum(-1)
+
+    def _search_with_backend(self, monkeypatch, backend, data, bits, qw, **kwargs):
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", backend)
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        scale, zp = N.neuqi_search_scale_zero(data.clone(), bits, qw=qw.clone() if qw is not None else None, **kwargs)
+        return scale, zp, N
+
+    @pytest.mark.enable_torch_compile
+    @pytest.mark.parametrize("bits", [2, 3, 4, 8])
+    @pytest.mark.parametrize("weighted", [False, True])
+    def test_fused_matches_eager(self, monkeypatch, bits, weighted):
+        gen = torch.Generator().manual_seed(bits * 10 + int(weighted))
+        n, g = 512, 128
+        data = torch.randn(n, g, generator=gen)
+        data[:, :5] *= 120.0  # heavy tails: near-tie zero points are common here
+        qw = torch.rand(n, g, generator=gen) + 0.1 if weighted else None
+
+        scale_e, zp_e, _ = self._search_with_backend(monkeypatch, "eager", data, bits, qw, coarse_n=8, fine_n=4)
+        scale_f, zp_f, N = self._search_with_backend(monkeypatch, "compile", data, bits, qw, coarse_n=8, fine_n=4)
+
+        if N._fused_zp_broken or not N._fused_zp_fns:
+            pytest.skip("torch.compile/inductor unavailable in this environment")
+
+        mismatch = (zp_e != zp_f).logical_or(scale_e != scale_f).nonzero().flatten()
+        for i in mismatch.tolist():
+            # a flip is acceptable only between zero points whose fp64 losses tie
+            # at the last fp32 ulp (summation-order artifacts), never a real loss change
+            loss_e = self._oracle_loss_fp64(
+                data[i], qw[i] if qw is not None else None, scale_e[i], zp_e[i], 2**bits - 1
+            )
+            loss_f = self._oracle_loss_fp64(
+                data[i], qw[i] if qw is not None else None, scale_f[i], zp_f[i], 2**bits - 1
+            )
+            assert (loss_f - loss_e).abs().item() <= 1e-6 * loss_e.abs().item()
+
+    @pytest.mark.enable_torch_compile
+    def test_last_layout_matches_mid_reference(self, monkeypatch):
+        """The CUDA layout (group axis last) must match the reference layout's
+        selections up to fp64 ties -- it runs on CUDA, its numerics are validated
+        here on CPU."""
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        gen = torch.Generator().manual_seed(31)
+        data = torch.randn(512, 64, generator=gen)
+        data[:, :4] *= 90.0
+        qw = torch.rand(512, 64, generator=gen) + 0.1
+
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "mid")
+        scale_m, zp_m = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=16, fine_n=4)
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "last")
+        scale_l, zp_l = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=16, fine_n=4)
+
+        if N._fused_zp_broken or not N._fused_zp_fns:
+            pytest.skip("torch.compile/inductor unavailable in this environment")
+
+        mismatch = (zp_m != zp_l).logical_or(scale_m != scale_l).nonzero().flatten()
+        maxq = 15
+        for i in mismatch.tolist():
+            loss_m = self._oracle_loss_fp64(data[i], qw[i], scale_m[i], zp_m[i], maxq)
+            loss_l = self._oracle_loss_fp64(data[i], qw[i], scale_l[i], zp_l[i], maxq)
+            assert (loss_l - loss_m).abs().item() <= 1e-6 * loss_m.abs().item()
+
+    def test_compile_failure_falls_back_to_eager(self, monkeypatch):
+        """A broken host toolchain must degrade to the eager sweep, not crash."""
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        data = _heavy_tailed_data(n_groups=16, seed=11)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated inductor failure")
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setattr(N, "_get_fused_zp_fn", _boom)
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+
+        scale_f, zp_f = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=4, fine_n=2)
+        assert N._fused_zp_broken is True  # permanently latched after the first failure
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        scale_e, zp_e = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=4, fine_n=2)
+        torch.testing.assert_close(scale_f, scale_e)
+        torch.testing.assert_close(zp_f, zp_e)
+
+    def test_backend_policy(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
+        assert N._zp_wants_compile("cuda") is True
+        assert N._zp_wants_compile("cpu") is False
+        assert N._zp_wants_compile("hpu") is False
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
+        assert N._zp_wants_compile("cpu") is True
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        assert N._zp_wants_compile("cuda") is False
+        # unrecognized values behave as the reference sweep
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "nonsense")
+        assert N._zp_wants_compile("cuda") is False
+
+    def test_layout_policy(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "auto")
+        assert N._zp_expr_for("cuda") is N._zp_expr_last
+        assert N._zp_expr_for("cpu") is N._zp_expr_mid
+        assert N._zp_expr_for("hpu") is N._zp_expr_mid
+        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "last")
+        assert N._zp_expr_for("cpu") is N._zp_expr_last
+        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "mid")
+        assert N._zp_expr_for("cuda") is N._zp_expr_mid
+
+    def test_cpu_default_is_eager(self, monkeypatch):
+        """AR_NEUQI_BACKEND defaults to auto: CPU tensors never trigger a compile."""
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        N.neuqi_search_scale_zero(_heavy_tailed_data(n_groups=8, seed=13).clone(), bits=4, coarse_n=4, fine_n=2)
+        assert not N._fused_zp_fns  # no compile attempt on CPU under auto
+
+
 class TestAsymSearchAPI:
     """RTNConfig(asym_search) enum: auto | neuqi | minmax (asym path only).
 

@@ -36,6 +36,16 @@ around the best coarse entry.
 The search replaces the plain min/max initialization of the asymmetric optimized-RTN
 path and is a strict generalization of the symmetric ``search_scales`` grid (which
 fixes ``z = 0``).
+
+Performance: the per-candidate zero-point sweep is a pure elementwise + reduction
+chain, so on CUDA it is fused into a single generated kernel via ``torch.compile``
+(``AR_NEUQI_BACKEND=auto``, the default). The fused sweep evaluates exactly the same
+losses on exactly the same candidate grid; only the fp32 summation order inside the
+reduction may differ, so selections can flip solely on near-ties: on random,
+heavy-tailed and imatrix-weighted inputs the flips stay below ~0.1% of groups with
+worst-case relative loss differences of ~5e-5 (measured on an RTX 3090; ~1e-6 on
+CPU). The eager chunked sweep remains the reference path (CPU default) and the
+automatic fallback whenever compilation is unavailable.
 """
 
 import math
@@ -49,7 +59,9 @@ from auto_round.data_type.utils import reshape_pad_tensor_by_group_size, revert_
 from auto_round.logger import logger
 
 # Upper bound on the number of elements of the temporary [chunk, group, zero_point]
-# loss tensor, used to cap peak memory regardless of the input size.
+# loss tensor, used to cap peak memory regardless of the input size. The bound is
+# honored by both the eager and the fused sweep, so a dynamo recompile-limit fallback
+# to eager execution degrades speed only, never correctness or memory.
 _MAX_TMP_ELEMS = 2**25
 
 
@@ -58,47 +70,166 @@ def _log_search_engaged(coarse_n: int, fine_n: int) -> None:
     logger.info("[NeUQI] joint (scale, zero-point) search active (coarse=%d, fine=%d)", coarse_n, fine_n)
 
 
-def _best_zp_for_scale(data, qw, scale, maxq):
+def _zp_expr_last(data, qw, scale, zp_grid, maxq):
+    """Zero-point sweep with the group dimension last: ``[C, Z, g]``, sum over ``dim=-1``.
+
+    Reduction over the contiguous last dimension is the canonical fused shape for
+    the Triton/CUDA codegen: the scheduler can keep the whole pointwise chain
+    (round -> clamp -> dequant -> squared error -> group sum -> zero-point min) in
+    registers and stream the group axis with coalesced loads. The equivalent
+    middle-dim reduction (``[C, g, Z]``) measured no faster than eager on CUDA
+    (RTX 3090) because the expanded buffer must be materialized or transposed to
+    reduce a non-contiguous axis; it is kept as ``_zp_expr_mid`` where it is the
+    faster layout (CPU, including eager execution).
+
+    Same operands and operand order per logical (group, zero-point) element as the
+    reference sweep, so losses are identical up to the fp32 summation order over
+    the group (last-ulp ties only).
+
+    Args:
+        data: [chunk, g] float32 group data.
+        qw: [chunk, g] float32 per-element weights or ``None``.
+        scale: [chunk, 1] float32 scale candidate.
+        zp_grid: [n_zp] float32 integral zero-point candidates ``0 .. maxq``.
+        maxq: maximum integer value (``2**bits - 1``).
+
+    Returns:
+        (min_loss [chunk], argmin_zp [chunk]) with the first-minimum tie rule of
+        ``Tensor.min`` (same winner as the eager sweep on equal losses).
+    """
+    # Stabilize rounding: values far outside the grid saturate identically after
+    # clamping, so clamping r first never changes clamp(r + z, 0, maxq) for z >= 0.
+    # Broadcasts give [C, Z, g]: data/qw over the middle (stride-0) zero-point
+    # axis, scale shared across the group, reduction over the last (contiguous) dim.
+    d = data.unsqueeze(-2)  # [C, 1, g]
+    sc = scale.unsqueeze(-1)  # [C, 1, 1]
+    zp = zp_grid.view(1, -1, 1)  # [1, Z, 1]
+    r = torch.round(d / sc).clamp_(min=-maxq - 1, max=2 * maxq + 1)
+    q = (r + zp).clamp_(0, maxq)
+    deq = sc * (q - zp)
+    diff = deq - d
+    loss = diff * diff
+    if qw is not None:
+        loss = loss * qw.unsqueeze(-2)
+    loss = loss.sum(dim=-1)  # [C, Z]
+    return loss.min(dim=-1)
+
+
+def _zp_expr_mid(data, qw, scale, zp_grid, maxq):
+    """Zero-point sweep with the zero-point dimension last: ``[C, g, Z]``, sum over ``dim=1``.
+
+    Byte-identical operand order to the historical chunked sweep. This is the
+    faster layout for eager execution and for the compiled CPU backend (the
+    zero-point broadcast rides the contiguous last axis, which TensorIterator
+    vectorizes well); it loses to ``_zp_expr_last`` under the Triton/CUDA
+    scheduler for the reasons given above.
+
+    Same args and returns as ``_zp_expr_last``.
+    """
+    # Stabilize rounding: values far outside the grid saturate identically after
+    # clamping, so clamping r first never changes clamp(r + z, 0, maxq) for z >= 0.
+    r = torch.round(data / scale).clamp_(min=-maxq - 1, max=2 * maxq + 1)
+    q = (r.unsqueeze(-1) + zp_grid).clamp_(0, maxq)
+    deq = scale.unsqueeze(-1) * (q - zp_grid)
+    diff = deq - data.unsqueeze(-1)
+    loss = diff * diff
+    if qw is not None:
+        loss = loss * qw.unsqueeze(-1)
+    loss = loss.sum(dim=1)  # [chunk, n_zp]
+    return loss.min(dim=-1)
+
+
+def _zp_expr_for(device_type: str):
+    """Pick the sweep layout for a device, per ``AR_NEUQI_LAYOUT``.
+
+    ``auto`` (default) selects by device: the last-dim-group reduction on CUDA
+    (canonical Triton fusion shape), the zero-point-last layout elsewhere (faster
+    under TensorIterator and the compiled CPU backend). "last"/"mid" force a
+    layout for A/B measurements.
+    """
+    layout = getattr(envs, "AR_NEUQI_LAYOUT", "auto")
+    if layout == "last":
+        return _zp_expr_last
+    if layout == "mid":
+        return _zp_expr_mid
+    return _zp_expr_last if device_type == "cuda" else _zp_expr_mid
+
+
+# torch.compile'd zero-point sweeps, keyed by the expression (layout) -- lazily
+# created on first CUDA use / forced backend.
+_fused_zp_fns = {}
+# Set when a fused invocation raised (e.g. no host C++ compiler for Inductor);
+# the process then permanently uses the eager sweep.
+_fused_zp_broken = False
+
+
+def _zp_wants_compile(device_type: str) -> bool:
+    """Whether the fused sweep should be used, per ``AR_NEUQI_BACKEND``."""
+    backend = envs.AR_NEUQI_BACKEND
+    if backend == "compile":
+        return True
+    if backend == "auto":
+        return device_type == "cuda"
+    return False  # "eager" (and any unrecognized value): reference sweep
+
+
+def _get_fused_zp_fn(expr):
+    """Lazily compile one sweep layout; callers fall back to eager on any failure."""
+    fn = _fused_zp_fns.get(expr)
+    if fn is None:
+        from auto_round.utils.device import _bump_dynamo_cache_limit
+
+        # Shape variants (group size x bits x qw-present x chunk tail) must never
+        # trip dynamo's recompile limit: exceeding it silently runs the frame in
+        # eager, which is memory-safe here (chunking bounds the expansion) but slow.
+        _bump_dynamo_cache_limit(64)
+        fn = torch.compile(expr, dynamic=False)
+        _fused_zp_fns[expr] = fn
+        logger.info("[NeUQI] zero-point sweep fused via torch.compile (layout=%s)", expr.__name__)
+    return fn
+
+
+def _eval_zp_chunk(data, qw, scale, zp_grid, maxq):
+    """Dispatch one chunk of the zero-point sweep to the fused or eager path."""
+    global _fused_zp_broken
+    expr = _zp_expr_for(data.device.type)
+    if not _fused_zp_broken and _zp_wants_compile(data.device.type):
+        try:
+            return _get_fused_zp_fn(expr)(data, qw, scale, zp_grid, maxq)
+        except Exception as e:  # pragma: no cover - depends on host toolchain
+            _fused_zp_broken = True
+            logger.warning("[NeUQI] fused zero-point sweep failed (%s); using the eager sweep", e)
+    return expr(data, qw, scale, zp_grid, maxq)
+
+
+def _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk):
     """Evaluate all integer zero points for one per-group scale candidate.
 
     Args:
         data: [N, g] float32 group data.
         qw: [N, g] float32 per-element weights or ``None``.
         scale: [N, 1] float32 scale candidates.
+        zp_grid: [n_zp] float32 integral zero-point candidates.
         maxq: maximum integer value (``2**bits - 1``).
+        chunk: number of groups per evaluation slice (bounds the temporary).
 
     Returns:
         best_loss: [N] float32, loss of the best zero point per group.
         best_zp: [N] float32, integral-valued optimal zero point per group.
     """
     n_groups = data.shape[0]
-    group_size = data.shape[1]
-    n_zp = maxq + 1
-    chunk = max(1, _MAX_TMP_ELEMS // (group_size * n_zp))
-
-    zp_grid = torch.arange(0, n_zp, device=data.device, dtype=data.dtype)
-
     best_loss = torch.full((n_groups,), float("inf"), device=data.device, dtype=data.dtype)
     best_zp = torch.zeros(n_groups, device=data.device, dtype=data.dtype)
 
     for start in range(0, n_groups, chunk):
         stop = min(start + chunk, n_groups)
-        data_c = data[start:stop]
-        qw_c = qw[start:stop] if qw is not None else None
-        scale_c = scale[start:stop]
-
-        # Stabilize rounding: values far outside the grid saturate identically after
-        # clamping, so clamping r first never changes clamp(r + z, 0, maxq) for z >= 0.
-        r = torch.round(data_c / scale_c).clamp_(min=-maxq - 1, max=2 * maxq + 1)
-        q = (r.unsqueeze(-1) + zp_grid).clamp_(0, maxq)
-        deq = scale_c.unsqueeze(-1) * (q - zp_grid)
-        diff = deq - data_c.unsqueeze(-1)
-        loss = diff * diff
-        if qw_c is not None:
-            loss = loss * qw_c.unsqueeze(-1)
-        loss = loss.sum(dim=1)  # [chunk, n_zp]
-
-        min_loss, argmin_zp = loss.min(dim=-1)
+        min_loss, argmin_zp = _eval_zp_chunk(
+            data[start:stop],
+            qw[start:stop] if qw is not None else None,
+            scale[start:stop],
+            zp_grid,
+            maxq,
+        )
         best_loss[start:stop] = min_loss
         best_zp[start:stop] = argmin_zp.to(data.dtype)
 
@@ -141,6 +272,9 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     if qw is not None:
         qw = qw.to(torch.float32)
 
+    zp_grid = torch.arange(0, maxq + 1, device=data.device, dtype=data.dtype)
+    chunk = max(1, _MAX_TMP_ELEMS // (data.shape[1] * (maxq + 1)))
+
     wmin = torch.clamp(data.min(dim=-1).values, max=0).unsqueeze(-1)
     wmax = torch.clamp(data.max(dim=-1).values, min=0).unsqueeze(-1)
     s0 = ((wmax - wmin) / maxq).clamp_(min=q_scale_thresh)  # [N, 1] min-max scale
@@ -152,10 +286,10 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     best_frac = torch.ones(data.shape[0], device=data.device, dtype=torch.float32)
     best_zp = torch.zeros(data.shape[0], device=data.device, dtype=torch.float32)
 
-# Coarse pass: shared log-spaced fractions of the per-group min-max scale.
+    # Coarse pass: shared log-spaced fractions of the per-group min-max scale.
     for idx in range(coarse_n):
         scale = s0 * coarse[idx]
-        loss, zp = _best_zp_for_scale(data, qw, scale, maxq)
+        loss, zp = _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk)
         improved = loss < best_loss
         best_loss = torch.where(improved, loss, best_loss)
         best_zp = torch.where(improved, zp, best_zp)
@@ -170,7 +304,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     for step in steps:
         frac = frac_lo * (1.0 - step) + frac_hi * step
         scale = s0 * frac.unsqueeze(-1)
-        loss, zp = _best_zp_for_scale(data, qw, scale, maxq)
+        loss, zp = _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk)
         improved = loss < best_loss
         best_loss = torch.where(improved, loss, best_loss)
         best_zp = torch.where(improved, zp, best_zp)

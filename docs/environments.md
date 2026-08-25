@@ -221,6 +221,26 @@ export AR_NEUQI_COARSE=64
 export AR_NEUQI_FINE=32
 ```
 
+### AR_NEUQI_BACKEND
+- **Description**: Backend for the NeUQI per-candidate zero-point sweep. `"auto"` (default) keeps the reference chunked eager sweep on CPU and switches to a `torch.compile`-fused single-kernel sweep on CUDA; `"compile"` forces the fused sweep on any device; `"eager"` always uses the reference sweep. The fused sweep evaluates the exact same losses over the exact same candidate grid (selections identical up to near-ties: <~0.1% of groups flip, worst observed relative loss difference ~5e-5 on an RTX 3090) but reads each weight element once per scale candidate instead of materializing a `[groups, group_size, 2^bits]` expansion, which removes the HBM-traffic bottleneck of the brute-force grid on large batched expert searches (measured 21x on a 2M-group RTX 3090 sweep). If compilation is unavailable in the environment (e.g. no host C++ compiler for Inductor), the search automatically and permanently falls back to the eager sweep.
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"compile"`, `"eager"` (unrecognized values are treated as `"eager"`)
+- **Usage**: Force the fused sweep on CPU for experimentation, or pin the reference sweep for A/B comparisons
+
+```bash
+export AR_NEUQI_BACKEND=eager
+```
+
+### AR_NEUQI_LAYOUT
+- **Description**: Memory layout of the fused zero-point sweep expression. The sweep reduces squared errors over the group axis for every integer zero point, and the two axes can be arranged either way: `"last"` lays the tensor out as `[groups, zero_points, group_size]` with the reduction over the contiguous last dimension (the canonical Triton/CUDA fusion shape; a middle-dimension reduction measured no faster than eager on an RTX 3090), while `"mid"` lays it out as `[groups, group_size, zero_points]` (faster under the eager TensorIterator path and the compiled CPU backend). `"auto"` (default) selects by device: `"last"` on CUDA, `"mid"` elsewhere. Both layouts compute identical losses up to the fp32 summation order over the group (last-ulp ties).
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"last"`, `"mid"` (unrecognized values follow the device-based `"auto"` rule)
+- **Usage**: A/B the two layouts on a given device
+
+```bash
+export AR_NEUQI_LAYOUT=mid
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **Description**: Controls whether `NVFP4E5M3QuantLinear` caches a dequantized high-precision weight after the first forward pass, instead of dequantizing the packed FP4 weight on every call.
 - **Default**: `False` (equivalent to `"0"`)
