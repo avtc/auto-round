@@ -88,10 +88,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NeUQI search in ``auto_round.data_type.neuqi``.
     "AR_NEUQI_COARSE": lambda: int(os.getenv("AR_NEUQI_COARSE", "64")),
     "AR_NEUQI_FINE": lambda: int(os.getenv("AR_NEUQI_FINE", "32")),
-    # Zero-point sweep backend for the NeUQI search: "auto" fuses the sweep into a
-    # single torch.compile kernel on CUDA (reference eager sweep elsewhere),
-    # "compile" forces the fused sweep on any device, "eager" always uses the
-    # reference chunked sweep.
+    # Zero-point sweep backend for the NeUQI search: "auto" serves the batched
+    # sweep with the extension Triton kernel on CUDA and falls back to the
+    # torch.compile-fused sweep (reference eager sweep elsewhere); "triton"
+    # forces the Triton kernel, "compile" forces the torch.compile sweeps on any
+    # device, "eager" always uses the reference chunked sweep.
     "AR_NEUQI_BACKEND": lambda: os.getenv("AR_NEUQI_BACKEND", "auto").lower(),
     # Memory layout of the fused zero-point sweep expression: "auto" picks by
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),

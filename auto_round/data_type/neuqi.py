@@ -41,14 +41,21 @@ Performance: the per-candidate zero-point sweep is a pure elementwise + reductio
 chain, so on CUDA it is fused into a single generated kernel via ``torch.compile``
 (``AR_NEUQI_BACKEND=auto``, the default), and all coarse/fine candidates of a pass
 are additionally folded into one such kernel per group chunk (``AR_NEUQI_BATCH``)
-so the search costs a handful of launches instead of candidates x chunks. The
-fused sweeps evaluate exactly the same losses on exactly the same candidate grid;
-only the fp32 summation order inside the reduction may differ, so selections can
-flip solely on near-ties: on random, heavy-tailed and imatrix-weighted inputs the
-flips stay below ~0.1% of groups with worst-case relative loss differences of
-~5e-5 (measured on an RTX 3090; ~1e-6 on CPU). The eager chunked sweep remains
-the reference path (CPU default) and the automatic fallback whenever compilation
-is unavailable.
+so the search costs a handful of launches instead of candidates x chunks. On CUDA
+the batched chunk is preferentially served by a hand-written Triton kernel
+(``auto_round_extension.triton.neuqi_sweep``) that loads each weight element into
+registers once and computes every (candidate, zero-point) loss from registers,
+removing the L2 re-read amplification of the compiled expression. Measured on an
+RTX 3090 (2M groups, g=64, bits=4, 64+32 grid): 12.3 s eager -> 0.59 s fused
+per-candidate -> 0.49 s compiled-batched -> 0.22 s Triton (~57x). The fused sweeps
+evaluate exactly the same losses on exactly the same candidate grid; only the fp32
+summation order inside the reduction may differ, so selections can flip solely on
+near-ties: on random, heavy-tailed and imatrix-weighted inputs the flips stay below
+~0.1% of groups with worst-case relative loss differences of ~5e-5 (measured on an
+RTX 3090; ~1e-6 on CPU), with the Triton kernel matching that tie profile exactly.
+The eager chunked sweep remains the reference path (CPU default) and the ultimate
+fallback; every stage latches down permanently on failure (Triton -> compiled
+batched -> compiled per-candidate -> eager).
 """
 
 import math
@@ -212,13 +219,43 @@ _batched_broken = False
 
 
 def _zp_wants_compile(device_type: str) -> bool:
-    """Whether the fused sweep should be used, per ``AR_NEUQI_BACKEND``."""
+    """Whether a fused torch.compile sweep should be used, per ``AR_NEUQI_BACKEND``."""
     backend = envs.AR_NEUQI_BACKEND
-    if backend == "compile":
+    if backend in ("compile", "triton"):
         return True
     if backend == "auto":
         return device_type == "cuda"
     return False  # "eager" (and any unrecognized value): reference sweep
+
+
+# Extension Triton sweep (auto_round_extension.triton.neuqi_sweep), lazily
+# resolved once; ``None`` when the extension/triton is unavailable on the host.
+_triton_sweep = None
+_triton_checked = False
+_triton_broken = False
+
+
+def _triton_sweep_fn():
+    """Resolve the extension Triton sweep once; ``None`` when unavailable."""
+    global _triton_sweep, _triton_checked
+    if not _triton_checked:
+        _triton_checked = True
+        try:
+            from auto_round_extension.triton.neuqi_sweep import neuqi_sweep_triton
+
+            _triton_sweep = neuqi_sweep_triton
+        except Exception as e:
+            logger.info("[NeUQI] Triton sweep unavailable (%s); using the torch.compile sweeps", e)
+            _triton_sweep = None
+    return _triton_sweep
+
+
+def _zp_wants_triton(device_type: str) -> bool:
+    """Whether the extension Triton sweep should be tried, per ``AR_NEUQI_BACKEND``."""
+    backend = envs.AR_NEUQI_BACKEND
+    if backend == "triton":
+        return True
+    return backend == "auto" and device_type == "cuda"
 
 
 def _get_fused_zp_fn(expr):
@@ -269,12 +306,24 @@ def _zp_batch_wanted(device_type: str) -> bool:
 def _eval_batched_chunk(data, qw, scales, zp_grid, maxq):
     """One chunk of the all-candidates batched sweep, or ``None`` when unavailable.
 
-    ``None`` (fused backend off, already broken, or the call raised) makes the
-    caller fall back to the per-candidate sweep; strict-improvement bookkeeping
-    makes a partial batched pass followed by the per-candidate pass converge to
-    the same selections (ties within the usual fp32 summation tolerance).
+    Preference order: the extension Triton sweep (registers-resident, one data
+    read per element -- the fastest evaluator on CUDA), then the compiled
+    batched expression, then ``None`` so the caller falls back to the
+    per-candidate sweep. Strict-improvement bookkeeping makes a partial pass
+    followed by a fallback converge to the same selections (ties within the
+    usual fp32 summation tolerance).
     """
-    global _batched_broken
+    global _triton_broken, _batched_broken
+    if not _triton_broken and _zp_wants_triton(data.device.type) and _zp_batch_wanted(data.device.type):
+        fn = _triton_sweep_fn()
+        if fn is not None:
+            try:
+                return fn(data, qw, scales, maxq)
+            except Exception as e:
+                _triton_broken = True
+                if data.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                logger.warning("[NeUQI] Triton sweep failed (%s); using the torch.compile sweeps", e)
     if _batched_broken or not _zp_wants_compile(data.device.type):
         return None
     try:

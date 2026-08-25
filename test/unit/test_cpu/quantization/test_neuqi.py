@@ -439,6 +439,91 @@ class TestNeuqiBatchedSweep:
         assert N._zp_batch_wanted("cpu") is True  # forced (e.g. for tests / A/B)
 
 
+class TestNeuqiTritonSweep:
+    """The extension Triton sweep integrates behind the batched dispatch.
+
+    Triton kernels cannot run on CPU hosts, so the plumbing (scale construction,
+    first-min bookkeeping, latch fallbacks, policy) is tested with a mock that
+    honors the kernel's contract; the kernel itself is exercised on CUDA by
+    ``test/unit/test_cuda/quantization/test_neuqi_triton.py`` and by the
+    self-contained GPU benchmark."""
+
+    def _mock_sweep_from(self, monkeypatch, impl):
+        import auto_round.data_type.neuqi as N
+
+        monkeypatch.setattr(N, "_triton_checked", True)
+        monkeypatch.setattr(N, "_triton_sweep", impl)
+        monkeypatch.setattr(N, "_triton_broken", False)
+
+    def test_triton_mock_matches_reference(self, monkeypatch):
+        """Driving the batched passes through a contract-honoring mock must
+        reproduce the per-candidate reference selections exactly."""
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        def mock(data, qw, scales, maxq):  # same contract as neuqi_sweep_triton
+            zp_grid = torch.arange(0, maxq + 1, device=data.device, dtype=torch.float32)
+            return N._zp_expr_batched(data, qw, scales, zp_grid, maxq)
+
+        self._mock_sweep_from(monkeypatch, mock)
+        data = _heavy_tailed_data(n_groups=64, group_size=64, seed=23)
+        qw = torch.rand(64, 64) + 0.1
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "triton")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        monkeypatch.setattr(N, "_batched_broken", False)
+        scale_t, zp_t = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=8, fine_n=3)
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        scale_ref, zp_ref = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=8, fine_n=3)
+        torch.testing.assert_close(scale_t, scale_ref)
+        torch.testing.assert_close(zp_t, zp_ref)
+
+    def test_triton_failure_latches_to_compile_path(self, monkeypatch):
+        """A raising Triton sweep must latch off and finish via the torch paths."""
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        def boom(data, qw, scales, maxq):
+            raise RuntimeError("simulated triton failure")
+
+        self._mock_sweep_from(monkeypatch, boom)
+        data = _heavy_tailed_data(n_groups=32, group_size=64, seed=29)
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "triton")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        monkeypatch.setattr(N, "_batched_broken", False)
+        scale_f, zp_f = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
+        assert N._triton_broken is True
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        scale_ref, zp_ref = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
+        torch.testing.assert_close(scale_f, scale_ref)
+        torch.testing.assert_close(zp_f, zp_ref)
+
+    def test_triton_policy(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "auto")
+        assert N._zp_wants_triton("cuda") is True
+        assert N._zp_wants_triton("cpu") is False
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        assert N._zp_wants_triton("cuda") is False
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "triton")
+        assert N._zp_wants_triton("cpu") is True  # forced (availability still checked)
+        # the Triton sweep IS the batched evaluator: batching off disables it
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        assert N._zp_batch_wanted("cuda") is False
+
+
 class TestAsymSearchAPI:
     """RTNConfig(asym_search) enum: auto | neuqi | minmax (asym path only).
 

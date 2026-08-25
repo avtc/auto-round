@@ -222,10 +222,10 @@ export AR_NEUQI_FINE=32
 ```
 
 ### AR_NEUQI_BACKEND
-- **Description**: Backend for the NeUQI per-candidate zero-point sweep. `"auto"` (default) keeps the reference chunked eager sweep on CPU and switches to a `torch.compile`-fused single-kernel sweep on CUDA; `"compile"` forces the fused sweep on any device; `"eager"` always uses the reference sweep. The fused sweep evaluates the exact same losses over the exact same candidate grid (selections identical up to near-ties: <~0.1% of groups flip, worst observed relative loss difference ~5e-5 on an RTX 3090) but reads each weight element once per scale candidate instead of materializing a `[groups, group_size, 2^bits]` expansion, which removes the HBM-traffic bottleneck of the brute-force grid on large batched expert searches (measured 21x on a 2M-group RTX 3090 sweep). If compilation is unavailable in the environment (e.g. no host C++ compiler for Inductor), the search automatically and permanently falls back to the eager sweep.
+- **Description**: Backend chain for the NeUQI zero-point sweep. `"auto"` (default) keeps the reference chunked eager sweep on CPU and, on CUDA, serves the batched sweep with the hand-written Triton kernel from `auto_round_extension.triton.neuqi_sweep` (registers-resident: each weight element is loaded once and every (candidate, zero-point) loss is computed from registers), falling back to the `torch.compile`-fused sweep when Triton is unavailable. `"triton"` forces the Triton kernel, `"compile"` forces the `torch.compile` sweeps on any device, and `"eager"` always uses the reference sweep. All backends evaluate the exact same losses over the exact same candidate grid (selections identical up to near-ties: <~0.1% of groups flip, worst observed relative loss difference ~5e-5 on an RTX 3090, with the Triton kernel matching that tie profile exactly) and remove the HBM-traffic bottleneck of the brute-force grid on large batched expert searches (measured on a 2M-group RTX 3090 sweep: 12.3 s eager -> 0.59 s fused per-candidate -> 0.49 s compiled-batched -> 0.22 s Triton, ~57x). Every stage latches down permanently on failure: Triton -> compiled batched -> compiled per-candidate -> eager. Requires `AR_NEUQI_BATCH` to be enabled for the Triton/compiled-batched stages (it is by default).
 - **Default**: `"auto"`
-- **Valid Values**: `"auto"`, `"compile"`, `"eager"` (unrecognized values are treated as `"eager"`)
-- **Usage**: Force the fused sweep on CPU for experimentation, or pin the reference sweep for A/B comparisons
+- **Valid Values**: `"auto"`, `"triton"`, `"compile"`, `"eager"` (unrecognized values are treated as `"eager"`)
+- **Usage**: Pin a specific stage for A/B comparisons, or disable compilation entirely
 
 ```bash
 export AR_NEUQI_BACKEND=eager
