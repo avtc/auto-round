@@ -678,6 +678,54 @@ class CompressionOrchestrator(BaseOrchestrator):
             flatten_list(all_blocks),
         )
 
+    @staticmethod
+    def _bp_required_vram_bytes(
+        largest_block_bytes: int,
+        *,
+        iters: int,
+        batch_size: int,
+        seqlen: int,
+        hidden: int,
+    ) -> int:
+        """Per-worker GPU bytes needed to tune the largest block.
+
+        Grounded in what a block-parallel worker actually executes, not a
+        worst-case guess:
+
+        iters == 0 (zero-shot OptRTN/NeUQI -- the RTN family):
+          - the block's weights are resident once; quantize-dequantize results
+            are written back in place (no whole-block copy);
+          - the expert search is chunk-capped (~2**28 elements per call:
+            stacked fp32 weights + imatrix + 128 MiB loss buffers -- see
+            ``rtn/quantizer._quantize_expert_batch`` and
+            ``neuqi._MAX_TMP_ELEMS``), so the search adds a bounded transient,
+            not a block-sized multiple;
+          - calibration / chain fast-forward runs ``batch_size`` rows at a
+            time (``BlockForwardRunner``); the rows themselves live on the CPU
+            cache device when ``low_cpu_mem_usage`` is on, so the activation
+            term follows the batch, never the full nsamples set.
+
+        iters > 0 (SignRound):
+          ``wrapper_block`` wraps every quantizable layer with fp32 ``value``
+          rounding params of the weight's shape and tunes them jointly against
+          a block loss with one optimizer, so the value params and their
+          gradients are each ``numel * 4`` bytes -- twice the bf16 block each.
+          This term dominates and correctly refuses blocks that cannot be
+          iteratively tuned on a single GPU (e.g. a ~4B-param MoE block).
+        """
+        gib = 1024**3
+        # bf16 hidden states x ~16 live intermediates (fp32 attention QKV/MLP
+        # transients of a couple of co-resident layers) per forwarded row
+        act_bytes = int(max(1, batch_size) * max(1, seqlen) * max(1, hidden) * 32)
+        if iters <= 0:
+            # resident weights + bounded search/qdq/fold transients (scale
+            # with the block until the ~2.5 GiB chunk cap) + forward transients
+            # + torch.compile / CUDA context / allocator margin
+            return int(largest_block_bytes + min(largest_block_bytes, int(2.5 * gib)) + act_bytes + 2 * gib)
+        # weights (1x) + fp32 value params (2x) + fp32 grads (2x)
+        # + forward/backward transients + compile/context margin
+        return int(largest_block_bytes * 5 + act_bytes + 2 * gib)
+
     def _maybe_block_parallel_tune(
         self, all_blocks: list, is_worker: bool, all_inputs: dict = None, input_ids_cache=None, pbar=None
     ) -> bool:
@@ -726,9 +774,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 allowed.append(int(str(dev).split(":")[-1]))
             except ValueError:
                 continue
-        # per-GPU VRAM requirement: largest block's weight bytes with a
-        # working-set multiplier (original + QDQ copy + workspace) plus an
-        # activation margin. Shapes are known even on the meta skeleton.
+        # per-GPU VRAM requirement: derived from what a worker actually
+        # executes for this run (zero-shot search vs iterative tuning) -- see
+        # _bp_required_vram_bytes. Shapes are known even on the meta skeleton.
         largest_block_bytes = 0
         for group in all_blocks:
             for block_name in group:
@@ -737,25 +785,26 @@ class CompressionOrchestrator(BaseOrchestrator):
                     continue
                 nbytes = sum(p.numel() * p.element_size() for p in block.parameters())
                 largest_block_bytes = max(largest_block_bytes, nbytes)
-        # activation margin: each worker holds the block entry, the preprocessed
-        # inputs, and tune-time intermediate activations, all scaling with
-        # nsamples x seqlen x hidden; the weights-only formula below would OOM
-        # edge configs (large nsamples/seqlen) at tune time
-        entry_bytes = 0
         try:
             hidden = getattr(getattr(self.model_context.model, "config", None), "hidden_size", 0) or 0
         except Exception:  # noqa: BLE001  config-less stub models
             hidden = 0
-        if hidden:
-            per_sample = self.calibration_context.nsamples * self.calibration_context.seqlen * hidden
-            entry_bytes = int(per_sample * 2 * 4 * 2)  # fp tensors x (entry + preprocessed)
-        required_vram_bytes = int(largest_block_bytes * 3) + (4 * 1024**3) + entry_bytes
+        iters = int(getattr(self.alg_composer.block_quantizer, "iters", 0) or 0)
+        required_vram_bytes = self._bp_required_vram_bytes(
+            largest_block_bytes,
+            iters=iters,
+            batch_size=int(getattr(self.calibration_context, "batch_size", 8) or 8),
+            seqlen=int(getattr(self.calibration_context, "seqlen", 2048) or 2048),
+            hidden=hidden,
+        )
         gpu_ids = bp.eligible_gpus(required_vram_bytes, allowed_indices=allowed or None)
         if not gpu_ids:
+            tune_kind = "iterative tuning (fp32 rounding params + grads per layer)" if iters > 0 else "zero-shot search"
             raise RuntimeError(
-                "block-parallel tuning: no eligible GPU. Each worker needs the largest block's "
-                f"weights x3 plus activation margin (~{required_vram_bytes / 1024**3:.1f} GiB free "
-                "per GPU). Widen --device_map or free VRAM."
+                "block-parallel tuning: no eligible GPU. Each worker needs ~"
+                f"{required_vram_bytes / 1024**3:.1f} GiB free per GPU "
+                f"(iters={iters} {tune_kind}: resident block + transients). "
+                "Widen --device_map or free VRAM."
             )
 
         # Resume storage reuses the serial flag: AR_RESUME_DIR set -> per-block

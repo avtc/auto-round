@@ -162,6 +162,86 @@ class TestImmediatePackingWithOutsideBlockQlayer(unittest.TestCase):
         assert ctx.is_immediate_packing is True
 
 
+class TestBPRequiredVRAMEstimate(unittest.TestCase):
+    """The per-worker VRAM requirement must match what the worker executes.
+
+    Ground truth from the code paths (see orchestrator._bp_required_vram_bytes
+    docstring): zero-shot (iters=0) holds the block once with chunk-capped
+    search transients and batch_size-chunked forwards; iterative tuning
+    (iters>0) additionally materializes fp32 rounding params + gradients for
+    every wrapped layer of the block at once.
+    """
+
+    GiB = 1024**3
+
+    def _hy3_block_bytes(self):
+        # largest hy3 block (MTP layer): ~3.95B params bf16
+        return int(3.95e9 * 2)
+
+    def test_zero_shot_hy3_block_fits_a_3090(self):
+        """Regression: the hy3 A/B run (iters=0) was refused with a 61.6 GiB
+        estimate built from nsamples-sized fp32 activations and a x3 block
+        multiplier; the real working set is ~2x the block."""
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        req = CompressionOrchestrator._bp_required_vram_bytes(
+            self._hy3_block_bytes(), iters=0, batch_size=8, seqlen=2048, hidden=4096
+        )
+        assert req < 24 * self.GiB, f"hy3 zero-shot worker must fit a 3090, got {req / self.GiB:.1f} GiB"
+        assert req > self._hy3_block_bytes(), "block weights must be included"
+        # must not scale with nsamples (not even a parameter) and the search
+        # transient is chunk-capped, not a multiple of the block
+        assert req < self._hy3_block_bytes() * 2 + 6 * self.GiB
+
+    def test_iterative_hy3_block_is_correctly_refused(self):
+        """iters>0 wraps every layer with fp32 value params + grads
+        (numel*4 each) -> ~5x the bf16 block: > any 3090 for a 3.95B MoE block."""
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        req = CompressionOrchestrator._bp_required_vram_bytes(
+            self._hy3_block_bytes(), iters=20, batch_size=8, seqlen=2048, hidden=4096
+        )
+        assert req >= 5 * self._hy3_block_bytes(), "fp32 rounding params + grads must dominate"
+        assert req > 24 * self.GiB, "a 3.95B-param MoE block cannot be tuned iteratively on one 3090"
+
+    def test_iterative_27b_dense_block_fits(self):
+        """0.42B-param dense block (the proven iters20/iters500 runs) must stay
+        eligible at iters>0."""
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        block = int(0.42e9 * 2)
+        req = CompressionOrchestrator._bp_required_vram_bytes(block, iters=200, batch_size=8, seqlen=2048, hidden=5120)
+        assert req < 24 * self.GiB
+
+    def test_activation_term_scales_with_batch_size(self):
+        """Forwards are chunked by batch_size (BlockForwardRunner), so the GPU
+        activation term follows the batch, never the full nsamples set."""
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        base = CompressionOrchestrator._bp_required_vram_bytes(
+            self._hy3_block_bytes(), iters=0, batch_size=8, seqlen=2048, hidden=4096
+        )
+        doubled_batch = CompressionOrchestrator._bp_required_vram_bytes(
+            self._hy3_block_bytes(), iters=0, batch_size=16, seqlen=2048, hidden=4096
+        )
+        assert doubled_batch > base
+        doubled_seq = CompressionOrchestrator._bp_required_vram_bytes(
+            self._hy3_block_bytes(), iters=0, batch_size=8, seqlen=4096, hidden=4096
+        )
+        assert doubled_seq > base
+
+    def test_search_transient_is_chunk_capped(self):
+        """Even a hypothetical 100 GiB block gets a bounded search transient at
+        iters=0 (the expert search chunks at ~2^28 elements per call)."""
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        huge = 100 * self.GiB
+        req = CompressionOrchestrator._bp_required_vram_bytes(huge, iters=0, batch_size=8, seqlen=2048, hidden=4096)
+        # 2.5 GiB search cap + act transients + 2 GiB margin = ~6.5 GiB; a
+        # block-proportional multiplier (the old x3) would add 200 GiB here
+        assert req < huge + 7 * self.GiB, "zero-shot transient must be capped, not block-proportional"
+
+
 class TestGuardReasons(unittest.TestCase):
     """Guard returns None (ok), 'disabled' (off), or a reason (on, blocked)."""
 
