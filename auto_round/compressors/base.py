@@ -327,32 +327,36 @@ class BaseOrchestrator(object):
         # Stream the checkpoint per block instead of materializing the whole
         # model (meta-device load + per-block tensor streaming + immediate
         # saving). For models far larger than host RAM.
-        self.stream_checkpoint = kwargs.pop("stream_checkpoint", False)
-        # Blocks staged into host RAM ahead of the quantize loop by a
-        # background reader (stream_checkpoint only); 0 disables prefetch.
+        self.stream_quantization = kwargs.pop("stream_quantization", False)
+        # Background block staging for the streaming loop (stream_quantization
+        # only): 0 disables it; None (CLI 'auto'/'cpu'/device-list mode) derives
+        # the depth at loop start -- one block per staging device, or 1 for
+        # host-RAM staging.
         self.stream_prefetch = kwargs.pop("stream_prefetch", 0)
         # Where prefetched blocks wait: None = host RAM (default); "auto" =
         # every CUDA device except the quant device; or an explicit list of
-        # devices (ints / "cuda:k" / "cpu"). Blocks are staged directly onto
-        # these devices and quantized in place (round-robin block homes), so
-        # no cross-device copy is needed when the loop reaches them.
-        # Requires stream_prefetch > 0.
+        # devices (ints / "cuda:k" / "cpu" -- never mixed: in-place round-robin
+        # quantization requires all-GPU or CPU-only staging). Requires
+        # stream_prefetch != 0.
         self.stream_prefetch_devices = kwargs.pop("stream_prefetch_devices", None)
         # Collect imatrix activation statistics with a streaming forward pass
-        # before the zero-shot loop (stream_checkpoint only): one block at a
+        # before the zero-shot loop (stream_quantization only): one block at a
         # time is materialized, all calibration rows are pushed through, and
         # per-module statistics land on the modules for the clip search.
         # Matches the data-driven imatrix exactly for identical rows.
+        # Auto-engages when the streaming loop needs activations (iters > 0
+        # tuning or a forced imatrix) -- see _auto_engage_stream_features.
         self.stream_calibration = kwargs.pop("stream_calibration", False)
-        # Cap on calibration rows for the streaming FP-input cache (host-RAM
-        # bound: rows x blocks x seqlen x hidden); 0 = no cap.
+        # Cap on chained calibration sequences for the streaming FP-input
+        # cache; 0 = no cap (follow nsamples).
         self.stream_calibration_rows = kwargs.pop("stream_calibration_rows", 0)
+        self._auto_engage_stream_features()
 
-        # ``stream_checkpoint`` handles its own block lifecycle (meta -> stream
+        # ``stream_quantization`` handles its own block lifecycle (meta -> stream
         # -> quantize -> write -> meta), so the accelerate-style offloader
         # must not interfere.
         self._offloader = OffloadManager(
-            enabled=low_cpu_mem_usage and not self.stream_checkpoint,
+            enabled=low_cpu_mem_usage and not self.stream_quantization,
             mode="offload",
             offload_dir_prefix="compressor",
         )
@@ -469,7 +473,7 @@ class BaseOrchestrator(object):
             formats=self.formats,
             is_act_quantize=self.quantize_config.is_act_quantize,
             quant_nontext_module=quant_nontext_module,
-            stream_checkpoint=self.stream_checkpoint,
+            stream_quantization=self.stream_quantization,
         )
         # Reset the singleton so each new orchestrator gets a fresh CompressContext.
         # CompressContext uses AutoSkipInitMeta (singleton), so without a reset the
@@ -549,6 +553,40 @@ class BaseOrchestrator(object):
             return True
         return self._needs_calibration_data()
 
+    def _auto_engage_stream_features(self) -> None:
+        """Resolve streaming-mode conveniences right after kwargs are popped.
+
+        1. Rotation transforms under stream_quantization can only run
+           layer-wise (whole-model rotation would materialize the model), so
+           layerwise_rotation auto-enables whenever a rotation config is
+           present. An explicit True/False from the caller wins.
+        2. The activation chain engages automatically when the streaming loop
+           needs activations -- iters > 0 tuning (SignRound) or a forced
+           imatrix (--imatrix_enabled true). Weight-only runs (RTN, iters=0)
+           never consume activations and stay chain-free.
+        """
+        if self.layerwise_rotation is None:
+            from auto_round.algorithms.transforms.base import BaseRotationConfig
+
+            has_rotations = any(isinstance(c, BaseRotationConfig) for c in self._alg_configs)
+            self.layerwise_rotation = bool(self.stream_quantization and has_rotations)
+            if self.layerwise_rotation:
+                logger.info("[stream_quantization] layerwise_rotation auto-enabled (rotation transforms present)")
+        else:
+            self.layerwise_rotation = bool(self.layerwise_rotation)
+        if self.stream_quantization and not self.stream_calibration:
+            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+            needs_chain = any(isinstance(c, SignRoundConfig) for c in self._alg_configs) or any(
+                getattr(c, "forced_imatrix", None) is True for c in self._alg_configs
+            )
+            if needs_chain:
+                self.stream_calibration = True
+                logger.info(
+                    "[stream_calibration] auto-engaged (streaming loop needs activations: "
+                    "iters > 0 tuning or forced imatrix)"
+                )
+
     def _needs_calibration_data(self) -> bool:
         """Determine whether calibration data is truly required.
 
@@ -563,7 +601,7 @@ class BaseOrchestrator(object):
 
         demanding = [c for c in self._alg_configs if getattr(c, "need_calib", True)]
         if demanding:
-            # stream_checkpoint cannot provide cached block inputs (no full-model
+            # stream_quantization cannot provide cached block inputs (no full-model
             # forward exists). The RTN family (incl. optimized RTN) is weight-only:
             # its clip search never consumes activations, so the demand is waived
             # and the zero-shot block loop runs instead. SignRound (iters > 0)
@@ -572,28 +610,21 @@ class BaseOrchestrator(object):
             from auto_round.algorithms.quantization.rtn.config import RTNConfig as _RTN
             from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig as _SignRound
 
-            if not getattr(self, "stream_checkpoint", False):
+            if not getattr(self, "stream_quantization", False):
                 return True
             if not all(isinstance(c, (_RTN, _SignRound)) for c in demanding):
                 return True
-            if any(isinstance(c, _SignRound) for c in demanding) and not getattr(self, "stream_calibration", False):
-                raise ValueError(
-                    "iters > 0 tuning under stream_checkpoint needs the calibration "
-                    "chain: pass --stream_calibration (stream_calibration=True) so "
-                    "the streaming loop chains real activations block-to-block, or "
-                    "disable stream_checkpoint for the ordinary data-driven path."
-                )
-            if any(getattr(c, "forced_imatrix", None) is True for c in demanding) and not getattr(
-                self, "stream_calibration", False
-            ):
-                raise ValueError(
-                    "--imatrix_enabled true under stream_checkpoint needs the "
-                    "calibration chain: pass --stream_calibration (stream_calibration=True) "
-                    "so the streaming loop can collect the activation statistics, or "
-                    "disable stream_checkpoint."
-                )
+            if not getattr(self, "stream_calibration", False):
+                # Normally auto-engaged in __init__ (_auto_engage_stream_features).
+                # If configs demanding activations slipped in afterwards, take
+                # the ordinary data-driven path rather than silently tuning
+                # weight-only under streaming.
+                if any(isinstance(c, _SignRound) for c in demanding) or any(
+                    getattr(c, "forced_imatrix", None) is True for c in demanding
+                ):
+                    return True
             logger.info(
-                "[stream_checkpoint] streaming zero-shot loop covers the calibration "
+                "[stream_quantization] streaming zero-shot loop covers the calibration "
                 "demand (weight-only search and/or stream_calibration chained rows)."
             )
 

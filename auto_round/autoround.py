@@ -333,7 +333,7 @@ _ENTRY_KWARG_OWNERS = {
     "quant_lm_head": "compressor",
     "to_quant_block_names": "compressor",
     "layerwise_rotation": "compressor",
-    "stream_checkpoint": "compressor",
+    "stream_quantization": "compressor",
     "stream_prefetch": "compressor",
     "stream_prefetch_devices": "compressor",
     "stream_calibration": "compressor",

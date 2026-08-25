@@ -382,8 +382,8 @@ class RTN(AlgorithmHandler):
             help=(
                 "Force the activation-imatrix weighting for the optimized-RTN search "
                 "on/off, overriding the scheme rules (sym int<8 -> on, asym -> off). "
-                "'auto' keeps the rules. Forcing it on under --stream_checkpoint also "
-                "requires --stream_calibration."
+                "'auto' keeps the rules. Under --stream_quantization a forced-on "
+                "imatrix auto-engages the activation chain (--stream_calibration)."
             ),
         )
 

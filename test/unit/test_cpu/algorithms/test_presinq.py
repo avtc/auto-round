@@ -335,20 +335,20 @@ class TestPlumbing:
 
         composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
         composer._layerwise_rotation = False
-        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=True)
+        composer._orchestrator_ref = SimpleNamespace(stream_quantization=True)
         meta_model = nn.Sequential(nn.Linear(32, 32), nn.Linear(32, 32)).to("meta")
-        with pytest.raises(ValueError, match=r"layerwise_rotation=True.*--layerwise_rotation"):
+        with pytest.raises(ValueError, match=r"layer-wise.*--layerwise_rotation"):
             composer.apply_model_transforms(meta_model)
 
     def test_meta_params_without_stream_attr_raise(self):
-        # meta skeleton detection must not depend on the stream_checkpoint attr
+        # meta skeleton detection must not depend on the stream_quantization attr
         from auto_round.algorithms.composer import AlgorithmComposer
 
         composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
         composer._layerwise_rotation = False
         composer._orchestrator_ref = None
         meta_model = nn.Sequential(nn.Linear(32, 32)).to("meta")
-        with pytest.raises(ValueError, match="layerwise_rotation=True"):
+        with pytest.raises(ValueError, match="layer-wise"):
             composer.apply_model_transforms(meta_model)
 
     def test_streamed_with_layerwise_defers_without_materializing(self):
@@ -358,7 +358,7 @@ class TestPlumbing:
 
         composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
         composer._layerwise_rotation = True
-        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=True)
+        composer._orchestrator_ref = SimpleNamespace(stream_quantization=True)
         meta_model = nn.Sequential(nn.Linear(32, 32), nn.Linear(32, 32)).to("meta")
         model = composer.apply_model_transforms(meta_model)
         assert model is meta_model
@@ -383,11 +383,11 @@ class TestPlumbing:
 
         composer._layerwise_rotation = True
 
-        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=True)
+        composer._orchestrator_ref = SimpleNamespace(stream_quantization=True)
 
         meta_model = nn.Sequential(nn.Linear(32, 32)).to("meta")
 
-        with pytest.raises(ValueError, match="layerwise_rotation=True"):
+        with pytest.raises(ValueError, match="layer-wise"):
 
             composer.apply_model_transforms(meta_model)
 
@@ -398,7 +398,7 @@ class TestPlumbing:
 
         composer = AlgorithmComposer([PreSINQConfig(group_size=16, n_iter=1, n_repeat=1), RTNConfig(group_size=16)])
         composer._layerwise_rotation = False
-        composer._orchestrator_ref = SimpleNamespace(stream_checkpoint=False)
+        composer._orchestrator_ref = SimpleNamespace(stream_quantization=False)
         model = nn.Sequential(nn.Linear(32, 32), nn.Linear(32, 32))
         out = composer.apply_model_transforms(model)
         assert all(p.device.type != "meta" for p in out.parameters())

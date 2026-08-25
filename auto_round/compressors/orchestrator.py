@@ -1285,6 +1285,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
         else:
             devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
+            if any(d.type == "cuda" for d in devices) and any(d.type == "cpu" for d in devices):
+                raise ValueError(
+                    "mixed GPU/CPU staging devices are not supported: staged blocks are "
+                    "quantized in place (round-robin homes), so staging must be all-GPU "
+                    "or CPU-only (host RAM); pass e.g. --stream_prefetch auto or --stream_prefetch cpu"
+                )
             if quant_dev.type != "cuda" and any(d.type == "cuda" for d in devices):
                 logger.warning(
                     "[stream] GPU staging devices ignored with CPU quant device %s; using host RAM", quant_dev
@@ -1334,11 +1340,11 @@ class CompressionOrchestrator(BaseOrchestrator):
             if lm_head_name is not None:
                 tied_weights_layers.append(lm_head_name)
 
-        # ── stream_checkpoint: per-block tensor streaming from the checkpoint ──
+        # ── stream_quantization: per-block tensor streaming from the checkpoint ──
         streamer = getattr(self.model_context, "checkpoint_streamer", None)
         if streamer is not None and not self.compress_context.is_immediate_saving:
             raise ValueError(
-                "stream_checkpoint=True requires immediate saving "
+                "stream_quantization=True requires immediate saving "
                 "(enable low_cpu_mem_usage=True and keep inplace packing; int data types only)."
             )
 
@@ -1370,9 +1376,15 @@ class CompressionOrchestrator(BaseOrchestrator):
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
         # of the quantize loop. With staging devices the blocks land directly
         # on those devices (round-robin by block index) and are quantized in
-        # place there; otherwise they wait in host RAM.
-        prefetch_depth = int(getattr(self, "stream_prefetch", 0) or 0)
-        stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and prefetch_depth > 0) else None
+        # place there; otherwise they wait in host RAM. A None depth (CLI
+        # 'auto'/'cpu'/device-list mode) derives one block per staging device,
+        # or 1 for host-RAM staging.
+        raw_depth = getattr(self, "stream_prefetch", 0)
+        stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and raw_depth != 0) else None
+        if raw_depth == 0 or raw_depth is None:
+            prefetch_depth = 0 if raw_depth == 0 else (len(stage_devices) if stage_devices else 1)
+        else:
+            prefetch_depth = int(raw_depth)
         if streamer is not None and prefetch_depth > 0:
             streamer.start_prefetch(flat_block_names, depth=prefetch_depth, stage_devices=stage_devices)
 

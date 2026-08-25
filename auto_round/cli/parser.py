@@ -147,21 +147,22 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         action="store_true",
         help=(
             "Apply rotation transforms (e.g. PreSINQ) per block inside the streaming "
-            "block loop instead of one whole-model pass. Required with rotation "
-            "transforms when the model is streamed (--stream_checkpoint / "
-            "AR_DISK_STREAM_MODEL=1)."
+            "block loop instead of one whole-model pass. Auto-enables under "
+            "--stream_quantization when rotation transforms are present; the flag "
+            "remains for explicit control on non-streamed models."
         ),
     )
     rt.add_argument(
-        "--stream_checkpoint",
-        dest="stream_checkpoint",
+        "--stream_quantization",
+        dest="stream_quantization",
         default=False,
         action="store_true",
         help=(
-            "Stream block weights from the source checkpoint on demand (meta skeleton, "
-            "one resident block at a time) and pack/save progressively; for models "
-            "larger than host RAM. iters=0 runs weight-only; iters>0 additionally "
-            "needs --stream_calibration."
+            "Quantize without ever materializing the model: block weights stream "
+            "from the source checkpoint on demand (meta skeleton, one resident "
+            "block at a time) and pack/save progressively; for models larger than "
+            "host RAM. The activation chain and layerwise rotation auto-engage "
+            "when the run needs them (iters>0, imatrix, rotations)."
         ),
     )
     rt.add_argument(
@@ -170,9 +171,10 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         default=False,
         action="store_true",
         help=(
-            "Chain calibration rows block-to-block under stream_checkpoint so "
-            "imatrix / tuning (iters>0) see real activations without a full model "
-            "load. Required for iters>0 and --imatrix_enabled true streaming runs."
+            "Chain calibration sequences block-to-block under stream_quantization "
+            "so imatrix / tuning (iters>0) see real activations without a full "
+            "model load. Auto-engages when needed; pass explicitly to force the "
+            "imatrix chain on for a weight-only (iters=0) run."
         ),
     )
     rt.add_argument(
@@ -181,30 +183,25 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         default=0,
         type=int,
         help=(
-            "Cap on chained calibration rows (0 = follow nsamples). Each chained row "
-            "costs one block forward per block; a modest cap is statistically fine "
-            "for the imatrix but tuning wants the full count."
+            "Cap on the number of calibration sequences chained through the "
+            "streaming block loop (0 = chain all nsamples sequences). Not a batch "
+            "size: each chained sequence costs one block forward per block; a "
+            "modest cap is statistically fine for the imatrix but iters>0 tuning "
+            "wants the full count."
         ),
     )
     rt.add_argument(
         "--stream_prefetch",
         dest="stream_prefetch",
-        default=0,
-        type=int,
-        help=(
-            "Number of upcoming blocks the streaming reader stages ahead (memory is "
-            "bounded at depth x block size). ~1 staged+active block per GPU with the "
-            "NeUQI expert search (e.g. 3 on 4x3090, 7 on 8 GPUs); deeper without it."
-        ),
-    )
-    rt.add_argument(
-        "--stream_prefetch_devices",
-        dest="stream_prefetch_devices",
-        default=None,
+        default="off",
         type=str,
         help=(
-            "Where staged blocks land: 'auto' (every CUDA device except the primary "
-            "quant device) or a comma list like 'cuda:0,cuda:2,cpu'. Unset = host RAM."
+            "Background block staging for the streaming loop: 'off' (default), "
+            "'auto' (every GPU except the primary, one staged block each -- e.g. "
+            "depth 3 on 4x3090), 'cpu' (host RAM, depth 1), or a comma list of "
+            "staging GPUs ('1,2' or 'cuda:1,cuda:2', one block each). Staged "
+            "blocks are quantized in place, round-robin across the devices, so "
+            "mixed GPU/CPU lists are not supported."
         ),
     )
     rt.add_argument("--output_dir", default="./tmp_autoround", type=str, help="Directory to save quantized artifacts.")
