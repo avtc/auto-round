@@ -263,6 +263,79 @@ class TestSinkhorn:
         assert torch.equal(mu1, ref_mu1) and torch.equal(mu2, ref_mu2)
 
 
+class TestPresinqTriton:
+    """The extension Triton sinkhorn integrates behind AR_PRESINQ_BACKEND.
+
+    Triton kernels cannot run on CPU hosts, so the plumbing (resolver,
+    dispatch preference, latch fallback) is tested with a contract-honoring
+    mock; the kernels themselves are exercised on CUDA by
+    ``test/unit/test_cuda/algorithms/test_presinq_triton.py`` and were
+    validated by the staged GPU benchmark."""
+
+    def _mock_resolver_from(self, monkeypatch, impl):
+        import auto_round.algorithms.transforms.presinq.sinkhorn as S
+
+        monkeypatch.setattr(S, "_triton_checked", True)
+        monkeypatch.setattr(S, "_triton_sweep", impl)
+        monkeypatch.setattr(S, "_triton_broken", False)
+
+    def test_policy(self, monkeypatch):
+        from auto_round import envs
+        from auto_round.algorithms.transforms.presinq.sinkhorn import _wants_triton
+
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "auto")
+        assert _wants_triton("cuda") is True  # measured 2.1-2.8x over eager on RTX 3090
+        assert _wants_triton("cpu") is False
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "triton")
+        assert _wants_triton("cpu") is True  # forced (availability still checked)
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
+        assert _wants_triton("cuda") is False
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "compile")
+        assert _wants_triton("cuda") is False
+
+    def test_mock_matches_eager(self, monkeypatch):
+        import auto_round.algorithms.transforms.presinq.sinkhorn as S
+        from auto_round import envs
+
+        def mock(m, order):  # same contract as sinkhorn_log_triton
+            saved = envs.AR_PRESINQ_BACKEND
+            envs.AR_PRESINQ_BACKEND = "eager"
+            try:
+                _, mu1, mu2 = S.sinkhorn_log(m, order=order, want_scaled=False)
+            finally:
+                envs.AR_PRESINQ_BACKEND = saved
+            return mu1, mu2
+
+        self._mock_resolver_from(monkeypatch, mock)
+        torch.manual_seed(3)
+        W = [torch.randn(64, 128) * torch.logspace(-1, 1, 128)]
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "triton")
+        monkeypatch.setattr(S, "_compiled_broken", False)
+        monkeypatch.setattr(S, "_compiled_body", None)
+        t_triton = S.column_scales(W, group_size=32, n_iter=4)
+        assert not S._triton_broken
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
+        torch.testing.assert_close(t_triton, S.column_scales(W, group_size=32, n_iter=4))
+
+    def test_failure_latches_to_eager(self, monkeypatch):
+        import auto_round.algorithms.transforms.presinq.sinkhorn as S
+        from auto_round import envs
+
+        def boom(m, order):
+            raise RuntimeError("simulated triton failure")
+
+        self._mock_resolver_from(monkeypatch, boom)
+        torch.manual_seed(4)
+        W = [torch.randn(64, 64)]
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "triton")
+        monkeypatch.setattr(S, "_compiled_broken", False)
+        monkeypatch.setattr(S, "_compiled_body", None)
+        t_fb = S.column_scales(W, group_size=32, n_iter=2)
+        assert S._triton_broken is True
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
+        torch.testing.assert_close(t_fb, S.column_scales(W, group_size=32, n_iter=2))
+
+
 class TestSinkhornBackend:
     """AR_PRESINQ_BACKEND compile arm: same math fused via torch.compile."""
 

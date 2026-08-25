@@ -60,9 +60,46 @@ def _wants_compile(device_type: str) -> bool:
     fused graph is at best on par with the eager loop (small expert folds) and
     up to 20% slower on the large shapes (Inductor's fused fp64 middle-dim
     std reductions do not beat torch's hand-tuned kernels). "compile" forces
-    the fused graph for experimentation on other architectures.
+    the fused graph for experimentation on other architectures. The Triton
+    kernels (``_wants_triton``) take precedence over this on CUDA.
     """
     return envs.AR_PRESINQ_BACKEND == "compile"
+
+
+# Extension Triton sinkhorn (auto_round_extension.triton.presinq_sinkhorn),
+# lazily resolved once; ``None`` when the extension/triton is unavailable.
+_triton_sweep = None
+_triton_checked = False
+_triton_broken = False
+
+
+def _triton_sweep_fn():
+    """Resolve the extension Triton sinkhorn once; ``None`` when unavailable."""
+    global _triton_sweep, _triton_checked
+    if not _triton_checked:
+        _triton_checked = True
+        try:
+            from auto_round_extension.triton.presinq_sinkhorn import sinkhorn_log_triton
+
+            _triton_sweep = sinkhorn_log_triton
+        except Exception as e:
+            logger.info("[PreSINQ] Triton sinkhorn unavailable (%s); using the torch loops", e)
+            _triton_sweep = None
+    return _triton_sweep
+
+
+def _wants_triton(device_type: str) -> bool:
+    """Whether the Triton sinkhorn should be tried, per ``AR_PRESINQ_BACKEND``.
+
+    "auto" prefers it on CUDA: measured 2.1-2.8x over the eager loop across
+    dense/concat/expert/pooled shapes on an RTX 3090, fp64-ulp parity, and it
+    runs the pooled MoE norm fold (huge concatenated consumer matrix) inside
+    24 GiB where the eager loop OOMs.
+    """
+    backend = envs.AR_PRESINQ_BACKEND
+    if backend == "triton":
+        return True
+    return backend == "auto" and device_type == "cuda"
 
 
 # Compiled-loop state: lazily built compiled callable plus a permanent
@@ -185,6 +222,21 @@ def sinkhorn_log(
     s2 = m.std(dim=-2)
     imb_min = imbalance_from(s1, s2)
     tgt_small = torch.minimum(s1.clamp(clip_min, clip_max).amin(-1), s2.clamp(clip_min, clip_max).amin(-1)) + eps
+
+    if m.shape[-1] >= 2 and _wants_triton(m.device.type):
+        global _triton_broken
+        fn = _triton_sweep_fn()
+        if fn is not None and not _triton_broken:
+            try:
+                mu1_star, mu2_star = fn(m, order)
+                if want_scaled:
+                    return m / mu1_star.unsqueeze(-2) / mu2_star, mu1_star, mu2_star
+                return None, mu1_star, mu2_star
+            except Exception as e:
+                _triton_broken = True
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.warning("[PreSINQ] Triton sinkhorn failed (%s); using the torch loops", e)
 
     body = _get_compiled_body() if _wants_compile(m.device.type) else None
     if body is not None:

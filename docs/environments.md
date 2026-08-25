@@ -242,10 +242,10 @@ export AR_NEUQI_LAYOUT=mid
 ```
 
 ### AR_PRESINQ_BACKEND
-- **Description**: Sinkhorn loop backend for the Pre-SINQ transform. `"auto"` (default) and `"eager"` both use the eager reference loop — measured on an RTX 3090, the eager loop's std-once refactor is 1.75–1.87x faster than the original port and the fused `torch.compile` graph is at best on par (small expert folds) and up to 20% slower (large shapes: Inductor's fused fp64 middle-dim std reductions do not beat torch's hand-tuned kernels). `"compile"` forces the fused graph on any device for experimentation on other architectures; it evaluates the same fp64 math and agrees with the eager loop to ~1e-15 (its tracker uses a 1e-12 comparison slack so that exact-equality decisions — which eager makes exactly — cannot flip under compiled reduction-order noise). Any compile or runtime failure permanently reverts to the eager loop for the rest of the run.
+- **Description**: Sinkhorn loop backend for the Pre-SINQ transform. `"auto"` (default) serves the loop with the hand-written Triton kernels from `auto_round_extension.triton.presinq_sinkhorn` on CUDA (three fp64 kernels per iteration — one read of the weight tile with both stds computed from registers, a deterministic two-phase column reduction, and the slack-hardened imbalance tracker) and uses the eager reference loop elsewhere. Measured on an RTX 3090: 2.1–2.8x faster than the eager std-once loop across dense/concat/expert/pooled shapes (~4.3x vs the original port), fp64-ulp parity (~1e-15), and the pooled MoE norm fold (huge concatenated consumer matrices, e.g. Hunyuan-A13B-class layers) runs within 24 GiB where the eager loop OOMs. `"triton"` forces the Triton kernels (falls back permanently to the torch loops on any failure — including a forced attempt without CUDA); `"eager"` always uses the eager loop; `"compile"` forces the `torch.compile` fused graph (opt-in: measured at best on par and up to 20% slower than eager on an RTX 3090). The eager loop itself is bit-exact with the previous release and ~1.8x faster (per-iteration stds computed once and reused, unused scaled-matrix materialization skipped).
 - **Default**: `"auto"`
-- **Valid Values**: `"auto"`, `"eager"`, `"compile"` (`"auto"`/`"eager"` behave identically; unrecognized values are treated as `"eager"`)
-- **Usage**: Force the fused graph on other GPU architectures, or pin explicitly for clarity
+- **Valid Values**: `"auto"`, `"triton"`, `"eager"`, `"compile"` (unrecognized values are treated as `"eager"`)
+- **Usage**: Pin a backend for A/B comparisons or on architectures where the measurements differ
 
 ```bash
 export AR_PRESINQ_BACKEND=eager

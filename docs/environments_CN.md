@@ -242,10 +242,10 @@ export AR_NEUQI_LAYOUT=mid
 ```
 
 ### AR_PRESINQ_BACKEND
-- **描述**：Pre-SINQ 变换的 Sinkhorn 循环后端。`"auto"`（默认）与 `"eager"` 均使用参考 eager 循环 —— RTX 3090 实测，eager 循环的 std 复用重构比原始实现快 1.75–1.87 倍，而融合的 `torch.compile` 图最好情况仅持平（小型专家折叠），大矩阵上慢达 20%（Inductor 融合的 fp64 中间维 std 归并不及 torch 的手调内核）。`"compile"` 在任意设备上强制使用融合图，供在其他架构上实验；它计算相同的 fp64 数学，与 eager 循环一致性约 1e-15（其追踪器使用 1e-12 的比较容差，使得 eager 中按精确相等做出的判决不会在编译版的归约顺序噪声下翻转）。任何编译或运行时失败都会在本次运行的剩余部分永久回退到 eager 循环。
+- **描述**：Pre-SINQ 变换的 Sinkhorn 循环后端。`"auto"`（默认）在 CUDA 上使用 `auto_round_extension.triton.presinq_sinkhorn` 中的手写 Triton 内核（每次迭代三个 fp64 内核 —— 权重分块只读取一次、两个 std 都在寄存器中计算，确定性的两阶段列归约，以及带容差的失衡追踪器），其他设备使用参考 eager 循环。RTX 3090 实测：比 std 复用后的 eager 循环快 2.1–2.8 倍（约为原始实现的 4.3 倍），fp64 ulp 级一致性（约 1e-15），并且 MoE 池化范数折叠（巨大的拼接消费者矩阵，如 Hunyuan-A13B 类层）可在 24 GiB 内运行而 eager 循环会 OOM。`"triton"` 强制使用 Triton 内核（任何失败都会永久回退到 torch 循环 —— 包括无 CUDA 时的强制尝试）；`"eager"` 始终使用 eager 循环；`"compile"` 强制 `torch.compile` 融合图（可选：RTX 3090 实测最好情况仅持平、大矩阵慢达 20%）。eager 循环本身与上一版本位级一致且快约 1.8 倍（每次迭代的 std 只计算一次并复用，跳过不需要的缩放后矩阵物化）。
 - **默认值**：`"auto"`
-- **有效值**：`"auto"`、`"eager"`、`"compile"`（`"auto"` 与 `"eager"` 行为相同；无法识别的值按 `"eager"` 处理）
-- **用法**：在其他 GPU 架构上强制融合图，或显式固定以便清晰
+- **有效值**：`"auto"`、`"triton"`、`"eager"`、`"compile"`（无法识别的值按 `"eager"` 处理）
+- **用法**：固定后端做 A/B 对比，或在测量结果不同的架构上切换
 
 ```bash
 export AR_PRESINQ_BACKEND=eager
