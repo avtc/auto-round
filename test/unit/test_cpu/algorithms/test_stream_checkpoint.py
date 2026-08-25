@@ -478,6 +478,50 @@ class TestStreamingRoutingWaiver:
         assert self._needs([OptimizedRTNConfig(group_size=16)], stream_quantization=True) is False
 
 
+class TestStreamModeExclusivity:
+    """stream_quantization is mutually exclusive with AR_DISK_STREAM_MODEL and
+    unsupported for multimodal models -- both must fail fast with the fix."""
+
+    def _make_context(self, monkeypatch, *, env_disk_stream=False, mllm=False):
+        from auto_round import envs
+        from auto_round.context.model import ModelContext
+
+        monkeypatch.setattr(envs, "AR_DISK_STREAM_MODEL", env_disk_stream)
+        monkeypatch.setattr("auto_round.context.model.is_mllm_model", lambda *a, **k: mllm)
+        monkeypatch.setattr("auto_round.context.model.is_diffusion_model", lambda *a, **k: False)
+        # BaseContext memoizes instances and skips __init__ on re-construction:
+        # reset around the construction so this test builds a fresh
+        # ModelContext and never leaks the instance to later tests.
+        ModelContext.reset_context()
+        try:
+            return ModelContext("dummy-model", stream_quantization=True)
+        finally:
+            ModelContext.reset_context()
+
+    def test_disk_stream_env_plus_stream_quantization_raises(self, monkeypatch):
+        import pytest
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._make_context(monkeypatch, env_disk_stream=True)
+
+    def test_stream_quantization_with_mllm_raises(self, monkeypatch):
+        import pytest
+
+        with pytest.raises(ValueError, match="multimodal"):
+            self._make_context(monkeypatch, mllm=True)
+
+    def test_text_path_without_env_proceeds_to_meta_load(self, monkeypatch):
+        """Sanity: the guards must not fire on the normal text streaming path
+        (the meta loader then fails on the dummy checkpoint -- any other
+        error than the two guards is acceptable progress)."""
+        import pytest
+
+        with pytest.raises(Exception) as excinfo:
+            self._make_context(monkeypatch)
+        assert "mutually exclusive" not in str(excinfo.value)
+        assert "multimodal" not in str(excinfo.value)
+
+
 class TestStreamRowsCap:
     """nsamples caps chained rows for every dataset type (list datasets were
     previously forwarded in full -- inconsistent with the data-driven

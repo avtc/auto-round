@@ -645,6 +645,12 @@ class _CompressorBuilder(object):
             alg_configs = normalize_algorithm_config(alg_configs)
         configs_for_routing = alg_configs if isinstance(alg_configs, list) else [alg_configs]
         preprocessor_configs, _, quant_config = _resolve_quant_config_for_routing(configs_for_routing)
+        if getattr(quant_config, "forced_imatrix", None) is True and getattr(quant_config, "disable_opt_rtn", False):
+            raise ValueError(
+                "--imatrix_enabled true requires the optimized-RTN search (the "
+                "imatrix only weights that search): unset --disable_opt_rtn or "
+                "use --imatrix_enabled auto/false."
+            )
         is_svdquant = any(type(config).__name__ == "SVDQuantConfig" for config in preprocessor_configs)
         if is_svdquant:
             format = "svdquant_nunchaku"

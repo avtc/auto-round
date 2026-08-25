@@ -278,6 +278,52 @@ class TestPlumbing:
         assert isinstance(rtn, OptimizedRTNConfig), "PreSINQ must not silently drop the optimized-RTN search"
         assert any(isinstance(c, PreSINQConfig) for c in configs)
 
+    def test_forced_imatrix_with_opt_rtn_disabled_raises(self, monkeypatch):
+        """--imatrix_enabled true x --disable_opt_rtn is inconsistent: the
+
+        imatrix only weights the optimized-RTN search, so forcing it on while
+
+        disabling the search must stop at validation, not collect statistics
+
+        nothing consumes."""
+
+        from auto_round.autoround import AutoRound as NewAutoRound
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator as Compressor
+
+        monkeypatch.setattr(Compressor, "__init__", lambda self, config, **kw: None)
+
+        monkeypatch.setattr("auto_round.utils.is_mllm_model", lambda *a, **k: False)
+
+        monkeypatch.setattr("auto_round.utils.is_diffusion_model", lambda *a, **k: False)
+
+        monkeypatch.setattr("auto_round.utils.model.detect_model_type", lambda *a, **k: "llm")
+
+        cfg = RTNConfig(group_size=32, sym=False, disable_opt_rtn=True)
+
+        cfg.forced_imatrix = True
+
+        with pytest.raises(ValueError, match="imatrix_enabled true requires the optimized-RTN"):
+
+            NewAutoRound("dummy-model", scheme="W4A16", alg_configs=[cfg], seqlen=8, nsamples=1)
+
+    def test_enable_opt_rtn_beats_w8_auto_rule(self):
+        """--enable_opt_rtn records a non-None sentinel, so the W8A16/W8A8
+
+        efficiency heuristic must NOT flip the search off when the user asked
+
+        for it explicitly."""
+
+        forced_on = RTNConfig(bits=8, act_bits=16, data_type="int", enable_opt_rtn=True)
+
+        assert forced_on.orig_disable_opt_rtn is False, "explicit enable must pin the sentinel"
+
+        assert forced_on.disable_opt_rtn is False
+
+        unset = RTNConfig(bits=8, act_bits=16, data_type="int")
+
+        assert unset.orig_disable_opt_rtn is None, "unset leaves room for the auto rule"
+
     def test_forced_imatrix_marker_honored_in_selection(self, monkeypatch):
         """--imatrix_enabled true must survive the scheme rules: asym resolves
 
