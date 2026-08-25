@@ -1,6 +1,8 @@
 import json
 import os
 import shutil
+
+import torch
 from test.helpers import forbid_threaded_packing, get_model_path, opt_name_or_path
 
 import pytest
@@ -15,6 +17,57 @@ from auto_round.export.export_to_llmcompressor import export_to_static_fp as llm
 from ...envs import is_compressed_tensors_available
 
 pytestmark = pytest.mark.skipif(not is_compressed_tensors_available(), reason="test requires compressed-tensors")
+
+
+class TestLLMCZpInt8:
+    """pack_layer must hand compressed_tensors an int8 zero-point tensor:
+    NeUQI stores zp as a float32 integral-valued tensor, and CT's packer
+    (pack_to_int32) hard-requires torch.int8."""
+
+    def _make_layer(self, zp_tensor, bits=4, sym=False):
+        import torch.nn as nn
+
+        layer = nn.Linear(16, 8)
+        layer.bits = bits
+        layer.sym = sym
+        layer.group_size = 16
+        layer.data_type = "int"
+        layer.act_bits = 16
+        layer.act_sym = True
+        layer.act_data_type = None
+        layer.scale = torch.full((8, 1), 0.01)
+        layer.zp = zp_tensor
+        return layer
+
+    def test_tensor_zp_cast_to_int8(self):
+        import torch
+
+        from auto_round.export.export_to_llmcompressor.export import pack_layer
+
+        layer = self._make_layer(torch.full((8, 1), 5.0))  # float32 integral-valued
+        model = torch.nn.Sequential()
+        model.add_module("q_proj", layer)
+        pack_layer("q_proj", model, device="cpu")
+        # after compression CT owns the params: zp arrives packed to int32 and
+        # the layer is marked COMPRESSED (the pre-fix code raised in pack_to_int32)
+        zp = getattr(layer, "weight_zero_point", None)
+        assert zp is not None and zp.dtype == torch.int32
+        assert getattr(layer, "weight_packed", None) is not None
+
+    def test_out_of_range_zp_raises(self):
+        import torch
+
+        from auto_round.export.export_to_llmcompressor.export import pack_layer
+
+        layer = self._make_layer(torch.full((8, 1), 200.0), bits=8)  # >127: not int8-representable
+        model = torch.nn.Sequential()
+        model.add_module("q_proj", layer)
+        try:
+            pack_layer("q_proj", model, device="cpu")
+        except ValueError as e:
+            assert "zero-point" in str(e)
+        else:
+            raise AssertionError("out-of-range zp must raise")
 
 
 class TestLLMC:
@@ -287,7 +340,6 @@ class TestLLMC:
             and quantization_config["config_groups"]["group_1"]["format"] == "mxfp4-pack-quantized"
             and quantization_config["ignore"] == ["lm_head"]
         ), f"Invalid mixed precision quantization configuration: {quantization_config}"
-
 
     def test_mixed_int_bits_llmcompressor_format(self, tiny_opt_model_path, tmp_path):
         """Mixed int W5A16-W8A16 auto-scheme export with an unsupported-as-first-option scheme

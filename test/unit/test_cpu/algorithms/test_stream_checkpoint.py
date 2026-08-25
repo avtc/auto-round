@@ -626,6 +626,29 @@ class TestStreamRowsCap:
         assert len(out) == 1
 
 
+class TestOffloadAfterPackDecision:
+    """Per-block offload writes must be skipped once the block is already
+    flushed to output shards (is_immediate_saving): the file would be dead
+    weight until process exit (hy3: ~6.8GB x 80 blocks = ~545GB)."""
+
+    def _should_offload(self, low_cpu_mem_usage, is_immediate_saving):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        ctx = SimpleNamespace(low_cpu_mem_usage=low_cpu_mem_usage, is_immediate_saving=is_immediate_saving)
+        return CompressionOrchestrator._should_offload_after_pack(ctx)
+
+    def test_offloads_when_not_immediate_saving(self):
+        assert self._should_offload(low_cpu_mem_usage=True, is_immediate_saving=False) is True
+
+    def test_skips_when_immediate_saving_flushed_the_block(self):
+        assert self._should_offload(low_cpu_mem_usage=True, is_immediate_saving=True) is False
+
+    def test_skips_when_low_cpu_mem_usage_off(self):
+        assert self._should_offload(low_cpu_mem_usage=False, is_immediate_saving=False) is False
+
+
 class TestDiskStreamEnvRotationGuard:
     """_assert_model_foldable_in_place must also refuse whole-model rotation
     under AR_DISK_STREAM_MODEL (env-var offloader path builds the same meta

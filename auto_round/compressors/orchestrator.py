@@ -518,7 +518,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # the parent's apply pass. Park the block back on meta so a
                 # long queue-serving lifetime never accumulates host memory.
                 get_module(model, block_name_or_names).to("meta")
-            elif self.compress_context.low_cpu_mem_usage and not self.compress_context.is_immediate_saving:
+            elif self._should_offload_after_pack(self.compress_context):
                 if nblocks == 1:
                     self._offloader(model, n, overwrite=True)
                 else:
@@ -1167,6 +1167,17 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             logger.info("block-parallel worker %d: block %s done", rank, blocks[k])
 
+    @staticmethod
+    def _should_offload_after_pack(compress_context) -> bool:
+        """Whether a just-processed block still needs an offloader state write.
+
+        With immediate saving the block is already flushed to the output
+        shards; writing its state_dict afterwards would leave a ~block-sized
+        dead file per block until process exit (on the 300B hy3 run that was
+        ~6.8GB x 80 = ~545GB retained next to a complete export).
+        """
+        return compress_context.low_cpu_mem_usage and not compress_context.is_immediate_saving
+
     def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
         """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
         from auto_round.compressors.utils import immediate_pack as _immediate_pack
@@ -1222,7 +1233,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _immediate_pack(module_name, self.layer_config)
                 if self.compress_context.is_immediate_saving:
                     self.shard_writer.write(block, is_finalize=False)
-                if self.compress_context.low_cpu_mem_usage:
+                if self._should_offload_after_pack(self.compress_context):
                     self._offloader(self.model_context.model, block_name, overwrite=True)
                 pbar.update(1)
                 if applied == 0:

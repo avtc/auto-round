@@ -236,7 +236,20 @@ def pack_layer(name, model, device=None):
         else:
             zp = torch.full_like(layer.weight_scale, layer.zp).to(torch.int8)
     else:
+        # NeUQI / optimized-RTN searches leave zp as a float32 integral-valued
+        # tensor; compressed_tensors' packed format hard-requires torch.int8
+        # (its own lifecycle quantizes with dtype=torch.int8), so cast here and
+        # refuse values that would wrap rather than corrupting them silently.
         zp = layer.zp
+        if zp.dtype != torch.int8:
+            zp = zp.round()
+            if zp.numel() and (zp.min() < -128 or zp.max() > 127):
+                raise ValueError(
+                    f"asymmetric zero-point values [{int(zp.min())}, {int(zp.max())}] do not fit "
+                    "torch.int8, which the compressed-tensors packed format requires; use a "
+                    "symmetric scheme or <=7-bit asymmetric quantization for this layer"
+                )
+            zp = zp.to(torch.int8)
 
     setattr(layer, "weight_zero_point", torch.nn.Parameter(zp.to(weight_device), requires_grad=False))
     delattr(layer, "scale")
