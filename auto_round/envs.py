@@ -97,6 +97,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
     # "last"/"mid" force one layout for A/B measurements.
     "AR_NEUQI_LAYOUT": lambda: os.getenv("AR_NEUQI_LAYOUT", "auto").lower(),
+    # All-candidates batched zero-point sweep for the NeUQI search: "auto" batches
+    # every coarse/fine scale candidate into one fused kernel per group chunk on
+    # CUDA, "on" forces it on any fused-capable device, "off" keeps the
+    # per-candidate loop.
+    "AR_NEUQI_BATCH": lambda: os.getenv("AR_NEUQI_BATCH", "auto").lower(),
     # Minimum value to which torch._dynamo cache_size_limit /
     # accumulated_cache_size_limit / recompile_limit are bumped when
     # ``enable_torch_compile`` is used. The default of 16 is enough to cover

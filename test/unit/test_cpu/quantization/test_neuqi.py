@@ -34,6 +34,17 @@ def _mse(x, y):
     return ((x.float() - y.float()) ** 2).mean().item()
 
 
+def _oracle_loss_fp64(data, qw, scale, zp, maxq):
+    """fp64 loss of one group under fixed (scale, zp) -- the tie-break oracle."""
+    r = torch.round(data.double() / scale.double()).clamp_(min=-maxq - 1, max=2 * maxq + 1)
+    q = (r + zp.double()).clamp_(0, maxq)
+    deq = scale.double() * (q - zp.double())
+    loss = (deq - data.double()) ** 2
+    if qw is not None:
+        loss = loss * qw.double()
+    return loss.sum(-1)
+
+
 class TestNeuqiSearch:
     def test_search_returns_valid_scale_and_zp(self):
         """The brute-force grid sweep is the only sweep: it must return a valid
@@ -209,13 +220,7 @@ class TestNeuqiFusedSweep:
 
     @staticmethod
     def _oracle_loss_fp64(data, qw, scale, zp, maxq):
-        r = torch.round(data.double() / scale.double()).clamp_(min=-maxq - 1, max=2 * maxq + 1)
-        q = (r + zp.double()).clamp_(0, maxq)
-        deq = scale.double() * (q - zp.double())
-        loss = (deq - data.double()) ** 2
-        if qw is not None:
-            loss = loss * qw.double()
-        return loss.sum(-1)
+        return _oracle_loss_fp64(data, qw, scale, zp, maxq)
 
     def _search_with_backend(self, monkeypatch, backend, data, bits, qw, **kwargs):
         import auto_round.data_type.neuqi as N
@@ -350,6 +355,88 @@ class TestNeuqiFusedSweep:
         monkeypatch.setattr(N, "_fused_zp_broken", False)
         N.neuqi_search_scale_zero(_heavy_tailed_data(n_groups=8, seed=13).clone(), bits=4, coarse_n=4, fine_n=2)
         assert not N._fused_zp_fns  # no compile attempt on CPU under auto
+
+
+class TestNeuqiBatchedSweep:
+    """The all-candidates batched sweep must reproduce the per-candidate search.
+
+    ``AR_NEUQI_BATCH=on`` evaluates every coarse/fine candidate in one fused
+    call per group chunk ([C, K, Z, g], min over z fused in-kernel, then first-min
+    over candidates). Selections must match the per-candidate sweep; ties may
+    resolve differently only within fp64-oracle tolerance."""
+
+    def _search(self, monkeypatch, backend, batch, data, bits, qw, **kwargs):
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", backend)
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", batch)
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        monkeypatch.setattr(N, "_batched_broken", False)
+        scale, zp = N.neuqi_search_scale_zero(data.clone(), bits, qw=qw.clone() if qw is not None else None, **kwargs)
+        return scale, zp, N
+
+    @pytest.mark.enable_torch_compile
+    @pytest.mark.parametrize("weighted", [False, True])
+    @pytest.mark.parametrize("bits", [2, 4])
+    def test_batched_matches_per_candidate(self, monkeypatch, weighted, bits):
+        gen = torch.Generator().manual_seed(bits * 7 + int(weighted))
+        n, g = 384, 64
+        data = torch.randn(n, g, generator=gen)
+        data[:, :4] *= 100.0
+        qw = torch.rand(n, g, generator=gen) + 0.1 if weighted else None
+
+        scale_ref, zp_ref, _ = self._search(monkeypatch, "eager", "off", data, bits, qw, coarse_n=8, fine_n=3)
+        scale_b, zp_b, N = self._search(monkeypatch, "compile", "on", data, bits, qw, coarse_n=8, fine_n=3)
+
+        if N._batched_broken or N._zp_expr_batched not in N._fused_zp_fns:
+            pytest.skip("torch.compile/inductor unavailable in this environment")
+
+        mismatch = (zp_ref != zp_b).logical_or(scale_ref != scale_b).nonzero().flatten()
+        maxq = 2**bits - 1
+        for i in mismatch.tolist():
+            loss_ref = self._oracle_loss_fp64(data[i], qw[i] if qw is not None else None, scale_ref[i], zp_ref[i], maxq)
+            loss_b = self._oracle_loss_fp64(data[i], qw[i] if qw is not None else None, scale_b[i], zp_b[i], maxq)
+            assert (loss_b - loss_ref).abs().item() <= 1e-6 * loss_ref.abs().item()
+
+    def test_batch_failure_falls_back_to_per_candidate(self, monkeypatch):
+        """A batched-call failure must degrade to the per-candidate sweep, not crash."""
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        data = _heavy_tailed_data(n_groups=24, group_size=64, seed=17)
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        monkeypatch.setattr(N, "_fused_zp_fns", {})
+        monkeypatch.setattr(N, "_fused_zp_broken", False)
+        monkeypatch.setattr(N, "_batched_broken", False)
+        monkeypatch.setattr(N, "_eval_batched_chunk", lambda *a, **k: None)  # simulate failure
+
+        scale_f, zp_f = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
+
+        # reference: per-candidate sweep (batch=off never touches the patched fn)
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        scale_ref, zp_ref = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
+        torch.testing.assert_close(scale_f, scale_ref)
+        torch.testing.assert_close(zp_f, zp_ref)
+
+    def test_batch_policy(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "auto")
+        assert N._zp_batch_wanted("cuda") is True
+        assert N._zp_batch_wanted("cpu") is False
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        assert N._zp_batch_wanted("cuda") is False  # batched needs the fused backend
+        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        assert N._zp_batch_wanted("cuda") is False
+        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        assert N._zp_batch_wanted("cpu") is True  # forced (e.g. for tests / A/B)
 
 
 class TestAsymSearchAPI:

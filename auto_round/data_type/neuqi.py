@@ -39,13 +39,16 @@ fixes ``z = 0``).
 
 Performance: the per-candidate zero-point sweep is a pure elementwise + reduction
 chain, so on CUDA it is fused into a single generated kernel via ``torch.compile``
-(``AR_NEUQI_BACKEND=auto``, the default). The fused sweep evaluates exactly the same
-losses on exactly the same candidate grid; only the fp32 summation order inside the
-reduction may differ, so selections can flip solely on near-ties: on random,
-heavy-tailed and imatrix-weighted inputs the flips stay below ~0.1% of groups with
-worst-case relative loss differences of ~5e-5 (measured on an RTX 3090; ~1e-6 on
-CPU). The eager chunked sweep remains the reference path (CPU default) and the
-automatic fallback whenever compilation is unavailable.
+(``AR_NEUQI_BACKEND=auto``, the default), and all coarse/fine candidates of a pass
+are additionally folded into one such kernel per group chunk (``AR_NEUQI_BATCH``)
+so the search costs a handful of launches instead of candidates x chunks. The
+fused sweeps evaluate exactly the same losses on exactly the same candidate grid;
+only the fp32 summation order inside the reduction may differ, so selections can
+flip solely on near-ties: on random, heavy-tailed and imatrix-weighted inputs the
+flips stay below ~0.1% of groups with worst-case relative loss differences of
+~5e-5 (measured on an RTX 3090; ~1e-6 on CPU). The eager chunked sweep remains
+the reference path (CPU default) and the automatic fallback whenever compilation
+is unavailable.
 """
 
 import math
@@ -139,6 +142,48 @@ def _zp_expr_mid(data, qw, scale, zp_grid, maxq):
     return loss.min(dim=-1)
 
 
+def _zp_expr_batched(data, qw, scales, zp_grid, maxq):
+    """All-candidates zero-point sweep in one call: ``[C, K, Z, g]``, group last.
+
+    Evaluates every per-group scale candidate (``scales``, [C, K]) against every
+    integer zero point in a single fused kernel: the group-axis reduction and the
+    min over zero points are fused in-kernel, so the kernel outputs only the
+    [C, K] best losses and [C, K] winning zero points -- one launch covers what
+    the per-candidate sweep needs K launches and K bookkeeping rounds for. This
+    removes the Python-dispatch bound of the per-candidate loop (the residual
+    cost after single-candidate fusion) at the price of a larger symbolic
+    intermediate, which is why eager execution of this expression is never used
+    (see ``_eval_batched_chunk``).
+
+    Same per-(group, candidate, zero-point) operand order as ``_zp_expr_last``;
+    the caller applies the first-minimum-over-candidates rule with ``Tensor.min``,
+    matching the sequential sweep's strict-improvement tie semantics.
+
+    Args:
+        data: [chunk, g] float32 group data.
+        qw: [chunk, g] float32 per-element weights or ``None``.
+        scales: [chunk, K] float32 per-group scale candidates.
+        zp_grid: [n_zp] float32 integral zero-point candidates ``0 .. maxq``.
+        maxq: maximum integer value (``2**bits - 1``).
+
+    Returns:
+        (best_loss [chunk, K], best_zp [chunk, K]) -- per-candidate minimum over
+        zero points, first-minimum tie rule.
+    """
+    d = data.unsqueeze(-2).unsqueeze(-2)  # [C, 1, 1, g]
+    sc = scales.unsqueeze(-1).unsqueeze(-1)  # [C, K, 1, 1]
+    zp = zp_grid.view(1, 1, -1, 1)  # [1, 1, Z, 1]
+    r = torch.round(d / sc).clamp_(min=-maxq - 1, max=2 * maxq + 1)
+    q = (r + zp).clamp_(0, maxq)
+    deq = sc * (q - zp)
+    diff = deq - d
+    loss = diff * diff
+    if qw is not None:
+        loss = loss * qw.unsqueeze(-2).unsqueeze(-2)
+    loss = loss.sum(dim=-1)  # [C, K, Z]
+    return loss.min(dim=-1)  # [C, K], [C, K]
+
+
 def _zp_expr_for(device_type: str):
     """Pick the sweep layout for a device, per ``AR_NEUQI_LAYOUT``.
 
@@ -161,6 +206,9 @@ _fused_zp_fns = {}
 # Set when a fused invocation raised (e.g. no host C++ compiler for Inductor);
 # the process then permanently uses the eager sweep.
 _fused_zp_broken = False
+# Set when the all-candidates batched sweep raised; the process then permanently
+# uses the per-candidate fused sweep.
+_batched_broken = False
 
 
 def _zp_wants_compile(device_type: str) -> bool:
@@ -200,6 +248,43 @@ def _eval_zp_chunk(data, qw, scale, zp_grid, maxq):
             _fused_zp_broken = True
             logger.warning("[NeUQI] fused zero-point sweep failed (%s); using the eager sweep", e)
     return expr(data, qw, scale, zp_grid, maxq)
+
+
+def _zp_batch_wanted(device_type: str) -> bool:
+    """Whether the all-candidates batched sweep should run, per ``AR_NEUQI_BATCH``.
+
+    "auto" (default) batches on CUDA when the fused backend engages there;
+    "on" forces it on any fused-capable device (tests, A/B); "off" keeps the
+    per-candidate loop. The batched expression is only ever executed compiled:
+    eager execution of [C, K, Z, g] would materialize the full expansion.
+    """
+    mode = getattr(envs, "AR_NEUQI_BATCH", "auto")
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return device_type == "cuda" and _zp_wants_compile(device_type)
+
+
+def _eval_batched_chunk(data, qw, scales, zp_grid, maxq):
+    """One chunk of the all-candidates batched sweep, or ``None`` when unavailable.
+
+    ``None`` (fused backend off, already broken, or the call raised) makes the
+    caller fall back to the per-candidate sweep; strict-improvement bookkeeping
+    makes a partial batched pass followed by the per-candidate pass converge to
+    the same selections (ties within the usual fp32 summation tolerance).
+    """
+    global _batched_broken
+    if _batched_broken or not _zp_wants_compile(data.device.type):
+        return None
+    try:
+        return _get_fused_zp_fn(_zp_expr_batched)(data, qw, scales, zp_grid, maxq)
+    except Exception as e:
+        _batched_broken = True
+        if data.device.type == "cuda":
+            torch.cuda.empty_cache()  # a failed launch may hold pooled memory
+        logger.warning("[NeUQI] batched zero-point sweep failed (%s); using the per-candidate sweep", e)
+        return None
 
 
 def _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk):
@@ -285,15 +370,41 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     best_loss = torch.full((data.shape[0],), float("inf"), device=data.device, dtype=torch.float32)
     best_frac = torch.ones(data.shape[0], device=data.device, dtype=torch.float32)
     best_zp = torch.zeros(data.shape[0], device=data.device, dtype=torch.float32)
+    n_groups = data.shape[0]
+    batch_wanted = _zp_batch_wanted(data.device.type)
 
     # Coarse pass: shared log-spaced fractions of the per-group min-max scale.
-    for idx in range(coarse_n):
-        scale = s0 * coarse[idx]
-        loss, zp = _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk)
-        improved = loss < best_loss
-        best_loss = torch.where(improved, loss, best_loss)
-        best_zp = torch.where(improved, zp, best_zp)
-        best_frac = torch.where(improved, torch.full_like(best_frac, coarse[idx]), best_frac)
+    # Batched fast path first: every candidate in one fused call per group chunk
+    # (AR_NEUQI_BATCH); the per-candidate loop is the reference and the fallback.
+    coarse_done = False
+    if batch_wanted:
+        chunk_b = max(1, _MAX_TMP_ELEMS // (coarse_n * (maxq + 1)))
+        for start in range(0, n_groups, chunk_b):
+            stop = min(start + chunk_b, n_groups)
+            scales = s0[start:stop] * coarse.view(1, -1)  # [chunk, K] shared fracs
+            out = _eval_batched_chunk(
+                data[start:stop], qw[start:stop] if qw is not None else None, scales, zp_grid, maxq
+            )
+            if out is None:
+                break  # latched failure / fused backend off: redo per candidate
+            loss_k, zp_k = out  # [chunk, K] each
+            loss, k_idx = loss_k.min(dim=1)  # first-min over candidates
+            zp = zp_k.gather(1, k_idx.unsqueeze(1)).squeeze(1)
+            frac = coarse.index_select(0, k_idx)
+            improved = loss < best_loss[start:stop]
+            best_loss[start:stop] = torch.where(improved, loss, best_loss[start:stop])
+            best_zp[start:stop] = torch.where(improved, zp, best_zp[start:stop])
+            best_frac[start:stop] = torch.where(improved, frac, best_frac[start:stop])
+        else:
+            coarse_done = True
+    if not coarse_done:
+        for idx in range(coarse_n):
+            scale = s0 * coarse[idx]
+            loss, zp = _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk)
+            improved = loss < best_loss
+            best_loss = torch.where(improved, loss, best_loss)
+            best_zp = torch.where(improved, zp, best_zp)
+            best_frac = torch.where(improved, torch.full_like(best_frac, coarse[idx]), best_frac)
 
     # Fine pass: additive grid between the coarse neighbors bracketing each winner.
     best_idx = torch.argmin(torch.abs(coarse.unsqueeze(0) - best_frac.unsqueeze(1)), dim=1)
@@ -301,14 +412,39 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     frac_hi = coarse[(best_idx + 1).clamp_(max=coarse_n - 1)]
 
     steps = torch.arange(1, fine_n + 1, device=data.device, dtype=torch.float32) / (fine_n + 1)
-    for step in steps:
-        frac = frac_lo * (1.0 - step) + frac_hi * step
-        scale = s0 * frac.unsqueeze(-1)
-        loss, zp = _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk)
-        improved = loss < best_loss
-        best_loss = torch.where(improved, loss, best_loss)
-        best_zp = torch.where(improved, zp, best_zp)
-        best_frac = torch.where(improved, frac, best_frac)
+    fine_done = fine_n == 0
+    if batch_wanted and not fine_done:
+        # per-group fracs: frac_lo/hi differ per group, steps shared
+        one_m_steps = 1.0 - steps
+        chunk_b = max(1, _MAX_TMP_ELEMS // (fine_n * (maxq + 1)))
+        for start in range(0, n_groups, chunk_b):
+            stop = min(start + chunk_b, n_groups)
+            fracs = frac_lo[start:stop].unsqueeze(1) * one_m_steps + frac_hi[start:stop].unsqueeze(1) * steps
+            scales = s0[start:stop] * fracs  # [chunk, K]
+            out = _eval_batched_chunk(
+                data[start:stop], qw[start:stop] if qw is not None else None, scales, zp_grid, maxq
+            )
+            if out is None:
+                break
+            loss_k, zp_k = out
+            loss, k_idx = loss_k.min(dim=1)
+            zp = zp_k.gather(1, k_idx.unsqueeze(1)).squeeze(1)
+            frac = fracs.gather(1, k_idx.unsqueeze(1)).squeeze(1)
+            improved = loss < best_loss[start:stop]
+            best_loss[start:stop] = torch.where(improved, loss, best_loss[start:stop])
+            best_zp[start:stop] = torch.where(improved, zp, best_zp[start:stop])
+            best_frac[start:stop] = torch.where(improved, frac, best_frac[start:stop])
+        else:
+            fine_done = True
+    if not fine_done:
+        for step in steps:
+            frac = frac_lo * (1.0 - step) + frac_hi * step
+            scale = s0 * frac.unsqueeze(-1)
+            loss, zp = _best_zp_for_scale(data, qw, scale, zp_grid, maxq, chunk)
+            improved = loss < best_loss
+            best_loss = torch.where(improved, loss, best_loss)
+            best_zp = torch.where(improved, zp, best_zp)
+            best_frac = torch.where(improved, frac, best_frac)
 
     scale = (best_frac.unsqueeze(-1) * s0).clamp_(min=q_scale_thresh)
     return scale, best_zp.unsqueeze(-1)

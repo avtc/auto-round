@@ -241,6 +241,16 @@ export AR_NEUQI_BACKEND=eager
 export AR_NEUQI_LAYOUT=mid
 ```
 
+### AR_NEUQI_BATCH
+- **Description**: All-candidates batched zero-point sweep. `"auto"` (default) folds every coarse and fine scale candidate of a pass into a single fused kernel per group chunk on CUDA (the per-candidate fused sweep spends most of its remaining wall time in per-candidate dispatch and bookkeeping launches); `"on"` forces the batched sweep on any fused-capable device (e.g. for A/B or tests); `"off"` keeps the per-candidate loop. The batched kernel computes the min over zero points in-kernel and emits only `[groups, candidates]` best losses and winning zero points per launch. Selections follow the same first-minimum tie rule as the sequential sweep; after the single-candidate fusion this is the second speedup stage on top of the same candidate grid (21x measured for the first stage on an RTX 3090). Any failure of a batched call (e.g. out of memory from the larger symbolic intermediate) permanently latches the process back to the per-candidate fused sweep for the remaining candidates.
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"on"`, `"off"` (unrecognized values follow the `"auto"` rule)
+- **Usage**: Pin the per-candidate loop for A/B comparisons of the batching stage
+
+```bash
+export AR_NEUQI_BATCH=off
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **Description**: Controls whether `NVFP4E5M3QuantLinear` caches a dequantized high-precision weight after the first forward pass, instead of dequantizing the packed FP4 weight on every call.
 - **Default**: `False` (equivalent to `"0"`)
