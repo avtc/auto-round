@@ -298,6 +298,44 @@ class TestSinkhornBackend:
             pytest.skip("torch.compile/inductor unavailable in this environment")
         torch.testing.assert_close(t_c, t_ref, rtol=1e-10, atol=1e-12)
 
+    @pytest.mark.enable_torch_compile
+    def test_compiled_matches_eager_on_tie_trajectories(self, monkeypatch):
+        """Compiled-arm decision robustness on the adversarial tile batch found
+        by the GPU bench smoke ([12, 2048, 64], seed 0): eager's imbalance
+        trajectory revisits a previous minimum exactly, and exact ``<=``/``>``
+        comparisons under compiled reduction noise flip a tile onto a
+        materially worse candidate (measured imbalance 1.226 vs eager 1.0125).
+        The compiled body's 1e-12 comparison slack must keep it glued to the
+        eager selections (mu within 1e-6; achieved imbalance equal within 1e-9)."""
+        pytest.importorskip("torch._inductor")
+        from auto_round import envs
+        import auto_round.algorithms.transforms.presinq.sinkhorn as S
+
+        torch.manual_seed(0)
+        W = torch.randn(2048, 768) * torch.logspace(-1, 1, 768)
+        Wt = W.view(2048, 12, 64).permute(1, 0, 2).contiguous()
+
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "eager")
+        _, mu1_e, mu2_e = S.sinkhorn_log(Wt, order=4)
+        monkeypatch.setattr(envs, "AR_PRESINQ_BACKEND", "compile")
+        S._compiled_broken = False
+        S._compiled_body = None
+        _, mu1_c, mu2_c = S.sinkhorn_log(Wt, order=4)
+        if S._compiled_broken:
+            pytest.skip("torch.compile/inductor unavailable in this environment")
+        torch.testing.assert_close(mu1_c, mu1_e, rtol=1e-6, atol=1e-9)
+        torch.testing.assert_close(mu2_c, mu2_e, rtol=1e-6, atol=1e-9)
+
+        m = Wt.to(torch.float64)
+
+        def imb_of(mat):
+            s1, s2 = mat.std(-1), mat.std(-2)
+            return torch.maximum(s1.amax(-1), s2.amax(-1)) / torch.minimum(s1.amin(-1), s2.amin(-1)).clamp_min(1e-12)
+
+        ie = imb_of(m / mu1_e.unsqueeze(-2) / mu2_e)
+        ic = imb_of(m / mu1_c.unsqueeze(-2) / mu2_c)
+        torch.testing.assert_close(ic, ie, rtol=1e-9, atol=1e-12)
+
     def test_compile_failure_latches(self, monkeypatch):
         from auto_round import envs
         import auto_round.algorithms.transforms.presinq.sinkhorn as S

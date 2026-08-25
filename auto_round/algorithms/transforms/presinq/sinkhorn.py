@@ -87,10 +87,21 @@ def _get_compiled_body():
 def _sinkhorn_body(m, tgt_small, order, clip_min, clip_max, stop_on_increasing_imbalance):
     """The sinkhorn iteration loop (compile-friendly: no data-dependent control).
 
-    Identical math to the eager loop in :func:`sinkhorn_log`; compiled fp64
-    execution agrees to ~1e-15 (reduction-order effects only — ties in the
-    best-so-far tracker may resolve to a different, equally-balanced
-    iteration). Kept in sync with the eager loop by the oracle test.
+    Same candidates and updates as the eager loop in :func:`sinkhorn_log`, with
+    two compile-specific hardenings (the eager loop needs neither):
+
+    * the best-so-far tracker starts from ``+inf``, so iteration 0 always
+      captures the identity candidate — eager compares it against the k=0
+      imbalance with an exact ``==``, which compiled reduction-order noise
+      (``cur == m`` when the log-mus are zero) would flip catastrophically via
+      the gate freeze;
+    * the tracker/gate comparisons use a relative slack of 1e-12: compiled
+      reduction order perturbs the imbalance by ~1e-16, and an exact-equality
+      tie in eager (trajectories revisit a previous minimum) must resolve the
+      same way (the later candidate wins, as eager's ``<=`` does) or the
+      diverged trajectory can end on a materially worse candidate. The slack
+      is ~1000x above the noise and 10+ orders below any meaningful imbalance
+      gap, so non-tie decisions are unaffected.
     """
     shape = m.shape
     imb_min = torch.full(m.shape[:-2], float("inf"), dtype=m.dtype, device=m.device)
@@ -108,13 +119,13 @@ def _sinkhorn_body(m, tgt_small, order, clip_min, clip_max, stop_on_increasing_i
         s_min = torch.minimum(s1.amin(dim=-1), s2.amin(dim=-1)).clamp_min(1e-12)
         s_max = torch.maximum(s1.amax(dim=-1), s2.amax(dim=-1))
         ib = s_max / s_min
-        better = ib <= imb_min
+        better = ib <= imb_min * (1.0 + 1e-12)
         imb_min = torch.minimum(imb_min, ib)
         mu1_star = torch.where(better.unsqueeze(-1), mu1e, mu1_star)
         mu2_star = torch.where(better.unsqueeze(-1).unsqueeze(-1), mu2e, mu2_star)
         if stop_on_increasing_imbalance:
-            rising = (ib > imb_min).to(m.dtype)
-            gate = torch.clip(gate + rising, max=1.0)
+            rising = ib > imb_min * (1.0 + 1e-12)
+            gate = torch.clip(gate + rising.to(m.dtype), max=1.0)
         g = 1.0 - gate
         sal_col = (s2.clamp(clip_min, clip_max) / tgt_small.unsqueeze(-1)).clamp(0.7, 2.0).log()
         sal_row = (s1.clamp(clip_min, clip_max) / tgt_small.unsqueeze(-1)).clamp(0.7, 2.0).log()
