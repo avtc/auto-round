@@ -279,6 +279,24 @@ class TestPresinqTriton:
         monkeypatch.setattr(S, "_triton_sweep", impl)
         monkeypatch.setattr(S, "_triton_broken", False)
 
+    def test_resolver_logs_engagement(self, monkeypatch):
+        """A successful resolution announces itself: the Triton arm is silent
+        otherwise, and live runs must be able to tell which backend served."""
+        import sys
+        import types
+
+        import auto_round.algorithms.transforms.presinq.sinkhorn as S
+
+        stub = types.ModuleType("auto_round_extension.triton.presinq_sinkhorn")
+        stub.sinkhorn_log_triton = object()
+        monkeypatch.setitem(sys.modules, "auto_round_extension.triton.presinq_sinkhorn", stub)
+        recorded = []
+        monkeypatch.setattr(S, "logger", types.SimpleNamespace(info=recorded.append))
+        monkeypatch.setattr(S, "_triton_checked", False)
+        monkeypatch.setattr(S, "_triton_sweep", None)
+        assert S._triton_sweep_fn() is stub.sinkhorn_log_triton
+        assert any("Triton sinkhorn engaged" in str(r) for r in recorded)
+
     def test_policy(self, monkeypatch):
         from auto_round import envs
         from auto_round.algorithms.transforms.presinq.sinkhorn import _wants_triton

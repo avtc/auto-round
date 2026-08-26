@@ -506,6 +506,24 @@ class TestNeuqiTritonSweep:
         torch.testing.assert_close(scale_f, scale_ref)
         torch.testing.assert_close(zp_f, zp_ref)
 
+    def test_resolver_logs_engagement(self, monkeypatch):
+        """A successful resolution announces itself: the Triton arm is silent
+        otherwise, and live runs must be able to tell which backend served."""
+        import sys
+        import types
+
+        import auto_round.data_type.neuqi as N
+
+        stub = types.ModuleType("auto_round_extension.triton.neuqi_sweep")
+        stub.neuqi_sweep_triton = object()
+        monkeypatch.setitem(sys.modules, "auto_round_extension.triton.neuqi_sweep", stub)
+        recorded = []
+        monkeypatch.setattr(N, "logger", types.SimpleNamespace(info=recorded.append))
+        monkeypatch.setattr(N, "_triton_checked", False)
+        monkeypatch.setattr(N, "_triton_sweep", None)
+        assert N._triton_sweep_fn() is stub.neuqi_sweep_triton
+        assert any("Triton zero-point sweep engaged" in str(r) for r in recorded)
+
     def test_triton_policy(self, monkeypatch):
         import auto_round.data_type.neuqi as N
         from auto_round import envs

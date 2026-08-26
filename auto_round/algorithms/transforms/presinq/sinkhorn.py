@@ -82,6 +82,7 @@ def _triton_sweep_fn():
             from auto_round_extension.triton.presinq_sinkhorn import sinkhorn_log_triton
 
             _triton_sweep = sinkhorn_log_triton
+            logger.info("[PreSINQ] Triton sinkhorn engaged (auto_round_extension.triton.presinq_sinkhorn)")
         except Exception as e:
             logger.info("[PreSINQ] Triton sinkhorn unavailable (%s); using the torch loops", e)
             _triton_sweep = None

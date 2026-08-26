@@ -266,6 +266,7 @@ def _triton_sweep_fn():
             from auto_round_extension.triton.neuqi_sweep import neuqi_sweep_triton
 
             _triton_sweep = neuqi_sweep_triton
+            logger.info("[NeUQI] Triton zero-point sweep engaged (auto_round_extension.triton.neuqi_sweep)")
         except Exception as e:
             logger.info("[NeUQI] Triton sweep unavailable (%s); using the torch.compile sweeps", e)
             _triton_sweep = None
