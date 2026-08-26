@@ -282,7 +282,7 @@ export AR_DISK_STREAM_MODEL=1
 ```
 
 ### AR_POST_SCALE_REFIT
-- **描述**: 调优结束后按组做最小二乘 scale 重拟合，整数网格与零点冻结。单步闭式解（冻结整数约束下的精确最优解）；存在 imatrix 时按 imatrix 加权；按构造保证加权 MSE 单调不增。可与任意 `AR_TUNE_RECIPE`（以及普通 minmax 初始化运行）组合；适用于标准 group size 的 int 数据类型。
+- **描述**: 调优结束后按组做最小二乘 scale 重拟合，整数网格与零点冻结。单步闭式解（冻结整数约束下的精确最优解）；存在 imatrix 时按 imatrix 加权；按构造保证加权 MSE 单调不增。可与任意 `AR_TUNE_RECIPE`（以及普通 minmax 初始化运行）组合；仅作用于标准 group size 的非对称 int 层（对称层保持原网格，记录一次日志）。
 - **默认值**: `0`（关闭）
 - **有效值**: `0`、`1`（也接受 `true`/`yes`）
 
@@ -291,7 +291,7 @@ export AR_POST_SCALE_REFIT=1
 ```
 
 ### AR_BIAS_CORRECT
-- **描述**: 逐 Transformer block 的量化后偏置校正：在 block 残差流边界取 `b = 校准 token 均值(y_fp - y_q)`，吸收进该 block 喂入残差流的投影层（out_features == hidden 的最后一个 Linear/Conv1D；路由专家模块被降权，因为它们只在部分 token 上执行）。bias 缺失时自动创建——所有导出格式原生支持，vLLM 无需改动即可生效。qon 路径复用链式前向（零额外前向）；qoff 路径增加一次 no-grad 前向。可与任意 `AR_TUNE_RECIPE`、`AR_POST_SCALE_REFIT` 组合。
+- **描述**: 逐 Transformer block 的量化后偏置校正：在 block 残差流边界取 `b = 校准 token 均值(y_fp - y_q)`，吸收进该 block 喂入残差流的投影层（out_features == hidden 的最后一个 Linear/Conv1D；路由专家模块被降权，因为它们只在部分 token 上执行）。bias 缺失时自动创建——所有导出格式原生支持，vLLM 无需改动即可生效。qon 路径复用链式前向（零额外前向）；qoff 路径增加一次 no-grad 前向。仅限串行/流式——block-parallel worker 下硬报错（bias 不属于 worker result 文件）。可与任意 `AR_TUNE_RECIPE`、`AR_POST_SCALE_REFIT` 组合。
 - **默认值**: `0`（关闭）
 - **有效值**: `0`、`1`（也接受 `true`/`yes`）
 

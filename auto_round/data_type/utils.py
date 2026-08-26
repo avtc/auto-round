@@ -103,7 +103,14 @@ def revert_tensor_by_pad(data: torch.Tensor, orig_shape: tuple, pad_len: Union[i
 
 
 def get_quant_func(
-    dtype: str, bits: int, sym: bool, disable_opt_rtn=False, group_size=None, iters=200, asym_search="auto"
+    dtype: str,
+    bits: int,
+    sym: bool,
+    disable_opt_rtn=False,
+    group_size=None,
+    iters=200,
+    asym_search="auto",
+    weight_path: bool = True,
 ) -> tuple[callable, str]:
     """Retrieve the quantization function based on data type, bit width, and symmetry.
 
@@ -141,7 +148,21 @@ def get_quant_func(
 
     from auto_round import envs
 
-    recipe = envs.AR_TUNE_RECIPE
+    recipe = envs.AR_TUNE_RECIPE if weight_path else ""
+    if weight_path and envs.AR_TOUCHUP_ITERS > 0 and recipe:
+        raise ValueError(
+            f"AR_TOUCHUP_ITERS anchors every layer from the stored result grid; AR_TUNE_RECIPE={recipe!r} "
+            "would fight it on layers without results. Use one or the other."
+        )
+    if weight_path and envs.AR_ALT2_ITERS2 > 0 and recipe != "alt2":
+        raise ValueError(
+            f"AR_ALT2_ITERS2 only applies to AR_TUNE_RECIPE=alt2 (current: {recipe!r}). Unset it or set alt2."
+        )
+    if weight_path and envs.AR_QOFF_NOISE and iters == 0:
+        raise ValueError(
+            "AR_QOFF_NOISE=1 injects noise during SignRound tuning; the zero-shot path (iters=0) never "
+            "tunes. Unset AR_QOFF_NOISE."
+        )
     _tuning_recipes = ("minmax_qon", "neuqi_qon", "neuqi_frozen_qon", "neuqi_fp", "opt_rtn_qon", "alt2")
     _valid = ("",) + _tuning_recipes + ("neuqi_it0",)
     if recipe not in _valid:
@@ -168,7 +189,7 @@ def get_quant_func(
             'AR_TUNE_RECIPE="opt_rtn_qon" anchors the symmetric scale-clip search; use a neuqi_* '
             "recipe for the asymmetric path."
         )
-    if asym_search == "neuqi" and iters > 0 and not recipe:
+    if weight_path and asym_search == "neuqi" and iters > 0 and not recipe:
         raise ValueError(
             'asym_search="neuqi" applies only to the zero-shot path (iters=0), where it replaces the '
             "optimized-RTN min/max initialization with a joint (scale, zero-point) grid search. With "

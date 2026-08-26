@@ -60,6 +60,23 @@ def get_scale_shape(weight, group_size):
     return shape
 
 
+def _prepare_recipe_imatrix(imatrix, weight_reshape, bits, group_size):
+    """Normalize an imatrix to the padded ``[N, gs]`` grouped layout.
+
+    Mirrors the zero-shot path (``quant_tensor_opt_rtn_sym``): the calibration
+    hooks attach a 1D ``[in_features]`` per-column importance vector -- it must
+    be padded by group size, expanded to the weight's grouped rows, and
+    zero-guarded before any per-group search consumes it. ``None`` returns
+    ``None`` (uniform weights).
+    """
+    from auto_round.data_type.gguf import _imatrix_handle_zero
+
+    qw = imatrix.reshape(1, -1).to(torch.float32)
+    qw = reshape_pad_tensor_by_group_size(qw, group_size, val=1e-5)[0].view(1, -1)
+    qw = qw.expand(weight_reshape.numel() // qw.numel(), -1).reshape(weight_reshape.shape)
+    return _imatrix_handle_zero(qw, weight_reshape, bits, group_size)
+
+
 def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
     """Searched (scale, zp) grid for AR_TUNE_RECIPE init, expressed as the
     per-group (tensor_min, tensor_max) pair the STE quant functions
@@ -73,15 +90,15 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
     Returns (wmin, wmax, frozen_margins) or None when the recipe needs no
     anchoring.
     """
-    import time as _time
+    import time
 
     if not recipe or recipe in ("minmax_qon", "neuqi_it0"):
         return None
-    t0 = _time.perf_counter()
+    t0 = time.perf_counter()
     w = weight.to(device=device, dtype=torch.float32)
     qw = None
     if imatrix is not None:
-        qw = imatrix.to(device=device, dtype=torch.float32)
+        qw = _prepare_recipe_imatrix(imatrix, w, bits, group_size).to(device)
 
     if recipe.startswith("neuqi_") or recipe == "alt2":
         from auto_round.data_type.neuqi import neuqi_search_scale_zero
@@ -110,13 +127,13 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
         logger.info(
             "[tune_recipe] %s init-search anchored the tuning grid (%.2fs first layer; margins %s)",
             recipe,
-            _time.perf_counter() - t0,
+            time.perf_counter() - t0,
             "pinned at 1.0" if frozen else "tunable from 1.0",
         )
     return wmin.squeeze(-1), wmax.squeeze(-1), frozen
 
 
-def _refit_scale_grid(weight, qdq_weight, scale, zp, group_size, qw=None):
+def _refit_scale_grid(weight, qdq_weight, scale, zp, group_size, bits=None, qw=None):
     """Per-group least-squares scale refit with the integer grid frozen.
 
     The deployed reconstruction is w_hat = s*(q - zp); with the integers q and
@@ -135,7 +152,9 @@ def _refit_scale_grid(weight, qdq_weight, scale, zp, group_size, qw=None):
     q = torch.round(qdq / s + zp_g)  # exact recovery: bf16 qdq error << s/2
     d = q - zp_g
     if qw is not None:
-        weights, _ws, _wp = reshape_pad_tensor_by_group_size(qw.detach().to(torch.float32), group_size)
+        # the calibration hooks attach a 1D [in_features] vector; normalize
+        # to the same padded [N, gs] layout as the weight
+        weights = _prepare_recipe_imatrix(qw, w, bits=bits, group_size=group_size)
     else:
         weights = torch.ones_like(d)
     num = (weights * w * d).sum(dim=-1, keepdim=True)
@@ -147,6 +166,7 @@ def _refit_scale_grid(weight, qdq_weight, scale, zp, group_size, qw=None):
 
 
 _RECIPE_INIT_LOGGED = False
+_REFIT_SKIPPED_SYM_LOGGED = False
 
 
 class WrapperLinear(torch.nn.Module):
@@ -284,6 +304,7 @@ class WrapperLinear(torch.nn.Module):
             and self.weight_min is not None
             and self.orig_layer.bits < 16
             and not isinstance(orig_layer.group_size, tuple)
+            and self.orig_layer.data_type == "int"
         ):
             _anchors = _compute_recipe_anchors(
                 weight_reshape,
@@ -295,6 +316,11 @@ class WrapperLinear(torch.nn.Module):
             )
             _touch_scale = getattr(orig_layer, "_touchup_scale", None)
             if _touch_scale is not None:
+                if getattr(orig_layer, "sym", False):
+                    raise ValueError(
+                        "AR_TOUCHUP_ITERS currently anchors asym layers only (min=-zp*s, "
+                        "max=(maxq-zp)*s); symmetric layers store a different grid convention."
+                    )
                 # post-BPT touch-up: anchor exactly to the tuned (scale, zp)
                 # pair; margins stay tunable so round 2 can still polish range
                 maxq = float(2**self.orig_layer.bits - 1)
@@ -341,6 +367,7 @@ class WrapperLinear(torch.nn.Module):
                 orig_layer.act_sym,
                 disable_opt_rtn=True,
                 iters=orig_layer.iters,
+                weight_path=False,  # AR_TUNE_RECIPE governs the weight grid only
             )
             if self.enable_torch_compile:
                 self.act_quant_func = compile_func(self.act_quant_func, self.device)
@@ -360,11 +387,9 @@ class WrapperLinear(torch.nn.Module):
     def alt2_regrid(self):
         """alt2 mid-tune re-grid: re-run the init search on the perturbed
         effective weights, re-anchor weight_min/weight_max, reset the rounding
-        params to zero. Returns mean |delta scale| telemetry, or None when
-        this layer does not participate.
+        params to zero (and the margins to 1.0). Returns mean |delta scale|
+        telemetry, or None when this layer does not participate.
         """
-        import torch as _torch
-
         from auto_round.data_type.neuqi import neuqi_search_scale_zero
 
         if getattr(self, "_tune_recipe", "") != "alt2" or self.orig_layer.bits >= 16:
@@ -372,26 +397,46 @@ class WrapperLinear(torch.nn.Module):
         gs = self.orig_layer.group_size
         if isinstance(gs, tuple):
             return None
-        with _torch.no_grad():
-            w = self.orig_layer.weight.detach().to(device=self.device, dtype=_torch.float32)
+        import transformers
+
+        with torch.no_grad():
+            w = self.orig_layer.weight.detach().to(device=self.device, dtype=torch.float32)
+            if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
+                w = w.t()  # Conv1D stores [in, out]; groups follow rows
             w_reshape, _shape, _pad = reshape_pad_tensor_by_group_size(w, gs)
             maxq = float(2**self.orig_layer.bits - 1)
-            s_cur = ((self.weight_max.float() - self.weight_min.float()) / maxq).reshape(-1, 1)
+            # fold the tuned margins into the grid the rounding acted on --
+            # quant_tensor_asym multiplies wmin/wmax by min_scale/max_scale
+            min_scale = self.min_scale.detach().float().reshape(-1, 1)
+            max_scale = self.max_scale.detach().float().reshape(-1, 1)
+            s_cur = (
+                self.weight_max.float().reshape(-1, 1) * max_scale - self.weight_min.float().reshape(-1, 1) * min_scale
+            ) / maxq
             w_eff = w_reshape + self.value.detach().reshape(w_reshape.shape) * s_cur
+            imatrix = getattr(self.orig_layer, "imatrix", None)
+            qw = _prepare_recipe_imatrix(imatrix, w_eff, self.orig_layer.bits, gs) if imatrix is not None else None
             scale, zp = neuqi_search_scale_zero(
                 w_eff,
                 self.orig_layer.bits,
-                qw=getattr(self.orig_layer, "imatrix", None),
+                qw=qw.to(self.device) if qw is not None else None,
                 q_scale_thresh=self.q_scale_thresh,
                 coarse_n=int(envs.AR_NEUQI_COARSE),
                 fine_n=int(envs.AR_NEUQI_FINE),
             )
             self.weight_min = (-zp * scale).squeeze(-1).to(self.weight_min.dtype)
             self.weight_max = ((maxq - zp) * scale).squeeze(-1).to(self.weight_max.dtype)
+            # margins restart from 1.0 against the fresh anchors: leaving the
+            # tuned values would shift round 2 off the searched grid
+            for pname in ("min_scale", "max_scale"):
+                pm = self.params.get(pname) if isinstance(self.params, dict) else None
+                if pm is not None:
+                    pm.data.fill_(1.0)
+                else:
+                    getattr(self, pname).fill_(1.0)
             v = self.params.get("value") if isinstance(self.params, dict) else None
             if v is not None:
                 v.data.zero_()
-            elif isinstance(self.value, _torch.Tensor):
+            elif isinstance(self.value, torch.Tensor):
                 self.value.zero_()
             return (scale - s_cur).abs().mean().item()
 
@@ -545,14 +590,27 @@ class WrapperLinear(torch.nn.Module):
             and not is_nv_fp(self.orig_layer.data_type)
             and self.orig_layer.bits < 16
         ):
-            qdq_weight, scale = _refit_scale_grid(
-                self.orig_layer.get_weight() if hasattr(self.orig_layer, "get_weight") else self.orig_layer.weight,
-                qdq_weight,
-                scale,
-                zp,
-                self.orig_layer.group_size,
-                qw=getattr(self.orig_layer, "imatrix", None),
-            )
+            if getattr(self.orig_layer, "sym", False):
+                global _REFIT_SKIPPED_SYM_LOGGED
+                if not _REFIT_SKIPPED_SYM_LOGGED:
+                    _REFIT_SKIPPED_SYM_LOGGED = True
+                    logger.info("[post_scale_refit] symmetric layers keep their grid (refit is asym-only)")
+            else:
+                _is_conv1d = type(self.orig_layer) == transformers.pytorch_utils.Conv1D
+                _refit_w = self.orig_layer.weight.t() if _is_conv1d else self.orig_layer.weight
+                _refit_qdq = qdq_weight.t() if _is_conv1d else qdq_weight
+                # qdq/scale/zp all live in the transposed grouped layout; the
+                # refit result must return to the original layout for copy_
+                _new_qdq, scale = _refit_scale_grid(
+                    _refit_w,
+                    _refit_qdq,
+                    scale,
+                    zp,
+                    self.orig_layer.group_size,
+                    bits=self.orig_layer.bits,
+                    qw=getattr(self.orig_layer, "imatrix", None),
+                )
+                qdq_weight = _new_qdq.t() if _is_conv1d else _new_qdq
         # if hasattr(self.orig_layer, "imatrix"):
         #     self.orig_layer.imatrix = None
         self.orig_layer.weight.data.copy_(qdq_weight)

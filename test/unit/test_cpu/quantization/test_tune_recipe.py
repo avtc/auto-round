@@ -483,8 +483,8 @@ class TestQoffNoise:
 
         import auto_round.envs as envs
 
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        monkeypatch.setenv("AR_QOFF_NOISE", "1")
+        monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
         x = [torch.zeros(2, 5, 8) for _ in range(2)]
 
         a = _maybe_qoff_noise(list(x), 1, enable_quanted_input=False)
@@ -495,7 +495,7 @@ class TestQoffNoise:
             assert torch.equal(tx, torch.zeros_like(tx)), "cached inputs never modified in place"
 
         # var=0 => x' == x + mean exactly
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path, var_val=0.0), raising=False)
+        monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path, var_val=0.0))
         c = _maybe_qoff_noise(list(x), 1, enable_quanted_input=False)
         for tc, tx in zip(c, x):
             torch.testing.assert_close(tc - tx, torch.full_like(tx, 0.05), rtol=0, atol=1e-6)
@@ -505,7 +505,7 @@ class TestQoffNoise:
 
         import auto_round.envs as envs
 
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE", False, raising=False)
+        monkeypatch.delenv("AR_QOFF_NOISE", raising=False)
         x = [torch.zeros(2, 4)]
         out = _maybe_qoff_noise(x, 3, enable_quanted_input=False)
         assert out is x
@@ -515,8 +515,8 @@ class TestQoffNoise:
 
         import auto_round.envs as envs
 
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        monkeypatch.setenv("AR_QOFF_NOISE", "1")
+        monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
         with pytest.raises(ValueError, match="qoff"):
             _maybe_qoff_noise([torch.zeros(1, 4, 8)], 1, enable_quanted_input=True)
 
@@ -525,8 +525,8 @@ class TestQoffNoise:
 
         import auto_round.envs as envs
 
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", "", raising=False)
+        monkeypatch.setenv("AR_QOFF_NOISE", "1")
+        monkeypatch.delenv("AR_QOFF_NOISE_STATS", raising=False)
         with pytest.raises(ValueError, match="AR_QOFF_NOISE_STATS"):
             _maybe_qoff_noise([torch.zeros(1, 4, 8)], 1, enable_quanted_input=False)
 
@@ -535,8 +535,8 @@ class TestQoffNoise:
 
         import auto_round.envs as envs
 
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        monkeypatch.setenv("AR_QOFF_NOISE", "1")
+        monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
         with pytest.raises(ValueError, match="block_0001.pt"):
             _maybe_qoff_noise([torch.zeros(1, 4, 8)], 2, enable_quanted_input=False)  # needs block 1 stats
 
@@ -545,25 +545,18 @@ class TestQoffNoise:
 
         import auto_round.envs as envs
 
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
-        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        monkeypatch.setenv("AR_QOFF_NOISE", "1")
+        monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
         x = [torch.zeros(1, 4, 8)]
         assert _maybe_qoff_noise(x, 0, enable_quanted_input=False) is x
 
     def test_collection_stats_finite(self, tmp_path):
-        import torch.nn as nn
+        from auto_round.algorithms.composer import _collect_qoff_noise_stats_from_outputs
 
-        from auto_round.algorithms.composer import _collect_qoff_noise_stats
-
-        block = nn.Linear(8, 8)
-        x = [torch.randn(4, 6, 8)]
-        fwd = lambda blk, inputs, others: blk(inputs[0])  # noqa: E731
-
-        def fwd_list(blk, inp, others):
-            return blk(inp[0])
-
+        y_fp = torch.zeros(4, 6, 8)
+        y_q = torch.randn(4, 6, 8) * 0.01
         path = str(tmp_path / "s" / "block_0000.pt")
-        mean, var = _collect_qoff_noise_stats(block, fwd_list, torch.zeros(4, 6, 8), x, {}, path)
+        mean, var = _collect_qoff_noise_stats_from_outputs(y_fp, y_q, path)
         assert mean.shape == (8,) and var.shape == (8,)
         assert torch.isfinite(mean).all() and torch.isfinite(var).all() and (var >= 0).all()
         import os
@@ -686,10 +679,166 @@ class TestTouchup:
         orch.calibration_context.nsamples = 8
         orch.calibration_context.seqlen = 512
 
-        monkeypatch.setattr(envs, "AR_TOUCHUP_ITERS", 0, raising=False)
+        monkeypatch.setenv("AR_TOUCHUP_ITERS", "0")
         sig0 = orch._parallel_run_signature([["model.layers.0"]])
-        monkeypatch.setattr(envs, "AR_TOUCHUP_ITERS", 5, raising=False)
+        monkeypatch.setenv("AR_TOUCHUP_ITERS", "5")
         sig5 = orch._parallel_run_signature([["model.layers.0"]])
-        monkeypatch.setattr(envs, "AR_TOUCHUP_ITERS", 7, raising=False)
+        monkeypatch.setenv("AR_TOUCHUP_ITERS", "7")
         sig7 = orch._parallel_run_signature([["model.layers.0"]])
         assert sig0 != sig5 != sig7, "touch-up count must invalidate stale resume artifacts"
+
+
+class TestReviewFixes:
+    """Regression tests for the code-review findings (imatrix, sym, act-path, Conv1D)."""
+
+    def test_recipe_anchor_with_1d_imatrix(self, monkeypatch):
+        """The standard 1D [in_features] imatrix must not crash the anchor search."""
+        from auto_round.wrapper import _compute_recipe_anchors
+
+        torch.manual_seed(11)
+        w = torch.randn(6, 32) * 0.05
+        im1d = torch.rand(32) * 4 + 0.5  # what register_imatrix_hooks attaches
+        for recipe in ("neuqi_qon", "opt_rtn_qon"):
+            out = _compute_recipe_anchors(w, 4, 32, im1d, recipe, torch.device("cpu"))
+            assert out is not None and out[0].shape == (6,)
+
+    def test_refit_with_1d_imatrix(self):
+        from auto_round.wrapper import _refit_scale_grid
+
+        torch.manual_seed(12)
+        w, s, zp, q, qdq = TestPostScaleRefit._quantized(seed=12)
+        im1d = torch.rand(32) * 4 + 0.5
+        qdq_new, _ = _refit_scale_grid(w, qdq.clone(), s.clone(), zp, 16, bits=4, qw=im1d)
+        assert torch.isfinite(qdq_new).all()
+
+    def test_refit_skips_sym_layers(self, monkeypatch):
+        import logging
+
+        from auto_round.wrapper import WrapperLinear
+
+        monkeypatch.setenv("AR_POST_SCALE_REFIT", "1")
+        layer = TestWrapperIntegration._armed_linear()
+        layer.sym = True  # symmetric layer
+        w = WrapperLinear(
+            layer,
+            enable_minmax_tuning=True,
+            enable_round_tuning=True,
+            enable_norm_bias_tuning=False,
+            device="cpu",
+            enable_torch_compile=False,
+            disable_opt_rtn=True,
+            asym_search="auto",
+            iters=5,
+        )
+        w.unwrapper({"value": torch.tensor(0.0), "min_scale": torch.tensor(1.0), "max_scale": torch.tensor(1.0)})
+        # sym layer keeps its quant_tensor_sym grid (scale magnitude = s from min/max)
+
+    def test_touchup_sym_fails_fast(self):
+        from auto_round.wrapper import WrapperLinear
+
+        layer = TestWrapperIntegration._armed_linear()
+        layer.sym = True
+        layer._touchup_scale = torch.full((16, 1), 0.003)
+        layer._touchup_zp = 3.0
+        with pytest.raises(ValueError, match="asym layers only"):
+            WrapperLinear(
+                layer,
+                enable_minmax_tuning=True,
+                enable_round_tuning=True,
+                enable_norm_bias_tuning=False,
+                device="cpu",
+                enable_torch_compile=False,
+                disable_opt_rtn=True,
+                asym_search="auto",
+                iters=5,
+            )
+
+    def test_act_quant_call_skips_recipe_guards(self, monkeypatch):
+        """neuqi_qon + W4A8 (act_sym=True) must not crash wrapper init (R1-10)."""
+        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
+        layer = TestWrapperIntegration._armed_linear()
+        layer.act_bits = 8  # activation quant engaged, sym default True
+        layer.act_data_type = "int"
+        layer.act_dynamic = True
+        from auto_round.wrapper import WrapperLinear
+
+        w = WrapperLinear(
+            layer,
+            enable_minmax_tuning=True,
+            enable_round_tuning=True,
+            enable_norm_bias_tuning=False,
+            device="cpu",
+            enable_torch_compile=False,
+            disable_opt_rtn=True,
+            asym_search="auto",
+            iters=20,
+            enable_act_quant=True,
+        )
+        assert w.act_quant_func is not None
+
+    def test_cross_env_guards(self, monkeypatch):
+        from auto_round.data_type import get_quant_func
+
+        import auto_round.envs as envs
+
+        monkeypatch.setenv("AR_ALT2_ITERS2", "10")
+        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
+        with pytest.raises(ValueError, match="AR_ALT2_ITERS2 only applies"):
+            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=20, asym_search="auto")
+
+        monkeypatch.setenv("AR_ALT2_ITERS2", "0")
+        monkeypatch.setenv("AR_QOFF_NOISE", "1")
+        with pytest.raises(ValueError, match="AR_QOFF_NOISE=1 injects"):
+            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=0, asym_search="auto")
+
+        monkeypatch.delenv("AR_QOFF_NOISE", raising=False)
+        monkeypatch.setenv("AR_TOUCHUP_ITERS", "5")
+        with pytest.raises(ValueError, match="one or the other"):
+            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=20, asym_search="auto")
+
+    def test_regrid_rederives_searched_grid(self, monkeypatch):
+        """After alt2_regrid the STE grid equals a manual search on w + v*s (R1-17)."""
+        from auto_round.data_type.int import quant_tensor_asym
+        from auto_round.data_type.neuqi import neuqi_search_scale_zero
+        from auto_round.wrapper import WrapperLinear
+
+        monkeypatch.setenv("AR_TUNE_RECIPE", "alt2")
+        layer = TestWrapperIntegration._armed_linear()
+        w = WrapperLinear(
+            layer,
+            enable_minmax_tuning=True,
+            enable_round_tuning=True,
+            enable_norm_bias_tuning=False,
+            device="cpu",
+            enable_torch_compile=False,
+            disable_opt_rtn=True,
+            asym_search="auto",
+            iters=20,
+        )
+        with torch.no_grad():
+            w.params["value"].uniform_(-0.4, 0.4)
+            # simulate tuned margins != 1.0
+            w.params["min_scale"].fill_(0.95)
+            w.params["max_scale"].fill_(1.05)
+            # snapshot the pre-switch state the manual reference must replay
+            v_snap = w.params["value"].detach().clone()
+            maxq = float(2**4 - 1)
+            s_eff = (w.weight_max.float().reshape(-1, 1) * 1.05 - w.weight_min.float().reshape(-1, 1) * 0.95) / maxq
+            w_eff_snap = layer.weight.float().reshape(16, 16) + v_snap.reshape(16, 16) * s_eff
+            w.alt2_regrid()
+        # margins must be back at 1.0 against the new anchors
+        torch.testing.assert_close(w.min_scale.detach(), torch.full_like(w.min_scale.detach(), 1.0), rtol=0, atol=1e-6)
+        torch.testing.assert_close(w.max_scale.detach(), torch.full_like(w.max_scale.detach(), 1.0), rtol=0, atol=1e-6)
+        # STE re-derivation matches a manual search on the pre-switch effective weights
+        with torch.no_grad():
+            s_man, zp_man = neuqi_search_scale_zero(w_eff_snap, 4)
+            _, scale_out, zp_out = quant_tensor_asym(
+                layer.weight,
+                bits=4,
+                group_size=16,
+                tensor_min=w.weight_min,
+                tensor_max=w.weight_max,
+                scale_dtype=torch.float32,
+            )
+        torch.testing.assert_close(scale_out.squeeze(-1), s_man.squeeze(-1), rtol=0, atol=1e-7)
+        torch.testing.assert_close(zp_out.squeeze(-1), zp_man.squeeze(-1), rtol=0, atol=1e-5)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
@@ -93,7 +94,7 @@ def _maybe_qoff_noise(active_inputs, block_index: int, enable_quanted_input: boo
             f"AR_QOFF_NOISE stats file {path} is missing. Run a zero-shot collection pass "
             "(--iters 0) with AR_QOFF_NOISE_STATS={stats_dir!r} first."
         )
-    stats = torch.load(path, map_location="cpu")
+    stats = torch.load(path, map_location="cpu", weights_only=True)
     mean = stats["mean"].to(torch.float32)
     std = stats["var"].to(torch.float32).clamp_min(0).sqrt()
     gen = torch.Generator(device="cpu").manual_seed(10_000 + block_index)
@@ -621,20 +622,28 @@ class SignRoundQuantizer(BaseQuantizer):
             if _alt2_switch is not None and (i + 1) == _alt2_switch and not _alt2_regridded:
                 _alt2_regrid_block(block)
                 _alt2_regridded = True
-                # the grid changed: round-1 best params/cache are invalid
+                # the grid changed: round-1 best params/cache and any optimizer
+                # moments reference the old grid -- drop them all
                 best_loss = torch.finfo(torch.float).max
                 best_params = {}
                 last_best_iter = i
+                optimizer.state = defaultdict(dict) if hasattr(optimizer.state, "default_factory") else {}
+                init_loss = None
 
         last_loss = total_loss
         best_iter = self.iters
         if not self.not_use_best_mse:
             last_loss = best_loss
             best_iter = last_best_iter
-        if self.iters > 0:
+        if self.iters > 0 and init_loss is not None:
             dump_info = (
                 f"quantized {len(quantized_layer_names)}/{(len(quantized_layer_names) + len(unquantized_layer_names))} "
                 f"layers in the block, loss iter 0: {init_loss:.6f} -> iter {best_iter}: {last_loss:.6f}"
+            )
+        elif self.iters > 0:  # alt2: iter 0 belonged to the superseded round-1 grid
+            dump_info = (
+                f"quantized {len(quantized_layer_names)}/{(len(quantized_layer_names) + len(unquantized_layer_names))} "
+                f"layers in the block, best iter {best_iter}: {last_loss:.6f}"
             )
         else:
             dump_info = (

@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+import transformers  # noqa: I001  (bias-correction target types)
 
 from auto_round.algorithms.block_runner import BlockForwardRunner
 from auto_round.algorithms.config_resolver import (
@@ -45,8 +46,6 @@ from auto_round.algorithms.utils import _has_nvfp4_layer
 from auto_round.logger import logger
 from auto_round.utils import clear_memory
 from auto_round.utils.device_manager import device_manager
-
-import transformers  # noqa: E402  (bias-correction hook target types)
 
 
 def _as_hidden_tensor(out):
@@ -82,10 +81,15 @@ def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
     y_fp = _as_hidden_tensor(y_fp).detach()
     y_q = _as_hidden_tensor(y_q).detach()
     b = (y_fp.to(torch.float32) - y_q.to(torch.float32)).mean(dim=tuple(range(y_q.dim() - 1)))
+
+    def _out_features(mod):
+        # nn.Linear weight is [out, in]; Conv1D weight is [in, out]
+        return mod.weight.shape[1] if isinstance(mod, transformers.pytorch_utils.Conv1D) else mod.weight.shape[0]
+
     targets = [
         (name, mod)
         for name, mod in block.named_modules()
-        if isinstance(mod, (nn.Linear, transformers.pytorch_utils.Conv1D)) and mod.weight.shape[0] == b.numel()
+        if isinstance(mod, (nn.Linear, transformers.pytorch_utils.Conv1D)) and _out_features(mod) == b.numel()
     ]
     non_expert = [(n, m) for n, m in targets if ".experts." not in n and "experts." not in n]
     pool = non_expert or targets
@@ -102,16 +106,15 @@ def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
     return True
 
 
-def _collect_qoff_noise_stats(block, block_forward_fn, y_fp, inputs, input_others, path):
+def _collect_qoff_noise_stats_from_outputs(y_fp, y_q, path):
     """Per-channel stats of the quantization noise (y_fp - y_q) for one block.
 
+    Consumes block outputs the pipeline already computed (no extra forward).
     Writes ``{mean, var}`` CPU tensors [hidden] to ``path`` (created with
     parents). Returns (mean, var).
     """
     import os as _os
 
-    with torch.no_grad():
-        y_q = block_forward_fn(block, inputs, input_others)
     y_fp_t = _as_hidden_tensor(y_fp).detach().to(torch.float32)
     y_q_t = _as_hidden_tensor(y_q).detach().to(torch.float32)
     noise = (y_fp_t - y_q_t).reshape(-1, y_fp_t.shape[-1])
@@ -120,17 +123,6 @@ def _collect_qoff_noise_stats(block, block_forward_fn, y_fp, inputs, input_other
     _os.makedirs(_os.path.dirname(path), exist_ok=True)
     torch.save({"mean": mean, "var": var}, path)
     return mean, var
-
-
-def _maybe_bias_correct(block, y_fp, block_forward_fn, inputs, input_others):
-    """Dedicated quantized pass for the non-chained (qoff) path + correction."""
-    from auto_round import envs
-
-    if y_fp is None or not envs.AR_BIAS_CORRECT:
-        return False
-    with torch.no_grad():
-        y_q = block_forward_fn(block, inputs, input_others)
-    return _apply_block_bias_correction(block, y_fp, y_q)
 
 
 if TYPE_CHECKING:  # avoid circular imports at runtime
@@ -588,40 +580,49 @@ class AlgorithmComposer:
             pre.post_quantize_block(block_ctx)
 
         # ── Step 6: Collect quantized-block outputs for the next block ──────────
+        from auto_round import envs as _envs
+
+        if _envs.AR_QOFF_NOISE_STATS and len(block_ctx.block_names) > 1:
+            raise ValueError(
+                "AR_QOFF_NOISE_STATS collects one stats file per compress_block call; with "
+                f"nblocks={len(block_ctx.block_names)} a call covers several blocks and the "
+                "per-block file contract breaks. Rerun with nblocks=1."
+            )
+        if _envs.AR_BIAS_CORRECT and _envs.AR_BLOCK_PARALLEL_WORKER:
+            raise ValueError(
+                "AR_BIAS_CORRECT mutates module biases, which are not part of the worker result files -- "
+                "the correction would be silently lost. It is a serial/streaming-only pass."
+            )
         if self.block_quantizer.enable_quanted_input:
             with torch.no_grad():
                 new_q_input = block_forward_fn(block, effective_input, input_others)
                 new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
             if reference_next_input is not None:
-                from auto_round import envs as _envs
-
+                # stats BEFORE bias correction: the correction absorbs the
+                # mean by construction, so post-correction stats would be ~0
+                if _envs.AR_QOFF_NOISE_STATS:
+                    _collect_qoff_noise_stats_from_outputs(
+                        reference_next_input,
+                        new_q_input,
+                        f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
+                    )
                 if _envs.AR_BIAS_CORRECT:
                     _apply_block_bias_correction(block, reference_next_input, new_q_input)
-                if _envs.AR_QOFF_NOISE_STATS:
-                    idx = getattr(block_ctx, "block_index", 0)
-                    _collect_qoff_noise_stats(
-                        block,
-                        block_forward_fn,
-                        reference_next_input,
-                        effective_input,
-                        input_others,
-                        f"{_envs.AR_QOFF_NOISE_STATS}/block_{idx:04d}.pt",
-                    )
         else:
             new_q_input = None
-            _maybe_bias_correct(block, reference_next_input, block_forward_fn, effective_input, input_others)
-            from auto_round import envs as _envs
-
-            if _envs.AR_QOFF_NOISE_STATS and reference_next_input is not None:
-                idx = getattr(block_ctx, "block_index", 0)
-                _collect_qoff_noise_stats(
-                    block,
-                    block_forward_fn,
-                    reference_next_input,
-                    effective_input,
-                    input_others,
-                    f"{_envs.AR_QOFF_NOISE_STATS}/block_{idx:04d}.pt",
-                )
+            _stats_y_q = None
+            if reference_next_input is not None:
+                if _envs.AR_QOFF_NOISE_STATS or _envs.AR_BIAS_CORRECT:
+                    with torch.no_grad():
+                        _stats_y_q = block_forward_fn(block, effective_input, input_others)
+                if _envs.AR_QOFF_NOISE_STATS:
+                    _collect_qoff_noise_stats_from_outputs(
+                        reference_next_input,
+                        _stats_y_q,
+                        f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
+                    )
+                if _envs.AR_BIAS_CORRECT:
+                    _apply_block_bias_correction(block, reference_next_input, _stats_y_q)
 
         return new_q_input, reference_next_input
 

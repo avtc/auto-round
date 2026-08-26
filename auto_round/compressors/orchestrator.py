@@ -376,6 +376,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             # process only the assigned block (span restricts the range)
             start_index = start_block_idx
         touchup = 0 if span is not None else envs.AR_TOUCHUP_ITERS
+        if touchup and resume_state is not None and resume_state.resume_index > 0:
+            raise ValueError(
+                f"AR_TOUCHUP_ITERS tunes every block from 0, but a partially-consumed resume manifest "
+                f"starts at block {resume_state.resume_index} (its chain entry would feed wrong-depth "
+                "inputs to the earlier blocks). Point AR_RESUME_DIR at a fresh dir or complete/clear "
+                "the prior run's manifests."
+            )
         if touchup:
             from auto_round.compressors import block_parallel as _bp_mod
 
@@ -527,9 +534,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # forward's pre-tune tail already published it)
                 _bp_save_block_results(bp_results_dir, block_names[i], self._collect_tuned_layers(block_names[i]))
             elif touchup and bp_results_dir:
-                # touch-up improved the block: overwrite its result so a later
-                # apply/export uses the touched grid
-                _bp_save_block_results(bp_results_dir, block_names[i], self._collect_tuned_layers(block_names[i]))
+                # touch-up improved the block(s): overwrite their results so a
+                # later apply/export uses the touched grid (all blocks of an
+                # nblocks>1 group, not just the first)
+                _touched = (
+                    [block_names[i]] if nblocks == 1 else list(block_names[i : min(i + nblocks, len(block_names))])
+                )
+                for _tn in _touched:
+                    _bp_save_block_results(bp_results_dir, _tn, self._collect_tuned_layers(_tn))
 
             if self.compress_context.is_immediate_saving and not is_bp_worker:
                 self.shard_writer.write(m, is_finalize=False)
@@ -2171,6 +2183,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                         else:
                             pbar.update(resume_state.resume_index)
 
+                _serial_bp_dir = None
+                if envs.AR_RESUME_DIR:
+                    from auto_round.compressors import block_parallel as _bp_call
+
+                    _serial_bp_dir = _bp_call.parallel_results_dir()
                 self._quantize_blocks(
                     self.model_context.model,
                     inputs,
@@ -2182,6 +2199,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     token_ids=input_ids_cache,
                     resume_state=resume_state,
                     resume_input_ids=resume_input_ids,
+                    bp_results_dir=_serial_bp_dir,
                 )
                 if self.compress_context.is_immediate_packing and len(self.formats) != 1:
                     raise ValueError(

@@ -282,7 +282,7 @@ export AR_DISK_STREAM_MODEL=1
 ```
 
 ### AR_POST_SCALE_REFIT
-- **Description**: Post-tuning per-group least-squares scale refit with the integer grid and zero points frozen. One closed-form step (the exact minimizer for frozen integers), imatrix-weighted when an imatrix is present; monotone non-increasing weighted MSE by construction. Composable with any `AR_TUNE_RECIPE` (and with plain minmax-init runs); applies to int data types with standard group sizes.
+- **Description**: Post-tuning per-group least-squares scale refit with the integer grid and zero points frozen. One closed-form step (the exact minimizer for frozen integers), imatrix-weighted when an imatrix is present; monotone non-increasing weighted MSE by construction. Composable with any `AR_TUNE_RECIPE` (and with plain minmax-init runs); applies to asymmetric int layers with standard group sizes (symmetric layers keep their grid, logged once).
 - **Default**: `0` (off)
 - **Valid Values**: `0`, `1` (also `true`/`yes`)
 
@@ -291,7 +291,7 @@ export AR_POST_SCALE_REFIT=1
 ```
 
 ### AR_BIAS_CORRECT
-- **Description**: Post-quantization bias correction per transformer block: `b = mean over calibration tokens(y_fp - y_q)` at the block's residual-stream boundary, absorbed into the bias of the block's residual-feeding projection (the last Linear/Conv1D with out_features == hidden; routed-expert modules are deprioritized since they execute on token subsets only). Bias is created when absent — native in all export formats, so vLLM sees it without changes. Reuses the chain forward on the qon path (zero extra forwards); adds one no-grad pass on the qoff path. Composable with any `AR_TUNE_RECIPE` and `AR_POST_SCALE_REFIT`.
+- **Description**: Post-quantization bias correction per transformer block: `b = mean over calibration tokens(y_fp - y_q)` at the block's residual-stream boundary, absorbed into the bias of the block's residual-feeding projection (the last Linear/Conv1D with out_features == hidden; routed-expert modules are deprioritized since they execute on token subsets only). Bias is created when absent — native in all export formats, so vLLM sees it without changes. Reuses the chain forward on the qon path (zero extra forwards); adds one no-grad pass on the qoff path. Serial/streaming only — a hard error under block-parallel workers (biases are not part of worker result files). Composable with any `AR_TUNE_RECIPE` and `AR_POST_SCALE_REFIT`.
 - **Default**: `0` (off)
 - **Valid Values**: `0`, `1` (also `true`/`yes`)
 
@@ -309,7 +309,7 @@ export AR_TUNE_RECIPE=alt2 AR_ALT2_ITERS2=10   # + --iters 20 --asym
 ```
 
 ### AR_QOFF_NOISE
-- **Description**: qoff (FP-reference-chain) tuning unblocker. BPT/serial qoff tuning optimizes each block against FP-reference inputs that the deployed quantized chain never produces — the measured deployment-mismatch regression. When enabled, the tuning forwards inject per-channel quantization noise `mean + std*eps` (stats of the previous quantized block's output drift, `eps` deterministic per block seed) into the FP inputs; the cached FP inputs are never modified in place. Block 0 skips injection (its inputs are embeddings). Guards: hard error under qon (quantized-input chaining already sees real inputs), without `AR_QOFF_NOISE_STATS`, or on missing/width-mismatched stats.
+- **Description**: qoff (FP-reference-chain) tuning unblocker. BPT/serial qoff tuning optimizes each block against FP-reference inputs that the deployed quantized chain never produces — the measured deployment-mismatch regression. When enabled, the tuning forwards inject per-channel quantization noise `mean + std*eps` (stats of the previous quantized block's output drift, `eps` deterministic per block seed) into the FP inputs; the cached FP inputs are never modified in place. Block 0 skips injection (its inputs are embeddings). Guards: hard error under qon (quantized-input chaining already sees real inputs), without `AR_QOFF_NOISE_STATS`, or on missing/width-mismatched stats, on the zero-shot path (no tuning), and when nblocks > 1 (one stats file per block contract).
 - **Default**: `0` (off)
 - **Valid Values**: `0`, `1` (also `true`/`yes`)
 
