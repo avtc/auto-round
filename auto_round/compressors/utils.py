@@ -555,16 +555,19 @@ _PACK_DEVICE_LOGGED = False
 def _format_supports_batched_pack(fmt) -> bool:
     """True when the format's pack chain terminates in the autoround packer.
 
-    Only the plain ``auto_round[:backend]`` formats qualify: gguf/awq/gptq/
-    llm_compressor and the nvfp/mxfp/fp8 sub-formats pack through their own
-    paths and keep the per-module immediate_pack loop. ``auto_round:llm_compressor``
-    carries the ``auto_round`` prefix but resolves to the compressed-tensors
-    packer -- batched-packing it would silently write qweight/qzeros/scales
-    modules into an otherwise CT-packed checkpoint (mixed-format export).
+    Only a PURE, unrouted ``auto_round`` format qualifies: ``AutoRoundFormat``
+    wraps other format families (``auto_round:llm_compressor`` -> CT packer,
+    sym ``auto_round`` -> gptq packer, 4-bit asym ``auto_round`` -> awq packer)
+    while its own ``output_format`` attribute stays the plain "auto_round" --
+    so the check must look at the ROUTING (``backend is None``), never at the
+    wrapper's identity attributes. Batched-packing a routed format writes
+    qweight/qzeros/scales modules into an otherwise differently-packed
+    checkpoint that no single consumer can load.
     """
-    format_name = getattr(fmt, "format_name", None)
-    if format_name is not None and format_name != "auto_round":
+    if getattr(fmt, "format_name", None) != "auto_round":
         return False
+    if getattr(fmt, "backend", None) is not None:
+        return False  # routed to another format family: per-module pack differs
     out = str(getattr(fmt, "output_format", "") or "")
     if not out.startswith("auto_round"):
         return False

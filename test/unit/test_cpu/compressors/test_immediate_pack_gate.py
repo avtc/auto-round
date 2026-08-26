@@ -26,25 +26,50 @@ import pytest
 import torch
 from torch import nn
 
+from auto_round.compressors.config_resolution import resolve_scheme_value
 from auto_round.compressors.utils import _format_supports_batched_pack
 from auto_round.export.export_to_autoround.export import pack_layers_batched
+from auto_round.export.formats import resolve_formats
 
 
-def test_gate_rejects_llm_compressor_family():
-    stub = SimpleNamespace(output_format="auto_round:llm_compressor", format_name="llm_compressor")
-    assert not _format_supports_batched_pack(stub)
+def _fmt(format: str, scheme_name: str = "W4A16", model=None, **overrides):
+    """Resolve to the REAL format instance the quantizer would use."""
+    scheme = resolve_scheme_value(scheme_name, overrides)
+    result = resolve_formats(scheme, format=format, layer_config=None, model=model)
+    return result.formats[0]
 
 
-def test_gate_rejects_llm_compressor_without_format_name():
-    stub = SimpleNamespace(output_format="auto_round:llm_compressor")
-    assert not _format_supports_batched_pack(stub)
+def test_gate_rejects_llm_compressor_wrapper():
+    # "auto_round:llm_compressor" resolves to an AutoRoundFormat WRAPPER whose
+    # output_format attr is plain "auto_round" (per-module packing delegates
+    # to the compressed-tensors packer) -- the gate must look at the routing,
+    # not the wrapper's identity attributes.
+    fmt = _fmt("auto_round:llm_compressor")
+    assert type(fmt).__name__ == "AutoRoundFormat"
+    assert fmt.output_format == "auto_round"  # the trap the gate must survive
+    assert not _format_supports_batched_pack(fmt)
 
 
-def test_gate_accepts_autoround_family():
-    assert _format_supports_batched_pack(SimpleNamespace(output_format="auto_round", format_name="auto_round"))
-    assert _format_supports_batched_pack(
-        SimpleNamespace(output_format="auto_round:exllamav2", format_name="auto_round")
-    )
+def test_gate_rejects_routed_sym_and_asym_defaults():
+    # plain "auto_round" silently routes sym -> gptq packer and 4-bit asym ->
+    # awq packer via the backend wrapper; both pack per-module through a
+    # DIFFERENT packer than the batched path uses -- must not batch.
+    sym = _fmt("auto_round", sym=True)
+    assert sym.backend is not None and "gptq" in type(sym.backend).__name__.lower()
+    assert not _format_supports_batched_pack(sym)
+
+    asym = _fmt("auto_round", sym=False, model=nn.ModuleDict({"q": nn.Linear(64, 64)}))
+    assert asym.backend is not None and "awq" in type(asym.backend).__name__.lower()
+    assert not _format_supports_batched_pack(asym)
+
+
+def test_gate_accepts_unrouted_autoround_format():
+    # a scheme that matches no routing branch (3-bit int asym) keeps
+    # backend=None -- the only case where per-module and batched packing use
+    # the same qlinear_torch packer.
+    fmt = _fmt("auto_round", sym=False, bits=3)
+    assert fmt.backend is None
+    assert _format_supports_batched_pack(fmt)
 
 
 def test_gate_still_rejects_fp_and_fake_variants():
