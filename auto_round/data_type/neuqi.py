@@ -59,6 +59,7 @@ batched -> compiled per-candidate -> eager).
 """
 
 import math
+import os
 import threading
 from functools import lru_cache
 
@@ -277,6 +278,26 @@ def _triton_sweep_fn():
 
 
 _BACKEND_OVERRIDE = None  # set by backend_override(); None = env-driven
+
+
+def _audit_indices(name: str, index: torch.Tensor, bound: int, extra: str = "") -> None:
+    """AR_NEUQI_AUDIT=1: host-side bounds check of gather inputs (forces sync).
+
+    Distinguishes "the index tensor really holds OOB values" (logic/memory
+    corruption feeding the gathers) from "valid indices + assert anyway"
+    (illegal memory access elsewhere, misreported at the next index op).
+    """
+    if os.getenv("AR_NEUQI_AUDIT", "0") not in ("1", "true", "yes"):
+        return
+    idx = index.detach().to(torch.int64).reshape(-1)
+    bad = (idx >= bound) | (idx < -bound)
+    n_bad = int(bad.sum().item())  # syncs
+    if n_bad:
+        raise RuntimeError(
+            f"[neuqi_audit] {name}: {n_bad}/{idx.numel()} indices OOB (bound {bound}); "
+            f"min {int(idx.min().item())} max {int(idx.max().item())} {extra}"
+        )
+
 
 _sweep_warm_lock = threading.Lock()
 _sweep_warmed_devices: set = set()  # device indices whose Triton sweep was warmed once
@@ -541,6 +562,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
                 break  # latched failure / fused backend off: redo per candidate
             loss_k, zp_k = out  # [chunk, K] each
             loss, k_idx = loss_k.min(dim=1)  # first-min over candidates
+            _audit_indices("coarse", k_idx, zp_k.shape[1], f"loss{tuple(loss_k.shape)} zp{tuple(zp_k.shape)}")
             zp = zp_k.gather(1, k_idx.unsqueeze(1)).squeeze(1)
             frac = coarse.index_select(0, k_idx)
             improved = loss < best_loss[start:stop]
@@ -580,6 +602,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
                 break
             loss_k, zp_k = out
             loss, k_idx = loss_k.min(dim=1)
+            _audit_indices("fine", k_idx, zp_k.shape[1], f"loss{tuple(loss_k.shape)} zp{tuple(zp_k.shape)}")
             zp = zp_k.gather(1, k_idx.unsqueeze(1)).squeeze(1)
             frac = fracs.gather(1, k_idx.unsqueeze(1)).squeeze(1)
             improved = loss < best_loss[start:stop]
