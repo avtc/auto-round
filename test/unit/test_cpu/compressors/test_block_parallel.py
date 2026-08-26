@@ -743,3 +743,26 @@ class TestRehomeBlock:
         block = torch.nn.Linear(4, 4)
         assert rehome_block_(block, torch.device("cpu")) == 0
         assert block.weight.device.type == "cpu"
+
+
+class TestStreamMemInventory:
+    """AR_STREAM_MEM_INVENTORY: bucket names + graceful no-CUDA behavior."""
+
+    def test_mem_bucket_names(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        b = CompressionOrchestrator._mem_bucket
+        assert b("model.language_model.layers.12.self_attn.q_proj.weight") == "block:12"
+        assert b("model.embed_tokens.weight") == "embeddings"
+        assert b("lm_head.weight") == "nonblock:lm_head"
+
+    def test_inventory_noop_without_cuda(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch.model = torch.nn.Linear(4, 4)  # cpu-only box: loop body skips cuda tensors
+        orch._log_device_inventory({"fp_inputs": [torch.ones(2)]}, "test")  # must not raise

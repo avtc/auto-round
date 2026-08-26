@@ -251,6 +251,11 @@ export AR_NEUQI_LAYOUT=mid
 export AR_PRESINQ_BACKEND=eager
 ```
 
+### AR_STREAM_MEM_INVENTORY
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Streaming-quantization diagnostic. When set, the zero-shot loop logs a per-GPU memory breakdown every 16 blocks (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
+
 ### AR_DISABLE_TUNING_FANOUT
 
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)

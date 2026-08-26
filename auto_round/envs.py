@@ -127,6 +127,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CUDA, "on" forces it on any fused-capable device, "off" keeps the
     # per-candidate loop.
     "AR_NEUQI_BATCH": lambda: os.getenv("AR_NEUQI_BATCH", "auto").lower(),
+    "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower()
+    in ("1", "true", "yes"),
     "AR_DISABLE_TUNING_FANOUT": lambda: os.getenv("AR_DISABLE_TUNING_FANOUT", "0").lower() in ("1", "true", "yes"),
     # Sinkhorn loop backend for the Pre-SINQ transform: "auto" serves the loop
     # with the extension Triton kernels on CUDA (2.1-2.8x over the eager loop,
