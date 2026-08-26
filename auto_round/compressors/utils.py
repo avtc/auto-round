@@ -143,6 +143,30 @@ def strip_stale_device_hooks_(module: torch.nn.Module) -> int:
     return cleaned
 
 
+def rehome_block_(module: torch.nn.Module, device) -> int:
+    """Move every non-meta tensor reachable from ``module`` onto ``device``.
+
+    Streams load only checkpoint-backed tensors under the block prefix onto the
+    round-robin home; modules created at setup OUTSIDE the checkpoint layout
+    (e.g. merged shared-layer projections living on the primary) are reachable
+    from the block but never re-homed - a block forward then mixes homes
+    (shared in_proj on cuda:0 x conv1d weight on cuda:1). Meta placeholders
+    are left for the streamer. Returns the number of tensors moved.
+    """
+    target = torch.device(device)
+    moved = 0
+
+    def _fn(t: torch.Tensor) -> torch.Tensor:
+        nonlocal moved
+        if t.device != target and t.device.type != "meta":
+            moved += 1
+            return t.to(target)
+        return t
+
+    module._apply(_fn)
+    return moved
+
+
 def block_forward(
     block: torch.nn.Module,
     input_ids: torch.Tensor,
