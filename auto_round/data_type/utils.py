@@ -139,6 +139,14 @@ def get_quant_func(
     def pad_bits(data_type):
         return data_type + str(bits)
 
+    if asym_search == "neuqi" and iters > 0:
+        raise ValueError(
+            'asym_search="neuqi" applies only to the zero-shot path (iters=0), where it replaces the '
+            "optimized-RTN min/max initialization with a joint (scale, zero-point) grid search. With "
+            "iters>0 the SignRound tuning path runs instead and --enable_neuqi would silently do "
+            "nothing. Set --iters 0 to use the NeUQI search, or drop --enable_neuqi to tune."
+        )
+
     if not disable_opt_rtn and iters == 0:
         rtn_data_type = "opt_rtn_" + dtype
         data_types = [rtn_data_type, pad_bits(rtn_data_type), pad_sym(rtn_data_type), pad_sym(pad_bits(rtn_data_type))]

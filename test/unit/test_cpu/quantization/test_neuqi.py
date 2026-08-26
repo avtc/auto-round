@@ -670,3 +670,21 @@ class TestAsymSearchAPI:
 
         cfg = RTNConfig(bits=4, group_size=32, sym=False)
         assert cfg.asym_search == "auto"
+
+
+class TestNeuqiItersGuard:
+    """--enable_neuqi with iters>0 is a silent no-op today; it must fail fast."""
+
+    def test_neuqi_with_iters_raises(self):
+        import pytest
+
+        from auto_round.data_type.utils import get_quant_func
+
+        with pytest.raises(ValueError, match="zero-shot path"):
+            get_quant_func("int", 4, False, disable_opt_rtn=False, group_size=128, iters=20, asym_search="neuqi")
+
+    def test_neuqi_zero_shot_still_resolves(self):
+        from auto_round.data_type.utils import get_quant_func
+
+        fn, name = get_quant_func("int", 4, False, disable_opt_rtn=False, group_size=128, iters=0, asym_search="neuqi")
+        assert name.startswith("opt_rtn_int_asym")
