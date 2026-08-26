@@ -611,9 +611,7 @@ def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: in
         # garbles the log ("...(batched...):33, 16.50s/it]")
         if not _PACK_DEVICE_LOGGED:
             _PACK_DEVICE_LOGGED = True
-            logger.info(
-                "immediate_pack_block: packing on %s (batched for same-shape Linear groups)", pack_device
-            )
+            logger.info("immediate_pack_block: packing on %s (batched for same-shape Linear groups)", pack_device)
     if fmt is not None and pack_device.type != "cpu" and _format_supports_batched_pack(fmt):
         from auto_round.export.export_to_autoround.export import pack_layers_batched
 
