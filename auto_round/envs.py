@@ -94,6 +94,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # forces the Triton kernel, "compile" forces the torch.compile sweeps on any
     # device, "eager" always uses the reference chunked sweep.
     "AR_NEUQI_BACKEND": lambda: os.getenv("AR_NEUQI_BACKEND", "auto").lower(),
+    # Experimental init-search recipes for the SignRound tuning path (iters>0):
+    # "" (default) = status-quo min/max init; see docs/environments.md for the
+    # recipe table, composability rules, and the BPT arms.
+    "AR_TUNE_RECIPE": lambda: os.getenv("AR_TUNE_RECIPE", "").strip().lower(),
     # Memory layout of the fused zero-point sweep expression: "auto" picks by
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
     # "last"/"mid" force one layout for A/B measurements.

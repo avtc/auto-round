@@ -139,12 +139,42 @@ def get_quant_func(
     def pad_bits(data_type):
         return data_type + str(bits)
 
-    if asym_search == "neuqi" and iters > 0:
+    from auto_round import envs
+
+    recipe = envs.AR_TUNE_RECIPE
+    _tuning_recipes = ("minmax_qon", "neuqi_qon", "neuqi_frozen_qon", "neuqi_fp", "opt_rtn_qon", "alt2")
+    _valid = ("",) + _tuning_recipes + ("neuqi_it0",)
+    if recipe not in _valid:
+        raise ValueError(f"AR_TUNE_RECIPE={recipe!r} is not one of {_valid}.")
+    if recipe == "neuqi_it0" and iters > 0:
+        raise ValueError(
+            'AR_TUNE_RECIPE="neuqi_it0" is the zero-shot reference (iters=0); for tuning use a '
+            "neuqi_* recipe or unset the variable."
+        )
+    if recipe in _tuning_recipes and iters == 0:
+        raise ValueError(
+            f"AR_TUNE_RECIPE={recipe!r} anchors the SignRound tuning path (iters>0); with iters=0 "
+            "the zero-shot search dispatch already runs. Unset the variable or use neuqi_it0."
+        )
+    if recipe == "alt2":
+        raise NotImplementedError(
+            'AR_TUNE_RECIPE="alt2" (alternating re-grid) is not implemented yet; it lands with its '
+            "own task. Available now: minmax_qon, neuqi_qon, neuqi_frozen_qon, neuqi_fp, opt_rtn_qon."
+        )
+    if recipe.startswith("neuqi_") and recipe != "neuqi_it0" and sym:
+        raise ValueError(f"AR_TUNE_RECIPE={recipe!r} requires the asymmetric path (sym=False).")
+    if recipe == "opt_rtn_qon" and not sym:
+        raise ValueError(
+            'AR_TUNE_RECIPE="opt_rtn_qon" anchors the symmetric scale-clip search; use a neuqi_* '
+            "recipe for the asymmetric path."
+        )
+    if asym_search == "neuqi" and iters > 0 and not recipe:
         raise ValueError(
             'asym_search="neuqi" applies only to the zero-shot path (iters=0), where it replaces the '
             "optimized-RTN min/max initialization with a joint (scale, zero-point) grid search. With "
             "iters>0 the SignRound tuning path runs instead and --enable_neuqi would silently do "
-            "nothing. Set --iters 0 to use the NeUQI search, or drop --enable_neuqi to tune."
+            "nothing. Set --iters 0 to use the NeUQI search, drop --enable_neuqi, or set "
+            "AR_TUNE_RECIPE to a neuqi_* recipe to use the search as the tuning init."
         )
 
     if not disable_opt_rtn and iters == 0:

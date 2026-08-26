@@ -281,6 +281,16 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 export AR_DISK_STREAM_MODEL=1
 ```
 
+### AR_TUNE_RECIPE
+- **描述**: SignRound 调优路径（`--iters > 0`）的实验性初始化搜索配方。配方用搜索到的网格替换逐组 min/max 调优网格：`neuqi_*` 锚定联合（scale、整数零点）搜索（`neuqi_search_scale_zero`，imatrix 加权）；`opt_rtn_qon` 锚定对称 scale-clip 搜索。`neuqi_frozen_qon` 额外把 `min_scale`/`max_scale` 调优边距固定为 1.0（网格完全固定，仅调舍入）。`neuqi_fp` 与 `neuqi_qon` 的区别仅在于初始化 imatrix 来自哪条链（FP 参考链 vs 量化链）——流式 qon 下实时 imatrix 本身就是链一致的。配方适用于标准（非 tuple）group size 的 int 数据类型；不支持的布局保持 min/max 网格。
+- **默认值**: 未设置（保持现状 min/max 初始化）
+- **有效值**: `minmax_qon`（显式对照臂）、`neuqi_qon`、`neuqi_frozen_qon`、`neuqi_fp`（兼容 BPT/qoff）、`opt_rtn_qon`（仅对称）、`alt2`（尚未实现）、`neuqi_it0`（零样本参考标记；需 `--iters 0`）
+- **用法**: 在小模型上按 KLD 对比分量配方。`neuqi_*` 需要 `--asym`；`opt_rtn_qon` 需要对称。可与 `AR_POST_SCALE_REFIT`、`AR_BIAS_CORRECT` 组合。
+
+```bash
+export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

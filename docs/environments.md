@@ -281,6 +281,16 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 export AR_DISK_STREAM_MODEL=1
 ```
 
+### AR_TUNE_RECIPE
+- **Description**: Experimental init-search recipe for the SignRound tuning path (`--iters > 0`). The recipe replaces the per-group min/max tuning grid with a searched grid: `neuqi_*` anchors the joint (scale, integer zero-point) search (`neuqi_search_scale_zero`, imatrix-weighted); `opt_rtn_qon` anchors the symmetric scale-clip search. `neuqi_frozen_qon` additionally pins the `min_scale`/`max_scale` tuning margins at 1.0 (grid fully fixed, only rounding tunes). `neuqi_fp` vs `neuqi_qon` differ only in which chain shaped the init imatrix (FP-reference vs quantized) — under streaming qon the live imatrix is already chain-faithful. Recipes apply to int data types with standard (non-tuple) group sizes; unsupported layouts keep the min/max grid.
+- **Default**: unset (status-quo min/max init)
+- **Valid Values**: `minmax_qon` (explicit control arm), `neuqi_qon`, `neuqi_frozen_qon`, `neuqi_fp` (BPT/qoff-compatible), `opt_rtn_qon` (symmetric only), `alt2` (not yet implemented), `neuqi_it0` (zero-shot reference marker; requires `--iters 0`)
+- **Usage**: Race quantization recipes by KLD on a small model. `neuqi_*` requires `--asym`; `opt_rtn_qon` requires symmetric. Composable with `AR_POST_SCALE_REFIT` and `AR_BIAS_CORRECT`.
+
+```bash
+export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

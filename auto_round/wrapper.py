@@ -59,6 +59,65 @@ def get_scale_shape(weight, group_size):
     return shape
 
 
+def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
+    """Searched (scale, zp) grid for AR_TUNE_RECIPE init, expressed as the
+    per-group (tensor_min, tensor_max) pair the STE quant functions
+    re-derive the grid from.
+
+    Asym anchoring (quant_tensor_asym: scale=(wmax-wmin)/maxq,
+    zp=round(-wmin/scale)):  min=-zp*s, max=(maxq-zp)*s  reproduces (s, zp)
+    exactly. Sym anchoring (quant_tensor_sym: scale=max(|wmax|,|wmin|)/maxq,
+    signed): min=-s*maxq, max=+s*maxq.
+
+    Returns (wmin, wmax, frozen_margins) or None when the recipe needs no
+    anchoring.
+    """
+    import time as _time
+
+    if not recipe or recipe in ("minmax_qon", "alt2", "neuqi_it0"):
+        return None
+    t0 = _time.perf_counter()
+    w = weight.to(device=device, dtype=torch.float32)
+    qw = None
+    if imatrix is not None:
+        qw = imatrix.to(device=device, dtype=torch.float32)
+
+    if recipe.startswith("neuqi_"):
+        from auto_round.data_type.neuqi import neuqi_search_scale_zero
+
+        s, zp = neuqi_search_scale_zero(w, bits, qw=qw)
+        maxq = int(2**bits) - 1
+        wmin = -(zp * s)
+        wmax = (maxq - zp) * s
+        frozen = recipe == "neuqi_frozen_qon"
+    else:  # opt_rtn_qon (symmetric scale-clip search)
+        from auto_round.data_type.int import search_scales
+
+        s = search_scales(w, bits, qw=qw)
+        # search_scales returns a SIGNED scale (1/(-nmax/group_max)); the sign
+        # cancels in qdq reconstruction. Anchor the grid magnitude on the STE
+        # path's positive convention: min=-|s|*maxq, max=+|s|*maxq derives
+        # scale=|s| -- the same qdq grid the search selected.
+        s = s.abs()
+        maxq = int(2 ** (bits - 1))
+        wmin = -(s * maxq)
+        wmax = s * maxq
+        frozen = False
+    global _RECIPE_INIT_LOGGED
+    if not _RECIPE_INIT_LOGGED:
+        _RECIPE_INIT_LOGGED = True
+        logger.info(
+            "[tune_recipe] %s init-search anchored the tuning grid (%.2fs first layer; margins %s)",
+            recipe,
+            _time.perf_counter() - t0,
+            "pinned at 1.0" if frozen else "tunable from 1.0",
+        )
+    return wmin.squeeze(-1), wmax.squeeze(-1), frozen
+
+
+_RECIPE_INIT_LOGGED = False
+
+
 class WrapperLinear(torch.nn.Module):
     """A wrapper for linear/conv1d layers to enable quantization and tuning.
 
@@ -183,13 +242,39 @@ class WrapperLinear(torch.nn.Module):
             if clip_max_flat.numel() == self.weight_max.numel() and clip_min_flat.numel() == self.weight_min.numel():
                 self.weight_max = torch.minimum(self.weight_max, clip_max_flat)
                 self.weight_min = torch.maximum(self.weight_min, clip_min_flat)
+        # AR_TUNE_RECIPE: anchor the tuning grid to a searched (scale, zp)
+        # instead of the raw per-group min/max. Placement mirrors the AWQ
+        # clip-as-init above; unsupported layouts (tuple group sizes, >=16
+        # bits, no round tuning) keep the status-quo min/max grid.
+        self._tune_recipe_frozen_margins = False
+        if (
+            weight_reshape is not None
+            and self.weight_min is not None
+            and self.orig_layer.bits < 16
+            and not isinstance(orig_layer.group_size, tuple)
+        ):
+            _anchors = _compute_recipe_anchors(
+                weight_reshape,
+                self.orig_layer.bits,
+                orig_layer.group_size,
+                getattr(orig_layer, "imatrix", None),
+                envs.AR_TUNE_RECIPE,
+                self.device,
+            )
+            if _anchors is not None:
+                _wmin, _wmax, self._tune_recipe_frozen_margins = _anchors
+                self.weight_min = _wmin.to(self.weight_min.dtype)
+                self.weight_max = _wmax.to(self.weight_max.dtype)
         self._init_params(
             "value", p_dtype, weight_reshape.shape, 0, self.enable_round_tuning and self.orig_layer.bits < 16
         )
         # Min-max scale initialization
         shape = get_scale_shape(orig_weight, orig_layer.group_size)
-        self._init_params("min_scale", p_dtype, shape, 1.0, (self.enable_minmax_tuning and self.orig_layer.bits < 16))
-        self._init_params("max_scale", p_dtype, shape, 1.0, (self.enable_minmax_tuning and self.orig_layer.bits < 16))
+        _margins_tunable = (self.enable_minmax_tuning and self.orig_layer.bits < 16) and (
+            not self._tune_recipe_frozen_margins
+        )
+        self._init_params("min_scale", p_dtype, shape, 1.0, _margins_tunable)
+        self._init_params("max_scale", p_dtype, shape, 1.0, _margins_tunable)
 
         self.weight_quant_func, self.data_type = get_quant_func(
             orig_layer.data_type,
