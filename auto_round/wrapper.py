@@ -293,7 +293,20 @@ class WrapperLinear(torch.nn.Module):
                 envs.AR_TUNE_RECIPE,
                 self.device,
             )
-            if _anchors is not None:
+            _touch_scale = getattr(orig_layer, "_touchup_scale", None)
+            if _touch_scale is not None:
+                # post-BPT touch-up: anchor exactly to the tuned (scale, zp)
+                # pair; margins stay tunable so round 2 can still polish range
+                maxq = float(2**self.orig_layer.bits - 1)
+                _tzp = getattr(orig_layer, "_touchup_zp", 0)
+                _tzp = _tzp.reshape(-1, 1).to(_touch_scale.dtype) if isinstance(_tzp, torch.Tensor) else _tzp
+                s = _touch_scale.reshape(-1, 1).to(torch.float32)
+                wmin = -(_tzp * s) if isinstance(_tzp, torch.Tensor) else torch.full_like(s, -_tzp) * s
+                wmax = ((maxq - _tzp) * s) if isinstance(_tzp, torch.Tensor) else (maxq - _tzp) * s
+                self.weight_min = wmin.squeeze(-1).to(self.weight_min.dtype)
+                self.weight_max = wmax.squeeze(-1).to(self.weight_max.dtype)
+                self._tune_recipe = "touchup"
+            elif _anchors is not None:
                 _wmin, _wmax, self._tune_recipe_frozen_margins = _anchors
                 self._tune_recipe = envs.AR_TUNE_RECIPE
                 self.weight_min = _wmin.to(self.weight_min.dtype)

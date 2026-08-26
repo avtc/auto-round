@@ -320,6 +320,17 @@ export AR_QOFF_NOISE_STATS=/mnt/bigdisk/qoff_stats
 export AR_QOFF_NOISE=1 AR_QOFF_NOISE_STATS=/mnt/bigdisk/qoff_stats
 ```
 
+### AR_TOUCHUP_ITERS
+- **描述**: BPT 之后的串行 qon 补调：当 block-parallel（qoff）运行完成所有 block 调优后，设置此环境的串行重跑会在真实量化链（qon）上对每个 block 补调 N 次迭代。每个 SignRound wrapper 以 BPT 调优得到的 (scale, zp) 对为锚点起始——恰好从并行运行停下的地方继续——舍入参数清零、边距仍可调；改进后的结果会覆盖该 block 的 result 文件，后续 apply/导出使用补调后的网格。运行签名包含补调次数：修改 N 会使过期的 resume 产物失效。守卫：仅限串行（worker 环境必须 unset）、要求量化输入链（qon）、要求 results 目录存在且每个 block 都有完整 result 文件。
+- **默认值**: `0`（关闭）
+- **有效值**: `0`（关闭），或小的正整数（通常 2–5）
+
+```bash
+# 1) BPT 阶段（结果在 AR_RESUME_DIR）
+# 2) 量化链上的串行补调：
+export AR_TOUCHUP_ITERS=5   # 同一个 AR_RESUME_DIR；去掉 --enable_block_parallel_tuning；启用 qon
+```
+
 ### AR_TUNE_RECIPE
 - **描述**: SignRound 调优路径（`--iters > 0`）的实验性初始化搜索配方。配方用搜索到的网格替换逐组 min/max 调优网格：`neuqi_*` 锚定联合（scale、整数零点）搜索（`neuqi_search_scale_zero`，imatrix 加权）；`opt_rtn_qon` 锚定对称 scale-clip 搜索。`neuqi_frozen_qon` 额外把 `min_scale`/`max_scale` 调优边距固定为 1.0（网格完全固定，仅调舍入）。`neuqi_fp` 与 `neuqi_qon` 的区别仅在于初始化 imatrix 来自哪条链（FP 参考链 vs 量化链）——流式 qon 下实时 imatrix 本身就是链一致的。配方适用于标准（非 tuple）group size 的 int 数据类型；不支持的布局保持 min/max 网格。
 - **默认值**: 未设置（保持现状 min/max 初始化）

@@ -115,6 +115,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # writes block_<idx>.pt (per-channel mean/var of y_fp - y_q); the tuning
     # run reads them back for injection.
     "AR_QOFF_NOISE_STATS": lambda: os.getenv("AR_QOFF_NOISE_STATS", "").strip(),
+    # Post-BPT serial qon touch-up: re-tune this many iterations per block on
+    # the real quantized chain, starting each wrapper from the tuned grid.
+    "AR_TOUCHUP_ITERS": lambda: int(os.getenv("AR_TOUCHUP_ITERS", "0") or 0),
     # Memory layout of the fused zero-point sweep expression: "auto" picks by
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
     # "last"/"mid" force one layout for A/B measurements.

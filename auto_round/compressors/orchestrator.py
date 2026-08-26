@@ -375,6 +375,39 @@ class CompressionOrchestrator(BaseOrchestrator):
             # worker tune call: the entry input was restored by the caller;
             # process only the assigned block (span restricts the range)
             start_index = start_block_idx
+        touchup = 0 if span is not None else envs.AR_TOUCHUP_ITERS
+        if touchup:
+            from auto_round.compressors import block_parallel as _bp_mod
+
+            if envs.AR_BLOCK_PARALLEL_WORKER:
+                raise ValueError(
+                    "AR_TOUCHUP_ITERS is a SERIAL post-BPT pass; unset it in block-parallel worker "
+                    "environments (rerun the parent command without --enable_block_parallel_tuning)."
+                )
+            if not self.alg_composer.need_quanted_input():
+                raise ValueError(
+                    "AR_TOUCHUP_ITERS re-tunes on the real quantized chain (qon); enable quantized-input "
+                    "chaining for the tuning run."
+                )
+            if not bp_results_dir or not os.path.isdir(bp_results_dir):
+                raise ValueError(
+                    f"AR_TOUCHUP_ITERS={touchup} requires existing block results; AR_RESUME_DIR/"
+                    f"results dir not found ({bp_results_dir!r}). Run the BPT pass first."
+                )
+            missing = _bp_mod.missing_result_blocks(bp_results_dir, [block_names])
+            if missing:
+                raise ValueError(
+                    f"AR_TOUCHUP_ITERS: {len(missing)} block(s) have no tuned result to start from "
+                    f"(first: {missing[0]}); complete the BPT pass before touching up."
+                )
+            if self.alg_composer.block_quantizer.iters != touchup:
+                logger.info(
+                    "[touchup] re-tuning %d iteration(s) per block on the quantized chain (was %d)",
+                    touchup,
+                    self.alg_composer.block_quantizer.iters,
+                )
+                self.alg_composer.block_quantizer.iters = touchup
+            start_index = 0  # touch up every block, in chain order
         for i in range(start_index, len(block_names), nblocks):
             if span is not None and i >= span[1]:
                 break  # span restriction: remaining blocks belong to another worker
@@ -417,6 +450,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             # ── Infrastructure: materialize, dtype convert, device placement ──
             materialize_model_(m)
             convert_module_to_hp_if_necessary(m, self.model_context.amp_dtype, device_manager.device)
+
+            if touchup:
+                self._apply_touchup_init(m, n if nblocks == 1 else names, bp_results_dir)
 
             m = self.alg_composer.dispatch_block(m, input_ids, input_others)
 
@@ -489,6 +525,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # resumable unit complete: persist this block's tuned scale/zp
                 # (the chain checkpoint is NOT written here -- the assigned
                 # forward's pre-tune tail already published it)
+                _bp_save_block_results(bp_results_dir, block_names[i], self._collect_tuned_layers(block_names[i]))
+            elif touchup and bp_results_dir:
+                # touch-up improved the block: overwrite its result so a later
+                # apply/export uses the touched grid
                 _bp_save_block_results(bp_results_dir, block_names[i], self._collect_tuned_layers(block_names[i]))
 
             if self.compress_context.is_immediate_saving and not is_bp_worker:
@@ -669,7 +709,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             self.calibration_context.nsamples,
             self.calibration_context.seqlen,
             flatten_list(all_blocks),
-        )
+        ) + (f"|touchup={envs.AR_TOUCHUP_ITERS}" if envs.AR_TOUCHUP_ITERS else "")
 
     @staticmethod
     def _bp_required_vram_bytes(
@@ -1355,6 +1395,32 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if applied == 0:
                     logger.debug("block %s: no worker-tuned layers (kept as-is)", block_name)
         pbar.close()
+
+    def _apply_touchup_init(self, block, block_name_or_names, results_dir: str) -> None:
+        """Seed a block's linears with the BPT-tuned (scale, zp) as the tuning init.
+
+        Sets ``_touchup_scale``/``_touchup_zp`` on each quantized submodule;
+        the SignRound wrapper anchors its grid from that pair (see
+        ``wrapper.py``), so touch-up tuning starts exactly where BPT left off
+        instead of re-deriving min/max. ``v`` starts at zero as usual.
+        """
+        from auto_round.compressors import block_parallel as _bp_mod
+        from auto_round.compressors.utils import check_to_quantized
+
+        names = block_name_or_names if isinstance(block_name_or_names, list) else [block_name_or_names]
+        for block_name in names:
+            result = _bp_mod.read_block_result(results_dir, block_name) or {}
+            block_mod = get_module(self.model_context.model, block_name)
+            for sub_name, sub in block_mod.named_modules():
+                entry = result.get(_tuned_layer_key(block_name, sub_name, sub))
+                if entry is None or not hasattr(sub, "weight"):
+                    continue
+                if not (hasattr(sub, "bits") and check_to_quantized(sub)):
+                    continue
+                sub._touchup_scale = entry["scale"].to(sub.weight.device, torch.float32)
+                zp = entry["zp"]
+                sub._touchup_zp = zp.to(sub.weight.device, torch.float32) if isinstance(zp, torch.Tensor) else zp
+        _ = block  # modules are reached via the model; ``block`` may be a WrapperMultiblock
 
     def _collect_tuned_layers(self, block_name: str) -> dict:
         """Extract this block's tuned {layer_name: {scale, zp}} from live modules.

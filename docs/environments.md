@@ -320,6 +320,17 @@ export AR_QOFF_NOISE_STATS=/mnt/bigdisk/qoff_stats
 export AR_QOFF_NOISE=1 AR_QOFF_NOISE_STATS=/mnt/bigdisk/qoff_stats
 ```
 
+### AR_TOUCHUP_ITERS
+- **Description**: Post-BPT serial qon touch-up: after a block-parallel (qoff) run has tuned every block, a serial rerun with this env re-tunes N iterations per block on the REAL quantized chain (qon). Each SignRound wrapper starts anchored to the BPT-tuned (scale, zp) pair — exactly where the parallel run left off — with rounding params reset to zero and margins still tunable; the improved result overwrites the block's result file, so a later apply/export uses the touched grid. The run signature includes the touch-up count: changing N invalidates stale resume artifacts. Guards: serial only (unset in worker environments), requires quantized-input chaining (qon), an existing results dir, and a complete result file for every block.
+- **Default**: `0` (off)
+- **Valid Values**: `0` (off), or a small positive iteration count (2–5 typical)
+
+```bash
+# 1) BPT pass (results in AR_RESUME_DIR)
+# 2) serial touch-up on the quantized chain:
+export AR_TOUCHUP_ITERS=5   # same AR_RESUME_DIR; no --enable_block_parallel_tuning; qon enabled
+```
+
 ### AR_TUNE_RECIPE
 - **Description**: Experimental init-search recipe for the SignRound tuning path (`--iters > 0`). The recipe replaces the per-group min/max tuning grid with a searched grid: `neuqi_*` anchors the joint (scale, integer zero-point) search (`neuqi_search_scale_zero`, imatrix-weighted); `opt_rtn_qon` anchors the symmetric scale-clip search. `neuqi_frozen_qon` additionally pins the `min_scale`/`max_scale` tuning margins at 1.0 (grid fully fixed, only rounding tunes). `neuqi_fp` vs `neuqi_qon` differ only in which chain shaped the init imatrix (FP-reference vs quantized) — under streaming qon the live imatrix is already chain-faithful. Recipes apply to int data types with standard (non-tuple) group sizes; unsupported layouts keep the min/max grid.
 - **Default**: unset (status-quo min/max init)

@@ -569,3 +569,127 @@ class TestQoffNoise:
         import os
 
         assert os.path.exists(path)
+
+
+class TestTouchup:
+    """AR_TOUCHUP_ITERS: post-BPT serial qon touch-up init."""
+
+    def test_wrapper_anchors_from_touchup_pair(self):
+        """The tuned (scale, zp) pair re-derives bit-exactly through the STE grid."""
+        from auto_round.data_type.int import quant_tensor_asym
+        from auto_round.wrapper import WrapperLinear
+
+        layer = TestWrapperIntegration._armed_linear()
+        bits, gs = 4, 16
+        maxq = float(2**bits - 1)
+        s = torch.full((16, 1), 0.0031)  # per-group scale [out*groups, 1]
+        zp = torch.randint(0, int(maxq) + 1, (16, 1)).float()
+        layer._touchup_scale, layer._touchup_zp = s, zp
+        w = WrapperLinear(
+            layer,
+            enable_minmax_tuning=True,
+            enable_round_tuning=True,
+            enable_norm_bias_tuning=False,
+            device="cpu",
+            enable_torch_compile=False,
+            disable_opt_rtn=True,
+            asym_search="auto",
+            iters=5,
+        )
+        assert w._tune_recipe == "touchup"
+        assert "value" in w.params and "min_scale" in w.params, "rounding + margins still tunable"
+        _, scale_out, zp_out = quant_tensor_asym(
+            layer.weight,
+            bits=bits,
+            group_size=gs,
+            tensor_min=w.weight_min,
+            tensor_max=w.weight_max,
+            scale_dtype=torch.float32,
+        )
+        torch.testing.assert_close(scale_out.squeeze(-1), s.squeeze(-1), rtol=0, atol=1e-7)
+        torch.testing.assert_close(zp_out.squeeze(-1), zp.squeeze(-1), rtol=0, atol=1e-5)
+
+    def test_env_off_is_status_quo(self):
+        import auto_round.envs as envs
+
+        assert envs.AR_TOUCHUP_ITERS == 0
+        from auto_round.wrapper import WrapperLinear
+
+        layer = TestWrapperIntegration._armed_linear()
+        w = WrapperLinear(
+            layer,
+            enable_minmax_tuning=True,
+            enable_round_tuning=True,
+            enable_norm_bias_tuning=False,
+            device="cpu",
+            enable_torch_compile=False,
+            disable_opt_rtn=True,
+            asym_search="auto",
+            iters=5,
+        )
+        assert w._tune_recipe == "" and not hasattr(layer, "_touchup_scale")
+        assert "value" in w.params and "min_scale" in w.params
+
+    def test_apply_touchup_init_sets_attrs(self, tmp_path):
+        import torch.nn as nn
+
+        from auto_round.compressors import block_parallel as bp
+        from auto_round.compressors.orchestrator import CompressionOrchestrator, _tuned_layer_key
+
+        block = nn.Sequential(TestWrapperIntegration._armed_linear())
+        block[0].global_name = "model.layers.0.mlp.down_proj"
+
+        class _Ctx:
+            pass
+
+        class _Model(nn.Module):
+            def __init__(self, blk):
+                super().__init__()
+                self.layers = nn.ModuleList([blk])
+
+        model = _Model(block)
+        results = str(tmp_path)
+        key = _tuned_layer_key("layers.0", "0", block[0])
+        bp.save_block_results(results, "layers.0", {key: {"scale": torch.full((16, 1), 0.002), "zp": 3}})
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch.model_context = _Ctx()
+        orch.model_context.model = model
+        orch._apply_touchup_init(block, "layers.0", results)
+        assert hasattr(block[0], "_touchup_scale") and abs(float(block[0]._touchup_scale[0, 0]) - 0.002) < 1e-7
+        assert block[0]._touchup_zp == 3
+
+    def test_signature_changes_with_touchup_iters(self, monkeypatch):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        import auto_round.envs as envs
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+
+        class _NS:
+            pass
+
+        orch.model_context = _NS()
+        orch.model_context.disk_stream_model_dir = None
+        m = _NS()
+        m.config = _NS()
+        m.config._name_or_path = "test-model"
+        orch.model_context.model = m
+        orch.scheme = "int4"
+        orch.quantizer = _NS()
+        orch.quantizer.layer_config = None
+        composer = _NS()
+        composer.need_quanted_input = lambda: True
+        orch._alg_composer = composer
+        orch.dataset = None
+        orch.calibration_context = _NS()
+        orch.calibration_context.nsamples = 8
+        orch.calibration_context.seqlen = 512
+
+        monkeypatch.setattr(envs, "AR_TOUCHUP_ITERS", 0, raising=False)
+        sig0 = orch._parallel_run_signature([["model.layers.0"]])
+        monkeypatch.setattr(envs, "AR_TOUCHUP_ITERS", 5, raising=False)
+        sig5 = orch._parallel_run_signature([["model.layers.0"]])
+        monkeypatch.setattr(envs, "AR_TOUCHUP_ITERS", 7, raising=False)
+        sig7 = orch._parallel_run_signature([["model.layers.0"]])
+        assert sig0 != sig5 != sig7, "touch-up count must invalidate stale resume artifacts"
