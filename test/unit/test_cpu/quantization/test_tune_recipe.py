@@ -842,3 +842,32 @@ class TestReviewFixes:
             )
         torch.testing.assert_close(scale_out.squeeze(-1), s_man.squeeze(-1), rtol=0, atol=1e-7)
         torch.testing.assert_close(zp_out.squeeze(-1), zp_man.squeeze(-1), rtol=0, atol=1e-5)
+
+
+class TestBackendOverride:
+    """Recipe wrapper-init searches pin the compile backend (Triton race workaround)."""
+
+    def test_override_disables_triton_enables_compile(self):
+        from auto_round.data_type.neuqi import _zp_wants_compile, _zp_wants_triton, backend_override
+
+        assert _zp_wants_triton("cuda"), "default auto should want triton on cuda"
+        with backend_override("compile"):
+            assert not _zp_wants_triton("cuda")
+            assert _zp_wants_compile("cuda")
+        assert _zp_wants_triton("cuda"), "override must restore env-driven behavior"
+
+    def test_override_eager_kills_both(self):
+        from auto_round.data_type.neuqi import _zp_wants_compile, _zp_wants_triton, backend_override
+
+        with backend_override("eager"):
+            assert not _zp_wants_triton("cuda")
+            assert not _zp_wants_compile("cuda")
+
+    def test_override_nests_and_restores(self):
+        from auto_round.data_type.neuqi import _zp_wants_triton, backend_override
+
+        with backend_override("compile"):
+            with backend_override("eager"):
+                assert not _zp_wants_triton("cuda")
+            assert not _zp_wants_triton("cuda"), "inner exit restores outer override"
+        assert _zp_wants_triton("cuda")

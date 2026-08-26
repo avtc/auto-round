@@ -242,7 +242,9 @@ _batched_broken = False
 
 def _zp_wants_compile(device_type: str) -> bool:
     """Whether a fused torch.compile sweep should be used, per ``AR_NEUQI_BACKEND``."""
-    backend = envs.AR_NEUQI_BACKEND
+    if _BACKEND_OVERRIDE == "eager":
+        return False
+    backend = _BACKEND_OVERRIDE or envs.AR_NEUQI_BACKEND
     if backend in ("compile", "triton"):
         return True
     if backend == "auto":
@@ -273,9 +275,40 @@ def _triton_sweep_fn():
     return _triton_sweep
 
 
+_BACKEND_OVERRIDE = None  # set by backend_override(); None = env-driven
+
+
+class backend_override:
+    """Context manager forcing the sweep backend (bypasses AR_NEUQI_BACKEND).
+
+    The extension Triton sweep intermittently device-asserts when invoked
+    from SignRound wrapper init (recipe init-searches) on multi-GPU
+    data-driven runs -- passes under CUDA_LAUNCH_BLOCKING=1, never faults in
+    the zero-shot quantizer that also uses it. Until that is root-caused,
+    wrapper-init searches pin the torch.compile backend: one-shot searches
+    cost ~0.2s/layer there vs Triton's ~0.07s -- noise over a whole model.
+    """
+
+    def __init__(self, backend: str):
+        self._backend = backend
+
+    def __enter__(self):
+        global _BACKEND_OVERRIDE
+        self._saved = _BACKEND_OVERRIDE
+        _BACKEND_OVERRIDE = self._backend
+        return self
+
+    def __exit__(self, *exc):
+        global _BACKEND_OVERRIDE
+        _BACKEND_OVERRIDE = self._saved
+        return False
+
+
 def _zp_wants_triton(device_type: str) -> bool:
     """Whether the extension Triton sweep should be tried, per ``AR_NEUQI_BACKEND``."""
-    backend = envs.AR_NEUQI_BACKEND
+    if _BACKEND_OVERRIDE == "compile" or _BACKEND_OVERRIDE == "eager":
+        return False
+    backend = _BACKEND_OVERRIDE or envs.AR_NEUQI_BACKEND
     if backend == "triton":
         return True
     return backend == "auto" and device_type == "cuda"
