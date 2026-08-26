@@ -101,6 +101,28 @@ def pick_stage_device(devices: list, index: int, needed_bytes: int, headroom: in
     return None
 
 
+@torch.no_grad()
+def _park_cpu_buffers_(module: torch.nn.Module, device) -> None:
+    """Move non-checkpoint CPU buffers (e.g. rotary inv_freq tables) to ``device``.
+
+    ``load_module_`` only replaces tensors present in the checkpoint; buffers a
+    module computes at init (rotary frequency tables, non-persistent caches) keep
+    whatever device the skeleton gave them -- typically CPU. A block forward then
+    mixes CUDA weights with CPU cos/sin and dies with a device mismatch at the
+    first rope-using (full-attention) block. Already-on-device tensors are left
+    untouched (identity mapping, no copies); meta buffers are left for
+    materialize_model_ to report.
+    """
+    target = torch.device(device)
+    if target.type == "cpu":
+        return
+
+    def _fn(t: torch.Tensor) -> torch.Tensor:
+        return t.to(target) if t.device.type == "cpu" else t
+
+    module._apply(_fn)
+
+
 class CheckpointStreamer:
     """Streams tensors from a HuggingFace checkpoint on demand.
 
@@ -468,6 +490,8 @@ class CheckpointStreamer:
             logger.info(f"[stream] {rewrites_hit} checkpoint tensor(s) matched via name rewrite")
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
+        if device is not None:
+            _park_cpu_buffers_(module, device)
         if self._prefetch_thread is not None:
             self.prefetch_consumed(prefix)
         return loaded
