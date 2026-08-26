@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from auto_round import envs
 from auto_round.algorithms.quantization.config import QuantizationConfig
 from auto_round.logger import logger
 
@@ -82,6 +83,10 @@ class RTNConfig(QuantizationConfig):
             disable_opt_rtn = False
         self.disable_opt_rtn = disable_opt_rtn
 
+        if parallel_tuning is None and envs.AR_DISABLE_TUNING_FANOUT:
+            # AR_DISABLE_TUNING_FANOUT flips the AUTO default to serial; an
+            # explicit parallel_tuning kwarg still wins (no silent overrides)
+            parallel_tuning = False
         self.parallel_tuning = parallel_tuning
         self.batch_expert_tuning = batch_expert_tuning
         valid_asym_search = ("auto", "neuqi", "minmax")

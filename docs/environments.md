@@ -251,6 +251,11 @@ export AR_NEUQI_LAYOUT=mid
 export AR_PRESINQ_BACKEND=eager
 ```
 
+### AR_DISABLE_TUNING_FANOUT
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Disables the multi-GPU per-module tuning fan-out in the RTN/NeUQI zero-shot path (the `[OptRTN] tuning fan-out: ... across N GPUs` round-robin that hops module weights to worker devices). With the env set, all scale/zp searches run serially on the primary device. Per-module results are identical either way; this is an isolation/forensics knob (single-stream Triton launches, no fan-out threads), not a speed knob. An explicit `parallel_tuning=True` config kwarg still wins over the env. Does not affect block-parallel tuning (BPT) or data-driven SignRound tuning, which have their own switches.
+
 ### AR_NEUQI_BATCH
 - **Description**: All-candidates batched zero-point sweep. `"auto"` (default) folds every coarse and fine scale candidate of a pass into a single fused kernel per group chunk on CUDA (the per-candidate fused sweep spends most of its remaining wall time in per-candidate dispatch and bookkeeping launches); `"on"` forces the batched sweep on any fused-capable device (e.g. for A/B or tests); `"off"` keeps the per-candidate loop. The batched kernel computes the min over zero points in-kernel and emits only `[groups, candidates]` best losses and winning zero points per launch. Selections follow the same first-minimum tie rule as the sequential sweep; after the single-candidate fusion this is the second speedup stage on top of the same candidate grid (21x measured for the first stage on an RTX 3090). Any failure of a batched call (e.g. out of memory from the larger symbolic intermediate) permanently latches the process back to the per-candidate fused sweep for the remaining candidates.
 - **Default**: `"auto"`

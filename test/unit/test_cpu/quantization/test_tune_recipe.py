@@ -904,3 +904,28 @@ class TestSweepWarmup:
 
         src = inspect.getsource(wrapper_mod._compute_recipe_anchors)
         assert "backend_override" not in src, "wrapper-init searches must keep the Triton default"
+
+
+class TestTuningFanoutEnv:
+    """AR_DISABLE_TUNING_FANOUT flips the auto default to serial; explicit kwarg wins."""
+
+    def test_env_disables_auto_fanout(self, monkeypatch):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        monkeypatch.setenv("AR_DISABLE_TUNING_FANOUT", "1")
+        cfg = RTNConfig(bits=4)
+        assert cfg.parallel_tuning is False
+
+    def test_env_ignores_off(self, monkeypatch):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        monkeypatch.delenv("AR_DISABLE_TUNING_FANOUT", raising=False)
+        cfg = RTNConfig(bits=4)
+        assert cfg.parallel_tuning is None  # auto: on when >1 GPU
+
+    def test_explicit_kwarg_wins_over_env(self, monkeypatch):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        monkeypatch.setenv("AR_DISABLE_TUNING_FANOUT", "1")
+        cfg = RTNConfig(bits=4, parallel_tuning=True)
+        assert cfg.parallel_tuning is True
