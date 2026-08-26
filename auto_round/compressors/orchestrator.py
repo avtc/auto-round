@@ -1041,7 +1041,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     rs = resume_states[g]
                     while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
                         k = rs.resume_index
-                        rs.mark_block_done_from_file(blocks[k], bp.chain_state_path(results_dir, g, k + 1))
+                        # the final block has no successor entry by design:
+                        # workers never ff past the last block (nothing
+                        # consumes it), so its commit carries no entry file
+                        entry_src = bp.chain_state_path(results_dir, g, k + 1) if k + 1 < len(blocks) else None
+                        rs.mark_block_done_from_file(blocks[k], entry_src)
                         # the just-committed block's own entry is superseded
                         # now (resume_input_ids holds the k+1 entry); prune it
                         # here so the disk stays bounded even when completions
@@ -1065,7 +1069,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 rs = resume_states[g]
                 while rs is not None and rs.resume_index < len(blocks) and rs.resume_index in done[g]:
                     k = rs.resume_index
-                    rs.mark_block_done_from_file(blocks[k], bp.chain_state_path(results_dir, g, k + 1))
+                    entry_src = bp.chain_state_path(results_dir, g, k + 1) if k + 1 < len(blocks) else None
+                    rs.mark_block_done_from_file(blocks[k], entry_src)
 
         tuned = bp.load_all_block_results(results_dir)
         missing = bp.missing_result_blocks(results_dir, all_blocks)

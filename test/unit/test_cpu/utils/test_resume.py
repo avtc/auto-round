@@ -14,6 +14,10 @@
 
 """Unit tests for auto_round.utils.resume (crash/resume checkpointing, AR_RESUME_DIR)."""
 
+import json
+import os
+import tempfile
+
 import pytest
 import torch
 
@@ -166,7 +170,6 @@ class TestLayerConfigFingerprint:
         assert layer_config_fingerprint(cfg_with_tensor) == layer_config_fingerprint(cfg_without_tensor)
 
 
-
 class TestMarkBlockDoneFromFile:
     def _rs(self, d, names=("b0", "b1")):
         return ResumeState(d, "sig", list(names))
@@ -196,3 +199,27 @@ class TestMarkBlockDoneFromFile:
         rs = self._rs(str(tmp_path))
         with pytest.raises(AssertionError):
             rs.mark_block_done_from_file("b1", block_parallel.chain_state_path(src_dir, 0, 0))
+
+
+class TestMarkBlockDoneFromFileLastBlock:
+    """The final block commits without a successor entry.
+
+    Workers never publish a chain entry past the last block (there is no
+    next assignee), so the BPT commit loop passes entry_src=None for it --
+    observed as FileNotFoundError on hy3 (MTP tail) at 79/80.
+    """
+
+    def test_last_block_none_entry_commits(self, tmp_path):
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        entry = str(tmp_path / "chain_b1.pt")
+        torch.save({"ids": torch.zeros(2, 3, dtype=torch.long)}, entry)
+        state.mark_block_done_from_file("b0", entry)
+        state.mark_block_done_from_file("b1", None)  # <- crashed here before
+        manifest = json.loads((tmp_path / "resume_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["completed_blocks"] == ["b0", "b1"]
+        assert state.resume_index == 2
+
+    def test_non_last_block_missing_entry_still_raises(self, tmp_path):
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        with pytest.raises(FileNotFoundError):
+            state.mark_block_done_from_file("b0", str(tmp_path / "nope.pt"))

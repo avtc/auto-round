@@ -158,7 +158,7 @@ class ResumeState:
             {"signature": self.signature, "completed_blocks": self.completed_blocks},
         )
 
-    def mark_block_done_from_file(self, block_name: str, entry_src: str) -> None:
+    def mark_block_done_from_file(self, block_name: str, entry_src: Optional[str]) -> None:
         """``mark_block_done`` with the entry handed over as a file path.
 
         The source holds exactly the payload the serial manifest persists
@@ -166,6 +166,11 @@ class ResumeState:
         instead of a deserialize + re-serialize round trip of a multi-GB
         entry inside a polling loop. Falls back to a byte copy across
         filesystems.
+
+        ``entry_src=None`` marks the final block done without a successor
+        entry: the chain publisher never ff-past-the-end (there is no next
+        block to consume it), and a resumed run at ``resume_index ==
+        len(blocks)`` never reads one either.
         """
         import shutil
 
@@ -177,11 +182,12 @@ class ResumeState:
             self.q_input_path.unlink()
         tmp = str(self.input_ids_path) + ".tmp"
         try:
-            try:
-                os.link(entry_src, tmp)
-            except OSError:  # cross-device or unsupported: byte copy
-                shutil.copyfile(entry_src, tmp)
-            os.replace(tmp, self.input_ids_path)
+            if entry_src is not None:
+                try:
+                    os.link(entry_src, tmp)
+                except OSError:  # cross-device or unsupported: byte copy
+                    shutil.copyfile(entry_src, tmp)
+                os.replace(tmp, self.input_ids_path)
         finally:
             if os.path.exists(tmp):
                 try:
