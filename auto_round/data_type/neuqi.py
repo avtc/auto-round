@@ -58,7 +58,6 @@ fallback; every stage latches down permanently on failure (Triton -> compiled
 batched -> compiled per-candidate -> eager).
 """
 
-import functools
 import math
 from functools import lru_cache
 
@@ -82,7 +81,6 @@ def _log_search_engaged(coarse_n: int, fine_n: int) -> None:
 
 
 @torch.compiler.disable
-@functools.lru_cache(maxsize=None)
 def _coarse_grid(lo: float, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Log-spaced coarse scale fractions, always built eagerly.
 
@@ -91,8 +89,15 @@ def _coarse_grid(lo: float, n: int, device: torch.device, dtype: torch.dtype) ->
     sweep's index-select math, where Triton rejects fp64 in the integer
     index guards ("unexpected type fp64" -- BPT worker crash, first MoE
     block under ``--enable_torch_compile``). Building the tiny [n] grid
-    eagerly keeps it a plain tensor input to any traced region; the cache
-    dedupes the per-chunk rebuilds (tensors are immutable here).
+    eagerly keeps it a plain tensor input to any traced region.
+
+    Deliberately NOT cached: the expert search fans out from a thread pool
+    (one thread per device), and a cached tensor would be created on the
+    first caller's stream and read from the others' streams with no event
+    ordering -- a cross-stream read-before-write window that surfaced as a
+    device-side assert on the streaming parent (hidden under
+    CUDA_LAUNCH_BLOCKING=1). Recreating 64 floats per call is free and
+    keeps creation on the calling thread's own stream.
     """
     return torch.logspace(math.log10(lo), 0.0, n, device=device, dtype=dtype)
 
