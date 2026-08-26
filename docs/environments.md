@@ -299,10 +299,19 @@ export AR_POST_SCALE_REFIT=1
 export AR_BIAS_CORRECT=1
 ```
 
+### AR_ALT2_ITERS2
+- **Description**: Iterations of the SECOND tuning round when `AR_TUNE_RECIPE=alt2` (alternating re-grid). Round 1 tunes the rounding on the init-search grid for `iters - iters2` iterations; then every alt2 layer re-runs the NeUQI search on the perturbed effective weights, re-anchors the grid, resets the rounding params to zero, and round 2 tunes `iters2` more iterations on the fresh grid. Best-params cache from round 1 is discarded at the switch (the grid changed).
+- **Default**: `0` (half of `--iters`)
+- **Valid Values**: `0` (auto: half), or `1` … `iters-1`
+
+```bash
+export AR_TUNE_RECIPE=alt2 AR_ALT2_ITERS2=10   # + --iters 20 --asym
+```
+
 ### AR_TUNE_RECIPE
 - **Description**: Experimental init-search recipe for the SignRound tuning path (`--iters > 0`). The recipe replaces the per-group min/max tuning grid with a searched grid: `neuqi_*` anchors the joint (scale, integer zero-point) search (`neuqi_search_scale_zero`, imatrix-weighted); `opt_rtn_qon` anchors the symmetric scale-clip search. `neuqi_frozen_qon` additionally pins the `min_scale`/`max_scale` tuning margins at 1.0 (grid fully fixed, only rounding tunes). `neuqi_fp` vs `neuqi_qon` differ only in which chain shaped the init imatrix (FP-reference vs quantized) — under streaming qon the live imatrix is already chain-faithful. Recipes apply to int data types with standard (non-tuple) group sizes; unsupported layouts keep the min/max grid.
 - **Default**: unset (status-quo min/max init)
-- **Valid Values**: `minmax_qon` (explicit control arm), `neuqi_qon`, `neuqi_frozen_qon`, `neuqi_fp` (BPT/qoff-compatible), `opt_rtn_qon` (symmetric only), `alt2` (not yet implemented), `neuqi_it0` (zero-shot reference marker; requires `--iters 0`)
+- **Valid Values**: `minmax_qon` (explicit control arm), `neuqi_qon`, `neuqi_frozen_qon`, `neuqi_fp` (BPT/qoff-compatible), `opt_rtn_qon` (symmetric only), `alt2`, `neuqi_it0` (zero-shot reference marker; requires `--iters 0`)
 - **Usage**: Race quantization recipes by KLD on a small model. `neuqi_*` requires `--asym`; `opt_rtn_qon` requires symmetric. Composable with `AR_POST_SCALE_REFIT` and `AR_BIAS_CORRECT`.
 
 ```bash

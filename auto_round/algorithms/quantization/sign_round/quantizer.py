@@ -35,6 +35,42 @@ from auto_round.utils import (
 )
 from auto_round.utils.device import clear_memory_if_reached_threshold
 from auto_round.utils.device_manager import device_manager
+
+
+def alt2_switch_iter(iters: int, recipe: str, iters2_env: int):
+    """Iteration index (exclusive) at which the alt2 re-grid fires, or None.
+
+    Round 1 tunes on the init-search grid for ``iters - iters2`` iterations;
+    the re-grid then re-anchors every alt2 layer to a fresh search over the
+    perturbed effective weights and resets the rounding params; round 2 tunes
+    for ``iters2`` more. ``iters2_env=0`` means "half of iters".
+    """
+    if recipe != "alt2" or iters < 2:
+        return None
+    if iters2_env < 0:
+        raise ValueError(f"AR_ALT2_ITERS2={iters2_env} must be >= 0 (0 = half of iters).")
+    iters2 = iters2_env if iters2_env > 0 else iters // 2
+    if not 1 <= iters2 < iters:
+        raise ValueError(f"AR_ALT2_ITERS2={iters2} must be in [1, {iters - 1}] (iters={iters}).")
+    return iters - iters2
+
+
+def _alt2_regrid_block(block) -> float:
+    """Re-grid every participating wrapper in the block; returns mean |delta scale|."""
+    deltas = []
+    for _, m in block.named_modules():
+        if getattr(m, "_tune_recipe", "") != "alt2":
+            continue
+        ds = m.alt2_regrid()
+        if ds is not None:
+            deltas.append(ds)
+    if not deltas:
+        return 0.0
+    mean_ds = sum(deltas) / len(deltas)
+    logger.info("[alt2] re-grid %d layers, mean |delta scale| %.3e", len(deltas), mean_ds)
+    return mean_ds
+
+
 from auto_round.utils.distributed import setup_ddp_if_needed_
 from auto_round.wrapper import WrapperLinear, unwrapper_block, unwrapper_layer, wrapper_block
 
@@ -468,6 +504,11 @@ class SignRoundQuantizer(BaseQuantizer):
             else None
         )
 
+        from auto_round import envs as _envs
+
+        _alt2_switch = alt2_switch_iter(self.iters, _envs.AR_TUNE_RECIPE, _envs.AR_ALT2_ITERS2)
+        _alt2_regridded = False
+
         for i in range(self.iters):
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
                 for n, m in block.named_modules():
@@ -521,6 +562,14 @@ class SignRoundQuantizer(BaseQuantizer):
                     break
             sync_gradients()
             self._step(scaler, optimizer, lr_schedule)
+
+            if _alt2_switch is not None and (i + 1) == _alt2_switch and not _alt2_regridded:
+                _alt2_regrid_block(block)
+                _alt2_regridded = True
+                # the grid changed: round-1 best params/cache are invalid
+                best_loss = torch.finfo(torch.float).max
+                best_params = {}
+                last_best_iter = i
 
         last_loss = total_loss
         best_iter = self.iters

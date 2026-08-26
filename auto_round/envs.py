@@ -105,6 +105,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Post-quantization per-Linear bias correction: one extra no-grad pass of
     # the calibration rows per block, b = mean(y_fp - y_q) absorbed into bias.
     "AR_BIAS_CORRECT": lambda: os.getenv("AR_BIAS_CORRECT", "0").lower() in ("1", "true", "yes"),
+    # alt2 (alternating re-grid): iterations of the SECOND tuning round after
+    # the mid-tune re-grid; 0 = half of --iters.
+    "AR_ALT2_ITERS2": lambda: int(os.getenv("AR_ALT2_ITERS2", "0") or 0),
     # Memory layout of the fused zero-point sweep expression: "auto" picks by
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
     # "last"/"mid" force one layout for A/B measurements.

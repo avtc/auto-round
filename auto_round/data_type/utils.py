@@ -157,10 +157,10 @@ def get_quant_func(
             "the zero-shot search dispatch already runs. Unset the variable or use neuqi_it0."
         )
     if recipe == "alt2":
-        raise NotImplementedError(
-            'AR_TUNE_RECIPE="alt2" (alternating re-grid) is not implemented yet; it lands with its '
-            "own task. Available now: minmax_qon, neuqi_qon, neuqi_frozen_qon, neuqi_fp, opt_rtn_qon."
-        )
+        if sym:
+            raise ValueError('AR_TUNE_RECIPE="alt2" requires the asymmetric path (sym=False).')
+        if iters < 2:
+            raise ValueError('AR_TUNE_RECIPE="alt2" needs at least 2 tuning iterations to alternate grids.')
     if recipe.startswith("neuqi_") and recipe != "neuqi_it0" and sym:
         raise ValueError(f"AR_TUNE_RECIPE={recipe!r} requires the asymmetric path (sym=False).")
     if recipe == "opt_rtn_qon" and not sym:

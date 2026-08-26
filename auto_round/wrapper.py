@@ -75,7 +75,7 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
     """
     import time as _time
 
-    if not recipe or recipe in ("minmax_qon", "alt2", "neuqi_it0"):
+    if not recipe or recipe in ("minmax_qon", "neuqi_it0"):
         return None
     t0 = _time.perf_counter()
     w = weight.to(device=device, dtype=torch.float32)
@@ -83,7 +83,7 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
     if imatrix is not None:
         qw = imatrix.to(device=device, dtype=torch.float32)
 
-    if recipe.startswith("neuqi_"):
+    if recipe.startswith("neuqi_") or recipe == "alt2":
         from auto_round.data_type.neuqi import neuqi_search_scale_zero
 
         s, zp = neuqi_search_scale_zero(w, bits, qw=qw)
@@ -278,6 +278,7 @@ class WrapperLinear(torch.nn.Module):
         # clip-as-init above; unsupported layouts (tuple group sizes, >=16
         # bits, no round tuning) keep the status-quo min/max grid.
         self._tune_recipe_frozen_margins = False
+        self._tune_recipe = ""
         if (
             weight_reshape is not None
             and self.weight_min is not None
@@ -294,6 +295,7 @@ class WrapperLinear(torch.nn.Module):
             )
             if _anchors is not None:
                 _wmin, _wmax, self._tune_recipe_frozen_margins = _anchors
+                self._tune_recipe = envs.AR_TUNE_RECIPE
                 self.weight_min = _wmin.to(self.weight_min.dtype)
                 self.weight_max = _wmax.to(self.weight_max.dtype)
         self._init_params(
@@ -341,6 +343,44 @@ class WrapperLinear(torch.nn.Module):
 
             self.bias_quant_func = quant_tensor_asym_wo_round
             self.params["bias_v"] = self.bias_v
+
+    def alt2_regrid(self):
+        """alt2 mid-tune re-grid: re-run the init search on the perturbed
+        effective weights, re-anchor weight_min/weight_max, reset the rounding
+        params to zero. Returns mean |delta scale| telemetry, or None when
+        this layer does not participate.
+        """
+        import torch as _torch
+
+        from auto_round.data_type.neuqi import neuqi_search_scale_zero
+
+        if getattr(self, "_tune_recipe", "") != "alt2" or self.orig_layer.bits >= 16:
+            return None
+        gs = self.orig_layer.group_size
+        if isinstance(gs, tuple):
+            return None
+        with _torch.no_grad():
+            w = self.orig_layer.weight.detach().to(device=self.device, dtype=_torch.float32)
+            w_reshape, _shape, _pad = reshape_pad_tensor_by_group_size(w, gs)
+            maxq = float(2**self.orig_layer.bits - 1)
+            s_cur = ((self.weight_max.float() - self.weight_min.float()) / maxq).reshape(-1, 1)
+            w_eff = w_reshape + self.value.detach().reshape(w_reshape.shape) * s_cur
+            scale, zp = neuqi_search_scale_zero(
+                w_eff,
+                self.orig_layer.bits,
+                qw=getattr(self.orig_layer, "imatrix", None),
+                q_scale_thresh=self.q_scale_thresh,
+                coarse_n=int(envs.AR_NEUQI_COARSE),
+                fine_n=int(envs.AR_NEUQI_FINE),
+            )
+            self.weight_min = (-zp * scale).squeeze(-1).to(self.weight_min.dtype)
+            self.weight_max = ((maxq - zp) * scale).squeeze(-1).to(self.weight_max.dtype)
+            v = self.params.get("value") if isinstance(self.params, dict) else None
+            if v is not None:
+                v.data.zero_()
+            elif isinstance(self.value, _torch.Tensor):
+                self.value.zero_()
+            return (scale - s_cur).abs().mean().item()
 
     def _init_params(self, name, dtype, shape, value, tunable):
         """Initializes a parameter for tuning or uses a constant if tuning is disabled.
