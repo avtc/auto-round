@@ -291,6 +291,8 @@ export AR_DISK_STREAM_MODEL=1
 export AR_RESUME_DIR=/path/to/resume/state
 ```
 
+跨模式断点续跑：串行（`AR_DISK_STREAM_MODEL`）、流式（`--stream_quantization`）与块并行（BPT）三种执行路径共用同一组逐块清单（manifest）。任意一种模式中断后，可以用相同或不同的模式从断点继续：已完成块的权重分片会被直接采用（不会被覆盖，也不会重新量化）；若中断的是 BPT 运行（已完成调优但尚未打包的块），流式路径会直接套用其调优结果（scale/zp）并打包，而不是重新搜索。
+
 ## 使用示例
 
 ### 设置环境变量
