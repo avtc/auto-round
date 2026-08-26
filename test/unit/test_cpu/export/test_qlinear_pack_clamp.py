@@ -26,6 +26,7 @@ import pytest
 import torch
 from torch import nn
 
+from auto_round.export.export_to_awq.utils import WQLinear_GEMM
 from auto_round_extension.torch.qlinear_torch import QuantLinear as QuantLinearDirect
 from auto_round_extension.torch.qlinear_torch_zp import QuantLinear as QuantLinearMinusOne
 
@@ -116,6 +117,34 @@ def test_minus_one_zp_packing_survives_zero_zero_point():
     # and the module still dequantizes (forward runs, no all-ones corruption)
     out = q(torch.eye(IN_F))
     assert torch.isfinite(out).all()
+
+
+def test_awq_pack_clamps_levels():
+    """The AWQ packer shares the unclamped-round spill bug: an out-of-range
+    level shifts bits into the neighboring packed nibble (AWQ interleave
+    order), corrupting it. Packed levels must equal the clamped grid."""
+    torch.manual_seed(0)
+    bits, maxq = 4, 15
+    w, scale, zp = _make_inputs(bits)  # [out, in], [out, in/g], [out, in/g]
+    lin = nn.Linear(IN_F, OUT_F, bias=False)
+    with torch.no_grad():
+        lin.weight.copy_(w)
+    q = WQLinear_GEMM.from_linear(lin, bits, GROUP, scales=scale.t(), zeros=zp.t(), device="cpu")
+
+    expected_q = torch.clamp(
+        torch.round(w / scale.repeat_interleave(GROUP, 1) + zp.repeat_interleave(GROUP, 1)), 0, maxq
+    ).to(torch.int32)
+
+    def _pack_rows(t):  # mirrors the packer: nibbles along dim 1, AWQ interleave
+        pack_num = 32 // bits
+        order = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7]) * bits
+        packed = t.reshape(t.shape[0], t.shape[1] // pack_num, pack_num) << order
+        return torch.sum(packed, dim=-1).to(torch.int32)
+
+    # qweight packs q transposed ([in, out/8], nibbles along the output dim);
+    # qzeros pack zp along the output dim ([in/g, out/8])
+    assert torch.equal(q.qweight, _pack_rows(expected_q.t().contiguous()))
+    assert torch.equal(q.qzeros, _pack_rows(zp.to(torch.int32).t().contiguous()))
 
 
 def test_direct_zp_roundtrip_in_range():
