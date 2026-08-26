@@ -605,12 +605,15 @@ def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: in
         # SLOWER. Keep the per-module path (the win lives on accelerators,
         # where per-module launch/transfer overhead dominates instead).
         logger.debug("immediate_pack_block: pack device is CPU; using per-module pack")
-    elif not _PACK_DEVICE_LOGGED:
+    else:
+        global _PACK_DEVICE_LOGGED
         # once per run: a per-block line collides with the tqdm redraws and
         # garbles the log ("...(batched...):33, 16.50s/it]")
-        global _PACK_DEVICE_LOGGED
-        _PACK_DEVICE_LOGGED = True
-        logger.info("immediate_pack_block: packing on %s (batched for same-shape Linear groups)", pack_device)
+        if not _PACK_DEVICE_LOGGED:
+            _PACK_DEVICE_LOGGED = True
+            logger.info(
+                "immediate_pack_block: packing on %s (batched for same-shape Linear groups)", pack_device
+            )
     if fmt is not None and pack_device.type != "cpu" and _format_supports_batched_pack(fmt):
         from auto_round.export.export_to_autoround.export import pack_layers_batched
 
