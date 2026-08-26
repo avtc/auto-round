@@ -631,3 +631,41 @@ class TestTunedLayerKey(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAssertNoCpuOffload:
+    """Data-driven runs fail fast when accelerate CPU-offloaded part of the model."""
+
+    def test_raises_on_cpu_offload(self):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch.model_context = SimpleNamespace(
+            model=SimpleNamespace(hf_device_map={"model.layers.0": "cuda:0", "model.layers.31": "cpu"})
+        )
+        import pytest
+
+        with pytest.raises(RuntimeError, match="full GPU residency"):
+            orch._assert_no_cpu_offload()
+
+    def test_passes_when_fully_resident(self):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch.model_context = SimpleNamespace(
+            model=SimpleNamespace(hf_device_map={"model.layers.0": 0, "model.layers.31": 1})
+        )
+        orch._assert_no_cpu_offload()  # must not raise
+
+    def test_passes_without_device_map(self):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch.model_context = SimpleNamespace(model=SimpleNamespace())
+        orch._assert_no_cpu_offload()  # must not raise
