@@ -107,7 +107,13 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
     # CUDA_LAUNCH_BLOCKING=1 (observed: recipe init-search on a 4-GPU
     # device_map). One sync per layer-init is noise next to the search cost.
     if torch.device(device).type == "cuda":
-        torch.cuda.synchronize(device)
+        # sync EVERY visible device, not just this layer's: under accelerate
+        # dispatch the cache-inputs forward moves activations GPU->GPU, and an
+        # un-joined peer copy recorded on ANOTHER device's stream can still be
+        # reading memory the search is about to reuse (allocator reuse -> the
+        # intermittent OOB-gather asserts that vanish under blocking mode)
+        for dev_idx in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(dev_idx)
 
     if recipe.startswith("neuqi_") or recipe == "alt2":
         from auto_round.data_type.neuqi import neuqi_search_scale_zero
