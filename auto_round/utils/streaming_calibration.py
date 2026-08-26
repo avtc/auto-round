@@ -67,11 +67,29 @@ def build_causal_attention_mask(input_ids):
 
 
 def _find_embedding(model, streamer):
-    """First embedding module whose weight is checkpoint-backed."""
+    """The token-embedding module: checkpoint-backed, preferring the config's
+    vocab size, else the largest candidate.
+
+    VL-capable checkpoints (e.g. qwen3_5) carry small positional Embeddings in
+    the vision tower that iterate FIRST; taking the first match compared
+    248k-token calibration ids against a 2304-row table. The vocab guard then
+    (correctly) failed the run instead of letting an OOB gather poison CUDA.
+    """
+    cfg = getattr(model, "config", None)
+    inner = getattr(cfg, "text_config", None)
+    if inner is not None and getattr(inner, "vocab_size", None):
+        cfg = inner  # VL wrapper: the token vocab lives in text_config
+    want = getattr(cfg, "vocab_size", None)
+
+    best_name, best_mod, best_n = None, None, -1
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Embedding) and f"{name}.weight" in streamer.weight_map:
-            return name, module
-    return None, None
+            n = module.num_embeddings if hasattr(module, "num_embeddings") else module.weight.shape[0]
+            if want is not None and n == want:
+                return name, module
+            if n > best_n:
+                best_name, best_mod, best_n = name, module, n
+    return best_name, best_mod
 
 
 def _ensure_real_rotary(rotary, cfg, device):
