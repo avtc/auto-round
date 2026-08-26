@@ -557,12 +557,18 @@ def _format_supports_batched_pack(fmt) -> bool:
 
     Only the plain ``auto_round[:backend]`` formats qualify: gguf/awq/gptq/
     llm_compressor and the nvfp/mxfp/fp8 sub-formats pack through their own
-    paths and keep the per-module immediate_pack loop.
+    paths and keep the per-module immediate_pack loop. ``auto_round:llm_compressor``
+    carries the ``auto_round`` prefix but resolves to the compressed-tensors
+    packer -- batched-packing it would silently write qweight/qzeros/scales
+    modules into an otherwise CT-packed checkpoint (mixed-format export).
     """
+    format_name = getattr(fmt, "format_name", None)
+    if format_name is not None and format_name != "auto_round":
+        return False
     out = str(getattr(fmt, "output_format", "") or "")
     if not out.startswith("auto_round"):
         return False
-    return not any(tok in out for tok in ("nv_fp", "mx_fp", "nvfp", "mxfp", "fp8", "fake"))
+    return not any(tok in out for tok in ("nv_fp", "mx_fp", "nvfp", "mxfp", "fp8", "fake", "llm_compressor"))
 
 
 def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: int = 1):

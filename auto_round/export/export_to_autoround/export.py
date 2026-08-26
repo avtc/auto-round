@@ -15,11 +15,11 @@
 import copy
 import functools
 import inspect
-from types import SimpleNamespace
 import json
 import os
 from dataclasses import fields
 from enum import Enum
+from types import SimpleNamespace
 from typing import Callable, Union
 
 import torch
@@ -261,6 +261,13 @@ def pack_layers_batched(names, model, backend, device=None, max_batch_bytes=768 
     import torch as _torch
 
     from auto_round.utils.model import get_module as _get_module
+
+    if "llm_compressor" in backend:
+        raise ValueError(
+            f"pack_layers_batched packs the AutoRound qweight/qzeros/scales format and must not be "
+            f"used for backend '{backend}': compressed-tensors exports pack through their own "
+            f"pack_layer, and mixing the two produces a checkpoint no single consumer can load."
+        )
 
     leftover = []
     groups = {}
