@@ -108,6 +108,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # alt2 (alternating re-grid): iterations of the SECOND tuning round after
     # the mid-tune re-grid; 0 = half of --iters.
     "AR_ALT2_ITERS2": lambda: int(os.getenv("AR_ALT2_ITERS2", "0") or 0),
+    # qoff (FP-reference-chain) tuning unblocker: inject per-channel
+    # quantization noise into the FP block inputs during SignRound tuning.
+    "AR_QOFF_NOISE": lambda: os.getenv("AR_QOFF_NOISE", "0").lower() in ("1", "true", "yes"),
+    # Directory for those noise stats: when set, every quantized block also
+    # writes block_<idx>.pt (per-channel mean/var of y_fp - y_q); the tuning
+    # run reads them back for injection.
+    "AR_QOFF_NOISE_STATS": lambda: os.getenv("AR_QOFF_NOISE_STATS", "").strip(),
     # Memory layout of the fused zero-point sweep expression: "auto" picks by
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
     # "last"/"mid" force one layout for A/B measurements.

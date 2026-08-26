@@ -308,6 +308,18 @@ export AR_BIAS_CORRECT=1
 export AR_TUNE_RECIPE=alt2 AR_ALT2_ITERS2=10   # + --iters 20 --asym
 ```
 
+### AR_QOFF_NOISE
+- **Description**: qoff (FP-reference-chain) tuning unblocker. BPT/serial qoff tuning optimizes each block against FP-reference inputs that the deployed quantized chain never produces — the measured deployment-mismatch regression. When enabled, the tuning forwards inject per-channel quantization noise `mean + std*eps` (stats of the previous quantized block's output drift, `eps` deterministic per block seed) into the FP inputs; the cached FP inputs are never modified in place. Block 0 skips injection (its inputs are embeddings). Guards: hard error under qon (quantized-input chaining already sees real inputs), without `AR_QOFF_NOISE_STATS`, or on missing/width-mismatched stats.
+- **Default**: `0` (off)
+- **Valid Values**: `0`, `1` (also `true`/`yes`)
+
+```bash
+# 1) collection pass (cheap, e.g. --iters 0): writes block_<idx>.pt stats
+export AR_QOFF_NOISE_STATS=/mnt/bigdisk/qoff_stats
+# 2) tuning pass (qoff/BPT): injects them
+export AR_QOFF_NOISE=1 AR_QOFF_NOISE_STATS=/mnt/bigdisk/qoff_stats
+```
+
 ### AR_TUNE_RECIPE
 - **Description**: Experimental init-search recipe for the SignRound tuning path (`--iters > 0`). The recipe replaces the per-group min/max tuning grid with a searched grid: `neuqi_*` anchors the joint (scale, integer zero-point) search (`neuqi_search_scale_zero`, imatrix-weighted); `opt_rtn_qon` anchors the symmetric scale-clip search. `neuqi_frozen_qon` additionally pins the `min_scale`/`max_scale` tuning margins at 1.0 (grid fully fixed, only rounding tunes). `neuqi_fp` vs `neuqi_qon` differ only in which chain shaped the init imatrix (FP-reference vs quantized) — under streaming qon the live imatrix is already chain-faithful. Recipes apply to int data types with standard (non-tuple) group sizes; unsupported layouts keep the min/max grid.
 - **Default**: unset (status-quo min/max init)

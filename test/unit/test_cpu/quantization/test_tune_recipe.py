@@ -461,3 +461,111 @@ class TestAlt2:
             iters=20,
         )
         assert w.alt2_regrid() is None  # not an alt2 layer
+
+
+class TestQoffNoise:
+    """AR_QOFF_NOISE: deterministic per-channel noise injection + guards."""
+
+    @staticmethod
+    def _stats_file(tmp_path, hidden=8, mean_val=0.05, var_val=0.04):
+        import torch as _t
+
+        d = tmp_path / "stats"
+        d.mkdir(exist_ok=True)
+        _t.save(
+            {"mean": _t.full((hidden,), mean_val), "var": _t.full((hidden,), var_val)},
+            d / "block_0000.pt",
+        )
+        return str(d)
+
+    def test_injection_deterministic_and_math(self, tmp_path, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
+
+        import auto_round.envs as envs
+
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        x = [torch.zeros(2, 5, 8) for _ in range(2)]
+
+        a = _maybe_qoff_noise(list(x), 1, enable_quanted_input=False)
+        b = _maybe_qoff_noise(list(x), 1, enable_quanted_input=False)
+        for ta, tb in zip(a, b):
+            torch.testing.assert_close(ta, tb, rtol=0, atol=0)  # same seed -> identical
+        for tx in x:
+            assert torch.equal(tx, torch.zeros_like(tx)), "cached inputs never modified in place"
+
+        # var=0 => x' == x + mean exactly
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path, var_val=0.0), raising=False)
+        c = _maybe_qoff_noise(list(x), 1, enable_quanted_input=False)
+        for tc, tx in zip(c, x):
+            torch.testing.assert_close(tc - tx, torch.full_like(tx, 0.05), rtol=0, atol=1e-6)
+
+    def test_env_off_is_identity(self, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
+
+        import auto_round.envs as envs
+
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE", False, raising=False)
+        x = [torch.zeros(2, 4)]
+        out = _maybe_qoff_noise(x, 3, enable_quanted_input=False)
+        assert out is x
+
+    def test_qon_guard(self, tmp_path, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
+
+        import auto_round.envs as envs
+
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        with pytest.raises(ValueError, match="qoff"):
+            _maybe_qoff_noise([torch.zeros(1, 4, 8)], 1, enable_quanted_input=True)
+
+    def test_missing_stats_dir_guard(self, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
+
+        import auto_round.envs as envs
+
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", "", raising=False)
+        with pytest.raises(ValueError, match="AR_QOFF_NOISE_STATS"):
+            _maybe_qoff_noise([torch.zeros(1, 4, 8)], 1, enable_quanted_input=False)
+
+    def test_missing_file_guard(self, tmp_path, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
+
+        import auto_round.envs as envs
+
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        with pytest.raises(ValueError, match="block_0001.pt"):
+            _maybe_qoff_noise([torch.zeros(1, 4, 8)], 2, enable_quanted_input=False)  # needs block 1 stats
+
+    def test_block_zero_skips(self, tmp_path, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
+
+        import auto_round.envs as envs
+
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE", True, raising=False)
+        monkeypatch.setattr(envs, "AR_QOFF_NOISE_STATS", self._stats_file(tmp_path), raising=False)
+        x = [torch.zeros(1, 4, 8)]
+        assert _maybe_qoff_noise(x, 0, enable_quanted_input=False) is x
+
+    def test_collection_stats_finite(self, tmp_path):
+        import torch.nn as nn
+
+        from auto_round.algorithms.composer import _collect_qoff_noise_stats
+
+        block = nn.Linear(8, 8)
+        x = [torch.randn(4, 6, 8)]
+        fwd = lambda blk, inputs, others: blk(inputs[0])  # noqa: E731
+
+        def fwd_list(blk, inp, others):
+            return blk(inp[0])
+
+        path = str(tmp_path / "s" / "block_0000.pt")
+        mean, var = _collect_qoff_noise_stats(block, fwd_list, torch.zeros(4, 6, 8), x, {}, path)
+        assert mean.shape == (8,) and var.shape == (8,)
+        assert torch.isfinite(mean).all() and torch.isfinite(var).all() and (var >= 0).all()
+        import os
+
+        assert os.path.exists(path)

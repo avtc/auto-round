@@ -102,6 +102,26 @@ def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
     return True
 
 
+def _collect_qoff_noise_stats(block, block_forward_fn, y_fp, inputs, input_others, path):
+    """Per-channel stats of the quantization noise (y_fp - y_q) for one block.
+
+    Writes ``{mean, var}`` CPU tensors [hidden] to ``path`` (created with
+    parents). Returns (mean, var).
+    """
+    import os as _os
+
+    with torch.no_grad():
+        y_q = block_forward_fn(block, inputs, input_others)
+    y_fp_t = _as_hidden_tensor(y_fp).detach().to(torch.float32)
+    y_q_t = _as_hidden_tensor(y_q).detach().to(torch.float32)
+    noise = (y_fp_t - y_q_t).reshape(-1, y_fp_t.shape[-1])
+    mean = noise.mean(dim=0).cpu()
+    var = noise.var(dim=0, unbiased=False).cpu()
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+    torch.save({"mean": mean, "var": var}, path)
+    return mean, var
+
+
 def _maybe_bias_correct(block, y_fp, block_forward_fn, inputs, input_others):
     """Dedicated quantized pass for the non-chained (qoff) path + correction."""
     from auto_round import envs
@@ -577,9 +597,31 @@ class AlgorithmComposer:
 
                 if _envs.AR_BIAS_CORRECT:
                     _apply_block_bias_correction(block, reference_next_input, new_q_input)
+                if _envs.AR_QOFF_NOISE_STATS:
+                    idx = getattr(block_ctx, "block_index", 0)
+                    _collect_qoff_noise_stats(
+                        block,
+                        block_forward_fn,
+                        reference_next_input,
+                        effective_input,
+                        input_others,
+                        f"{_envs.AR_QOFF_NOISE_STATS}/block_{idx:04d}.pt",
+                    )
         else:
             new_q_input = None
             _maybe_bias_correct(block, reference_next_input, block_forward_fn, effective_input, input_others)
+            from auto_round import envs as _envs
+
+            if _envs.AR_QOFF_NOISE_STATS and reference_next_input is not None:
+                idx = getattr(block_ctx, "block_index", 0)
+                _collect_qoff_noise_stats(
+                    block,
+                    block_forward_fn,
+                    reference_next_input,
+                    effective_input,
+                    input_others,
+                    f"{_envs.AR_QOFF_NOISE_STATS}/block_{idx:04d}.pt",
+                )
 
         return new_q_input, reference_next_input
 
