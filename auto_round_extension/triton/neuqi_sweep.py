@@ -114,6 +114,13 @@ def neuqi_sweep_triton(data, qw, scales, maxq):
     assert scales.is_contiguous() and scales.dtype == torch.float32
     if qw is not None:
         assert qw.dtype == torch.float32 and qw.is_contiguous() and qw.shape == data.shape
+    # Triton dereferences raw pointers with no device consistency check -- a
+    # cross-device input surfaces as a delayed "device-side assert" far from
+    # the launch. Fail here, naming the offending tensor, instead.
+    _dev = data.device
+    assert scales.device == _dev, f"neuqi_sweep: scales on {scales.device} but data on {_dev}"
+    if qw is not None:
+        assert qw.device == _dev, f"neuqi_sweep: qw on {qw.device} but data on {_dev}"
 
     c, g = data.shape
     k = scales.shape[1]
