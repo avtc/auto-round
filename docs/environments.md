@@ -290,6 +290,15 @@ export AR_DISK_STREAM_MODEL=1
 export AR_POST_SCALE_REFIT=1
 ```
 
+### AR_BIAS_CORRECT
+- **Description**: Post-quantization bias correction per transformer block: `b = mean over calibration tokens(y_fp - y_q)` at the block's residual-stream boundary, absorbed into the bias of the block's residual-feeding projection (the last Linear/Conv1D with out_features == hidden; routed-expert modules are deprioritized since they execute on token subsets only). Bias is created when absent — native in all export formats, so vLLM sees it without changes. Reuses the chain forward on the qon path (zero extra forwards); adds one no-grad pass on the qoff path. Composable with any `AR_TUNE_RECIPE` and `AR_POST_SCALE_REFIT`.
+- **Default**: `0` (off)
+- **Valid Values**: `0`, `1` (also `true`/`yes`)
+
+```bash
+export AR_BIAS_CORRECT=1
+```
+
 ### AR_TUNE_RECIPE
 - **Description**: Experimental init-search recipe for the SignRound tuning path (`--iters > 0`). The recipe replaces the per-group min/max tuning grid with a searched grid: `neuqi_*` anchors the joint (scale, integer zero-point) search (`neuqi_search_scale_zero`, imatrix-weighted); `opt_rtn_qon` anchors the symmetric scale-clip search. `neuqi_frozen_qon` additionally pins the `min_scale`/`max_scale` tuning margins at 1.0 (grid fully fixed, only rounding tunes). `neuqi_fp` vs `neuqi_qon` differ only in which chain shaped the init imatrix (FP-reference vs quantized) — under streaming qon the live imatrix is already chain-faithful. Recipes apply to int data types with standard (non-tuple) group sizes; unsupported layouts keep the min/max grid.
 - **Default**: unset (status-quo min/max init)

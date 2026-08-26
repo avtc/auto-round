@@ -102,6 +102,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and zero points frozen (composable with any AR_TUNE_RECIPE; also
     # applies to plain minmax-init runs).
     "AR_POST_SCALE_REFIT": lambda: os.getenv("AR_POST_SCALE_REFIT", "0").lower() in ("1", "true", "yes"),
+    # Post-quantization per-Linear bias correction: one extra no-grad pass of
+    # the calibration rows per block, b = mean(y_fp - y_q) absorbed into bias.
+    "AR_BIAS_CORRECT": lambda: os.getenv("AR_BIAS_CORRECT", "0").lower() in ("1", "true", "yes"),
     # Memory layout of the fused zero-point sweep expression: "auto" picks by
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
     # "last"/"mid" force one layout for A/B measurements.

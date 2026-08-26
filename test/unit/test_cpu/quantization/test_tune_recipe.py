@@ -284,3 +284,89 @@ class TestPostScaleRefit:
         qdq = torch.zeros_like(w)  # d == 0 everywhere
         qdq_new, s_new = _refit_scale_grid(w, qdq, s, zp, 16)
         torch.testing.assert_close(s_new, s)
+
+
+class TestBiasCorrect:
+    """AR_BIAS_CORRECT: block-output b = mean(y_fp - y_q) absorbed into the residual sink."""
+
+    @staticmethod
+    def _toy_block(d=8, seed=3):
+        import torch.nn as nn
+
+        torch.manual_seed(seed)
+        block = nn.Sequential(nn.Linear(d, 16, bias=True), nn.Linear(16, d, bias=False))
+        return block
+
+    def test_block_output_mean_restored(self):
+        from auto_round.algorithms.composer import _apply_block_bias_correction
+
+        block = self._toy_block()
+        x = torch.randn(64, 8)
+        y_fp = block(x)
+        with torch.no_grad():  # simulate quantization error in BOTH linears
+            block[0].weight.add_(torch.randn_like(block[0].weight) * 0.02)
+            block[1].weight.add_(torch.randn_like(block[1].weight) * 0.02)
+        y_q = block(x)
+        assert not torch.allclose(y_fp.mean(0), y_q.mean(0), atol=1e-4)
+
+        assert _apply_block_bias_correction(block, y_fp, y_q) is True
+        assert block[1].bias is not None, "correction lands on the residual sink (last proj)"
+        y_corr = block(x)
+        torch.testing.assert_close(y_corr.mean(0), y_fp.mean(0), rtol=0, atol=1e-4)
+
+    def test_absent_bias_created(self):
+        from auto_round.algorithms.composer import _apply_block_bias_correction
+
+        block = self._toy_block(seed=4)
+        x = torch.randn(32, 8)
+        y_fp = block(x)
+        with torch.no_grad():
+            block[1].weight.mul_(1.01)
+        y_q = block(x)
+        _apply_block_bias_correction(block, y_fp, y_q)
+        assert block[1].bias is not None and block[1].bias.shape == (8,)
+
+    def test_expert_sink_deprioritized(self):
+        """Routed experts (token-subset execution) never win over the shared sink."""
+        import torch.nn as nn
+
+        from auto_round.algorithms.composer import _apply_block_bias_correction
+
+        class _MoEish(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.hidden = nn.Linear(8, 8)
+                self.shared = nn.Linear(8, 8)
+                # experts LAST in named_modules order: without deprioritization
+                # pool[-1] would pick mlp_experts.2 as the sink
+                self.mlp_experts = nn.ModuleList([nn.Linear(8, 8) for _ in range(3)])
+
+            def forward(self, x):
+                return self.shared(self.hidden(x)) + sum(e(x) for e in self.mlp_experts) / 3.0
+
+        block = _MoEish()
+        expert_bias_before = [e.bias.detach().clone() for e in block.mlp_experts]
+        shared_bias_before = block.shared.bias.detach().clone()
+        x = torch.randn(16, 8)
+        y_fp = block(x)
+        with torch.no_grad():
+            block.shared.weight.mul_(0.98)
+        y_q = block(x)
+        _apply_block_bias_correction(block, y_fp, y_q)
+        assert not torch.equal(block.shared.bias.detach(), shared_bias_before), "sink must be shared"
+        for e, before in zip(block.mlp_experts, expert_bias_before):
+            assert torch.equal(e.bias.detach(), before), "expert biases must stay untouched"
+
+    def test_as_hidden_tensor_dict(self):
+        from auto_round.algorithms.composer import _as_hidden_tensor
+
+        t = torch.zeros(2, 3)
+        assert _as_hidden_tensor({"hidden_states": t, "foo": 1}) is t
+        assert _as_hidden_tensor({"last_hidden_state": t}) is t
+        assert _as_hidden_tensor((t,)) is t
+        assert _as_hidden_tensor(t) is t
+
+    def test_off_by_default(self):
+        import auto_round.envs as envs
+
+        assert not envs.AR_BIAS_CORRECT
