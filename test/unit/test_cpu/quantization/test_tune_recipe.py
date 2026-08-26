@@ -871,3 +871,36 @@ class TestBackendOverride:
                 assert not _zp_wants_triton("cuda")
             assert not _zp_wants_triton("cuda"), "inner exit restores outer override"
         assert _zp_wants_triton("cuda")
+
+
+class TestTritonEscapeHatch:
+    """AR_NEUQI_BACKEND=triton outranks the wrapper-init compile pin (forensics path)."""
+
+    def test_explicit_triton_wins_over_override(self, monkeypatch):
+        from auto_round.data_type.neuqi import _zp_wants_triton, backend_override
+
+        import auto_round.envs as envs
+
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "triton")
+        with backend_override("compile"):
+            assert _zp_wants_triton("cuda"), "explicit triton must stay available for forensics"
+
+
+class TestSweepWarmup:
+    """Serialized per-device Triton sweep warmup (replaces the compile pin)."""
+
+    def test_cpu_is_noop(self):
+        from auto_round.data_type.neuqi import _sweep_warmed_devices, ensure_sweep_warmup
+
+        before = set(_sweep_warmed_devices)
+        ensure_sweep_warmup(torch.device("cpu"))
+        assert _sweep_warmed_devices == before, "cpu devices are never warmed"
+
+    def test_wrapper_init_search_no_longer_pins_compile(self):
+        """The pin was replaced by the warmup; source must not reference backend_override."""
+        import inspect
+
+        import auto_round.wrapper as wrapper_mod
+
+        src = inspect.getsource(wrapper_mod._compute_recipe_anchors)
+        assert "backend_override" not in src, "wrapper-init searches must keep the Triton default"

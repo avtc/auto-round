@@ -110,13 +110,12 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
         torch.cuda.synchronize(device)
 
     if recipe.startswith("neuqi_") or recipe == "alt2":
-        from auto_round.data_type.neuqi import backend_override, neuqi_search_scale_zero
+        from auto_round.data_type.neuqi import neuqi_search_scale_zero
 
-        # pin the compile backend for wrapper-init searches: the extension
-        # Triton sweep device-asserts intermittently in this context (see
-        # backend_override's docstring); compile is ~0.2s/layer here
-        with backend_override("compile"):
-            s, zp = neuqi_search_scale_zero(w, bits, qw=qw)
+        # the extension Triton sweep stays the default here as everywhere
+        # else; ensure_sweep_warmup (inside the search) serializes its
+        # first launch per device to keep it race-free
+        s, zp = neuqi_search_scale_zero(w, bits, qw=qw)
         maxq = int(2**bits) - 1
         wmin = -(zp * s)
         wmax = (maxq - zp) * s

@@ -59,6 +59,7 @@ batched -> compiled per-candidate -> eager).
 """
 
 import math
+import threading
 from functools import lru_cache
 
 import torch
@@ -277,6 +278,48 @@ def _triton_sweep_fn():
 
 _BACKEND_OVERRIDE = None  # set by backend_override(); None = env-driven
 
+_sweep_warm_lock = threading.Lock()
+_sweep_warmed_devices: set = set()  # device indices whose Triton sweep was warmed once
+
+
+def ensure_sweep_warmup(device) -> None:
+    """Serialized, synchronized first launch of the extension Triton sweep.
+
+    The first Triton launch JIT-compiles the kernel, initializes the launcher
+    and writes the on-disk cache; doing that while unrelated GPU work is in
+    flight (e.g. inductor compile workers active during SignRound wrapper
+    init, or several fan-out threads first-hitting the sweep at once) has been
+    observed to leave the sweep producing corrupt selections that surface as
+    out-of-bounds gather indices downstream (device-side asserts, vanishing
+    under CUDA_LAUNCH_BLOCKING=1). Warming once per device -- under a lock,
+    followed by a full device synchronize -- makes every subsequent launch a
+    cached, race-free launch. Failures latch the existing Triton-broken
+    fallback instead of raising.
+    """
+    if device.type != "cuda":
+        return
+    with _sweep_warm_lock:
+        if device.index in _sweep_warmed_devices:
+            return
+        _sweep_warmed_devices.add(device.index)
+        if not _zp_wants_triton(device.type):
+            return
+        fn = _triton_sweep_fn()
+        if fn is None:
+            return
+        global _triton_broken
+        try:
+            data = torch.randn(4, 128, device=device, dtype=torch.float32)
+            scales = torch.rand(4, 2, device=device, dtype=torch.float32) * 0.01 + 0.001
+            loss, _zp = fn(data, torch.ones_like(data), scales, 15)
+            torch.cuda.synchronize(device)
+            if not torch.isfinite(loss).all():
+                raise RuntimeError("warmup produced non-finite losses")
+            logger.info("[NeUQI] Triton sweep warmed on %s", device)
+        except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
+            _triton_broken = True
+            logger.warning("[NeUQI] Triton sweep warmup failed on %s (%s); using torch.compile sweeps", device, e)
+
 
 class backend_override:
     """Context manager forcing the sweep backend (bypasses AR_NEUQI_BACKEND).
@@ -306,6 +349,8 @@ class backend_override:
 
 def _zp_wants_triton(device_type: str) -> bool:
     """Whether the extension Triton sweep should be tried, per ``AR_NEUQI_BACKEND``."""
+    if envs.AR_NEUQI_BACKEND == "triton":
+        return True  # explicit user intent outranks the wrapper-init pin
     if _BACKEND_OVERRIDE == "compile" or _BACKEND_OVERRIDE == "eager":
         return False
     backend = _BACKEND_OVERRIDE or envs.AR_NEUQI_BACKEND
@@ -456,6 +501,8 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     if fine_n is None:
         fine_n = envs.AR_NEUQI_FINE if envs.AR_NEUQI_FINE else 32
     _log_search_engaged(coarse_n, fine_n)
+    if torch.is_tensor(data):
+        ensure_sweep_warmup(data.device)
 
     maxq = int(2**bits) - 1
     data = data.to(torch.float32)
