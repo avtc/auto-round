@@ -479,16 +479,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             # ── Infrastructure: immediate_pack / shard write ──────────────────
             is_bp_worker = bool(envs.AR_BLOCK_PARALLEL_WORKER)
             if self.compress_context.is_immediate_packing and not is_bp_worker:
-                for _n, _mod in m.named_modules():
-                    if hasattr(_mod, "bits") and check_to_quantized(_mod):
-                        from auto_round.compressors.utils import immediate_pack as _immediate_pack
+                from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
-                        module_name = getattr(_mod, "global_name", None)
-                        if module_name is None and nblocks == 1 and _n:
-                            module_name = f"{n}.{_n}"
-                        if module_name is None:
-                            continue
-                        _immediate_pack(module_name, self.layer_config)
+                _immediate_pack_block(m, n, self.layer_config, nblocks=nblocks)
 
             input_ids = next_input_ids
 
@@ -1351,14 +1344,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # mirror _collect_tuned_layers: only tensors move devices
                     sub.zp = zp.to(sub.weight.device) if isinstance(zp, torch.Tensor) else zp
                     applied += 1
-                for sub_name, sub in block.named_modules():
-                    if hasattr(sub, "bits") and check_to_quantized(sub):
-                        module_name = getattr(sub, "global_name", None) or (
-                            f"{block_name}.{sub_name}" if sub_name else None
-                        )
-                        if module_name is None:
-                            continue
-                        _immediate_pack(module_name, self.layer_config)
+                from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
+
+                _immediate_pack_block(block, block_name, self.layer_config, nblocks=1)
                 if self.compress_context.is_immediate_saving:
                     self.shard_writer.write(block, is_finalize=False)
                 if self._should_offload_after_pack(self.compress_context):
@@ -1505,14 +1493,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         if applied == 0:
             raise RuntimeError(f"resume: BPT result for {block_name} matched no layers (key mismatch)")
         if self.compress_context.is_immediate_packing:
-            for _n, _mod in block.named_modules():
-                if hasattr(_mod, "bits") and check_to_quantized(_mod):
-                    module_name = getattr(_mod, "global_name", None)
-                    if module_name is None and self.nblocks == 1 and _n:
-                        module_name = f"{block.global_name}.{_n}"
-                    if module_name is None:
-                        continue
-                    _immediate_pack(module_name, self.layer_config)
+            from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
+
+            _immediate_pack_block(block, block_name, self.layer_config, nblocks=self.nblocks)
         if self.compress_context.is_immediate_saving:
             for _n, m in block.named_modules():
                 if (
@@ -1763,16 +1746,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
                 if self.compress_context.is_immediate_packing:
                     _t_pack = _time.perf_counter()
-                    for _n, _mod in block.named_modules():
-                        if hasattr(_mod, "bits") and check_to_quantized(_mod):
-                            from auto_round.compressors.utils import immediate_pack as _immediate_pack
+                    from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
-                            module_name = getattr(_mod, "global_name", None)
-                            if module_name is None and self.nblocks == 1 and _n:
-                                module_name = f"{block.global_name}.{_n}"
-                            if module_name is None:
-                                continue
-                            _immediate_pack(module_name, self.layer_config)
+                    _immediate_pack_block(block, block_name, self.layer_config, nblocks=self.nblocks)
                     _t_pack = _time.perf_counter() - _t_pack
                 else:
                     _t_pack = 0.0
