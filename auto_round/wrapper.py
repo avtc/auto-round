@@ -99,6 +99,15 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
     qw = None
     if imatrix is not None:
         qw = _prepare_recipe_imatrix(imatrix, w, bits, group_size).to(device)
+    # Join any in-flight GPU work before the search launches: the data-driven
+    # pipeline's input-caching pass moves activations across GPUs on side
+    # streams (accelerate), and the zero-shot path that never faulted does not
+    # run it. A not-yet-joined producer makes the search read stale tensors --
+    # an intermittent device-side assert that disappears under
+    # CUDA_LAUNCH_BLOCKING=1 (observed: recipe init-search on a 4-GPU
+    # device_map). One sync per layer-init is noise next to the search cost.
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
 
     if recipe.startswith("neuqi_") or recipe == "alt2":
         from auto_round.data_type.neuqi import neuqi_search_scale_zero
