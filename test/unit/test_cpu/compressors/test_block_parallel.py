@@ -766,3 +766,32 @@ class TestStreamMemInventory:
         orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
         orch.model = torch.nn.Linear(4, 4)  # cpu-only box: loop body skips cuda tensors
         orch._log_device_inventory({"fp_inputs": [torch.ones(2)]}, "test")  # must not raise
+
+
+class TestAutoStagingPrimaryFit:
+    """auto staging adds the primary only when the largest block fits free VRAM."""
+
+    def test_largest_block_bytes_from_meta(self):
+        import torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList(
+                    [torch.nn.ModuleDict({"w": torch.nn.Linear(4, 4, device="meta")}) for _ in range(2)]
+                )
+                self.blocks[1].big = torch.nn.Linear(16, 16, device="meta")
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch.model = FakeModel()
+        got = orch._largest_block_bytes()
+        want = (16 * 16 + 16) * 4 + (4 * 4 + 4) * 4  # big block weight+bias dominates
+        assert abs(got - want) < 1, (got, want)
+
+    def test_primary_fit_none_without_cuda(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        assert orch._primary_fits_largest_block(torch.device("cpu")) is None

@@ -1605,6 +1605,42 @@ class CompressionOrchestrator(BaseOrchestrator):
             return "embeddings"
         return "nonblock:" + name.split(".")[0]
 
+    def _largest_block_bytes(self) -> float:
+        """Largest block's checkpoint-tensor footprint from the meta skeleton (bytes)."""
+        try:
+            block_names = [n for sub in get_block_names(self.model, quant_vision=True) for n in sub]
+        except Exception:  # noqa: BLE001  sizing must never break staging
+            return float("inf")
+        per_block: dict = {}
+        for name, t in self.model.named_parameters():
+            for b in block_names:
+                if name == b or name.startswith(b + "."):
+                    per_block[b] = per_block.get(b, 0) + t.numel() * t.element_size()
+                    break
+        if not per_block:
+            return float("inf")
+        return float(max(per_block.values()))
+
+    def _primary_fits_largest_block(self, quant_dev: torch.device):
+        """Whether the primary GPU can join the auto rotation, else None.
+
+        Fit rule: free VRAM (queried live) - 3 GiB headroom >= largest block.
+        The headroom covers tuning transients on top of the block (batch
+        slices, in-place qdq, pack buffers). Conservative on purpose: the
+        largest block gates EVERY block's home, and sizes vary by layer type.
+        """
+        if quant_dev.type != "cuda" or quant_dev.index is None:
+            return None
+        try:
+            free_b, _total_b = torch.cuda.mem_get_info(quant_dev.index)
+        except Exception:  # noqa: BLE001
+            return None
+        largest = self._largest_block_bytes()
+        free_gb = free_b / 2**30
+        if largest is float("inf") or free_gb - 3.0 < largest / 2**30:
+            return None
+        return largest / 2**30, free_gb
+
     def _log_device_inventory(self, calib_state: dict, tag: str) -> None:
         """AR_STREAM_MEM_INVENTORY=1: per-GPU breakdown of the streaming parent's memory.
 
@@ -1684,6 +1720,21 @@ class CompressionOrchestrator(BaseOrchestrator):
                 logger.warning("[stream] stream_prefetch_devices='auto' ignored: no CUDA devices visible")
                 return None
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
+            # The primary joins the rotation when its free VRAM comfortably
+            # holds the LARGEST block (block sizes vary by layer type - GDN vs
+            # full-attention vs first/last): parent working set + block + tuning
+            # transients must coexist there for one block at a time.
+            primary_fit = self._primary_fits_largest_block(quant_dev)
+            if primary_fit is not None:
+                largest_gb, free_gb = primary_fit
+                devices = [torch.device("cuda", i) for i in range(n_gpu)]
+                logger.info(
+                    "[stream] auto staging includes the primary %s: largest block %.2fG fits free %.2fG "
+                    "(headroom 3.0G for tuning transients)",
+                    quant_dev,
+                    largest_gb,
+                    free_gb,
+                )
         else:
             devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
             if any(d.type == "cuda" for d in devices) and any(d.type == "cpu" for d in devices):
@@ -1905,7 +1956,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _t_pack = _time.perf_counter()
                     from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
-                    _immediate_pack_block(block, block_name, self.layer_config, nblocks=self.nblocks)
+                    _immediate_pack_block(
+                        block, block_name, self.layer_config, nblocks=self.nblocks, device=load_device
+                    )
                     _t_pack = _time.perf_counter() - _t_pack
                 else:
                     _t_pack = 0.0

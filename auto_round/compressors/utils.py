@@ -627,7 +627,7 @@ def _format_supports_batched_pack(fmt) -> bool:
     return not any(tok in out for tok in ("nv_fp", "mx_fp", "nvfp", "mxfp", "fp8", "fake", "llm_compressor"))
 
 
-def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: int = 1):
+def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: int = 1, device=None):
     """Immediate-pack every quantizable module of one block.
 
     Same-shape Linear modules (MoE experts -- 576 per hy3 block) go through a
@@ -660,7 +660,9 @@ def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: in
     fmt = compress_context.formats[0] if compress_context.formats else None
     from auto_round.utils.device_manager import get_packing_device
 
-    pack_device = get_packing_device(device_manager.device)
+    # default to the caller's block home: weights/scales/zp already sit there,
+    # so packing in place avoids a per-module round trip to the primary
+    pack_device = get_packing_device(device if device is not None else device_manager.device)
     if pack_device.type == "cpu":
         # CPU packing is elementwise-compute-bound: batching trades small
         # per-module allocations for one huge intermediate and measures ~30%
