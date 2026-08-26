@@ -223,3 +223,14 @@ class TestMarkBlockDoneFromFileLastBlock:
         state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
         with pytest.raises(FileNotFoundError):
             state.mark_block_done_from_file("b0", str(tmp_path / "nope.pt"))
+
+
+class TestMarkBlockDoneInMemoryLastBlock:
+    """mark_block_done(None input_ids) marks the final block without a successor entry."""
+
+    def test_last_block_none_input_ids(self, tmp_path):
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        state.mark_block_done("b0", None, torch.zeros(2, 3, dtype=torch.long))
+        state.mark_block_done("b1", None, None)  # final block: no successor entry
+        assert state.resume_index == 2
+        assert not (tmp_path / "resume_input_ids.pt").exists() or state.completed_blocks == ["b0", "b1"]
