@@ -882,6 +882,27 @@ class CompressionOrchestrator(BaseOrchestrator):
         done = {}
         for g, blocks in enumerate(all_blocks):
             done[g] = {k for k, b in enumerate(blocks) if bp.block_results_complete(results_dir, b)}
+        # Cross-mode resume (streaming/serial): blocks below the serial-
+        # manifest frontier with no result file were PACKED by the interrupted
+        # run -- their tensors live in shards on disk, not in result files.
+        # Seed them as done so workers never re-tune them; the apply pass
+        # skips them and the parent's ShardWriter adopts their shards.
+        manifest_done = set()
+        for g, blocks in enumerate(all_blocks):
+            rs_done = resume_states[g] if resumable else None
+            if rs_done is None:
+                continue
+            for k in range(rs_done.resume_index):
+                if k not in done[g]:
+                    done[g].add(k)
+                    manifest_done.add((g, k))
+        manifest_done_names = {all_blocks[g][k] for g, k in manifest_done}
+        if manifest_done:
+            logger.info(
+                "block-parallel tuning: %d block(s) done by a prior streaming/serial run "
+                "(already packed in shards; not re-tuning)",
+                len(manifest_done),
+            )
         total_blocks = sum(len(blocks) for blocks in all_blocks)
         n_todo = total_blocks - sum(len(d) for d in done.values())
 
@@ -895,8 +916,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             tuned = bp.load_all_block_results(results_dir)
             if not tuned:
-                raise RuntimeError(f"block-parallel tuning: no block results found in {results_dir}")
-            self._apply_tuned_results(all_blocks, tuned)
+                raise RuntimeError(
+                    "block-parallel tuning: nothing to do -- every block is marked done by a prior "
+                    "streaming/serial run (no worker results exist). Unset --enable_block_parallel_tuning "
+                    "or clear AR_RESUME_DIR, then rerun to export."
+                )
+            if self.shard_writer is not None and manifest_done_names:
+                self.shard_writer.adopt_existing_shards()
+            self._apply_tuned_results(all_blocks, tuned, skip_blocks=manifest_done_names)
             if resumable:
                 self._resume_states = resume_states
             return True
@@ -1073,8 +1100,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     rs.mark_block_done_from_file(blocks[k], entry_src)
 
         tuned = bp.load_all_block_results(results_dir)
-        missing = bp.missing_result_blocks(results_dir, all_blocks)
-        if missing or not tuned:
+        missing = [b for b in bp.missing_result_blocks(results_dir, all_blocks) if b not in manifest_done_names]
+        if missing or not tuned and not manifest_done_names:
             raise RuntimeError(
                 f"block-parallel tuning: no results for {len(missing)} block(s) "
                 f"(first: {missing[0] if missing else 'n/a'}); logs in {results_dir}"
@@ -1084,7 +1111,11 @@ class CompressionOrchestrator(BaseOrchestrator):
             len(tuned),
             codes,
         )
-        self._apply_tuned_results(all_blocks, tuned)
+        if self.shard_writer is not None and manifest_done_names:
+            # streaming/serial-packed blocks: adopt their shards so the final
+            # index covers tensors from both runs and nothing is overwritten
+            self.shard_writer.adopt_existing_shards()
+        self._apply_tuned_results(all_blocks, tuned, skip_blocks=manifest_done_names)
         if resumable:
             # quantize_and_save clears these after a successful export (same as serial)
             self._resume_states = resume_states
@@ -1262,16 +1293,24 @@ class CompressionOrchestrator(BaseOrchestrator):
         """
         return compress_context.low_cpu_mem_usage and not compress_context.is_immediate_saving
 
-    def _apply_tuned_results(self, all_blocks: list, tuned: dict) -> None:
-        """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding."""
+    def _apply_tuned_results(self, all_blocks: list, tuned: dict, skip_blocks: Optional[set] = None) -> None:
+        """Pack blocks from worker-tuned scale/zp without re-tuning or forwarding.
+
+        ``skip_blocks`` names blocks whose tensors a prior streaming/serial run
+        already packed into shards (cross-mode resume): they are neither
+        validated (no results exist for them) nor reloaded/packed/written.
+        """
         from auto_round.compressors.utils import immediate_pack as _immediate_pack
 
+        skip_blocks = skip_blocks or set()
         # pre-validate key coverage before touching any module: every module
         # the pack loop will touch must have a tuned entry -- a mismatch fails
         # here with names, instead of an AttributeError in the export stack
         expected = set()
         for group in all_blocks:
             for block_name in group:
+                if block_name in skip_blocks:
+                    continue
                 block = get_module(self.model_context.model, block_name)
                 for sub_name, sub in block.named_modules():
                     if hasattr(sub, "bits") and check_to_quantized(sub):
@@ -1291,6 +1330,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         for group in all_blocks:
             for block_name in group:
                 pbar.set_description(f"Packing {block_name}")
+                if block_name in skip_blocks:
+                    # already packed in an adopted shard by a prior run; the
+                    # writer's _all_saved set dedups any accidental re-write
+                    pbar.update(1)
+                    continue
                 if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
                     self._offloader.reload(self.model_context.model, block_name)
                 block = get_module(self.model_context.model, block_name)

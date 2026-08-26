@@ -196,3 +196,47 @@ class TestStreamResumeDoneBlock:
                 pbar=None,
                 tied_weights_layers=[],
             )
+
+
+class TestBPTResumeFromStreaming:
+    """The BPT parent skips streaming-packed blocks (cross-mode resume)."""
+
+    def _orch(self, model):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import _tuned_layer_key
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+        orch.model_context = SimpleNamespace(model=model, amp_dtype=None)
+        orch.compress_context = SimpleNamespace(
+            is_immediate_packing=False, is_immediate_saving=False, low_cpu_mem_usage=False
+        )
+        orch.shard_writer = None
+        orch.layer_config = {}
+        return orch
+
+    def test_apply_skips_manifest_done_blocks(self):
+        model = _ToyModel()
+        orch = self._orch(model)
+        from auto_round.compressors.orchestrator import _tuned_layer_key
+
+        scale = torch.full((4, 1), 0.25)
+        tuned = {_tuned_layer_key("dec1", "linear", model.dec1.linear): {"scale": scale, "zp": 0}}
+
+        # dec0 is streaming-packed (skipped): no result for it, no scale set,
+        # and the expected-coverage validation must not flag its layers
+        orch._apply_tuned_results([["dec0", "dec1"]], tuned, skip_blocks={"dec0"})
+
+        assert torch.equal(model.dec1.linear.scale, scale)
+        assert not hasattr(model.dec0.linear, "scale")
+
+    def test_apply_raises_on_uncovered_pending_block(self):
+        import pytest
+
+        model = _ToyModel()
+        # a to-pack layer: bits attr makes check_to_quantized True
+        model.dec0.linear.bits = 4
+        orch = self._orch(model)
+
+        with pytest.raises(RuntimeError, match="missing from worker"):
+            orch._apply_tuned_results([["dec0"]], {})
