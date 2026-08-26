@@ -119,6 +119,30 @@ def resolve_block_replay_device(block_device, requested_device):
     return torch.device(requested_device)
 
 
+def strip_stale_device_hooks_(module: torch.nn.Module) -> int:
+    """Remove accelerate dispatch hooks that remember pre-streaming devices.
+
+    Under ``--device_map`` the streaming skeleton is accelerate-built: every
+    module carries a pre-forward hook that moves args to its dispatch-time
+    device. When the streamer loads a block onto its round-robin home (or the
+    primary), those hooks fight the runner's explicit input placement - e.g.
+    weights streamed to cuda:1 while the hook drags inputs back to cuda:0.
+    Only called for streamed blocks; the data-driven path keeps its hooks.
+
+    Returns the number of modules cleaned.
+    """
+    try:
+        from accelerate.hooks import remove_hook_from_module
+    except ImportError:  # pragma: no cover - accelerate ships with transformers
+        return 0
+    cleaned = 0
+    for m in module.modules():
+        if getattr(m, "_hf_hook", None) is not None:
+            remove_hook_from_module(m)
+            cleaned += 1
+    return cleaned
+
+
 def block_forward(
     block: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -151,7 +175,12 @@ def block_forward(
     device = resolve_block_replay_device(block_param.device if block_param is not None else None, device)
     if input_ids.device != device:
         input_ids = to_device(input_ids, device)
-        input_others = to_device(input_others, device)
+    # input_others move is NOT gated on input_ids: the streaming chain parks
+    # kwargs separately from the hidden states (e.g. (cos.cpu(), sin.cpu())
+    # position-embedding tuples), so the hidden states can already sit on the
+    # replay device while rope tables are still on host RAM. to_device is an
+    # identity for already-placed tensors, so this is free when placed.
+    input_others = to_device(input_others, device)
     input_tuple = input_others.pop("positional_inputs", None)
     if "alibi" in input_others.keys() and input_others["alibi"] is not None:
         alibi = input_others["alibi"]

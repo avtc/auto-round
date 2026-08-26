@@ -669,3 +669,52 @@ class TestAssertNoCpuOffload:
         orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
         orch.model_context = SimpleNamespace(model=SimpleNamespace())
         orch._assert_no_cpu_offload()  # must not raise
+
+
+class TestStripStaleDeviceHooks:
+    """Streamed blocks lose accelerate hooks that remember pre-streaming devices."""
+
+    def test_strips_hooked_modules_only(self, monkeypatch):
+        import torch
+
+        import auto_round.compressors.utils as cu
+
+        removed = []
+
+        def fake_remove(mod):
+            removed.append(mod)
+            if hasattr(mod, "_hf_hook"):
+                del mod._hf_hook
+
+        import accelerate.hooks  # noqa: F401  ensure import path exists
+
+        monkeypatch.setattr("accelerate.hooks.remove_hook_from_module", fake_remove)
+        block = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+        block[0]._hf_hook = object()  # only the first module is hooked
+        n = cu.strip_stale_device_hooks_(block)
+        assert n == 1
+        assert removed == [block[0]]
+        assert not hasattr(block[0], "_hf_hook")
+
+    def test_noop_without_hooks(self):
+        import torch
+
+        from auto_round.compressors.utils import strip_stale_device_hooks_
+
+        block = torch.nn.Linear(4, 4)
+        assert strip_stale_device_hooks_(block) == 0
+
+
+class TestInputOthersAlwaysMoved:
+    """block_forward moves kwargs even when hidden states are already placed."""
+
+    def test_to_device_recurses_pe_tuples(self):
+        import torch
+
+        from auto_round.utils.model import to_device
+
+        cos, sin = torch.ones(2), torch.ones(2)
+        others = {"position_embeddings": [(cos, sin)], "attention_mask": [torch.ones(2)]}
+        moved = to_device(others, torch.device("cpu"))
+        # identity for on-device tensors - masters untouched, structure intact
+        assert moved["position_embeddings"][0][0] is cos
