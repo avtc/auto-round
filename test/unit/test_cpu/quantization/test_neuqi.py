@@ -157,6 +157,21 @@ class _LogCapture(logging.Handler):
 
 
 class TestNeuqiLogging:
+    def test_coarse_grid_is_recreated_per_call(self):
+        """A cached grid is a cross-stream hazard in the expert fan-out: the
+        tensor is filled on the first caller's stream and read from other
+        threads' streams with no event ordering (49aa6405, device-side assert
+        on the streaming parent). Recreating it per call keeps creation on the
+        calling thread's own stream -- this locks that invariant in."""
+        import auto_round.data_type.neuqi as N
+
+        args = (0.001, 8, torch.device("cpu"), torch.float32)
+        a = N._coarse_grid(*args)
+        b = N._coarse_grid(*args)
+        assert a is not b, "grid must not be shared state across calls"
+        assert not hasattr(N._coarse_grid, "cache_info"), "tensor-returning helper must not be lru_cache'd"
+        torch.testing.assert_close(a, b)  # values stay deterministic across calls
+
     def test_engaged_log_line(self):
         _log_search_engaged.cache_clear()
         cap = _LogCapture()
