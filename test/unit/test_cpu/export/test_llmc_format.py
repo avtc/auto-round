@@ -54,12 +54,58 @@ class TestLLMCZpInt8:
         assert zp is not None and zp.dtype == torch.int32
         assert getattr(layer, "weight_packed", None) is not None
 
+    def test_asym_zp_signed_convention_round_trip(self):
+        """AutoRound zp is unsigned (q in [0, 2^b-1], W = (q - zp) * s);
+        compressed-tensors re-quantizes with the SIGNED range
+        [-2^(b-1), 2^(b-1)-1] (clamp AFTER adding zp). The unsigned zp must be
+        shifted into the signed convention before packing, or CT's clamp
+        collapses every level above 2^(b-1)-1. Round-trip through CT's own
+        compressor must reproduce AutoRound's fake-quantized weight exactly."""
+        import torch
+        import torch.nn as nn
+
+        from auto_round.export.export_to_llmcompressor.export import pack_layer
+        from compressed_tensors.compressors.pack_quantized import PackedQuantizationCompressor
+
+        torch.manual_seed(0)
+        out_f, in_f, gs = 8, 32, 16
+        w = torch.randn(out_f, in_f)
+        scale = torch.rand(out_f, in_f // gs) * 0.02 + 0.005  # [out, in/g]
+        zp = torch.randint(0, 16, (out_f, in_f // gs)).float()
+        zp[:, 0] = 12  # exercise levels above 2^(b-1)-1 (the pre-fix clamp)
+
+        layer = nn.Linear(in_f, out_f)
+        with torch.no_grad():
+            layer.weight.copy_(w)
+        layer.bits, layer.sym, layer.group_size = 4, False, gs
+        layer.data_type, layer.act_bits, layer.act_sym, layer.act_data_type = "int", 16, True, None
+        layer.scale, layer.zp = scale, zp
+
+        model = nn.Sequential()
+        model.add_module("q_proj", layer)
+        pack_layer("q_proj", model, device="cpu")
+
+        # AutoRound's own fake-quantized weight (unsigned convention)
+        s = scale.repeat_interleave(gs, dim=1)
+        z = zp.repeat_interleave(gs, dim=1)
+        q = (w / s + z).round().clamp(0, 15)
+        w_ref = (q - z) * s
+
+        state = {
+            "weight_packed": layer.weight_packed.detach(),
+            "weight_scale": layer.weight_scale.detach(),
+            "weight_zero_point": layer.weight_zero_point.detach(),
+            "weight_shape": layer.weight_shape.detach(),
+        }
+        out = PackedQuantizationCompressor.decompress(state, layer.quantization_scheme)
+        assert torch.equal(out["weight"].to(torch.float32), w_ref)
+
     def test_out_of_range_zp_raises(self):
         import torch
 
         from auto_round.export.export_to_llmcompressor.export import pack_layer
 
-        layer = self._make_layer(torch.full((8, 1), 200.0), bits=8)  # >127: not int8-representable
+        layer = self._make_layer(torch.full((8, 1), 200.0), bits=4)  # zp >> 2^b-1: invalid at any convention
         model = torch.nn.Sequential()
         model.add_module("q_proj", layer)
         try:
