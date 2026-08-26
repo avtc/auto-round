@@ -281,6 +281,15 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 export AR_DISK_STREAM_MODEL=1
 ```
 
+### AR_POST_SCALE_REFIT
+- **描述**: 调优结束后按组做最小二乘 scale 重拟合，整数网格与零点冻结。单步闭式解（冻结整数约束下的精确最优解）；存在 imatrix 时按 imatrix 加权；按构造保证加权 MSE 单调不增。可与任意 `AR_TUNE_RECIPE`（以及普通 minmax 初始化运行）组合；适用于标准 group size 的 int 数据类型。
+- **默认值**: `0`（关闭）
+- **有效值**: `0`、`1`（也接受 `true`/`yes`）
+
+```bash
+export AR_POST_SCALE_REFIT=1
+```
+
 ### AR_TUNE_RECIPE
 - **描述**: SignRound 调优路径（`--iters > 0`）的实验性初始化搜索配方。配方用搜索到的网格替换逐组 min/max 调优网格：`neuqi_*` 锚定联合（scale、整数零点）搜索（`neuqi_search_scale_zero`，imatrix 加权）；`opt_rtn_qon` 锚定对称 scale-clip 搜索。`neuqi_frozen_qon` 额外把 `min_scale`/`max_scale` 调优边距固定为 1.0（网格完全固定，仅调舍入）。`neuqi_fp` 与 `neuqi_qon` 的区别仅在于初始化 imatrix 来自哪条链（FP 参考链 vs 量化链）——流式 qon 下实时 imatrix 本身就是链一致的。配方适用于标准（非 tuple）group size 的 int 数据类型；不支持的布局保持 min/max 网格。
 - **默认值**: 未设置（保持现状 min/max 初始化）

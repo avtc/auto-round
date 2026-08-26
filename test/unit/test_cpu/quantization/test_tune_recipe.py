@@ -231,3 +231,56 @@ class TestWrapperIntegration:
 
         gmin = _t.clamp(w.orig_layer.weight.reshape(8, 2, 16).amin(dim=-1).flatten(), max=0)
         _t.testing.assert_close(w.weight_min, gmin, rtol=0, atol=1e-7)
+
+
+class TestPostScaleRefit:
+    """AR_POST_SCALE_REFIT: exact LS scale refit, integers+zp frozen."""
+
+    @staticmethod
+    def _quantized(bits=4, gs=16, n=8, seed=5):
+        torch.manual_seed(seed)
+        w = torch.randn(n, gs).float() * 0.05
+        s = (torch.rand(n, 1) * 0.004 + 0.002).float()
+        maxq = 2**bits - 1
+        zp = torch.randint(0, maxq + 1, (n, 1)).float()
+        q = torch.clamp(torch.round(w / s + zp), 0, maxq)
+        qdq = (s * (q - zp)).to(w.dtype)
+        return w, s, zp, q, qdq
+
+    def test_refit_never_increases_mse(self):
+        from auto_round.wrapper import _refit_scale_grid
+
+        w, s, zp, q, qdq = self._quantized()
+        qdq_new, s_new = _refit_scale_grid(w, qdq.clone(), s.clone(), zp, 16)
+        mse0 = ((qdq - w) ** 2).sum()
+        mse1 = ((qdq_new - w) ** 2).sum()
+        assert mse1 <= mse0 + 1e-12, f"refit increased MSE: {mse0} -> {mse1}"
+
+    def test_integers_and_zp_frozen(self):
+        from auto_round.wrapper import _refit_scale_grid
+
+        w, s, zp, q, qdq = self._quantized(seed=6)
+        qdq_new, s_new = _refit_scale_grid(w, qdq.clone(), s.clone(), zp, 16)
+        q_rec = torch.round(qdq_new / s_new + zp)
+        q_ref = torch.round(qdq / s + zp)
+        assert torch.equal(q_rec, q_ref), "integer grid must not move"
+
+    def test_imatrix_weighted_objective_improves(self):
+        from auto_round.wrapper import _refit_scale_grid
+
+        w, s, zp, q, qdq = self._quantized(seed=7)
+        qw = (torch.rand_like(w) * 10) ** 2  # strong per-element weighting
+        qdq_new, _ = _refit_scale_grid(w, qdq.clone(), s.clone(), zp, 16, qw=qw)
+        wmse0 = (qw * (qdq - w) ** 2).sum()
+        wmse1 = (qw * (qdq_new - w) ** 2).sum()
+        assert wmse1 <= wmse0 + 1e-9
+
+    def test_degenerate_group_keeps_scale(self):
+        from auto_round.wrapper import _refit_scale_grid
+
+        w = torch.zeros(2, 16)
+        s = torch.full((2, 1), 0.01)
+        zp = torch.zeros(2, 1)
+        qdq = torch.zeros_like(w)  # d == 0 everywhere
+        qdq_new, s_new = _refit_scale_grid(w, qdq, s, zp, 16)
+        torch.testing.assert_close(s_new, s)

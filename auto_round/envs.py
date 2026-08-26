@@ -98,6 +98,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "" (default) = status-quo min/max init; see docs/environments.md for the
     # recipe table, composability rules, and the BPT arms.
     "AR_TUNE_RECIPE": lambda: os.getenv("AR_TUNE_RECIPE", "").strip().lower(),
+    # Post-tuning per-group least-squares scale refit with the integer grid
+    # and zero points frozen (composable with any AR_TUNE_RECIPE; also
+    # applies to plain minmax-init runs).
+    "AR_POST_SCALE_REFIT": lambda: os.getenv("AR_POST_SCALE_REFIT", "0").lower() in ("1", "true", "yes"),
     # Memory layout of the fused zero-point sweep expression: "auto" picks by
     # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
     # "last"/"mid" force one layout for A/B measurements.

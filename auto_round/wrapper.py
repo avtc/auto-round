@@ -22,6 +22,7 @@ from torch.functional import F
 import auto_round.envs as envs
 from auto_round.compressors.utils import is_nv_fp
 from auto_round.data_type import get_quant_func, reshape_pad_tensor_by_group_size
+from auto_round.data_type.utils import revert_tensor_by_pad
 from auto_round.logger import logger
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
@@ -113,6 +114,36 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
             "pinned at 1.0" if frozen else "tunable from 1.0",
         )
     return wmin.squeeze(-1), wmax.squeeze(-1), frozen
+
+
+def _refit_scale_grid(weight, qdq_weight, scale, zp, group_size, qw=None):
+    """Per-group least-squares scale refit with the integer grid frozen.
+
+    The deployed reconstruction is w_hat = s*(q - zp); with the integers q and
+    zero points zp FROZEN, the weighted LS optimum is closed-form:
+        s* = sum(qw * w * d) / sum(qw * d^2),  d = q - zp
+    so one step is the exact minimizer for that constraint (monotone
+    non-increasing weighted MSE by construction). Degenerate groups (d == 0
+    throughout) keep their scale.
+
+    Returns (qdq_new, scale_new); zp and the integers are unchanged.
+    """
+    w, _shape, _pad = reshape_pad_tensor_by_group_size(weight.detach().to(torch.float32), group_size)
+    qdq, _s, _p = reshape_pad_tensor_by_group_size(qdq_weight.detach().to(torch.float32), group_size)
+    s = scale.detach().to(torch.float32).reshape(-1, 1)
+    zp_g = zp.detach().to(torch.float32).reshape(-1, 1) if isinstance(zp, torch.Tensor) else zp
+    q = torch.round(qdq / s + zp_g)  # exact recovery: bf16 qdq error << s/2
+    d = q - zp_g
+    if qw is not None:
+        weights, _ws, _wp = reshape_pad_tensor_by_group_size(qw.detach().to(torch.float32), group_size)
+    else:
+        weights = torch.ones_like(d)
+    num = (weights * w * d).sum(dim=-1, keepdim=True)
+    den = (weights * d * d).sum(dim=-1, keepdim=True)
+    s_new = torch.where(den > 0, num / den.clamp(min=1e-30), s)
+    qdq_new = (s_new * d).to(qdq_weight.dtype)
+    qdq_new = revert_tensor_by_pad(qdq_new, orig_shape=_shape, pad_len=_pad)
+    return qdq_new, s_new.reshape(scale.shape).to(scale.dtype)
 
 
 _RECIPE_INIT_LOGGED = False
@@ -454,6 +485,21 @@ class WrapperLinear(torch.nn.Module):
             self.orig_layer.to(self.device)
         # Unwrapper weight
         qdq_weight, scale, zp = self._qdq_weight(v, min_scale, max_scale)
+        if (
+            envs.AR_POST_SCALE_REFIT
+            and isinstance(scale, torch.Tensor)
+            and not isinstance(self.orig_layer.group_size, tuple)
+            and not is_nv_fp(self.orig_layer.data_type)
+            and self.orig_layer.bits < 16
+        ):
+            qdq_weight, scale = _refit_scale_grid(
+                self.orig_layer.get_weight() if hasattr(self.orig_layer, "get_weight") else self.orig_layer.weight,
+                qdq_weight,
+                scale,
+                zp,
+                self.orig_layer.group_size,
+                qw=getattr(self.orig_layer, "imatrix", None),
+            )
         # if hasattr(self.orig_layer, "imatrix"):
         #     self.orig_layer.imatrix = None
         self.orig_layer.weight.data.copy_(qdq_weight)
