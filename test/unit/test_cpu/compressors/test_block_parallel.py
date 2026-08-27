@@ -795,3 +795,19 @@ class TestAutoStagingPrimaryFit:
 
         orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
         assert orch._primary_fits_largest_block(torch.device("cpu")) is None
+
+
+class TestPinStreamHome:
+    """Streaming homes win over dispatch_block's multi-GPU sharding."""
+
+    def test_pin_stream_home(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import quantizer as qmod
+
+        block = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+        block[0].tuning_device = "cpu"  # pre-existing pin must be overwritten
+        qmod.SignRoundQuantizer._pin_stream_home(block, torch.device("meta"))
+        assert block[0].tuning_device == torch.device("meta")
+        assert block[1].tuning_device == torch.device("meta")
+        assert not hasattr(block, "tuning_device")  # parents untouched

@@ -1910,6 +1910,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 materialize_model_(block)
                 strip_stale_device_hooks_(block)
                 _n_moved = rehome_block_(block, load_device)
+                block._stream_home_device = torch.device(load_device)
                 if stream_block_idx == 0:
                     logger.info(
                         "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
