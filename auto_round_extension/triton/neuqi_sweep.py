@@ -129,6 +129,15 @@ def neuqi_sweep_triton(data, qw, scales, maxq):
     bc = max(1, min(64, 4096 // gp))
     loss = torch.empty((c, k), device=data.device, dtype=torch.float32)
     zp = torch.empty((c, k), device=data.device, dtype=torch.int32)
+    # Triton launches on the CURRENT cuda device; with tensors on another GPU
+    # (block homes under streaming rotation) the launcher rejects the pointer
+    # ("cannot be accessed from Triton (cpu tensor?)") or misbehaves. Pin the
+    # context to the data's device for the launch.
+    with torch.cuda.device(_dev):
+        return _launch_sweep(data, qw, scales, loss, zp, c, g, k, nz, maxq, bc, gp)
+
+
+def _launch_sweep(data, qw, scales, loss, zp, c, g, k, nz, maxq, bc, gp):
     _neuqi_sweep_kernel[(triton.cdiv(c, bc),)](
         data,
         qw if qw is not None else data,  # dummy pointer when unweighted (dead lanes)

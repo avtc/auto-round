@@ -241,29 +241,33 @@ def sinkhorn_log_triton(matrix, order=8):
     gate = torch.zeros(B, dtype=torch.float64, device=dev)
     better = torch.zeros(B, dtype=torch.int32, device=dev)
     cp = max(8, 2048 // LP)
-    for k in range(order):
-        _k1_pass[(P, B)](m, lm1, lm2, s1, csum, csq, H, L, B, BH=_BH, LP=LP, num_warps=4)
-        _k2_update[(B,)](
-            csum,
-            csq,
-            s1,
-            lm1,
-            m1s,
-            tgt,
-            imb_min,
-            gate,
-            better,
-            H,
-            L,
-            B,
-            P,
-            FIRST=(k == 0),
-            LP=LP,
-            CP=cp,
-            SH=4096,
-            num_warps=4,
-        )
-        _k3_rows[(P, B)](s1, lm2, m2s, tgt, gate, better, H, BH=_BH, num_warps=4)
+    # launch under the matrix's device context: Triton kernels launch on the
+    # CURRENT cuda device and reject/misread pointers from other GPUs (streaming
+    # block homes live on non-primary devices)
+    with torch.cuda.device(dev):
+        for k in range(order):
+            _k1_pass[(P, B)](m, lm1, lm2, s1, csum, csq, H, L, B, BH=_BH, LP=LP, num_warps=4)
+            _k2_update[(B,)](
+                csum,
+                csq,
+                s1,
+                lm1,
+                m1s,
+                tgt,
+                imb_min,
+                gate,
+                better,
+                H,
+                L,
+                B,
+                P,
+                FIRST=(k == 0),
+                LP=LP,
+                CP=cp,
+                SH=4096,
+                num_warps=4,
+            )
+            _k3_rows[(P, B)](s1, lm2, m2s, tgt, gate, better, H, BH=_BH, num_warps=4)
     if squeeze:
         return m1s[0], m2s[0].unsqueeze(-1)
     return m1s, m2s.unsqueeze(-1)

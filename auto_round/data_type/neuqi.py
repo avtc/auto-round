@@ -332,7 +332,8 @@ def ensure_sweep_warmup(device) -> None:
         try:
             data = torch.randn(4, 128, device=device, dtype=torch.float32)
             scales = torch.rand(4, 2, device=device, dtype=torch.float32) * 0.01 + 0.001
-            loss, _zp = fn(data, torch.ones_like(data), scales, 15)
+            with torch.cuda.device(device):  # Triton launches on the CURRENT device
+                loss, _zp = fn(data, torch.ones_like(data), scales, 15)
             torch.cuda.synchronize(device)
             if not torch.isfinite(loss).all():
                 raise RuntimeError("warmup produced non-finite losses")
