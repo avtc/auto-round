@@ -193,4 +193,6 @@ class TestStagedSourceRef:
         block = nn.Linear(2, 1)
         block._stream_prefetch_source = StagedSourceRef(_Unpicklable(), "layers.0")
         out = sharded_nograd_forward(_R(), block, list(range(4)), {}, torch.device("cpu"), [torch.device("cpu")] * 2)
-        assert out.shape == (4, 1)
+        # serial contract: per-sample list survives the deepcopy of the stamped block
+        assert isinstance(out, list) and len(out) == 4
+        assert all(t.shape == (1, 1) for t in out)
