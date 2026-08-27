@@ -280,12 +280,27 @@ class ReplicaGroup:
                         setattr(mm, attr, val)
 
     def run_threaded(self, fns: Sequence) -> None:
-        """Run one callable per replica in parallel threads."""
-        threads = [threading.Thread(target=fn) for fn in fns]
+        """Run one callable per replica in parallel threads.
+
+        Exceptions propagate: the first failure (by thread index) is re-raised
+        in the joining thread -- a swallowed worker failure would otherwise
+        leave missing shard losses/grads and corrupt the step silently.
+        """
+        errors: dict = {}
+
+        def _guarded(idx, fn):
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                errors[idx] = exc
+
+        threads = [threading.Thread(target=_guarded, args=(i, fn)) for i, fn in enumerate(fns)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        if errors:
+            raise errors[min(errors)]
 
     def teardown(self) -> None:
         self.mirrors = []

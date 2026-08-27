@@ -207,3 +207,34 @@ class TestRelocateParams:
         assert isinstance(wrapper.params["buf"], torch.Tensor) and not isinstance(
             wrapper.params["buf"], torch.nn.Parameter
         )
+
+
+class TestRunThreaded:
+    def test_exception_propagates_to_caller(self):
+        block = torch.nn.Linear(2, 2)
+        plan = DDPPlan(world=2, devices=[torch.device("cpu")] * 2, shard_size=4)
+        group = ReplicaGroup(block, plan)
+
+        def boom():
+            raise RuntimeError("mirror failed")
+
+        with pytest.raises(RuntimeError, match="mirror failed"):
+            group.run_threaded([lambda: None, boom])
+        group.teardown()
+
+    def test_all_run_even_when_one_fails(self):
+        ran = []
+        block = torch.nn.Linear(2, 2)
+        plan = DDPPlan(world=3, devices=[torch.device("cpu")] * 3, shard_size=4)
+        group = ReplicaGroup(block, plan)
+
+        def ok(i):
+            ran.append(i)
+
+        def boom():
+            raise ValueError("x")
+
+        with pytest.raises(ValueError):
+            group.run_threaded([lambda i=0: ok(i), boom, lambda i=2: ok(i)])
+        assert sorted(ran) == [0, 2]
+        group.teardown()
