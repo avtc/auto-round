@@ -241,7 +241,7 @@ class TestNeuqiFusedSweep:
         import auto_round.data_type.neuqi as N
         from auto_round import envs
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", backend)
+        monkeypatch.setenv("AR_NEUQI_BACKEND", backend)
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
         scale, zp = N.neuqi_search_scale_zero(data.clone(), bits, qw=qw.clone() if qw is not None else None, **kwargs)
@@ -290,12 +290,12 @@ class TestNeuqiFusedSweep:
 
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
-        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "mid")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_LAYOUT", "mid")
         scale_m, zp_m = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=16, fine_n=4)
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
-        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "last")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setenv("AR_NEUQI_LAYOUT", "last")
         scale_l, zp_l = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=16, fine_n=4)
 
         if N._fused_zp_broken or not N._fused_zp_fns:
@@ -318,7 +318,7 @@ class TestNeuqiFusedSweep:
         def _boom(*args, **kwargs):
             raise RuntimeError("simulated inductor failure")
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
         monkeypatch.setattr(N, "_get_fused_zp_fn", _boom)
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
@@ -326,7 +326,7 @@ class TestNeuqiFusedSweep:
         scale_f, zp_f = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=4, fine_n=2)
         assert N._fused_zp_broken is True  # permanently latched after the first failure
         monkeypatch.setattr(N, "_fused_zp_broken", False)
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
         scale_e, zp_e = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=4, fine_n=2)
         torch.testing.assert_close(scale_f, scale_e)
         torch.testing.assert_close(zp_f, zp_e)
@@ -335,29 +335,29 @@ class TestNeuqiFusedSweep:
         import auto_round.data_type.neuqi as N
         from auto_round import envs
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "auto")
         assert N._zp_wants_compile("cuda") is True
         assert N._zp_wants_compile("cpu") is False
         assert N._zp_wants_compile("hpu") is False
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
         assert N._zp_wants_compile("cpu") is True
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
         assert N._zp_wants_compile("cuda") is False
         # unrecognized values behave as the reference sweep
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "nonsense")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "nonsense")
         assert N._zp_wants_compile("cuda") is False
 
     def test_layout_policy(self, monkeypatch):
         import auto_round.data_type.neuqi as N
         from auto_round import envs
 
-        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "auto")
+        monkeypatch.setenv("AR_NEUQI_LAYOUT", "auto")
         assert N._zp_expr_for("cuda") is N._zp_expr_last
         assert N._zp_expr_for("cpu") is N._zp_expr_mid
         assert N._zp_expr_for("hpu") is N._zp_expr_mid
-        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "last")
+        monkeypatch.setenv("AR_NEUQI_LAYOUT", "last")
         assert N._zp_expr_for("cpu") is N._zp_expr_last
-        monkeypatch.setattr(envs, "AR_NEUQI_LAYOUT", "mid")
+        monkeypatch.setenv("AR_NEUQI_LAYOUT", "mid")
         assert N._zp_expr_for("cuda") is N._zp_expr_mid
 
     def test_cpu_default_is_eager(self, monkeypatch):
@@ -365,7 +365,7 @@ class TestNeuqiFusedSweep:
         import auto_round.data_type.neuqi as N
         from auto_round import envs
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "auto")
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
         N.neuqi_search_scale_zero(_heavy_tailed_data(n_groups=8, seed=13).clone(), bits=4, coarse_n=4, fine_n=2)
@@ -384,8 +384,8 @@ class TestNeuqiBatchedSweep:
         import auto_round.data_type.neuqi as N
         from auto_round import envs
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", backend)
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", batch)
+        monkeypatch.setenv("AR_NEUQI_BACKEND", backend)
+        monkeypatch.setenv("AR_NEUQI_BATCH", batch)
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
         monkeypatch.setattr(N, "_batched_broken", False)
@@ -422,8 +422,8 @@ class TestNeuqiBatchedSweep:
 
         data = _heavy_tailed_data(n_groups=24, group_size=64, seed=17)
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "on")
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
         monkeypatch.setattr(N, "_batched_broken", False)
@@ -432,7 +432,7 @@ class TestNeuqiBatchedSweep:
         scale_f, zp_f = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
 
         # reference: per-candidate sweep (batch=off never touches the patched fn)
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "off")
         scale_ref, zp_ref = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
         torch.testing.assert_close(scale_f, scale_ref)
         torch.testing.assert_close(zp_f, zp_ref)
@@ -441,16 +441,16 @@ class TestNeuqiBatchedSweep:
         import auto_round.data_type.neuqi as N
         from auto_round import envs
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "auto")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "auto")
         assert N._zp_batch_wanted("cuda") is True
         assert N._zp_batch_wanted("cpu") is False
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
         assert N._zp_batch_wanted("cuda") is False  # batched needs the fused backend
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "compile")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "off")
         assert N._zp_batch_wanted("cuda") is False
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "on")
         assert N._zp_batch_wanted("cpu") is True  # forced (e.g. for tests / A/B)
 
 
@@ -484,15 +484,15 @@ class TestNeuqiTritonSweep:
         data = _heavy_tailed_data(n_groups=64, group_size=64, seed=23)
         qw = torch.rand(64, 64) + 0.1
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "triton")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "triton")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "on")
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
         monkeypatch.setattr(N, "_batched_broken", False)
         scale_t, zp_t = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=8, fine_n=3)
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "off")
         scale_ref, zp_ref = N.neuqi_search_scale_zero(data.clone(), bits=4, qw=qw, coarse_n=8, fine_n=3)
         torch.testing.assert_close(scale_t, scale_ref)
         torch.testing.assert_close(zp_t, zp_ref)
@@ -508,15 +508,15 @@ class TestNeuqiTritonSweep:
         self._mock_sweep_from(monkeypatch, boom)
         data = _heavy_tailed_data(n_groups=32, group_size=64, seed=29)
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "triton")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "on")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "triton")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "on")
         monkeypatch.setattr(N, "_fused_zp_fns", {})
         monkeypatch.setattr(N, "_fused_zp_broken", False)
         monkeypatch.setattr(N, "_batched_broken", False)
         scale_f, zp_f = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
         assert N._triton_broken is True
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
         scale_ref, zp_ref = N.neuqi_search_scale_zero(data.clone(), bits=4, coarse_n=6, fine_n=2)
         torch.testing.assert_close(scale_f, scale_ref)
         torch.testing.assert_close(zp_f, zp_ref)
@@ -543,17 +543,17 @@ class TestNeuqiTritonSweep:
         import auto_round.data_type.neuqi as N
         from auto_round import envs
 
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "auto")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "auto")
         assert N._zp_wants_triton("cuda") is True
         assert N._zp_wants_triton("cpu") is False
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
         assert N._zp_wants_triton("cuda") is False
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "triton")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "triton")
         assert N._zp_wants_triton("cpu") is True  # forced (availability still checked)
         # the Triton sweep IS the batched evaluator: batching off disables it
-        monkeypatch.setattr(envs, "AR_NEUQI_BACKEND", "auto")
-        monkeypatch.setattr(envs, "AR_NEUQI_BATCH", "off")
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "auto")
+        monkeypatch.setenv("AR_NEUQI_BATCH", "off")
         assert N._zp_batch_wanted("cuda") is False
 
 
