@@ -381,6 +381,7 @@ def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -
 
 
 _pool_move_warned: set = set()
+_coll_mirror_setup_logged: set = set()
 
 
 def expect_pool_local(pieces, device, site: str) -> None:
@@ -461,6 +462,9 @@ def sharded_nograd_forward(
         return runner(block, inputs, input_others, cache_device=out_device)
     shard = n // world
     shards = [list(range(r * shard, (r + 1) * shard)) for r in range(world)]
+    import time as _time
+
+    _t_mirrors = _time.perf_counter()
     home_dev = _block_device(block)
     mirrors: List[torch.nn.Module] = []
     reps: List[torch.nn.Module] = []
@@ -473,6 +477,14 @@ def sharded_nograd_forward(
             _relocate_params(m, dev)
             reps.append(m)
             mirrors.append(m)
+    global _coll_mirror_setup_logged
+    if world > 1 and "_coll" not in _coll_mirror_setup_logged:
+        _coll_mirror_setup_logged.add("_coll")
+        logger.info(
+            "[tune-ddp] collection mirror setup: %.0f ms per pass (world=%d) -- included in ref_collect/post_collect",
+            (_time.perf_counter() - _t_mirrors) * 1000,
+            world,
+        )
     parts: List = [None] * world
 
     def _run(r):

@@ -733,6 +733,7 @@ class AlgorithmComposer:
                 q_inputs,
                 block_ctx,
                 input_ids=input_ids,
+                _block_prof=_prof,
             )
 
         # ── Steps 5+6: post_quantize_block + collect quantized-block outputs ──
@@ -762,13 +763,15 @@ class AlgorithmComposer:
                     # stats BEFORE bias correction: the correction absorbs the
                     # mean by construction, so post-correction stats would be ~0
                     if _envs.AR_QOFF_NOISE_STATS:
-                        _collect_qoff_noise_stats_from_outputs(
-                            reference_next_input,
-                            new_q_input,
-                            f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
-                        )
+                        with _prof_stage(_prof, "noise"):
+                            _collect_qoff_noise_stats_from_outputs(
+                                reference_next_input,
+                                new_q_input,
+                                f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
+                            )
                     if _envs.AR_BIAS_CORRECT:
-                        _apply_block_bias_correction(block, reference_next_input, new_q_input)
+                        with _prof_stage(_prof, "bias"):
+                            _apply_block_bias_correction(block, reference_next_input, new_q_input)
             else:
                 new_q_input = None
                 _stats_y_q = None

@@ -511,6 +511,10 @@ class SignRoundQuantizer(BaseQuantizer):
             dict: Best quantization parameters found during optimization, or an
                 empty dict if no trainable parameters were found.
         """
+        from auto_round.utils.tune_profile import stage as _bp_stage
+
+        _prof_bp = kwargs.pop("_block_prof", None)
+
         device = getattr(block, "_stream_home_device", None) or device_manager.device
         loss_device = getattr(self, "_loss_device", device)
         card_0_in_high_risk = getattr(self, "_card_0_in_high_risk", False)
@@ -536,13 +540,14 @@ class SignRoundQuantizer(BaseQuantizer):
         _rehome_deferred = (active_inputs, fp_outputs, _home)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
-        quantized_layer_names, unquantized_layer_names = self.wrapper_block(
-            block,
-            self.enable_minmax_tuning,
-            self.enable_norm_bias_tuning,
-            enable_torch_compile=self.compress_context.enable_torch_compile,
-            device=device,
-        )
+        with _bp_stage(_prof_bp, "wrap_search"):
+            quantized_layer_names, unquantized_layer_names = self.wrapper_block(
+                block,
+                self.enable_minmax_tuning,
+                self.enable_norm_bias_tuning,
+                enable_torch_compile=self.compress_context.enable_torch_compile,
+                device=device,
+            )
 
         def _collect_tuning_params(mod):
             """Collect (round, minmax) params + per-lr groups from a wrapped block."""
@@ -699,8 +704,9 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 # distributed calibration pool: shard-local tune reads; replaces
                 # the serial gather-to-home re-home (each device takes 1/world)
-                distribute_pool(active_inputs, _plan.devices)
-                distribute_pool(fp_outputs, _plan.devices)
+                with _bp_stage(_prof_bp, "distribute"):
+                    distribute_pool(active_inputs, _plan.devices)
+                    distribute_pool(fp_outputs, _plan.devices)
                 _dp_placed = True
                 _staged_src = getattr(block, "_stream_prefetch_source", None)
                 if _staged_src is not None:
@@ -745,17 +751,18 @@ class SignRoundQuantizer(BaseQuantizer):
                 # serially would silently invalidate the configuration and any
                 # measurement against it). Grads are discarded.
                 try:
-                    for r, rep in enumerate(replica_group.replicas):
-                        _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
-                        _dev_r = next(rep.parameters()).device
-                        with torch.cuda.device(_dev_r):
-                            expect_pool_local([fp_outputs[j] for j in _warm], _dev_r, "warmup-ref")
-                            _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
-                            _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
-                            _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
-                            _loss_w.backward()
-                    for _opt in [optimizer] + mirror_optimizers:
-                        _opt.zero_grad()
+                    with _bp_stage(_prof_bp, "ddp_setup"):
+                        for r, rep in enumerate(replica_group.replicas):
+                            _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
+                            _dev_r = next(rep.parameters()).device
+                            with torch.cuda.device(_dev_r):
+                                expect_pool_local([fp_outputs[j] for j in _warm], _dev_r, "warmup-ref")
+                                _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
+                                _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
+                                _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
+                                _loss_w.backward()
+                        for _opt in [optimizer] + mirror_optimizers:
+                            _opt.zero_grad()
                 except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
                     replica_group.teardown()
                     raise RuntimeError(
@@ -946,11 +953,12 @@ class SignRoundQuantizer(BaseQuantizer):
                 "layers in the block"
             )
 
-        self.compress_context.clear_memory()  # clear cached memory during training
+        with _bp_stage(_prof_bp, "clear_mem"):
+            self.compress_context.clear_memory()  # clear cached memory during training
         if len(unquantized_layer_names) != 0:
             logger.info(f"Unquantized layers: {unquantized_layer_names}")
-        with torch.no_grad():
-            unwrapper_block(block, best_params)
+        with torch.no_grad(), _bp_stage(_prof_bp, "refit"):
+            unwrapper_block(block, best_params)  # includes AR_POST_SCALE_REFIT
 
         if self.config.is_act_nv_fp:
             # enable moe experts act_max automatic generation for WrapperWALayer
