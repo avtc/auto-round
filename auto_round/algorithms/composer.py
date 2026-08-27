@@ -532,14 +532,17 @@ class AlgorithmComposer:
         if n < world or n % world != 0:
             return None
         try:
-            from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups, resolve_ddp_plan
+            from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                effective_ddp_groups,
+                resolve_ddp_plan,
+            )
 
             plan = resolve_ddp_plan(
                 world,
                 home,
                 n,
                 visible_cuda_devices=list(range(torch.cuda.device_count())),
-                groups=parse_ddp_groups(getattr(_envs, "AR_TUNE_DDP_GROUPS", None)),
+                groups=effective_ddp_groups(),
             )
         except Exception:  # pragma: no cover - CUDA reachability on odd hosts
             return None

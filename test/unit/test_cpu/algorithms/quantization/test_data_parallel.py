@@ -571,3 +571,43 @@ class TestExpectPoolLocal:
         args = warn.call_args[0]
         assert args[1] == "test-site-stray" and args[2] == 1 and args[3] == 4  # 1 stray of 4
         assert "meta" in str(args[5])
+
+
+class TestEffectiveGroups:
+    def test_env_groups_win_over_registry(self):
+        import auto_round.envs as envs_mod
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        dp.set_effective_ddp_groups([[torch.device("cuda", 4), torch.device("cuda", 5)]])
+        try:
+            envs_mod.AR_TUNE_DDP_GROUPS = "0,1,2,3;4,5,6,7"
+            got = dp.effective_ddp_groups()
+            assert [str(d) for g in got for d in g] == [
+                "cuda:0",
+                "cuda:1",
+                "cuda:2",
+                "cuda:3",
+                "cuda:4",
+                "cuda:5",
+                "cuda:6",
+                "cuda:7",
+            ]
+        finally:
+            envs_mod.AR_TUNE_DDP_GROUPS = ""
+            dp.set_effective_ddp_groups(None)
+
+    def test_registry_used_when_env_empty(self):
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        dp.set_effective_ddp_groups([[torch.device("cuda", 0), torch.device("cuda", 1)]])
+        try:
+            got = dp.effective_ddp_groups()
+            assert got is not None and len(got) == 1 and len(got[0]) == 2
+        finally:
+            dp.set_effective_ddp_groups(None)
+
+    def test_none_when_unset(self):
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        dp.set_effective_ddp_groups(None)
+        assert dp.effective_ddp_groups() is None

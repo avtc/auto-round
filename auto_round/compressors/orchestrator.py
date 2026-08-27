@@ -1720,18 +1720,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 logger.warning("[stream] stream_prefetch_devices='auto' ignored: no CUDA devices visible")
                 return None
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
-            # DDP without explicit groups: the plan is home + first devices in
-            # ascending visible order -- staging beyond that pool puts homes on
-            # devices whose groups displace others (rotating idle partners).
-            # Ping-pong groups keep the full rotation (both groups are active).
-            try:
-                _w = int(getattr(envs, "AR_TUNE_DDP_WORLD", 1) or 1)
-                _g = str(getattr(envs, "AR_TUNE_DDP_GROUPS", "") or "")
-            except Exception:
-                _w, _g = 1, ""
-            if _w > 1 and not _g and len(devices) > _w:
-                devices = devices[:_w]
-                logger.info("[stream] auto staging restricted to the first %d device(s): DDP world=%d", _w, _w)
             # The primary joins the rotation when its free VRAM comfortably
             # holds the LARGEST block (block sizes vary by layer type - GDN vs
             # full-attention vs first/last): parent working set + block + tuning
@@ -1867,16 +1855,38 @@ class CompressionOrchestrator(BaseOrchestrator):
         # or 1 for host-RAM staging.
         raw_depth = getattr(self, "stream_prefetch", 0)
         stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and raw_depth != 0) else None
-        from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            effective_ddp_groups,
+            parse_ddp_groups,
+            set_effective_ddp_groups,
+        )
 
+        try:
+            _ddp_world = int(getattr(envs, "AR_TUNE_DDP_WORLD", 1) or 1)
+        except Exception:
+            _ddp_world = 1
         _ddp_groups = parse_ddp_groups(getattr(envs, "AR_TUNE_DDP_GROUPS", None))
+        _groups_auto = False
+        if not _ddp_groups and _ddp_world > 1 and stage_devices and len(stage_devices) >= _ddp_world:
+            # AUTO ping-pong: split the staging pool into consecutive
+            # world-sized groups (device_map=8 GPUs x world=4 -> groups
+            # [0,1,2,3],[4,5,6,7]; pool==world -> a single fixed-home group).
+            # Homes alternate between group LEADERS; each block mirrors within
+            # its own group; the idle group(s) prefetch upcoming blocks.
+            _n_groups = len(stage_devices) // _ddp_world
+            _ddp_groups = [stage_devices[i * _ddp_world : (i + 1) * _ddp_world] for i in range(_n_groups)]
+            _groups_auto = True
+            if len(stage_devices) % _ddp_world:
+                logger.info(
+                    "[stream] %d staging device(s) beyond whole DDP groups stay idle",
+                    len(stage_devices) % _ddp_world,
+                )
+        set_effective_ddp_groups(_ddp_groups)
         if _ddp_groups:
-            # ping-pong: homes alternate between group leaders (the round-robin
-            # below indexes this list), each block mirrors within its own group,
-            # and the idle group prefetches the next block
             stage_devices = [g[0] for g in _ddp_groups]
             logger.info(
-                "[stream] DDP ping-pong staging: homes alternate between group leaders %s",
+                "[stream] DDP ping-pong staging (%s): homes alternate between group leaders %s",
+                "auto" if _groups_auto else "AR_TUNE_DDP_GROUPS",
                 [str(d) for d in stage_devices],
             )
         if raw_depth == 0 or raw_depth is None:
@@ -1902,7 +1912,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             except Exception:
                 _ddp_world = 1
             if stage_devices and _ddp_world > 1:
-                _p_groups = parse_ddp_groups(getattr(envs, "AR_TUNE_DDP_GROUPS", None))
+                _p_groups = effective_ddp_groups()
                 _all_cuda = [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
 
                 def _replica_of(idx, primary):

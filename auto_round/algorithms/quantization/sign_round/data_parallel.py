@@ -51,6 +51,31 @@ class DDPPlan:
         return self.world > 1
 
 
+_effective_groups_registry: Optional[List[List[torch.device]]] = None
+
+
+def set_effective_ddp_groups(groups) -> None:
+    """Register DDP device groups derived OUTSIDE the env (auto ping-pong).
+
+    The streaming orchestrator can split the staging pool into consecutive
+    world-sized groups when AR_TUNE_DDP_GROUPS is unset; the quantizer, the
+    composer and the prefetch fan-out must all see the SAME groups, so they
+    resolve through effective_ddp_groups() (explicit env wins).
+    """
+    global _effective_groups_registry
+    _effective_groups_registry = [list(g) for g in groups] if groups else None
+
+
+def effective_ddp_groups():
+    """Explicit env groups, else the registered auto groups, else None."""
+    from auto_round import envs as _envs
+
+    env_groups = parse_ddp_groups(getattr(_envs, "AR_TUNE_DDP_GROUPS", None))
+    if env_groups:
+        return env_groups
+    return _effective_groups_registry
+
+
 def parse_ddp_groups(spec: Optional[str]) -> Optional[List[List[torch.device]]]:
     """Parse AR_TUNE_DDP_GROUPS syntax ``"0,1,2,3;4,5,6,7"`` into device groups.
 
