@@ -505,9 +505,15 @@ class AlgorithmComposer:
             return None
         return plan.devices if plan.world > 1 else None
 
-    def _collect_forward(self, block, inputs, input_others, out_dev):
-        """Collection forward: sharded across DDP mirrors when eligible."""
-        if self._coll_devs is None:
+    def _collect_forward(self, block, inputs, input_others, out_dev, allow_shard: bool = True):
+        """Collection forward: sharded across DDP mirrors when eligible.
+
+        ``allow_shard=False`` forces the serial path: passes that carry
+        forward hooks (act_max / fp-input / q-input stats) must not shard --
+        hook writes land on the ephemeral mirror copies and are freed with
+        them, silently dropping that shard's statistics.
+        """
+        if self._coll_devs is None or not allow_shard:
             return self.block_forward(block, inputs, input_others, cache_device=out_dev)
         from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
 
@@ -608,7 +614,9 @@ class AlgorithmComposer:
         if fp_inputs is not None:
             with _prof_stage(_prof, "ref_collect"), torch.no_grad():
                 quant_hooks = self._get_fp_act_hooks(block)
-                reference_output = self._collect_forward(block, fp_inputs, input_others, _out_dev)
+                reference_output = self._collect_forward(
+                    block, fp_inputs, input_others, _out_dev, allow_shard=not quant_hooks
+                )
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
                     h.remove()
@@ -617,7 +625,11 @@ class AlgorithmComposer:
                     q_hooks = self._get_q_act_hooks(block)
                     if q_hooks:
                         self._collect_forward(
-                            block, q_inputs if q_inputs is not None else fp_inputs, input_others, _out_dev
+                            block,
+                            q_inputs if q_inputs is not None else fp_inputs,
+                            input_others,
+                            _out_dev,
+                            allow_shard=not q_hooks,
                         )
                         for h in q_hooks:
                             h.remove()

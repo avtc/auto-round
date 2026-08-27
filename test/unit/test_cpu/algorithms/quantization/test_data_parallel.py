@@ -401,3 +401,21 @@ class TestShardedForwardStructure:
         assert all(t.shape == (1, 3, 2) for t in out)
         # the partial last-shard dict residue must be cleared
         assert runner.last_output_dict is None
+
+
+class TestHookGate:
+    def test_collect_forward_with_hooks_stays_serial(self):
+        """Hook-carrying collection passes must not shard (mirror stats are lost)."""
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        composer = AlgorithmComposer.__new__(AlgorithmComposer)
+
+        class _BF:
+            def __call__(self, block, inputs, input_others, cache_device=None):
+                return ["serial"]
+
+        composer.block_forward = _BF()
+        composer._coll_devs = [torch.device("cpu"), torch.device("cpu")]
+
+        out = composer._collect_forward(object(), [1, 2], {}, torch.device("cpu"), allow_shard=False)
+        assert out == ["serial"]
