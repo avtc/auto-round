@@ -1595,7 +1595,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         clear_memory()
         return True
 
-    @torch.no_grad()
     @staticmethod
     def _mem_bucket(name: str) -> str:
         """Bucket a module-path name for the device-memory inventory."""
@@ -1696,6 +1695,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 other,
             )
 
+    @torch.no_grad()
     def _resolve_stream_stage_devices(self):
         """Resolve ``stream_prefetch_devices`` into a list of staging devices.
 
