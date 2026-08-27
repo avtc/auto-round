@@ -110,6 +110,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # plus CUDA-event GPU times and the host-sync bubble). Diagnostic only;
     # adds no per-iteration sync points.
     "AR_TUNE_PROFILE": lambda: os.getenv("AR_TUNE_PROFILE", "0").lower() in ("1", "true", "yes", "on"),
+    # Single-process data parallelism for the block tuning loop: the global
+    # calibration batch is sharded across AR_TUNE_DDP_WORLD GPUs (the block's
+    # home + mirrors), gradients exchanged with a halving-doubling all-reduce
+    # so every replica applies the identical SignSGD step. 1 (default) keeps
+    # the exact serial path; must divide the calibration batch size and be a
+    # power of two (2/4/8 at batch 8).
+    "AR_TUNE_DDP_WORLD": lambda: int(os.getenv("AR_TUNE_DDP_WORLD", "1") or 1),
+    # Optional explicit mirror devices for AR_TUNE_DDP_WORLD, comma-separated
+    # ("cuda:1,cuda:2"; the block home is always rank 0). Default: home + next
+    # GPUs in ascending order, per-mirror VRAM-guarded.
+    "AR_TUNE_DDP_DEVICES": lambda: os.getenv("AR_TUNE_DDP_DEVICES", ""),
+    # Exchange DDP gradients in bfloat16 (halves PCIe payload; sign-SGD robust
+    # to the reduced precision, but the trajectory changes within fp noise).
+    "AR_TUNE_DDP_BF16_GRAD": lambda: os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes"),
     # alt2 (alternating re-grid): iterations of the SECOND tuning round after
     # the mid-tune re-grid; 0 = half of --iters.
     "AR_ALT2_ITERS2": lambda: int(os.getenv("AR_ALT2_ITERS2", "0") or 0),

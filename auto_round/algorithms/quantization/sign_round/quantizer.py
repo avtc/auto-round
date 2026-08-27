@@ -539,30 +539,34 @@ class SignRoundQuantizer(BaseQuantizer):
             device=device,
         )
 
-        round_params = []
-        minmax_params = []
+        def _collect_tuning_params(mod):
+            """Collect (round, minmax) params + per-lr groups from a wrapped block."""
+            r_params, m_params = [], []
+            r_groups: dict[float, list] = {}
+            m_groups: dict[float, list] = {}
+            for _n, m in mod.named_modules():
+                if hasattr(m, "orig_layer"):
+                    layer_bits = getattr(m.orig_layer, "bits", None)
+                    layer_lr = self._config.compute_lr(layer_bits)
+                    if layer_lr is None:
+                        layer_lr = self.lr
+                    self._maybe_log_low_bit_lr(layer_lr)
+                    layer_minmax_lr = self._config.compute_minmax_lr(layer_bits)
+                    if layer_minmax_lr is None:
+                        layer_minmax_lr = self.minmax_lr
+                    for key in m.params.keys():
+                        if "min" in key or "max" in key:
+                            m_params.append(m.params[key])
+                            m_groups.setdefault(float(layer_minmax_lr), []).append(m.params[key])
+                        else:
+                            r_params.append(m.params[key])
+                            r_groups.setdefault(float(layer_lr), []).append(m.params[key])
+            return r_params, m_params, r_groups, m_groups
+
         # Group parameters by their effective lr so that mixed-bit configs
         # (e.g. a 4-bit model with a few 2-bit layers) use a per-layer lr
         # derived from each layer's own bit-width.
-        round_lr_groups: dict[float, list] = {}
-        minmax_lr_groups: dict[float, list] = {}
-        for n, m in block.named_modules():
-            if hasattr(m, "orig_layer"):
-                layer_bits = getattr(m.orig_layer, "bits", None)
-                layer_lr = self._config.compute_lr(layer_bits)
-                if layer_lr is None:
-                    layer_lr = self.lr
-                self._maybe_log_low_bit_lr(layer_bits)
-                layer_minmax_lr = self._config.compute_minmax_lr(layer_bits)
-                if layer_minmax_lr is None:
-                    layer_minmax_lr = self.minmax_lr
-                for key in m.params.keys():
-                    if "min" in key or "max" in key:
-                        minmax_params.append(m.params[key])
-                        minmax_lr_groups.setdefault(float(layer_minmax_lr), []).append(m.params[key])
-                    else:
-                        round_params.append(m.params[key])
-                        round_lr_groups.setdefault(float(layer_lr), []).append(m.params[key])
+        round_params, minmax_params, round_lr_groups, minmax_lr_groups = _collect_tuning_params(block)
 
         lr = torch.tensor(self.lr)
         minmax_lr = torch.tensor(self.minmax_lr)
@@ -640,6 +644,81 @@ class SignRoundQuantizer(BaseQuantizer):
         from auto_round.utils.tune_profile import make_tune_profiler
         from auto_round.utils.tune_profile import stage as tune_stage
 
+        # ── Optional single-process data parallelism (AR_TUNE_DDP_WORLD) ─────
+        replica_group = None
+        mirror_optimizers = []
+        mirror_schedules = []
+        params_per_replica = []
+        _dp_world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
+        _dp_eligible = (
+            _dp_world > 1
+            and self.iters > 0
+            and _home.type == "cuda"
+            and scaler is None
+            and self.gradient_accumulate_steps == 1
+            and valid_token_mask is None
+            and not self.enable_lfq
+            and isinstance(active_inputs, list)
+            and isinstance(fp_outputs, list)
+        )
+        if _dp_eligible:
+            from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup, resolve_ddp_plan
+
+            _explicit = [d.strip() for d in str(_envs.AR_TUNE_DDP_DEVICES or "").split(",") if d.strip()]
+            _mirror_bytes = sum(p.numel() * p.element_size() for p in round_params + minmax_params) + sum(
+                p.numel() * p.element_size() for p in block.parameters()
+            )
+            _free = None
+            try:
+                _free = {
+                    torch.device("cuda", idx): torch.cuda.mem_get_info(idx)[0]
+                    for idx in range(torch.cuda.device_count())
+                }
+            except Exception:  # pragma: no cover - non-CUDA reachability
+                _free = None
+            _plan = resolve_ddp_plan(
+                _dp_world,
+                _home,
+                global_batch_size,
+                visible_cuda_devices=list(range(torch.cuda.device_count())) if _free else None,
+                explicit_devices=_explicit or None,
+                vram_free_bytes=_free,
+                mirror_footprint_bytes=_mirror_bytes,
+            )
+            if _plan.enabled and _plan.world & (_plan.world - 1) == 0:
+                replica_group = ReplicaGroup(block, _plan, bf16_grad=bool(_envs.AR_TUNE_DDP_BF16_GRAD))
+                for note in _plan.notes:
+                    logger.info("[tune-ddp] %s", note)
+                # mirror-side optimizers replicate the home group structure
+                for mirror in replica_group.mirrors:
+                    r_ps, m_ps, r_gr, m_gr = _collect_tuning_params(mirror)
+                    m_params = [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in r_gr.items()]
+                    if self.enable_minmax_tuning:
+                        m_params += [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in m_gr.items()]
+                    m_opt = self.optimizer(m_params, lr=lr, weight_decay=0, **extra_kwargs)
+                    m_sched = (
+                        torch.optim.lr_scheduler.LinearLR(
+                            m_opt, start_factor=1.0, end_factor=0.0, total_iters=self.iters
+                        )
+                        if self.lr_scheduler is None
+                        else copy.deepcopy(self.lr_scheduler)
+                    )
+                    mirror_optimizers.append(m_opt)
+                    mirror_schedules.append(m_sched)
+                params_per_replica = [
+                    r_ps + m_ps if self.enable_minmax_tuning else r_ps
+                    for r_ps, m_ps, _r, _m in (_collect_tuning_params(rep) for rep in replica_group.replicas)
+                ]
+                logger.info(
+                    "[tune-ddp] engaged: world=%d shard=%d devices=%s bf16_grad=%s",
+                    _plan.world,
+                    _plan.shard_size,
+                    [str(d) for d in _plan.devices],
+                    bool(_envs.AR_TUNE_DDP_BF16_GRAD),
+                )
+            elif _plan.enabled:
+                logger.info("[tune-ddp] disabled: resolved world %d is not a power of two", _plan.world)
+
         tune_prof = make_tune_profiler(device)
         _tune_wall_t0 = time.perf_counter() if tune_prof is not None else None
         if tune_prof is not None and tune_prof.debug:
@@ -665,39 +744,63 @@ class SignRoundQuantizer(BaseQuantizer):
             if valid_token_mask:
                 num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
 
-            for batch_start in range(0, len(global_indices), batch_size):
-                indices = global_indices[batch_start : batch_start + batch_size]
-                with tune_stage(tune_prof, "ref_h2d"):
-                    ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
+            if replica_group is not None:
+                _world = replica_group.world
+                _shard = len(global_indices) // _world
+                _shards = [global_indices[r * _shard : (r + 1) * _shard] for r in range(_world)]
+                _losses = [None] * _world
+
+                def _dp_replica_step(r, shard):
+                    rep = replica_group.replicas[r]
+                    dev_r = next(rep.parameters()).device
+                    with torch.cuda.device(dev_r):
+                        ref_r = torch.cat([fp_outputs[j] for j in shard], dim=0).to(dev_r)
+                        cache_r = dev_r if _fwd_cache_device is not None else None
+                        pred_r = block_fwd.forward(rep, active_inputs, input_others, shard, cache_r)
+                        loss_r = self._get_loss(pred_r, ref_r, shard, mse_loss, dev_r, None)
+                        _losses[r] = loss_r.detach()
+                        loss_r.backward()
+
                 with tune_stage(tune_prof, "fwd"):
-                    pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
-                    if loss_device is not None:
-                        pred_output = pred_output.to(loss_device)
-                if (
-                    block_ctx.block_index == block_ctx.block_cnt - 1
-                    and self.enable_lfq
-                    and input_ids is not None
-                    and self._is_text_decoder_block(block_ctx.block_name)
-                ):
-                    with tune_stage(tune_prof, "loss"):
-                        loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in indices], dim=0))
-                else:
-                    with tune_stage(tune_prof, "loss"):
-                        loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
-                num_elm = 1 if num_elm <= 0 else num_elm
-                with tune_stage(tune_prof, "sync"):
-                    total_loss += loss.item() / num_elm
+                    replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
+                with tune_stage(tune_prof, "allreduce"):
+                    replica_group.sync_grads(params_per_replica)
+                # report the global-batch mean: mean of equal-size shard means
+                total_loss = sum(l.item() for l in _losses if l is not None) / _world
+            else:
+                for batch_start in range(0, len(global_indices), batch_size):
+                    indices = global_indices[batch_start : batch_start + batch_size]
+                    with tune_stage(tune_prof, "ref_h2d"):
+                        ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
+                    with tune_stage(tune_prof, "fwd"):
+                        pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
+                        if loss_device is not None:
+                            pred_output = pred_output.to(loss_device)
+                    if (
+                        block_ctx.block_index == block_ctx.block_cnt - 1
+                        and self.enable_lfq
+                        and input_ids is not None
+                        and self._is_text_decoder_block(block_ctx.block_name)
+                    ):
+                        with tune_stage(tune_prof, "loss"):
+                            loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in indices], dim=0))
+                    else:
+                        with tune_stage(tune_prof, "loss"):
+                            loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
+                    num_elm = 1 if num_elm <= 0 else num_elm
+                    with tune_stage(tune_prof, "sync"):
+                        total_loss += loss.item() / num_elm
 
-                if mid_iter_mem_check:
-                    # clear memory to avoid OOM due to memory fragmentation
-                    clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
+                    if mid_iter_mem_check:
+                        # clear memory to avoid OOM due to memory fragmentation
+                        clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
 
-                with tune_stage(tune_prof, "bwd"):
-                    self._scale_loss_and_backward(scaler, loss)
+                    with tune_stage(tune_prof, "bwd"):
+                        self._scale_loss_and_backward(scaler, loss)
 
-                if mid_iter_mem_check:
-                    # clear memory to avoid OOM due to memory fragmentation
-                    clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
+                    if mid_iter_mem_check:
+                        # clear memory to avoid OOM due to memory fragmentation
+                        clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
 
             if i == 0:
                 init_loss = total_loss
@@ -722,13 +825,33 @@ class SignRoundQuantizer(BaseQuantizer):
             if not self.not_use_best_mse:
                 if 0 < self.dynamic_max_gap <= i - last_best_iter:
                     break
-            sync_gradients()
-            with tune_stage(tune_prof, "step"):
-                self._step(scaler, optimizer, lr_schedule)
+            if replica_group is not None:
+                with tune_stage(tune_prof, "step"):
+                    self._step(scaler, optimizer, lr_schedule)
+
+                    def _mirror_step(opt, sched):
+                        opt.step()
+                        opt.zero_grad()
+                        sched.step()
+
+                    replica_group.run_threaded(
+                        [
+                            lambda oo=opt, ss=sch: _mirror_step(oo, ss)
+                            for opt, sch in zip(mirror_optimizers, mirror_schedules)
+                        ]
+                    )
+            else:
+                sync_gradients()
+                with tune_stage(tune_prof, "step"):
+                    self._step(scaler, optimizer, lr_schedule)
 
             if _alt2_switch is not None and (i + 1) == _alt2_switch and not _alt2_regridded:
                 _alt2_regrid_block(block)
                 _alt2_regridded = True
+                if replica_group is not None:
+                    replica_group.broadcast_module_attrs(("weight_min", "weight_max"))
+                    for _mopt in mirror_optimizers:
+                        _mopt.state = defaultdict(dict) if hasattr(_mopt.state, "default_factory") else {}
                 # the grid changed: round-1 best params/cache and any optimizer
                 # moments reference the old grid -- drop them all
                 best_loss = torch.finfo(torch.float).max
@@ -737,6 +860,8 @@ class SignRoundQuantizer(BaseQuantizer):
                 optimizer.state = defaultdict(dict) if hasattr(optimizer.state, "default_factory") else {}
                 init_loss = None
 
+        if replica_group is not None:
+            replica_group.teardown()
         last_loss = total_loss
         if tune_prof is not None:
             tune_prof.log_summary(
