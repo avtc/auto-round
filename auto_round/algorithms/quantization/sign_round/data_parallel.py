@@ -367,12 +367,21 @@ def sharded_nograd_forward(
 
     runner_group = ReplicaGroup.__new__(ReplicaGroup)  # reuse only the thread runner
     runner_group.run_threaded([lambda r=r: _run(r) for r in range(world)])
-    out = parts[0]
-    for part in parts[1:]:
-        out = torch.cat([out, part], dim=0)
+    # Return the SERIAL structure: a per-sample list ([1, S, H] pieces from
+    # split_outputs), NOT one flat/batched tensor -- downstream consumers cat
+    # per-sample refs along dim 0 (tune loss) and iterate the list for the
+    # cascade inputs, so a tensor here changes every per-sample shape.
+    pieces: List[torch.Tensor] = []
+    split_outputs = getattr(runner, "split_outputs", None)
+    for part in parts:
+        pieces.extend(split_outputs(part) if split_outputs else torch.split(part, 1, dim=0))
+    # threaded shard calls each stamped a PARTIAL last_output_dict (their own
+    # shard's rows); the serial text path leaves it unset so callers fall back
+    # to the returned list -- clear the residue to keep that contract.
+    runner.last_output_dict = None
     mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
     reps.clear()
-    return out
+    return pieces
 
 
 class ReplicaGroup:

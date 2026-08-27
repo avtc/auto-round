@@ -348,8 +348,9 @@ class TestShardedNoGradForward:
             devices=[torch.device("cpu")] * 4,
             sample_count=8,
         )
-        assert out.shape == (8, 1)
-        # shards disjoint, in order, concatenated
+        # serial contract: per-sample list, in order -- NOT one cat'd tensor
+        assert isinstance(out, list) and len(out) == 8
+        assert all(t.shape == (1, 1) for t in out)
         got = [i for _b, idx, _c in runner.calls for i in idx]
         assert got == list(range(8))
         assert len(runner.calls) == 4
@@ -371,3 +372,32 @@ class TestShardedNoGradForward:
             sample_count=7,
         )
         assert len(runner.calls) == 1  # serial fallback
+
+
+class TestShardedForwardStructure:
+    def test_sharded_returns_serial_per_sample_list(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
+
+        class _Runner:
+            def __init__(self):
+                self.last_output_dict = None
+                self.batch_dim = 0
+
+            def split_outputs(self, output):
+                return list(torch.split(output, 1, dim=self.batch_dim))
+
+            def __call__(self, block, inputs, input_others, indices=None, cache_device=None):
+                idx = list(indices) if indices is not None else list(range(len(inputs)))
+                # mimic BlockForwardRunner: indices -> batched tensor [n, S, H]
+                outs = [block(torch.ones(1, 3, 2)) for _i in idx]
+                return torch.cat(outs, dim=0)
+
+        block = torch.nn.Linear(2, 2)
+        runner = _Runner()
+        inputs = [torch.zeros(1, 3, 2) for _ in range(4)]
+        out = sharded_nograd_forward(runner, block, inputs, {}, torch.device("cpu"), [torch.device("cpu")] * 2)
+        # serial contract: list of per-sample [1, S, H] tensors in order
+        assert isinstance(out, list) and len(out) == 4
+        assert all(t.shape == (1, 3, 2) for t in out)
+        # the partial last-shard dict residue must be cleared
+        assert runner.last_output_dict is None
