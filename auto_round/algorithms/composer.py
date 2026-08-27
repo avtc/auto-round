@@ -78,6 +78,21 @@ def _as_hidden_tensor(out):
     return out
 
 
+def _iter_hidden_tensors(out):
+    """Yield per-sample hidden tensors from a collection output.
+
+    The collection contract returns a per-sample LIST (text) or a dict/tuple
+    wrapping one (diffusion / multi-output). Every yielded tensor keeps its
+    leading sample/batch dims; consumers reduce over them.
+    """
+    import torch as _torch
+
+    if isinstance(out, (tuple, list)) and out and isinstance(out[0], _torch.Tensor):
+        yield from out
+    else:
+        yield _as_hidden_tensor(out)
+
+
 def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
     """Absorb b = mean(y_fp - y_q) into the block's residual-feeding projection.
 
@@ -91,9 +106,21 @@ def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
     """
     import torch.nn as nn
 
-    y_fp = _as_hidden_tensor(y_fp).detach()
-    y_q = _as_hidden_tensor(y_q).detach()
-    b = (y_fp.to(torch.float32) - y_q.to(torch.float32)).mean(dim=tuple(range(y_q.dim() - 1)))
+    # b = mean over ALL calibration rows of (y_fp - y_q): stream the per-sample
+    # list (fp32 accumulators, no full cat -- VRAM stays one sample's output).
+    b = None
+    rows = 0
+    for y_fp_t, y_q_t in zip(_iter_hidden_tensors(y_fp), _iter_hidden_tensors(y_q)):
+        y_fp_t = y_fp_t.detach()
+        y_q_t = y_q_t.detach()
+        d = y_fp_t.to(torch.float32) - y_q_t.to(torch.float32)
+        part = d.sum(dim=tuple(range(d.dim() - 1)))
+        b = part if b is None else b + part
+        rows += d.numel() // d.shape[-1]
+    if b is None:
+        logger.warning("[bias_correct] no rows collected; correction skipped")
+        return False
+    b = b / rows
 
     def _out_features(mod):
         # nn.Linear weight is [out, in]; Conv1D weight is [in, out]
@@ -128,11 +155,22 @@ def _collect_qoff_noise_stats_from_outputs(y_fp, y_q, path):
     """
     import os as _os
 
-    y_fp_t = _as_hidden_tensor(y_fp).detach().to(torch.float32)
-    y_q_t = _as_hidden_tensor(y_q).detach().to(torch.float32)
-    noise = (y_fp_t - y_q_t).reshape(-1, y_fp_t.shape[-1])
-    mean = noise.mean(dim=0).cpu()
-    var = noise.var(dim=0, unbiased=False).cpu()
+    # stream all per-sample rows; fp64 accumulators keep the variance stable
+    # over the full 262k-row pool (E[x^2] - E[x]^2 cancellation)
+    sum_d = None
+    sumsq_d = None
+    rows = 0
+    for y_fp_t, y_q_t in zip(_iter_hidden_tensors(y_fp), _iter_hidden_tensors(y_q)):
+        d = (y_fp_t.detach().to(torch.float64) - y_q_t.detach().to(torch.float64)).reshape(-1, y_fp_t.shape[-1])
+        part = d.sum(dim=0)
+        partsq = d.pow(2).sum(dim=0)
+        sum_d = part if sum_d is None else sum_d + part
+        sumsq_d = partsq if sumsq_d is None else sumsq_d + partsq
+        rows += d.shape[0]
+    if sum_d is None:
+        raise ValueError("qoff noise stats: no rows collected")
+    mean = (sum_d / rows).float().cpu()
+    var = (sumsq_d / rows - (sum_d / rows).pow(2)).float().cpu()
     _os.makedirs(_os.path.dirname(path), exist_ok=True)
     torch.save({"mean": mean, "var": var}, path)
     return mean, var

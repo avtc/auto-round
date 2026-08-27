@@ -479,9 +479,8 @@ class TestQoffNoise:
         return str(d)
 
     def test_injection_deterministic_and_math(self, tmp_path, monkeypatch):
-        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
-
         import auto_round.envs as envs
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
 
         monkeypatch.setenv("AR_QOFF_NOISE", "1")
         monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
@@ -501,9 +500,8 @@ class TestQoffNoise:
             torch.testing.assert_close(tc - tx, torch.full_like(tx, 0.05), rtol=0, atol=1e-6)
 
     def test_env_off_is_identity(self, monkeypatch):
-        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
-
         import auto_round.envs as envs
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
 
         monkeypatch.delenv("AR_QOFF_NOISE", raising=False)
         x = [torch.zeros(2, 4)]
@@ -511,9 +509,8 @@ class TestQoffNoise:
         assert out is x
 
     def test_qon_guard(self, tmp_path, monkeypatch):
-        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
-
         import auto_round.envs as envs
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
 
         monkeypatch.setenv("AR_QOFF_NOISE", "1")
         monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
@@ -521,9 +518,8 @@ class TestQoffNoise:
             _maybe_qoff_noise([torch.zeros(1, 4, 8)], 1, enable_quanted_input=True)
 
     def test_missing_stats_dir_guard(self, monkeypatch):
-        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
-
         import auto_round.envs as envs
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
 
         monkeypatch.setenv("AR_QOFF_NOISE", "1")
         monkeypatch.delenv("AR_QOFF_NOISE_STATS", raising=False)
@@ -531,9 +527,8 @@ class TestQoffNoise:
             _maybe_qoff_noise([torch.zeros(1, 4, 8)], 1, enable_quanted_input=False)
 
     def test_missing_file_guard(self, tmp_path, monkeypatch):
-        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
-
         import auto_round.envs as envs
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
 
         monkeypatch.setenv("AR_QOFF_NOISE", "1")
         monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
@@ -541,9 +536,8 @@ class TestQoffNoise:
             _maybe_qoff_noise([torch.zeros(1, 4, 8)], 2, enable_quanted_input=False)  # needs block 1 stats
 
     def test_block_zero_skips(self, tmp_path, monkeypatch):
-        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
-
         import auto_round.envs as envs
+        from auto_round.algorithms.quantization.sign_round.quantizer import _maybe_qoff_noise
 
         monkeypatch.setenv("AR_QOFF_NOISE", "1")
         monkeypatch.setenv("AR_QOFF_NOISE_STATS", self._stats_file(tmp_path))
@@ -653,9 +647,8 @@ class TestTouchup:
         assert block[0]._touchup_zp == 3
 
     def test_signature_changes_with_touchup_iters(self, monkeypatch):
-        from auto_round.compressors.orchestrator import CompressionOrchestrator
-
         import auto_round.envs as envs
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
 
         orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
 
@@ -777,9 +770,8 @@ class TestReviewFixes:
         assert w.act_quant_func is not None
 
     def test_cross_env_guards(self, monkeypatch):
-        from auto_round.data_type import get_quant_func
-
         import auto_round.envs as envs
+        from auto_round.data_type import get_quant_func
 
         monkeypatch.setenv("AR_ALT2_ITERS2", "10")
         monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
@@ -877,9 +869,8 @@ class TestTritonEscapeHatch:
     """AR_NEUQI_BACKEND=triton outranks the wrapper-init compile pin (forensics path)."""
 
     def test_explicit_triton_wins_over_override(self, monkeypatch):
-        from auto_round.data_type.neuqi import _zp_wants_triton, backend_override
-
         import auto_round.envs as envs
+        from auto_round.data_type.neuqi import _zp_wants_triton, backend_override
 
         monkeypatch.setenv("AR_NEUQI_BACKEND", "triton")
         with backend_override("compile"):
@@ -929,3 +920,42 @@ class TestTuningFanoutEnv:
         monkeypatch.setenv("AR_DISABLE_TUNING_FANOUT", "1")
         cfg = RTNConfig(bits=4, parallel_tuning=True)
         assert cfg.parallel_tuning is True
+
+
+class TestBiasCorrectAllRows:
+    """The design: b = mean over ALL calibration rows (not the first sample)."""
+
+    def test_drift_in_later_samples_is_corrected(self):
+        import torch.nn as nn
+
+        from auto_round.algorithms.composer import _apply_block_bias_correction
+
+        torch.manual_seed(0)
+        d = 8
+        block = nn.Sequential(nn.Linear(d, 16, bias=True), nn.Linear(16, d, bias=False))
+        # sample 0: zero drift; samples 1-3: +1 per-channel drift on ch 0..3
+        y_fp = [torch.zeros(1, 5, d) for _ in range(4)]
+        y_q = [torch.zeros(1, 5, d) for _ in range(4)]
+        for i in range(1, 4):
+            y_q[i][..., 0] = 1.0
+            y_q[i][..., 1] = -1.0
+        assert _apply_block_bias_correction(block, y_fp, y_q) is True
+        # old (out[0]) behavior gave b == 0; b = mean(y_fp - y_q) over all rows
+        assert abs(block[1].bias[0].item() + 0.75) < 1e-6
+        assert abs(block[1].bias[1].item() - 0.75) < 1e-6
+        assert torch.all(block[1].bias[2:] == 0)
+
+    def test_noise_stats_use_all_rows(self, tmp_path):
+        import os
+
+        from auto_round.algorithms.composer import _collect_qoff_noise_stats_from_outputs
+
+        torch.manual_seed(1)
+        y_fp = [torch.randn(1, 16, 4) for _ in range(3)]
+        y_q = [t + 0.5 for t in y_fp]
+        path = os.path.join(tmp_path, "n", "block_0000.pt")
+        mean, var = _collect_qoff_noise_stats_from_outputs(y_fp, y_q, path)
+        assert mean.shape == (4,) and var.shape == (4,)
+        torch.testing.assert_close(mean, torch.full((4,), -0.5), rtol=0, atol=1e-5)
+        torch.testing.assert_close(var, torch.zeros(4), rtol=0, atol=1e-4)  # constant noise
+        assert os.path.exists(path)
