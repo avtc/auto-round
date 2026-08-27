@@ -589,6 +589,16 @@ class SignRoundQuantizer(BaseQuantizer):
 
         tune_prof = make_tune_profiler(device)
         _tune_wall_t0 = time.perf_counter() if tune_prof is not None else None
+        if tune_prof is not None and tune_prof.debug:
+            _ai = active_inputs if isinstance(active_inputs, list) else []
+            tune_prof.log_placement(
+                device=device,
+                loss_device=loss_device,
+                cache_device=self.compress_context.cache_device,
+                inputs=[(str(t.device), tuple(t.shape)) for t in _ai[:2]],
+                fp_outputs=[(str(t.device), tuple(t.shape)) for t in fp_outputs[:2]],
+                nsamples=nsamples,
+            )
 
         _alt2_switch = alt2_switch_iter(self.iters, _envs.AR_TUNE_RECIPE, _envs.AR_ALT2_ITERS2)
         _alt2_regridded = False

@@ -454,6 +454,15 @@ class AutoRound(AlgorithmHandler):
             action=argparse.BooleanOptionalAction,
             help="Skip restoring best-MSE checkpoint.",
         )
+        group.add_argument(
+            "--dynamic_max_gap",
+            default=-1,
+            type=int,
+            help=(
+                "Stop tuning a block early when the best loss has not improved for this many "
+                "iterations (best-MSE checkpoint is still restored); -1 disables."
+            ),
+        )
         quanted_input_mutex = group.add_mutually_exclusive_group()
         quanted_input_mutex.add_argument(
             "--enable_quanted_input",
@@ -496,6 +505,7 @@ class AutoRound(AlgorithmHandler):
             gradient_accumulate_steps=getattr(args, "gradient_accumulate_steps", 1),
             enable_alg_ext=getattr(args, "enable_alg_ext", False),
             not_use_best_mse=getattr(args, "not_use_best_mse", False),
+            dynamic_max_gap=getattr(args, "dynamic_max_gap", -1),
             enable_quanted_input=getattr(args, "enable_quanted_input", True),
             enable_adam=getattr(args, "enable_adam", False),
             enable_lfq=getattr(args, "enable_lfq", False),

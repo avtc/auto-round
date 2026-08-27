@@ -183,3 +183,20 @@ class TestImatrixEnabledFlag(unittest.TestCase):
         config-class selection (autoround.py) turns it back on."""
         rtn = self._rtn(["--imatrix_enabled", "true", "--asym"])
         self.assertIs(rtn.forced_imatrix, True)
+
+
+class TestDynamicMaxGapFlag(unittest.TestCase):
+    def _signround(self, extra):
+        args = _parse(["--iters", "50", *extra])
+        configs = _build(args)
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        sr = [c for c in configs if isinstance(c, SignRoundConfig)]
+        self.assertTrue(sr, "an SignRound config must be built for iters>0")
+        return sr[0]
+
+    def test_default_disabled(self):
+        self.assertEqual(self._signround([]).dynamic_max_gap, -1)
+
+    def test_flag_reaches_config(self):
+        self.assertEqual(self._signround(["--dynamic_max_gap", "15"]).dynamic_max_gap, 15)

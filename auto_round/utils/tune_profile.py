@@ -29,6 +29,7 @@ Usage inside the tuning loop::
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -36,7 +37,6 @@ from typing import DefaultDict, List, Optional, Tuple, Union
 
 import torch
 
-from auto_round import envs
 from auto_round.logger import logger
 
 _STAGE_ORDER = ("ref_h2d", "fwd", "loss", "sync", "bwd", "snapshot", "step")
@@ -45,8 +45,9 @@ _STAGE_ORDER = ("ref_h2d", "fwd", "loss", "sync", "bwd", "snapshot", "step")
 class TuneProfiler:
     """Accumulates per-stage host timings (and deferred CUDA-event timings)."""
 
-    def __init__(self, device: Optional[Union[str, torch.device]] = None) -> None:
+    def __init__(self, device: Optional[Union[str, torch.device]] = None, debug: bool = False) -> None:
         self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.debug = debug
         self._use_events = self.device.type == "cuda" and torch.cuda.is_available()
         self.host: DefaultDict[str, float] = defaultdict(float)  # seconds
         self.counts: DefaultDict[str, int] = defaultdict(int)
@@ -79,6 +80,29 @@ class TuneProfiler:
                 totals[name] += ev0.elapsed_time(ev1) / 1000.0  # ms -> s
         return totals
 
+    def log_placement(
+        self,
+        device,
+        loss_device,
+        cache_device,
+        inputs,
+        fp_outputs,
+        nsamples,
+    ) -> None:
+        """One-line dump of tensor residency for the block (AR_TUNE_PROFILE=2).
+
+        ``inputs`` / ``fp_outputs`` are lists of (device, shape) summaries.
+        """
+        parts = []
+        for label, entries in (("inputs", inputs), ("fp_outputs", fp_outputs)):
+            if entries:
+                uniq = sorted({f"{d}{tuple(s)}" for d, s in entries}, key=str)
+                parts.append(f"{label}={uniq}")
+        logger.info(
+            f"[tune-profile-placement] device={device} loss_device={loss_device} "
+            f"cache_device={cache_device} nsamples={nsamples} " + " ".join(parts)
+        )
+
     def log_summary(self, block_name: str, iters_done: int, wall: float) -> None:
         """Emit a single greppable INFO line with the per-block stage table."""
         per_iter = 1000.0 / iters_done if iters_done > 0 else 0.0  # s -> ms/iter
@@ -106,7 +130,13 @@ def stage(prof: Optional[TuneProfiler], name: str):
 
 
 def make_tune_profiler(device: Optional[Union[str, torch.device]] = None) -> Optional[TuneProfiler]:
-    """Return a TuneProfiler when AR_TUNE_PROFILE is enabled, else None."""
-    if not envs.AR_TUNE_PROFILE:
+    """Return a TuneProfiler when AR_TUNE_PROFILE is enabled, else None.
+
+    ``AR_TUNE_PROFILE=2`` additionally enables the per-block placement dump
+    (where inputs / reference outputs / cache tensors live) — level 1 keeps
+    the log to the timing table only.
+    """
+    raw = os.getenv("AR_TUNE_PROFILE", "0").strip().lower()
+    if raw not in ("1", "true", "yes", "on", "2"):
         return None
-    return TuneProfiler(device)
+    return TuneProfiler(device, debug=raw == "2")

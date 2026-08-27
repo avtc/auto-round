@@ -29,8 +29,29 @@ def test_enabled_via_env(monkeypatch):
     monkeypatch.setenv("AR_TUNE_PROFILE", "1")
     prof = make_tune_profiler()
     assert isinstance(prof, TuneProfiler)
+    assert prof.debug is False
     monkeypatch.setenv("AR_TUNE_PROFILE", "true")
     assert isinstance(make_tune_profiler(), TuneProfiler)
+
+
+def test_level_2_enables_debug_placement_line(monkeypatch, caplog):
+    monkeypatch.setenv("AR_TUNE_PROFILE", "2")
+    prof = make_tune_profiler()
+    assert isinstance(prof, TuneProfiler) and prof.debug is True
+    ar_logger = _capture_autoround_logs(caplog)
+    try:
+        prof.log_placement(
+            device="cuda:1",
+            loss_device="cuda:1",
+            cache_device="cpu",
+            inputs=[("cpu", (8, 2048, 4096)), ("cuda:0", (8, 2048, 4096))],
+            fp_outputs=[("cuda:0", (8, 2048, 4096))],
+            nsamples=128,
+        )
+    finally:
+        ar_logger.removeHandler(caplog.handler)
+    line = next(rec.message for rec in caplog.records if "[tune-profile-placement]" in rec.message)
+    assert "cuda:1" in line and "cpu" in line and "nsamples=128" in line
 
 
 def test_stage_with_none_profiler_is_nullcontext():
