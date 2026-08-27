@@ -569,6 +569,10 @@ class AlgorithmComposer:
         # Rotates this block's weights and installs online hooks so all downstream
         # calibration and reference collection operate on the rotated block. No-op
         # unless layer-wise rotation is active.
+        # staged-copy adoption gate: prefetch replicas hold the RAW checkpoint
+        # weights; any in-place weight mutation (AWQ clip/scale, layer-wise
+        # rotation) makes them stale -> mirrors must deep-copy from home instead
+        block._stream_weights_pristine = not self.preprocessors and not getattr(self, "_rotation_transforms", None)
         with _prof_stage(_prof, "ready"):
             self._run_block_ready_transforms(block, block_ctx)
 

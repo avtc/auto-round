@@ -355,18 +355,63 @@ def sharded_nograd_forward(
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
-    def __init__(self, block, plan: DDPPlan, bf16_grad: bool = False) -> None:
+    def __init__(self, block, plan: DDPPlan, bf16_grad: bool = False, staged_source=None) -> None:
         self.plan = plan
         self.bf16_grad = bf16_grad
         self.home = block
         self.mirrors: List[torch.nn.Module] = []
+        self.adopted = 0
         for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
-            mirror = copy.deepcopy(block).to(dev)
+            mirror = self._make_mirror(block, dev, staged_source)
             _relocate_params(mirror, dev)
             self.mirrors.append(mirror)
         self.replicas = [block] + self.mirrors
         self.world = len(self.replicas)
-        logger.info("[tune-ddp] world=%d devices=%s", self.world, [str(d) for d in plan.devices])
+        logger.info(
+            "[tune-ddp] world=%d devices=%s adopted=%d/%d",
+            self.world,
+            [str(d) for d in plan.devices],
+            self.adopted,
+            max(0, self.world - 1),
+        )
+
+    def _make_mirror(self, block, dev, staged_source):
+        """Mirror the block onto ``dev``, adopting prefetched weights when sane.
+
+        ``staged_source`` = (streamer, prefix): when the prefetch reader
+        fanned this block out onto ``dev`` AND the home weights are pristine
+        (no pre-quantize transform mutated them), the checkpoint-backed
+        orig_layer weights are swapped to meta before the device move and
+        re-materialized from the local staged copies -- the cross-GPU copy
+        then carries only the small tuning state instead of the block
+        weights. Falls back to the plain deepcopy path otherwise.
+        """
+        staged = None
+        if staged_source is not None:
+            streamer, prefix = staged_source
+            try:
+                staged = streamer.staged_replica_tensors(prefix, dev)
+            except Exception:
+                staged = None
+        if not staged or not getattr(block, "_stream_weights_pristine", False):
+            return copy.deepcopy(block).to(dev)
+
+        mirror = copy.deepcopy(block)
+        swapped = []
+        for name, param in mirror.named_parameters():
+            if ".orig_layer." in name:
+                key = (
+                    (prefix + "." + name.replace(".orig_layer.", ".")) if prefix else name.replace(".orig_layer.", ".")
+                )
+                if key in staged:
+                    param.data = torch.empty(0, dtype=param.dtype, device="cpu")
+                    swapped.append((name, key))
+        mirror = mirror.to(dev)  # cheap: big weights ride as empty meta tensors
+        params = dict(mirror.named_parameters())
+        for name, key in swapped:
+            params[name].data = staged[key].to(params[name].device)
+        self.adopted += 1
+        return mirror
 
     def round_params(self) -> List[List[torch.nn.Parameter]]:
         out = []

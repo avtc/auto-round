@@ -689,7 +689,10 @@ class SignRoundQuantizer(BaseQuantizer):
                 mirror_footprint_bytes=_mirror_bytes,
             )
             if _plan.enabled and _plan.world & (_plan.world - 1) == 0:
-                replica_group = ReplicaGroup(block, _plan, bf16_grad=bool(_envs.AR_TUNE_DDP_BF16_GRAD))
+                _staged_src = getattr(block, "_stream_prefetch_source", None)
+                replica_group = ReplicaGroup(
+                    block, _plan, bf16_grad=bool(_envs.AR_TUNE_DDP_BF16_GRAD), staged_source=_staged_src
+                )
                 for note in _plan.notes:
                     logger.info("[tune-ddp] %s", note)
                 # mirror-side optimizers replicate the home group structure

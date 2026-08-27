@@ -1884,7 +1884,29 @@ class CompressionOrchestrator(BaseOrchestrator):
                 )
                 prefetch_names = flat_block_names[_pending_offset:]
         if streamer is not None and prefetch_depth > 0 and prefetch_names:
-            streamer.start_prefetch(prefetch_names, depth=prefetch_depth, stage_devices=stage_devices)
+            _replica_of = None
+            try:
+                _ddp_world = int(getattr(envs, "AR_TUNE_DDP_WORLD", 1) or 1)
+            except Exception:
+                _ddp_world = 1
+            if stage_devices and _ddp_world > 1:
+                _p_groups = parse_ddp_groups(getattr(envs, "AR_TUNE_DDP_GROUPS", None))
+                _all_cuda = [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
+
+                def _replica_of(idx, primary):
+                    primary = torch.device(primary)
+                    if _p_groups:
+                        # ping-pong: fan each block out onto its OWN group
+                        for g in _p_groups:
+                            if primary in g:
+                                return [d for d in g if d != primary]
+                        return []
+                    # single group = all devices: prefetch on the current group
+                    return [d for d in _all_cuda if d != primary]
+
+            streamer.start_prefetch(
+                prefetch_names, depth=prefetch_depth, stage_devices=stage_devices, replica_of=_replica_of
+            )
 
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         stream_block_idx = 0
@@ -1955,6 +1977,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     set_amax_for_all_moe_layers(block, attr_name="act_max")
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
+                block._stream_prefetch_source = (streamer, block_name) if streamer is not None else None
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
@@ -1973,6 +1996,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         calib_state.pop("q_inputs", None)
                 else:
                     self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
+                if streamer is not None:
+                    streamer.release_replicas(block_name)
                 if self.compress_context.is_immediate_packing:
                     _t_pack = _time.perf_counter()
                     from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block

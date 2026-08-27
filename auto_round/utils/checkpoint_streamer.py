@@ -155,6 +155,11 @@ class CheckpointStreamer:
         self._prefetch_err: Optional[BaseException] = None
         self._prefetch_handles: dict[str, object] = {}  # reader-owned handle pool
         self._prefetch_handle_order: list[str] = []
+        self._prefetch_replica_of = None
+        self._prefetch_stage_dev: dict = {}  # prefix -> primary staging device
+        self._prefetch_replica_cache: dict = {}
+        self._prefetch_replica_ready: set = set()
+        self._prefetch_replica_warned = False
 
         index = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.exists(index):
@@ -268,7 +273,13 @@ class CheckpointStreamer:
             time.sleep(0.5)
         return None
 
-    def start_prefetch(self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None) -> None:
+    def start_prefetch(
+        self,
+        module_prefixes: list,
+        depth: int = 1,
+        stage_devices: Optional[list] = None,
+        replica_of=None,
+    ) -> None:
         """Stream whole module prefixes ahead of the consumer on a background
         thread.
 
@@ -279,6 +290,15 @@ class CheckpointStreamer:
         index, overlapping the checkpoint read with block compute; without it
         prefixes land in host RAM. Memory use is bounded at roughly ``depth``
         prefixes worth of tensors.
+
+        ``replica_of(idx, primary_device) -> list[device]`` additionally fans
+        each prefix out onto other devices (e.g. the DDP mirror group of that
+        block): after staging onto the primary device, the reader copies every
+        tensor of the prefix to each replica device, guarded by free VRAM (a
+        device that cannot hold the whole prefix is dropped for it, partially
+        copied entries are discarded). Complete per-device copies are served
+        to :meth:`staged_replica_tensors` so DDP mirror creation can read
+        local memory instead of copying cross-GPU from the primary.
         """
         if self._prefetch_thread is not None:
             raise RuntimeError("prefetch already running; call stop_prefetch() first")
@@ -296,6 +316,14 @@ class CheckpointStreamer:
         self._prefetch_stage_devices = [torch.device(d) for d in stage_devices] if stage_devices else None
         self._prefetch_stage_dev = {}  # prefix -> device it was staged on
         self._prefetch_cpu_staged = 0  # outstanding rescue-buffered prefixes
+        self._prefetch_replica_of = None
+        self._prefetch_replica_cache = {}
+        self._prefetch_replica_ready = set()
+        self._prefetch_replica_warned = False
+        self._prefetch_replica_of = replica_of
+        self._prefetch_replica_cache = {}  # device -> {name: tensor}
+        self._prefetch_replica_ready = set()  # (prefix, device) pairs with all names staged
+        self._prefetch_replica_warned = False
 
         def _reader():
             try:
@@ -313,6 +341,15 @@ class CheckpointStreamer:
                         stage_dev = self._wait_for_stage_device(idx, prefix)
                     if self._prefetch_stop:
                         return
+                    rep_devs = []
+                    if stage_dev is not None and self._prefetch_replica_of is not None:
+                        try:
+                            rep_devs = [torch.device(d) for d in self._prefetch_replica_of(idx, stage_dev)]
+                        except Exception:
+                            rep_devs = []
+                        rep_devs = [d for d in rep_devs if d != stage_dev and d.type != "meta"]
+                    rep_budget = {d: 0 for d in rep_devs}
+                    rep_dropped = set()
                     for name in names:
                         if self._prefetch_stop:
                             return
@@ -321,10 +358,44 @@ class CheckpointStreamer:
                             tensor = tensor.to(stage_dev)
                         with self._prefetch_cond:
                             self._prefetch_cache[name] = tensor
+                        for d in rep_devs:
+                            if d in rep_dropped:
+                                continue
+                            try:
+                                if d.type == "cuda":
+                                    free, _total = torch.cuda.mem_get_info(d)
+                                    need = rep_budget[d] + tensor.nbytes + (1 << 30)
+                                    if need > free:
+                                        rep_dropped.add(d)
+                                        self._prefetch_replica_cache.pop(d, None)
+                                        if not self._prefetch_replica_warned:
+                                            self._prefetch_replica_warned = True
+                                            logger.info(
+                                                "[stream] prefetch replica staging on %s paused: "
+                                                "insufficient free VRAM for this prefix",
+                                                d,
+                                            )
+                                        continue
+                                with self._prefetch_cond:
+                                    self._prefetch_replica_cache.setdefault(d, {})[name] = tensor.to(d)
+                                rep_budget[d] += tensor.nbytes
+                            except RuntimeError:
+                                rep_dropped.add(d)
+                                with self._prefetch_cond:
+                                    cache = self._prefetch_replica_cache.get(d)
+                                    if cache is not None:
+                                        for n in names:
+                                            cache.pop(n, None)
+                    staged_names = set(names)
                     with self._prefetch_cond:
                         self._prefetch_staged.append(prefix)
                         if stage_dev is not None:
                             self._prefetch_stage_dev[prefix] = stage_dev
+                        for d in rep_devs:
+                            if d in rep_dropped:
+                                continue
+                            if staged_names.issubset(self._prefetch_replica_cache.get(d, {}).keys()):
+                                self._prefetch_replica_ready.add((prefix, d))
             except BaseException as e:  # surfaced at the next fetch
                 self._prefetch_err = e
             finally:
@@ -332,6 +403,19 @@ class CheckpointStreamer:
 
         self._prefetch_thread = threading.Thread(target=_reader, daemon=True, name="ckpt-prefetch")
         self._prefetch_thread.start()
+
+    def staged_replica_tensors(self, prefix: str, device) -> Optional[dict]:
+        """All staged replica tensors of ``prefix`` on ``device``, or None.
+
+        None (partial dicts are never returned) means the device does not
+        hold a complete copy and the caller must fall back to cross-GPU
+        copies from the primary staging device.
+        """
+        dev = torch.device(device)
+        with self._prefetch_cond:
+            if (prefix, dev) not in self._prefetch_replica_ready:
+                return None
+            return dict(self._prefetch_replica_cache.get(dev, {}))
 
     def prefetch_pending(self) -> bool:
         """Whether the reader has work left (not yet joined/stopped)."""
@@ -356,6 +440,20 @@ class CheckpointStreamer:
                 self._prefetch_cpu_staged = max(0, self._prefetch_cpu_staged - 1)
             self._prefetch_cond.notify_all()
 
+    def release_replicas(self, prefix: str) -> None:
+        """Free the staged replica copies of ``prefix`` on all devices.
+
+        Called by the consumer after mirror creation (or when a block skips
+        DDP); replica tensors must outlive the primary ``prefetch_consumed``
+        so :meth:`staged_replica_tensors` can serve them for adoption.
+        """
+        with self._prefetch_cond:
+            for dev in list(self._prefetch_replica_cache):
+                cache = self._prefetch_replica_cache[dev]
+                for name in [n for n in cache if n == prefix or n.startswith(prefix + ".")]:
+                    del cache[name]
+            self._prefetch_replica_ready = {(p, d) for (p, d) in self._prefetch_replica_ready if p != prefix}
+
     def stop_prefetch(self) -> None:
         """Signal the reader to stop, join it, and clear the staging cache."""
         if self._prefetch_thread is None:
@@ -367,6 +465,8 @@ class CheckpointStreamer:
         self._prefetch_thread = None
         with self._prefetch_cond:
             self._prefetch_cache.clear()
+            self._prefetch_replica_cache.clear()
+            self._prefetch_replica_ready.clear()
 
     def _prefetch_pop(self, name: str) -> Optional[torch.Tensor]:
         if self._prefetch_err is not None:
