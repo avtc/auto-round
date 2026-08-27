@@ -161,3 +161,36 @@ class TestMirrorAdoption:
         assert group.adopted == 0
         assert torch.equal(group.mirrors[0].m.orig_layer.weight, block.m.orig_layer.weight)
         group.teardown()
+
+
+class TestStagedSourceRef:
+    def test_deepcopy_shares_the_reference(self):
+        import copy as _copy
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import StagedSourceRef
+
+        ref = StagedSourceRef(object(), "layers.0")
+        block = torch.nn.Linear(2, 2)
+        block._stream_prefetch_source = ref
+        clone = _copy.deepcopy(block)
+        assert clone._stream_prefetch_source is ref
+        assert clone._stream_prefetch_source.unpack()[1] == "layers.0"
+
+    def test_sharded_forward_survives_stamped_block(self):
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import StagedSourceRef, sharded_nograd_forward
+
+        class _Unpicklable:
+            def __deepcopy__(self, memo):
+                raise TypeError("cannot pickle safe_open")
+
+        class _R:
+            def __call__(self, block, inputs, others, indices=None, cache_device=None):
+                idx = list(indices) if indices is not None else list(range(len(inputs)))
+                return torch.stack([block(torch.tensor([float(i), float(i)])) for i in idx]).reshape(len(idx), 1)
+
+        block = nn.Linear(2, 1)
+        block._stream_prefetch_source = StagedSourceRef(_Unpicklable(), "layers.0")
+        out = sharded_nograd_forward(_R(), block, list(range(4)), {}, torch.device("cpu"), [torch.device("cpu")] * 2)
+        assert out.shape == (4, 1)

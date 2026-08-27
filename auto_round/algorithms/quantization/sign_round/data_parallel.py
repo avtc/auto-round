@@ -161,6 +161,29 @@ def _move_tensor(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     return t.to(device)
 
 
+class StagedSourceRef:
+    """Deepcopy-safe (streamer, prefix) holder stamped on streamed blocks.
+
+    ``block._stream_prefetch_source`` must survive ``copy.deepcopy(block)``
+    (mirror creation, sharded collection copies) without walking into the
+    CheckpointStreamer -- its prefetch reader owns ``safe_open`` handles that
+    cannot be pickled. All copies therefore SHARE this reference (read-only).
+    """
+
+    def __init__(self, streamer, prefix: str) -> None:
+        self.streamer = streamer
+        self.prefix = prefix
+
+    def unpack(self):
+        return self.streamer, self.prefix
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):  # pragma: no cover - defensive
+        return (StagedSourceRef, (None, self.prefix))
+
+
 def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:
     """Move ALL state that ``nn.Module.to()`` cannot see onto ``device``.
 

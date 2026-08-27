@@ -690,6 +690,8 @@ class SignRoundQuantizer(BaseQuantizer):
             )
             if _plan.enabled and _plan.world & (_plan.world - 1) == 0:
                 _staged_src = getattr(block, "_stream_prefetch_source", None)
+                if _staged_src is not None:
+                    _staged_src = _staged_src.unpack()
                 replica_group = ReplicaGroup(
                     block, _plan, bf16_grad=bool(_envs.AR_TUNE_DDP_BF16_GRAD), staged_source=_staged_src
                 )

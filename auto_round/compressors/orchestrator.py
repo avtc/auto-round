@@ -1977,7 +1977,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     set_amax_for_all_moe_layers(block, attr_name="act_max")
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
-                block._stream_prefetch_source = (streamer, block_name) if streamer is not None else None
+                if streamer is not None:
+                    from auto_round.algorithms.quantization.sign_round.data_parallel import StagedSourceRef
+
+                    block._stream_prefetch_source = StagedSourceRef(streamer, block_name)
+                else:
+                    block._stream_prefetch_source = None
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
