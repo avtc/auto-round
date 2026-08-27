@@ -109,6 +109,24 @@ def resolve_ddp_plan(
     return DDPPlan(len(devices), devices, batch_size // len(devices), notes)
 
 
+def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:
+    """Move dict-registered tuning params (``m.params``) to ``device``.
+
+    Wrapper modules keep their tunable tensors in a plain ``params`` dict --
+    ``nn.Module.to()`` does not see them, so a mirrored block would compute
+    with home-device ``v``/``min_scale``/``max_scale``. Recreate each entry as
+    a fresh leaf Parameter on the target device (grad state resets, which is
+    correct for a fresh mirror).
+    """
+    for _n, m in module.named_modules():
+        params = getattr(m, "params", None)
+        if not isinstance(params, dict):
+            continue
+        for key, val in params.items():
+            if isinstance(val, torch.nn.Parameter):
+                params[key] = torch.nn.Parameter(val.detach().to(device), requires_grad=val.requires_grad)
+
+
 def _param_grad_buffers(params_by_device: List[List[torch.nn.Parameter]]) -> List[Optional[torch.Tensor]]:
     """Flatten each replica's gradients into one contiguous fp32 buffer."""
     bufs: List[Optional[torch.Tensor]] = []
@@ -223,6 +241,7 @@ class ReplicaGroup:
         self.mirrors: List[torch.nn.Module] = []
         for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
             mirror = copy.deepcopy(block).to(dev)
+            _relocate_params(mirror, dev)
             self.mirrors.append(mirror)
         self.replicas = [block] + self.mirrors
         self.world = len(self.replicas)

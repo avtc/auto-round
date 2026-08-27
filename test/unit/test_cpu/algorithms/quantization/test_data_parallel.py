@@ -181,3 +181,29 @@ class TestDDPEnvGate:
         assert envs.AR_TUNE_DDP_DEVICES == "cuda:1,cuda:2"
         monkeypatch.setenv("AR_TUNE_DDP_BF16_GRAD", "1")
         assert envs.AR_TUNE_DDP_BF16_GRAD is True
+
+
+class TestRelocateParams:
+    def test_params_dict_entries_recreated_as_fresh_parameters(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _relocate_params
+
+        wrapper = torch.nn.Module()
+        wrapper.params = {"v": torch.nn.Parameter(torch.randn(4, 4))}
+        old = wrapper.params["v"]
+        old.grad = torch.ones(4, 4)
+        _relocate_params(wrapper, torch.device("cpu"))
+        new = wrapper.params["v"]
+        assert isinstance(new, torch.nn.Parameter)
+        assert new is not old and new.grad is None  # fresh leaf, grad state reset
+        assert torch.equal(new.detach(), old.detach())
+
+    def test_non_dict_and_non_params_untouched(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _relocate_params
+
+        wrapper = torch.nn.Module()
+        wrapper.params = {"note": "text", "buf": torch.zeros(3)}  # plain tensor stays as-is type-wise
+        _relocate_params(wrapper, torch.device("cpu"))
+        assert wrapper.params["note"] == "text"
+        assert isinstance(wrapper.params["buf"], torch.Tensor) and not isinstance(
+            wrapper.params["buf"], torch.nn.Parameter
+        )
