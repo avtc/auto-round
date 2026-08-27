@@ -568,4 +568,6 @@ class TestExpectPoolLocal:
             expect_pool_local(pieces + [stray], torch.device("cpu"), "test-site-stray")
             expect_pool_local(pieces + [stray], torch.device("cpu"), "test-site-stray")  # latched
         assert warn.call_count == 1
-        assert "1/4" in str(warn.call_args) and "meta" in str(warn.call_args)
+        args = warn.call_args[0]
+        assert args[1] == "test-site-stray" and args[2] == 1 and args[3] == 4  # 1 stray of 4
+        assert "meta" in str(args[5])
