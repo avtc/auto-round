@@ -542,3 +542,30 @@ class TestCatDeviceSafe:
 
         tensors = [torch.randn(1, 3, 2) for _ in range(3)]
         torch.testing.assert_close(_cat_device_safe(tensors, 0), torch.cat(tensors, dim=0))
+
+
+class TestExpectPoolLocal:
+    def test_no_warning_when_local(self, caplog):
+        import logging
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import expect_pool_local
+
+        pieces = [torch.randn(2, 2) for _ in range(3)]
+        with caplog.at_level(logging.WARNING, logger="auto_round"):
+            expect_pool_local(pieces, torch.device("cpu"), "test-site-local")
+        assert not [r for r in caplog.records if "test-site-local" in r.message]
+
+    def test_warns_once_per_site_on_misplacement(self):
+        from unittest.mock import patch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import expect_pool_local
+
+        dp._pool_move_warned.discard("test-site-stray")
+        pieces = [torch.randn(2, 2) for _ in range(3)]
+        stray = torch.randn(2, 2, device="meta")  # CPU box: simulate a stray via meta
+        with patch.object(dp.logger, "warning") as warn:
+            expect_pool_local(pieces + [stray], torch.device("cpu"), "test-site-stray")
+            expect_pool_local(pieces + [stray], torch.device("cpu"), "test-site-stray")  # latched
+        assert warn.call_count == 1
+        assert "1/4" in str(warn.call_args) and "meta" in str(warn.call_args)

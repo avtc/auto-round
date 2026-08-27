@@ -355,6 +355,33 @@ def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -
                     setattr(h_mod, attr, torch.max(h_val, m_val))
 
 
+_pool_move_warned: set = set()
+
+
+def expect_pool_local(pieces, device, site: str) -> None:
+    """Warn (once per site) when pool pieces are NOT on ``device``.
+
+    The distributed-pool contract says DDP shard reads are device-local; the
+    defensive ``.to(device)`` at those sites would silently paper over a
+    placement bug (or a demoted block paying per-batch copies). This makes
+    any actual cross-device engagement visible: count, devices found, site.
+    """
+    device = torch.device(device)
+    stray = [t for t in pieces if t.device != device]
+    if stray and site not in _pool_move_warned:
+        _pool_move_warned.add(site)
+        found = sorted({str(t.device) for t in stray})
+        logger.warning(
+            "[tune-ddp] %s: %d/%d pool pieces are not on %s (found on %s) -- cross-device copies engaged; "
+            "expected zero under the distributed pool",
+            site,
+            len(stray),
+            len(pieces),
+            device,
+            found,
+        )
+
+
 def distribute_pool(pool: List[torch.Tensor], devices: List[torch.device]) -> None:
     """Scatter a per-sample calibration pool across ``devices`` (in place).
 

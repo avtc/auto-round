@@ -662,7 +662,11 @@ class SignRoundQuantizer(BaseQuantizer):
             and isinstance(fp_outputs, list)
         )
         if _dp_eligible:
-            from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup, resolve_ddp_plan
+            from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                ReplicaGroup,
+                expect_pool_local,
+                resolve_ddp_plan,
+            )
 
             _explicit = [d.strip() for d in str(_envs.AR_TUNE_DDP_DEVICES or "").split(",") if d.strip()]
             _mirror_bytes = sum(p.numel() * p.element_size() for p in round_params + minmax_params) + sum(
@@ -736,6 +740,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
                         _dev_r = next(rep.parameters()).device
                         with torch.cuda.device(_dev_r):
+                            expect_pool_local([fp_outputs[j] for j in _warm], _dev_r, "warmup-ref")
                             _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
                             _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
                             _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
@@ -789,6 +794,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     rep = replica_group.replicas[r]
                     dev_r = next(rep.parameters()).device
                     with torch.cuda.device(dev_r):
+                        expect_pool_local([fp_outputs[j] for j in shard], dev_r, "ddp-ref")
                         ref_r = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
                         # always device-local: the runner's default cache_device
                         # is the PRIMARY GPU -- parking a mirror's output there
@@ -810,6 +816,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     indices = global_indices[batch_start : batch_start + batch_size]
                     with tune_stage(tune_prof, "ref_h2d"):
                         _loss_dev = torch.device(loss_device) if loss_device is not None else fp_outputs[0].device
+                        expect_pool_local([fp_outputs[i] for i in indices], _loss_dev, "serial-ref")
                         ref_output = torch.cat([fp_outputs[i].to(_loss_dev) for i in indices], dim=0)
                     with tune_stage(tune_prof, "fwd"):
                         pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)

@@ -101,6 +101,11 @@ def _cat_device_safe(tensors: list, dim: int) -> "torch.Tensor":
         raise ValueError("_cat_device_safe: empty selection")
     dev = tensors[0].device
     if any(t.device != dev for t in tensors):
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug(
+            "_cat_device_safe: moved %d/%d pieces to %s", sum(1 for t in tensors if t.device != dev), len(tensors), dev
+        )
         tensors = [t.to(dev) for t in tensors]
     return _torch.cat(tensors, dim=dim)
 
