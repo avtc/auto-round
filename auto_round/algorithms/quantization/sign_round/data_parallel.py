@@ -51,6 +51,24 @@ class DDPPlan:
         return self.world > 1
 
 
+def parse_ddp_groups(spec: Optional[str]) -> Optional[List[List[torch.device]]]:
+    """Parse AR_TUNE_DDP_GROUPS syntax ``"0,1,2,3;4,5,6,7"`` into device groups.
+
+    Ping-pong staging: blocks alternate between groups (home = group leader,
+    following the streaming round-robin over leaders), each block's mirrors
+    are the rest of its group, and the other group prefetches the next block.
+    """
+    if not spec or not str(spec).strip():
+        return None
+    groups = []
+    for part in str(spec).split(";"):
+        items = [t.strip() for t in part.split(",") if t.strip()]
+        if not items:
+            continue
+        groups.append([torch.device(f"cuda:{t}") if t.isdigit() else torch.device(t) for t in items])
+    return groups or None
+
+
 def resolve_ddp_plan(
     world: int,
     home: torch.device,
@@ -60,6 +78,7 @@ def resolve_ddp_plan(
     vram_free_bytes: Optional[int] = None,
     mirror_footprint_bytes: Optional[int] = None,
     margin_bytes: int = 2 * 1024**3,
+    groups: Optional[List[List[torch.device]]] = None,
 ) -> DDPPlan:
     """Pick mirror devices for ``world``-way data parallelism of one block.
 
@@ -79,6 +98,34 @@ def resolve_ddp_plan(
         notes.append("home device is not CUDA")
         return DDPPlan(1, [home], batch_size, notes)
     world = int(world)
+    if groups:
+        # ping-pong mode: mirrors are the block's own group (rotated so the
+        # streaming home leads); the requested world must match the group size
+        own = [g for g in groups if home in g]
+        if not own:
+            notes.append(f"home {home} is not part of any AR_TUNE_DDP_GROUPS group")
+            return DDPPlan(1, [home], batch_size, notes)
+        g = own[0]
+        if len(g) != world:
+            notes.append(f"group size {len(g)} != requested world {world}; using group size")
+            world = len(g)
+        if batch_size % world != 0:
+            notes.append(f"batch_size {batch_size} not divisible by world {world}")
+            return DDPPlan(1, [home], batch_size, notes)
+        devices = [home] + [d for d in g if d != home]
+        if vram_free_bytes is not None and mirror_footprint_bytes is not None:
+            kept = [devices[0]]
+            for dev in devices[1:]:
+                free = vram_free_bytes.get(dev, 0) if hasattr(vram_free_bytes, "get") else vram_free_bytes
+                if free < mirror_footprint_bytes + margin_bytes:
+                    notes.append(f"skip {dev}: free {free / 2**30:.1f}GiB < footprint+margin")
+                    continue
+                kept.append(dev)
+            devices = kept
+        if len(devices) < 2:
+            notes.append("no mirror device passed the VRAM guard")
+            return DDPPlan(1, [home], batch_size, notes)
+        return DDPPlan(len(devices), devices, batch_size // len(devices), notes)
     if batch_size % world != 0:
         notes.append(f"batch_size {batch_size} not divisible by world {world}")
         return DDPPlan(1, [home], batch_size, notes)
@@ -243,6 +290,66 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
 
     for buf in buffers:
         buf.mul_(scale)
+
+
+def sharded_nograd_forward(
+    runner,
+    block,
+    inputs,
+    input_others: dict,
+    out_device: torch.device,
+    devices: List[torch.device],
+    sample_count: Optional[int] = None,
+):
+    """Parallelize a no-grad collection forward across ``devices``.
+
+    The collection passes (reference outputs, quantized-output cascade) are
+    plain forwards over the whole sample pool on one GPU while the mirrors
+    idle. Here the pool is split into equal disjoint shards; an ephemeral
+    copy of the block on each device forwards its shard in a parallel thread;
+    per-shard outputs are parked on ``out_device`` and concatenated in order.
+    Bit-identical to the serial pass: rows are sample-independent and the
+    module copies carry identical weights. Falls back to the serial runner
+    call when the pool is not divisible or fewer than two devices are given.
+    Mirrors are dropped (freed) afterwards.
+    """
+    world = len(devices)
+    n = sample_count if sample_count is not None else (len(inputs) if isinstance(inputs, list) else 0)
+    if world < 2 or n < world or n % world != 0:
+        return runner(block, inputs, input_others, cache_device=out_device)
+    shard = n // world
+    shards = [list(range(r * shard, (r + 1) * shard)) for r in range(world)]
+    home_dev = _block_device(block)
+    mirrors: List[torch.nn.Module] = []
+    reps: List[torch.nn.Module] = []
+    for dev in devices:
+        if dev == home_dev:
+            reps.append(block)
+            mirrors.append(None)
+        else:
+            m = copy.deepcopy(block).to(dev)
+            _relocate_params(m, dev)
+            reps.append(m)
+            mirrors.append(m)
+    parts: List = [None] * world
+
+    def _run(r):
+        rep = reps[r]
+        dev_r = _block_device(rep)
+        if dev_r.type == "cuda":
+            with torch.cuda.device(dev_r):
+                parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=out_device)
+        else:
+            parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=out_device)
+
+    runner_group = ReplicaGroup.__new__(ReplicaGroup)  # reuse only the thread runner
+    runner_group.run_threaded([lambda r=r: _run(r) for r in range(world)])
+    out = parts[0]
+    for part in parts[1:]:
+        out = torch.cat([out, part], dim=0)
+    mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
+    reps.clear()
+    return out
 
 
 class ReplicaGroup:

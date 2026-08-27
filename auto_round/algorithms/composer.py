@@ -469,6 +469,50 @@ class AlgorithmComposer:
     def compress_embedding_layer(self):
         return self.block_quantizer.quantize_embedding_layer()
 
+    def _ddp_collection_devices(self, block, fp_inputs):
+        """Mirror devices for sharding the no-grad collection forwards.
+
+        Engages only when AR_TUNE_DDP_WORLD is active for this block's home
+        (CUDA, stamped streaming home, pool divisible into equal shards) and
+        the runner uses the plain tensor output layout. Returns None to keep
+        the serial single-GPU collection.
+        """
+        from auto_round import envs as _envs
+
+        world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
+        if world <= 1 or not isinstance(fp_inputs, list) or not fp_inputs:
+            return None
+        home = getattr(block, "_stream_home_device", None)
+        if home is None or home.type != "cuda":
+            return None
+        runner_cfg = getattr(self.block_forward, "output_config", None)
+        if runner_cfg and list(runner_cfg) != ["hidden_states"]:
+            return None  # multi-output layouts need the serial last_output_dict path
+        n = len(fp_inputs)
+        if n < world or n % world != 0:
+            return None
+        try:
+            from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups, resolve_ddp_plan
+
+            plan = resolve_ddp_plan(
+                world,
+                home,
+                n,
+                visible_cuda_devices=list(range(torch.cuda.device_count())),
+                groups=parse_ddp_groups(getattr(_envs, "AR_TUNE_DDP_GROUPS", None)),
+            )
+        except Exception:  # pragma: no cover - CUDA reachability on odd hosts
+            return None
+        return plan.devices if plan.world > 1 else None
+
+    def _collect_forward(self, block, inputs, input_others, out_dev):
+        """Collection forward: sharded across DDP mirrors when eligible."""
+        if self._coll_devs is None:
+            return self.block_forward(block, inputs, input_others, cache_device=out_dev)
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
+
+        return sharded_nograd_forward(self.block_forward, block, inputs, input_others, out_dev, self._coll_devs)
+
     # ── Per-block pipeline orchestration ─────────────────────────────────────
 
     def compress_block(
@@ -508,6 +552,7 @@ class AlgorithmComposer:
         """
         block_forward_fn = self.block_forward
         _out_dev = _stream_out_device(block)
+        self._coll_devs = self._ddp_collection_devices(block, fp_inputs)
         import time as _time
 
         from auto_round.utils.tune_profile import make_tune_profiler
@@ -559,7 +604,7 @@ class AlgorithmComposer:
         if fp_inputs is not None:
             with _prof_stage(_prof, "ref_collect"), torch.no_grad():
                 quant_hooks = self._get_fp_act_hooks(block)
-                reference_output = block_forward_fn(block, fp_inputs, input_others, cache_device=_out_dev)
+                reference_output = self._collect_forward(block, fp_inputs, input_others, _out_dev)
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
                     h.remove()
@@ -567,8 +612,8 @@ class AlgorithmComposer:
                 if self.block_quantizer.enable_quanted_input:
                     q_hooks = self._get_q_act_hooks(block)
                     if q_hooks:
-                        block_forward_fn(
-                            block, q_inputs if q_inputs is not None else fp_inputs, input_others, cache_device=_out_dev
+                        self._collect_forward(
+                            block, q_inputs if q_inputs is not None else fp_inputs, input_others, _out_dev
                         )
                         for h in q_hooks:
                             h.remove()
@@ -628,7 +673,7 @@ class AlgorithmComposer:
                 )
             if self.block_quantizer.enable_quanted_input:
                 with torch.no_grad():
-                    new_q_input = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
+                    new_q_input = self._collect_forward(block, effective_input, input_others, _out_dev)
                     new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
                 if reference_next_input is not None:
                     # stats BEFORE bias correction: the correction absorbs the

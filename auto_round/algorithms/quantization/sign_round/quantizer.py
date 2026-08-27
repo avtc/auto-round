@@ -676,10 +676,13 @@ class SignRoundQuantizer(BaseQuantizer):
                 }
             except Exception:  # pragma: no cover - non-CUDA reachability
                 _free = None
+            from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups
+
             _plan = resolve_ddp_plan(
                 _dp_world,
                 _home,
                 global_batch_size,
+                groups=parse_ddp_groups(getattr(_envs, "AR_TUNE_DDP_GROUPS", None)),
                 visible_cuda_devices=list(range(torch.cuda.device_count())) if _free else None,
                 explicit_devices=_explicit or None,
                 vram_free_bytes=_free,

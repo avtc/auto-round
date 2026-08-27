@@ -121,6 +121,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ("cuda:1,cuda:2"; the block home is always rank 0). Default: home + next
     # GPUs in ascending order, per-mirror VRAM-guarded.
     "AR_TUNE_DDP_DEVICES": lambda: os.getenv("AR_TUNE_DDP_DEVICES", ""),
+    # Ping-pong device groups for AR_TUNE_DDP_WORLD, syntax "0,1,2,3;4,5,6,7":
+    # streaming homes alternate between group leaders, each block's mirrors
+    # are its own group, and the idle group prefetches the next block.
+    "AR_TUNE_DDP_GROUPS": lambda: os.getenv("AR_TUNE_DDP_GROUPS", ""),
     # Exchange DDP gradients in bfloat16 (halves PCIe payload; sign-SGD robust
     # to the reduced precision, but the trajectory changes within fp noise).
     "AR_TUNE_DDP_BF16_GRAD": lambda: os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes"),

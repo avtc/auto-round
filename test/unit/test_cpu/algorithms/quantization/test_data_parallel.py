@@ -281,3 +281,93 @@ class TestRelocatePlainState:
         w.skeleton = torch.zeros(4, device="meta")
         dp._relocate_params(w, torch.device("cuda:1"))
         assert w.skeleton.device.type == "meta"
+
+
+class TestDDPGroups:
+    def test_parse_group_syntax(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups
+
+        groups = parse_ddp_groups("0,1,2,3;4,5,6,7")
+        assert groups == [
+            [torch.device("cuda", i) for i in (0, 1, 2, 3)],
+            [torch.device("cuda", i) for i in (4, 5, 6, 7)],
+        ]
+        assert parse_ddp_groups("") is None
+        assert parse_ddp_groups(None) is None
+
+    def test_plan_uses_group_containing_home(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups, resolve_ddp_plan
+
+        groups = parse_ddp_groups("0,1,2,3;4,5,6,7")
+        plan = resolve_ddp_plan(4, torch.device("cuda:5"), batch_size=8, groups=groups)
+        assert plan.devices[0] == torch.device("cuda", 5)
+        assert plan.world == 4
+        assert set(plan.devices) == {torch.device("cuda", i) for i in (4, 5, 6, 7)}
+
+    def test_plan_home_outside_groups_disables(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups, resolve_ddp_plan
+
+        groups = parse_ddp_groups("0,1,2,3;4,5,6,7")
+        plan = resolve_ddp_plan(4, torch.device("cuda:0"), batch_size=8, groups=parse_ddp_groups("4,5,6,7"))
+        assert plan.world == 1 and any("group" in n for n in plan.notes)
+
+
+class TestShardedNoGradForward:
+    def _runner(self):
+        class _R:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, block, inputs, others, indices=None, cache_device=None):
+                return self.forward(block, inputs, others, indices, cache_device)
+
+            def forward(self, block, inputs, others, indices, cache_device=None):
+                import torch
+
+                idx = list(indices) if indices is not None else list(range(len(inputs)))
+                self.calls.append((str(block), idx, str(cache_device)))
+                rows = [block(torch.tensor([float(i), float(i)])) for i in idx]
+                return torch.stack(rows).reshape(len(idx), 1)
+
+        return _R()
+
+    def test_shards_split_outputs_concat_in_order(self):
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
+
+        block = nn.Linear(2, 1)
+        inputs = list(range(8))  # opaque to the helper; indices matter
+        runner = self._runner()
+        out = sharded_nograd_forward(
+            runner,
+            block,
+            inputs,
+            {},
+            out_device=torch.device("cpu"),
+            devices=[torch.device("cpu")] * 4,
+            sample_count=8,
+        )
+        assert out.shape == (8, 1)
+        # shards disjoint, in order, concatenated
+        got = [i for _b, idx, _c in runner.calls for i in idx]
+        assert got == list(range(8))
+        assert len(runner.calls) == 4
+
+    def test_indivisible_falls_back_serial(self):
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
+
+        block = nn.Linear(2, 1)
+        runner = self._runner()
+        out = sharded_nograd_forward(
+            runner,
+            block,
+            list(range(7)),
+            {},
+            out_device=torch.device("cpu"),
+            devices=[torch.device("cpu")] * 4,
+            sample_count=7,
+        )
+        assert len(runner.calls) == 1  # serial fallback

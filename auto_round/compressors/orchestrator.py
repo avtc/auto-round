@@ -1855,6 +1855,18 @@ class CompressionOrchestrator(BaseOrchestrator):
         # or 1 for host-RAM staging.
         raw_depth = getattr(self, "stream_prefetch", 0)
         stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and raw_depth != 0) else None
+        from auto_round.algorithms.quantization.sign_round.data_parallel import parse_ddp_groups
+
+        _ddp_groups = parse_ddp_groups(getattr(envs, "AR_TUNE_DDP_GROUPS", None))
+        if _ddp_groups:
+            # ping-pong: homes alternate between group leaders (the round-robin
+            # below indexes this list), each block mirrors within its own group,
+            # and the idle group prefetches the next block
+            stage_devices = [g[0] for g in _ddp_groups]
+            logger.info(
+                "[stream] DDP ping-pong staging: homes alternate between group leaders %s",
+                [str(d) for d in stage_devices],
+            )
         if raw_depth == 0 or raw_depth is None:
             prefetch_depth = 0 if raw_depth == 0 else (len(stage_devices) if stage_devices else 1)
         else:
