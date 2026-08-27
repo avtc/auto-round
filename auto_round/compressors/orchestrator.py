@@ -1911,6 +1911,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 strip_stale_device_hooks_(block)
                 _n_moved = rehome_block_(block, load_device)
                 block._stream_home_device = torch.device(load_device)
+                # pin leaf tuning_device to the home: WrapperLinear prefers it
+                # (wrapper.py self.device = orig_layer.tuning_device or device),
+                # and quantize_block's local device otherwise defaults to the
+                # global primary - the wrapper would drag the wrapped layers
+                # back to cuda:0 while unwrapped siblings (conv1d) stay home.
+                from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+                SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
                 if stream_block_idx == 0:
                     logger.info(
                         "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
