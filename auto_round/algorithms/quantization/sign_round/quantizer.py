@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
@@ -583,6 +584,11 @@ class SignRoundQuantizer(BaseQuantizer):
         )
 
         from auto_round import envs as _envs
+        from auto_round.utils.tune_profile import make_tune_profiler
+        from auto_round.utils.tune_profile import stage as tune_stage
+
+        tune_prof = make_tune_profiler(device)
+        _tune_wall_t0 = time.perf_counter() if tune_prof is not None else None
 
         _alt2_switch = alt2_switch_iter(self.iters, _envs.AR_TUNE_RECIPE, _envs.AR_ALT2_ITERS2)
         _alt2_regridded = False
@@ -598,27 +604,33 @@ class SignRoundQuantizer(BaseQuantizer):
 
             for batch_start in range(0, len(global_indices), batch_size):
                 indices = global_indices[batch_start : batch_start + batch_size]
-                ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
-                pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
-                if loss_device is not None:
-                    pred_output = pred_output.to(loss_device)
+                with tune_stage(tune_prof, "ref_h2d"):
+                    ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
+                with tune_stage(tune_prof, "fwd"):
+                    pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
+                    if loss_device is not None:
+                        pred_output = pred_output.to(loss_device)
                 if (
                     block_ctx.block_index == block_ctx.block_cnt - 1
                     and self.enable_lfq
                     and input_ids is not None
                     and self._is_text_decoder_block(block_ctx.block_name)
                 ):
-                    loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in indices], dim=0))
+                    with tune_stage(tune_prof, "loss"):
+                        loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in indices], dim=0))
                 else:
-                    loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
+                    with tune_stage(tune_prof, "loss"):
+                        loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
                 num_elm = 1 if num_elm <= 0 else num_elm
-                total_loss += loss.item() / num_elm
+                with tune_stage(tune_prof, "sync"):
+                    total_loss += loss.item() / num_elm
 
                 if mid_iter_mem_check:
                     # clear memory to avoid OOM due to memory fragmentation
                     clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
 
-                self._scale_loss_and_backward(scaler, loss)
+                with tune_stage(tune_prof, "bwd"):
+                    self._scale_loss_and_backward(scaler, loss)
 
                 if mid_iter_mem_check:
                     # clear memory to avoid OOM due to memory fragmentation
@@ -630,7 +642,8 @@ class SignRoundQuantizer(BaseQuantizer):
             if total_loss < best_loss:
                 best_loss = total_loss
                 if not self.not_use_best_mse:
-                    best_params = collect_best_params(block, self.compress_context.cache_device)
+                    with tune_stage(tune_prof, "snapshot"):
+                        best_params = collect_best_params(block, self.compress_context.cache_device)
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
                 best_params = collect_best_params(block, self.compress_context.cache_device)
@@ -639,7 +652,8 @@ class SignRoundQuantizer(BaseQuantizer):
                 if 0 < self.dynamic_max_gap <= i - last_best_iter:
                     break
             sync_gradients()
-            self._step(scaler, optimizer, lr_schedule)
+            with tune_stage(tune_prof, "step"):
+                self._step(scaler, optimizer, lr_schedule)
 
             if _alt2_switch is not None and (i + 1) == _alt2_switch and not _alt2_regridded:
                 _alt2_regrid_block(block)
@@ -653,6 +667,12 @@ class SignRoundQuantizer(BaseQuantizer):
                 init_loss = None
 
         last_loss = total_loss
+        if tune_prof is not None:
+            tune_prof.log_summary(
+                block_name=getattr(block_ctx, "block_name", ""),
+                iters_done=(i + 1) if self.iters > 0 else 0,
+                wall=time.perf_counter() - _tune_wall_t0,
+            )
         best_iter = self.iters
         if not self.not_use_best_mse:
             last_loss = best_loss
