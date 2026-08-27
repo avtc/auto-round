@@ -109,22 +109,36 @@ def resolve_ddp_plan(
     return DDPPlan(len(devices), devices, batch_size // len(devices), notes)
 
 
-def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:
-    """Move dict-registered tuning params (``m.params``) to ``device``.
+def _move_tensor(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Move a tensor to ``device`` (seam for tests on single-device hosts)."""
+    return t.to(device)
 
-    Wrapper modules keep their tunable tensors in a plain ``params`` dict --
-    ``nn.Module.to()`` does not see them, so a mirrored block would compute
-    with home-device ``v``/``min_scale``/``max_scale``. Recreate each entry as
-    a fresh leaf Parameter on the target device (grad state resets, which is
-    correct for a fresh mirror).
+
+def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:
+    """Move ALL state that ``nn.Module.to()`` cannot see onto ``device``.
+
+    Wrapper modules keep three kinds of non-registered state that a mirrored
+    block would otherwise leave on the home device:
+    - tunable tensors in the plain ``params`` dict (``v``/``min_scale``/...)
+      -- recreated as fresh leaf Parameters (grad state resets, correct for a
+      fresh mirror);
+    - plain tensor attributes (``weight_min``/``weight_max`` anchors, cached
+      imatrix slices, ...) -- moved in place;
+    - device-typed attributes (``device``/``output_device``/``tuning_device``)
+      -- repointed so wrapper forward staging targets the mirror, not home.
     """
     for _n, m in module.named_modules():
         params = getattr(m, "params", None)
-        if not isinstance(params, dict):
-            continue
-        for key, val in params.items():
-            if isinstance(val, torch.nn.Parameter):
-                params[key] = torch.nn.Parameter(val.detach().to(device), requires_grad=val.requires_grad)
+        if isinstance(params, dict):
+            for key, val in params.items():
+                if isinstance(val, torch.nn.Parameter):
+                    moved = _move_tensor(val.detach(), device)
+                    params[key] = torch.nn.Parameter(moved, requires_grad=val.requires_grad)
+        for key, val in list(m.__dict__.items()):
+            if isinstance(val, torch.Tensor) and val.device != device and val.device.type != "meta":
+                m.__dict__[key] = _move_tensor(val, device)
+            elif isinstance(val, torch.device):
+                m.__dict__[key] = device
 
 
 def _param_grad_buffers(params_by_device: List[List[torch.nn.Parameter]]) -> List[Optional[torch.Tensor]]:

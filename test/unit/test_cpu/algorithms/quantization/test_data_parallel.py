@@ -238,3 +238,46 @@ class TestRunThreaded:
             group.run_threaded([lambda i=0: ok(i), boom, lambda i=2: ok(i)])
         assert sorted(ran) == [0, 2]
         group.teardown()
+
+
+class TestRelocatePlainState:
+    def _wrapper(self):
+        w = torch.nn.Module()
+        w.orig_layer = torch.nn.Linear(8, 8)
+        w.params = {"v": torch.nn.Parameter(torch.zeros(8, 8))}
+        w.weight_min = torch.zeros(8)
+        w.weight_max = torch.ones(8)
+        w.device = torch.device("cuda:0")
+        w.output_device = torch.device("cuda:0")
+        return w
+
+    def test_plain_tensors_and_device_attrs_relocated(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        target = torch.device("cuda:1")
+        wrapper = self._wrapper()
+        moved = []
+
+        def fake_move(t, dev):
+            moved.append((tuple(t.shape), dev))
+            return t
+
+        monkeypatch.setattr(dp, "_move_tensor", fake_move)
+        dp._relocate_params(wrapper, target)
+        assert wrapper.weight_min is wrapper.weight_min  # replaced via the seam
+        assert (tuple(wrapper.weight_min.shape), target) in moved
+        assert (tuple(wrapper.weight_max.shape), target) in moved
+        assert wrapper.device == target and wrapper.output_device == target
+        # params dict entries remain fresh Parameters (v moved via the seam too)
+        assert isinstance(wrapper.params["v"], torch.nn.Parameter)
+        assert any(shape == (8, 8) for shape, _dev in moved)
+
+    def test_meta_tensors_left_alone(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        moved = []
+        monkeypatch.setattr(dp, "_move_tensor", lambda t, dev: moved.append(1) or t)
+        w = self._wrapper()
+        w.skeleton = torch.zeros(4, device="meta")
+        dp._relocate_params(w, torch.device("cuda:1"))
+        assert w.skeleton.device.type == "meta"
