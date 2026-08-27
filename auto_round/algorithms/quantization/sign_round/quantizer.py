@@ -729,8 +729,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         _dev_r = next(rep.parameters()).device
                         with torch.cuda.device(_dev_r):
                             _ref_w = torch.cat([fp_outputs[j] for j in _warm], dim=0).to(_dev_r)
-                            _cache_w = _dev_r if _fwd_cache_device is not None else None
-                            _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _cache_w)
+                            _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
                             _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
                             _loss_w.backward()
                     for _opt in [optimizer] + mirror_optimizers:
@@ -783,8 +782,11 @@ class SignRoundQuantizer(BaseQuantizer):
                     dev_r = next(rep.parameters()).device
                     with torch.cuda.device(dev_r):
                         ref_r = torch.cat([fp_outputs[j] for j in shard], dim=0).to(dev_r)
-                        cache_r = dev_r if _fwd_cache_device is not None else None
-                        pred_r = block_fwd.forward(rep, active_inputs, input_others, shard, cache_r)
+                        # always device-local: the runner's default cache_device
+                        # is the PRIMARY GPU -- parking a mirror's output there
+                        # would both mismatch the loss and cost a cross-device
+                        # copy every iteration
+                        pred_r = block_fwd.forward(rep, active_inputs, input_others, shard, dev_r)
                         loss_r = self._get_loss(pred_r, ref_r, shard, mse_loss, dev_r, None)
                         _losses[r] = loss_r.detach()
                         loss_r.backward()
