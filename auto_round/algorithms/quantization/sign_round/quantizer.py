@@ -528,6 +528,8 @@ class SignRoundQuantizer(BaseQuantizer):
         active_inputs = q_inputs if (q_inputs is not None and self.enable_quanted_input) else fp_inputs
         active_inputs = _maybe_qoff_noise(active_inputs, block_ctx.block_index, self.enable_quanted_input)
         _home = torch.device(device) if not isinstance(device, torch.device) else device
+        from auto_round.algorithms.quantization.sign_round.data_parallel import expect_pool_local
+
         # calibration-state placement is DEFERRED: under an engaged DDP plan the
         # pools are scattered across the plan devices (shard-local reads); the
         # gather-to-home re-home runs only on the serial path
@@ -666,11 +668,7 @@ class SignRoundQuantizer(BaseQuantizer):
             and isinstance(fp_outputs, list)
         )
         if _dp_eligible:
-            from auto_round.algorithms.quantization.sign_round.data_parallel import (
-                ReplicaGroup,
-                expect_pool_local,
-                resolve_ddp_plan,
-            )
+            from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup, resolve_ddp_plan
 
             _explicit = [d.strip() for d in str(_envs.AR_TUNE_DDP_DEVICES or "").split(",") if d.strip()]
             _mirror_bytes = sum(p.numel() * p.element_size() for p in round_params + minmax_params) + sum(
