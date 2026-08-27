@@ -483,3 +483,62 @@ class TestMirrorStatMerge:
         mirror.act_max = torch.tensor([3.0, 2.0])
         _merge_mirror_stats(home, [mirror])
         assert home.act_max.tolist() == [3.0, 5.0]
+
+
+class TestDistributedPool:
+    def test_distribute_pool_noop_on_single_device(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import distribute_pool
+
+        pool = [torch.randn(1, 2, 2) for _ in range(4)]
+        before = [t.data_ptr() for t in pool]
+        distribute_pool(pool, [torch.device("cpu")])  # world < 2 -> untouched
+        assert [t.data_ptr() for t in pool] == before
+        distribute_pool(pool, [torch.device("cpu")] * 4)  # already local
+        assert [t.data_ptr() for t in pool] == before
+
+    def test_distribute_pool_indivisible_untouched(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import distribute_pool
+
+        pool = [torch.randn(1, 2, 2) for _ in range(5)]
+        before = [t.data_ptr() for t in pool]
+        distribute_pool(pool, [torch.device("cpu")] * 2)  # 5 % 2 != 0
+        assert [t.data_ptr() for t in pool] == before
+
+    def test_sharded_outputs_stay_on_replica_device(self):
+        """The per-shard runner call must receive cache_device == replica device."""
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
+
+        seen = []
+
+        class _Runner:
+            last_output_dict = None
+
+            def split_outputs(self, output):
+                return list(torch.split(output, 1, dim=0))
+
+            def __call__(self, block, inputs, input_others, indices=None, cache_device=None):
+                seen.append(cache_device)
+                outs = [block(torch.ones(1, 2, 2)) for _i in indices]
+                return torch.cat(outs, dim=0).to(cache_device)
+
+        block = torch.nn.Linear(2, 2)
+        sharded_nograd_forward(_Runner(), block, list(range(4)), {}, torch.device("cpu"), [torch.device("cpu")] * 2)
+        # every shard was told to park its outputs on ITS OWN device (here cpu)
+        assert all(d == torch.device("cpu") for d in seen) and len(seen) == 2
+
+
+class TestCatDeviceSafe:
+    def test_same_device_selection_is_copy_free(self):
+        from auto_round.algorithms.block_runner import _cat_device_safe
+
+        tensors = [torch.randn(1, 3, 2) for _ in range(4)]
+        ptrs = [t.data_ptr() for t in tensors]
+        out = _cat_device_safe(tensors, dim=0)
+        assert out.shape == (4, 3, 2)
+        assert [t.data_ptr() for t in tensors] == ptrs  # no silent copies
+
+    def test_cat_matches_torch_cat(self):
+        from auto_round.algorithms.block_runner import _cat_device_safe
+
+        tensors = [torch.randn(1, 3, 2) for _ in range(3)]
+        torch.testing.assert_close(_cat_device_safe(tensors, 0), torch.cat(tensors, dim=0))

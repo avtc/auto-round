@@ -305,8 +305,8 @@ class SignRoundQuantizer(BaseQuantizer):
             else autocast(device_type=str(device).split(":")[0], dtype=self.model_context.amp_dtype)
         )
         if valid_token_mask:
-            tmp_attention_mask = [valid_token_mask[i] for i in indices]
-            tmp_attention_mask = torch.cat(tmp_attention_mask, dim=0).to(device)
+            tmp_attention_mask = [valid_token_mask[i].to(device) for i in indices]
+            tmp_attention_mask = torch.cat(tmp_attention_mask, dim=0)
             tmp_attention_mask.unsqueeze_(-1)
 
             with autocast_ctx:
@@ -736,7 +736,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
                         _dev_r = next(rep.parameters()).device
                         with torch.cuda.device(_dev_r):
-                            _ref_w = torch.cat([fp_outputs[j] for j in _warm], dim=0).to(_dev_r)
+                            _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
                             _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
                             _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
                             _loss_w.backward()
@@ -789,7 +789,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     rep = replica_group.replicas[r]
                     dev_r = next(rep.parameters()).device
                     with torch.cuda.device(dev_r):
-                        ref_r = torch.cat([fp_outputs[j] for j in shard], dim=0).to(dev_r)
+                        ref_r = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
                         # always device-local: the runner's default cache_device
                         # is the PRIMARY GPU -- parking a mirror's output there
                         # would both mismatch the loss and cost a cross-device
@@ -809,7 +809,8 @@ class SignRoundQuantizer(BaseQuantizer):
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
                     with tune_stage(tune_prof, "ref_h2d"):
-                        ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
+                        _loss_dev = torch.device(loss_device) if loss_device is not None else fp_outputs[0].device
+                        ref_output = torch.cat([fp_outputs[i].to(_loss_dev) for i in indices], dim=0)
                     with tune_stage(tune_prof, "fwd"):
                         pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
                         if loss_device is not None:

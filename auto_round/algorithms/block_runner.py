@@ -87,6 +87,24 @@ register_block_output("GlmMoeDsaDecoderLayer", ["hidden_states", "prev_topk_indi
 
 
 # TODO wenhuach better follow heng's imp to decouple llm/diffusion
+def _cat_device_safe(tensors: list, dim: int) -> "torch.Tensor":
+    """Concatenate per-sample tensors that may live on different devices.
+
+    Distributed calibration pools keep each sample on its owning DDP device;
+    batch selection that crosses owners moves the minority to the first
+    piece's device (same-device selections -- the common DDP case -- stay
+    copy-free).
+    """
+    import torch as _torch
+
+    if not tensors:
+        raise ValueError("_cat_device_safe: empty selection")
+    dev = tensors[0].device
+    if any(t.device != dev for t in tensors):
+        tensors = [t.to(dev) for t in tensors]
+    return _torch.cat(tensors, dim=dim)
+
+
 class BlockForwardRunner:
     """Stateless block-forward execution engine shared across quantizer & compressor.
 
@@ -383,14 +401,14 @@ class BlockForwardRunner:
                         selected_inputs[key] = val
                 else:
                     if isinstance(val, list):
-                        selected_inputs[key] = torch.cat([val[i] for i in indices], dim=batch_dim)
+                        selected_inputs[key] = _cat_device_safe([val[i] for i in indices], batch_dim)
                     elif isinstance(val, torch.Tensor):
                         selected_inputs[key] = torch.index_select(val, batch_dim, indices)
                     else:
                         selected_inputs[key] = val
         else:
             if isinstance(inputs, list):
-                selected_inputs = torch.cat([inputs[i] for i in indices], dim=batch_dim)
+                selected_inputs = _cat_device_safe([inputs[i] for i in indices], batch_dim)
             else:
                 selected_inputs = torch.index_select(inputs, batch_dim, indices)
 
@@ -412,7 +430,7 @@ class BlockForwardRunner:
                 if len(batch_vals) == 1:
                     selected_others[key] = batch_vals[0]
                 else:
-                    selected_others[key] = torch.cat(batch_vals, dim=batch_dim)
+                    selected_others[key] = _cat_device_safe(batch_vals, batch_dim)
             elif isinstance(val, torch.Tensor):
                 selected_others[key] = torch.index_select(val, batch_dim, indices)
             elif isinstance(val, (str, bool, type(None))):

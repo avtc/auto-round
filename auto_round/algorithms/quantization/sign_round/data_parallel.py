@@ -355,6 +355,30 @@ def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -
                     setattr(h_mod, attr, torch.max(h_val, m_val))
 
 
+def distribute_pool(pool: List[torch.Tensor], devices: List[torch.device]) -> None:
+    """Scatter a per-sample calibration pool across ``devices`` (in place).
+
+    Device r owns samples [r*shard, (r+1)*shard) -- the same boundaries the
+    DDP tune shards and the sharded collection use -- so shard-local reads
+    (ref_r build, _select_batch for shard r, per-replica collections) never
+    cross devices. Pieces already on their target device are untouched
+    (idempotent; a pool produced by the previous block's sharded collection
+    on the same group costs nothing). Pools smaller than / indivisible by
+    the world are left alone (serial consumers handle them via move-on-demand
+    cats).
+    """
+    n = len(pool)
+    world = len(devices)
+    if world < 2 or n < world or n % world != 0:
+        return
+    shard = n // world
+    for r, dev in enumerate(devices):
+        dev = torch.device(dev)
+        for i in range(r * shard, (r + 1) * shard):
+            if pool[i].device != dev:
+                pool[i] = pool[i].to(dev)
+
+
 def sharded_nograd_forward(
     runner,
     block,
@@ -375,7 +399,9 @@ def sharded_nograd_forward(
     Bit-identical to the serial pass: rows are sample-independent and the
     module copies carry identical weights. Falls back to the serial runner
     call when the pool is not divisible or fewer than two devices are given.
-    Mirrors are dropped (freed) afterwards.
+    Mirrors are dropped (freed) afterwards. Returned pieces stay on the
+    device that computed them (distributed pool); consumers either read
+    shard-locally or use device-safe cats.
     """
     world = len(devices)
     n = sample_count if sample_count is not None else (len(inputs) if isinstance(inputs, list) else 0)
@@ -400,11 +426,13 @@ def sharded_nograd_forward(
     def _run(r):
         rep = reps[r]
         dev_r = _block_device(rep)
+        # outputs stay ON the replica that computed them: the per-sample list
+        # returned below is a distributed pool (device r owns shard r's rows)
         if dev_r.type == "cuda":
             with torch.cuda.device(dev_r):
-                parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=out_device)
+                parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=dev_r)
         else:
-            parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=out_device)
+            parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=dev_r)
 
     runner_group = ReplicaGroup.__new__(ReplicaGroup)  # reuse only the thread runner
     runner_group.run_threaded([lambda r=r: _run(r) for r in range(world)])

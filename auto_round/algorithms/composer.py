@@ -113,6 +113,7 @@ def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
     for y_fp_t, y_q_t in zip(_iter_hidden_tensors(y_fp), _iter_hidden_tensors(y_q)):
         y_fp_t = y_fp_t.detach()
         y_q_t = y_q_t.detach()
+        y_q_t = y_q_t.to(y_fp_t.device)  # distributed pool: pair may straddle devices
         d = y_fp_t.to(torch.float32) - y_q_t.to(torch.float32)
         part = d.sum(dim=tuple(range(d.dim() - 1)))
         b = part if b is None else b + part
@@ -161,6 +162,7 @@ def _collect_qoff_noise_stats_from_outputs(y_fp, y_q, path):
     sumsq_d = None
     rows = 0
     for y_fp_t, y_q_t in zip(_iter_hidden_tensors(y_fp), _iter_hidden_tensors(y_q)):
+        y_q_t = y_q_t.detach().to(y_fp_t.device)  # distributed pool pair alignment
         d = (y_fp_t.detach().to(torch.float64) - y_q_t.detach().to(torch.float64)).reshape(-1, y_fp_t.shape[-1])
         part = d.sum(dim=0)
         partsq = d.pow(2).sum(dim=0)
@@ -611,6 +613,16 @@ class AlgorithmComposer:
         block_forward_fn = self.block_forward
         _out_dev = _stream_out_device(block)
         self._coll_devs = self._ddp_collection_devices(block, fp_inputs)
+        if self._coll_devs:
+            # distributed calibration pool: each DDP device owns its sample
+            # shard (matching the tune shards), so shard-local reads never
+            # cross devices; serial consumers use device-safe cats
+            from auto_round.algorithms.quantization.sign_round.data_parallel import distribute_pool
+
+            if isinstance(fp_inputs, list) and fp_inputs:
+                distribute_pool(fp_inputs, self._coll_devs)
+            if isinstance(q_inputs, list) and q_inputs:
+                distribute_pool(q_inputs, self._coll_devs)
         import time as _time
 
         from auto_round.utils.tune_profile import make_tune_profiler
