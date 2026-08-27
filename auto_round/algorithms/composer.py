@@ -48,6 +48,19 @@ from auto_round.utils import clear_memory
 from auto_round.utils.device_manager import device_manager
 
 
+def _stream_out_device(block):
+    """Park collected calibration rows on the producing block's home.
+
+    BlockForwardRunner parks returned rows on its fixed cache_device (the
+    primary GPU); under streaming with round-robin homes every non-primary
+    block would then pay a cross-device toll per tuning iteration. When the
+    streaming loop has stamped a home device, collect there instead. Returns
+    None for non-streaming runs (runner default, unchanged behavior).
+    """
+    home = getattr(block, "_stream_home_device", None)
+    return torch.device(home) if home is not None else None
+
+
 def _as_hidden_tensor(out):
     """Normalize a block output (tensor | dict | tuple) to its hidden-states tensor."""
     import torch as _torch
@@ -494,6 +507,7 @@ class AlgorithmComposer:
             - *reference_output*: FP reference output collected before optimization.
         """
         block_forward_fn = self.block_forward
+        _out_dev = _stream_out_device(block)
 
         # ── Step 0: Layer-wise rotation (before any reference/calibration) ────
         # Rotates this block's weights and installs online hooks so all downstream
@@ -507,7 +521,7 @@ class AlgorithmComposer:
             for pre in self.preprocessors:
                 pre_hooks.extend(pre.register_fp_input_forward_hooks(block))
             if pre_hooks:
-                block_forward_fn(block, fp_inputs, input_others)
+                block_forward_fn(block, fp_inputs, input_others, cache_device=_out_dev)
             for h in pre_hooks:
                 h.remove()
 
@@ -516,7 +530,9 @@ class AlgorithmComposer:
                 if hasattr(pre, "register_qinput_forward_hooks"):
                     pre_q_hooks.extend(pre.register_qinput_forward_hooks(block))
             if pre_q_hooks:
-                block_forward_fn(block, q_inputs if q_inputs is not None else fp_inputs, input_others)
+                block_forward_fn(
+                    block, q_inputs if q_inputs is not None else fp_inputs, input_others, cache_device=_out_dev
+                )
             for h in pre_q_hooks:
                 h.remove()
 
@@ -530,7 +546,7 @@ class AlgorithmComposer:
         if fp_inputs is not None:
             with torch.no_grad():
                 quant_hooks = self._get_fp_act_hooks(block)
-                reference_output = block_forward_fn(block, fp_inputs, input_others)
+                reference_output = block_forward_fn(block, fp_inputs, input_others, cache_device=_out_dev)
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
                     h.remove()
@@ -538,7 +554,9 @@ class AlgorithmComposer:
                 if self.block_quantizer.enable_quanted_input:
                     q_hooks = self._get_q_act_hooks(block)
                     if q_hooks:
-                        block_forward_fn(block, q_inputs if q_inputs is not None else fp_inputs, input_others)
+                        block_forward_fn(
+                            block, q_inputs if q_inputs is not None else fp_inputs, input_others, cache_device=_out_dev
+                        )
                         for h in q_hooks:
                             h.remove()
 
@@ -595,7 +613,7 @@ class AlgorithmComposer:
             )
         if self.block_quantizer.enable_quanted_input:
             with torch.no_grad():
-                new_q_input = block_forward_fn(block, effective_input, input_others)
+                new_q_input = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
                 new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
             if reference_next_input is not None:
                 # stats BEFORE bias correction: the correction absorbs the
@@ -614,7 +632,7 @@ class AlgorithmComposer:
             if reference_next_input is not None:
                 if _envs.AR_QOFF_NOISE_STATS or _envs.AR_BIAS_CORRECT:
                     with torch.no_grad():
-                        _stats_y_q = block_forward_fn(block, effective_input, input_others)
+                        _stats_y_q = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
                 if _envs.AR_QOFF_NOISE_STATS:
                     _collect_qoff_noise_stats_from_outputs(
                         reference_next_input,

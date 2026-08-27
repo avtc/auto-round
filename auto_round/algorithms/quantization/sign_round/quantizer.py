@@ -39,6 +39,57 @@ from auto_round.utils.device import clear_memory_if_reached_threshold
 from auto_round.utils.device_manager import device_manager
 
 
+def _rehome_calibration_state(
+    active_inputs,
+    fp_outputs,
+    device,
+    margin_bytes: int = 2 * 1024**3,
+) -> int:
+    """Move a block's calibration tensors to its tuning device, once per block.
+
+    Under streaming with round-robin homes, collected rows are parked on the
+    GPU that PRODUCED them (previous block's home / the primary); a block
+    tuning on a different device would then pay a cross-device toll on every
+    iteration (batch staging inside forward, the reference cat+to, snapshot
+    copies). One guarded bulk move replaces those per-iteration tolls.
+
+    Lists are mutated in place. VRAM-guarded: skips (returns 0) when the
+    target device cannot hold the off-device bytes with margin. Only CUDA
+    devices are considered; CPU targets and CPU-resident inputs are no-ops.
+    """
+    if device is None or getattr(device, "type", "") != "cuda":
+        return 0
+    lists = [lst for lst in (active_inputs, fp_outputs) if isinstance(lst, list)]
+    off_device = [t for lst in lists for t in lst if torch.is_tensor(t) and t.device != device]
+    needed = sum(t.nbytes for t in off_device)
+    if needed == 0:
+        return 0
+    free, _total = torch.cuda.mem_get_info(device)
+    if needed + margin_bytes > free:
+        logger.info(
+            "[tune-locality] keeping calibration state off %s: need %.1fGiB + margin, free %.1fGiB",
+            device,
+            needed / 2**30,
+            free / 2**30,
+        )
+        return 0
+    t0 = time.perf_counter()
+    moved = 0
+    for lst in lists:
+        for i, t in enumerate(lst):
+            if torch.is_tensor(t) and t.device != device:
+                lst[i] = t.to(device)
+                moved += 1
+    logger.info(
+        "[tune-locality] re-homed %d calibration tensors (%.1fGiB) to %s in %.1fs",
+        moved,
+        needed / 2**30,
+        device,
+        time.perf_counter() - t0,
+    )
+    return moved
+
+
 def alt2_switch_iter(iters: int, recipe: str, iters2_env: int):
     """Iteration index (exclusive) at which the alt2 re-grid fires, or None.
 
@@ -476,6 +527,8 @@ class SignRoundQuantizer(BaseQuantizer):
         # Use quantized inputs if available and enabled
         active_inputs = q_inputs if (q_inputs is not None and self.enable_quanted_input) else fp_inputs
         active_inputs = _maybe_qoff_noise(active_inputs, block_ctx.block_index, self.enable_quanted_input)
+        _home = torch.device(device) if not isinstance(device, torch.device) else device
+        _rehome_calibration_state(active_inputs, fp_outputs, _home)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
@@ -652,8 +705,16 @@ class SignRoundQuantizer(BaseQuantizer):
             if total_loss < best_loss:
                 best_loss = total_loss
                 if not self.not_use_best_mse:
+                    # park the snapshot where it was produced when the pipeline
+                    # already caches on GPU: cross-device D2D snapshots cost
+                    # ~0.1s/iter on non-primary homes
+                    _snap_dev = (
+                        _home
+                        if getattr(self.compress_context.cache_device, "type", "") == "cuda" and _home.type == "cuda"
+                        else self.compress_context.cache_device
+                    )
                     with tune_stage(tune_prof, "snapshot"):
-                        best_params = collect_best_params(block, self.compress_context.cache_device)
+                        best_params = collect_best_params(block, _snap_dev)
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
                 best_params = collect_best_params(block, self.compress_context.cache_device)
