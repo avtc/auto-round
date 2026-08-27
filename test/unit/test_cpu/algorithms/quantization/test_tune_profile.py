@@ -139,3 +139,17 @@ def test_summary_reports_host_and_wall_consistently(caplog, monkeypatch):
     line = next(rec.message for rec in caplog.records if "[tune-profile]" in rec.message)
     assert "ms/iter" in line
     assert "iters=4" in line
+
+
+def test_log_summary_custom_prefix(caplog, monkeypatch):
+    monkeypatch.setenv("AR_TUNE_PROFILE", "1")
+    prof = make_tune_profiler()
+    with prof.stage("ref_collect"):
+        pass
+    ar_logger = _capture_autoround_logs(caplog)
+    try:
+        prof.log_summary(block_name="layers.9", iters_done=1, wall=0.2, prefix="compress-profile")
+    finally:
+        ar_logger.removeHandler(caplog.handler)
+    line = next(rec.message for rec in caplog.records if "compress-profile" in rec.message)
+    assert "ref_collect" in line and "layers.9" in line

@@ -508,15 +508,27 @@ class AlgorithmComposer:
         """
         block_forward_fn = self.block_forward
         _out_dev = _stream_out_device(block)
+        import time as _time
+
+        from auto_round.utils.tune_profile import make_tune_profiler
+        from auto_round.utils.tune_profile import stage as _prof_stage
+
+        _prof_dev = _out_dev
+        if _prof_dev is None:
+            _p = next(block.parameters(), None)
+            _prof_dev = _p.device if _p is not None else torch.device("cpu")
+        _prof = make_tune_profiler(_prof_dev)
+        _prof_t0 = _time.perf_counter() if _prof is not None else None
 
         # ── Step 0: Layer-wise rotation (before any reference/calibration) ────
         # Rotates this block's weights and installs online hooks so all downstream
         # calibration and reference collection operate on the rotated block. No-op
         # unless layer-wise rotation is active.
-        self._run_block_ready_transforms(block, block_ctx)
+        with _prof_stage(_prof, "ready"):
+            self._run_block_ready_transforms(block, block_ctx)
 
         # ── Step 1: Preprocessor calibration (e.g. AWQ activation stats) ──────
-        with torch.no_grad():
+        with _prof_stage(_prof, "pre_calib"), torch.no_grad():
             pre_hooks = []
             for pre in self.preprocessors:
                 pre_hooks.extend(pre.register_fp_input_forward_hooks(block))
@@ -537,14 +549,15 @@ class AlgorithmComposer:
                 h.remove()
 
         # ── Step 2: pre_quantize_block (stats consolidation + weight transforms) ──
-        for pre in self.preprocessors:
-            pre.pre_quantize_block(block_ctx)
+        with _prof_stage(_prof, "pre_quantize"):
+            for pre in self.preprocessors:
+                pre.pre_quantize_block(block_ctx)
 
         reference_output = None
         reference_next_input = None
         # ── Step 3: Quantizer calibration (act_max, imatrix, etc.) ─────────────
         if fp_inputs is not None:
-            with torch.no_grad():
+            with _prof_stage(_prof, "ref_collect"), torch.no_grad():
                 quant_hooks = self._get_fp_act_hooks(block)
                 reference_output = block_forward_fn(block, fp_inputs, input_others, cache_device=_out_dev)
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
@@ -583,65 +596,74 @@ class AlgorithmComposer:
         # When quantized input is available from the previous block, use it;
         # otherwise fall back to the FP input.
         effective_input = q_inputs if q_inputs is not None else fp_inputs
-        self.block_quantizer.quantize_block(
-            block,
-            effective_input,
-            input_others,
-            reference_output,
-            q_inputs,
-            block_ctx,
-            input_ids=input_ids,
-        )
+        with _prof_stage(_prof, "tune"):
+            self.block_quantizer.quantize_block(
+                block,
+                effective_input,
+                input_others,
+                reference_output,
+                q_inputs,
+                block_ctx,
+                input_ids=input_ids,
+            )
 
-        # ── Step 5: post_quantize_block ─────────────────────────────────────────
-        for pre in self.preprocessors:
-            pre.post_quantize_block(block_ctx)
-
+        # ── Steps 5+6: post_quantize_block + collect quantized-block outputs ──
+        with _prof_stage(_prof, "post"):
+            for pre in self.preprocessors:
+                pre.post_quantize_block(block_ctx)
         # ── Step 6: Collect quantized-block outputs for the next block ──────────
-        from auto_round import envs as _envs
+        with _prof_stage(_prof, "post_collect"):
+            from auto_round import envs as _envs
 
-        if _envs.AR_QOFF_NOISE_STATS and len(block_ctx.block_names) > 1:
-            raise ValueError(
-                "AR_QOFF_NOISE_STATS collects one stats file per compress_block call; with "
-                f"nblocks={len(block_ctx.block_names)} a call covers several blocks and the "
-                "per-block file contract breaks. Rerun with nblocks=1."
-            )
-        if _envs.AR_BIAS_CORRECT and _envs.AR_BLOCK_PARALLEL_WORKER:
-            raise ValueError(
-                "AR_BIAS_CORRECT mutates module biases, which are not part of the worker result files -- "
-                "the correction would be silently lost. It is a serial/streaming-only pass."
-            )
-        if self.block_quantizer.enable_quanted_input:
-            with torch.no_grad():
-                new_q_input = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
-                new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
-            if reference_next_input is not None:
-                # stats BEFORE bias correction: the correction absorbs the
-                # mean by construction, so post-correction stats would be ~0
-                if _envs.AR_QOFF_NOISE_STATS:
-                    _collect_qoff_noise_stats_from_outputs(
-                        reference_next_input,
-                        new_q_input,
-                        f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
-                    )
-                if _envs.AR_BIAS_CORRECT:
-                    _apply_block_bias_correction(block, reference_next_input, new_q_input)
-        else:
-            new_q_input = None
-            _stats_y_q = None
-            if reference_next_input is not None:
-                if _envs.AR_QOFF_NOISE_STATS or _envs.AR_BIAS_CORRECT:
-                    with torch.no_grad():
-                        _stats_y_q = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
-                if _envs.AR_QOFF_NOISE_STATS:
-                    _collect_qoff_noise_stats_from_outputs(
-                        reference_next_input,
-                        _stats_y_q,
-                        f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
-                    )
-                if _envs.AR_BIAS_CORRECT:
-                    _apply_block_bias_correction(block, reference_next_input, _stats_y_q)
+            if _envs.AR_QOFF_NOISE_STATS and len(block_ctx.block_names) > 1:
+                raise ValueError(
+                    "AR_QOFF_NOISE_STATS collects one stats file per compress_block call; with "
+                    f"nblocks={len(block_ctx.block_names)} a call covers several blocks and the "
+                    "per-block file contract breaks. Rerun with nblocks=1."
+                )
+            if _envs.AR_BIAS_CORRECT and _envs.AR_BLOCK_PARALLEL_WORKER:
+                raise ValueError(
+                    "AR_BIAS_CORRECT mutates module biases, which are not part of the worker result files -- "
+                    "the correction would be silently lost. It is a serial/streaming-only pass."
+                )
+            if self.block_quantizer.enable_quanted_input:
+                with torch.no_grad():
+                    new_q_input = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
+                    new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
+                if reference_next_input is not None:
+                    # stats BEFORE bias correction: the correction absorbs the
+                    # mean by construction, so post-correction stats would be ~0
+                    if _envs.AR_QOFF_NOISE_STATS:
+                        _collect_qoff_noise_stats_from_outputs(
+                            reference_next_input,
+                            new_q_input,
+                            f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
+                        )
+                    if _envs.AR_BIAS_CORRECT:
+                        _apply_block_bias_correction(block, reference_next_input, new_q_input)
+            else:
+                new_q_input = None
+                _stats_y_q = None
+                if reference_next_input is not None:
+                    if _envs.AR_QOFF_NOISE_STATS or _envs.AR_BIAS_CORRECT:
+                        with torch.no_grad():
+                            _stats_y_q = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
+                    if _envs.AR_QOFF_NOISE_STATS:
+                        _collect_qoff_noise_stats_from_outputs(
+                            reference_next_input,
+                            _stats_y_q,
+                            f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
+                        )
+                    if _envs.AR_BIAS_CORRECT:
+                        _apply_block_bias_correction(block, reference_next_input, _stats_y_q)
 
+        if _prof is not None:
+            _prof.log_summary(
+                block_name=getattr(block_ctx, "block_name", ""),
+                iters_done=1,
+                wall=_time.perf_counter() - _prof_t0,
+                prefix="compress-profile",
+            )
         return new_q_input, reference_next_input
 
     def compress_layer_outside_block(

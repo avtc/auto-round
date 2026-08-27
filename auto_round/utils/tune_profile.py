@@ -103,13 +103,16 @@ class TuneProfiler:
             f"cache_device={cache_device} nsamples={nsamples} " + " ".join(parts)
         )
 
-    def log_summary(self, block_name: str, iters_done: int, wall: float) -> None:
+    def log_summary(self, block_name: str, iters_done: int, wall: float, prefix: str = "tune-profile") -> None:
         """Emit a single greppable INFO line with the per-block stage table."""
         per_iter = 1000.0 / iters_done if iters_done > 0 else 0.0  # s -> ms/iter
         host_ms = {name: self.host[name] * per_iter for name in sorted(self.host)}
-        known = sum(host_ms.get(name, 0.0) for name in _STAGE_ORDER)
+        # stable ordering: known tune-loop stages first, then any extra stages
+        # recorded by other callers (e.g. compress_block phases) alphabetically
+        ordered = [n for n in _STAGE_ORDER if n in host_ms] + sorted(set(host_ms) - set(_STAGE_ORDER))
+        known = sum(host_ms.get(name, 0.0) for name in ordered)
         other_ms = max(0.0, wall * 1000.0 / max(iters_done, 1) - known)
-        host_parts = " ".join(f"{name}={host_ms[name]:.1f}" for name in _STAGE_ORDER if name in host_ms)
+        host_parts = " ".join(f"{name}={host_ms[name]:.1f}" for name in ordered)
         gpu = self.gpu_totals()
         gpu_parts = ""
         bubble = ""
@@ -118,7 +121,7 @@ class TuneProfiler:
             gpu_parts = " | gpu ms/iter: " + " ".join(f"{name}={gpu_ms[name]:.1f}" for name in gpu_ms)
             bubble = f" | bubble={wall * 1000.0 / max(iters_done, 1) - sum(gpu_ms.values()):.1f}"
         logger.info(
-            f"[tune-profile] block={block_name} iters={iters_done} wall={wall:.1f}s "
+            f"[{prefix}] block={block_name} iters={iters_done} wall={wall:.1f}s "
             f"({wall * 1000.0 / max(iters_done, 1):.1f} ms/iter) | host ms/iter: {host_parts} "
             f"other={other_ms:.1f}{gpu_parts}{bubble}"
         )
