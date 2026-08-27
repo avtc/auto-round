@@ -315,6 +315,46 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
         buf.mul_(scale)
 
 
+# hook-written statistics that are safe to merge across mirror copies:
+# associative reductions reproduce the serial totals up to fp32 summation order
+_MERGEABLE_STATS = {
+    "imatrix": "sum",  # module.imatrix += sum(x^2) per shard
+    "act_max": "max",  # element-wise running max
+}
+
+
+def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -> None:
+    """Fold hook-written statistics from mirror copies back into the home.
+
+    Each mirror forwarded a disjoint sample shard; its hooks accumulated
+    into mirror-local module attrs which die with the mirror. The stats we
+    know how to merge (see ``_MERGEABLE_STATS``) are associative, so the
+    merged home totals equal the serial pass's totals up to fp32 summation
+    order (~1e-7 relative) -- far below any quantization-relevant scale.
+    """
+    home_mods = dict(home.named_modules())
+    for mirror in mirrors:
+        if mirror is None:
+            continue
+        for name, m_mod in mirror.named_modules():
+            h_mod = home_mods.get(name)
+            if h_mod is None:
+                continue
+            for attr, how in _MERGEABLE_STATS.items():
+                m_val = getattr(m_mod, attr, None)
+                if not torch.is_tensor(m_val):
+                    continue
+                h_val = getattr(h_mod, attr, None)
+                if h_val is None:
+                    setattr(h_mod, attr, m_val.to(h_mod.weight.device if hasattr(h_mod, "weight") else m_val.device))
+                    continue
+                m_val = m_val.to(h_val.device, h_val.dtype)
+                if how == "sum":
+                    setattr(h_mod, attr, h_val + m_val)
+                else:  # max
+                    setattr(h_mod, attr, torch.max(h_val, m_val))
+
+
 def sharded_nograd_forward(
     runner,
     block,
@@ -323,6 +363,7 @@ def sharded_nograd_forward(
     out_device: torch.device,
     devices: List[torch.device],
     sample_count: Optional[int] = None,
+    merge_stats: bool = False,
 ):
     """Parallelize a no-grad collection forward across ``devices``.
 
@@ -379,6 +420,8 @@ def sharded_nograd_forward(
     # shard's rows); the serial text path leaves it unset so callers fall back
     # to the returned list -- clear the residue to keep that contract.
     runner.last_output_dict = None
+    if merge_stats:
+        _merge_mirror_stats(block, mirrors)
     mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
     reps.clear()
     return pieces

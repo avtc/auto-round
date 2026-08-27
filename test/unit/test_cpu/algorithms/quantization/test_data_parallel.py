@@ -419,3 +419,67 @@ class TestHookGate:
 
         out = composer._collect_forward(object(), [1, 2], {}, torch.device("cpu"), allow_shard=False)
         assert out == ["serial"]
+
+
+class TestMirrorStatMerge:
+    def _hooked_block(self):
+        import torch.nn as nn
+
+        block = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+
+        def collect_imatrix(module, inputs, output):
+            x = inputs[0].reshape(-1, inputs[0].shape[-1]).float()
+            sq = torch.sum(x.pow(2), dim=0)
+            if hasattr(module, "imatrix"):
+                module.imatrix += sq
+            else:
+                module.imatrix = sq
+
+        for m in block:
+            m.register_forward_hook(collect_imatrix)
+        return block
+
+    def test_merged_imatrix_equals_serial(self):
+        """home-shard + mirror-shard + merge == serial all-samples total.
+
+        Exercises the merge directly (on CPU all devices collapse onto the
+        home block, whose threaded hook accumulation would race -- production
+        always assigns distinct CUDA devices per replica).
+        """
+        import copy as _copy
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _merge_mirror_stats
+
+        torch.manual_seed(0)
+        inputs = [torch.randn(1, 3, 4) for _ in range(4)]
+
+        block0 = self._hooked_block()
+        serial_block = _copy.deepcopy(block0)
+        with torch.no_grad():
+            for x in inputs:
+                serial_block(x)
+        serial = {n: getattr(m, "imatrix").clone() for n, m in serial_block.named_modules() if hasattr(m, "imatrix")}
+
+        home = block0  # identical weights: module-1 inputs depend on module-0 weights
+        mirror = _copy.deepcopy(home)  # hooks copied; mirror accumulates its own shard
+        with torch.no_grad():
+            for x in inputs[:2]:
+                home(x)
+            for x in inputs[2:]:
+                mirror(x)
+        _merge_mirror_stats(home, [mirror])
+        for n, m in home.named_modules():
+            if hasattr(m, "imatrix"):
+                torch.testing.assert_close(m.imatrix, serial[n], rtol=1e-5, atol=1e-5)
+
+    def test_act_max_merged_as_max(self):
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _merge_mirror_stats
+
+        home = nn.Linear(2, 2)
+        home.act_max = torch.tensor([1.0, 5.0])
+        mirror = nn.Linear(2, 2)
+        mirror.act_max = torch.tensor([3.0, 2.0])
+        _merge_mirror_stats(home, [mirror])
+        assert home.act_max.tolist() == [3.0, 5.0]

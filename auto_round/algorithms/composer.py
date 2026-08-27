@@ -543,19 +543,33 @@ class AlgorithmComposer:
             return None
         return plan.devices if plan.world > 1 else None
 
+    @staticmethod
+    def _merge_stats_on() -> bool:
+        from auto_round import envs as _envs
+
+        return bool(getattr(_envs, "AR_TUNE_DDP_MERGE_STATS", False))
+
     def _collect_forward(self, block, inputs, input_others, out_dev, allow_shard: bool = True):
         """Collection forward: sharded across DDP mirrors when eligible.
 
         ``allow_shard=False`` forces the serial path: passes that carry
         forward hooks (act_max / fp-input / q-input stats) must not shard --
         hook writes land on the ephemeral mirror copies and are freed with
-        them, silently dropping that shard's statistics.
+        them, silently dropping that shard's statistics. Exception:
+        AR_TUNE_DDP_MERGE_STATS=1 folds the mergeable stats (imatrix, act_max)
+        from the mirrors back into the home, so hook passes may shard.
         """
         if self._coll_devs is None or not allow_shard:
             return self.block_forward(block, inputs, input_others, cache_device=out_dev)
+        from auto_round import envs as _envs
         from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
 
-        return sharded_nograd_forward(self.block_forward, block, inputs, input_others, out_dev, self._coll_devs)
+        # hook-carrying passes may shard ONLY under the merge opt-in: mirror-side
+        # hook stats are folded back into the home by _merge_mirror_stats
+        _merge = bool(getattr(_envs, "AR_TUNE_DDP_MERGE_STATS", False))
+        return sharded_nograd_forward(
+            self.block_forward, block, inputs, input_others, out_dev, self._coll_devs, merge_stats=_merge
+        )
 
     # ── Per-block pipeline orchestration ─────────────────────────────────────
 
@@ -653,7 +667,7 @@ class AlgorithmComposer:
             with _prof_stage(_prof, "ref_collect"), torch.no_grad():
                 quant_hooks = self._get_fp_act_hooks(block)
                 reference_output = self._collect_forward(
-                    block, fp_inputs, input_others, _out_dev, allow_shard=not quant_hooks
+                    block, fp_inputs, input_others, _out_dev, allow_shard=not quant_hooks or self._merge_stats_on()
                 )
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
@@ -667,7 +681,7 @@ class AlgorithmComposer:
                             q_inputs if q_inputs is not None else fp_inputs,
                             input_others,
                             _out_dev,
-                            allow_shard=not q_hooks,
+                            allow_shard=not q_hooks or self._merge_stats_on(),
                         )
                         for h in q_hooks:
                             h.remove()
