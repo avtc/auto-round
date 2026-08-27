@@ -528,7 +528,10 @@ class SignRoundQuantizer(BaseQuantizer):
         active_inputs = q_inputs if (q_inputs is not None and self.enable_quanted_input) else fp_inputs
         active_inputs = _maybe_qoff_noise(active_inputs, block_ctx.block_index, self.enable_quanted_input)
         _home = torch.device(device) if not isinstance(device, torch.device) else device
-        _rehome_calibration_state(active_inputs, fp_outputs, _home)
+        # calibration-state placement is DEFERRED: under an engaged DDP plan the
+        # pools are scattered across the plan devices (shard-local reads); the
+        # gather-to-home re-home runs only on the serial path
+        _rehome_deferred = (active_inputs, fp_outputs, _home)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
@@ -650,6 +653,7 @@ class SignRoundQuantizer(BaseQuantizer):
         mirror_schedules = []
         params_per_replica = []
         _dp_world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
+        _dp_placed = False  # True once pools are distributed across the engaged plan
         _dp_eligible = (
             _dp_world > 1
             and self.iters > 0
@@ -693,6 +697,13 @@ class SignRoundQuantizer(BaseQuantizer):
                 mirror_footprint_bytes=_mirror_bytes,
             )
             if _plan.enabled and _plan.world & (_plan.world - 1) == 0:
+                from auto_round.algorithms.quantization.sign_round.data_parallel import distribute_pool
+
+                # distributed calibration pool: shard-local tune reads; replaces
+                # the serial gather-to-home re-home (each device takes 1/world)
+                distribute_pool(active_inputs, _plan.devices)
+                distribute_pool(fp_outputs, _plan.devices)
+                _dp_placed = True
                 _staged_src = getattr(block, "_stream_prefetch_source", None)
                 if _staged_src is not None:
                     _staged_src = _staged_src.unpack()
@@ -759,6 +770,8 @@ class SignRoundQuantizer(BaseQuantizer):
             elif _plan.enabled:
                 logger.info("[tune-ddp] disabled: resolved world %d is not a power of two", _plan.world)
 
+        if not _dp_placed:  # serial path (or DDP ineligible): gather-to-home as before
+            _rehome_calibration_state(*_rehome_deferred)
         tune_prof = make_tune_profiler(device)
         _tune_wall_t0 = time.perf_counter() if tune_prof is not None else None
         if tune_prof is not None and tune_prof.debug:

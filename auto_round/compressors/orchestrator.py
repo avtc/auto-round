@@ -1720,6 +1720,18 @@ class CompressionOrchestrator(BaseOrchestrator):
                 logger.warning("[stream] stream_prefetch_devices='auto' ignored: no CUDA devices visible")
                 return None
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
+            # DDP without explicit groups: the plan is home + first devices in
+            # ascending visible order -- staging beyond that pool puts homes on
+            # devices whose groups displace others (rotating idle partners).
+            # Ping-pong groups keep the full rotation (both groups are active).
+            try:
+                _w = int(getattr(envs, "AR_TUNE_DDP_WORLD", 1) or 1)
+                _g = str(getattr(envs, "AR_TUNE_DDP_GROUPS", "") or "")
+            except Exception:
+                _w, _g = 1, ""
+            if _w > 1 and not _g and len(devices) > _w:
+                devices = devices[:_w]
+                logger.info("[stream] auto staging restricted to the first %d device(s): DDP world=%d", _w, _w)
             # The primary joins the rotation when its free VRAM comfortably
             # holds the LARGEST block (block sizes vary by layer type - GDN vs
             # full-attention vs first/last): parent working set + block + tuning
@@ -1901,8 +1913,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                             if primary in g:
                                 return [d for d in g if d != primary]
                         return []
-                    # single group = all devices: prefetch on the current group
-                    return [d for d in _all_cuda if d != primary]
+                    # no explicit groups: mirror the plan the block WILL get
+                    # (home + next devices in ascending visible order) -- staging
+                    # replicas on devices outside that plan can never be adopted
+                    rest = [d for d in _all_cuda if d != primary]
+                    return rest[: _ddp_world - 1]
 
             streamer.start_prefetch(
                 prefetch_names, depth=prefetch_depth, stage_devices=stage_devices, replica_of=_replica_of
