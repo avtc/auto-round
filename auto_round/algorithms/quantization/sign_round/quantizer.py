@@ -719,9 +719,10 @@ class SignRoundQuantizer(BaseQuantizer):
                 # Warm up every replica SERIALLY in the main thread: torch.compile
                 # materializes its per-device kernels lazily at first call, and
                 # compiling from several worker threads at once races in dynamo.
-                # The warm-up also validates each mirror end-to-end; on any
-                # failure DDP is dropped BEFORE the first real step (deterministic
-                # fallback to the exact serial path). Grads are discarded.
+                # The warm-up also validates each mirror end-to-end; a failure
+                # ABORTS the run (DDP was explicitly requested -- continuing
+                # serially would silently invalidate the configuration and any
+                # measurement against it). Grads are discarded.
                 try:
                     for r, rep in enumerate(replica_group.replicas):
                         _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
@@ -734,13 +735,15 @@ class SignRoundQuantizer(BaseQuantizer):
                             _loss_w.backward()
                     for _opt in [optimizer] + mirror_optimizers:
                         _opt.zero_grad()
-                except Exception as _warm_err:  # noqa: BLE001 - reported, then degrade
-                    logger.info("[tune-ddp] disabled: replica warm-up failed: %s", _warm_err)
+                except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
                     replica_group.teardown()
-                    replica_group = None
-                    mirror_optimizers = []
-                    mirror_schedules = []
-                    params_per_replica = []
+                    raise RuntimeError(
+                        "AR_TUNE_DDP_WORLD was requested but the replica warm-up failed -- "
+                        "DDP was explicitly engaged, so refusing to continue on the serial "
+                        "path (that would silently invalidate the requested configuration "
+                        "and any measurement against it). Fix the underlying failure or "
+                        "unset AR_TUNE_DDP_WORLD."
+                    ) from _warm_err
             elif _plan.enabled:
                 logger.info("[tune-ddp] disabled: resolved world %d is not a power of two", _plan.world)
 
