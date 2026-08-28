@@ -72,11 +72,22 @@ class TuneProfiler:
             self.counts[name] += 1
 
     def gpu_totals(self) -> DefaultDict[str, float]:
-        """Resolve deferred CUDA events; syncs once. Seconds per stage."""
+        """Resolve deferred CUDA events; syncs once. Seconds per stage.
+
+        Syncs EVERY CUDA device, not just the profiler's home: stage events
+        can be recorded on (or wait behind work enqueued to) mirror streams
+        -- e.g. the source-side casts of a reduced-precision gradient
+        transport -- and a home-only synchronize leaves those events
+        un-resolved, which elapsed_time treats as a hard error. A pair that
+        is somehow still pending is skipped rather than crashing the run.
+        """
         totals: DefaultDict[str, float] = defaultdict(float)
         if self._use_events and self._events:
-            torch.cuda.synchronize(self.device)
+            for _idx in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(_idx)
             for name, ev0, ev1 in self._events:
+                if not ev0.query() or not ev1.query():  # pragma: no cover - defensive
+                    continue
                 totals[name] += ev0.elapsed_time(ev1) / 1000.0  # ms -> s
         return totals
 
