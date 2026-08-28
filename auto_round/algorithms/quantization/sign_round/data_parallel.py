@@ -637,9 +637,11 @@ def _debug_flat_leak_probe(tag: str) -> None:
                 and obj.untyped_storage().nbytes() >= 64 * 2**20
             ):
                 hits.append(obj)
-                key = (str(obj.dtype).replace("torch.", ""), obj.numel())
+                # int() coerces SymInt/SymFloat (meta/fake tensors) to plain
+                # numbers; symbolic ones raise and are skipped by the guard
+                key = (str(obj.dtype).replace("torch.", ""), int(obj.numel()))
                 histogram[key] += 1
-                bytes_by_key[key] += obj.untyped_storage().nbytes()
+                bytes_by_key[key] += int(obj.untyped_storage().nbytes())
         except Exception:  # noqa: BLE001 - probe must never kill a run
             continue
     try:
@@ -656,7 +658,7 @@ def _debug_flat_leak_probe(tag: str) -> None:
         reserved,
         hist,
     )
-    hits.sort(key=lambda t: -t.untyped_storage().nbytes())
+    hits.sort(key=lambda t: -int(t.untyped_storage().nbytes()))
     for t in hits[:4]:
         names = []
         for r in gc.get_referrers(t)[:8]:
@@ -669,8 +671,8 @@ def _debug_flat_leak_probe(tag: str) -> None:
             tag,
             t.data_ptr(),
             t.dtype,
-            t.numel(),
-            t.untyped_storage().nbytes() / 2**30,
+            int(t.numel()),
+            int(t.untyped_storage().nbytes()) / 2**30,
             names,
         )
 
