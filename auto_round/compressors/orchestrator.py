@@ -1752,8 +1752,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     logger.info("[stream] bg pack %s: pack %.1fs", block_name, holder["pack"])
             except BaseException as e:  # noqa: BLE001 - re-raised at join
                 holder["exc"] = e
-            finally:
-                clear_memory()
+            # NOTE: deliberately NO clear_memory()/gc here: empty_cache +
+            # gc.collect() are process-wide and firing them from this thread
+            # while the main loop's CUDA kernels are in flight corrupted
+            # in-flight accesses on the server (async illegal-memory-access
+            # surfacing in an unrelated allocation). The join point clears.
 
         t = _threading.Thread(target=_worker, daemon=True, name=f"bg-pack-{block_name}")
         t.autoround_state = holder
@@ -1764,6 +1767,7 @@ class CompressionOrchestrator(BaseOrchestrator):
     def _join_bg_pack(thread) -> None:
         """Join a background pack pipeline, surfacing any worker failure."""
         thread.join()
+        clear_memory()  # single-threaded again: safe to release cached blocks
         holder = getattr(thread, "autoround_state", None) or {}
         exc = holder.get("exc")
         if exc is not None:

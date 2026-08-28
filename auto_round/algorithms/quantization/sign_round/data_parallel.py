@@ -519,6 +519,10 @@ def sharded_nograd_forward(
     return pieces
 
 
+_STAGED_MISS_LOGGED = False
+_MIRROR_PATH_LOGGED = False
+
+
 def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.device) -> None:
     """Make a ``torch.nn.parallel.replicate`` output safe to TUNE.
 
@@ -649,20 +653,36 @@ class ReplicaGroup:
         plain deepcopy paths on CPU or any replicate failure (mirror
         correctness > speed).
         """
+        global _STAGED_MISS_LOGGED, _MIRROR_PATH_LOGGED
         staged = None
         prefix = ""
         if staged_source is not None:
             streamer, prefix = staged_source
             try:
                 staged = streamer.staged_replica_tensors(prefix, dev)
-            except Exception:
-                staged = None
+            except Exception as e:  # noqa: BLE001 - fall back to replication
+                logger.debug("[tune-ddp] staged_replica_tensors(%s, %s) raised %r", prefix, dev, e)
+            if staged is None:
+                if not _STAGED_MISS_LOGGED:
+                    _STAGED_MISS_LOGGED = True
+                    status = getattr(streamer, "staged_replica_status", lambda _p: [])(prefix)
+                    logger.info(
+                        "[tune-ddp] staged-replica adoption miss for %s on %s "
+                        "(devices with complete replicas: %s); using %s instead",
+                        prefix,
+                        dev,
+                        status or "none",
+                        "deepcopy" if not _MIRROR_PATH_LOGGED else "mirror build",
+                    )
         adopt = bool(staged) and getattr(block, "_stream_weights_pristine", False)
         if dev.type == "cuda":
             try:
                 mirror = self._replicate_mirror(block, dev, staged if adopt else None, prefix)
                 if adopt:
                     self.adopted += 1
+                if not _MIRROR_PATH_LOGGED:
+                    _MIRROR_PATH_LOGGED = True
+                    logger.info("[tune-ddp] mirror path: replicate+repair engaged (first mirror on %s)", dev)
                 return mirror
             except Exception as e:  # noqa: BLE001 - deepcopy fallback below
                 logger.info("[tune-ddp] replicate mirror onto %s failed (%r); using deepcopy", dev, e)

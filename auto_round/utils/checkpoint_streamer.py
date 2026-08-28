@@ -440,6 +440,11 @@ class CheckpointStreamer:
                 self._prefetch_cpu_staged = max(0, self._prefetch_cpu_staged - 1)
             self._prefetch_cond.notify_all()
 
+    def staged_replica_status(self, prefix: str) -> list:
+        """Devices holding a COMPLETE staged replica of ``prefix`` (debug aid)."""
+        with self._prefetch_cond:
+            return [str(d) for (p, d) in self._prefetch_replica_ready if p == prefix]
+
     def release_replicas(self, prefix: str) -> None:
         """Free the staged replica copies of ``prefix`` on all devices.
 
