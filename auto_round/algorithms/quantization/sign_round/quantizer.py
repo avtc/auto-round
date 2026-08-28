@@ -878,6 +878,31 @@ class SignRoundQuantizer(BaseQuantizer):
         _alt2_switch = alt2_switch_iter(self.iters, _envs.AR_TUNE_RECIPE, _envs.AR_ALT2_ITERS2)
         _alt2_regridded = False
 
+        # delayed-loss mode (DDP only): read loss(i).item() at iteration i+1 so
+        # the drain overlaps the next iteration's already-enqueued GPU work
+        # instead of stalling the pipeline between iterations; best-params
+        # selection semantics are unchanged (same (loss, pre-step params)
+        # pairs, same strict-less rule -- resolved one iteration later)
+        _delayed = replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and self.dynamic_max_gap <= 0
+        if replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and 0 < self.dynamic_max_gap:
+            logger.warning(
+                "[tune-ddp] dynamic_max_gap is set: keeping the immediate loss read "
+                "(the early-stop decision needs the current loss in-loop)"
+            )
+        _tracker = None
+        _init_done = False
+        _snap_dev = None
+        if _delayed:
+            from auto_round.algorithms.quantization.sign_round.data_parallel import _DelayedBestTracker
+
+            _tracker = _DelayedBestTracker()
+            # same parking policy as the legacy best-params snapshot below
+            _snap_dev = (
+                _home
+                if getattr(self.compress_context.cache_device, "type", "") == "cuda" and _home.type == "cuda"
+                else self.compress_context.cache_device
+            )
+
         for i in range(self.iters):
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
                 for n, m in block.named_modules():
@@ -933,8 +958,27 @@ class SignRoundQuantizer(BaseQuantizer):
                 # asynchronous, so that drain-wait surfaces HERE, not in the
                 # allreduce stage -- keep it in its own bucket so "other" stays
                 # honest.
-                with tune_stage(tune_prof, "loss_sync"):
-                    total_loss = sum(l.item() for l in _losses if l is not None) / _world
+                if _delayed:
+                    # resolve(i-1): the .item() drain now overlaps THIS
+                    # iteration's enqueued forward/backward instead of the
+                    # previous one's tail; then park iter i pre-step
+                    with tune_stage(tune_prof, "loss_sync"):
+                        _resolved = _tracker.resolve()
+                    if _resolved is not None:
+                        total_loss = _resolved / _world
+                        if not _init_done:
+                            init_loss = total_loss
+                            _init_done = True
+                        if _tracker.last_promoted:
+                            best_loss = _tracker.best_loss
+                            last_best_iter = _tracker.best_iter
+                    with tune_stage(tune_prof, "snapshot"):
+                        _tracker.stage(
+                            None if self.not_use_best_mse else collect_best_params(block, _snap_dev), _losses, i
+                        )
+                else:
+                    with tune_stage(tune_prof, "loss_sync"):
+                        total_loss = sum(l.item() for l in _losses if l is not None) / _world
             else:
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
@@ -972,29 +1016,34 @@ class SignRoundQuantizer(BaseQuantizer):
                         # clear memory to avoid OOM due to memory fragmentation
                         clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
 
-            if i == 0:
-                init_loss = total_loss
+            if not _delayed:
+                if i == 0:
+                    init_loss = total_loss
 
-            if total_loss < best_loss:
-                best_loss = total_loss
+                if total_loss < best_loss:
+                    best_loss = total_loss
+                    if not self.not_use_best_mse:
+                        # park the snapshot where it was produced when the pipeline
+                        # already caches on GPU: cross-device D2D snapshots cost
+                        # ~0.1s/iter on non-primary homes
+                        _snap_dev = (
+                            _home
+                            if getattr(self.compress_context.cache_device, "type", "") == "cuda"
+                            and _home.type == "cuda"
+                            else self.compress_context.cache_device
+                        )
+                        with tune_stage(tune_prof, "snapshot"):
+                            best_params = collect_best_params(block, _snap_dev)
+                        last_best_iter = i
+                if self.not_use_best_mse and i == self.iters - 1:
+                    best_params = collect_best_params(block, self.compress_context.cache_device)
+
                 if not self.not_use_best_mse:
-                    # park the snapshot where it was produced when the pipeline
-                    # already caches on GPU: cross-device D2D snapshots cost
-                    # ~0.1s/iter on non-primary homes
-                    _snap_dev = (
-                        _home
-                        if getattr(self.compress_context.cache_device, "type", "") == "cuda" and _home.type == "cuda"
-                        else self.compress_context.cache_device
-                    )
-                    with tune_stage(tune_prof, "snapshot"):
-                        best_params = collect_best_params(block, _snap_dev)
-                    last_best_iter = i
-            if self.not_use_best_mse and i == self.iters - 1:
+                    if 0 < self.dynamic_max_gap <= i - last_best_iter:
+                        break
+            elif _delayed and self.not_use_best_mse and i == self.iters - 1:
+                # loss-delay-only mode keeps the single last-iter collection
                 best_params = collect_best_params(block, self.compress_context.cache_device)
-
-            if not self.not_use_best_mse:
-                if 0 < self.dynamic_max_gap <= i - last_best_iter:
-                    break
             if replica_group is not None:
                 with tune_stage(tune_prof, "step"):
                     self._step(scaler, optimizer, lr_schedule)
@@ -1034,9 +1083,25 @@ class SignRoundQuantizer(BaseQuantizer):
                 last_best_iter = i
                 optimizer.state = defaultdict(dict) if hasattr(optimizer.state, "default_factory") else {}
                 init_loss = None
+                if _delayed:
+                    _tracker.reset()  # pending iteration + ring belong to the old grid
+                    _init_done = True  # keep init_loss None (iter 0 was on the old grid)
 
         if replica_group is not None:
             replica_group.teardown()
+        if _delayed:
+            # drain the final iteration: resolve, promote if best, publish
+            _resolved = _tracker.resolve()
+            if _resolved is not None:
+                total_loss = _resolved / _world
+                if not _init_done:
+                    init_loss = total_loss
+                    _init_done = True
+                if _tracker.last_promoted:
+                    best_loss = _tracker.best_loss
+                    last_best_iter = _tracker.best_iter
+            if not self.not_use_best_mse:
+                best_params = _tracker.best_params or {}
         last_loss = total_loss
         if tune_prof is not None:
             tune_prof.log_summary(

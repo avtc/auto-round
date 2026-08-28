@@ -20,6 +20,7 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     DDPPlan,
     ReplicaGroup,
     ReplicaThreadPool,
+    _DelayedBestTracker,
     _param_grad_buffers,
     _write_back_grads,
     halving_doubling_allreduce,
@@ -391,6 +392,94 @@ class TestReplicaThreadPool:
         with pytest.raises(ValueError, match="wrong count"):
             pool.run([lambda: None])  # mismatched length is refused
         pool.shutdown()
+
+
+class TestDelayedBestTracker:
+    """Ring + delayed-read selection must match immediate selection exactly.
+
+    The tracker defers loss(i).item() to iteration i+1 (host pipelining);
+    these tests pin the SELECTION contract: same argmin, same strict-less
+    tie rule, same promoted snapshot values as an immediate reference.
+    """
+
+    @staticmethod
+    def _snap(tag):
+        # nested dict mirroring collect_best_params shape, value-tagged
+        return {"layers.0.mlp": {"v": torch.full((4,), float(tag))}}
+
+    def _run(self, tracker, losses, track=True):
+        for i, v in enumerate(losses):
+            tracker.stage(self._snap(i) if track else None, [torch.tensor(float(v), dtype=torch.float64)], i)
+            tracker.resolve()
+
+    def test_selection_matches_immediate_reference(self):
+        sequences = [
+            [3.0, 2.0, 1.0],  # decreasing
+            [1.0, 2.0, 3.0],  # min at iter 0
+            [2.0, 2.0, 2.0],  # all ties -> first wins (strict less)
+            [5.0, 4.0, 5.0, 1.0, 2.0],  # late min
+            [3.0, 2.0, 1.0, 0.5],  # min at last iter
+            [7.0, 3.0, 3.0, 5.0, 9.0, 2.9],  # tie then near-tie
+        ]
+        for losses in sequences:
+            ref_loss, ref_iter = min((v, i) for i, v in enumerate(losses))
+            tr = _DelayedBestTracker()
+            self._run(tr, losses)
+            assert tr.best_loss == ref_loss, losses
+            assert tr.best_iter == ref_iter, losses
+            won = tr.best_params["layers.0.mlp"]["v"]
+            assert torch.equal(won, torch.full((4,), float(ref_iter))), losses
+
+    def test_pending_required_before_resolve(self):
+        tr = _DelayedBestTracker()
+        assert tr.resolve() is None  # nothing staged yet
+        tr.stage(self._snap(0), [torch.tensor(1.0)], 0)
+        assert tr.resolve() == 1.0
+        assert tr.resolve() is None  # pending consumed
+
+    def test_unresolved_loss_value_is_exact(self):
+        # resolve returns the raw sum; caller applies its own scaling
+        tr = _DelayedBestTracker()
+        tr.stage(None, [torch.tensor(1.5), torch.tensor(2.5)], 3)
+        assert tr.resolve() == 4.0
+        assert tr.best_loss is None  # None snapshot never promotes
+        assert tr.best_params is None
+        assert tr.last_promoted is False
+
+    def test_last_promoted_flag_tracks_promotions(self):
+        tr = _DelayedBestTracker()
+        tr.stage(self._snap(0), [torch.tensor(5.0, dtype=torch.float64)], 0)
+        assert tr.resolve() == 5.0 and tr.last_promoted is True  # first stage promotes
+        tr.stage(self._snap(1), [torch.tensor(4.0, dtype=torch.float64)], 1)
+        assert tr.resolve() == 4.0 and tr.last_promoted is True
+        tr.stage(self._snap(2), [torch.tensor(6.0, dtype=torch.float64)], 2)
+        assert tr.resolve() == 6.0 and tr.last_promoted is False  # no improvement
+
+    def test_copy_on_reuse_preserves_best(self):
+        tr = _DelayedBestTracker()
+        losses = [5.0, 1.0, 4.0, 3.0, 2.0]  # best at iter 1, never improved
+        self._run(tr, losses)
+        assert tr.best_iter == 1
+        # after the wrap (iter 3 reuses slot 1) the promoted snapshot must
+        # still hold the iter-1 values
+        assert torch.equal(tr.best_params["layers.0.mlp"]["v"], torch.full((4,), 1.0))
+
+    def test_reset_clears_everything(self):
+        tr = _DelayedBestTracker()
+        self._run(tr, [3.0, 2.0])
+        tr.reset()
+        assert tr.best_loss is None and tr.best_params is None and tr.best_iter is None
+        assert tr.resolve() is None  # pending dropped too
+        # fresh selection after reset (alt2 re-grid semantics)
+        self._run(tr, [9.0, 8.0])
+        assert tr.best_loss == 8.0 and tr.best_iter == 1
+
+    def test_delayed_env_gate_default_and_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        assert envs.AR_TUNE_DDP_DELAYED_LOSS is True
+        monkeypatch.setattr(envs, "AR_TUNE_DDP_DELAYED_LOSS", False)
+        assert envs.AR_TUNE_DDP_DELAYED_LOSS is False
 
 
 class TestRunThreaded:

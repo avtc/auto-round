@@ -1095,6 +1095,74 @@ class ReplicaThreadPool:
             t.join(timeout=30)
 
 
+class _DelayedBestTracker:
+    """Delayed-loss best-params selection for the DDP tune loop.
+
+    The per-iteration host wait on ``loss.item()`` drains the whole GPU
+    chain of the iteration that just ran; deferring the read to the next
+    iteration overlaps that drain with the freshly enqueued forward instead
+    of stalling the pipeline between iterations. Selection semantics are
+    IDENTICAL to immediate selection -- the same (loss, pre-step params)
+    pairs are compared with the same strict-less rule; the comparison and
+    the ``.item()`` read simply happen one iteration later on the host.
+
+    Snapshots alternate between two slots. ``resolve()`` promotes the
+    resolved slot's snapshot by IDENTITY; when the alternation is about to
+    overwrite the still-best slot, that snapshot is first cloned out
+    (device-local copy of the nested dict) -- zero copies while improvements
+    keep arriving.
+    """
+
+    def __init__(self) -> None:
+        self._slots: List[Optional[dict]] = [None, None]
+        self._pending: Optional[Tuple[int, Sequence, int]] = None  # (slot, losses, iter)
+        self._next_slot = 0
+        self.best_loss: Optional[float] = None
+        self.best_params: Optional[dict] = None
+        self.best_iter: Optional[int] = None
+        self.last_promoted = False
+
+    def reset(self) -> None:
+        """Drop pending iteration, ring slots, and promotion (grid re-swap)."""
+        self.__init__()
+
+    @staticmethod
+    def _copy_snapshot(snapshot: dict) -> dict:
+        return {
+            mod: {key: (val.clone() if torch.is_tensor(val) else val) for key, val in entry.items()}
+            for mod, entry in snapshot.items()
+        }
+
+    def stage(self, snapshot: Optional[dict], losses: Sequence, iter_index: int) -> None:
+        """Park iteration ``iter_index``'s pre-step snapshot and loss tensors."""
+        slot = self._next_slot % 2
+        self._next_slot += 1
+        if self.best_params is not None and self._slots[slot] is self.best_params:
+            self.best_params = self._copy_snapshot(self.best_params)
+        self._slots[slot] = snapshot
+        self._pending = (slot, losses, iter_index)
+
+    def resolve(self) -> Optional[float]:
+        """Drain the parked iteration: return its loss, promote if best.
+
+        Returns ``None`` when nothing is pending (loop start / post-drain).
+        ``snapshot=None`` iterations (loss-delay-only mode) never promote.
+        """
+        if self._pending is None:
+            return None
+        slot, losses, iter_index = self._pending
+        self._pending = None
+        self.last_promoted = False
+        loss = float(sum(l.item() for l in losses if l is not None))
+        snapshot = self._slots[slot]
+        if snapshot is not None and (self.best_loss is None or loss < self.best_loss):
+            self.best_loss = loss
+            self.best_params = snapshot
+            self.best_iter = iter_index
+            self.last_promoted = True
+        return loss
+
+
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
