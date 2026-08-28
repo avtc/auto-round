@@ -371,6 +371,18 @@ class TestReplicaThreadPool:
             run_threaded_spawn([lambda: ran.append(0), boom, lambda: ran.append(2)])
         assert sorted(ran) == [0, 2]
 
+    def test_pool_width_matches_world_not_first_call(self):
+        group = self._block_group(4)
+        # a narrower first call must not pin the pool to the wrong size:
+        # it falls back to spawn, and the pool (when created) is world-wide
+        ran = []
+        group.run_threaded([lambda: ran.append(0)])  # width 1 < world 4
+        assert ran == [0]
+        group.run_threaded([lambda i=r: ran.append(i) for r in range(4)])
+        assert sorted(ran) == [0, 0, 1, 2, 3]
+        assert group._pool is not None and group._pool.n == 4
+        group.teardown()
+
     def test_pool_class_run_and_shutdown(self):
         pool = ReplicaThreadPool(2)
         order = []

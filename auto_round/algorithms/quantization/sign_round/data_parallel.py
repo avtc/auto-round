@@ -1484,7 +1484,10 @@ class ReplicaGroup:
             from auto_round import envs
 
             if envs.AR_TUNE_DDP_THREAD_POOL:
-                self._pool = pool = ReplicaThreadPool(len(fns))
+                # sized by the replica width, not the first call's fn count:
+                # narrower callers (e.g. a padded-in-later stage) must not
+                # permanently pin the pool to a wrong size
+                self._pool = pool = ReplicaThreadPool(getattr(self, "world", len(fns)))
         if pool is not None and len(fns) == pool.n:
             pool.run(fns)
         else:

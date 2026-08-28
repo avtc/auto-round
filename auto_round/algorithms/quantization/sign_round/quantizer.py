@@ -1004,8 +1004,13 @@ class SignRoundQuantizer(BaseQuantizer):
                         opt.zero_grad()
                         sched.step()
 
+                    # mirror optimizers exclude the HOME replica (its step ran
+                    # serially above) -- pad with a no-op home slot so the
+                    # fns width matches the replica worker pool (a narrower
+                    # list would silently fall back to spawn-per-call)
                     replica_group.run_threaded(
-                        [
+                        [lambda: None]
+                        + [
                             lambda oo=opt, ss=sch: _mirror_step(oo, ss)
                             for opt, sch in zip(mirror_optimizers, mirror_schedules)
                         ]
