@@ -188,6 +188,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is set (its early-stop decision needs the current loss in-loop). Set
     # to 0 to restore the immediate read.
     "AR_TUNE_DDP_DELAYED_LOSS": lambda: os.getenv("AR_TUNE_DDP_DELAYED_LOSS", "1").lower() in ("1", "true", "yes"),
+    # Flat v-param storage for the DDP tune loop (default ON): rebuild every
+    # wrapper tuning parameter as a view of per-(kind, lr) group parameters
+    # spanning one fp32 storage, so autograd accumulates into contiguous
+    # group grads and the per-iteration gradient gather/scatter collapses to
+    # a zero-copy strided view (numerics unchanged: same values, same order,
+    # same optimizer math). Built only when DDP engages; any layout mismatch
+    # (non-fp32 / mixed-device params) falls back to the legacy per-param
+    # storage. Set to 0 to restore per-parameter leaf storage.
+    "AR_TUNE_DDP_FLAT_VPARAMS": lambda: os.getenv("AR_TUNE_DDP_FLAT_VPARAMS", "1").lower() in ("1", "true", "yes"),
     "AR_TUNE_COLL_HOOK_SHARDS": lambda: (
         lambda v: (
             int(v)

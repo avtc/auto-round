@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for single-process data parallelism of the SignRound tuning loop."""
 
+import copy
+
 import pytest
 import torch
 
@@ -21,8 +23,11 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     ReplicaGroup,
     ReplicaThreadPool,
     _DelayedBestTracker,
+    _flat_grad_buffer,
     _param_grad_buffers,
+    _rebuild_flat_views,
     _write_back_grads,
+    build_flat_tuning_params,
     halving_doubling_allreduce,
     resolve_ddp_plan,
     run_threaded_spawn,
@@ -480,6 +485,240 @@ class TestDelayedBestTracker:
         assert envs.AR_TUNE_DDP_DELAYED_LOSS is True
         monkeypatch.setattr(envs, "AR_TUNE_DDP_DELAYED_LOSS", False)
         assert envs.AR_TUNE_DDP_DELAYED_LOSS is False
+
+
+class _FakeWrap(torch.nn.Module):
+    """Minimal wrapper stand-in: params dict + module-attr dual aliasing."""
+
+    def __init__(self, shape=(4,), keys=("value", "min_scale", "max_scale")):
+        super().__init__()
+        self.orig_layer = torch.nn.Linear(3, 3, bias=False)
+        self.params = {}
+        for k in keys:
+            p = torch.nn.Parameter(torch.randn(shape))
+            self.params[k] = p
+            setattr(self, k, p)
+
+
+class TestFlatVParams:
+    """Flat v-param storage: views must alias the group parameters exactly."""
+
+    @staticmethod
+    def _block():
+        block = torch.nn.Module()
+        block.m1 = _FakeWrap((4,))
+        block.m2 = _FakeWrap((6,))
+        return block
+
+    @staticmethod
+    def _lrs(m):
+        return 0.01
+
+    @staticmethod
+    def _mlrs(m):
+        return 0.02
+
+    def test_views_alias_flat_storage(self):
+        block = self._block()
+        assert build_flat_tuning_params(block, self._lrs, self._mlrs) is True
+        for m in (block.m1, block.m2):
+            for key in m.params:
+                v = m.params[key]
+                assert not isinstance(v, torch.nn.Parameter)  # a view, not a leaf
+                assert key not in m._parameters  # stale leaf registration removed
+                assert getattr(m, key) is v  # attr aliasing preserved
+        # write through the view -> visible in the flat group parameter
+        man = block._tune_flat_manifest
+        e = [x for x in man if x[0] == "m1" and x[1] == "value"][0]
+        block.m1.params["value"].data.zero_()
+        gp = block._tune_flat_groups[e[2]]
+        assert gp.data[e[3] : e[3] + e[4]].abs().sum().item() == 0.0
+
+    def test_manifest_order_and_groups(self):
+        block = self._block()
+        assert build_flat_tuning_params(block, self._lrs, self._mlrs) is True
+        man = block._tune_flat_manifest
+
+        # flat order == legacy exchange order: round keys (named_modules x key
+        # order) first, then minmax keys -- the r_ps + m_ps concatenation
+        def _kind(k):
+            return 1 if ("min" in k or "max" in k) else 0
+
+        legacy = [(n, k) for n, m in block.named_modules() if hasattr(m, "orig_layer") for k in m.params]
+        legacy = sorted(legacy, key=lambda nk: _kind(nk[1]))
+        # buffer order == manifest sorted by (group, offset) == legacy r_ps + m_ps
+        in_buffer_order = sorted(man, key=lambda x: (x[2], x[3]))
+        assert [(e[0], e[1]) for e in in_buffer_order] == legacy
+        # one group per (kind, lr); round groups indexed before minmax groups
+        gk = block._tune_flat_group_lrs
+        kinds = [k for k, _lr in gk]
+        assert kinds == sorted(kinds, key=lambda k: 0 if k == "round" else 1)
+        assert len(gk) == len(set(gk))  # one group per (kind, lr) pair
+        # every group param covers its manifest slice exactly
+        for gidx, gp in enumerate(block._tune_flat_groups):
+            es = [e for e in man if e[2] == gidx]
+            assert sum(e[4] for e in es) == gp.numel()
+
+    def test_sign_sgd_steps_through_views(self):
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+        block = self._block()
+        build_flat_tuning_params(block, self._lrs, self._mlrs)
+        groups = list(block._tune_flat_groups)
+        opt = SignSGD([{"params": [gp], "lr": 0.1} for gp in groups], lr=0.1)
+        before = [gp.detach().clone() for gp in groups]
+        loss = sum(
+            (m.params[k] * 2.0).sum() for _n, m in block.named_modules() if hasattr(m, "params") for k in m.params
+        )
+        loss.backward()
+        for gp in groups:
+            assert gp.grad is not None  # autograd reached the group leaf via views
+        opt.step()
+        for gp, b in zip(groups, before):
+            assert not torch.equal(gp.detach(), b)  # stepped in place
+
+    def test_rebuild_views_on_mirror(self):
+        block = self._block()
+        build_flat_tuning_params(block, self._lrs, self._mlrs)
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _deepcopy_flat_safe
+
+        with pytest.raises(RuntimeError):
+            copy.deepcopy(block)  # plain deepcopy refuses non-leaf views
+        mirror = _deepcopy_flat_safe(block)
+        # simulate repair: fresh group parameter objects on the mirror
+        fresh = torch.nn.ParameterList([torch.nn.Parameter(gp.detach().clone()) for gp in mirror._tune_flat_groups])
+        fresh[0].data.zero_()  # distinguishable values
+        mirror._tune_flat_groups = fresh
+        assert _rebuild_flat_views(mirror) is True
+        mods = dict(mirror.named_modules())
+        e = [x for x in mirror._tune_flat_manifest if x[1] == "value"][0]
+        mv = mods[e[0]].params[e[1]]
+        assert mv.numel() == e[4]
+        # view reads the MIRROR's fresh group, not home's storage
+        assert mv.abs().sum().item() == 0.0
+
+    def test_flat_grad_buffer_zero_copy_adjacent(self):
+        base = torch.zeros(10)
+        p1 = torch.nn.Parameter(base[0:6])
+        p2 = torch.nn.Parameter(base[6:10])
+        p1.grad = torch.ones(6)
+        p2.grad = torch.ones(4)
+        # grads must share one contiguous storage for the zero-copy path
+        p1.grad = base[0:6].clone().requires_grad_(False)  # separate: returns None
+        assert _flat_grad_buffer([p1, p2]) is None
+        # now build genuinely adjacent grads
+        g = torch.ones(10)
+        p1.grad = g[0:6]
+        p2.grad = g[6:10]
+        buf = _flat_grad_buffer([p1, p2])
+        assert buf is not None and buf.numel() == 10
+        assert buf.data_ptr() == p1.grad.data_ptr()  # zero-copy over the chain
+        buf[3] = 99.0
+        assert p1.grad[3].item() == 99.0 and p2.grad[0].item() == 1.0  # aliases
+
+    def test_flat_build_skips_non_fp32(self):
+        block = self._block()
+        orig = block.m1.params["value"]
+        with torch.no_grad():
+            block.m1.params["value"] = torch.nn.Parameter(torch.randn(4, dtype=torch.float64))
+        setattr(block.m1, "value", block.m1.params["value"])
+        assert build_flat_tuning_params(block, self._lrs, self._mlrs) is False
+        assert isinstance(block.m1.params["value"], torch.nn.Parameter)  # untouched
+        assert block.m1.params["value"] is not orig
+        assert getattr(block, "_tune_flat_groups", None) is None
+
+    def test_parked_grads_share_one_buffer(self):
+        block = self._block()
+        build_flat_tuning_params(block, self._lrs, self._mlrs)
+        loss = sum(
+            (m.params[k] * 2.0).sum() for _n, m in block.named_modules() if hasattr(m, "params") for k in m.params
+        )
+        loss.backward()
+        for gp in block._tune_flat_groups:
+            assert gp.grad is not None
+        buf = _flat_grad_buffer(list(block._tune_flat_groups))
+        assert buf is not None, "parked grads must be storage-adjacent after backward"
+        assert buf.numel() == block._tune_flat_base.numel()
+        # zero in place (set_to_none=False semantics) keeps the parking
+        for gp in block._tune_flat_groups:
+            gp.grad.zero_()
+        assert _flat_grad_buffer(list(block._tune_flat_groups)) is not None
+
+    def test_flat_vs_legacy_equivalence(self):
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+        def vals(block):
+            return {
+                f"{n}.{k}": m.params[k].detach().clone()
+                for n, m in block.named_modules()
+                if hasattr(m, "params")
+                for k in m.params
+            }
+
+        def legacy_block(seed):
+            torch.manual_seed(seed)
+            b = torch.nn.Module()
+            b.m1 = _FakeWrap((6,))
+            b.m2 = _FakeWrap((8,))
+            return b
+
+        weights = [1.7, -0.9]
+        legacy = [legacy_block(11 + r) for r in range(2)]
+        flats = [legacy_block(11 + r) for r in range(2)]
+        for b in flats:
+            assert build_flat_tuning_params(b, self._lrs, self._mlrs)
+        for b in legacy + flats:
+            assert set(vals(b)) == set(vals(legacy[0]))
+        lopts = [
+            SignSGD(
+                [
+                    {
+                        "params": [
+                            m.params[k] for _n, m in b.named_modules() if hasattr(m, "params") for k in m.params
+                        ],
+                        "lr": 0.05,
+                    }
+                ],
+                lr=0.05,
+            )
+            for b in legacy
+        ]
+        fopts = [SignSGD([{"params": list(b._tune_flat_groups), "lr": 0.05}], lr=0.05) for b in flats]
+        for _it in range(10):
+            for blocks, opts in ((legacy, lopts), (flats, fopts)):
+                for b, w in zip(blocks, weights):
+                    sum(
+                        (m.params[k] * w).sum() for _n, m in b.named_modules() if hasattr(m, "params") for k in m.params
+                    ).backward()
+            # legacy: gather + exchange + scatter
+            per_replica = [
+                [m.params[k] for _n, m in b.named_modules() if hasattr(m, "params") for k in m.params] for b in legacy
+            ]
+            bufs = _param_grad_buffers(per_replica)
+            halving_doubling_allreduce(bufs, scale=0.5)
+            for buf, ps in zip(bufs, per_replica):
+                _write_back_grads(buf, ps)
+            # flat: zero-copy exchange over parked grads
+            fbufs = []
+            for b in flats:
+                fb = _flat_grad_buffer(list(b._tune_flat_groups))
+                assert fb is not None
+                fbufs.append(fb)
+            halving_doubling_allreduce(fbufs, scale=0.5)
+            for o in lopts + fopts:
+                o.step()
+                o.zero_grad(set_to_none=False)
+        for r in range(2):
+            va, vb = vals(legacy[r]), vals(flats[r])
+            for k in va:
+                assert torch.equal(va[k], vb[k]), f"replica {r} key {k} diverged"
+
+    def test_flat_env_gate_default_and_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        assert envs.AR_TUNE_DDP_FLAT_VPARAMS is True
+        monkeypatch.setattr(envs, "AR_TUNE_DDP_FLAT_VPARAMS", False)
+        assert envs.AR_TUNE_DDP_FLAT_VPARAMS is False
 
 
 class TestRunThreaded:

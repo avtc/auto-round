@@ -675,6 +675,28 @@ class SignRoundQuantizer(BaseQuantizer):
                 _staged_src = getattr(block, "_stream_prefetch_source", None)
                 if _staged_src is not None:
                     _staged_src = _staged_src.unpack()
+                if _envs.AR_TUNE_DDP_FLAT_VPARAMS:
+                    # build BEFORE the replicas: replicate/deepcopy then carries
+                    # the flat layout to every mirror (mixed layouts would
+                    # desynchronize the exchange bytes), and the recipe anchor's
+                    # margin freeze runs afterwards on home + mirrors alike
+                    from auto_round.algorithms.quantization.sign_round.data_parallel import build_flat_tuning_params
+
+                    def _lr_pair(m):
+                        _bits = getattr(m.orig_layer, "bits", None)
+                        _rl = self._config.compute_lr(_bits)
+                        _rl = self.lr if _rl is None else _rl
+                        self._maybe_log_low_bit_lr(_rl)
+                        _ml = self._config.compute_minmax_lr(_bits)
+                        _ml = self.minmax_lr if _ml is None else _ml
+                        return _rl, _ml
+
+                    if build_flat_tuning_params(block, lambda m: _lr_pair(m)[0], lambda m: _lr_pair(m)[1]):
+                        logger.info(
+                            "[tune-ddp] flat v-params engaged: %d group(s), %d element(s)",
+                            len(block._tune_flat_groups),
+                            block._tune_flat_base.numel(),
+                        )
                 replica_group = ReplicaGroup(
                     block, _plan, grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT, staged_source=_staged_src
                 )
@@ -694,9 +716,26 @@ class SignRoundQuantizer(BaseQuantizer):
 
         def _collect_tuning_params(mod):
             """Collect (round, minmax) params + per-lr groups from a wrapped block."""
+            _flat_groups = getattr(mod, "_tune_flat_groups", None)
+            if _flat_groups is not None and getattr(mod, "_tune_flat_group_lrs", None):
+                # flat v-param layout: each group parameter IS one (kind, lr)
+                # group; wrapper params hold views of these (no .grad on
+                # views -- collecting them instead of the group leaves would
+                # silently skip the exchange, the 76b0bc76 bug class)
+                r_params, m_params = [], []
+                r_groups: dict[float, list] = {}
+                m_groups: dict[float, list] = {}
+                for gp, (kind, group_lr) in zip(_flat_groups, mod._tune_flat_group_lrs):
+                    if kind == "minmax":
+                        m_params.append(gp)
+                        m_groups.setdefault(group_lr, []).append(gp)
+                    else:
+                        r_params.append(gp)
+                        r_groups.setdefault(group_lr, []).append(gp)
+                return r_params, m_params, r_groups, m_groups
             r_params, m_params = [], []
-            r_groups: dict[float, list] = {}
-            m_groups: dict[float, list] = {}
+            r_groups = {}
+            m_groups = {}
             for _n, m in mod.named_modules():
                 if hasattr(m, "orig_layer"):
                     layer_bits = getattr(m.orig_layer, "bits", None)
@@ -849,7 +888,10 @@ class SignRoundQuantizer(BaseQuantizer):
                             _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
                             _loss_w.backward()
                     for _opt in [optimizer] + mirror_optimizers:
-                        _opt.zero_grad()
+                        # set_to_none=False keeps flat v-param grads parked as
+                        # views of the shared grad buffer (None grads would
+                        # silently fall the exchange back to the legacy gather)
+                        _opt.zero_grad(set_to_none=False)
             except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
                 replica_group.teardown()
                 raise RuntimeError(
@@ -1050,7 +1092,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
                     def _mirror_step(opt, sched):
                         opt.step()
-                        opt.zero_grad()
+                        opt.zero_grad(set_to_none=False)
                         sched.step()
 
                     # mirror optimizers exclude the HOME replica (its step ran
@@ -1409,5 +1451,5 @@ class SignRoundQuantizer(BaseQuantizer):
         # for hpu
         if is_hpex_available():
             htcore.mark_step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=False)
         lr_schedule.step()
