@@ -1110,10 +1110,14 @@ class ReplicaGroup:
         from auto_round.utils.tune_profile import stage as _stage
 
         ov = self._overlap
-        with _stage(prof, "exchange"):
+        # ov_wait: how long the home default stream sits waiting the side
+        # streams AFTER draining its own backward -- the true straggler+side
+        # lag. ov_reduce: the canonical reduction kernels themselves.
+        with _stage(prof, "ov_wait"):
             for d, dev in enumerate(ov["devs"]):
                 with torch.cuda.device(dev):
                     torch.cuda.current_stream(dev).wait_stream(ov["side"][d])
+        with _stage(prof, "ov_reduce"):
             for k in range(ov["n_buckets"]):
                 for d, dev in enumerate(ov["devs"]):
                     p = params_per_replica[d][k]
@@ -1141,6 +1145,7 @@ class ReplicaGroup:
                         acc.copy_(total)
                         acc.mul_(1.0 / self.world)
                         p.grad.copy_(acc.view_as(p.grad))
+            return
 
     def round_params(self) -> List[List[torch.nn.Parameter]]:
         out = []
