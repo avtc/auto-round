@@ -869,35 +869,33 @@ def sharded_nograd_forward(
     # steady-state breakdown for the collection passes: setup = ephemeral
     # mirror deepcopy/relocate (per pass!), fwd = threaded shard forwards
     # (wall includes enqueue, gpu is the device-measured chain incl. the
-    # per-thread output parking), split/merge = host assembly. Logs the first
-    # couple of passes and then every 16th to bound verbosity.
-    global _coll_profile_count
-    _coll_profile_count += 1
-    if _coll_profile_count <= 2 or _coll_profile_count % 16 == 0:
-        _walls = sorted(fwd_walls)
-        _gpus = sorted(fwd_gpu)
-        logger.info(
-            "[tune-ddp] sharded collect breakdown: world=%d n=%d setup=%.0fms "
-            "fwd_wall[min/med/max]=%.0f/%.0f/%.0fms fwd_gpu[min/med/max]=%.0f/%.0f/%.0fms "
-            "split=%.0fms merge=%.0fms",
-            world,
-            n,
-            _t_setup_ms,
-            _walls[0],
-            _walls[len(_walls) // 2],
-            _walls[-1],
-            _gpus[0],
-            _gpus[len(_gpus) // 2],
-            _gpus[-1],
-            (_t_merge - _t_split) * 1000,
-            (_time.perf_counter() - _t_merge) * 1000,
-        )
+    # per-thread output parking), split/merge = host assembly. Logged for
+    # EVERY pass: the first-call-per-block compile signature (uniformly
+    # ~2.3-2.8 s fwd at world=8 vs 0.6-0.8 s on the second pass) needs the
+    # per-block view to separate warmup from steady state.
+    _walls = sorted(fwd_walls)
+    _gpus = sorted(fwd_gpu)
+    logger.info(
+        "[tune-ddp] sharded collect breakdown: world=%d n=%d setup=%.0fms "
+        "fwd_wall[min/med/max]=%.0f/%.0f/%.0fms fwd_gpu[min/med/max]=%.0f/%.0f/%.0fms "
+        "split=%.0fms merge=%.0fms",
+        world,
+        n,
+        _t_setup_ms,
+        _walls[0],
+        _walls[len(_walls) // 2],
+        _walls[-1],
+        _gpus[0],
+        _gpus[len(_gpus) // 2],
+        _gpus[-1],
+        (_t_merge - _t_split) * 1000,
+        (_time.perf_counter() - _t_merge) * 1000,
+    )
     return pieces
 
 
 _STAGED_MISS_LOGGED = False
 _MIRROR_PATH_LOGGED = False
-_coll_profile_count = 0
 
 
 def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.device) -> None:

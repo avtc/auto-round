@@ -460,7 +460,6 @@ class TestShardedNoGradForward:
 
         block = nn.Linear(2, 1)
         runner = self._runner()
-        dp._coll_profile_count = 0  # force the first-call log
         with patch.object(dp.logger, "info") as info:
             dp.sharded_nograd_forward(
                 runner,
