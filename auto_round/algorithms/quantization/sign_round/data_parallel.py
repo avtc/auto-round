@@ -519,6 +519,92 @@ def sharded_nograd_forward(
     return pieces
 
 
+def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.device) -> None:
+    """Make a ``torch.nn.parallel.replicate`` output safe to TUNE.
+
+    ``replicate`` shallow-copies every module: parameters/buffers are
+    broadcast per device (chunked, no 2x source spike), but every plain
+    ``__dict__`` attribute stays SHARED with home, and the broadcast params
+    land as non-leaf non-Parameter attributes (``_former_parameters``) --
+    replicas are not trainable modules as-is. The repair walk re-leafs the
+    broadcast tensors into fresh ``nn.Parameter``s, re-keys wrapper aliasing
+    dicts (``m.params``) to those NEW objects -- otherwise mirror optimizers
+    would collect HOME's parameters and silently tune the home -- and clones
+    tensor-valued plain attrs (weight_min/max, caches) plus shared mutable
+    containers onto the replica device.
+    """
+    home_mods = dict(home.named_modules())
+    # break whole-dict aliasing from shallow copies before walking (children
+    # were already re-pointed by replicate; only the container is shared)
+    replica._modules = dict(replica._modules)
+    replica._parameters = dict(replica._parameters)
+    replica._buffers = dict(replica._buffers)
+    for name, rmod in replica.named_modules():
+        hmod = home_mods.get(name)
+        if hmod is None:  # pragma: no cover - replica cannot grow modules
+            continue
+        former = getattr(rmod, "_former_parameters", None) or {}
+        # ── parameters: re-leaf the broadcast copies ──────────────────────
+        new_params = {}
+        for key, hparam in hmod._parameters.items():
+            if hparam is None:
+                continue
+            src = former.get(key)
+            if not torch.is_tensor(src):
+                cand = rmod._parameters.get(key)
+                src = cand if cand is not None and cand is not hparam else None
+            if not torch.is_tensor(src):
+                src = hparam.detach().to(dev)  # last resort: direct copy
+            new_params[key] = torch.nn.Parameter(src.detach(), requires_grad=hparam.requires_grad)
+        rmod._parameters = new_params
+        for key in new_params:
+            rmod.__dict__.pop(key, None)  # drop the non-leaf plain-attr shadow
+        if hasattr(rmod, "_former_parameters"):
+            try:
+                delattr(rmod, "_former_parameters")
+            except AttributeError:  # pragma: no cover
+                pass
+        # ── buffers: adopt the broadcast copy wherever it landed ─────────
+        # (rebind a FRESH dict: a shallow copy may share the dict object
+        # itself, and in-place writes would corrupt the home module)
+        new_buffers = dict(rmod._buffers)
+        for key, hbuf in hmod._buffers.items():
+            if hbuf is None:
+                continue
+            src = new_buffers.get(key)
+            if src is None or src is hbuf:
+                src = rmod.__dict__.get(key)
+                if not torch.is_tensor(src) or src is hbuf:
+                    src = hbuf.to(dev)
+                    if src is hbuf:  # .to() is a no-op on the same device
+                        src = src.clone()
+            new_buffers[key] = src
+            rmod.__dict__.pop(key, None)
+        rmod._buffers = new_buffers
+        # ── plain attrs: clone tensors, deepcopy shared containers ───────
+        for attr, val in list(rmod.__dict__.items()):
+            if attr.startswith("_") or attr in ("training", "T_destination"):
+                continue  # torch-internal bookkeeping / immutable scalars
+            hval = hmod.__dict__.get(attr)
+            if torch.is_tensor(val) and val is hval:
+                setattr(rmod, attr, hval.detach().clone().to(dev))
+            elif isinstance(val, (list, dict, set)) and val is hval:
+                setattr(rmod, attr, copy.deepcopy(hval))
+        # ── wrapper aliasing dict: re-key to the NEW parameters ──────────
+        if hasattr(hmod, "orig_layer") and isinstance(getattr(hmod, "params", None), dict):
+            fixed = {}
+            for k, v in hmod.params.items():
+                if isinstance(v, torch.nn.Parameter) and k in rmod._parameters:
+                    fixed[k] = rmod._parameters[k]
+                elif torch.is_tensor(v):
+                    fixed[k] = v.detach().clone().to(dev)
+                elif isinstance(v, (list, dict, set)):
+                    fixed[k] = copy.deepcopy(v)
+                else:
+                    fixed[k] = v
+            rmod.params = fixed
+
+
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
@@ -545,22 +631,36 @@ class ReplicaGroup:
     def _make_mirror(self, block, dev, staged_source):
         """Mirror the block onto ``dev``, adopting prefetched weights when sane.
 
-        ``staged_source`` = (streamer, prefix): when the prefetch reader
-        fanned this block out onto ``dev`` AND the home weights are pristine
-        (no pre-quantize transform mutated them), the checkpoint-backed
-        orig_layer weights are swapped to meta before the device move and
-        re-materialized from the local staged copies -- the cross-GPU copy
-        then carries only the small tuning state instead of the block
-        weights. Falls back to the plain deepcopy path otherwise.
+        Fast path (CUDA): ``torch.nn.parallel.replicate`` + a repair walk --
+        parameters/buffers are broadcast per device in coalesced chunks (no
+        whole-block 2x duplication on the home GPU, faster than a Python
+        deepcopy), then :func:`_repair_replica` re-leafs the broadcast
+        tensors into trainable Parameters and clones the attrs replicate
+        shares with home. With staged copies + pristine weights, the big
+        checkpoint weights are swapped to empty for the broadcast and
+        re-materialized from the device-local staged copies (the cross-GPU
+        traffic then carries only the small tuning state). Falls back to the
+        plain deepcopy paths on CPU or any replicate failure (mirror
+        correctness > speed).
         """
         staged = None
+        prefix = ""
         if staged_source is not None:
             streamer, prefix = staged_source
             try:
                 staged = streamer.staged_replica_tensors(prefix, dev)
             except Exception:
                 staged = None
-        if not staged or not getattr(block, "_stream_weights_pristine", False):
+        adopt = bool(staged) and getattr(block, "_stream_weights_pristine", False)
+        if dev.type == "cuda":
+            try:
+                mirror = self._replicate_mirror(block, dev, staged if adopt else None, prefix)
+                if adopt:
+                    self.adopted += 1
+                return mirror
+            except Exception as e:  # noqa: BLE001 - deepcopy fallback below
+                logger.info("[tune-ddp] replicate mirror onto %s failed (%r); using deepcopy", dev, e)
+        if not adopt:
             return copy.deepcopy(block).to(dev)
 
         mirror = copy.deepcopy(block)
@@ -579,6 +679,38 @@ class ReplicaGroup:
             params[name].data = staged[key].to(params[name].device)
         self.adopted += 1
         return mirror
+
+    @staticmethod
+    def _replicate_mirror(block, dev, staged, prefix):
+        """Build one mirror via replicate+repair (+ optional staged adoption)."""
+        from torch.nn.parallel import replicate as _torch_replicate
+
+        swap = []
+        try:
+            if staged is not None:
+                # adoption: the big checkpoint weights ride as empty tensors
+                # so the broadcast carries only the tuning state; the home
+                # pointers are restored right after (the saved references
+                # keep the storages alive)
+                for _n, p in block.named_parameters():
+                    if ".orig_layer." in _n:
+                        swap.append((p, p.data))
+                        p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+            replica = _torch_replicate(block, [dev])[0]
+        finally:
+            for p, data in swap:
+                p.data = data
+        _repair_replica(block, replica, dev)
+        if staged is not None:
+            for name, param in replica.named_parameters():
+                if ".orig_layer." not in name:
+                    continue
+                key = (
+                    (prefix + "." + name.replace(".orig_layer.", ".")) if prefix else name.replace(".orig_layer.", ".")
+                )
+                if key in staged:
+                    param.data = staged[key].to(param.device)
+        return replica
 
     def round_params(self) -> List[List[torch.nn.Parameter]]:
         out = []

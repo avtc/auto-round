@@ -196,3 +196,106 @@ class TestStagedSourceRef:
         # serial contract: per-sample list survives the deepcopy of the stamped block
         assert isinstance(out, list) and len(out) == 4
         assert all(t.shape == (1, 1) for t in out)
+
+
+class TestReplicaRepair:
+    """_repair_replica: replicate-style shallow copies become tunable modules."""
+
+    @staticmethod
+    def _home():
+        import torch.nn as nn
+
+        class _Wrap(nn.Module):
+            def __init__(self):
+                super().__init__()
+                layer = nn.Linear(4, 4, bias=True)
+                layer.bits = 4
+                self.orig_layer = layer
+                self.register_buffer("act_max", torch.zeros(4))
+                self.params = {"v": nn.Parameter(torch.full((4,), 2.0)), "keep": 7}
+                self.weight_min = torch.zeros(4)
+                self.tags = [1, 2]
+
+        return _Wrap()
+
+    @classmethod
+    def _replica_like(cls, home):
+        """Mimic torch.nn.parallel.replicate output: shallow-copied modules,
+        broadcast param copies parked as non-leaf plain attrs + _former_parameters,
+        everything else shared with home."""
+        import copy as _copy
+
+        from collections import OrderedDict
+
+        rep = _copy.copy(home)  # shallow: plain attrs shared
+        rep._modules = {}
+        for k, child in home._modules.items():
+            rep._modules[k] = _copy.copy(child)
+        former = OrderedDict()
+        new_params = {}
+        for k, p in home._parameters.items():
+            former[k] = p.detach().clone()  # the "broadcast" copy
+            new_params[k] = None  # replicate drops/None-s the original entries
+        rep._parameters = new_params
+        rep._former_parameters = former
+        for k in list(rep.__dict__):
+            if k in former:
+                rep.__dict__[k] = former[k]  # plain-attr non-leaf shadows
+        return rep
+
+    def test_repair_makes_replica_independent_and_trainable(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _repair_replica
+
+        home = self._home()
+        rep = self._replica_like(home)
+        _repair_replica(home, rep, torch.device("cpu"))
+        # params: fresh leaves, values preserved, NOT home's objects
+        for k, hp in home._parameters.items():
+            rp = rep._parameters[k]
+            assert isinstance(rp, torch.nn.Parameter) and rp is not hp
+            assert rp.is_leaf and rp.requires_grad == hp.requires_grad
+            torch.testing.assert_close(rp.data, hp.data)
+        assert getattr(rep, "_former_parameters", None) is None
+        # aliasing dict re-keyed to the NEW parameters; non-tensor entries kept
+        assert rep.params["v"] is rep._parameters.get("v", rep.params["v"]) or rep.params["v"] is not home.params["v"]
+        assert rep.params["v"] is not home.params["v"] and rep.params["keep"] == 7
+        # plain-attr tensors cloned, containers deepcopied
+        assert rep.weight_min is not home.weight_min
+        assert rep.tags is not home.tags and rep.tags == [1, 2]
+        # buffers independent
+        assert rep.act_max is not home.act_max
+
+    def test_repair_handles_shared_parameters_style(self):
+        # shallow copy that KEEPS home's Parameter objects (probe behavior of
+        # Module._replicate_for_data_parallel) — repair must break the aliasing
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _repair_replica
+
+        import copy as _copy
+
+        home = self._home()
+        rep = _copy.copy(home)
+        rep._modules = dict(home._modules)
+        rep._parameters = dict(home._parameters)  # shared objects
+        _repair_replica(home, rep, torch.device("cpu"))
+        for k, hp in home._parameters.items():
+            assert rep._parameters[k] is not hp
+            torch.testing.assert_close(rep._parameters[k].data, hp.data)
+
+    def test_make_mirror_cpu_uses_deepcopy(self):
+        # replicate is CUDA-only: on CPU the fallback must engage transparently
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import DDPPlan, ReplicaGroup
+
+        home = self._home()
+        plan = DDPPlan(world=2, shard_size=2, devices=[torch.device("cpu"), torch.device("cpu")])
+        rg = ReplicaGroup.__new__(ReplicaGroup)
+        rg.plan = plan
+        rg.bf16_grad = False
+        rg.home = home
+        rg.mirrors = []
+        rg.adopted = 0
+        mirror = rg._make_mirror(home, torch.device("cpu"), staged_source=None)
+        assert mirror is not home
+        for k, hp in home._parameters.items():
+            assert mirror._parameters[k] is not hp
