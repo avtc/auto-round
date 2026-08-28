@@ -383,12 +383,15 @@ def use_one_shot(world: int, transport: str) -> bool:
         return True
     if mode == "halving":
         return False
-    if transport in ("bf16", "int8"):
-        return world <= 8
-    return world <= 4
+    # auto keeps halving-doubling for now: one-shot MEASURED slower on the
+    # reference fabric (350 ms vs 195 ms per tune iteration at world=4 int8,
+    # against ~22 ms of actual wire) -- the per-rank wire argument did not
+    # survive contact with the machine. Flip to one-shot explicitly to help
+    # profile the wave structure (encode/copy/reduce sub-stages are logged).
+    return False
 
 
-def one_shot_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32") -> None:
+def one_shot_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32", prof=None) -> None:
     """In-place all-reduce via a single full-broadcast wave, then local sums.
 
     Halving-doubling pays 2*log2(W) DEPENDENT exchange steps; each step's
@@ -410,54 +413,63 @@ def one_shot_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transpor
         return
     if transport not in ("fp32", "bf16", "int8"):
         raise ValueError(f"unknown gradient transport {transport!r} (fp32|bf16|int8)")
+    from auto_round.utils.tune_profile import stage as _stage
+
     with torch.no_grad():
         dt = buffers[0].dtype
         devs = [b.device for b in buffers]
         # wave 0: transport-encode each source ONCE (its own stream); the
         # int8 amax scalars must be captured HERE -- buffers are mutated by
         # the scale below, so recomputing amax later would be wrong.
-        payloads, scales = [], []
-        for src in buffers:
-            if transport == "int8":
-                amax = src.abs().amax()
-                inv = 127.0 / amax.clamp_min(torch.finfo(src.dtype).tiny)
-                payloads.append(torch.round(src * inv).clamp_(-127.0, 127.0).to(torch.int8))
-                scales.append(amax)
-            elif transport == "bf16":
-                payloads.append(src.to(torch.bfloat16))
-                scales.append(None)
-            else:
-                # clone: buffers are mutated in wave 2, and a same-device
-                # .to() later is a no-op that would keep the alias alive
-                payloads.append(src.clone())
-                scales.append(None)
+        with _stage(prof, "os_encode"):
+            payloads, scales = [], []
+            for src in buffers:
+                if transport == "int8":
+                    amax = src.abs().amax()
+                    inv = 127.0 / amax.clamp_min(torch.finfo(src.dtype).tiny)
+                    payloads.append(torch.round(src * inv).clamp_(-127.0, 127.0).to(torch.int8))
+                    scales.append(amax)
+                elif transport == "bf16":
+                    payloads.append(src.to(torch.bfloat16))
+                    scales.append(None)
+                else:
+                    # clone: buffers are mutated in wave 2, and a same-device
+                    # .to() later is a no-op that would keep the alias alive
+                    payloads.append(src.clone())
+                    scales.append(None)
         # wave 1: move every payload (and its int8 scalar) to every peer;
         # the copies overlap on the fabric -- int8 payloads are 1/4 fp32 so
         # W*(W-1) of them fit easily
-        recv = [[None] * world for _ in range(world)]
-        scale_d = [[None] * world for _ in range(world)]
-        for r in range(world):
-            for d in range(world):
-                if d != r:
-                    recv[d][r] = payloads[r].to(devs[d], non_blocking=True)
-                    if scales[r] is not None:
-                        scale_d[d][r] = scales[r].to(devs[d], non_blocking=True)
+        with _stage(prof, "os_copy"):
+            recv = [[None] * world for _ in range(world)]
+            scale_d = [[None] * world for _ in range(world)]
+            for r in range(world):
+                for d in range(world):
+                    if d != r:
+                        recv[d][r] = payloads[r].to(devs[d], non_blocking=True)
+                        if scales[r] is not None:
+                            scale_d[d][r] = scales[r].to(devs[d], non_blocking=True)
+        # (wave boundaries are enqueue boundaries; the GPU executes across
+        # them asynchronously -- the sub-stages below bracket where each
+        # wave's work was ISSUED, and their stage events drain on the home
+        # stream, so the numbers show critical-path contribution)
         # wave 2: canonical reduction. Every rank sums the SAME dequantized
         # payloads in the SAME (source-index) order -- including its own,
         # round-tripped through the transport like everyone else's -- so all
         # ranks end up bitwise identical, and the accumulation tree matches
         # across ranks exactly like halving-doubling's exchange tree does.
         # One reusable fp32 temp per device; acc is rebuilt from zero.
-        for d in range(world):
-            acc = buffers[d]
-            acc.zero_()
-            for r in range(world):
-                t = (payloads[r] if r == d else recv[d][r]).to(dt)
-                s_r = scales[r] if r == d else scale_d[d][r]
-                if s_r is not None:
-                    t.mul_(s_r / 127.0)
-                acc.add_(t)
-            acc.mul_(scale)
+        with _stage(prof, "os_reduce"):
+            for d in range(world):
+                acc = buffers[d]
+                acc.zero_()
+                for r in range(world):
+                    t = (payloads[r] if r == d else recv[d][r]).to(dt)
+                    s_r = scales[r] if r == d else scale_d[d][r]
+                    if s_r is not None:
+                        t.mul_(s_r / 127.0)
+                    acc.add_(t)
+                acc.mul_(scale)
 
 
 def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32") -> None:
@@ -987,7 +999,7 @@ class ReplicaGroup:
                     logger.info(
                         "[tune-ddp] one-shot allreduce engaged: world=%d transport=%s", self.world, self.grad_transport
                     )
-                one_shot_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
+                one_shot_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport, prof=prof)
             else:
                 halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
         with _stage(prof, "writeback"):

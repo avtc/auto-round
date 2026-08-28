@@ -736,11 +736,11 @@ class TestAllreduceModeSwitch:
 
         monkeypatch.delenv("AR_TUNE_DDP_ALLREDUCE", raising=False)
         assert envs.AR_TUNE_DDP_ALLREDUCE == "auto"
-        # auto policy: reduced transports one-shot through world=8, fp32 through 4
-        assert use_one_shot(2, "int8") and use_one_shot(4, "int8") and use_one_shot(8, "int8")
-        assert use_one_shot(2, "bf16") and use_one_shot(8, "bf16")
-        assert use_one_shot(4, "fp32")
-        assert not use_one_shot(8, "fp32")
+        # auto policy: halving-doubling everywhere (one-shot measured slower
+        # at world=4 int8: 350 ms vs 195 ms); explicit values force the choice
+        for world in (2, 4, 8):
+            for transport in ("fp32", "bf16", "int8"):
+                assert not use_one_shot(world, transport)
         monkeypatch.setenv("AR_TUNE_DDP_ALLREDUCE", "oneshot")  # forces regardless
         assert use_one_shot(8, "fp32")
         monkeypatch.setenv("AR_TUNE_DDP_ALLREDUCE", "halving")
