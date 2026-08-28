@@ -28,6 +28,7 @@ World size 1 (default) executes none of this code.
 from __future__ import annotations
 
 import copy
+import queue
 import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
@@ -851,8 +852,10 @@ def sharded_nograd_forward(
             evs[r] = ev
         fwd_walls[r] = (_time.perf_counter() - t_r) * 1000
 
-    runner_group = ReplicaGroup.__new__(ReplicaGroup)  # reuse only the thread runner
-    runner_group.run_threaded([lambda r=r: _run(r) for r in range(world)])
+    # spawn path, not the ReplicaGroup pool: this bare helper instance has no
+    # lifecycle and would leak pool workers (collection passes are twice per
+    # block -- the spawn cost is irrelevant here)
+    run_threaded_spawn([lambda r=r: _run(r) for r in range(world)])
     # per-shard GPU times: sync the participating devices (their outputs are
     # consumed right after anyway -- the first downstream read syncs too)
     fwd_gpu = [0.0] * world
@@ -1008,6 +1011,90 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
 _PEER_ACCESS_LOGGED = False
 
 
+def run_threaded_spawn(fns: Sequence) -> None:
+    """Run one callable per item in parallel SPAWNED threads (legacy path).
+
+    Exceptions propagate: the first failure (by thread index) is re-raised
+    in the joining thread -- a swallowed worker failure would otherwise
+    leave missing shard losses/grads and corrupt the step silently.
+    """
+    errors: dict = {}
+
+    def _guarded(idx, fn):
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            errors[idx] = exc
+
+    threads = [threading.Thread(target=_guarded, args=(i, fn)) for i, fn in enumerate(fns)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[min(errors)]
+
+
+class ReplicaThreadPool:
+    """Persistent per-replica workers replacing per-iteration thread spawns.
+
+    The tune loop calls ``run_threaded`` twice per iteration (forward shards
+    + mirror optimizer steps); spawning and joining ``world`` fresh threads
+    each call costs ~1-2 ms per thread of setup/teardown plus GIL churn --
+    a measurable slice of the per-iteration host gap. The pool keeps one
+    daemon worker per replica alive for the block's lifetime, fed through
+    per-worker queues; each round's completion is signalled by per-worker
+    events, preserving the spawn path's semantics exactly: every callable
+    runs to completion, and the first failure BY WORKER INDEX is re-raised
+    in the calling thread. Workers are daemon threads so a pool abandoned
+    by a crash can never hang process exit; ``shutdown()`` joins them in
+    the normal flow (ReplicaGroup.teardown).
+    """
+
+    def __init__(self, n_workers: int) -> None:
+        self.n = n_workers
+        self._queues: List["queue.Queue"] = [queue.Queue() for _ in range(n_workers)]
+        self._errors: List[Optional[BaseException]] = [None] * n_workers
+        self._events: List[threading.Event] = []
+        self._threads: List[threading.Thread] = []
+        for i in range(n_workers):
+            t = threading.Thread(target=self._worker, args=(i,), name=f"tune-ddp-worker-{i}", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _worker(self, idx: int) -> None:
+        for fn in iter(self._queues[idx].get, None):  # None = poison pill
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001 - surfaced by run()
+                self._errors[idx] = exc
+            finally:
+                self._events[idx].set()
+
+    def run(self, fns: Sequence) -> None:
+        """Execute one round: fns[i] runs on worker i; raise first-by-index error."""
+        if len(fns) != self.n:
+            raise ValueError(f"wrong count: pool has {self.n} worker(s), got {len(fns)} callable(s)")
+        # fresh round state before anything is enqueued (workers are idle
+        # between rounds -- run() only returns after every event of the
+        # previous round was set)
+        self._errors = [None] * self.n
+        self._events = [threading.Event() for _ in range(self.n)]
+        for i, fn in enumerate(fns):
+            self._queues[i].put(fn)
+        for ev in self._events:
+            ev.wait()
+        failed = [i for i, exc in enumerate(self._errors) if exc is not None]
+        if failed:
+            raise self._errors[min(failed)]
+
+    def shutdown(self) -> None:
+        for q in self._queues:
+            q.put(None)
+        for t in self._threads:
+            t.join(timeout=30)
+
+
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
@@ -1037,6 +1124,9 @@ class ReplicaGroup:
         # overlapped-exchange state (built lazily on first sync_grads; None
         # keeps the classic sequential exchange)
         self._overlap = None
+        # persistent replica worker pool (built lazily on first run_threaded
+        # when AR_TUNE_DDP_THREAD_POOL is on; None keeps spawn-per-call)
+        self._pool = None
         logger.info(
             "[tune-ddp] world=%d devices=%s adopted=%d/%d",
             self.world,
@@ -1379,31 +1469,35 @@ class ReplicaGroup:
     def run_threaded(self, fns: Sequence) -> None:
         """Run one callable per replica in parallel threads.
 
+        Uses the persistent worker pool when AR_TUNE_DDP_THREAD_POOL is on
+        (default): the tune loop calls this twice per iteration, and pool
+        reuse removes the per-call thread spawn/join overhead. Falls back to
+        ``run_threaded_spawn`` when the pool is disabled, not yet built, or
+        the callable count does not match the pool width.
+
         Exceptions propagate: the first failure (by thread index) is re-raised
         in the joining thread -- a swallowed worker failure would otherwise
         leave missing shard losses/grads and corrupt the step silently.
         """
-        errors: dict = {}
+        pool = getattr(self, "_pool", None)
+        if pool is None:
+            from auto_round import envs
 
-        def _guarded(idx, fn):
-            try:
-                fn()
-            except BaseException as exc:  # noqa: BLE001 - re-raised below
-                errors[idx] = exc
-
-        threads = [threading.Thread(target=_guarded, args=(i, fn)) for i, fn in enumerate(fns)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        if errors:
-            raise errors[min(errors)]
+            if envs.AR_TUNE_DDP_THREAD_POOL:
+                self._pool = pool = ReplicaThreadPool(len(fns))
+        if pool is not None and len(fns) == pool.n:
+            pool.run(fns)
+        else:
+            run_threaded_spawn(fns)
 
     def teardown(self) -> None:
         ov, self._overlap = self._overlap, None
         if ov is not None:
             for h in ov["hooks"]:
                 h.remove()
+        pool, self._pool = getattr(self, "_pool", None), None
+        if pool is not None:
+            pool.shutdown()
         self.mirrors = []
         self.replicas = [self.home]
 

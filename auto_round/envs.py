@@ -169,6 +169,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # AR_TUNE_DDP_MERGE_STATS=1 lets hook passes shard at all. Values above
     # the engaged world are no-ops; the knee is CPU-dependent (weaker CPUs
     # convoy earlier).
+    # Persistent replica worker pool for the DDP tune loop (default ON):
+    # run_threaded is called twice per iteration (forward shards + mirror
+    # optimizer steps) and spawning/joining `world` fresh threads each call
+    # costs ~1-2 ms per thread of setup plus GIL churn -- a measurable slice
+    # of the per-iteration host gap. The pool keeps one daemon worker per
+    # replica for the block's lifetime (same first-by-index exception
+    # semantics as the spawn path). Set to 0 to restore spawn-per-call
+    # (collection passes always use the spawn path -- no lifecycle there).
+    "AR_TUNE_DDP_THREAD_POOL": lambda: os.getenv("AR_TUNE_DDP_THREAD_POOL", "1").lower() in ("1", "true", "yes"),
     "AR_TUNE_COLL_HOOK_SHARDS": lambda: (
         lambda v: (
             int(v)

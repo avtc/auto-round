@@ -19,10 +19,12 @@ import torch
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
     DDPPlan,
     ReplicaGroup,
+    ReplicaThreadPool,
     _param_grad_buffers,
     _write_back_grads,
     halving_doubling_allreduce,
     resolve_ddp_plan,
+    run_threaded_spawn,
     sign_exchange_allreduce,
 )
 
@@ -303,6 +305,80 @@ class TestRelocateParams:
         assert isinstance(wrapper.params["buf"], torch.Tensor) and not isinstance(
             wrapper.params["buf"], torch.nn.Parameter
         )
+
+
+class TestReplicaThreadPool:
+    def _block_group(self, world=4):
+        block = torch.nn.Linear(2, 2)
+        plan = DDPPlan(world=world, devices=[torch.device("cpu")] * world, shard_size=4)
+        return ReplicaGroup(block, plan)
+
+    def test_pool_executes_all_callables(self):
+        group = self._block_group(4)
+        ran = []
+        group.run_threaded([lambda i=r: ran.append(i) for r in range(4)])
+        assert sorted(ran) == [0, 1, 2, 3]
+        # second round reuses the same workers
+        group.run_threaded([lambda i=r: ran.append(i + 10) for r in range(4)])
+        assert sorted(ran) == [0, 1, 2, 3, 10, 11, 12, 13]
+        group.teardown()
+
+    def test_pool_exception_first_by_index_and_survives(self):
+        group = self._block_group(4)
+
+        def boom(tag):
+            def _f():
+                raise ValueError(tag)
+
+            return _f
+
+        with pytest.raises(ValueError, match="second"):
+            group.run_threaded([lambda: None, boom("second"), boom("third"), lambda: None])
+        # the pool stays usable after a failing round
+        ran = []
+        group.run_threaded([lambda i=r: ran.append(i) for r in range(4)])
+        assert sorted(ran) == [0, 1, 2, 3]
+        group.teardown()
+
+    def test_pool_env_opt_out_uses_spawn(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.setattr(envs, "AR_TUNE_DDP_THREAD_POOL", False)
+        group = self._block_group(2)
+        ran = []
+        group.run_threaded([lambda: ran.append(0), lambda: ran.append(1)])
+        assert sorted(ran) == [0, 1]
+        assert getattr(group, "_pool", None) is None  # no pool created under opt-out
+        group.teardown()
+
+    def test_teardown_joins_workers(self):
+        import threading as _threading
+
+        before = _threading.active_count()
+        group = self._block_group(3)
+        group.run_threaded([lambda: None for _ in range(3)])
+        assert _threading.active_count() >= before + 3  # workers alive mid-life
+        group.teardown()
+        assert _threading.active_count() == before  # all joined
+
+    def test_spawn_function_semantics(self):
+        ran = []
+
+        def boom():
+            raise RuntimeError("spawn boom")
+
+        with pytest.raises(RuntimeError, match="spawn boom"):
+            run_threaded_spawn([lambda: ran.append(0), boom, lambda: ran.append(2)])
+        assert sorted(ran) == [0, 2]
+
+    def test_pool_class_run_and_shutdown(self):
+        pool = ReplicaThreadPool(2)
+        order = []
+        pool.run([lambda: order.append("a"), lambda: order.append("b")])
+        assert sorted(order) == ["a", "b"]
+        with pytest.raises(ValueError, match="wrong count"):
+            pool.run([lambda: None])  # mismatched length is refused
+        pool.shutdown()
 
 
 class TestRunThreaded:
