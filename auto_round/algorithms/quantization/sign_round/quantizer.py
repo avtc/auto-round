@@ -897,8 +897,17 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 with tune_stage(tune_prof, "fwd"):
                     replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
-                # sync_grads stages itself (bufprep / exchange / writeback)
-                replica_group.sync_grads(params_per_replica, prof=tune_prof)
+                # sync_grads stages itself (bufprep / exchange / writeback).
+                # sign_exchange: the update consumes only sign(mean-grad) and
+                # weight_decay is 0, so exchanging int8 signs after the
+                # reduce-scatter is bitwise-identical across ranks and at
+                # least as faithful as a lossy transport all-gather -- but a
+                # momentum buffer would mix magnitudes back in, so gate on it.
+                replica_group.sync_grads(
+                    params_per_replica,
+                    prof=tune_prof,
+                    sign_exchange=self.momentum is None or float(self.momentum) == 0.0,
+                )
                 # report the global-batch mean: mean of equal-size shard means.
                 # .item() blocks the host until each replica's fwd+loss+bwd has
                 # drained; with P2P transport the allreduce enqueue above is fully

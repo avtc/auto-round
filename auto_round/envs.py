@@ -142,6 +142,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         or ("bf16" if os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes") else "fp32")
     ),
     "AR_TUNE_DDP_MERGE_STATS": lambda: os.getenv("AR_TUNE_DDP_MERGE_STATS", "0").lower() in ("1", "true", "yes"),
+    # Sign-cast gradient exchange (default ON): the SignRound update consumes
+    # only sign(mean-grad), so the tuner exchanges int8 SIGNS after the
+    # reduce-scatter instead of all-gathering the averaged values -- bitwise
+    # identical across ranks, strictly more faithful than a lossy transport
+    # all-gather (which can round tiny averaged gradients to zero and lose
+    # their sign), and the all-gather wire shrinks 4x (world=8: the exchange
+    # loses the payload-heavy all-gather steps that dominated its cost).
+    # Only taken when the optimizer is pure sign-SGD (no momentum); set to 0
+    # to force the full averaged-value halving-doubling allreduce.
+    "AR_TUNE_DDP_SIGN_EXCHANGE": lambda: os.getenv("AR_TUNE_DDP_SIGN_EXCHANGE", "1").lower() in ("1", "true", "yes"),
     # Allreduce algorithm for the DDP gradient exchange: auto | oneshot |
     # halving. halving-doubling moves the bandwidth-optimal 2*(W-1)/W of the
     # payload per rank but pays 2*log2(W) DEPENDENT exchange steps; one-shot

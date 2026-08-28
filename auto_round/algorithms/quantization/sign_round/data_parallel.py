@@ -535,10 +535,25 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
     numel = buffers[0].numel()
     chunk = (numel + world - 1) // world
 
-    # ── reduce-scatter: working block per rank halves each step; each rank
-    # keeps one half (adding the partner's copy of it) and discards the other
-    # (whose values are added into the partner's kept half). Rank r ends up
-    # owning reduced chunk r.
+    _reduce_scatter_halving(buffers, transport)
+    _allgather_doubling(buffers, transport)
+
+    for buf in buffers:
+        buf.mul_(scale)
+
+
+def _reduce_scatter_halving(buffers: List[torch.Tensor], transport: str) -> None:
+    """Recursive-halving reduce-scatter across device-resident buffers.
+
+    The flat space is split into W chunks; the working block per rank halves
+    each step (each rank keeps one half, adding the partner's transport-
+    rounded copy of it). Rank r ends up owning reduced chunk r; the other
+    chunks hold partial garbage. Accumulation stays fp32 on the receiver.
+    Requires a power-of-two world.
+    """
+    world = len(buffers)
+    numel = buffers[0].numel()
+    chunk = (numel + world - 1) // world
     length = world  # chunks in each rank's working block
     while length > 1:
         half = length // 2
@@ -557,8 +572,19 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
                 buffers[rank][chunk * mid : chunk * hi].add_(seg)
         length = half
 
-    # ── all-gather: working block per rank doubles each step; ranks exchange
-    # the chunks the partner owns (copies, no adds)
+
+def _allgather_doubling(buffers: List[torch.Tensor], transport: str) -> None:
+    """Recursive-doubling all-gather of per-rank owned chunks.
+
+    Mirrors the reduce-scatter block structure: the working block per rank
+    doubles each step; ranks exchange the chunks the partner owns (copies,
+    no adds). Every rank ends holding every chunk -- bitwise identical when
+    the transport is lossless for the buffer dtype (fp32 buffers with fp32
+    transport, int8 buffers with fp32 transport).
+    """
+    world = len(buffers)
+    numel = buffers[0].numel()
+    chunk = (numel + world - 1) // world
     length = 2
     while length <= world:
         half = length // 2
@@ -577,8 +603,53 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
                 dst.copy_(_xchg(src, dst.device, dst.dtype, transport))
         length *= 2
 
-    for buf in buffers:
-        buf.mul_(scale)
+
+_SIGN_LOGGED = False
+
+
+def sign_exchange_allreduce(buffers: List[torch.Tensor], transport: str = "fp32") -> None:
+    """In-place sign all-reduce for SignSGD gradients (single process).
+
+    The SignRound optimizer consumes ONLY torch.sign(grad) (weight_decay is
+    always 0), so the averaged gradient's magnitude never reaches the
+    update. This exchanges exactly what the step needs: a recursive-halving
+    reduce-scatter (identical transport rounding of the partials as
+    halving-doubling) leaves rank r owning the reduced chunk r; each rank
+    then computes torch.sign() ONCE on its exact fp32 chunk and the signs
+    are all-gathered as int8 -- a lossless wire format 4x smaller than
+    fp32. Compared to a full halving-doubling allreduce this REMOVES the
+    all-gather's transport rounding (bf16 rounding can zero out tiny
+    averaged gradients, losing their sign), so the signs every rank applies
+    are bitwise identical and at least as faithful to the true fp32 mean.
+
+    Valid only when the optimizer is pure sign-SGD: a momentum buffer or
+    weight decay would mix magnitudes back into the update, so callers must
+    gate on momentum == 0 (weight_decay is hard-wired to 0 in the tuner).
+    """
+    world = len(buffers)
+    if world < 2:
+        for buf in buffers:
+            buf.sign_()
+        return
+    if world & (world - 1):
+        raise ValueError(f"sign_exchange_allreduce needs a power-of-two world, got {world}")
+
+    _reduce_scatter_halving(buffers, transport)
+
+    numel = buffers[0].numel()
+    chunk = (numel + world - 1) // world
+    sign_bufs: List[torch.Tensor] = []
+    for rank, buf in enumerate(buffers):
+        signs = torch.empty(numel, dtype=torch.int8, device=buf.device)
+        lo, hi = chunk * rank, min(numel, chunk * (rank + 1))
+        signs[lo:hi] = torch.sign(buf[lo:hi]).to(torch.int8)
+        sign_bufs.append(signs)
+
+    # fp32 transport on int8 buffers = plain device copies, lossless
+    _allgather_doubling(sign_bufs, "fp32")
+
+    for buf, signs in zip(buffers, sign_bufs):
+        buf.copy_(signs)  # int8 -> fp32: -1.0 / 0.0 / 1.0
 
 
 # hook-written statistics that are safe to merge across mirror copies:
@@ -1157,13 +1228,20 @@ class ReplicaGroup:
             out.append(ps)
         return out
 
-    def sync_grads(self, params_per_replica: List[List[torch.nn.Parameter]], prof=None) -> None:
+    def sync_grads(
+        self, params_per_replica: List[List[torch.nn.Parameter]], prof=None, sign_exchange: bool = False
+    ) -> None:
         """All-reduce v-gradients so every replica holds the identical average.
 
+        ``sign_exchange=True`` (caller-gated to pure sign-SGD, i.e. no
+        momentum) exchanges int8 signs instead of averaged values -- bitwise
+        identical across ranks, at least as faithful to the fp32 mean, and
+        the all-gather wire shrinks 4x (see sign_exchange_allreduce).
         ``prof`` (optional tune profiler) splits the work into bufprep /
         exchange / writeback stages so the profile line shows where the
         allreduce time actually goes.
         """
+        from auto_round import envs
         from auto_round.utils.tune_profile import stage as _stage
 
         if self._overlap is not None or self._init_overlap(params_per_replica):
@@ -1191,7 +1269,18 @@ class ReplicaGroup:
                     )
                 one_shot_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport, prof=prof)
             else:
-                halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
+                if sign_exchange and envs.AR_TUNE_DDP_SIGN_EXCHANGE:
+                    global _SIGN_LOGGED
+                    if not _SIGN_LOGGED:
+                        _SIGN_LOGGED = True
+                        logger.info(
+                            "[tune-ddp] sign-cast exchange engaged: world=%d transport=%s (int8 sign allgather)",
+                            self.world,
+                            self.grad_transport,
+                        )
+                    sign_exchange_allreduce(bufs, transport=self.grad_transport)
+                else:
+                    halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
         with _stage(prof, "writeback"):
             for buf, params in zip(bufs, params_per_replica):
                 _write_back_grads(buf, params)

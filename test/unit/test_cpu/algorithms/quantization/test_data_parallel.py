@@ -23,6 +23,7 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     _write_back_grads,
     halving_doubling_allreduce,
     resolve_ddp_plan,
+    sign_exchange_allreduce,
 )
 
 
@@ -60,6 +61,66 @@ class TestHalvingDoublingAllreduce:
         halving_doubling_allreduce(bufs, scale=0.25, transport="bf16")
         for b in bufs:
             assert torch.allclose(b, expected, rtol=1e-2, atol=1e-2)
+
+
+class TestSignExchangeAllreduce:
+    @pytest.mark.parametrize("world", [2, 4, 8])
+    @pytest.mark.parametrize("n", [96, 100, 5])  # divisible, non-divisible, smaller than world
+    def test_matches_fp32_sign_of_mean(self, world, n):
+        torch.manual_seed(0)
+        bufs = [torch.randn(n) for _ in range(world)]
+        bufs[0][0] = 0.0  # an exact zero in the sum must survive as sign 0
+        avg = torch.stack(bufs).sum(0) / world
+        expected = torch.sign(avg)
+        sign_exchange_allreduce(bufs, transport="fp32")
+        for b in bufs:
+            assert torch.equal(b, expected)  # fp32 transport: exact signs of the mean
+            assert torch.equal(b, bufs[0])  # ranks bitwise identical
+
+    def test_bf16_transport_signs_match_outside_tiny_band(self):
+        torch.manual_seed(1)
+        bufs = [torch.randn(512) for _ in range(4)]
+        avg = torch.stack(bufs).sum(0) / 4
+        expected = torch.sign(avg)
+        sign_exchange_allreduce(bufs, transport="bf16")
+        mism = bufs[0] != expected
+        # the reduce-scatter partials round through bf16, so a sign may flip
+        # only where the averaged gradient is essentially zero
+        assert (avg[mism].abs() < 5e-2).all()
+        for b in bufs:
+            assert torch.equal(b, bufs[0])
+
+    def test_int8_transport_values_and_rank_identity(self):
+        torch.manual_seed(2)
+        bufs = [torch.randn(256) for _ in range(8)]
+        sign_exchange_allreduce(bufs, transport="int8")
+        for b in bufs:
+            assert set(b.unique().tolist()) <= {-1.0, 0.0, 1.0}
+            assert torch.equal(b, bufs[0])
+
+    def test_world_one_signs_in_place(self):
+        torch.manual_seed(3)
+        vals = torch.randn(16)
+        vals[4] = 0.0
+        expected = torch.sign(vals)
+        sign_exchange_allreduce([vals])
+        assert torch.equal(vals, expected)
+
+    def test_non_power_of_two_raises(self):
+        with pytest.raises(ValueError):
+            sign_exchange_allreduce([torch.randn(4) for _ in range(3)])
+
+    def test_optim_sign_update_is_unchanged(self):
+        # the optimizer step is param.add_(sign(d_p), alpha=-lr): feeding it
+        # pre-signed gradients (-1/0/1) must produce the identical update as
+        # feeding it the full averaged gradients
+        g_avg = torch.randn(32)
+        p_ref = torch.randn(32)
+        p_signed = p_ref.clone()
+        lr = 1e-2
+        p_ref.add_(torch.sign(g_avg), alpha=-lr)
+        p_signed.add_(torch.sign(torch.sign(g_avg)), alpha=-lr)
+        assert torch.equal(p_ref, p_signed)
 
 
 class TestGradBuffers:
@@ -155,6 +216,36 @@ class TestReplicaGroup:
         for rep_ps in per_replica:
             for p in rep_ps:
                 assert torch.allclose(p.grad, torch.full_like(p, 2.0))
+        group.teardown()
+
+    def test_sync_grads_sign_exchange(self):
+        block = self._block()
+        plan = DDPPlan(world=2, devices=[torch.device("cpu")] * 2, shard_size=8)
+        group = ReplicaGroup(block, plan)
+        per_replica = group.round_params()
+        for rep_ps, val in zip(per_replica, [1.0, 3.0]):
+            for p in rep_ps:
+                p.grad = torch.full_like(p, val)
+        group.sync_grads(per_replica, sign_exchange=True)
+        for rep_ps in per_replica:
+            for p in rep_ps:
+                # signs of the averaged gradient (2.0), not the average
+                assert torch.equal(p.grad, torch.ones_like(p.grad))
+        group.teardown()
+
+    def test_sync_grads_sign_exchange_env_opt_out(self, monkeypatch):
+        monkeypatch.setenv("AR_TUNE_DDP_SIGN_EXCHANGE", "0")
+        block = self._block()
+        plan = DDPPlan(world=2, devices=[torch.device("cpu")] * 2, shard_size=8)
+        group = ReplicaGroup(block, plan)
+        per_replica = group.round_params()
+        for rep_ps, val in zip(per_replica, [1.0, 3.0]):
+            for p in rep_ps:
+                p.grad = torch.full_like(p, val)
+        group.sync_grads(per_replica, sign_exchange=True)
+        for rep_ps in per_replica:
+            for p in rep_ps:
+                assert torch.allclose(p.grad, torch.full_like(p, 2.0))  # averaged, not signed
         group.teardown()
 
     def test_broadcast_module_attrs(self):
