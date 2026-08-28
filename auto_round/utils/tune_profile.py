@@ -88,7 +88,10 @@ class TuneProfiler:
             for name, ev0, ev1 in self._events:
                 if not ev0.query() or not ev1.query():  # pragma: no cover - defensive
                     continue
-                totals[name] += ev0.elapsed_time(ev1) / 1000.0  # ms -> s
+                try:
+                    totals[name] += ev0.elapsed_time(ev1) / 1000.0  # ms -> s
+                except RuntimeError:  # pragma: no cover - cross-device/broken pair
+                    continue
         return totals
 
     def log_placement(

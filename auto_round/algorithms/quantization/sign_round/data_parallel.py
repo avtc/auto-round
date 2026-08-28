@@ -115,20 +115,28 @@ def enable_peer_access(devices) -> list:
             cudart = ctypes.CDLL("libcudart.so.2")
         except OSError:
             return []
-    for i in devs:
-        for j in devs:
-            if i == j:
-                continue
-            try:
-                can = ctypes.c_int(0)
-                if cudart.cudaDeviceCanAccessPeer(ctypes.byref(can), i, j) != 0 or not can.value:
+    # the raw cudart calls below bypass torch's device-guard bookkeeping: a
+    # leaked cudaSetDevice would silently move the thread's current device
+    # and split later CUDA-event pairs across devices (profiler crashes).
+    # Hold one torch device context around the whole loop so it is restored.
+    saved = torch.cuda.current_device()
+    try:
+        for i in devs:
+            for j in devs:
+                if i == j:
                     continue
-                cudart.cudaSetDevice(i)
-                # cudaErrorPeerAccessAlreadySet (716) is fine
-                cudart.cudaDeviceEnablePeerAccess(j, 0)
-                enabled.append(f"{i}->{j}")
-            except Exception:  # noqa: BLE001 - best effort only
-                continue
+                try:
+                    can = ctypes.c_int(0)
+                    if cudart.cudaDeviceCanAccessPeer(ctypes.byref(can), i, j) != 0 or not can.value:
+                        continue
+                    cudart.cudaSetDevice(i)
+                    # cudaErrorPeerAccessAlreadySet (716) is fine
+                    cudart.cudaDeviceEnablePeerAccess(j, 0)
+                    enabled.append(f"{i}->{j}")
+                except Exception:  # noqa: BLE001 - best effort only
+                    continue
+    finally:
+        torch.cuda.set_device(saved)
     return enabled
 
 
