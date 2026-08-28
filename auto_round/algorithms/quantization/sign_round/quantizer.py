@@ -90,6 +90,58 @@ def _rehome_calibration_state(
     return moved
 
 
+def _shard_recipe_anchor(replica_group):
+    """Anchor the deferred AR_TUNE_RECIPE grids, sharded across the replicas.
+
+    Every wrapped module's init-search is deterministic (weight + imatrix
+    only), so replica r anchoring its round-robin share of the modules
+    produces grids bit-identical to a serial anchor. The anchored
+    (weight_min, weight_max) tensors and the recipe flags are then broadcast
+    to the same-named module on every other replica; frozen recipes pin the
+    min/max margins to constants on all copies exactly like a non-deferred
+    init would.
+    """
+    replicas = replica_group.replicas
+    home = replica_group.home
+    names = [n for n, m in home.named_modules() if getattr(m, "_recipe_anchor_deferred", False)]
+    if not names:
+        return
+    world = len(replicas)
+    owner = {n: i % world for i, n in enumerate(names)}
+
+    def _anchor(r):
+        rep = replicas[r]
+        mods = dict(rep.named_modules())
+        targets = [n for n in names if owner[n] == r]
+        if not targets:
+            return
+        dev_r = next(rep.parameters()).device
+        if dev_r.type == "cuda":
+            with torch.cuda.device(dev_r):
+                for n in targets:
+                    mods[n].anchor_recipe_grid()
+        else:
+            for n in targets:
+                mods[n].anchor_recipe_grid()
+
+    replica_group.run_threaded([lambda r=r: _anchor(r) for r in range(world)])
+
+    mods_by_rep = [dict(rep.named_modules()) for rep in replicas]
+    for n in names:
+        src = mods_by_rep[owner[n]][n]
+        for r in range(world):
+            if r == owner[n]:
+                continue
+            dst = mods_by_rep[r][n]
+            dst.weight_min = src.weight_min.to(device=dst.device, dtype=dst.weight_min.dtype)
+            dst.weight_max = src.weight_max.to(device=dst.device, dtype=dst.weight_max.dtype)
+            dst._tune_recipe = src._tune_recipe
+            dst._tune_recipe_frozen_margins = src._tune_recipe_frozen_margins
+            dst._recipe_anchor_deferred = False  # grid arrived via broadcast
+            if src._tune_recipe_frozen_margins:
+                dst._pin_margins_frozen()
+
+
 def alt2_switch_iter(iters: int, recipe: str, iters2_env: int):
     """Iteration index (exclusive) at which the alt2 re-grid fires, or None.
 
@@ -540,6 +592,36 @@ class SignRoundQuantizer(BaseQuantizer):
         _rehome_deferred = (active_inputs, fp_outputs, _home)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
+        from auto_round import envs as _envs
+
+        batch_size = self.calibration_context.batch_size
+        global_batch_size = batch_size * self.gradient_accumulate_steps
+        global_batch_size = min(nsamples, global_batch_size)
+
+        # ── Optional single-process data parallelism (AR_TUNE_DDP_WORLD) ─────
+        # eligibility resolved BEFORE wrapping: when DDP engages, the recipe
+        # init-search anchor is DEFERRED and runs sharded across the replica
+        # devices (deterministic search on local weights) right after the
+        # mirrors exist -- and before tuning-parameter collection, so frozen
+        # recipes remove the margin parameters everywhere consistently.
+        replica_group = None
+        mirror_optimizers = []
+        mirror_schedules = []
+        params_per_replica = []
+        _dp_world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
+        _dp_placed = False  # True once pools are distributed across the engaged plan
+        _scaler_early = self._get_scaler()  # pylint: disable=assignment-from-none
+        _dp_eligible = (
+            _dp_world > 1
+            and self.iters > 0
+            and _home.type == "cuda"
+            and _scaler_early is None
+            and self.gradient_accumulate_steps == 1
+            and valid_token_mask is None
+            and not self.enable_lfq
+            and isinstance(active_inputs, list)
+            and isinstance(fp_outputs, list)
+        )
         with _bp_stage(_prof_bp, "wrap_search"):
             quantized_layer_names, unquantized_layer_names = self.wrapper_block(
                 block,
@@ -547,7 +629,67 @@ class SignRoundQuantizer(BaseQuantizer):
                 self.enable_norm_bias_tuning,
                 enable_torch_compile=self.compress_context.enable_torch_compile,
                 device=device,
+                defer_recipe_anchor=_dp_eligible,
             )
+        _plan = None
+        if _dp_eligible:
+            from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup, resolve_ddp_plan
+
+            _explicit = [d.strip() for d in str(_envs.AR_TUNE_DDP_DEVICES or "").split(",") if d.strip()]
+            _mirror_bytes = sum(p.numel() * p.element_size() for p in block.parameters()) + sum(
+                p.numel() * p.element_size()
+                for _m in block.modules()
+                if hasattr(_m, "orig_layer")
+                for p in _m.params.values()
+            )
+            _free = None
+            try:
+                _free = {
+                    torch.device("cuda", idx): torch.cuda.mem_get_info(idx)[0]
+                    for idx in range(torch.cuda.device_count())
+                }
+            except Exception:  # pragma: no cover - non-CUDA reachability
+                _free = None
+            from auto_round.algorithms.quantization.sign_round.data_parallel import effective_ddp_groups
+
+            _plan = resolve_ddp_plan(
+                _dp_world,
+                _home,
+                global_batch_size,
+                groups=effective_ddp_groups(),
+                visible_cuda_devices=list(range(torch.cuda.device_count())) if _free else None,
+                explicit_devices=_explicit or None,
+                vram_free_bytes=_free,
+                mirror_footprint_bytes=_mirror_bytes,
+            )
+            if _plan.enabled and _plan.world & (_plan.world - 1) == 0:
+                from auto_round.algorithms.quantization.sign_round.data_parallel import distribute_pool
+
+                # distributed calibration pool: shard-local tune reads; replaces
+                # the serial gather-to-home re-home (each device takes 1/world)
+                with _bp_stage(_prof_bp, "distribute"):
+                    distribute_pool(active_inputs, _plan.devices)
+                    distribute_pool(fp_outputs, _plan.devices)
+                _dp_placed = True
+                _staged_src = getattr(block, "_stream_prefetch_source", None)
+                if _staged_src is not None:
+                    _staged_src = _staged_src.unpack()
+                replica_group = ReplicaGroup(
+                    block, _plan, bf16_grad=bool(_envs.AR_TUNE_DDP_BF16_GRAD), staged_source=_staged_src
+                )
+                for note in _plan.notes:
+                    logger.info("[tune-ddp] %s", note)
+                with _bp_stage(_prof_bp, "sharded_anchor"):
+                    _shard_recipe_anchor(replica_group)
+                logger.info(
+                    "[tune-ddp] engaged: world=%d shard=%d devices=%s bf16_grad=%s",
+                    _plan.world,
+                    _plan.shard_size,
+                    [str(d) for d in _plan.devices],
+                    bool(_envs.AR_TUNE_DDP_BF16_GRAD),
+                )
+            elif _plan.enabled:
+                logger.info("[tune-ddp] disabled: resolved world %d is not a power of two", _plan.world)
 
         def _collect_tuning_params(mod):
             """Collect (round, minmax) params + per-lr groups from a wrapped block."""
@@ -623,9 +765,6 @@ class SignRoundQuantizer(BaseQuantizer):
         init_loss = None
         best_params = {}
         total_loss = 0
-        batch_size = self.calibration_context.batch_size
-        global_batch_size = batch_size * self.gradient_accumulate_steps
-        global_batch_size = min(nsamples, global_batch_size)
         # Compute num_elm once before the loop (used to normalise the accumulated loss).
         # We assume the block input and output shape is same
         if self.gradient_accumulate_steps != 1 and not valid_token_mask:
@@ -655,125 +794,57 @@ class SignRoundQuantizer(BaseQuantizer):
         from auto_round.utils.tune_profile import stage as tune_stage
 
         # ── Optional single-process data parallelism (AR_TUNE_DDP_WORLD) ─────
-        replica_group = None
-        mirror_optimizers = []
-        mirror_schedules = []
-        params_per_replica = []
-        _dp_world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
-        _dp_placed = False  # True once pools are distributed across the engaged plan
-        _dp_eligible = (
-            _dp_world > 1
-            and self.iters > 0
-            and _home.type == "cuda"
-            and scaler is None
-            and self.gradient_accumulate_steps == 1
-            and valid_token_mask is None
-            and not self.enable_lfq
-            and isinstance(active_inputs, list)
-            and isinstance(fp_outputs, list)
-        )
-        if _dp_eligible:
-            from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup, resolve_ddp_plan
-
-            _explicit = [d.strip() for d in str(_envs.AR_TUNE_DDP_DEVICES or "").split(",") if d.strip()]
-            _mirror_bytes = sum(p.numel() * p.element_size() for p in round_params + minmax_params) + sum(
-                p.numel() * p.element_size() for p in block.parameters()
-            )
-            _free = None
+        # (eligibility, plan, mirrors, the sharded recipe anchor and the pool
+        # distribution ran BEFORE parameter collection -- see the early block
+        # after wrapper_block; only mirror optimizers + warm-up remain here)
+        if _dp_eligible and replica_group is not None:
+            # mirror-side optimizers replicate the home group structure
+            for mirror in replica_group.mirrors:
+                r_ps, m_ps, r_gr, m_gr = _collect_tuning_params(mirror)
+                m_params = [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in r_gr.items()]
+                if self.enable_minmax_tuning:
+                    m_params += [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in m_gr.items()]
+                m_opt = self.optimizer(m_params, lr=lr, weight_decay=0, **extra_kwargs)
+                m_sched = (
+                    torch.optim.lr_scheduler.LinearLR(m_opt, start_factor=1.0, end_factor=0.0, total_iters=self.iters)
+                    if self.lr_scheduler is None
+                    else copy.deepcopy(self.lr_scheduler)
+                )
+                mirror_optimizers.append(m_opt)
+                mirror_schedules.append(m_sched)
+            params_per_replica = [
+                r_ps + m_ps if self.enable_minmax_tuning else r_ps
+                for r_ps, m_ps, _r, _m in (_collect_tuning_params(rep) for rep in replica_group.replicas)
+            ]
+            # Warm up every replica SERIALLY in the main thread: torch.compile
+            # materializes its per-device kernels lazily at first call, and
+            # compiling from several worker threads at once races in dynamo.
+            # The warm-up also validates each mirror end-to-end; a failure
+            # ABORTS the run (DDP was explicitly requested -- continuing
+            # serially would silently invalidate the configuration and any
+            # measurement against it). Grads are discarded.
             try:
-                _free = {
-                    torch.device("cuda", idx): torch.cuda.mem_get_info(idx)[0]
-                    for idx in range(torch.cuda.device_count())
-                }
-            except Exception:  # pragma: no cover - non-CUDA reachability
-                _free = None
-            from auto_round.algorithms.quantization.sign_round.data_parallel import effective_ddp_groups
-
-            _plan = resolve_ddp_plan(
-                _dp_world,
-                _home,
-                global_batch_size,
-                groups=effective_ddp_groups(),
-                visible_cuda_devices=list(range(torch.cuda.device_count())) if _free else None,
-                explicit_devices=_explicit or None,
-                vram_free_bytes=_free,
-                mirror_footprint_bytes=_mirror_bytes,
-            )
-            if _plan.enabled and _plan.world & (_plan.world - 1) == 0:
-                from auto_round.algorithms.quantization.sign_round.data_parallel import distribute_pool
-
-                # distributed calibration pool: shard-local tune reads; replaces
-                # the serial gather-to-home re-home (each device takes 1/world)
-                with _bp_stage(_prof_bp, "distribute"):
-                    distribute_pool(active_inputs, _plan.devices)
-                    distribute_pool(fp_outputs, _plan.devices)
-                _dp_placed = True
-                _staged_src = getattr(block, "_stream_prefetch_source", None)
-                if _staged_src is not None:
-                    _staged_src = _staged_src.unpack()
-                replica_group = ReplicaGroup(
-                    block, _plan, bf16_grad=bool(_envs.AR_TUNE_DDP_BF16_GRAD), staged_source=_staged_src
-                )
-                for note in _plan.notes:
-                    logger.info("[tune-ddp] %s", note)
-                # mirror-side optimizers replicate the home group structure
-                for mirror in replica_group.mirrors:
-                    r_ps, m_ps, r_gr, m_gr = _collect_tuning_params(mirror)
-                    m_params = [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in r_gr.items()]
-                    if self.enable_minmax_tuning:
-                        m_params += [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in m_gr.items()]
-                    m_opt = self.optimizer(m_params, lr=lr, weight_decay=0, **extra_kwargs)
-                    m_sched = (
-                        torch.optim.lr_scheduler.LinearLR(
-                            m_opt, start_factor=1.0, end_factor=0.0, total_iters=self.iters
-                        )
-                        if self.lr_scheduler is None
-                        else copy.deepcopy(self.lr_scheduler)
-                    )
-                    mirror_optimizers.append(m_opt)
-                    mirror_schedules.append(m_sched)
-                params_per_replica = [
-                    r_ps + m_ps if self.enable_minmax_tuning else r_ps
-                    for r_ps, m_ps, _r, _m in (_collect_tuning_params(rep) for rep in replica_group.replicas)
-                ]
-                logger.info(
-                    "[tune-ddp] engaged: world=%d shard=%d devices=%s bf16_grad=%s",
-                    _plan.world,
-                    _plan.shard_size,
-                    [str(d) for d in _plan.devices],
-                    bool(_envs.AR_TUNE_DDP_BF16_GRAD),
-                )
-                # Warm up every replica SERIALLY in the main thread: torch.compile
-                # materializes its per-device kernels lazily at first call, and
-                # compiling from several worker threads at once races in dynamo.
-                # The warm-up also validates each mirror end-to-end; a failure
-                # ABORTS the run (DDP was explicitly requested -- continuing
-                # serially would silently invalidate the configuration and any
-                # measurement against it). Grads are discarded.
-                try:
-                    with _bp_stage(_prof_bp, "ddp_setup"):
-                        for r, rep in enumerate(replica_group.replicas):
-                            _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
-                            _dev_r = next(rep.parameters()).device
-                            with torch.cuda.device(_dev_r):
-                                expect_pool_local([fp_outputs[j] for j in _warm], _dev_r, "warmup-ref")
-                                _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
-                                _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
-                                _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
-                                _loss_w.backward()
-                        for _opt in [optimizer] + mirror_optimizers:
-                            _opt.zero_grad()
-                except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
-                    replica_group.teardown()
-                    raise RuntimeError(
-                        "AR_TUNE_DDP_WORLD was requested but the replica warm-up failed -- "
-                        "DDP was explicitly engaged, so refusing to continue on the serial "
-                        "path (that would silently invalidate the requested configuration "
-                        "and any measurement against it). Fix the underlying failure or "
-                        "unset AR_TUNE_DDP_WORLD."
-                    ) from _warm_err
-            elif _plan.enabled:
-                logger.info("[tune-ddp] disabled: resolved world %d is not a power of two", _plan.world)
+                with _bp_stage(_prof_bp, "ddp_setup"):
+                    for r, rep in enumerate(replica_group.replicas):
+                        _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
+                        _dev_r = next(rep.parameters()).device
+                        with torch.cuda.device(_dev_r):
+                            expect_pool_local([fp_outputs[j] for j in _warm], _dev_r, "warmup-ref")
+                            _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
+                            _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
+                            _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
+                            _loss_w.backward()
+                    for _opt in [optimizer] + mirror_optimizers:
+                        _opt.zero_grad()
+            except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
+                replica_group.teardown()
+                raise RuntimeError(
+                    "AR_TUNE_DDP_WORLD was requested but the replica warm-up failed -- "
+                    "DDP was explicitly engaged, so refusing to continue on the serial "
+                    "path (that would silently invalidate the requested configuration "
+                    "and any measurement against it). Fix the underlying failure or "
+                    "unset AR_TUNE_DDP_WORLD."
+                ) from _warm_err
 
         if not _dp_placed:  # serial path (or DDP ineligible): gather-to-home as before
             _rehome_calibration_state(*_rehome_deferred)

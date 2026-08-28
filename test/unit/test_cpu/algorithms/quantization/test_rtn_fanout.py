@@ -72,7 +72,7 @@ def _dense_targets(n=10):
 
 class TestQuantizeTargetsFanout:
     def test_serial_when_single_gpu(self):
-        q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
+        q = _RecordingQuantizer(RTNConfig(parallel_tuning=True))
         with mock.patch("torch.cuda.device_count", return_value=1):
             q._quantize_targets(_dense_targets())
         assert all(dev is None for _, dev in q.calls)
@@ -85,7 +85,7 @@ class TestQuantizeTargetsFanout:
         assert all(dev is None for _, dev in q.calls)
 
     def test_round_robin_across_gpus(self):
-        q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
+        q = _RecordingQuantizer(RTNConfig(parallel_tuning=True))
         with mock.patch("torch.cuda.device_count", return_value=4):
             q._quantize_targets(_dense_targets())
         assert len(q.calls) == 10
@@ -97,14 +97,14 @@ class TestQuantizeTargetsFanout:
             assert by_name[f"layers.0.mlp.linear.{i}"] == f"cuda:{i % 4}"
 
     def test_round_robin_respects_worker_cap(self):
-        q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
+        q = _RecordingQuantizer(RTNConfig(parallel_tuning=True))
         mods = _dense_targets(3)
         with mock.patch("torch.cuda.device_count", return_value=8):
             q._quantize_targets(mods)
         assert sorted(dev for _, dev in q.calls) == ["cuda:0", "cuda:1", "cuda:2"]
 
     def test_empty_targets_noop(self):
-        q = _RecordingQuantizer(RTNConfig(parallel_tuning=None))
+        q = _RecordingQuantizer(RTNConfig(parallel_tuning=True))
         q._quantize_targets([])
         assert q.calls == []
 
@@ -153,7 +153,7 @@ class TestExpertBatching:
 
         # expert batching only pays off when the NeUQI search actually runs,
         # so the gate requires the explicit opt-in
-        q = _RecordingQuantizer(RTNConfig(asym_search="neuqi"), batch=True)
+        q = _RecordingQuantizer(RTNConfig(asym_search="neuqi", parallel_tuning=True), batch=True)
         ar_logger = logging.getLogger("autoround")
         ar_logger.addHandler(caplog.handler)  # autoround logger has propagate=False
         try:

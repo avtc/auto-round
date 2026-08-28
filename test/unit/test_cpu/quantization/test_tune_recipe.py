@@ -912,7 +912,7 @@ class TestTuningFanoutEnv:
 
         monkeypatch.delenv("AR_DISABLE_TUNING_FANOUT", raising=False)
         cfg = RTNConfig(bits=4)
-        assert cfg.parallel_tuning is None  # auto: on when >1 GPU
+        assert cfg.parallel_tuning is False  # serial default; opt in with True
 
     def test_explicit_kwarg_wins_over_env(self, monkeypatch):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
@@ -959,3 +959,112 @@ class TestBiasCorrectAllRows:
         torch.testing.assert_close(mean, torch.full((4,), -0.5), rtol=0, atol=1e-5)
         torch.testing.assert_close(var, torch.zeros(4), rtol=0, atol=1e-4)  # constant noise
         assert os.path.exists(path)
+
+
+class TestDeferredRecipeAnchor:
+    """Mirrors-first flow: deferred anchor == immediate anchor, bit-exact."""
+
+    @staticmethod
+    def _armed(out=8, inp=32, gs=16):
+        import torch.nn as nn
+
+        layer = nn.Linear(inp, out, bias=True)
+        with torch.no_grad():
+            layer.weight.normal_(0, 0.02)
+        layer.bits, layer.group_size, layer.sym = 4, gs, False
+        layer.data_type, layer.act_bits, layer.act_sym = "int", 16, True
+        layer.scale_dtype = torch.float16
+        layer.iters = 20
+        return layer
+
+    @classmethod
+    def _wrap(cls, recipe, monkeypatch, defer=False, weight=None):
+        from auto_round.wrapper import WrapperLinear
+
+        monkeypatch.setenv("AR_TUNE_RECIPE", recipe)
+        layer = cls._armed()
+        if weight is not None:
+            with torch.no_grad():
+                layer.weight.copy_(weight)
+        return WrapperLinear(
+            layer,
+            enable_minmax_tuning=True,
+            enable_round_tuning=True,
+            enable_norm_bias_tuning=False,
+            device="cpu",
+            enable_torch_compile=False,
+            disable_opt_rtn=True,
+            asym_search="auto",
+            iters=20,
+            defer_recipe_anchor=defer,
+        )
+
+    def test_deferred_anchor_matches_immediate_frozen(self, monkeypatch):
+        w_imm = self._wrap("neuqi_frozen_qon", monkeypatch)
+        w_def = self._wrap("neuqi_frozen_qon", monkeypatch, defer=True, weight=w_imm.orig_layer.weight.data)
+        assert w_def._recipe_anchor_deferred is True
+        assert w_def.anchor_recipe_grid() is True
+        torch.testing.assert_close(w_def.weight_min, w_imm.weight_min, rtol=0, atol=0)
+        torch.testing.assert_close(w_def.weight_max, w_imm.weight_max, rtol=0, atol=0)
+        for w in (w_imm, w_def):
+            assert "min_scale" not in w.params and "max_scale" not in w.params
+            assert float(w.min_scale) == 1.0 and float(w.max_scale) == 1.0
+        assert w_def._tune_recipe_frozen_margins is True
+
+    def test_shard_helper_broadcasts_grids(self, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _shard_recipe_anchor
+
+        class _RG:
+            def __init__(self, reps):
+                self.replicas = reps
+                self.home = reps[0]
+
+            def run_threaded(self, fns):
+                for fn in fns:
+                    fn()
+
+        import torch.nn as nn
+
+        base = self._armed()
+        blocks = []
+        for i in range(2):
+            monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_frozen_qon")
+            layer = self._armed()
+            with torch.no_grad():
+                layer.weight.copy_(base.weight.data)  # identical across "replicas"
+            blk = nn.Sequential()
+            blk.add_module("l", layer)
+            blk.l = self._wrap.__func__.__self__._wrap_layer(layer) if False else _wrap_layer(layer)
+            blocks.append(blk)
+        _shard_recipe_anchor(_RG(blocks))
+        for blk in blocks:
+            assert getattr(blk.l, "_recipe_anchor_deferred", False) is False
+            assert "min_scale" not in blk.l.params
+        torch.testing.assert_close(blocks[0].l.weight_min, blocks[1].l.weight_min, rtol=0, atol=0)
+        torch.testing.assert_close(blocks[0].l.weight_max, blocks[1].l.weight_max, rtol=0, atol=0)
+
+
+def _wrap_layer(layer):
+    from auto_round.wrapper import WrapperLinear
+
+    return WrapperLinear(
+        layer,
+        enable_minmax_tuning=True,
+        enable_round_tuning=True,
+        enable_norm_bias_tuning=False,
+        device="cpu",
+        enable_torch_compile=False,
+        disable_opt_rtn=True,
+        asym_search="auto",
+        iters=20,
+        defer_recipe_anchor=True,
+    )
+
+
+class TestFanOutDefault:
+    def test_parallel_tuning_defaults_serial(self, monkeypatch):
+        monkeypatch.delenv("AR_DISABLE_TUNING_FANOUT", raising=False)
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        cfg = RTNConfig()
+        assert cfg.parallel_tuning is False

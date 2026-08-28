@@ -310,7 +310,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         n_gpu = torch.cuda.device_count()
         parallel_tuning = getattr(self.config, "parallel_tuning", None)
         if parallel_tuning is None:
-            parallel_tuning = n_gpu > 1
+            parallel_tuning = False  # default serial (see RTNConfig.parallel_tuning)
         if getattr(self.config, "batch_expert_tuning", True) and self._expert_search_active():
             hint = n_gpu if parallel_tuning and n_gpu > 1 else 0
             batches, targets = self._split_expert_batches(targets, n_jobs_hint=hint)

@@ -226,6 +226,7 @@ class WrapperLinear(torch.nn.Module):
         super(WrapperLinear, self).__init__()
         self.orig_layer = orig_layer
         self.orig_layer.iters = kwargs.pop("iters", 200)
+        self._defer_anchor_requested = kwargs.pop("defer_recipe_anchor", False)
         self.disable_opt_rtn = disable_opt_rtn
         self.asym_search = asym_search
         self.output_device = device
@@ -324,14 +325,21 @@ class WrapperLinear(torch.nn.Module):
             and not isinstance(orig_layer.group_size, tuple)
             and self.orig_layer.data_type == "int"
         ):
-            _anchors = _compute_recipe_anchors(
-                weight_reshape,
-                self.orig_layer.bits,
-                orig_layer.group_size,
-                getattr(orig_layer, "imatrix", None),
-                envs.AR_TUNE_RECIPE,
-                self.device,
-            )
+            if self._defer_anchor_requested:
+                # DDP mirrors-first flow: the (deterministic) init-search runs
+                # sharded across the replica devices AFTER the mirrors exist;
+                # anchor_recipe_grid() recomputes the grouped weight locally
+                self._recipe_anchor_deferred = True
+                _anchors = None
+            else:
+                _anchors = _compute_recipe_anchors(
+                    weight_reshape,
+                    self.orig_layer.bits,
+                    orig_layer.group_size,
+                    getattr(orig_layer, "imatrix", None),
+                    envs.AR_TUNE_RECIPE,
+                    self.device,
+                )
             _touch_scale = getattr(orig_layer, "_touchup_scale", None)
             if _touch_scale is not None:
                 if getattr(orig_layer, "sym", False):
@@ -457,6 +465,54 @@ class WrapperLinear(torch.nn.Module):
             elif isinstance(self.value, torch.Tensor):
                 self.value.zero_()
             return (scale - s_cur).abs().mean().item()
+
+    def anchor_recipe_grid(self):
+        """Run the deferred AR_TUNE_RECIPE init-search and pin the grid now.
+
+        Mirrors-first DDP flow: WrapperLinear was constructed with
+        ``defer_recipe_anchor=True``; each replica device anchors its share of
+        the wrapped modules on LOCAL weights (deterministic search -> identical
+        results), then the anchored grids are broadcast to every replica.
+        Must run before tuning-parameter collection (frozen recipes remove the
+        min/max margin parameters from ``self.params`` exactly like a
+        non-deferred init would).
+        """
+        if not getattr(self, "_recipe_anchor_deferred", False):
+            return False
+        self._recipe_anchor_deferred = False
+        _ow = getattr(self.orig_layer, "get_weight", lambda: self.orig_layer.weight)()
+        if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
+            _ow = _ow.t()
+        w_reshape, _, _ = reshape_pad_tensor_by_group_size(_ow.data, self.orig_layer.group_size)
+        _anchors = _compute_recipe_anchors(
+            w_reshape,
+            self.orig_layer.bits,
+            self.orig_layer.group_size,
+            getattr(self.orig_layer, "imatrix", None),
+            envs.AR_TUNE_RECIPE,
+            self.device,
+        )
+        if _anchors is None:
+            return False
+        _wmin, _wmax, frozen = _anchors
+        self._tune_recipe_frozen_margins = frozen
+        self._tune_recipe = envs.AR_TUNE_RECIPE
+        self.weight_min = _wmin.to(self.weight_min.dtype)
+        self.weight_max = _wmax.to(self.weight_max.dtype)
+        if frozen:
+            self._pin_margins_frozen()
+        return True
+
+    def _pin_margins_frozen(self):
+        """Pin min/max margins to constants, exactly like a non-deferred init.
+
+        Removes them from ``self.params`` (collectors iterate ``params.keys()``)
+        and unregisters the Parameters so plain-tensor assignment is legal.
+        """
+        for _key in ("min_scale", "max_scale"):
+            self.params.pop(_key, None)
+            self._parameters.pop(_key, None)
+            setattr(self, _key, torch.tensor(1.0, device=self.device, dtype=self.weight_min.dtype))
 
     def _init_params(self, name, dtype, shape, value, tunable):
         """Initializes a parameter for tuning or uses a constant if tuning is disabled.

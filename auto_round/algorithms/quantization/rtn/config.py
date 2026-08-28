@@ -83,9 +83,12 @@ class RTNConfig(QuantizationConfig):
             disable_opt_rtn = False
         self.disable_opt_rtn = disable_opt_rtn
 
-        if parallel_tuning is None and envs.AR_DISABLE_TUNING_FANOUT:
-            # AR_DISABLE_TUNING_FANOUT flips the AUTO default to serial; an
-            # explicit parallel_tuning kwarg still wins (no silent overrides)
+        if parallel_tuning is None:
+            # hop fan-out is no longer the AUTO default: the mirrors-first DDP
+            # flow shards the neuqi_* recipe anchors across the group's own
+            # devices, and hopping weights to arbitrary visible GPUs buys
+            # nothing there. AR_DISABLE_TUNING_FANOUT is kept as a no-op for
+            # compat; opt back in with parallel_tuning=True.
             parallel_tuning = False
         self.parallel_tuning = parallel_tuning
         self.batch_expert_tuning = batch_expert_tuning
