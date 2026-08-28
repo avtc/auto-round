@@ -33,6 +33,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import threading
+
 import torch
 import transformers  # noqa: I001  (bias-correction target types)
 
@@ -371,6 +373,11 @@ class AlgorithmComposer:
         # Rotation lifecycle state (populated by apply_model_transforms)
         self._rotation_transforms: list = []
         self._rotation_prepared: bool = False
+        # Serializes layer-wise rotate_layer calls: transforms keep per-weight
+        # registries (e.g. PreSINQ's shadow scales) that are cleared at the end
+        # of each layer, so the background early-transform thread and the
+        # in-loop ready stage must never run concurrently on the same object.
+        self._ready_transform_lock = threading.Lock()
 
     # ── Internal hook helpers (act_max calibration) ───────────────────────────
 
@@ -647,7 +654,13 @@ class AlgorithmComposer:
         # rotation) makes them stale -> mirrors must deep-copy from home instead
         block._stream_weights_pristine = not self.preprocessors and not getattr(self, "_rotation_transforms", None)
         with _prof_stage(_prof, "ready"):
-            self._run_block_ready_transforms(block, block_ctx)
+            if getattr(block, "_bg_ready_done", False):
+                # the streaming orchestrator's background thread already loaded
+                # and transformed this block on its home device
+                logger.debug("[ready] %s: transforms pre-applied by the background thread", block_ctx.block_name)
+            else:
+                with self._ready_transform_lock:
+                    self._run_block_ready_transforms(block, block_ctx)
 
         # ── Step 1: Preprocessor calibration (e.g. AWQ activation stats) ──────
         with _prof_stage(_prof, "pre_calib"), torch.no_grad():
@@ -1028,6 +1041,22 @@ class AlgorithmComposer:
         else:
             for t in self._rotation_transforms:
                 t.rotate_layer(block, layer_idx=block_idx)
+
+    def run_ready_transforms(self, block: "torch.nn.Module", block_ctx: "BlockContext") -> None:
+        """Apply the block's weight-only ready transforms OUTSIDE compress_block.
+
+        Used by the streaming orchestrator's background early-transform thread
+        (default ON; AR_DISABLE_BG_READY_TRANSFORMS opts out): while block N tunes on its ping-pong
+        group, the next block is loaded onto the idle group's home device and
+        its layer-wise transforms run there, taking the transform off the
+        critical path. Serialized against the in-loop ready stage via
+        ``_ready_transform_lock``; activation-dependent preprocessors are NOT
+        run here (they need the calibration chain and stay in-loop).
+        """
+        if not self._rotation_transforms:
+            return
+        with self._ready_transform_lock:
+            self._run_block_ready_transforms(block, block_ctx)
 
     def _finalize_rotation(self, model: "torch.nn.Module") -> None:
         """Finalize layer-wise rotation after all blocks are processed (no-op when inactive)."""

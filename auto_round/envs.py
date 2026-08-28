@@ -129,6 +129,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the reduced precision, but the trajectory changes within fp noise).
     "AR_TUNE_DDP_BF16_GRAD": lambda: os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes"),
     "AR_TUNE_DDP_MERGE_STATS": lambda: os.getenv("AR_TUNE_DDP_MERGE_STATS", "0").lower() in ("1", "true", "yes"),
+    # Background ready-transforms (default ON when eligible): while block N
+    # tunes on its ping-pong group, early-load block N+1 on the idle group's
+    # home device and apply the weight-only layer-wise transforms (e.g. PreSINQ
+    # folds) there, taking the transform off the critical path. Eligibility
+    # still requires >=2 ping-pong staging groups + an active layer-wise
+    # transform + streaming prefetch; activation-dependent preprocessors (AWQ
+    # scale/clip) stay in-loop either way. Set to 1 to opt out.
+    "AR_DISABLE_BG_READY_TRANSFORMS": lambda: os.getenv("AR_DISABLE_BG_READY_TRANSFORMS", "0").lower()
+    in ("1", "true", "yes"),
     # alt2 (alternating re-grid): iterations of the SECOND tuning round after
     # the mid-tune re-grid; 0 = half of --iters.
     "AR_ALT2_ITERS2": lambda: int(os.getenv("AR_ALT2_ITERS2", "0") or 0),

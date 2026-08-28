@@ -1596,6 +1596,86 @@ class CompressionOrchestrator(BaseOrchestrator):
         return True
 
     @staticmethod
+    def _prefetch_replica_eligible(ddp_world: int, stage_devices, composer) -> bool:
+        """Whether the prefetch replica fan-out is worthwhile.
+
+        Staged raw copies only pay off when mirrors can ADOPT them as weights.
+        The pristine gate disables adoption for every block whenever weight
+        transforms are active (layer-wise rotation) or preprocessors will
+        mutate weights in-loop (AWQ clip/scale) -- in that regime the fan-out
+        is pure staging traffic + VRAM: skip it and let mirrors deepcopy the
+        (transformed) home instead.
+        """
+        if not stage_devices or int(ddp_world) <= 1:
+            return False
+        if bool(getattr(composer, "has_layerwise_rotation", False)):
+            return False
+        return not list(getattr(composer, "preprocessors", []) or [])
+
+    def _start_bg_ready_transform(self, block_name: str, home_device, streamer):
+        """Early-load + ready-transform the NEXT block on its idle-group home.
+
+        Spawns a daemon worker that (after a free-VRAM guard on the target
+        home and waiting for the prefetcher to stage the block): streams the
+        block in, re-homes and pins it exactly like the main loop's load
+        stage, then applies the weight-only layer-wise transforms off the
+        critical path while the current block tunes. On success the block is
+        marked ``_bg_ready_done`` (the main loop skips its load stage and
+        compress_block skips the ready stage); on any failure the block is
+        marked ``_bg_ready_failed`` and the main loop reloads it from the
+        checkpoint, resetting any partially applied transform.
+
+        Staged replica copies are released eagerly: the in-place transform
+        invalidates them for mirror adoption (the pristine gate), so keeping
+        them would waste a block of VRAM per replica device.
+        """
+        home = torch.device(home_device)
+
+        def _worker():
+            from auto_round.algorithms.composer import BlockContext
+
+            block = get_module(self.model, block_name)
+            try:
+                if home.type == "cuda":
+                    needed = streamer.prefix_bytes(block_name) + 2 * 1024**3
+                    free, _total = torch.cuda.mem_get_info(home)
+                    if free < needed:
+                        raise MemoryError(f"only {free / 2**30:.1f} GiB free on {home}, need {needed / 2**30:.1f} GiB")
+                if not streamer.wait_until_staged(block_name, timeout=900):
+                    raise TimeoutError("prefetcher did not stage the block within 900s")
+                streamer.load_module_(block, block_name, device=str(home))
+                materialize_model_(block)
+                strip_stale_device_hooks_(block)
+                rehome_block_(block, home)
+                block._stream_home_device = home
+                from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+                SignRoundQuantizer._pin_stream_home(block, home)
+                ctx = BlockContext(
+                    model=self.model,
+                    block_names=[block_name],
+                    block_name=block_name,
+                    block_index=0,
+                )
+                self.alg_composer.run_ready_transforms(block, ctx)
+                streamer.release_replicas(block_name)
+                block._bg_ready_done = True
+                logger.info("[stream] background ready-transform armed %s on %s", block_name, home)
+            except Exception as e:  # noqa: BLE001 - recorded, main path recovers
+                block._bg_ready_failed = repr(e)
+                logger.warning(
+                    "[stream] background ready-transform for %s aborted (%r); the main path will reload it",
+                    block_name,
+                    e,
+                )
+
+        import threading as _threading
+
+        t = _threading.Thread(target=_worker, daemon=True, name="bg-ready-transform")
+        t.start()
+        return t
+
+    @staticmethod
     def _mem_bucket(name: str) -> str:
         """Bucket a module-path name for the device-memory inventory."""
         if ".layers." in name:
@@ -1911,7 +1991,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _ddp_world = int(getattr(envs, "AR_TUNE_DDP_WORLD", 1) or 1)
             except Exception:
                 _ddp_world = 1
-            if stage_devices and _ddp_world > 1:
+            if self._prefetch_replica_eligible(_ddp_world, stage_devices, self.alg_composer):
                 _p_groups = effective_ddp_groups()
                 _all_cuda = [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
 
@@ -1929,15 +2009,63 @@ class CompressionOrchestrator(BaseOrchestrator):
                     rest = [d for d in _all_cuda if d != primary]
                     return rest[: _ddp_world - 1]
 
+            elif stage_devices and _ddp_world > 1:
+                logger.info(
+                    "[stream] staged replica fan-out skipped: weight transforms disable mirror "
+                    "adoption; mirrors will copy the transformed home"
+                )
+
             streamer.start_prefetch(
                 prefetch_names, depth=prefetch_depth, stage_devices=stage_devices, replica_of=_replica_of
             )
+
+        # ── Background ready-transforms (default ON; AR_DISABLE_... opts out) ──
+        # While block N tunes on its ping-pong group, a background thread
+        # early-loads block N+1 on the IDLE group's home device and applies
+        # the weight-only layer-wise transforms there (activation-dependent
+        # preprocessors stay in-loop). Eligible only with >=2 staging groups,
+        # an active layer-wise transform, and a live prefetcher to wait on.
+        _bg_eligible = bool(
+            streamer is not None
+            and stage_devices
+            and len(stage_devices) >= 2
+            and prefetch_depth > 0
+            and prefetch_names
+            and not envs.AR_DISABLE_BG_READY_TRANSFORMS
+            and self.alg_composer.has_layerwise_rotation
+        )
+        _bg_next: dict = {}  # block name -> next block name to early-transform
+        if _bg_eligible:
+            _cut = {}
+            _fi = 0
+            for _gi, _names in enumerate(all_blocks):
+                _rs = resume_states[_gi] if resume_states is not None and _gi < len(resume_states) else None
+                for _ki, _n in enumerate(_names):
+                    _cut[_fi] = _rs is not None and _ki < _rs.resume_index
+                    _fi += 1
+            for _fi in range(len(flat_block_names) - 1):
+                # spawn only from a REAL quantize block onto a REAL one: the
+                # home prediction (stream_block_idx + 1) breaks across resume
+                # iterations that consume no staging slot
+                if not _cut.get(_fi, False) and not _cut.get(_fi + 1, False):
+                    _bg_next[flat_block_names[_fi]] = flat_block_names[_fi + 1]
+            logger.info(
+                "[stream] background ready-transforms armed for %d/%d block(s)",
+                len(_bg_next),
+                max(len(flat_block_names) - 1, 0),
+            )
+        _bg_thread = None
 
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         stream_block_idx = 0
         for g_idx, block_names in enumerate(all_blocks):
             rs = resume_states[g_idx] if resume_states is not None and g_idx < len(resume_states) else None
             for k_idx, block_name in enumerate(block_names):
+                if _bg_thread is not None:
+                    # the worker is bounded (staging wait has a timeout), so a
+                    # plain join cannot hang; its result flag decides below
+                    _bg_thread.join()
+                    _bg_thread = None
                 pbar.set_description(f"Quantizing {block_name}")
                 if rs is not None and k_idx < rs.resume_index:
                     # already durably done in a previous (possibly BPT) run
@@ -1959,25 +2087,45 @@ class CompressionOrchestrator(BaseOrchestrator):
                 import time as _time
 
                 _t_load = _time.perf_counter()
-                if streamer is not None:
-                    if stage_devices:
-                        # round-robin home: the block was staged here, quantize in place
-                        load_device = stage_devices[stream_block_idx % len(stage_devices)]
-                    else:
-                        load_device = str(self.device)
-                    streamer.load_module_(block, block_name, device=load_device)
-                materialize_model_(block)
-                strip_stale_device_hooks_(block)
-                _n_moved = rehome_block_(block, load_device)
-                block._stream_home_device = torch.device(load_device)
-                # pin leaf tuning_device to the home: WrapperLinear prefers it
-                # (wrapper.py self.device = orig_layer.tuning_device or device),
-                # and quantize_block's local device otherwise defaults to the
-                # global primary - the wrapper would drag the wrapped layers
-                # back to cuda:0 while unwrapped siblings (conv1d) stay home.
-                from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+                if getattr(block, "_bg_ready_done", False):
+                    # background early-transform hit: the block was loaded,
+                    # re-homed, pinned and transformed on its home device
+                    # while the previous block tuned
+                    load_device = str(block._stream_home_device)
+                    logger.info(
+                        "[stream] %s: background ready-transform hit (loaded + transformed on %s)",
+                        block_name,
+                        load_device,
+                    )
+                else:
+                    if getattr(block, "_bg_ready_failed", None):
+                        # partial state from an aborted background attempt:
+                        # reloading every leaf from the checkpoint resets any
+                        # partially applied transform
+                        logger.warning(
+                            "[stream] %s: background ready-transform failed (%s); reloading",
+                            block_name,
+                            getattr(block, "_bg_ready_failed", ""),
+                        )
+                    if streamer is not None:
+                        if stage_devices:
+                            # round-robin home: the block was staged here, quantize in place
+                            load_device = stage_devices[stream_block_idx % len(stage_devices)]
+                        else:
+                            load_device = str(self.device)
+                        streamer.load_module_(block, block_name, device=load_device)
+                    materialize_model_(block)
+                    strip_stale_device_hooks_(block)
+                    _n_moved = rehome_block_(block, load_device)
+                    block._stream_home_device = torch.device(load_device)
+                    # pin leaf tuning_device to the home: WrapperLinear prefers it
+                    # (wrapper.py self.device = orig_layer.tuning_device or device),
+                    # and quantize_block's local device otherwise defaults to the
+                    # global primary - the wrapper would drag the wrapped layers
+                    # back to cuda:0 while unwrapped siblings (conv1d) stay home.
+                    from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
 
-                SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
+                    SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
                 if stream_block_idx == 0:
                     logger.info(
                         "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
@@ -2008,6 +2156,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     block._stream_prefetch_source = StagedSourceRef(streamer, block_name)
                 else:
                     block._stream_prefetch_source = None
+                if _bg_thread is None and _bg_eligible:
+                    _tgt = _bg_next.get(block_name)
+                    if _tgt is not None:
+                        _home_next = stage_devices[(stream_block_idx + 1) % len(stage_devices)]
+                        _bg_thread = self._start_bg_ready_transform(_tgt, _home_next, streamer)
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
@@ -2087,6 +2240,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 pbar.update(1)
 
         # ── Pipeline lifecycle: model-level teardown (also finalizes rotation) ─
+        if _bg_thread is not None:
+            _bg_thread.join()
+            _bg_thread = None
         if streamer is not None and prefetch_depth > 0:
             streamer.stop_prefetch()
         self.alg_composer.finalize_run()

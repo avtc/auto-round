@@ -454,6 +454,29 @@ class CheckpointStreamer:
                     del cache[name]
             self._prefetch_replica_ready = {(p, d) for (p, d) in self._prefetch_replica_ready if p != prefix}
 
+    def wait_until_staged(self, prefix: str, timeout: Optional[float] = None) -> bool:
+        """Wait until the prefetch reader has fully staged ``prefix``.
+
+        Returns False when the prefix cannot arrive (reader stopped or failed,
+        or ``timeout`` seconds elapsed). With no prefetch thread running there
+        is nothing to wait for -- :meth:`load_module_` will read from disk.
+        """
+        if self._prefetch_thread is None:
+            return True
+        deadline = None if timeout is None else time.time() + timeout
+        with self._prefetch_cond:
+            while prefix not in self._prefetch_staged:
+                if self._prefetch_stop or self._prefetch_err is not None:
+                    return False
+                if deadline is not None and time.time() >= deadline:
+                    return False
+                self._prefetch_cond.wait(0.5)
+        return True
+
+    def prefix_bytes(self, prefix: str) -> int:
+        """Exact staged size (bytes) of the tensors under ``prefix``."""
+        return self._prefix_bytes_estimate(prefix)
+
     def stop_prefetch(self) -> None:
         """Signal the reader to stop, join it, and clear the staging cache."""
         if self._prefetch_thread is None:
