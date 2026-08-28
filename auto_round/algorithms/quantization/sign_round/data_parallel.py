@@ -94,6 +94,44 @@ def parse_ddp_groups(spec: Optional[str]) -> Optional[List[List[torch.device]]]:
     return groups or None
 
 
+def enable_peer_access(devices) -> list:
+    """Explicitly enable CUDA peer access between every device pair.
+
+    A patched driver can expose full-mesh P2P, but the caching allocator
+    does not necessarily call cudaDeviceEnablePeerAccess for each ordered
+    pair -- and without it every cross-device tensor copy silently stages
+    through host memory (~3-4 GB/s instead of the measured 13-26 GB/s),
+    which showed up as a multi-x allreduce slowdown. Returns the list of
+    enabled "i<->j" pairs for logging.
+    """
+    import ctypes
+
+    devs = sorted({int(getattr(d, "index", d) if getattr(d, "index", None) is not None else d) for d in devices})
+    enabled = []
+    try:
+        cudart = ctypes.CDLL("libcudart.so")
+    except OSError:
+        try:
+            cudart = ctypes.CDLL("libcudart.so.2")
+        except OSError:
+            return []
+    for i in devs:
+        for j in devs:
+            if i == j:
+                continue
+            try:
+                can = ctypes.c_int(0)
+                if cudart.cudaDeviceCanAccessPeer(ctypes.byref(can), i, j) != 0 or not can.value:
+                    continue
+                cudart.cudaSetDevice(i)
+                # cudaErrorPeerAccessAlreadySet (716) is fine
+                cudart.cudaDeviceEnablePeerAccess(j, 0)
+                enabled.append(f"{i}->{j}")
+            except Exception:  # noqa: BLE001 - best effort only
+                continue
+    return enabled
+
+
 def resolve_ddp_plan(
     world: int,
     home: torch.device,
@@ -623,15 +661,29 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
             rmod.params = fixed
 
 
+_PEER_ACCESS_LOGGED = False
+
+
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
     def __init__(self, block, plan: DDPPlan, bf16_grad: bool = False, staged_source=None) -> None:
+        global _PEER_ACCESS_LOGGED
         self.plan = plan
         self.bf16_grad = bf16_grad
         self.home = block
         self.mirrors: List[torch.nn.Module] = []
         self.adopted = 0
+        if not _PEER_ACCESS_LOGGED and any(d.type == "cuda" for d in plan.devices):
+            _PEER_ACCESS_LOGGED = True
+            _pairs = enable_peer_access(plan.devices)
+            if _pairs:
+                logger.info("[tune-ddp] P2P peer access enabled for %d pair(s)", len(_pairs))
+            else:
+                logger.info(
+                    "[tune-ddp] P2P peer access NOT enabled (no accessible pairs); "
+                    "cross-device copies may stage through host memory"
+                )
         for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
             mirror = self._make_mirror(block, dev, staged_source)
             _relocate_params(mirror, dev)
