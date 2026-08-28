@@ -197,6 +197,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (non-fp32 / mixed-device params) falls back to the legacy per-param
     # storage. Set to 0 to restore per-parameter leaf storage.
     "AR_TUNE_DDP_FLAT_VPARAMS": lambda: os.getenv("AR_TUNE_DDP_FLAT_VPARAMS", "1").lower() in ("1", "true", "yes"),
+    # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
+    # fp32 tensors that survived the block teardown and log their referrers --
+    # attributes the per-block VRAM growth without a debugger.
+    "AR_DEBUG_FLAT_LEAK": lambda: os.getenv("AR_DEBUG_FLAT_LEAK", "0").lower() in ("1", "true", "yes"),
     "AR_TUNE_COLL_HOOK_SHARDS": lambda: (
         lambda v: (
             int(v)

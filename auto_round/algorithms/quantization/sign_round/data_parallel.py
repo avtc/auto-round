@@ -608,6 +608,52 @@ def _allgather_doubling(buffers: List[torch.Tensor], transport: str) -> None:
 _SIGN_LOGGED = False
 
 
+def _debug_flat_leak_probe(tag: str) -> None:
+    """AR_DEBUG_FLAT_LEAK=1: name the holders of large surviving flat tensors.
+
+    Scans gc-tracked cuda:0 fp32 tensors of flat-buffer scale after the block
+    teardown; prints each survivor's immediate referrers so a per-block VRAM
+    leak can be attributed without a debugger.
+    """
+    import gc
+
+    from auto_round import envs
+
+    if not getattr(envs, "AR_DEBUG_FLAT_LEAK", False):
+        return
+    gc.collect()
+    hits = []
+    for obj in gc.get_objects():
+        try:
+            if (
+                torch.is_tensor(obj)
+                and obj.device.type == "cuda"
+                and obj.device.index == 0
+                and obj.dtype == torch.float32
+                and obj.numel() > 300_000_000
+            ):
+                hits.append(obj)
+        except Exception:  # noqa: BLE001 - probe must never kill a run
+            continue
+    if not hits:
+        logger.info("[leak-probe/%s] no flat-scale cuda:0 fp32 tensors alive", tag)
+        return
+    for t in hits[:4]:
+        names = []
+        for r in gc.get_referrers(t)[:8]:
+            kind = type(r).__name__
+            if isinstance(r, dict):
+                kind += "[" + ",".join(str(k) for k in list(r.keys())[:3]) + "]"
+            names.append(kind)
+        logger.info(
+            "[leak-probe/%s] cuda:0 fp32 numel=%d (%.2f GB) referrers: %s",
+            tag,
+            t.numel(),
+            t.numel() * 4 / 2**30,
+            names,
+        )
+
+
 def sign_exchange_allreduce(buffers: List[torch.Tensor], transport: str = "fp32") -> None:
     """In-place sign all-reduce for SignSGD gradients (single process).
 

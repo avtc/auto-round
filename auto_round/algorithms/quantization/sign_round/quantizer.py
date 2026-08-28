@@ -1182,6 +1182,9 @@ class SignRoundQuantizer(BaseQuantizer):
             # enable moe experts act_max automatic generation for WrapperWALayer
             set_amax_for_all_moe_layers(block, attr_name="orig_layer.act_max")
 
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _debug_flat_leak_probe
+
+        _debug_flat_leak_probe(f"{getattr(block_ctx, 'block_name', 'block')}-end")
         logger.infoclean(dump_info)
         return best_params
 
