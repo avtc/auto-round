@@ -696,7 +696,12 @@ class ReplicaGroup:
                     if ".orig_layer." in _n:
                         swap.append((p, p.data))
                         p.data = torch.empty(0, dtype=p.dtype, device=p.device)
-            replica = _torch_replicate(block, [dev])[0]
+            # devices[0] must be the tensors' SOURCE device (broadcast goes
+            # FROM it; replicas[0] reuses the originals -- no home duplicate)
+            _src = next(block.parameters()).device
+            if _src == dev:  # pragma: no cover - mirrors never share the home
+                raise RuntimeError("mirror device equals the home device")
+            replica = _torch_replicate(block, [_src, dev])[1]
         finally:
             for p, data in swap:
                 p.data = data

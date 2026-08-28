@@ -110,6 +110,11 @@ def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
 
     # b = mean over ALL calibration rows of (y_fp - y_q): stream the per-sample
     # list (fp32 accumulators, no full cat -- VRAM stays one sample's output).
+    # Under a DDP tune the pool may be scattered across replica devices (the
+    # tune distributes it in place), so per-pair parts can land on different
+    # devices: pin the accumulator to the block's device (also where the bias
+    # will be applied) and move each part before adding.
+    _acc_dev = next(block.parameters(), torch.empty(0)).device
     b = None
     rows = 0
     for y_fp_t, y_q_t in zip(_iter_hidden_tensors(y_fp), _iter_hidden_tensors(y_q)):
@@ -117,7 +122,7 @@ def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
         y_q_t = y_q_t.detach()
         y_q_t = y_q_t.to(y_fp_t.device)  # distributed pool: pair may straddle devices
         d = y_fp_t.to(torch.float32) - y_q_t.to(torch.float32)
-        part = d.sum(dim=tuple(range(d.dim() - 1)))
+        part = d.sum(dim=tuple(range(d.dim() - 1))).to(_acc_dev)
         b = part if b is None else b + part
         rows += d.numel() // d.shape[-1]
     if b is None:

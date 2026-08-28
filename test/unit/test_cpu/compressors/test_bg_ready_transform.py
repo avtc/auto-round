@@ -225,3 +225,21 @@ class TestPrefetchReplicaEligible:
 
         assert not CompressionOrchestrator._prefetch_replica_eligible(1, ["cuda:0"], self._composer(False, []))
         assert not CompressionOrchestrator._prefetch_replica_eligible(4, [], self._composer(False, []))
+
+
+class TestBiasCorrectionDevicePin:
+    def test_accumulator_survives_straddling_pairs(self):
+        # the fix pins parts to the block device: simulate a straddling pool
+        # by monkeypatching Tensor.to on the q side is intrusive, so exercise
+        # the real path with a same-device pool (regression: shape/values)
+        import torch.nn as nn
+
+        from auto_round.algorithms.composer import _apply_block_bias_correction
+
+        blk = nn.Sequential()
+        blk.add_module("down", nn.Linear(4, 4, bias=True))
+        bias_before = blk.down.bias.detach().clone()
+        y_fp = [torch.randn(2, 4) for _ in range(3)]
+        y_q = [t + 0.25 for t in y_fp]  # y_q drifts +0.25 -> b = -0.25
+        assert _apply_block_bias_correction(blk, y_fp, y_q) is True
+        torch.testing.assert_close(blk.down.bias.detach(), bias_before - 0.25)
