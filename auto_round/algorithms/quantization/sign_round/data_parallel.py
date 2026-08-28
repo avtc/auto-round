@@ -227,8 +227,16 @@ def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:
         if isinstance(params, dict):
             for key, val in params.items():
                 if isinstance(val, torch.nn.Parameter):
-                    moved = _move_tensor(val.detach(), device)
-                    params[key] = torch.nn.Parameter(moved, requires_grad=val.requires_grad)
+                    # move IN PLACE: the dict entry and the registered
+                    # _parameters entry are the SAME object by construction
+                    # (wrapper _init_params). Replacing the object here broke
+                    # that aliasing -- optimizers collected the dict's dead
+                    # clone while the forward/backward used the registered
+                    # Parameter, so mirror grads stayed None, sync_grads
+                    # silently skipped the allreduce, and the home stepped on
+                    # its own shard's gradient only (quality regressed,
+                    # monotonically in world size).
+                    val.data = _move_tensor(val.detach(), device)
         for key, val in list(m.__dict__.items()):
             if isinstance(val, torch.Tensor) and val.device != device and val.device.type != "meta":
                 m.__dict__[key] = _move_tensor(val, device)
@@ -757,6 +765,14 @@ class ReplicaGroup:
         """All-reduce v-gradients so every replica holds the identical average."""
         bufs = _param_grad_buffers(params_per_replica)
         if any(b is None for b in bufs):
+            # a replica without gradients means the collected params are not
+            # the ones the forward/backward touched -- the tune would silently
+            # degrade to single-shard updates
+            logger.warning(
+                "[tune-ddp] sync_grads skipped: %d/%d replica(s) have no gradients on their collected params",
+                sum(1 for b in bufs if b is None),
+                len(bufs),
+            )
             return
         halving_doubling_allreduce(bufs, scale=1.0 / self.world, bf16=self.bf16_grad)
         for buf, params in zip(bufs, params_per_replica):

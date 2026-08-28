@@ -184,7 +184,12 @@ class TestDDPEnvGate:
 
 
 class TestRelocateParams:
-    def test_params_dict_entries_recreated_as_fresh_parameters(self):
+    def test_params_dict_entries_move_in_place(self):
+        # the dict entry must stay the SAME object: wrapper _init_params
+        # aliases params[name] with the registered _parameters entry, and the
+        # optimizer collects from the dict while the forward reads the
+        # registered Parameter -- replacing the object here silently broke
+        # mirror tuning (grads landed on an object nobody stepped)
         from auto_round.algorithms.quantization.sign_round.data_parallel import _relocate_params
 
         wrapper = torch.nn.Module()
@@ -194,7 +199,7 @@ class TestRelocateParams:
         _relocate_params(wrapper, torch.device("cpu"))
         new = wrapper.params["v"]
         assert isinstance(new, torch.nn.Parameter)
-        assert new is not old and new.grad is None  # fresh leaf, grad state reset
+        assert new is old  # object identity preserved; data moved in place
         assert torch.equal(new.detach(), old.detach())
 
     def test_non_dict_and_non_params_untouched(self):

@@ -313,3 +313,66 @@ class TestReplicaRepair:
         assert mirror is not home
         for k, hp in home._parameters.items():
             assert mirror._parameters[k] is not hp
+
+
+class TestRelocatePreservesAliasing:
+    def test_relocate_keeps_dict_and_parameters_identical(self):
+        # regression: _relocate_params used to replace params-dict entries
+        # with NEW Parameter objects, breaking the params <-> _parameters
+        # aliasing -- mirror optimizers then collected dead tensors while
+        # the forward used the registered ones (allreduce silently skipped)
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _relocate_params
+
+        class _Wrap(nn.Module):
+            def __init__(self):
+                super().__init__()
+                layer = nn.Linear(4, 4, bias=False)
+                layer.bits = 4
+                self.orig_layer = layer
+                self.v = nn.Parameter(torch.zeros(4))
+                self.min_scale = nn.Parameter(torch.ones(4))
+                self.params = {"v": self.v, "min_scale": self.min_scale}
+                self.weight_min = torch.zeros(4)
+
+        m = _Wrap()
+        assert m.params["v"] is m.v and m.params["min_scale"] is m.min_scale
+        _relocate_params(m, torch.device("cpu"))
+        assert m.params["v"] is m.v
+        assert m.params["min_scale"] is m.min_scale
+        assert m.v.device.type == "cpu" and m.weight_min.device.type == "cpu"
+
+    def test_mirror_grads_flow_to_collected_params(self):
+        # end-to-end contract: after mirror creation + relocate, a backward
+        # must leave .grad on the objects _collect_tuning_params-style walks
+        # (m.params) would hand to the optimizer
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            DDPPlan,
+            ReplicaGroup,
+            _relocate_params,
+        )
+
+        class _Wrap(nn.Module):
+            def __init__(self):
+                super().__init__()
+                layer = nn.Linear(4, 4, bias=False)
+                layer.bits = 4
+                self.orig_layer = layer
+                self.v = nn.Parameter(torch.zeros(4))
+                self.params = {"v": self.v}
+
+            def forward(self, x):
+                return torch.nn.functional.linear(x, self.orig_layer.weight + self.v)
+
+        home = _Wrap()
+        plan = DDPPlan(world=2, shard_size=2, devices=[torch.device("cpu"), torch.device("cpu")])
+        rg = ReplicaGroup.__new__(ReplicaGroup)
+        rg.plan, rg.bf16_grad, rg.home, rg.mirrors, rg.adopted = plan, False, home, [], 0
+        mirror = rg._make_mirror(home, torch.device("cpu"), staged_source=None)
+        _relocate_params(mirror, torch.device("cpu"))
+        x = torch.randn(2, 4)
+        mirror(x).sum().backward()
+        assert mirror.params["v"].grad is not None, "grad must reach the dict-aliased parameter"
