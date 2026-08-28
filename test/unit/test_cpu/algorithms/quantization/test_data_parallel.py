@@ -582,6 +582,49 @@ class TestMirrorStatMerge:
 
 
 class TestDistributedPool:
+    def test_shard_samplers_align_with_pool_layout(self):
+        from auto_round.compressors.utils import shard_samplers
+
+        # nsamples=128, world=8, 1 sample per replica per iteration
+        sams = shard_samplers(128, 8, 1)
+        assert sams is not None and len(sams) == 8
+        shard = 128 // 8
+        seen = set()
+        for r, s in enumerate(sams):
+            for _ in range(shard):  # one full epoch per replica
+                batch = s.next_batch()
+                assert len(batch) == 1
+                j = batch[0]
+                assert r * shard <= j < (r + 1) * shard  # shard-local draws only
+                seen.add(j)
+        assert seen == set(range(128))  # complete, disjoint coverage per epoch
+
+    def test_shard_samplers_multi_draw_and_fallbacks(self):
+        from auto_round.compressors.utils import IndexSampler, shard_samplers
+
+        # batch 8 / world 4 -> 2 samples per replica from a 32-piece shard
+        sams = shard_samplers(128, 4, 2)
+        assert sams is not None
+        for r, s in enumerate(sams):
+            b = s.next_batch()
+            assert len(b) == 2
+            assert all(32 * r <= j < 32 * (r + 1) for j in b)
+        # not applicable: world 1, indivisible pool, oversized draw
+        assert shard_samplers(128, 1, 8) is None
+        assert shard_samplers(130, 8, 1) is None  # 130 % 8 != 0
+        assert shard_samplers(8, 4, 3) is None  # draw 3 > shard 2
+
+    def test_index_sampler_explicit_indices(self):
+        import random
+
+        from auto_round.compressors.utils import IndexSampler
+
+        random.seed(0)
+        s = IndexSampler(4, 2, indices=[10, 11, 12, 13])
+        drawn = [j for _ in range(2) for j in s.next_batch()]
+        assert set(drawn) <= {10, 11, 12, 13}
+        assert s.nsamples == 4
+
     def test_distribute_pool_noop_on_single_device(self):
         from auto_round.algorithms.quantization.sign_round.data_parallel import distribute_pool
 

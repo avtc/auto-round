@@ -27,6 +27,7 @@ from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.compressors.utils import (
     IndexSampler,
     collect_best_params,
+    shard_samplers,
 )
 from auto_round.logger import logger
 from auto_round.utils import (
@@ -774,6 +775,19 @@ class SignRoundQuantizer(BaseQuantizer):
 
         block, sync_gradients = setup_ddp_if_needed_(self, block, device_manager.device_list)
         index_sampler = IndexSampler(nsamples, global_batch_size)
+        # shard-constrained DDP sampling: with the distributed pool, device r
+        # owns samples [r*shard, (r+1)*shard); drawing each replica's
+        # sub-batch from its own shard keeps every per-iteration pool read
+        # device-local (a global shuffled batch scatters pieces across
+        # devices and costs cross-device cats every iteration)
+        _dp_samplers = None
+        if (
+            replica_group is not None
+            and _dp_placed
+            and global_batch_size % replica_group.world == 0
+            and _envs.AR_TUNE_DDP_SHARD_SAMPLER
+        ):
+            _dp_samplers = shard_samplers(nsamples, replica_group.world, global_batch_size // replica_group.world)
         block_fwd = self.block_forward
 
         # When low_gpu_mem_usage is enabled, active_inputs / fp_outputs are intentionally
@@ -870,14 +884,19 @@ class SignRoundQuantizer(BaseQuantizer):
                     m.cur_iter = i
             total_loss = 0
             with tune_stage(tune_prof, "sampler"):
-                global_indices = index_sampler.next_batch()
+                if _dp_samplers is not None:
+                    _shards = [s.next_batch() for s in _dp_samplers]
+                    global_indices = [j for sh in _shards for j in sh]
+                else:
+                    global_indices = index_sampler.next_batch()
                 if valid_token_mask:
                     num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
 
             if replica_group is not None:
                 _world = replica_group.world
-                _shard = len(global_indices) // _world
-                _shards = [global_indices[r * _shard : (r + 1) * _shard] for r in range(_world)]
+                if _dp_samplers is None:
+                    _shard = len(global_indices) // _world
+                    _shards = [global_indices[r * _shard : (r + 1) * _shard] for r in range(_world)]
                 _losses = [None] * _world
 
                 def _dp_replica_step(r, shard):

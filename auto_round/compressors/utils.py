@@ -14,7 +14,7 @@
 import os
 import random
 import re
-from typing import Union
+from typing import List, Optional, Union
 
 import torch
 from torch.amp import autocast
@@ -471,16 +471,23 @@ class IndexSampler:
         indices (List[int]): Shuffled list of indices.
     """
 
-    def __init__(self, nsamples: int, batch_size: int) -> None:
+    def __init__(self, nsamples: int, batch_size: int, indices: Optional[List[int]] = None) -> None:
         """Initializes the sampler.
 
         Args:
             nsamples (int): Total number of samples (must be >= batch_size).
             batch_size (int): Number of indices per batch.
+            indices (list[int], optional): Explicit index pool to shuffle
+                (defaults to ``range(nsamples)``). Used by shard-constrained
+                DDP sampling; ``nsamples`` must equal ``len(indices)``.
 
         Raises:
             ValueError: If batch_size is not in the range (0, nsamples].
         """
+        if indices is None:
+            indices = list(range(nsamples))
+        elif len(indices) != nsamples:
+            raise ValueError(f"indices pool ({len(indices)}) does not match nsamples ({nsamples})")
         if batch_size <= 0 or batch_size > nsamples:
             raise ValueError("batch_size must be > 0 and <= nsamples")
 
@@ -488,7 +495,7 @@ class IndexSampler:
         self.batch_size: int = batch_size
         self.index: int = 0
 
-        self.indices: list[int] = list(range(nsamples))
+        self.indices: list[int] = list(indices)
         random.shuffle(self.indices)
 
     def next_batch(self) -> list[int]:
@@ -507,6 +514,33 @@ class IndexSampler:
         batch = self.indices[self.index : self.index + self.batch_size]
         self.index += self.batch_size
         return batch
+
+
+def shard_samplers(nsamples: int, world: int, batch_per_replica: int) -> Optional[List[IndexSampler]]:
+    """Per-replica index samplers aligned with ``distribute_pool``'s layout.
+
+    The distributed calibration pool gives device r the CONTIGUOUS sample
+    range [r*shard, (r+1)*shard), but a global shuffled sampler draws batches
+    whose pieces live on arbitrary devices -- every tune iteration then pays
+    cross-device copies in each replica's reference/input cat (measured as
+    the misplaced-pool warnings and ~10-40 ms/iter at world=8). These
+    samplers draw each replica's per-iteration sub-batch from its OWN
+    shard, so all pool reads stay device-local at any batch size.
+
+    Statistical properties match the global sampler per epoch: every sample
+    is drawn exactly once per shard-epoch, and each iteration's global batch
+    is a uniform random subset (one draw per shard). Returns None when the
+    layout does not apply (single device, indivisible pool, draw larger
+    than the shard) -- callers fall back to the global sampler.
+    """
+    if world < 2 or nsamples % world != 0:
+        return None
+    shard = nsamples // world
+    if batch_per_replica < 1 or batch_per_replica > shard:
+        return None
+    return [
+        IndexSampler(shard, batch_per_replica, indices=list(range(r * shard, (r + 1) * shard))) for r in range(world)
+    ]
 
 
 def _get_quantized_layer_names_outside_blocks(model, layer_config, supported_types, quant_block_list) -> list:

@@ -152,6 +152,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Only taken when the optimizer is pure sign-SGD (no momentum); set to 0
     # to force the full averaged-value halving-doubling allreduce.
     "AR_TUNE_DDP_SIGN_EXCHANGE": lambda: os.getenv("AR_TUNE_DDP_SIGN_EXCHANGE", "1").lower() in ("1", "true", "yes"),
+    # Shard-constrained DDP sampling (default ON): with the distributed
+    # calibration pool (device r owns samples [r*shard, (r+1)*shard)), each
+    # replica draws its per-iteration sub-batch from its OWN shard instead
+    # of a globally shuffled batch -- every pool read stays device-local
+    # (a global batch scatters pieces across devices, costing cross-device
+    # copies in every replica's reference/input cat, ~10-40 ms/iter at
+    # world=8). Same per-epoch coverage; set to 0 for the global sampler.
+    "AR_TUNE_DDP_SHARD_SAMPLER": lambda: os.getenv("AR_TUNE_DDP_SHARD_SAMPLER", "1").lower() in ("1", "true", "yes"),
     # Allreduce algorithm for the DDP gradient exchange: auto | oneshot |
     # halving. halving-doubling moves the bandwidth-optimal 2*(W-1)/W of the
     # payload per rank but pays 2*log2(W) DEPENDENT exchange steps; one-shot
