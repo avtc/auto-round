@@ -869,9 +869,10 @@ class SignRoundQuantizer(BaseQuantizer):
                 for n, m in block.named_modules():
                     m.cur_iter = i
             total_loss = 0
-            global_indices = index_sampler.next_batch()
-            if valid_token_mask:
-                num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
+            with tune_stage(tune_prof, "sampler"):
+                global_indices = index_sampler.next_batch()
+                if valid_token_mask:
+                    num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
 
             if replica_group is not None:
                 _world = replica_group.world
@@ -898,8 +899,14 @@ class SignRoundQuantizer(BaseQuantizer):
                     replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
                 with tune_stage(tune_prof, "allreduce"):
                     replica_group.sync_grads(params_per_replica)
-                # report the global-batch mean: mean of equal-size shard means
-                total_loss = sum(l.item() for l in _losses if l is not None) / _world
+                # report the global-batch mean: mean of equal-size shard means.
+                # .item() blocks the host until each replica's fwd+loss+bwd has
+                # drained; with P2P transport the allreduce enqueue above is fully
+                # asynchronous, so that drain-wait surfaces HERE, not in the
+                # allreduce stage -- keep it in its own bucket so "other" stays
+                # honest.
+                with tune_stage(tune_prof, "loss_sync"):
+                    total_loss = sum(l.item() for l in _losses if l is not None) / _world
             else:
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
