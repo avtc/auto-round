@@ -774,6 +774,20 @@ def sharded_nograd_forward(
         return runner(block, inputs, input_others, cache_device=out_device)
     shard = n // world
     shards = [list(range(r * shard, (r + 1) * shard)) for r in range(world)]
+    # the input pool typically arrives pooled on the primary device; without
+    # re-placement every shard pulls its pieces cross-device from that ONE
+    # source -- measured at world=8: uniformly 2.3-2.8 s of shard-forward
+    # time versus 0.6-0.8 s for the same pass reading an already-distributed
+    # pool. Distribute first (idempotent, same layout the tune engagement
+    # enforces later); serial consumers afterwards re-gather to home.
+    # Tensor pools only: the helper's contract also admits opaque pools.
+    if (
+        isinstance(inputs, list)
+        and inputs
+        and all(isinstance(t, torch.Tensor) for t in inputs)
+        and (sample_count is None or sample_count == len(inputs))
+    ):
+        distribute_pool(inputs, devices)
     import time as _time
 
     _t_mirrors = _time.perf_counter()

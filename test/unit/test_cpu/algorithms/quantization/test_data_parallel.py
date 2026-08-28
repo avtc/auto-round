@@ -482,6 +482,54 @@ class TestShardedNoGradForward:
         msg = line % call.args[1:]
         assert "world=4" in msg and "nan" not in msg
 
+    def test_input_pool_pre_distributed(self):
+        from unittest.mock import patch
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        block = nn.Linear(2, 1)
+        pool = [torch.randn(1, 2, 2) for _ in range(8)]  # tensor pool: placed
+        runner = self._runner()
+        with patch.object(dp, "distribute_pool", wraps=dp.distribute_pool) as dist:
+            dp.sharded_nograd_forward(
+                runner,
+                block,
+                pool,
+                {},
+                out_device=torch.device("cpu"),
+                devices=[torch.device("cpu")] * 4,
+                sample_count=8,
+            )
+            # shard-local reads: the input pool is placed on the collect
+            # devices BEFORE the threaded forwards
+            dist.assert_called_once_with(pool, [torch.device("cpu")] * 4)
+        # explicit sample_count != len(inputs): skip pre-distribution
+        with patch.object(dp, "distribute_pool", wraps=dp.distribute_pool) as dist2:
+            dp.sharded_nograd_forward(
+                runner,
+                block,
+                pool,
+                {},
+                out_device=torch.device("cpu"),
+                devices=[torch.device("cpu")] * 4,
+                sample_count=4,
+            )
+            dist2.assert_not_called()
+        # opaque (non-tensor) pools keep the historic passthrough contract
+        with patch.object(dp, "distribute_pool", wraps=dp.distribute_pool) as dist3:
+            dp.sharded_nograd_forward(
+                runner,
+                block,
+                list(range(8)),
+                {},
+                out_device=torch.device("cpu"),
+                devices=[torch.device("cpu")] * 4,
+                sample_count=8,
+            )
+            dist3.assert_not_called()
+
     def test_indivisible_falls_back_serial(self):
         import torch.nn as nn
 
