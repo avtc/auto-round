@@ -432,23 +432,6 @@ def distribute_pool(pool: List[torch.Tensor], devices: List[torch.device]) -> No
                 pool[i] = pool[i].to(dev)
 
 
-def _reset_mirror_stats(mirrors: List[torch.nn.Module]) -> None:
-    """Zero hook-written stats on mirrors that will be REUSED (cached).
-
-    Ephemeral mirrors die after their pass, so merged stats vanish with them.
-    A cached mirror survives into the next pass -- without a reset its stale
-    stats would be merged AGAIN (double counting).
-    """
-    for mirror in mirrors:
-        if mirror is None:
-            continue
-        for _n, m_mod in mirror.named_modules():
-            for attr in _MERGEABLE_STATS:
-                m_val = getattr(m_mod, attr, None)
-                if torch.is_tensor(m_val):
-                    setattr(m_mod, attr, torch.zeros_like(m_val))
-
-
 def sharded_nograd_forward(
     runner,
     block,
@@ -458,27 +441,20 @@ def sharded_nograd_forward(
     devices: List[torch.device],
     sample_count: Optional[int] = None,
     merge_stats: bool = False,
-    mirror_cache: Optional[dict] = None,
 ):
     """Parallelize a no-grad collection forward across ``devices``.
 
     The collection passes (reference outputs, quantized-output cascade) are
     plain forwards over the whole sample pool on one GPU while the mirrors
-    idle. Here the pool is split into equal disjoint shards; a copy of the
-    block on each device forwards its shard in a parallel thread; per-shard
-    outputs are parked on ``out_device`` and concatenated in order.
+    idle. Here the pool is split into equal disjoint shards; an ephemeral
+    copy of the block on each device forwards its shard in a parallel thread;
+    per-shard outputs are parked on ``out_device`` and concatenated in order.
     Bit-identical to the serial pass: rows are sample-independent and the
     module copies carry identical weights. Falls back to the serial runner
     call when the pool is not divisible or fewer than two devices are given.
-
-    ``mirror_cache`` (caller-owned {device: module} dict) keeps the mirrors
-    ALIVE across calls -- sequential collection passes over the same block
-    state (fp-input hooks, q-input hooks) build them once instead of per
-    pass. Mirrors are built via replicate+repair on CUDA (deepcopy fallback);
-    merged hook stats are reset on cached mirrors so a later pass cannot
-    double-count. Without a cache, mirrors are dropped (freed) afterwards.
-    Returned pieces stay on the device that computed them (distributed pool);
-    consumers either read shard-locally or use device-safe cats.
+    Mirrors are dropped (freed) afterwards. Returned pieces stay on the
+    device that computed them (distributed pool); consumers either read
+    shard-locally or use device-safe cats.
     """
     world = len(devices)
     n = sample_count if sample_count is not None else (len(inputs) if isinstance(inputs, list) else 0)
@@ -497,15 +473,8 @@ def sharded_nograd_forward(
             reps.append(block)
             mirrors.append(None)
         else:
-            m = mirror_cache.get(dev) if mirror_cache is not None else None
-            if m is None:
-                try:  # replicate+repair: coalesced broadcast, no 2x home spike
-                    m = ReplicaGroup._replicate_mirror(block, dev, None, "")
-                except Exception:  # noqa: BLE001 - CPU / replicate failure
-                    m = copy.deepcopy(block).to(dev)
-                _relocate_params(m, dev)
-                if mirror_cache is not None:
-                    mirror_cache[dev] = m
+            m = copy.deepcopy(block).to(dev)
+            _relocate_params(m, dev)
             reps.append(m)
             mirrors.append(m)
     global _coll_mirror_setup_logged
@@ -545,11 +514,8 @@ def sharded_nograd_forward(
     runner.last_output_dict = None
     if merge_stats:
         _merge_mirror_stats(block, mirrors)
-        if mirror_cache is not None:
-            _reset_mirror_stats(mirrors)
-    if mirror_cache is None:
-        mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
-        reps.clear()
+    mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
+    reps.clear()
     return pieces
 
 
@@ -811,42 +777,6 @@ class ReplicaGroup:
             t.join()
         if errors:
             raise errors[min(errors)]
-
-    def sync_tuning_params(self) -> None:
-        """Copy the home's post-tune wrapper state onto every mirror.
-
-        After the tune the home may have diverged from the mirrors: the
-        best-iteration parameter restore and post-tune passes (e.g. scale
-        refit) write home-side tuning params. Mirrors reused for the
-        post-tune sharded collection must reflect the FINAL state. Weights
-        are untouched by the tune and stay identical; only wrapper params
-        (``_parameters``, the ``params`` dict) and small plain-attr tensors
-        (scale/zp caches) are copied.
-        """
-        home_mods = dict(self.home.named_modules())
-        for mirror in self.mirrors:
-            for name, m_mod in mirror.named_modules():
-                h_mod = home_mods.get(name)
-                if h_mod is None or not hasattr(h_mod, "orig_layer"):
-                    continue
-                for key, hp in h_mod._parameters.items():
-                    if hp is None:
-                        continue
-                    mp = m_mod._parameters.get(key)
-                    if mp is not None and mp.shape == hp.shape:
-                        mp.data.copy_(hp.data.to(mp.device))
-                for key, hv in getattr(h_mod, "params", {}).items():
-                    if not torch.is_tensor(hv):
-                        continue
-                    mv = getattr(m_mod, "params", {}).get(key)
-                    if torch.is_tensor(mv) and mv.shape == hv.shape:
-                        mv.data.copy_(hv.data.to(mv.device))
-                for attr, hv in h_mod.__dict__.items():
-                    if attr.startswith("_") or not torch.is_tensor(hv):
-                        continue
-                    mv = m_mod.__dict__.get(attr)
-                    if torch.is_tensor(mv) and mv.shape == hv.shape:
-                        mv.data.copy_(hv.data.to(mv.device))
 
     def teardown(self) -> None:
         self.mirrors = []
