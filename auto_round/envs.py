@@ -142,6 +142,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         or ("bf16" if os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes") else "fp32")
     ),
     "AR_TUNE_DDP_MERGE_STATS": lambda: os.getenv("AR_TUNE_DDP_MERGE_STATS", "0").lower() in ("1", "true", "yes"),
+    # Allreduce algorithm for the DDP gradient exchange: auto | oneshot |
+    # halving. halving-doubling moves the bandwidth-optimal 2*(W-1)/W of the
+    # payload per rank but pays 2*log2(W) DEPENDENT exchange steps; one-shot
+    # broadcasts each rank's transport-reduced buffer to every peer in a
+    # single concurrent wave (2*(W-1) of payload per rank, one latency hop)
+    # and reduces locally in canonical order. When per-exchange latency
+    # dominates wire bytes (reduced transports on small payloads) one-shot
+    # wins decisively. auto picks one-shot for bf16/int8 at world<=8 and
+    # fp32 at world<=4 (fp32 one-shot at world=8 would park ~2.85 GB of
+    # staging per device); the explicit values force the algorithm.
+    "AR_TUNE_DDP_ALLREDUCE": lambda: (
+        lambda v: (
+            v
+            if v in ("auto", "oneshot", "halving")
+            else (_ for _ in ()).throw(ValueError(f"AR_TUNE_DDP_ALLREDUCE must be auto|oneshot|halving, got {v!r}"))
+        )
+    )(os.getenv("AR_TUNE_DDP_ALLREDUCE", "auto").strip().lower()),
     # Background ready-transforms (default ON when eligible): while block N
     # tunes on its ping-pong group, early-load block N+1 on the idle group's
     # home device and apply the weight-only layer-wise transforms (e.g. PreSINQ

@@ -361,6 +361,33 @@ def _xchg(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, transport: s
     raise ValueError(f"unknown gradient transport {transport!r} (fp32|bf16|int8)")
 
 
+_ONESHOT_LOGGED = False
+
+
+def use_one_shot(world: int, transport: str) -> bool:
+    """Pick the allreduce algorithm (AR_TUNE_DDP_ALLREDUCE=auto|oneshot|halving).
+
+    One-shot trades bandwidth for latency: 2*(W-1) payload per rank instead
+    of halving-doubling's bandwidth-optimal 2*(W-1)/W, but a single
+    concurrency wave instead of 2*log2(W) dependent steps. Reduced transports
+    (bf16/int8) shrink the payload enough that latency dominates everywhere
+    up to world=8; fp32 one-shot only stays comfortable through world=4 --
+    at world=8 its (W-1)=7 fp32 payloads plus a dequant temp park ~2.85 GB
+    per device, so auto keeps halving-doubling there. Explicit values force
+    the algorithm regardless of world/transport.
+    """
+    from auto_round import envs
+
+    mode = envs.AR_TUNE_DDP_ALLREDUCE
+    if mode == "oneshot":
+        return True
+    if mode == "halving":
+        return False
+    if transport in ("bf16", "int8"):
+        return world <= 8
+    return world <= 4
+
+
 def one_shot_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32") -> None:
     """In-place all-reduce via a single full-broadcast wave, then local sums.
 
@@ -371,9 +398,10 @@ def one_shot_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transpor
     every rank's transport-reduced buffer to every peer in ONE concurrent
     wave (W*(W-1) copies) and dequant-adds locally afterwards.
 
-    Staging cost is W*(W-1) transport-dtype payloads plus one fp32 temp per
-    device -- sensible only for int8 at world<=4 (~0.5 GB + ~355 MB). fp32 /
-    bf16 and larger worlds keep halving-doubling.
+    Staging is (W-1) transport-dtype payloads plus one fp32 temp per DEVICE
+    (int8 world=8: ~0.7 GB; bf16 world=8: ~1.6 GB; fp32 world=4: ~1.4 GB).
+    See ``use_one_shot`` for the auto policy; AR_TUNE_DDP_ALLREDUCE forces
+    either algorithm.
     """
     world = len(buffers)
     if world < 2:
@@ -952,8 +980,14 @@ class ReplicaGroup:
             )
             return
         with _stage(prof, "exchange"):
-            if self.grad_transport == "int8" and self.world <= 4:
-                one_shot_allreduce(bufs, scale=1.0 / self.world, transport="int8")
+            if use_one_shot(self.world, self.grad_transport):
+                global _ONESHOT_LOGGED
+                if not _ONESHOT_LOGGED:
+                    _ONESHOT_LOGGED = True
+                    logger.info(
+                        "[tune-ddp] one-shot allreduce engaged: world=%d transport=%s", self.world, self.grad_transport
+                    )
+                one_shot_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
             else:
                 halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
         with _stage(prof, "writeback"):

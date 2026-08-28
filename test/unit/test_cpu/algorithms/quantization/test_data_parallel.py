@@ -727,3 +727,39 @@ class TestOneShotAllreduce:
             one_shot_allreduce(bufs, scale=scale, transport="int8")
             step = torch.stack(base).abs().amax() / 127.0
             torch.testing.assert_close(bufs[0], expected, rtol=0, atol=float(step))
+
+
+class TestAllreduceModeSwitch:
+    def test_env_default_and_validation(self, monkeypatch):
+        from auto_round import envs
+        from auto_round.algorithms.quantization.sign_round.data_parallel import use_one_shot
+
+        monkeypatch.delenv("AR_TUNE_DDP_ALLREDUCE", raising=False)
+        assert envs.AR_TUNE_DDP_ALLREDUCE == "auto"
+        # auto policy: reduced transports one-shot through world=8, fp32 through 4
+        assert use_one_shot(2, "int8") and use_one_shot(4, "int8") and use_one_shot(8, "int8")
+        assert use_one_shot(2, "bf16") and use_one_shot(8, "bf16")
+        assert use_one_shot(4, "fp32")
+        assert not use_one_shot(8, "fp32")
+        monkeypatch.setenv("AR_TUNE_DDP_ALLREDUCE", "oneshot")  # forces regardless
+        assert use_one_shot(8, "fp32")
+        monkeypatch.setenv("AR_TUNE_DDP_ALLREDUCE", "halving")
+        assert not use_one_shot(4, "int8")
+        monkeypatch.setenv("AR_TUNE_DDP_ALLREDUCE", "ring")
+        with pytest.raises(ValueError, match="auto\|oneshot\|halving"):
+            _ = envs.AR_TUNE_DDP_ALLREDUCE
+
+    @pytest.mark.parametrize("transport", ["fp32", "bf16", "int8"])
+    @pytest.mark.parametrize("world", [2, 4, 8])
+    def test_one_shot_parity_all_worlds(self, world, transport):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import one_shot_allreduce
+
+        torch.manual_seed(6)
+        base = [torch.randn(4096) for _ in range(world)]
+        expected = torch.stack(base).mean(0)
+        bufs = [b.clone() for b in base]
+        one_shot_allreduce(bufs, scale=1.0 / world, transport=transport)
+        atol = {"fp32": 1e-6, "bf16": 2e-2, "int8": 1e-1}[transport]
+        torch.testing.assert_close(bufs[0], expected, rtol=0, atol=atol)
+        for b in bufs[1:]:
+            assert torch.equal(b, bufs[0])  # bitwise identical across all ranks
