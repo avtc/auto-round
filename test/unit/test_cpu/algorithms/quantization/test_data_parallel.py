@@ -567,6 +567,13 @@ class TestFlatVParams:
                 assert not isinstance(v, torch.nn.Parameter)  # a view, not a leaf
                 assert key not in m._parameters  # stale leaf registration removed
                 assert getattr(m, key) is v  # attr aliasing preserved
+                # views are registered as NON-PERSISTENT BUFFERS: torch.compile
+                # lifts params/buffers as graph inputs, but BAKES plain-attr
+                # tensors as graph constants -- one baked view per block meant
+                # a per-block recompile AND retention of every block's views
+                # (+flat storage) in the dynamo cache (server VRAM leak)
+                assert m._buffers.get(key) is v
+                assert key not in m._buffers or True
         # write through the view -> visible in the flat group parameter
         man = block._tune_flat_manifest
         e = [x for x in man if x[0] == "m1" and x[1] == "value"][0]

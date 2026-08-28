@@ -1168,7 +1168,12 @@ def build_flat_tuning_params(mod: torch.nn.Module, lr_fn, minmax_lr_fn) -> bool:
         if key in m._parameters:
             del m._parameters[key]  # plain-tensor setattr below requires this
         m.params[key] = view
-        setattr(m, key, view)
+        # register as a NON-PERSISTENT BUFFER, not a plain attr: torch.compile
+        # lifts params/buffers to graph INPUTS, but BAKES plain-attr tensors as
+        # graph constants -- one baked view set per block meant a per-block
+        # guard-miss recompile AND retention of every block's views (+ their
+        # flat storage) in the dynamo cache, ~1.5 GB/block on the home GPU
+        m.register_buffer(key, view, persistent=False)
         manifest.append((name, key, gidx, off, n, tuple(p.shape)))
         cursors[gidx] += n
 
@@ -1229,7 +1234,9 @@ def _rebuild_flat_views(mirror: torch.nn.Module) -> bool:
         if key in m._parameters:
             del m._parameters[key]
         m.params[key] = view
-        setattr(m, key, view)
+        # buffer registration (see build_flat_tuning_params): lifted graph
+        # input, not a baked constant
+        m.register_buffer(key, view, persistent=False)
     _park_flat_grads(mirror, force_new=True)  # fresh group params: park grads on the mirror's own buffer
     return True
 
@@ -1252,14 +1259,21 @@ def _deepcopy_flat_safe(block: torch.nn.Module) -> torch.nn.Module:
     try:
         for name, key, gidx, off, n, shape in manifest:
             m = mods[name]
-            saved.append((m, key, m.params[key]))
-            m.params[key] = groups[gidx].data[off : off + n].view(shape)
-            setattr(m, key, m.params[key])
+            saved.append((m, key, m.params[key], key in m._buffers))
+            swapped = groups[gidx].data[off : off + n].view(shape)
+            m.params[key] = swapped
+            if key in m._buffers:  # buffer-registered views swap in place
+                m._buffers[key] = swapped
+            else:
+                setattr(m, key, swapped)
         mirror = copy.deepcopy(block)
     finally:
-        for m, key, view in saved:
+        for m, key, view, was_buffer in saved:
             m.params[key] = view
-            setattr(m, key, view)
+            if was_buffer:
+                m._buffers[key] = view
+            else:
+                setattr(m, key, view)
     return mirror
 
 
