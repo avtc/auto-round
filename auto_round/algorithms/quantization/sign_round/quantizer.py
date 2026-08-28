@@ -897,8 +897,8 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 with tune_stage(tune_prof, "fwd"):
                     replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
-                with tune_stage(tune_prof, "allreduce"):
-                    replica_group.sync_grads(params_per_replica)
+                # sync_grads stages itself (bufprep / exchange / writeback)
+                replica_group.sync_grads(params_per_replica, prof=tune_prof)
                 # report the global-batch mean: mean of equal-size shard means.
                 # .item() blocks the host until each replica's fwd+loss+bwd has
                 # drained; with P2P transport the allreduce enqueue above is fully

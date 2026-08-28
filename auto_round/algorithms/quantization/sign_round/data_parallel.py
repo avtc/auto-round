@@ -361,6 +361,77 @@ def _xchg(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, transport: s
     raise ValueError(f"unknown gradient transport {transport!r} (fp32|bf16|int8)")
 
 
+def one_shot_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32") -> None:
+    """In-place all-reduce via a single full-broadcast wave, then local sums.
+
+    Halving-doubling pays 2*log2(W) DEPENDENT exchange steps; each step's
+    copy cannot start before the previous step's result exists, so at small
+    payloads the chain latency dominates the wire bytes (measured: int8
+    world=4 allreduce ~195 ms vs ~30 ms of wire). One-shot instead ships
+    every rank's transport-reduced buffer to every peer in ONE concurrent
+    wave (W*(W-1) copies) and dequant-adds locally afterwards.
+
+    Staging cost is W*(W-1) transport-dtype payloads plus one fp32 temp per
+    device -- sensible only for int8 at world<=4 (~0.5 GB + ~355 MB). fp32 /
+    bf16 and larger worlds keep halving-doubling.
+    """
+    world = len(buffers)
+    if world < 2:
+        if buffers:
+            buffers[0].mul_(scale)
+        return
+    if transport not in ("fp32", "bf16", "int8"):
+        raise ValueError(f"unknown gradient transport {transport!r} (fp32|bf16|int8)")
+    with torch.no_grad():
+        dt = buffers[0].dtype
+        devs = [b.device for b in buffers]
+        # wave 0: transport-encode each source ONCE (its own stream); the
+        # int8 amax scalars must be captured HERE -- buffers are mutated by
+        # the scale below, so recomputing amax later would be wrong.
+        payloads, scales = [], []
+        for src in buffers:
+            if transport == "int8":
+                amax = src.abs().amax()
+                inv = 127.0 / amax.clamp_min(torch.finfo(src.dtype).tiny)
+                payloads.append(torch.round(src * inv).clamp_(-127.0, 127.0).to(torch.int8))
+                scales.append(amax)
+            elif transport == "bf16":
+                payloads.append(src.to(torch.bfloat16))
+                scales.append(None)
+            else:
+                # clone: buffers are mutated in wave 2, and a same-device
+                # .to() later is a no-op that would keep the alias alive
+                payloads.append(src.clone())
+                scales.append(None)
+        # wave 1: move every payload (and its int8 scalar) to every peer;
+        # the copies overlap on the fabric -- int8 payloads are 1/4 fp32 so
+        # W*(W-1) of them fit easily
+        recv = [[None] * world for _ in range(world)]
+        scale_d = [[None] * world for _ in range(world)]
+        for r in range(world):
+            for d in range(world):
+                if d != r:
+                    recv[d][r] = payloads[r].to(devs[d], non_blocking=True)
+                    if scales[r] is not None:
+                        scale_d[d][r] = scales[r].to(devs[d], non_blocking=True)
+        # wave 2: canonical reduction. Every rank sums the SAME dequantized
+        # payloads in the SAME (source-index) order -- including its own,
+        # round-tripped through the transport like everyone else's -- so all
+        # ranks end up bitwise identical, and the accumulation tree matches
+        # across ranks exactly like halving-doubling's exchange tree does.
+        # One reusable fp32 temp per device; acc is rebuilt from zero.
+        for d in range(world):
+            acc = buffers[d]
+            acc.zero_()
+            for r in range(world):
+                t = (payloads[r] if r == d else recv[d][r]).to(dt)
+                s_r = scales[r] if r == d else scale_d[d][r]
+                if s_r is not None:
+                    t.mul_(s_r / 127.0)
+                acc.add_(t)
+            acc.mul_(scale)
+
+
 def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32") -> None:
     """In-place all-reduce across device-resident buffers (single process).
 
@@ -859,9 +930,17 @@ class ReplicaGroup:
             out.append(ps)
         return out
 
-    def sync_grads(self, params_per_replica: List[List[torch.nn.Parameter]]) -> None:
-        """All-reduce v-gradients so every replica holds the identical average."""
-        bufs = _param_grad_buffers(params_per_replica)
+    def sync_grads(self, params_per_replica: List[List[torch.nn.Parameter]], prof=None) -> None:
+        """All-reduce v-gradients so every replica holds the identical average.
+
+        ``prof`` (optional tune profiler) splits the work into bufprep /
+        exchange / writeback stages so the profile line shows where the
+        allreduce time actually goes.
+        """
+        from auto_round.utils.tune_profile import stage as _stage
+
+        with _stage(prof, "bufprep"):
+            bufs = _param_grad_buffers(params_per_replica)
         if any(b is None for b in bufs):
             # a replica without gradients means the collected params are not
             # the ones the forward/backward touched -- the tune would silently
@@ -872,9 +951,14 @@ class ReplicaGroup:
                 len(bufs),
             )
             return
-        halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
-        for buf, params in zip(bufs, params_per_replica):
-            _write_back_grads(buf, params)
+        with _stage(prof, "exchange"):
+            if self.grad_transport == "int8" and self.world <= 4:
+                one_shot_allreduce(bufs, scale=1.0 / self.world, transport="int8")
+            else:
+                halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
+        with _stage(prof, "writeback"):
+            for buf, params in zip(bufs, params_per_replica):
+                _write_back_grads(buf, params)
 
     def broadcast_module_attrs(self, attr_names: Tuple[str, ...]) -> None:
         """Copy small anchor attrs (e.g. weight_min/max after a re-grid) to mirrors."""

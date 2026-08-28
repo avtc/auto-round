@@ -678,3 +678,52 @@ class TestGradTransportSwitch:
             halving_doubling_allreduce(work, scale=0.25, transport=transport)
             atol = {"fp32": 1e-6, "bf16": 2e-2, "int8": 1e-1}[transport]
             torch.testing.assert_close(work[0], ref, rtol=0, atol=atol)
+
+
+class TestOneShotAllreduce:
+    @pytest.mark.parametrize("world", [2, 4])
+    @pytest.mark.parametrize("n", [96, 100])
+    def test_matches_reference_mean(self, world, n):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import one_shot_allreduce
+
+        torch.manual_seed(3)
+        bufs = [torch.randn(n) for _ in range(world)]
+        expected = torch.stack(bufs).sum(0) / world
+        one_shot_allreduce(bufs, scale=1.0 / world)  # fp32 default: exact
+        for b in bufs:
+            assert torch.allclose(b, expected, rtol=1e-5, atol=1e-6)
+
+    def test_int8_and_bf16_close_and_identical_across_ranks(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import one_shot_allreduce
+
+        torch.manual_seed(4)
+        base = [torch.randn(4096) for _ in range(4)]
+        expected = torch.stack(base).mean(0)
+        for transport, atol in (("bf16", 2e-2), ("int8", 1e-1)):
+            bufs = [b.clone() for b in base]
+            one_shot_allreduce(bufs, scale=0.25, transport=transport)
+            torch.testing.assert_close(bufs[0], expected, rtol=0, atol=atol)
+            for b in bufs[1:]:
+                assert torch.equal(b, bufs[0])  # every rank holds the same average
+
+    def test_world_one_scales_only(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import one_shot_allreduce
+
+        b = torch.randn(8)
+        one_shot_allreduce([b], scale=0.5)
+        assert b.shape == (8,)  # scaled in place, no crash
+
+    def test_int8_amax_captured_before_scale_mutation(self):
+        # scale is applied per-destination inside the loop; a source whose
+        # amax were recomputed AFTER its own acc.mul_(scale) would dequantize
+        # every later peer with a shrunken scale -- this pins the ordering.
+        from auto_round.algorithms.quantization.sign_round.data_parallel import one_shot_allreduce
+
+        torch.manual_seed(5)
+        base = [torch.randn(2048) for _ in range(4)]
+        for scale in (1.0 / 4, 0.37):  # non-uniform scale also exercises it
+            bufs = [b.clone() for b in base]
+            expected = torch.stack(bufs).sum(0) * scale
+            one_shot_allreduce(bufs, scale=scale, transport="int8")
+            step = torch.stack(base).abs().amax() / 127.0
+            torch.testing.assert_close(bufs[0], expected, rtol=0, atol=float(step))
