@@ -166,8 +166,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # beyond a handful of threads -- measured at world=8, the hook pass runs
     # at 3-5x its world=4 per-sample cost (uniformly across shards), while
     # hookless passes scale cleanly and are never capped. Only applies when
-    # AR_TUNE_DDP_MERGE_STATS=1 lets hook passes shard at all.
-    "AR_TUNE_COLL_HOOK_SHARDS": lambda: int(os.getenv("AR_TUNE_COLL_HOOK_SHARDS", "4") or 0),
+    # AR_TUNE_DDP_MERGE_STATS=1 lets hook passes shard at all. Values above
+    # the engaged world are no-ops; the knee is CPU-dependent (weaker CPUs
+    # convoy earlier).
+    "AR_TUNE_COLL_HOOK_SHARDS": lambda: (
+        lambda v: (
+            int(v)
+            if v.isdigit()
+            else (_ for _ in ()).throw(
+                ValueError(f"AR_TUNE_COLL_HOOK_SHARDS must be a non-negative integer, got {v!r}")
+            )
+        )
+    )(os.getenv("AR_TUNE_COLL_HOOK_SHARDS", "4").strip()),
     # Allreduce algorithm for the DDP gradient exchange: auto | oneshot |
     # halving. halving-doubling moves the bandwidth-optimal 2*(W-1)/W of the
     # payload per rank but pays 2*log2(W) DEPENDENT exchange steps; one-shot
