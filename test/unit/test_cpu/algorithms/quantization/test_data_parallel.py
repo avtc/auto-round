@@ -451,6 +451,37 @@ class TestShardedNoGradForward:
         assert got == list(range(8))
         assert len(runner.calls) == 4
 
+    def test_sharded_collect_breakdown_logged(self):
+        from unittest.mock import patch
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        block = nn.Linear(2, 1)
+        runner = self._runner()
+        dp._coll_profile_count = 0  # force the first-call log
+        with patch.object(dp.logger, "info") as info:
+            dp.sharded_nograd_forward(
+                runner,
+                block,
+                list(range(8)),
+                {},
+                out_device=torch.device("cpu"),
+                devices=[torch.device("cpu")] * 4,
+                sample_count=8,
+            )
+        lines = [c.args[0] for c in info.call_args_list if "sharded collect breakdown" in c.args[0]]
+        assert lines, "expected the per-pass collection breakdown log"
+        line = lines[0]
+        # setup / fwd_wall / fwd_gpu / split / merge all present, and the
+        # %-format args interpolate cleanly (calls' args carry the numbers)
+        for key in ("setup=", "fwd_wall", "fwd_gpu", "split=", "merge="):
+            assert key in line
+        call = info.call_args_list[[c.args[0] for c in info.call_args_list].index(line)]
+        msg = line % call.args[1:]
+        assert "world=4" in msg and "nan" not in msg
+
     def test_indivisible_falls_back_serial(self):
         import torch.nn as nn
 

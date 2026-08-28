@@ -797,11 +797,19 @@ def sharded_nograd_forward(
             (_time.perf_counter() - _t_mirrors) * 1000,
             world,
         )
+    _t_setup_ms = (_time.perf_counter() - _t_mirrors) * 1000
     parts: List = [None] * world
+    fwd_walls = [0.0] * world  # per-thread stores at distinct indices: race-free
+    evs: List = [None] * world
 
     def _run(r):
         rep = reps[r]
         dev_r = _block_device(rep)
+        t_r = _time.perf_counter()
+        ev = None
+        if dev_r.type == "cuda":
+            ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            ev[0].record()
         # outputs stay ON the replica that computed them: the per-sample list
         # returned below is a distributed pool (device r owns shard r's rows)
         if dev_r.type == "cuda":
@@ -809,9 +817,24 @@ def sharded_nograd_forward(
                 parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=dev_r)
         else:
             parts[r] = runner(rep, inputs, input_others, shards[r], cache_device=dev_r)
+        if ev is not None:
+            ev[1].record()
+            evs[r] = ev
+        fwd_walls[r] = (_time.perf_counter() - t_r) * 1000
 
     runner_group = ReplicaGroup.__new__(ReplicaGroup)  # reuse only the thread runner
     runner_group.run_threaded([lambda r=r: _run(r) for r in range(world)])
+    # per-shard GPU times: sync the participating devices (their outputs are
+    # consumed right after anyway -- the first downstream read syncs too)
+    fwd_gpu = [0.0] * world
+    for r, dev in enumerate(devices):
+        if evs[r] is not None:
+            try:
+                torch.cuda.synchronize(dev)
+                fwd_gpu[r] = evs[r][0].elapsed_time(evs[r][1])
+            except RuntimeError:  # a broken pair must never kill the pass
+                fwd_gpu[r] = float("nan")
+    _t_split = _time.perf_counter()
     # Return the SERIAL structure: a per-sample list ([1, S, H] pieces from
     # split_outputs), NOT one flat/batched tensor -- downstream consumers cat
     # per-sample refs along dim 0 (tune loss) and iterate the list for the
@@ -824,15 +847,43 @@ def sharded_nograd_forward(
     # shard's rows); the serial text path leaves it unset so callers fall back
     # to the returned list -- clear the residue to keep that contract.
     runner.last_output_dict = None
+    _t_merge = _time.perf_counter()
     if merge_stats:
         _merge_mirror_stats(block, mirrors)
     mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
     reps.clear()
+    # steady-state breakdown for the collection passes: setup = ephemeral
+    # mirror deepcopy/relocate (per pass!), fwd = threaded shard forwards
+    # (wall includes enqueue, gpu is the device-measured chain incl. the
+    # per-thread output parking), split/merge = host assembly. Logs the first
+    # couple of passes and then every 16th to bound verbosity.
+    global _coll_profile_count
+    _coll_profile_count += 1
+    if _coll_profile_count <= 2 or _coll_profile_count % 16 == 0:
+        _walls = sorted(fwd_walls)
+        _gpus = sorted(fwd_gpu)
+        logger.info(
+            "[tune-ddp] sharded collect breakdown: world=%d n=%d setup=%.0fms "
+            "fwd_wall[min/med/max]=%.0f/%.0f/%.0fms fwd_gpu[min/med/max]=%.0f/%.0f/%.0fms "
+            "split=%.0fms merge=%.0fms",
+            world,
+            n,
+            _t_setup_ms,
+            _walls[0],
+            _walls[len(_walls) // 2],
+            _walls[-1],
+            _gpus[0],
+            _gpus[len(_gpus) // 2],
+            _gpus[-1],
+            (_t_merge - _t_split) * 1000,
+            (_time.perf_counter() - _t_merge) * 1000,
+        )
     return pieces
 
 
 _STAGED_MISS_LOGGED = False
 _MIRROR_PATH_LOGGED = False
+_coll_profile_count = 0
 
 
 def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.device) -> None:
