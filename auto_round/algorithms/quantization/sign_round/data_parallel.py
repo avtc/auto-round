@@ -362,6 +362,23 @@ def _xchg(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, transport: s
 
 
 _ONESHOT_LOGGED = False
+_OVERLAP_LOGGED = False
+
+
+def _encode_transport(t: torch.Tensor, transport: str):
+    """Encode a gradient tensor for wire transport.
+
+    Returns ``(payload, meta)``: the wire tensor (int8 / bfloat16 / fp32) and
+    the int8 per-bucket amax scalar (``None`` for fp32 / bf16). fp32 returns
+    the tensor itself (read-only alias -- callers must not mutate it).
+    """
+    if transport == "int8":
+        amax = t.abs().amax()
+        inv = 127.0 / amax.clamp_min(torch.finfo(t.dtype).tiny)
+        return torch.round(t * inv).clamp_(-127.0, 127.0).to(torch.int8), amax
+    if transport == "bf16":
+        return t.to(torch.bfloat16), None
+    return t, None
 
 
 def use_one_shot(world: int, transport: str) -> bool:
@@ -389,6 +406,27 @@ def use_one_shot(world: int, transport: str) -> bool:
     # survive contact with the machine. Flip to one-shot explicitly to help
     # profile the wave structure (encode/copy/reduce sub-stages are logged).
     return False
+
+
+def _canonical_bucket_sum(payloads, metas, transport: str, dtype: torch.dtype) -> torch.Tensor:
+    """Sum transport-encoded bucket payloads in canonical (source-index) order.
+
+    Every contribution -- including the local one -- enters as the SAME
+    dequantized payload every other rank sums, so all ranks end up bitwise
+    identical (the same guarantee halving-doubling's exchange tree gives).
+    """
+    acc = None
+    for payload, meta in zip(payloads, metas):
+        t = payload.to(dtype)
+        if transport == "int8" and meta is not None:
+            t = t.mul_(meta.to(dtype) / 127.0)
+        if acc is None:
+            # fp32 transport aliases the payload (to() is a no-op) -- clone so
+            # the in-place adds never mutate the caller's staging slot
+            acc = t.clone() if t is payload else t
+        else:
+            acc.add_(t)
+    return acc
 
 
 def one_shot_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32", prof=None) -> None:
@@ -847,6 +885,9 @@ class ReplicaGroup:
             self.mirrors.append(mirror)
         self.replicas = [block] + self.mirrors
         self.world = len(self.replicas)
+        # overlapped-exchange state (built lazily on first sync_grads; None
+        # keeps the classic sequential exchange)
+        self._overlap = None
         logger.info(
             "[tune-ddp] world=%d devices=%s adopted=%d/%d",
             self.world,
@@ -960,6 +1001,141 @@ class ReplicaGroup:
                     param.data = staged[key].to(param.device)
         return replica
 
+    def _init_overlap(self, params_per_replica) -> bool:
+        """Build hook + staging state for the overlapped gradient exchange.
+
+        For every replica r and bucket k (one bucket per collected v-param):
+        a ``register_post_accumulate_grad_hook`` fires mid-backward, encodes
+        the bucket on replica r's SIDE stream and copies the payload into
+        preallocated staging slots on every device d (including a self-slot
+        at [d==r], so every rank later sums the identical transport-rounded
+        bits). Copies into device d go onto d's side stream -- never the
+        default stream, which is busy running backward: this is what lets
+        the wire work overlap the remaining layers instead of queueing
+        behind the whole drain.
+
+        Stream ordering contract:
+        - side_r.wait_stream(default_r) inside the hook waits exactly up to
+          this bucket's accumulation (an event, not the whole backward);
+        - cross-device copy_ event-syncs the SOURCE device's current stream
+          (side_r, where the encode ran) onto the destination side stream;
+        - sync_grads' tail makes every default stream wait its side stream
+          before the canonical reduce, and the optimizer step then runs on
+          the default stream -- fully ordered, nothing asynchronous leaks.
+        """
+        from auto_round import envs
+
+        if envs.AR_DISABLE_OVERLAP_EXCHANGE:
+            return False
+        if self.world < 2 or not hasattr(torch.Tensor, "register_post_accumulate_grad_hook"):
+            return False
+        devs = []
+        for params in params_per_replica:
+            if not params:
+                return False
+            devs.append(params[0].device)
+        if any(d.type != "cuda" for d in devs):
+            return False
+        n_buckets = min(len(params) for params in params_per_replica)
+        if n_buckets < 1:
+            return False
+        wire_dt = {"int8": torch.int8, "bf16": torch.bfloat16}.get(self.grad_transport, torch.float32)
+        side = [torch.cuda.Stream(device=d) for d in devs]
+        # staging[d][r][k]: replica r's encoded bucket k as received on device d
+        staging = [[None] * self.world for _ in range(self.world)]
+        metas = [[None] * self.world for _ in range(self.world)]
+        for d in range(self.world):
+            for r in range(self.world):
+                staging[d][r] = [torch.empty(p.numel(), dtype=wire_dt, device=devs[d]) for p in params_per_replica[r]]
+                metas[d][r] = [torch.empty((), dtype=torch.float32, device=devs[d]) for _ in range(n_buckets)]
+        acc = [
+            torch.empty(max(p.numel() for p in params), dtype=torch.float32, device=d)
+            for d, params in zip(devs, params_per_replica)
+        ]
+        hooks = []
+        for r in range(self.world):
+            for k in range(n_buckets):
+                hooks.append(
+                    params_per_replica[r][k].register_post_accumulate_grad_hook(
+                        self._make_bucket_hook(r, k, devs, side, staging, metas)
+                    )
+                )
+        self._overlap = {
+            "devs": devs,
+            "side": side,
+            "staging": staging,
+            "metas": metas,
+            "acc": acc,
+            "hooks": hooks,
+            "n_buckets": n_buckets,
+        }
+        global _OVERLAP_LOGGED
+        if not _OVERLAP_LOGGED:
+            _OVERLAP_LOGGED = True
+            logger.info(
+                "[tune-ddp] overlapped gradient exchange engaged: world=%d transport=%s buckets=%d",
+                self.world,
+                self.grad_transport,
+                n_buckets,
+            )
+        return True
+
+    def _make_bucket_hook(self, r, k, devs, side, staging, metas):
+        transport = self.grad_transport
+        world = self.world
+        dev_r = devs[r]
+
+        def hook(grad):
+            cur = torch.cuda.current_stream(dev_r)
+            with torch.cuda.device(dev_r):
+                side[r].wait_stream(cur)
+                with torch.cuda.stream(side[r]):
+                    payload, meta = _encode_transport(grad.detach(), transport)
+                    for d in range(world):
+                        with torch.cuda.device(devs[d]), torch.cuda.stream(side[d]):
+                            staging[d][r][k].copy_(payload, non_blocking=True)
+                            if meta is not None:
+                                metas[d][r][k].copy_(meta, non_blocking=True)
+
+        return hook
+
+    def _finish_overlap(self, params_per_replica, prof) -> None:
+        """Wait the side streams and run the canonical per-bucket reduction."""
+        from auto_round.utils.tune_profile import stage as _stage
+
+        ov = self._overlap
+        with _stage(prof, "exchange"):
+            for d, dev in enumerate(ov["devs"]):
+                with torch.cuda.device(dev):
+                    torch.cuda.current_stream(dev).wait_stream(ov["side"][d])
+            for k in range(ov["n_buckets"]):
+                for d, dev in enumerate(ov["devs"]):
+                    p = params_per_replica[d][k]
+                    if p.grad is None:
+                        # a replica without gradients means the backward never
+                        # touched this bucket -- its staging slot holds the
+                        # PREVIOUS iteration's payload and the tune would
+                        # silently degrade; same loud contract as the
+                        # sequential path
+                        logger.warning(
+                            "[tune-ddp] overlap exchange: replica %d bucket %d has no gradient; "
+                            "left its local (un-averaged) value in place",
+                            d,
+                            k,
+                        )
+                        continue
+                    with torch.cuda.device(dev):
+                        total = _canonical_bucket_sum(
+                            [row[k] for row in ov["staging"][d]],
+                            [row[k] for row in ov["metas"][d]],
+                            self.grad_transport,
+                            torch.float32,
+                        )
+                        acc = ov["acc"][d][: p.numel()]
+                        acc.copy_(total)
+                        acc.mul_(1.0 / self.world)
+                        p.grad.copy_(acc.view_as(p.grad))
+
     def round_params(self) -> List[List[torch.nn.Parameter]]:
         out = []
         for rep in self.replicas:
@@ -979,6 +1155,9 @@ class ReplicaGroup:
         """
         from auto_round.utils.tune_profile import stage as _stage
 
+        if self._overlap is not None or self._init_overlap(params_per_replica):
+            self._finish_overlap(params_per_replica, prof)
+            return
         with _stage(prof, "bufprep"):
             bufs = _param_grad_buffers(params_per_replica)
         if any(b is None for b in bufs):
@@ -1043,6 +1222,10 @@ class ReplicaGroup:
             raise errors[min(errors)]
 
     def teardown(self) -> None:
+        ov, self._overlap = self._overlap, None
+        if ov is not None:
+            for h in ov["hooks"]:
+                h.remove()
         self.mirrors = []
         self.replicas = [self.home]
 

@@ -763,3 +763,75 @@ class TestAllreduceModeSwitch:
         torch.testing.assert_close(bufs[0], expected, rtol=0, atol=atol)
         for b in bufs[1:]:
             assert torch.equal(b, bufs[0])  # bitwise identical across all ranks
+
+
+class TestOverlapExchange:
+    def test_encode_transport(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _encode_transport
+
+        g = torch.randn(10000)
+        q, meta = _encode_transport(g, "int8")
+        assert q.dtype == torch.int8 and meta is not None
+        step = g.abs().amax() / 127.0
+        torch.testing.assert_close(q.to(torch.float32) * (meta / 127.0), g, rtol=0, atol=float(step))
+        b, m = _encode_transport(g, "bf16")
+        assert b.dtype == torch.bfloat16 and m is None
+        f, m2 = _encode_transport(g, "fp32")
+        assert f is g and m2 is None
+
+    def test_canonical_bucket_sum_matches_mean_and_is_reusable(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _canonical_bucket_sum,
+            _encode_transport,
+        )
+
+        torch.manual_seed(7)
+        base = [torch.randn(4096) for _ in range(4)]
+        for transport, atol in (("fp32", 1e-6), ("bf16", 2e-2), ("int8", 1e-1)):
+            enc = [_encode_transport(b, transport) for b in base]
+            payloads = [e[0] for e in enc]
+            metas = [e[1] for e in enc]
+            # call twice: the second call must see identical inputs (no
+            # in-place mutation of the payloads through aliasing)
+            first = _canonical_bucket_sum(payloads, metas, transport, torch.float32).clone()
+            second = _canonical_bucket_sum(payloads, metas, transport, torch.float32)
+            assert torch.equal(first, second)
+            expected = torch.stack(base).mean(0)
+            torch.testing.assert_close(first / 4.0, expected, rtol=0, atol=atol)
+
+    def test_cpu_group_stays_on_sequential_path(self):
+        # the overlap machinery is CUDA-only; a CPU group must keep working
+        # through the classic exchange and leave _overlap unset
+        from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup
+
+        class _Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.randn(16))
+
+            def forward(self, x):
+                return x * self.w
+
+        blk = _Tiny()
+        blk.params = {"v": blk.w}  # type: ignore[attr-defined]
+        group = ReplicaGroup(
+            blk, DDPPlan(world=2, devices=[torch.device("cpu")] * 2, shard_size=1), grad_transport="fp32"
+        )
+        per_rep = group.round_params()
+        for ps in per_rep:
+            for p in ps:
+                p.grad = p.detach().clone()
+        group.sync_grads(per_rep)
+        for ps in per_rep:
+            for p in ps:
+                assert p.grad is not None
+        assert group._overlap is None
+        group.teardown()
+
+    def test_env_opt_out_blocks_overlap(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_DISABLE_OVERLAP_EXCHANGE", raising=False)
+        assert envs.AR_DISABLE_OVERLAP_EXCHANGE is False
+        monkeypatch.setenv("AR_DISABLE_OVERLAP_EXCHANGE", "1")
+        assert envs.AR_DISABLE_OVERLAP_EXCHANGE is True
