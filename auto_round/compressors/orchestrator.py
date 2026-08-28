@@ -1675,6 +1675,104 @@ class CompressionOrchestrator(BaseOrchestrator):
         t.start()
         return t
 
+    def _start_bg_pack_block(
+        self,
+        block,
+        block_name: str,
+        load_device,
+        layer_config: dict,
+        nblocks: int,
+        tied_weights_layers,
+        rs,
+        q_snap,
+        fp_snap,
+        is_model_last: bool,
+    ):
+        """Pack + shard-write the FINISHED block in a background thread.
+
+        Runs while the main loop advances to the next block (which tunes on
+        the other ping-pong group): :func:`immediate_pack_block` on the
+        block's home device, then the leaf saves, block-scope write, flush,
+        resume-manifest update and meta-release -- exactly the serial tail,
+        on the now-idle group. ``q_snap``/``fp_snap`` are CAPTURED references
+        to the next block's inputs (the main loop mutates ``calib_state``
+        the moment it advances); ``mark_block_done`` must receive those, not
+        a live dict read. Exactly one pipeline thread runs at a time (the
+        loop joins the previous one first): shard writes stay ordered and
+        the lock-free ShardWriter has a single writer. A worker failure is
+        re-raised at join time -- a silently skipped pack would corrupt the
+        checkpoint.
+        """
+        import threading as _threading
+
+        holder = {"exc": None, "pack": 0.0, "write": 0.0}
+
+        def _worker():
+            import time as _wtime
+
+            try:
+                _t0 = _wtime.perf_counter()
+                from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
+
+                _immediate_pack_block(block, block_name, layer_config, nblocks=nblocks, device=load_device)
+                holder["pack"] = _wtime.perf_counter() - _t0
+                if self.compress_context.is_immediate_saving:
+                    _t0 = _wtime.perf_counter()
+                    # Save non-quantized leaf modules (e.g. norms, embeddings in block).
+                    for _n, m in block.named_modules():
+                        if (
+                            not any(m.children())
+                            and len(m.state_dict()) > 0
+                            and hasattr(m, "global_name")
+                            and m.global_name not in tied_weights_layers
+                            and not check_to_quantized(m)
+                        ):
+                            set_module(self.model, m.global_name, copy.deepcopy(m))
+                            self.shard_writer.write(name=m.global_name)
+                            get_module(self.model, m.global_name).to("meta")
+                            m.to("meta")
+                    # Write at block scope for any remaining params/buffers.
+                    self.shard_writer.write(name=block_name)
+                    block.to("meta")
+                    holder["write"] = _wtime.perf_counter() - _t0
+                    if rs is not None:
+                        # crash-durability contract, same as the serial path:
+                        # the manifest may claim this block done only after
+                        # its tensors are durably flushed to a shard file
+                        self.shard_writer._flush_shard()
+                        rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
+                    logger.info(
+                        "[stream] bg pack+write %s: pack %.1fs write %.1fs",
+                        block_name,
+                        holder["pack"],
+                        holder["write"],
+                    )
+                else:
+                    mv_module_from_gpu(block)
+                    logger.info("[stream] bg pack %s: pack %.1fs", block_name, holder["pack"])
+            except BaseException as e:  # noqa: BLE001 - re-raised at join
+                holder["exc"] = e
+            finally:
+                clear_memory()
+
+        t = _threading.Thread(target=_worker, daemon=True, name=f"bg-pack-{block_name}")
+        t.autoround_state = holder
+        t.start()
+        return t
+
+    @staticmethod
+    def _join_bg_pack(thread) -> None:
+        """Join a background pack pipeline, surfacing any worker failure."""
+        thread.join()
+        holder = getattr(thread, "autoround_state", None) or {}
+        exc = holder.get("exc")
+        if exc is not None:
+            raise RuntimeError(
+                f"background pack pipeline for a block failed ({exc!r}); refusing to continue -- "
+                "the checkpoint would silently miss packed tensors. Fix the underlying failure "
+                "or set AR_DISABLE_BG_PACK=1."
+            ) from exc
+
     @staticmethod
     def _mem_bucket(name: str) -> str:
         """Bucket a module-path name for the device-memory inventory."""
@@ -2056,6 +2154,24 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         _bg_thread = None
 
+        # ── Background pack pipeline (default ON; AR_DISABLE_BG_PACK opts out)
+        # The finished block's immediate-pack + shard-write tail runs in a
+        # background thread on its (now idle) ping-pong home while the loop
+        # advances to the next block's tune on the other group. Eligible only
+        # with >=2 staging groups (the finished block must stay GPU-resident
+        # on a group nobody else needs) and immediate packing; exactly one
+        # pipeline thread runs at a time (the loop joins the previous one
+        # before spawning the next, ordering shard writes and serializing the
+        # lock-free ShardWriter behind a single writer at any moment).
+        _bg_pack_eligible = bool(
+            streamer is not None
+            and stage_devices
+            and len(stage_devices) >= 2
+            and self.compress_context.is_immediate_packing
+            and not envs.AR_DISABLE_BG_PACK
+        )
+        _bg_pack = None
+
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         stream_block_idx = 0
         for g_idx, block_names in enumerate(all_blocks):
@@ -2068,6 +2184,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _bg_thread = None
                 pbar.set_description(f"Quantizing {block_name}")
                 if rs is not None and k_idx < rs.resume_index:
+                    if _bg_pack is not None:
+                        # the BPT resume-apply path packs + writes on THIS
+                        # thread; the background pipeline must be quiesced
+                        # first (single ShardWriter writer at a time)
+                        self._join_bg_pack(_bg_pack)
+                        _bg_pack = None
                     # already durably done in a previous (possibly BPT) run
                     if self._stream_resume_done_block(
                         block_name,
@@ -2181,7 +2303,35 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
                 if streamer is not None:
                     streamer.release_replicas(block_name)
-                if self.compress_context.is_immediate_packing:
+                if _bg_pack is not None:
+                    # the previous block's pipeline must finish before this
+                    # block's spawn: shard-write order follows quantization
+                    # order and the ShardWriter has no internal locking
+                    self._join_bg_pack(_bg_pack)
+                    _bg_pack = None
+                if _bg_pack_eligible:
+                    # pack + write of the FINISHED block move to a background
+                    # pipeline thread: they run on this block's (now idle)
+                    # ping-pong home while the loop advances to the next
+                    # block's tune on the other group. Snapshots of the next
+                    # block's inputs are captured NOW -- the main loop mutates
+                    # calib_state as soon as it advances.
+                    _q_snap = calib_state.get("q_inputs") if calib_state is not None else None
+                    _fp_snap = calib_state["fp_inputs"] if calib_state is not None else None
+                    _is_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
+                    _bg_pack = self._start_bg_pack_block(
+                        block,
+                        block_name,
+                        load_device,
+                        self.layer_config,
+                        self.nblocks,
+                        tied_weights_layers,
+                        rs,
+                        _q_snap,
+                        _fp_snap,
+                        _is_last,
+                    )
+                elif self.compress_context.is_immediate_packing:
                     _t_pack = _time.perf_counter()
                     from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
@@ -2193,7 +2343,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _t_pack = 0.0
 
                 # ── Infrastructure: shard write / device cleanup ──────────
-                if self.compress_context.is_immediate_saving:
+                if not _bg_pack_eligible and self.compress_context.is_immediate_saving:
                     _t_write = _time.perf_counter()
                     # Save non-quantized leaf modules (e.g. norms, embeddings in block).
                     for _n, m in block.named_modules():
@@ -2229,7 +2379,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                             calib_state.get("q_inputs") if calib_state is not None else None,
                             (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None,
                         )
-                else:
+                elif not _bg_pack_eligible:
                     mv_module_from_gpu(block)
                     if self.compress_context.low_cpu_mem_usage and streamer is None:
                         self._offloader(self.model, block_name)
@@ -2243,6 +2393,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         if _bg_thread is not None:
             _bg_thread.join()
             _bg_thread = None
+        if _bg_pack is not None:
+            # final save/index write below reads the ShardWriter state; the
+            # last block's pack pipeline must be complete first
+            self._join_bg_pack(_bg_pack)
+            _bg_pack = None
         if streamer is not None and prefetch_depth > 0:
             streamer.stop_prefetch()
         self.alg_composer.finalize_run()

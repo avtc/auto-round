@@ -138,6 +138,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scale/clip) stay in-loop either way. Set to 1 to opt out.
     "AR_DISABLE_BG_READY_TRANSFORMS": lambda: os.getenv("AR_DISABLE_BG_READY_TRANSFORMS", "0").lower()
     in ("1", "true", "yes"),
+    # Background pack pipeline (default ON when eligible): the finished
+    # block's immediate-pack + shard-write tail runs in a background thread
+    # on its (now idle) ping-pong home while the loop advances to the next
+    # block's tune on the other group. Eligibility still requires >=2 staging
+    # groups + streaming + immediate packing; exactly one pipeline thread
+    # runs at a time. Set to 1 to opt out.
+    "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
     # alt2 (alternating re-grid): iterations of the SECOND tuning round after
     # the mid-tune re-grid; 0 = half of --iters.
     "AR_ALT2_ITERS2": lambda: int(os.getenv("AR_ALT2_ITERS2", "0") or 0),
