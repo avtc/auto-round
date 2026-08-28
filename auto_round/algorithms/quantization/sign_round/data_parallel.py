@@ -548,6 +548,11 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
         new_params = {}
         for key, hparam in hmod._parameters.items():
             if hparam is None:
+                # None-registered parameter (e.g. Linear(bias=False) keeps
+                # ``bias: None``): preserve the registration -- dropping the
+                # key breaks attribute lookup on the replica (wrapper forward
+                # reads orig_layer.bias)
+                new_params[key] = None
                 continue
             src = former.get(key)
             if not torch.is_tensor(src):
@@ -570,6 +575,7 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
         new_buffers = dict(rmod._buffers)
         for key, hbuf in hmod._buffers.items():
             if hbuf is None:
+                new_buffers[key] = None  # keep the None registration
                 continue
             src = new_buffers.get(key)
             if src is None or src is hbuf:

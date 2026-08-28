@@ -208,7 +208,7 @@ class TestReplicaRepair:
         class _Wrap(nn.Module):
             def __init__(self):
                 super().__init__()
-                layer = nn.Linear(4, 4, bias=True)
+                layer = nn.Linear(4, 4, bias=False)  # bias stays None-registered
                 layer.bits = 4
                 self.orig_layer = layer
                 self.register_buffer("act_max", torch.zeros(4))
@@ -264,6 +264,20 @@ class TestReplicaRepair:
         assert rep.tags is not home.tags and rep.tags == [1, 2]
         # buffers independent
         assert rep.act_max is not home.act_max
+
+    def test_repair_preserves_none_registrations(self):
+        # Linear(bias=False) keeps ``bias: None`` in _parameters; the repair
+        # must not drop the key (wrapper forwards read orig_layer.bias)
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _repair_replica
+
+        home = self._home()
+        assert "bias" in home.orig_layer._parameters and home.orig_layer._parameters["bias"] is None
+        rep = self._replica_like(home)
+        _repair_replica(home, rep, torch.device("cpu"))
+        assert "bias" in rep.orig_layer._parameters and rep.orig_layer._parameters["bias"] is None
+        assert rep.orig_layer.bias is None  # attribute lookup must not raise
+        # the real weight parameter still repaired independently
+        assert rep.orig_layer._parameters["weight"] is not home.orig_layer._parameters["weight"]
 
     def test_repair_handles_shared_parameters_style(self):
         # shallow copy that KEEPS home's Parameter objects (probe behavior of
