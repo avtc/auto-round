@@ -1085,12 +1085,18 @@ class ReplicaGroup:
         world = self.world
         dev_r = devs[r]
 
-        def hook(grad):
+        def hook(param):
+            # post-accumulate hooks receive the PARAM (its .grad is populated);
+            # encode the gradient, flattened to match the [numel] staging slots
+            # (a 2-D param payload would hit copy_ broadcasting, not a flat copy)
+            g = param.grad
+            if g is None:  # defensive: nothing accumulated for this bucket
+                return
             cur = torch.cuda.current_stream(dev_r)
             with torch.cuda.device(dev_r):
                 side[r].wait_stream(cur)
                 with torch.cuda.stream(side[r]):
-                    payload, meta = _encode_transport(grad.detach(), transport)
+                    payload, meta = _encode_transport(g.detach().reshape(-1), transport)
                     for d in range(world):
                         with torch.cuda.device(devs[d]), torch.cuda.stream(side[d]):
                             staging[d][r][k].copy_(payload, non_blocking=True)
