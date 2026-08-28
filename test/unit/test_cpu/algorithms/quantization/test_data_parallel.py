@@ -460,14 +460,17 @@ class TestDelayedBestTracker:
         tr.stage(self._snap(2), [torch.tensor(6.0, dtype=torch.float64)], 2)
         assert tr.resolve() == 6.0 and tr.last_promoted is False  # no improvement
 
-    def test_copy_on_reuse_preserves_best(self):
+    def test_best_survives_staging_without_reuse_copies(self):
         tr = _DelayedBestTracker()
         losses = [5.0, 1.0, 4.0, 3.0, 2.0]  # best at iter 1, never improved
         self._run(tr, losses)
         assert tr.best_iter == 1
-        # after the wrap (iter 3 reuses slot 1) the promoted snapshot must
-        # still hold the iter-1 values
+        # snapshots are fresh allocations: the promoted best keeps the iter-1
+        # values unchanged while later iterations stage their own copies
         assert torch.equal(tr.best_params["layers.0.mlp"]["v"], torch.full((4,), 1.0))
+        # at most two snapshot dicts alive at any time (pending + best)
+        tr.stage(self._snap(9), [torch.tensor(9.0, dtype=torch.float64)], 9)
+        assert tr.best_iter == 1  # pending staged, not yet resolved
 
     def test_reset_clears_everything(self):
         tr = _DelayedBestTracker()

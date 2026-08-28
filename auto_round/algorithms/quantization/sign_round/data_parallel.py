@@ -992,7 +992,7 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
             if torch.is_tensor(val) and val is hval:
                 setattr(rmod, attr, hval.detach().clone().to(dev))
             elif isinstance(val, (list, dict, set)) and val is hval:
-                setattr(rmod, attr, copy.deepcopy(hval))
+                setattr(rmod, attr, _copy_attr_value(hval))
         # ── wrapper aliasing dict: re-key to the NEW parameters ──────────
         if hasattr(hmod, "orig_layer") and isinstance(getattr(hmod, "params", None), dict):
             fixed = {}
@@ -1002,13 +1002,36 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
                 elif torch.is_tensor(v):
                     fixed[k] = v.detach().clone().to(dev)
                 elif isinstance(v, (list, dict, set)):
-                    fixed[k] = copy.deepcopy(v)
+                    fixed[k] = _copy_attr_value(v)
                 else:
                     fixed[k] = v
             rmod.params = fixed
 
 
 _PEER_ACCESS_LOGGED = False
+
+
+def _copy_attr_value(value):
+    """Deep-copy a shared attr value, cloning non-leaf tensors by value.
+
+    ``copy.deepcopy`` refuses non-leaf tensors (the flat v-param views stored
+    in wrapper ``params`` dicts); those are cloned detached instead -- for
+    flat layouts the views are re-narrowed onto the mirror's own group
+    parameters right after the repair (``_rebuild_flat_views``), so only the
+    non-tensor contents of containers matter here. Leaf tensors and
+    Parameters keep the plain deepcopy semantics.
+    """
+    if torch.is_tensor(value):
+        if value.is_leaf:
+            return copy.deepcopy(value)
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _copy_attr_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_attr_value(v) for v in value]
+    if isinstance(value, set):
+        return set(value)  # tensors are unhashable -- scalar members copy fine
+    return copy.deepcopy(value)
 
 
 def _flat_grad_buffer(params: Sequence[torch.nn.Parameter]) -> Optional[torch.Tensor]:
@@ -1057,12 +1080,15 @@ def build_flat_tuning_params(mod: torch.nn.Module, lr_fn, minmax_lr_fn) -> bool:
             continue
         rl, ml = float(lr_fn(m)), float(minmax_lr_fn(m))
         for key, p in params.items():
-            if not isinstance(p, torch.nn.Parameter) or p.dtype is not torch.float32:
+            if not isinstance(p, torch.nn.Parameter):
+                continue  # constants / metadata stay as plain dict entries
+            # a non-fp32 or mixed-device Parameter cannot join the flat --
+            # abort so the WHOLE block keeps the legacy layout (a partial
+            # flat would silently drop that parameter from optimizer+exchange)
+            if p.dtype is not torch.float32 or (device is not None and p.device != device):
                 return False
             if device is None:
                 device = p.device
-            elif p.device != device:
-                return False
             kind = "minmax" if ("min" in key or "max" in key) else "round"
             entries.append((name, key, kind, ml if kind == "minmax" else rl, p))
     if not entries:
@@ -1286,41 +1312,26 @@ class _DelayedBestTracker:
     pairs are compared with the same strict-less rule; the comparison and
     the ``.item()`` read simply happen one iteration later on the host.
 
-    Snapshots alternate between two slots. ``resolve()`` promotes the
-    resolved slot's snapshot by IDENTITY; when the alternation is about to
-    overwrite the still-best slot, that snapshot is first cloned out
-    (device-local copy of the nested dict) -- zero copies while improvements
-    keep arriving.
+    Memory: the caller stages a FRESH ``collect_best_params`` allocation
+    every iteration, so the tracker only ever holds two snapshot copies
+    (the pending one and the promoted best) -- one more than the immediate
+    path, independent of iteration count.
     """
 
     def __init__(self) -> None:
-        self._slots: List[Optional[dict]] = [None, None]
-        self._pending: Optional[Tuple[int, Sequence, int]] = None  # (slot, losses, iter)
-        self._next_slot = 0
+        self._pending: Optional[Tuple[Optional[dict], Sequence, int]] = None  # (snapshot, losses, iter)
         self.best_loss: Optional[float] = None
         self.best_params: Optional[dict] = None
         self.best_iter: Optional[int] = None
         self.last_promoted = False
 
     def reset(self) -> None:
-        """Drop pending iteration, ring slots, and promotion (grid re-swap)."""
+        """Drop the pending iteration and the promotion (grid re-swap)."""
         self.__init__()
-
-    @staticmethod
-    def _copy_snapshot(snapshot: dict) -> dict:
-        return {
-            mod: {key: (val.clone() if torch.is_tensor(val) else val) for key, val in entry.items()}
-            for mod, entry in snapshot.items()
-        }
 
     def stage(self, snapshot: Optional[dict], losses: Sequence, iter_index: int) -> None:
         """Park iteration ``iter_index``'s pre-step snapshot and loss tensors."""
-        slot = self._next_slot % 2
-        self._next_slot += 1
-        if self.best_params is not None and self._slots[slot] is self.best_params:
-            self.best_params = self._copy_snapshot(self.best_params)
-        self._slots[slot] = snapshot
-        self._pending = (slot, losses, iter_index)
+        self._pending = (snapshot, losses, iter_index)
 
     def resolve(self) -> Optional[float]:
         """Drain the parked iteration: return its loss, promote if best.
@@ -1330,14 +1341,13 @@ class _DelayedBestTracker:
         """
         if self._pending is None:
             return None
-        slot, losses, iter_index = self._pending
+        snapshot, losses, iter_index = self._pending
         self._pending = None
         self.last_promoted = False
         loss = float(sum(l.item() for l in losses if l is not None))
-        snapshot = self._slots[slot]
         if snapshot is not None and (self.best_loss is None or loss < self.best_loss):
             self.best_loss = loss
-            self.best_params = snapshot
+            self.best_params = snapshot  # fresh allocation -- safe by reference
             self.best_iter = iter_index
             self.last_promoted = True
         return loss
