@@ -566,7 +566,7 @@ class AlgorithmComposer:
 
         return bool(getattr(_envs, "AR_TUNE_DDP_MERGE_STATS", False))
 
-    def _collect_forward(self, block, inputs, input_others, out_dev, allow_shard: bool = True):
+    def _collect_forward(self, block, inputs, input_others, out_dev, allow_shard: bool = True, mirror_cache=None):
         """Collection forward: sharded across DDP mirrors when eligible.
 
         ``allow_shard=False`` forces the serial path: passes that carry
@@ -585,7 +585,14 @@ class AlgorithmComposer:
         # hook stats are folded back into the home by _merge_mirror_stats
         _merge = bool(getattr(_envs, "AR_TUNE_DDP_MERGE_STATS", False))
         return sharded_nograd_forward(
-            self.block_forward, block, inputs, input_others, out_dev, self._coll_devs, merge_stats=_merge
+            self.block_forward,
+            block,
+            inputs,
+            input_others,
+            out_dev,
+            self._coll_devs,
+            merge_stats=_merge,
+            mirror_cache=mirror_cache,
         )
 
     # ── Per-block pipeline orchestration ─────────────────────────────────────
@@ -698,9 +705,18 @@ class AlgorithmComposer:
         # ── Step 3: Quantizer calibration (act_max, imatrix, etc.) ─────────────
         if fp_inputs is not None:
             with _prof_stage(_prof, "ref_collect"), torch.no_grad():
+                # the fp-input and q-input hook passes run over the SAME block
+                # state: one caller-owned mirror cache serves both (mirrors
+                # built once, merged stats reset between passes)
+                _fp_coll_cache = {}
                 quant_hooks = self._get_fp_act_hooks(block)
                 reference_output = self._collect_forward(
-                    block, fp_inputs, input_others, _out_dev, allow_shard=not quant_hooks or self._merge_stats_on()
+                    block,
+                    fp_inputs,
+                    input_others,
+                    _out_dev,
+                    allow_shard=not quant_hooks or self._merge_stats_on(),
+                    mirror_cache=_fp_coll_cache,
                 )
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
@@ -715,9 +731,11 @@ class AlgorithmComposer:
                             input_others,
                             _out_dev,
                             allow_shard=not q_hooks or self._merge_stats_on(),
+                            mirror_cache=_fp_coll_cache,
                         )
                         for h in q_hooks:
                             h.remove()
+                _fp_coll_cache.clear()  # the block is about to be wrapped: stale
 
             # ── Step 3.5: MoE scale alignment + global scale update ─────────────────
             # Must run after calibration hooks (act_max collected) and before quantize_block.
@@ -751,6 +769,7 @@ class AlgorithmComposer:
                 q_inputs,
                 block_ctx,
                 input_ids=input_ids,
+                keep_replicas=True,
                 _block_prof=_prof,
             )
 
@@ -775,7 +794,24 @@ class AlgorithmComposer:
                 )
             if self.block_quantizer.enable_quanted_input:
                 with torch.no_grad():
-                    new_q_input = self._collect_forward(block, effective_input, input_others, _out_dev)
+                    # reuse the TUNE's mirrors for the sharded collection: the
+                    # home's final state (best-iter restore, post-tune refit)
+                    # is synced onto them first; freed right after the pass
+                    _tune_group = getattr(block, "_tune_replica_group", None)
+                    _post_cache = None
+                    if _tune_group is not None and self._coll_devs:
+                        _tune_group.sync_tuning_params()
+                        _post_cache = {
+                            dev: rep
+                            for dev, rep in zip(_tune_group.plan.devices, _tune_group.replicas)
+                            if rep is not block and dev in set(self._coll_devs)
+                        }
+                    new_q_input = self._collect_forward(
+                        block, effective_input, input_others, _out_dev, mirror_cache=_post_cache
+                    )
+                    if _tune_group is not None:
+                        _tune_group.teardown()
+                        delattr(block, "_tune_replica_group")
                     new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
                 if reference_next_input is not None:
                     # stats BEFORE bias correction: the correction absorbs the

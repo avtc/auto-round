@@ -534,6 +534,7 @@ class SignRoundQuantizer(BaseQuantizer):
         q_inputs,
         block_ctx,
         input_ids=None,
+        keep_replicas: bool = False,
         **kwargs,
     ) -> dict:
         """Apply the AutoRound optimization algorithm to a block.
@@ -996,7 +997,13 @@ class SignRoundQuantizer(BaseQuantizer):
                 init_loss = None
 
         if replica_group is not None:
-            replica_group.teardown()
+            if keep_replicas:
+                # the composer reuses the tuned mirrors for the post-tune
+                # sharded collection (post_collect) and frees them there;
+                # tuning params are synced home -> mirrors before that pass
+                block._tune_replica_group = replica_group
+            else:
+                replica_group.teardown()
         last_loss = total_loss
         if tune_prof is not None:
             tune_prof.log_summary(
