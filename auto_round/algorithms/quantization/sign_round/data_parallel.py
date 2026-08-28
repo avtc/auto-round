@@ -308,22 +308,37 @@ def _write_back_grads(buf: Optional[torch.Tensor], params: List[torch.nn.Paramet
         offset += n
 
 
-def _xchg(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, bf16: bool) -> torch.Tensor:
-    """Move a peer's segment onto ``dev`` (optionally transported as bf16).
+def _xchg(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, transport: str) -> torch.Tensor:
+    """Move a peer's segment onto ``dev`` in the requested transport dtype.
 
     Transport ORDER matters: a combined ``.to(device, dtype)`` cross-device
     copy casts on the SOURCE first and then memcpys -- with an fp32
     destination the wire carried full fp32 bytes and the bf16 transport was
     a no-op on payload (measured: bf16 allreduce time == fp32 on a
-    half-duplex-per-link fabric). Cast down on the source, move the bf16
+    half-duplex-per-link fabric). Cast down on the source, move the reduced
     bytes, cast back up on the receiver instead.
+
+    int8 uses symmetric per-segment scaling: one amax per exchanged segment
+    rides along as an fp32 scalar. The step size stays relative to the
+    segment max, and the averaged-gradient signs SignSGD consumes are only
+    perturbed inside a band far below typical |grad| magnitudes.
     """
-    if not bf16:
+    if transport == "fp32":
         return seg.to(dev)
-    return seg.to(torch.bfloat16).to(dev).to(dtype)
+    if transport == "bf16":
+        return seg.to(torch.bfloat16).to(dev).to(dtype)
+    if transport == "int8":
+        with torch.no_grad():
+            amax = seg.detach().abs().amax()
+            scale = amax.to(torch.float64) / 127.0
+            scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+            q = torch.clamp(torch.round(seg.detach().to(torch.float64) / scale), -127, 127).to(torch.int8)
+            q = q.to(dev)
+            return (q.to(dtype).to(torch.float64) * scale.to(dev).to(torch.float64)).to(dtype)
+    raise ValueError(f"unknown gradient transport {transport!r} (fp32|bf16|int8)")
 
 
-def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, bf16: bool = False) -> None:
+def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32") -> None:
     """In-place all-reduce across device-resident buffers (single process).
 
     Chunked recursive halving-doubling: the flat space is split into W
@@ -332,9 +347,10 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
     the all-gather phase re-exchanges owned chunks until every rank holds
     the fully reduced buffer. Per-rank traffic is 2*(W-1)/W*bytes, same as a
     ring. Cross-device ``to()`` copies use P2P when available. ``scale`` is
-    applied at the end (pass ``1/world`` to average). ``bf16`` casts the
-    exchanged chunks to bfloat16 (halves the PCIe payload; accumulation
-    stays fp32). Requires a power-of-two world (the resolver guarantees it).
+    applied at the end (pass ``1/world`` to average). ``transport`` selects
+    the exchange dtype: fp32 (exact), bf16 (half wire bytes) or int8
+    (quarter wire bytes, symmetric per-segment amax scaling); accumulation
+    stays fp32. Requires a power-of-two world (the resolver guarantees it).
     """
     world = len(buffers)
     if world < 2:
@@ -360,12 +376,12 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
             if rank % length < half:
                 partner = rank + half  # keep [base, mid)
                 seg = buffers[partner][chunk * base : chunk * mid]
-                seg = _xchg(seg, buffers[rank].device, buffers[rank].dtype, bf16)
+                seg = _xchg(seg, buffers[rank].device, buffers[rank].dtype, transport)
                 buffers[rank][chunk * base : chunk * mid].add_(seg)
             else:
                 partner = rank - half  # keep [mid, hi)
                 seg = buffers[partner][chunk * mid : chunk * hi]
-                seg = _xchg(seg, buffers[rank].device, buffers[rank].dtype, bf16)
+                seg = _xchg(seg, buffers[rank].device, buffers[rank].dtype, transport)
                 buffers[rank][chunk * mid : chunk * hi].add_(seg)
         length = half
 
@@ -381,12 +397,12 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
                 partner = rank + half
                 src = buffers[partner][chunk * mid : chunk * hi]
                 dst = buffers[rank][chunk * mid : chunk * hi]
-                dst.copy_(_xchg(src, dst.device, dst.dtype, bf16))
+                dst.copy_(_xchg(src, dst.device, dst.dtype, transport))
             else:
                 partner = rank - half
                 src = buffers[partner][chunk * base : chunk * mid]
                 dst = buffers[rank][chunk * base : chunk * mid]
-                dst.copy_(_xchg(src, dst.device, dst.dtype, bf16))
+                dst.copy_(_xchg(src, dst.device, dst.dtype, transport))
         length *= 2
 
     for buf in buffers:
@@ -674,10 +690,10 @@ _PEER_ACCESS_LOGGED = False
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
-    def __init__(self, block, plan: DDPPlan, bf16_grad: bool = False, staged_source=None) -> None:
+    def __init__(self, block, plan: DDPPlan, grad_transport: str = "fp32", staged_source=None) -> None:
         global _PEER_ACCESS_LOGGED
         self.plan = plan
-        self.bf16_grad = bf16_grad
+        self.grad_transport = grad_transport
         self.home = block
         self.mirrors: List[torch.nn.Module] = []
         self.adopted = 0
@@ -833,7 +849,7 @@ class ReplicaGroup:
                 len(bufs),
             )
             return
-        halving_doubling_allreduce(bufs, scale=1.0 / self.world, bf16=self.bf16_grad)
+        halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
         for buf, params in zip(bufs, params_per_replica):
             _write_back_grads(buf, params)
 

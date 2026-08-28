@@ -675,18 +675,18 @@ class SignRoundQuantizer(BaseQuantizer):
                 if _staged_src is not None:
                     _staged_src = _staged_src.unpack()
                 replica_group = ReplicaGroup(
-                    block, _plan, bf16_grad=bool(_envs.AR_TUNE_DDP_BF16_GRAD), staged_source=_staged_src
+                    block, _plan, grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT, staged_source=_staged_src
                 )
                 for note in _plan.notes:
                     logger.info("[tune-ddp] %s", note)
                 with _bp_stage(_prof_bp, "sharded_anchor"):
                     _shard_recipe_anchor(replica_group)
                 logger.info(
-                    "[tune-ddp] engaged: world=%d shard=%d devices=%s bf16_grad=%s",
+                    "[tune-ddp] engaged: world=%d shard=%d devices=%s grad_transport=%s",
                     _plan.world,
                     _plan.shard_size,
                     [str(d) for d in _plan.devices],
-                    bool(_envs.AR_TUNE_DDP_BF16_GRAD),
+                    _envs.AR_TUNE_DDP_GRAD_TRANSPORT,
                 )
             elif _plan.enabled:
                 logger.info("[tune-ddp] disabled: resolved world %d is not a power of two", _plan.world)

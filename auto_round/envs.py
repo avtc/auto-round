@@ -125,9 +125,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # streaming homes alternate between group leaders, each block's mirrors
     # are its own group, and the idle group prefetches the next block.
     "AR_TUNE_DDP_GROUPS": lambda: os.getenv("AR_TUNE_DDP_GROUPS", ""),
-    # Exchange DDP gradients in bfloat16 (halves PCIe payload; sign-SGD robust
-    # to the reduced precision, but the trajectory changes within fp noise).
-    "AR_TUNE_DDP_BF16_GRAD": lambda: os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes"),
+    # DDP gradient TRANSPORT dtype: fp32 (exact) | bf16 (half wire bytes) |
+    # int8 (quarter wire bytes; symmetric per-segment amax scaling -- sign-SGD
+    # consumes sign(mean-grad), and the quantization step stays far below any
+    # sign-relevant magnitude for realistic gradient spreads). The legacy
+    # AR_TUNE_DDP_BF16_GRAD=1 alias maps to bf16; the explicit transport
+    # value wins.
+    "AR_TUNE_DDP_GRAD_TRANSPORT": lambda: (
+        lambda v: (
+            v
+            if v in ("fp32", "bf16", "int8")
+            else (_ for _ in ()).throw(ValueError(f"AR_TUNE_DDP_GRAD_TRANSPORT must be fp32|bf16|int8, got {v!r}"))
+        )
+    )(
+        os.getenv("AR_TUNE_DDP_GRAD_TRANSPORT", "").strip().lower()
+        or ("bf16" if os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes") else "fp32")
+    ),
     "AR_TUNE_DDP_MERGE_STATS": lambda: os.getenv("AR_TUNE_DDP_MERGE_STATS", "0").lower() in ("1", "true", "yes"),
     # Background ready-transforms (default ON when eligible): while block N
     # tunes on its ping-pong group, early-load block N+1 on the idle group's

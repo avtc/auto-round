@@ -57,7 +57,7 @@ class TestHalvingDoublingAllreduce:
         torch.manual_seed(2)
         bufs = [torch.randn(128) for _ in range(4)]
         expected = torch.stack(bufs).sum(0) / 4
-        halving_doubling_allreduce(bufs, scale=0.25, bf16=True)
+        halving_doubling_allreduce(bufs, scale=0.25, transport="bf16")
         for b in bufs:
             assert torch.allclose(b, expected, rtol=1e-2, atol=1e-2)
 
@@ -180,7 +180,7 @@ class TestDDPEnvGate:
         monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "cuda:1,cuda:2")
         assert envs.AR_TUNE_DDP_DEVICES == "cuda:1,cuda:2"
         monkeypatch.setenv("AR_TUNE_DDP_BF16_GRAD", "1")
-        assert envs.AR_TUNE_DDP_BF16_GRAD is True
+        assert envs.AR_TUNE_DDP_GRAD_TRANSPORT == "bf16"  # legacy alias resolves
 
 
 class TestRelocateParams:
@@ -625,11 +625,56 @@ class TestBf16TransportOrder:
         from auto_round.algorithms.quantization.sign_round.data_parallel import _xchg
 
         src = torch.randn(1000, dtype=torch.float32)
-        got = _xchg(src, torch.device("cpu"), torch.float32, bf16=True)
+        got = _xchg(src, torch.device("cpu"), torch.float32, "bf16")
         assert got.dtype == torch.float32
         # transported through bf16: agreement at bf16 resolution, not exact
         torch.testing.assert_close(got, src, rtol=5e-2, atol=5e-2)
         assert not torch.equal(got, src)
         # fp32 path stays exact
-        got32 = _xchg(src, torch.device("cpu"), torch.float32, bf16=False)
+        got32 = _xchg(src, torch.device("cpu"), torch.float32, "fp32")
         assert torch.equal(got32, src)
+
+
+class TestGradTransportSwitch:
+    def test_env_default_alias_and_override(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_DDP_GRAD_TRANSPORT", raising=False)
+        monkeypatch.delenv("AR_TUNE_DDP_BF16_GRAD", raising=False)
+        assert envs.AR_TUNE_DDP_GRAD_TRANSPORT == "fp32"
+        monkeypatch.setenv("AR_TUNE_DDP_BF16_GRAD", "1")  # legacy alias
+        assert envs.AR_TUNE_DDP_GRAD_TRANSPORT == "bf16"
+        monkeypatch.setenv("AR_TUNE_DDP_GRAD_TRANSPORT", "int8")  # explicit wins
+        assert envs.AR_TUNE_DDP_GRAD_TRANSPORT == "int8"
+
+    def test_env_invalid_raises(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.setenv("AR_TUNE_DDP_GRAD_TRANSPORT", "fp16")
+        with pytest.raises(ValueError, match="fp32\|bf16\|int8"):
+            _ = envs.AR_TUNE_DDP_GRAD_TRANSPORT
+
+    def test_xchg_int8_accuracy_and_signs(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _xchg
+
+        g = torch.randn(10000, dtype=torch.float32)
+        got = _xchg(g, torch.device("cpu"), torch.float32, "int8")
+        step = g.abs().amax() / 127.0
+        torch.testing.assert_close(got, g, rtol=0, atol=float(step))  # within one quantization step
+        # signs preserved for anything above one step (SignSGD consumes sign(mean))
+        significant = g.abs() > step
+        assert (torch.sign(got[significant]) == torch.sign(g[significant])).float().mean() > 0.999
+        # zero segment is safe
+        z = torch.zeros(100)
+        torch.testing.assert_close(_xchg(z, torch.device("cpu"), torch.float32, "int8"), z)
+
+    def test_allreduce_int8_close_to_mean(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import halving_doubling_allreduce
+
+        bufs = [torch.randn(4096) for _ in range(4)]
+        ref = torch.stack(bufs).mean(0)
+        for transport in ("fp32", "bf16", "int8"):
+            work = [b.clone() for b in bufs]
+            halving_doubling_allreduce(work, scale=0.25, transport=transport)
+            atol = {"fp32": 1e-6, "bf16": 2e-2, "int8": 1e-1}[transport]
+            torch.testing.assert_close(work[0], ref, rtol=0, atol=atol)
