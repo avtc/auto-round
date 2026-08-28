@@ -1012,7 +1012,7 @@ class SignRoundQuantizer(BaseQuantizer):
                             init_loss = total_loss
                             _init_done = True
                         if _tracker.last_promoted:
-                            best_loss = _tracker.best_loss
+                            best_loss = _tracker.best_loss / _world  # tracker stores the raw sum
                             last_best_iter = _tracker.best_iter
                     with tune_stage(tune_prof, "snapshot"):
                         _tracker.stage(
@@ -1140,7 +1140,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     init_loss = total_loss
                     _init_done = True
                 if _tracker.last_promoted:
-                    best_loss = _tracker.best_loss
+                    best_loss = _tracker.best_loss / _world  # tracker stores the raw sum
                     last_best_iter = _tracker.best_iter
             if not self.not_use_best_mse:
                 best_params = _tracker.best_params or {}

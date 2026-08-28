@@ -482,6 +482,43 @@ class TestDelayedBestTracker:
         self._run(tr, [9.0, 8.0])
         assert tr.best_loss == 8.0 and tr.best_iter == 1
 
+    def test_delayed_wiring_init_and_best_share_scale(self):
+        """Quantizer wiring must divide the tracker's raw sum by world.
+
+        The tracker stores undivided replica-loss sums (its internal
+        comparisons are scale-consistent, so the argmin and promoted
+        snapshot are correct); the quantizer mirrors must convert to the
+        global-batch mean -- otherwise the reported best_loss is world-times
+        the true value (observed as "best above init" in server logs).
+        """
+        world = 4
+        vals = [9e-6 + 3e-7 * i for i in range(50)]  # rising trajectory, argmin=0
+        best_loss = torch.finfo(torch.float).max
+        init_loss = None
+        last_best_iter = 0
+        tracker = _DelayedBestTracker()
+        _init_done = False
+
+        def loop_body(i, losses):
+            nonlocal best_loss, init_loss, last_best_iter, _init_done
+            resolved = tracker.resolve()
+            if resolved is not None:
+                total = resolved / world
+                if not _init_done:
+                    init_loss = total
+                    _init_done = True
+                if tracker.last_promoted:
+                    best_loss = tracker.best_loss / world
+                    last_best_iter = tracker.best_iter
+            tracker.stage({}, losses, i)
+
+        for i in range(50):
+            loop_body(i, [torch.tensor(vals[i], dtype=torch.float64) for _ in range(world)])
+        loop_body(50, [])  # post-loop drain
+        assert init_loss == vals[0]
+        assert last_best_iter == 0
+        assert abs(best_loss - vals[0]) < 1e-12  # same scale as init, not world x
+
     def test_delayed_env_gate_default_and_opt_out(self, monkeypatch):
         from auto_round import envs
 
