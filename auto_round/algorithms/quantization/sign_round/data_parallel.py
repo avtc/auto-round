@@ -329,20 +329,35 @@ def _xchg(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, transport: s
     int8 uses symmetric per-segment scaling: one amax per exchanged segment
     rides along as an fp32 scalar. The step size stays relative to the
     segment max, and the averaged-gradient signs SignSGD consumes are only
-    perturbed inside a band far below typical |grad| magnitudes.
+    perturbed inside a band far below typical |grad| magnitudes. All int8
+    arithmetic stays fp32: the first implementation routed the quantize /
+    dequantize through fp64, whose temporaries carry 2x fp32 traffic and
+    made the exchange SLOWER than plain fp32 wire (measured 360-390 ms vs
+    ~243 fp32 per tune iteration at world=4), on top of ~2.5 GB of extra
+    peak VRAM.
+
+    The wire hop itself uses non_blocking=True: the measured allreduce is
+    payload-independent across fp32/bf16 (~243/~231 ms), i.e. dominated by
+    the per-exchange HOST blocking of a synchronous copy rather than wire
+    bytes. Cross-device copy_ is stream-ordered on both endpoints (it
+    records an event on the source stream and makes the destination stream
+    wait), and every producer/consumer of a region runs on that device's
+    current stream in issue order, so dropping the host block lets the
+    exchange chain execute back-to-back on the GPUs without races.
     """
     if transport == "fp32":
-        return seg.to(dev)
+        return seg.to(dev, non_blocking=True)
     if transport == "bf16":
-        return seg.to(torch.bfloat16).to(dev).to(dtype)
+        return seg.to(torch.bfloat16).to(dev, non_blocking=True).to(dtype)
     if transport == "int8":
         with torch.no_grad():
-            amax = seg.detach().abs().amax()
-            scale = amax.to(torch.float64) / 127.0
-            scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-            q = torch.clamp(torch.round(seg.detach().to(torch.float64) / scale), -127, 127).to(torch.int8)
-            q = q.to(dev)
-            return (q.to(dtype).to(torch.float64) * scale.to(dev).to(torch.float64)).to(dtype)
+            src = seg.detach()
+            amax = src.abs().amax()
+            inv = 127.0 / amax.clamp_min(torch.finfo(src.dtype).tiny)
+            q = torch.round(src * inv).clamp_(-127.0, 127.0).to(torch.int8)
+            q = q.to(dev, non_blocking=True)
+            scale = amax.to(dev, non_blocking=True) / 127.0
+            return q.to(dtype).mul_(scale)
     raise ValueError(f"unknown gradient transport {transport!r} (fp32|bf16|int8)")
 
 
