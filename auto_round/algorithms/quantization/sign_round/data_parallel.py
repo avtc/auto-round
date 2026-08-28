@@ -609,13 +609,16 @@ _SIGN_LOGGED = False
 
 
 def _debug_flat_leak_probe(tag: str) -> None:
-    """AR_DEBUG_FLAT_LEAK=1: name the holders of large surviving flat tensors.
+    """AR_DEBUG_FLAT_LEAK=1: attribute per-block cuda:0 accumulation.
 
-    Scans gc-tracked cuda:0 fp32 tensors of flat-buffer scale after the block
-    teardown; prints each survivor's immediate referrers so a per-block VRAM
-    leak can be attributed without a debugger.
+    Scans ALL gc-tracked cuda:0 tensors >= 64 MB (any dtype): prints the
+    per-(dtype, numel) histogram (untruncated survivor count), the
+    allocator's allocated/reserved bytes, and referrers for the largest
+    survivors -- so a next-block "-start" probe reveals whether the
+    PREVIOUS block's tensors really died.
     """
     import gc
+    from collections import Counter
 
     from auto_round import envs
 
@@ -623,21 +626,37 @@ def _debug_flat_leak_probe(tag: str) -> None:
         return
     gc.collect()
     hits = []
+    histogram: Counter = Counter()
+    bytes_by_key: Counter = Counter()
     for obj in gc.get_objects():
         try:
             if (
                 torch.is_tensor(obj)
                 and obj.device.type == "cuda"
                 and obj.device.index == 0
-                and obj.dtype == torch.float32
-                and obj.numel() > 300_000_000
+                and obj.untyped_storage().nbytes() >= 64 * 2**20
             ):
                 hits.append(obj)
+                key = (str(obj.dtype).replace("torch.", ""), obj.numel())
+                histogram[key] += 1
+                bytes_by_key[key] += obj.untyped_storage().nbytes()
         except Exception:  # noqa: BLE001 - probe must never kill a run
             continue
-    if not hits:
-        logger.info("[leak-probe/%s] no flat-scale cuda:0 fp32 tensors alive", tag)
-        return
+    try:
+        alloc = torch.cuda.memory_allocated(0) / 2**30
+        reserved = torch.cuda.memory_reserved(0) / 2**30
+    except Exception:  # noqa: BLE001
+        alloc = reserved = -1.0
+    hist = " ".join(f"{k[0]}[{k[1]}]x{v}({bytes_by_key[k] / 2**30:.2f}GB)" for k, v in sorted(histogram.items()))
+    logger.info(
+        "[leak-probe/%s] cuda:0 tensors>=64MB: %d total, alloc=%.2fGB reserved=%.2fGB | %s",
+        tag,
+        len(hits),
+        alloc,
+        reserved,
+        hist,
+    )
+    hits.sort(key=lambda t: -t.untyped_storage().nbytes())
     for t in hits[:4]:
         names = []
         for r in gc.get_referrers(t)[:8]:
@@ -646,10 +665,12 @@ def _debug_flat_leak_probe(tag: str) -> None:
                 kind += "[" + ",".join(str(k) for k in list(r.keys())[:3]) + "]"
             names.append(kind)
         logger.info(
-            "[leak-probe/%s] cuda:0 fp32 numel=%d (%.2f GB) referrers: %s",
+            "[leak-probe/%s]   ptr=%d %s numel=%d (%.2f GB) referrers: %s",
             tag,
+            t.data_ptr(),
+            t.dtype,
             t.numel(),
-            t.numel() * 4 / 2**30,
+            t.untyped_storage().nbytes() / 2**30,
             names,
         )
 

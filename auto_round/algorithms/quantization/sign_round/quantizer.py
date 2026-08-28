@@ -905,6 +905,9 @@ class SignRoundQuantizer(BaseQuantizer):
         if not _dp_placed:  # serial path (or DDP ineligible): gather-to-home as before
             _rehome_calibration_state(*_rehome_deferred)
         tune_prof = make_tune_profiler(device)
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _debug_flat_leak_probe
+
+        _debug_flat_leak_probe(f"{getattr(block_ctx, 'block_name', 'block')}-start")
         _tune_wall_t0 = time.perf_counter() if tune_prof is not None else None
         if tune_prof is not None and tune_prof.debug:
             _ai = active_inputs if isinstance(active_inputs, list) else []
