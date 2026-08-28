@@ -753,8 +753,15 @@ def sharded_nograd_forward(
     devices: List[torch.device],
     sample_count: Optional[int] = None,
     merge_stats: bool = False,
+    max_devices: int = 0,
 ):
     """Parallelize a no-grad collection forward across ``devices``.
+
+    ``max_devices > 0`` truncates the shard set to the first K devices
+    (shards grow accordingly): forward hooks force dynamo graph breaks,
+    leaving the compiled runner as python-bound eager sections that
+    GIL-convoy beyond a handful of threads -- hook-carrying passes are
+    capped by the caller while hookless passes shard wide.
 
     The collection passes (reference outputs, quantized-output cascade) are
     plain forwards over the whole sample pool on one GPU while the mirrors
@@ -770,6 +777,14 @@ def sharded_nograd_forward(
     """
     world = len(devices)
     n = sample_count if sample_count is not None else (len(inputs) if isinstance(inputs, list) else 0)
+    if max_devices and 0 < max_devices < world:
+        logger.info(
+            "[tune-ddp] sharded collect: capping concurrent shards at %d of %d device(s) (hook pass)",
+            max_devices,
+            world,
+        )
+        devices = list(devices)[:max_devices]
+        world = max_devices
     if world < 2 or n < world or n % world != 0:
         return runner(block, inputs, input_others, cache_device=out_device)
     shard = n // world

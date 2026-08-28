@@ -566,7 +566,7 @@ class AlgorithmComposer:
 
         return bool(getattr(_envs, "AR_TUNE_DDP_MERGE_STATS", False))
 
-    def _collect_forward(self, block, inputs, input_others, out_dev, allow_shard: bool = True):
+    def _collect_forward(self, block, inputs, input_others, out_dev, allow_shard: bool = True, hook_pass: bool = False):
         """Collection forward: sharded across DDP mirrors when eligible.
 
         ``allow_shard=False`` forces the serial path: passes that carry
@@ -575,17 +575,30 @@ class AlgorithmComposer:
         them, silently dropping that shard's statistics. Exception:
         AR_TUNE_DDP_MERGE_STATS=1 folds the mergeable stats (imatrix, act_max)
         from the mirrors back into the home, so hook passes may shard.
+
+        ``hook_pass=True`` additionally caps the concurrent shards at
+        AR_TUNE_COLL_HOOK_SHARDS (default 4, 0 = uncapped): forward hooks
+        force dynamo graph breaks, leaving the compiled runner as
+        python-bound eager sections that GIL-convoy under many threads
+        (measured: the world=8 hook pass runs at 3-5x its world=4 per-sample
+        cost, uniformly; hookless passes scale cleanly and stay uncapped).
         """
         if self._coll_devs is None or not allow_shard:
             return self.block_forward(block, inputs, input_others, cache_device=out_dev)
         from auto_round import envs as _envs
         from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_nograd_forward
 
-        # hook-carrying passes may shard ONLY under the merge opt-in: mirror-side
-        # hook stats are folded back into the home by _merge_mirror_stats
         _merge = bool(getattr(_envs, "AR_TUNE_DDP_MERGE_STATS", False))
+        _hook_cap = int(getattr(_envs, "AR_TUNE_COLL_HOOK_SHARDS", 4) or 0)
         return sharded_nograd_forward(
-            self.block_forward, block, inputs, input_others, out_dev, self._coll_devs, merge_stats=_merge
+            self.block_forward,
+            block,
+            inputs,
+            input_others,
+            out_dev,
+            self._coll_devs,
+            merge_stats=_merge,
+            max_devices=_hook_cap if hook_pass else 0,
         )
 
     # ── Per-block pipeline orchestration ─────────────────────────────────────
@@ -700,7 +713,12 @@ class AlgorithmComposer:
             with _prof_stage(_prof, "ref_collect"), torch.no_grad():
                 quant_hooks = self._get_fp_act_hooks(block)
                 reference_output = self._collect_forward(
-                    block, fp_inputs, input_others, _out_dev, allow_shard=not quant_hooks or self._merge_stats_on()
+                    block,
+                    fp_inputs,
+                    input_others,
+                    _out_dev,
+                    allow_shard=not quant_hooks or self._merge_stats_on(),
+                    hook_pass=bool(quant_hooks),
                 )
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
@@ -715,6 +733,7 @@ class AlgorithmComposer:
                             input_others,
                             _out_dev,
                             allow_shard=not q_hooks or self._merge_stats_on(),
+                            hook_pass=bool(q_hooks),
                         )
                         for h in q_hooks:
                             h.remove()

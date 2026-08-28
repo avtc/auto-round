@@ -160,6 +160,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies in every replica's reference/input cat, ~10-40 ms/iter at
     # world=8). Same per-epoch coverage; set to 0 for the global sampler.
     "AR_TUNE_DDP_SHARD_SAMPLER": lambda: os.getenv("AR_TUNE_DDP_SHARD_SAMPLER", "1").lower() in ("1", "true", "yes"),
+    # Concurrent-shard cap for hook-carrying collection passes (default 4,
+    # 0 = uncapped): forward hooks force dynamo graph breaks, leaving the
+    # compiled block runner as python-bound eager sections that GIL-convoy
+    # beyond a handful of threads -- measured at world=8, the hook pass runs
+    # at 3-5x its world=4 per-sample cost (uniformly across shards), while
+    # hookless passes scale cleanly and are never capped. Only applies when
+    # AR_TUNE_DDP_MERGE_STATS=1 lets hook passes shard at all.
+    "AR_TUNE_COLL_HOOK_SHARDS": lambda: int(os.getenv("AR_TUNE_COLL_HOOK_SHARDS", "4") or 0),
     # Allreduce algorithm for the DDP gradient exchange: auto | oneshot |
     # halving. halving-doubling moves the bandwidth-optimal 2*(W-1)/W of the
     # payload per rank but pays 2*log2(W) DEPENDENT exchange steps; one-shot

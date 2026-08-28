@@ -451,6 +451,70 @@ class TestShardedNoGradForward:
         assert got == list(range(8))
         assert len(runner.calls) == 4
 
+    def test_hook_pass_shard_cap(self):
+        from unittest.mock import patch
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        block = nn.Linear(2, 1)
+        runner = self._runner()
+        devices = [torch.device("cpu")] * 8
+        with patch.object(dp.logger, "info"):
+            out = dp.sharded_nograd_forward(
+                runner,
+                block,
+                [torch.randn(1, 2, 2) for _ in range(8)],
+                {},
+                out_device=torch.device("cpu"),
+                devices=devices,
+                sample_count=8,
+                max_devices=4,
+            )
+        # 8 samples over the first 4 devices -> 2-sample shards, in order
+        assert len(runner.calls) == 4
+        got = [i for _b, idx, _c in runner.calls for i in idx]
+        assert got == list(range(8))
+        assert [len(idx) for _b, idx, _c in runner.calls] == [2, 2, 2, 2]
+        assert isinstance(out, list) and len(out) == 8
+        # cap of 0 leaves all devices sharded
+        runner2 = self._runner()
+        dp.sharded_nograd_forward(
+            runner2,
+            block,
+            [torch.randn(1, 2, 2) for _ in range(8)],
+            {},
+            out_device=torch.device("cpu"),
+            devices=devices,
+            sample_count=8,
+            max_devices=0,
+        )
+        assert len(runner2.calls) == 8
+
+    def test_hook_pass_shard_cap_logging(self):
+        from unittest.mock import patch
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        block = nn.Linear(2, 1)
+        runner = self._runner()
+        with patch.object(dp.logger, "info") as info:
+            dp.sharded_nograd_forward(
+                runner,
+                block,
+                [torch.randn(1, 2, 2) for _ in range(8)],
+                {},
+                out_device=torch.device("cpu"),
+                devices=[torch.device("cpu")] * 8,
+                sample_count=8,
+                max_devices=4,
+            )
+        msgs = [c.args[0] % c.args[1:] if len(c.args) > 1 else c.args[0] for c in info.call_args_list]
+        assert any("capping concurrent shards at 4 of 8" in m for m in msgs)
+
     def test_sharded_collect_breakdown_logged(self):
         from unittest.mock import patch
 
