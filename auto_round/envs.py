@@ -179,11 +179,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # post-accumulate-grad hooks fire DURING backward, encode each bucket on a
     # per-device side stream and P2P-copy it into preallocated staging on all
     # peers; sync_grads then only waits the side streams and runs the canonical
-    # per-bucket sum. The wire work overlaps the remaining backward layers
-    # instead of queueing behind the whole drain on the shared default streams
-    # (measured: the classic exchange stage absorbed ~150-200 ms/iter of
-    # backward drain + per-copy latency at world=4 int8). CUDA-only, world>=2.
-    "AR_DISABLE_OVERLAP_EXCHANGE": lambda: os.getenv("AR_DISABLE_OVERLAP_EXCHANGE", "0").lower()
+    # per-bucket sum. DEFAULT OFF: the per-hook fan-out issues copies from
+    # multiple autograd threads with per-copy device/stream context switches,
+    # which drops the P2P fast path (~2 GB/s vs ~13 GB/s single-threaded),
+    # making the overlapped exchange SLOWER than the classic sequential one
+    # (world=4 bf16: 825 vs 472 ms/iter; int8: 580 vs 458). Set to "0" to
+    # re-enable; the structure is kept for a single-threaded fan-out rework.
+    "AR_DISABLE_OVERLAP_EXCHANGE": lambda: os.getenv("AR_DISABLE_OVERLAP_EXCHANGE", "1").lower()
     in ("1", "true", "yes"),
     # alt2 (alternating re-grid): iterations of the SECOND tuning round after
     # the mid-tune re-grid; 0 = half of --iters.

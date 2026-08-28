@@ -831,7 +831,11 @@ class TestOverlapExchange:
     def test_env_opt_out_blocks_overlap(self, monkeypatch):
         from auto_round import envs
 
+        # default off: the per-hook fan-out regresses the exchange (see the
+        # AR_DISABLE_OVERLAP_EXCHANGE comment in envs.py)
         monkeypatch.delenv("AR_DISABLE_OVERLAP_EXCHANGE", raising=False)
+        assert envs.AR_DISABLE_OVERLAP_EXCHANGE is True
+        monkeypatch.setenv("AR_DISABLE_OVERLAP_EXCHANGE", "0")
         assert envs.AR_DISABLE_OVERLAP_EXCHANGE is False
         monkeypatch.setenv("AR_DISABLE_OVERLAP_EXCHANGE", "1")
         assert envs.AR_DISABLE_OVERLAP_EXCHANGE is True
