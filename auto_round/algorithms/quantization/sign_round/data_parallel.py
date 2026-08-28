@@ -308,6 +308,21 @@ def _write_back_grads(buf: Optional[torch.Tensor], params: List[torch.nn.Paramet
         offset += n
 
 
+def _xchg(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, bf16: bool) -> torch.Tensor:
+    """Move a peer's segment onto ``dev`` (optionally transported as bf16).
+
+    Transport ORDER matters: a combined ``.to(device, dtype)`` cross-device
+    copy casts on the SOURCE first and then memcpys -- with an fp32
+    destination the wire carried full fp32 bytes and the bf16 transport was
+    a no-op on payload (measured: bf16 allreduce time == fp32 on a
+    half-duplex-per-link fabric). Cast down on the source, move the bf16
+    bytes, cast back up on the receiver instead.
+    """
+    if not bf16:
+        return seg.to(dev)
+    return seg.to(torch.bfloat16).to(dev).to(dtype)
+
+
 def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, bf16: bool = False) -> None:
     """In-place all-reduce across device-resident buffers (single process).
 
@@ -345,20 +360,12 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
             if rank % length < half:
                 partner = rank + half  # keep [base, mid)
                 seg = buffers[partner][chunk * base : chunk * mid]
-                seg = (
-                    seg.to(torch.bfloat16).to(buffers[rank].device, buffers[rank].dtype)
-                    if bf16
-                    else seg.to(buffers[rank].device)
-                )
+                seg = _xchg(seg, buffers[rank].device, buffers[rank].dtype, bf16)
                 buffers[rank][chunk * base : chunk * mid].add_(seg)
             else:
                 partner = rank - half  # keep [mid, hi)
                 seg = buffers[partner][chunk * mid : chunk * hi]
-                seg = (
-                    seg.to(torch.bfloat16).to(buffers[rank].device, buffers[rank].dtype)
-                    if bf16
-                    else seg.to(buffers[rank].device)
-                )
+                seg = _xchg(seg, buffers[rank].device, buffers[rank].dtype, bf16)
                 buffers[rank][chunk * mid : chunk * hi].add_(seg)
         length = half
 
@@ -374,12 +381,12 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
                 partner = rank + half
                 src = buffers[partner][chunk * mid : chunk * hi]
                 dst = buffers[rank][chunk * mid : chunk * hi]
-                dst.copy_(src.to(torch.bfloat16).to(dst.device, dst.dtype) if bf16 else src.to(dst.device))
+                dst.copy_(_xchg(src, dst.device, dst.dtype, bf16))
             else:
                 partner = rank - half
                 src = buffers[partner][chunk * base : chunk * mid]
                 dst = buffers[rank][chunk * base : chunk * mid]
-                dst.copy_(src.to(torch.bfloat16).to(dst.device, dst.dtype) if bf16 else src.to(dst.device))
+                dst.copy_(_xchg(src, dst.device, dst.dtype, bf16))
         length *= 2
 
     for buf in buffers:

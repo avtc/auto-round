@@ -616,3 +616,20 @@ class TestEffectiveGroups:
 
         dp.set_effective_ddp_groups(None)
         assert dp.effective_ddp_groups() is None
+
+
+class TestBf16TransportOrder:
+    def test_xchg_moves_bf16_bytes_not_fp32(self):
+        # regression: .to(device, dtype) casts on the SOURCE and ships fp32;
+        # _xchg must cast-down -> move bf16 -> cast-up
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _xchg
+
+        src = torch.randn(1000, dtype=torch.float32)
+        got = _xchg(src, torch.device("cpu"), torch.float32, bf16=True)
+        assert got.dtype == torch.float32
+        # transported through bf16: agreement at bf16 resolution, not exact
+        torch.testing.assert_close(got, src, rtol=5e-2, atol=5e-2)
+        assert not torch.equal(got, src)
+        # fp32 path stays exact
+        got32 = _xchg(src, torch.device("cpu"), torch.float32, bf16=False)
+        assert torch.equal(got32, src)
