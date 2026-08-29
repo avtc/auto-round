@@ -1801,22 +1801,42 @@ def make_serial_graphed_step(
 def sign_step_foreach_ok(optimizer) -> bool:
     """Whether the optimizer qualifies for the foreach pure-sign fast path.
 
-    Mirrors SignSGD's engaged configuration (momentum 0, weight_decay 0 --
-    dampening/nesterov only apply with momentum). Checked on the OPTIMIZER's
-    own defaults so home and mirror optimizers qualify identically.
+    Mirrors SignSGD's engaged configuration EXACTLY: a SignSGD instance (not a
+    different optimizer class/subclass with its own step semantics) whose
+    defaults AND every per-group override keep momentum 0, weight_decay 0,
+    maximize off (maximize would flip the update direction), nesterov off.
+    Checked on the optimizer's own state so home and mirror optimizers
+    qualify identically.
     """
+    from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+    if not isinstance(optimizer, SignSGD):
+        return False
     d = getattr(optimizer, "defaults", {}) or {}
-    return float(d.get("momentum", 0) or 0) == 0.0 and float(d.get("weight_decay", 0) or 0) == 0.0
+    if d.get("maximize", False) or d.get("nesterov", False):
+        return False
+    if float(d.get("momentum", 0) or 0) != 0.0 or float(d.get("weight_decay", 0) or 0) != 0.0:
+        return False
+    for group in optimizer.param_groups:
+        if group.get("maximize", d.get("maximize", False)) or group.get("nesterov", d.get("nesterov", False)):
+            return False
+        if float(group.get("momentum", d.get("momentum", 0)) or 0) != 0.0:
+            return False
+        if float(group.get("weight_decay", d.get("weight_decay", 0)) or 0) != 0.0:
+            return False
+    return True
 
 
-def _sign_step_foreach(optimizer) -> None:
+def _sign_step_foreach(optimizer, free_grads: bool = False) -> None:
     """Pure-sign SignSGD step via foreach ops (bit-identical, ~3 kernels/group).
 
     Same math as SignSGD's always-used ``_single_tensor_sgd`` for the engaged
     configuration: ``param.add_(sign(grad), alpha=-lr)`` then a parked zero
     (``set_to_none=False`` semantics). Params with ``grad=None`` are skipped,
     exactly like the optimizer. The 1195-launch single-tensor loop collapses
-    to ~3 foreach kernels per param group.
+    to ~3 foreach kernels per param group. ``free_grads=True`` releases the
+    grad tensors after the update (host-side, matching the legacy
+    ``set_to_none=True`` between-iterations behavior for non-graph callers).
     """
     with torch.no_grad():
         for group in optimizer.param_groups:
@@ -1827,7 +1847,11 @@ def _sign_step_foreach(optimizer) -> None:
             grads = [g for _, g in pairs]
             signs = torch._foreach_sign(grads)
             torch._foreach_add_(params, signs, alpha=-float(group["lr"]))
-            torch._foreach_zero_(grads)
+            if free_grads:
+                for p in params:
+                    p.grad = None
+            else:
+                torch._foreach_zero_(grads)
 
 
 def serial_step_vram_ok(needed_bytes, free_fn, margin: int = 1 << 30) -> bool:

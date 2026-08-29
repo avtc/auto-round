@@ -1577,7 +1577,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
                     def _mirror_step(opt, sched):
                         if sign_step_foreach_ok(opt):
-                            _sign_step_foreach(opt)  # bit-identical, parked zero
+                            _sign_step_foreach(opt, free_grads=not _graphs_active)
                         else:
                             opt.step()
                             opt.zero_grad(set_to_none=not _graphs_active)
@@ -1966,24 +1966,29 @@ class SignRoundQuantizer(BaseQuantizer):
     def _step(self, scaler: Any, optimizer: Any, lr_schedule: Any, keep_grads: bool = False):
         """Performs a step in the optimization process.
 
+        Pure-sign SignSGD (no scaler, HPU apart, momentum/weight-decay/maximize
+        off everywhere) takes the bit-identical foreach fast path; the grad
+        release matches ``keep_grads`` (parked for graph replays, freed
+        otherwise). Any other configuration runs the original
+        step/zero_grad/schedule sequence.
+
         Args:
         scaler: The scaler to be used.
         optimizer: The optimizer for the step.
         lr_schedule: The learning rate schedule.
+        keep_grads: grads keep their addresses (CUDA-graph replay loops).
 
         Returns:
         None
         """
         from auto_round.algorithms.quantization.sign_round.data_parallel import _sign_step_foreach, sign_step_foreach_ok
 
-        if scaler is None and sign_step_foreach_ok(optimizer):
+        if scaler is None and not is_hpex_available() and sign_step_foreach_ok(optimizer):
             # pure-sign SignSGD: the single-tensor loop is launch-bound
             # (~1195 groups x sign+mul+add+zero); the foreach form is
             # bit-identical and ~3 kernels per param group. The zero is
             # included (parked when grads must keep their addresses).
-            _sign_step_foreach(optimizer)
-            if is_hpex_available():
-                htcore.mark_step()
+            _sign_step_foreach(optimizer, free_grads=not keep_grads)
             lr_schedule.step()
             return
         optimizer.step()

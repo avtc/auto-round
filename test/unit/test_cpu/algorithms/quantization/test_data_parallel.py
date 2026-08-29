@@ -2331,8 +2331,6 @@ class TestSignStepForeach:
             _sign_step_foreach(fast)
             # single-tensor reference (SignSGD's engaged formula)
             with torch.no_grad():
-                for group, module in ((None, slow_a), (None, slow_b)):
-                    pass
                 lr_map = {id(slow_a.weight): 0.3, id(slow_b.weight): 0.07}
                 for p in (slow_a.weight, slow_b.weight):
                     p.add_(torch.sign(p.grad), alpha=-lr_map[id(p)])
@@ -2348,19 +2346,35 @@ class TestSignStepForeach:
 
         lin = torch.nn.Linear(3, 3)
         pure = torch.optim.SGD(list(lin.parameters()), lr=0.1)
-        assert sign_step_foreach_ok(pure) is True
+        assert sign_step_foreach_ok(pure) is False  # not a SignSGD instance
         mom = torch.optim.SGD(list(lin.parameters()), lr=0.1, momentum=0.9)
-        assert sign_step_foreach_ok(mom) is False
-        wd = torch.optim.SGD(list(lin.parameters()), lr=0.1, weight_decay=0.01)
-        assert sign_step_foreach_ok(wd) is False
+        assert sign_step_foreach_ok(mom) is False  # not SignSGD + momentum
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+        sgd_mom = SignSGD(list(lin.parameters()), lr=0.1, momentum=0.9)
+        assert sign_step_foreach_ok(sgd_mom) is False
+        sgd_max = SignSGD(list(lin.parameters()), lr=0.1, maximize=True)
+        assert sign_step_foreach_ok(sgd_max) is False  # would flip the update
+        sgd_grp = SignSGD([{"params": list(lin.parameters()), "momentum": 0.5}], lr=0.1)
+        assert sign_step_foreach_ok(sgd_grp) is False  # per-group override
+        sgd_wd = SignSGD(list(lin.parameters()), lr=0.1, weight_decay=0.01)
+        assert sign_step_foreach_ok(sgd_wd) is False
+        sgd_pure = SignSGD(list(lin.parameters()), lr=0.1)
+        assert sign_step_foreach_ok(sgd_pure) is True
 
     def test_none_grad_param_untouched(self):
         import torch
 
         from auto_round.algorithms.quantization.sign_round.data_parallel import _sign_step_foreach
 
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
         lin = torch.nn.Linear(3, 3)
-        opt = torch.optim.SGD(list(lin.parameters()), lr=0.1)
+        opt = SignSGD(list(lin.parameters()), lr=0.1)
         before = lin.weight.detach().clone()
         _sign_step_foreach(opt)  # no grads at all
         assert torch.equal(lin.weight.detach(), before)
+        # free_grads releases tensors (non-graph parity with set_to_none=True)
+        lin.weight.grad = torch.zeros_like(lin.weight)
+        _sign_step_foreach(opt, free_grads=True)
+        assert lin.weight.grad is None
