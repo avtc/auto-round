@@ -683,6 +683,16 @@ def _debug_flat_leak_probe(tag: str) -> None:
                                 hk += "[" + ",".join(str(k) for k in list(h.keys())[:3]) + "]"
                             held_by.append(hk)
                         names.append(f"MODULE<{type(mod).__name__}#{id(mod) % 100000}> held-by: {held_by}")
+                        if type(mod).__name__ == "ReplicaGroup":
+                            gh = []
+                            for h in gc.get_referrers(mod)[:6]:
+                                hk = type(h).__name__
+                                if isinstance(h, (list, tuple)):
+                                    hk += f"[len{len(h)}]"
+                                elif isinstance(h, dict):
+                                    hk += "[" + ",".join(str(k) for k in list(h.keys())[:3]) + "]"
+                                gh.append(hk)
+                            names.append(f"GROUP-HELD-BY: {gh}")
         logger.info(
             "[leak-probe/%s]   ptr=%d %s numel=%d (%.2f GB) referrers: %s",
             tag,
@@ -1272,6 +1282,8 @@ def _rebuild_flat_views(mirror: torch.nn.Module) -> bool:
     mods = dict(mirror.named_modules())
     for name, key, gidx, off, n, shape in manifest:
         m = mods[name]
+        if not isinstance(getattr(m, "params", None), dict):
+            continue  # stale entry: the wrapper was unwrapped already
         gp = groups[gidx]
         view = gp[off : off + n].view(shape)
         if key in m._parameters:
@@ -1309,6 +1321,8 @@ def _deepcopy_flat_safe(block: torch.nn.Module, tuning: bool = True) -> torch.nn
     try:
         for name, key, gidx, off, n, shape in manifest:
             m = mods[name]
+            if not isinstance(getattr(m, "params", None), dict):
+                continue  # stale entry: the wrapper was unwrapped already
             saved.append((m, key, m.params[key], key in m._buffers))
             swapped = groups[gidx].data[off : off + n].view(shape)
             m.params[key] = swapped
