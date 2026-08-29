@@ -1127,6 +1127,164 @@ def _copy_attr_value(value):
     return copy.deepcopy(value)
 
 
+_GRAPH_CAPTURE_LOCK = threading.Lock()
+
+
+def _cuda_graphs_supported() -> bool:
+    """CUDA graphs need a CUDA build; CPU runs stay eager."""
+    return torch.cuda.is_available() and hasattr(torch.cuda, "CUDAGraph")
+
+
+def cuda_graphs_engage(replica_group) -> bool:
+    """Whether the DDP tune loop may capture per-replica CUDA graphs.
+
+    Quiet refusals are environment properties only (serial path, no CUDA).
+    Everything that fails *during* prepare/capture/replay is a real fault
+    and raises (see :class:`GraphedReplicaStep`).
+    """
+    if replica_group is None:
+        return False
+    return _cuda_graphs_supported()
+
+
+def _copy_into_static(dst, src) -> None:
+    """Refresh a static buffer tree from a freshly gathered one, leaf-wise.
+
+    Tensors are ``copy_``-ed in place (addresses must stay stable for CUDA
+    graph replay); identical objects (shared caches such as rotary tables)
+    are skipped; non-tensor leaves must already be equal. A shape or dtype
+    mismatch raises -- replay would read a wrong-shaped buffer, so the run
+    halts instead of silently training on garbage.
+    """
+    if isinstance(dst, torch.Tensor):
+        if dst is src:
+            return
+        if not isinstance(src, torch.Tensor):
+            raise RuntimeError(f"static-buffer leaf type drift: {type(dst)} vs {type(src)}")
+        if dst.shape != src.shape or dst.dtype != src.dtype:
+            raise RuntimeError(
+                f"static-buffer shape/dtype drift: {tuple(dst.shape)}/{dst.dtype} vs " f"{tuple(src.shape)}/{src.dtype}"
+            )
+        dst.copy_(src, non_blocking=True)
+        return
+    if isinstance(dst, dict):
+        for k in dst:
+            if k not in src:
+                raise RuntimeError(f"static-buffer key vanished: {k!r}")
+            _copy_into_static(dst[k], src[k])
+        return
+    if isinstance(dst, (tuple, list)):
+        if len(dst) != len(src):
+            raise RuntimeError(f"static-buffer length drift: {len(dst)} vs {len(src)}")
+        for d, v in zip(dst, src):
+            _copy_into_static(d, v)
+        return
+    if dst != src:
+        raise RuntimeError(f"static-buffer non-tensor leaf changed: {dst!r} vs {src!r}")
+
+
+class GraphedReplicaStep:
+    """One replica's tune step (prepare eager + compute in a CUDA graph).
+
+    Split contract:
+    - ``prepare(...)`` runs eagerly EVERY iteration: gathers this
+      iteration's samples into the replica's STATIC device buffers (inputs,
+      kwargs, fp reference). Shapes must repeat; a drift raises (halt).
+    - ``compute()`` is the pure-GPU region -- forward + loss + backward on
+      the static buffers, grads parked (``zero_grad(set_to_none=False)``)
+      so backward accumulates into the addresses baked at capture.
+    - the first ``warmup_iters`` ``__call__``-s run prepare + compute
+      eagerly; ``capture_now()`` then records the graph (from the MAIN
+      thread at a point where the pool workers are parked -- torch.cuda.graph
+      forbids concurrent CUDA work process-wide during capture) and
+      immediately replays once so that iteration's work executes; later
+      ``__call__``-s just prepare + replay. The returned loss is a CLONE
+      of the static output tensor (its buffer is rewritten by each replay).
+
+    Any prepare/capture/replay failure is logged and re-raised: the run
+    halts instead of silently degrading -- set AR_TUNE_CUDA_GRAPHS=0 to
+    disable graphs.
+    """
+
+    def __init__(
+        self,
+        prepare,
+        compute,
+        *,
+        warmup_iters: int = 2,
+        name: str = "",
+        device=None,
+        graph_factory=None,
+        capture_ctx=None,
+    ):
+        self.prepare = prepare
+        self.compute = compute
+        self.warmup_iters = warmup_iters
+        self.name = name or "replica"
+        self.device = device
+        self._graph = None
+        self._static_loss = None
+        self._calls = 0
+        self._graph_factory = graph_factory if graph_factory is not None else lambda: torch.cuda.CUDAGraph()
+        self._capture_ctx = capture_ctx if capture_ctx is not None else lambda g: torch.cuda.graph(g)
+
+    def capture_now(self):
+        """Record the graph now (main thread, workers parked) and replay once.
+
+        The process-wide capture lock is held anyway: torch.cuda.graph uses
+        a singleton capture stream, so captures must serialize even if a
+        future caller forgets the parked-workers contract.
+        """
+        import contextlib
+
+        try:
+            with _GRAPH_CAPTURE_LOCK:
+                with torch.cuda.device(self.device) if self.device is not None else contextlib.nullcontext():
+                    graph = self._graph_factory()
+                    with self._capture_ctx(graph):
+                        self._static_loss = self.compute()
+                    # capture only RECORDS: execute this iteration's work
+                    graph.replay()
+                    self._graph = graph
+        except Exception as exc:
+            logger.error(
+                "[tune-ddp] cuda graph capture failed for %s (%s): set AR_TUNE_CUDA_GRAPHS=0 to disable",
+                self.name,
+                exc,
+            )
+            raise
+        return self._static_loss.detach().clone()
+
+    def __call__(self, *args, **kwargs):
+        try:
+            self.prepare(*args, **kwargs)
+        except Exception as exc:
+            logger.error(
+                "[tune-ddp] cuda-graph prepare failed for %s (%s): set AR_TUNE_CUDA_GRAPHS=0 to disable",
+                self.name,
+                exc,
+            )
+            raise
+        if self._graph is None:
+            self._calls += 1
+            if self._calls <= self.warmup_iters:
+                return self.compute().detach()
+            raise RuntimeError(
+                f"cuda graph for {self.name} was not captured after {self.warmup_iters} warmup iteration(s) "
+                "-- capture_now() must run at the loop's barrier point"
+            )
+        try:
+            self._graph.replay()
+        except Exception as exc:
+            logger.error(
+                "[tune-ddp] cuda graph replay failed for %s (%s): set AR_TUNE_CUDA_GRAPHS=0 to disable",
+                self.name,
+                exc,
+            )
+            raise
+        return self._static_loss.detach().clone()
+
+
 def run_threaded_spawn(fns: Sequence) -> None:
     """Run one callable per item in parallel SPAWNED threads (legacy path).
 

@@ -54,15 +54,15 @@ class AdamRoundQuantizer(SignRoundQuantizer):
             htcore.mark_step()
         return loss
 
-    def _step(self, scaler, optimizer, lr_schedule):
+    def _step(self, scaler, optimizer, lr_schedule, keep_grads: bool = False):
         if scaler is not None:
             scaler.step(optimizer)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=not keep_grads)
             lr_schedule.step()
             scaler.update()
         else:
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=not keep_grads)
             lr_schedule.step()
         if is_hpex_available():
             htcore.mark_step()

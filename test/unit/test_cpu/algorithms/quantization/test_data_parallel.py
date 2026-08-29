@@ -13,12 +13,15 @@
 # limitations under the License.
 """Tests for single-process data parallelism of the SignRound tuning loop."""
 
+import contextlib
 import copy
 
 import pytest
 import torch
 
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
+    GraphedReplicaStep,
+    _copy_into_static,
     DDPPlan,
     ReplicaGroup,
     ReplicaThreadPool,
@@ -1320,3 +1323,154 @@ class TestOverlapExchange:
             for p in ps:
                 assert p.grad is not None
         group.teardown()
+
+
+class TestGraphedReplicaStepV2:
+    """Orchestration tests for the prepare/compute-split CUDA-graph step.
+
+    A duck-typed fake graph stands in for torch.cuda.CUDAGraph: its replay()
+    re-runs the compute callable, simulating kernels rewriting the static
+    loss buffer (and reading the static input buffers the prepare callable
+    filled).
+    """
+
+    @staticmethod
+    def _make(warmup=2):
+        static_in = torch.zeros(1)
+        state = {"prepares": 0, "computes": 0}
+
+        def prepare(v):
+            static_in.fill_(v)
+            state["prepares"] += 1
+
+        def compute():
+            state["computes"] += 1
+            return static_in.clone().sum().reshape(1)
+
+        step_holder = {}
+
+        class FakeGraph:
+            def replay(self):
+                step_holder["step"]._static_loss.copy_(compute())
+
+        step_holder["step"] = GraphedReplicaStep(
+            prepare,
+            compute,
+            warmup_iters=warmup,
+            name="r0",
+            graph_factory=lambda: FakeGraph(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        return step_holder["step"], static_in, state
+
+    def test_warmup_runs_prepare_and_compute_eagerly(self):
+        step, _, state = self._make(warmup=2)
+        assert step(11.0).item() == 11.0
+        assert step(12.0).item() == 12.0
+        assert state["prepares"] == 2 and state["computes"] == 2
+
+    def test_capture_then_replay_uses_prepared_buffers(self):
+        step, _, state = self._make(warmup=1)
+        assert step(5.0).item() == 5.0  # warmup
+        r2 = step.capture_now()  # records, then replays once (this iter's work)
+        assert r2.item() == 5.0  # static buffer still holds the warmup gather
+        step(6.0)  # prepare + replay through the fake graph
+        assert r2.item() == 5.0  # earlier clone unaffected
+        assert state["prepares"] == 2 and state["computes"] == 4
+
+    def test_uncaptured_beyond_warmup_raises(self):
+        step, _, _ = self._make(warmup=1)
+        step(1.0)
+        with pytest.raises(RuntimeError, match="capture_now"):
+            step(2.0)
+
+    def test_replay_returns_clone_not_static(self):
+        step, _, _ = self._make(warmup=1)
+        a = step(1.0)
+        step.capture_now()
+        b = step(2.0)
+        assert a is not b and a is not step._static_loss
+        assert a.item() == 1.0 and b.item() == 2.0
+
+    def test_capture_failure_halts(self, caplog):
+        from auto_round.logger import logger as ar_logger
+
+        def boom(_g):
+            raise RuntimeError("no capture")
+
+        step = GraphedReplicaStep(
+            lambda: None,
+            lambda: torch.zeros(1),
+            warmup_iters=0,
+            name="r1",
+            graph_factory=lambda: object(),
+            capture_ctx=boom,
+        )
+        ar_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("ERROR"):
+                with pytest.raises(RuntimeError, match="no capture"):
+                    step.capture_now()
+        finally:
+            ar_logger.removeHandler(caplog.handler)
+        assert any("AR_TUNE_CUDA_GRAPHS=0" in r.getMessage() for r in caplog.records)
+        assert step._graph is None
+
+    def test_replay_failure_halts(self, caplog):
+        from auto_round.logger import logger as ar_logger
+
+        step, _, _ = self._make(warmup=0)
+        step.capture_now()
+
+        def boom():
+            raise RuntimeError("replay died")
+
+        step._graph.replay = boom
+        ar_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("ERROR"):
+                with pytest.raises(RuntimeError, match="replay died"):
+                    step(2.0)
+        finally:
+            ar_logger.removeHandler(caplog.handler)
+        assert any("AR_TUNE_CUDA_GRAPHS=0" in r.getMessage() for r in caplog.records)
+
+    def test_prepare_failure_before_capture_halts(self):
+        def bad_prepare():
+            raise RuntimeError("gather failed")
+
+        step = GraphedReplicaStep(
+            bad_prepare,
+            lambda: torch.zeros(1),
+            warmup_iters=0,
+            name="r2",
+            graph_factory=lambda: object(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        with pytest.raises(RuntimeError, match="gather failed"):
+            step()
+
+
+class TestStaticBufferLeafCopy:
+    def test_copy_into_static_walks_structures(self):
+        t = lambda *s: torch.full(s, 2.0)
+        dst = {"a": torch.zeros(2), "b": (torch.zeros(2, 2), torch.zeros(3)), "c": [torch.zeros(1)], "d": "same"}
+        src = {"a": t(2), "b": (t(2, 2), t(3)), "c": [t(1)], "d": "same"}
+        _copy_into_static(dst, src)
+        assert torch.equal(dst["a"], t(2))
+        assert torch.equal(dst["b"][0], t(2, 2)) and torch.equal(dst["b"][1], t(3))
+        assert torch.equal(dst["c"][0], t(1))
+        assert dst["d"] == "same"
+
+    def test_identity_leaves_skip_copy(self):
+        shared = torch.zeros(2)
+        dst = {"rope": shared, "mask": torch.zeros(2)}
+        src = {"rope": shared, "mask": torch.full((2,), 1.0)}
+        _copy_into_static(dst, src)
+        assert torch.equal(dst["mask"], torch.full((2,), 1.0))
+
+    def test_shape_mismatch_raises(self):
+        dst = {"a": torch.zeros(2)}
+        src = {"a": torch.zeros(3)}
+        with pytest.raises(RuntimeError, match="shape"):
+            _copy_into_static(dst, src)

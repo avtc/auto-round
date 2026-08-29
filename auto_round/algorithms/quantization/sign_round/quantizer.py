@@ -756,6 +756,29 @@ class SignRoundQuantizer(BaseQuantizer):
             _dp_samplers = shard_samplers(nsamples, replica_group.world, global_batch_size // replica_group.world)
         block_fwd = self.block_forward
 
+        # CUDA graphs for the DDP tune loop: the per-replica step is split
+        # into an eager per-iteration PREPARE (gather this iteration's shard
+        # into stable device buffers) and a captured COMPUTE (fwd + loss +
+        # bwd on those buffers). Rotating shard contents stay correct --
+        # only the addresses must repeat. Engagement is environment-gated
+        # only (list inputs / not diffusion / no valid-token mask); anything
+        # failing during prepare/capture/replay raises and halts the run.
+        _graphs_active = False
+        _graphed_steps = None
+        _graphs_warmups_left = 0
+        _graphs_capture_pending = False
+        from auto_round.algorithms.quantization.sign_round.data_parallel import cuda_graphs_engage
+
+        if (
+            _envs.AR_TUNE_CUDA_GRAPHS
+            and replica_group is not None
+            and cuda_graphs_engage(replica_group)
+            and isinstance(active_inputs, list)
+            and not getattr(block_fwd, "is_diffusion", False)
+            and valid_token_mask is None
+        ):
+            _graphs_active = True
+
         # When low_gpu_mem_usage is enabled, active_inputs / fp_outputs are intentionally
         # kept on CPU to limit GPU memory.  However block_fwd normally routes pred_output
         # through CPU (cache_device="cpu") and the very next line moves it back to
@@ -815,7 +838,11 @@ class SignRoundQuantizer(BaseQuantizer):
                             _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
                             _loss_w.backward()
                     for _opt in [optimizer] + mirror_optimizers:
-                        _opt.zero_grad()
+                        # graphs replay backward into the captured grad
+                        # addresses: the warm-up backward above allocated
+                        # them, freeing here would make replay write into
+                        # recycled memory
+                        _opt.zero_grad(set_to_none=not _graphs_active)
             except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
                 replica_group.teardown()
                 raise RuntimeError(
@@ -905,8 +932,88 @@ class SignRoundQuantizer(BaseQuantizer):
                         _losses[r] = loss_r.detach()
                         loss_r.backward()
 
-                with tune_stage(tune_prof, "fwd"):
-                    replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
+                def _make_graphed_step(r):
+                    # Static buffers: the FIRST gather's tensors become the
+                    # graph's baked inputs (their addresses must repeat);
+                    # every later prepare refreshes them in place. Shared
+                    # leaves (rotary tables) keep their identity -- no copy.
+                    rep = replica_group.replicas[r]
+                    dev_r = next(rep.parameters()).device
+                    st = {"inputs": None, "others": None, "ref": None}
+                    from auto_round.algorithms.quantization.sign_round.data_parallel import _copy_into_static
+
+                    def prepare(shard):
+                        with torch.cuda.device(dev_r):
+                            expect_pool_local([fp_outputs[j] for j in shard], dev_r, "ddp-ref")
+                            ref = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
+                            # same gather the runner performs inside forward()
+                            indices = torch.tensor(shard, dtype=torch.long, device=dev_r)
+                            bins, bother = [], []
+                            for i in range(0, len(indices), block_fwd.batch_size):
+                                bi = indices[i : i + block_fwd.batch_size]
+                                _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
+                                bins.append(_in)
+                                bother.append(_oth)
+                            if st["ref"] is None:
+                                st["ref"], st["inputs"], st["others"] = ref, bins, bother
+                                return
+                            _copy_into_static(st["ref"], ref)
+                            _copy_into_static(st["inputs"], bins)
+                            _copy_into_static(st["others"], bother)
+
+                    def compute():
+                        with torch.cuda.device(dev_r):
+                            outs = []
+                            for _in, _oth in zip(st["inputs"], st["others"]):
+                                raw = block_fwd._forward_one_batch(rep, _in, _oth)
+                                out = block_fwd._normalize_output(raw, rep)
+                                outs.append(out.to(dev_r) if out.device != dev_r else out)
+                            pred_r = outs[0] if len(outs) == 1 else torch.cat(outs, dim=block_fwd.batch_dim)
+                            # valid_token_mask is None on this path, so the
+                            # indices argument of _get_loss is never consumed
+                            loss_r = self._get_loss(pred_r, st["ref"], None, mse_loss, dev_r, None)
+                            loss_r.backward()
+                            return loss_r
+
+                    from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+                    return GraphedReplicaStep(prepare, compute, name=f"replica-{r}", device=dev_r)
+
+                def _dp_run(r):
+                    _losses[r] = _graphed_steps[r](_shards[r])
+
+                if _graphs_active and _graphed_steps is None:
+                    _graphed_steps = [_make_graphed_step(r) for r in range(_world)]
+                    _graphs_warmups_left = _graphed_steps[0].warmup_iters
+                    logger.info(
+                        "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
+                        _world,
+                        _graphs_warmups_left,
+                    )
+
+                if _graphs_capture_pending:
+                    # barrier point: pool workers are parked and no CUDA work
+                    # is in flight process-wide -- torch.cuda.graph forbids
+                    # concurrent CUDA during capture, so all captures run
+                    # sequentially here on the main thread; the immediate
+                    # replay inside capture_now executes this iteration's work
+                    with tune_stage(tune_prof, "fwd"):
+                        for r in range(_world):
+                            _graphed_steps[r].prepare(_shards[r])
+                        for r in range(_world):
+                            _losses[r] = _graphed_steps[r].capture_now()
+                        _graphs_capture_pending = False
+                        logger.info("[tune-ddp] cuda graphs captured %d replica step(s)", _world)
+                elif _graphed_steps is not None:
+                    with tune_stage(tune_prof, "fwd"):
+                        replica_group.run_threaded([lambda r=r: _dp_run(r) for r in range(_world)])
+                    if _graphs_warmups_left > 0:
+                        _graphs_warmups_left -= 1
+                        if _graphs_warmups_left == 0:
+                            _graphs_capture_pending = True
+                else:
+                    with tune_stage(tune_prof, "fwd"):
+                        replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
                 # sync_grads stages itself (bufprep / exchange / writeback).
                 # sign_exchange: the update consumes only sign(mean-grad) and
                 # weight_decay is 0, so exchanging int8 signs after the
@@ -1012,11 +1119,11 @@ class SignRoundQuantizer(BaseQuantizer):
                 best_params = collect_best_params(block, self.compress_context.cache_device)
             if replica_group is not None:
                 with tune_stage(tune_prof, "step"):
-                    self._step(scaler, optimizer, lr_schedule)
+                    self._step(scaler, optimizer, lr_schedule, keep_grads=_graphs_active)
 
                     def _mirror_step(opt, sched):
                         opt.step()
-                        opt.zero_grad()
+                        opt.zero_grad(set_to_none=not _graphs_active)
                         sched.step()
 
                     # mirror optimizers exclude the HOME replica (its step ran
@@ -1345,7 +1452,7 @@ class SignRoundQuantizer(BaseQuantizer):
             htcore.mark_step()
         return scale_loss
 
-    def _step(self, scaler: Any, optimizer: Any, lr_schedule: Any):
+    def _step(self, scaler: Any, optimizer: Any, lr_schedule: Any, keep_grads: bool = False):
         """Performs a step in the optimization process.
 
         Args:
@@ -1360,5 +1467,7 @@ class SignRoundQuantizer(BaseQuantizer):
         # for hpu
         if is_hpex_available():
             htcore.mark_step()
-        optimizer.zero_grad()
+        # keep_grads=True (CUDA-graph tune loop): grads must stay parked at
+        # their captured addresses for the next replay
+        optimizer.zero_grad(set_to_none=not keep_grads)
         lr_schedule.step()
