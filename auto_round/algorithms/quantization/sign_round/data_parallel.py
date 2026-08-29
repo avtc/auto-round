@@ -1379,13 +1379,6 @@ def _deepcopy_flat_safe(block: torch.nn.Module, tuning: bool = True) -> torch.nn
                 gp.grad = g
         if grad_buf is not None:
             block._tune_flat_grad = grad_buf
-        if saved_state is not None:
-            bufs, datas, grads = saved_state
-            block._buffers.update(bufs)
-            for gp, d in zip(groups, datas):
-                gp.data = d
-            for gp, g in grads.items():
-                gp.grad = g
         for m, key, view, was_buffer in saved:
             m.params[key] = view
             if was_buffer:

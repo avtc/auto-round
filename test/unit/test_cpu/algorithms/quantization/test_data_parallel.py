@@ -760,6 +760,31 @@ class TestFlatVParams:
             for k in va:
                 assert torch.equal(va[k], vb[k]), f"replica {r} key {k} diverged"
 
+    def test_deepcopy_flat_safe_value_only_and_stale_manifest(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _deepcopy_flat_safe,
+            _park_flat_grads,
+        )
+
+        block = self._block()
+        assert build_flat_tuning_params(block, self._lrs, self._mlrs)
+        _park_flat_grads(block)
+        grad_buf = block._tune_flat_grad
+        grad_view = block._tune_flat_groups[0].grad
+        views = {k: v for k, v in block.m1.params.items()}
+        mir = _deepcopy_flat_safe(block, tuning=False)
+        # mirror: values only, no full-flat storage, no parked grads
+        assert mir._tune_flat_base.numel() == 0
+        assert getattr(mir, "_tune_flat_grad", None) is None
+        assert torch.equal(mir.m1.params["value"].detach(), views["value"].detach())
+        # home restored exactly (objects, not just values)
+        assert block._tune_flat_grad is grad_buf
+        assert block._tune_flat_groups[0].grad is grad_view
+        assert all(block.m1.params[k] is views[k] for k in views)
+        # stale manifest: unwrapped modules are skipped, not crashed on
+        block.m1 = block.m1.orig_layer
+        _deepcopy_flat_safe(block, tuning=False)
+
     def test_flat_env_gate_default_and_opt_out(self, monkeypatch):
         from auto_round import envs
 
