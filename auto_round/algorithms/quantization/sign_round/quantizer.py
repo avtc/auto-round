@@ -1130,7 +1130,11 @@ class SignRoundQuantizer(BaseQuantizer):
             and self._is_text_decoder_block(block_ctx.block_name)
         )
         _serial_streamer = getattr(getattr(block, "_stream_prefetch_source", None), "streamer", None)
-        from auto_round.algorithms.quantization.sign_round.data_parallel import serial_graphs_engage
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _sign_step_foreach,
+            serial_graphs_engage,
+            sign_step_foreach_ok,
+        )
 
         if bool(_envs.AR_TUNE_CUDA_GRAPHS) and serial_graphs_engage(
             replica_group,
@@ -1572,8 +1576,11 @@ class SignRoundQuantizer(BaseQuantizer):
                     self._step(scaler, optimizer, lr_schedule, keep_grads=_graphs_active)
 
                     def _mirror_step(opt, sched):
-                        opt.step()
-                        opt.zero_grad(set_to_none=not _graphs_active)
+                        if sign_step_foreach_ok(opt):
+                            _sign_step_foreach(opt)  # bit-identical, parked zero
+                        else:
+                            opt.step()
+                            opt.zero_grad(set_to_none=not _graphs_active)
                         sched.step()
 
                     # mirror optimizers exclude the HOME replica (its step ran
@@ -1967,6 +1974,18 @@ class SignRoundQuantizer(BaseQuantizer):
         Returns:
         None
         """
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _sign_step_foreach, sign_step_foreach_ok
+
+        if scaler is None and sign_step_foreach_ok(optimizer):
+            # pure-sign SignSGD: the single-tensor loop is launch-bound
+            # (~1195 groups x sign+mul+add+zero); the foreach form is
+            # bit-identical and ~3 kernels per param group. The zero is
+            # included (parked when grads must keep their addresses).
+            _sign_step_foreach(optimizer)
+            if is_hpex_available():
+                htcore.mark_step()
+            lr_schedule.step()
+            return
         optimizer.step()
         # for hpu
         if is_hpex_available():

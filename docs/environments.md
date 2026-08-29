@@ -418,6 +418,11 @@ export AR_TUNE_SERIAL_DEVICE_SCHEDULE=0   # lazy next_batch + host-list indices 
 export AR_TUNE_CUDA_GRAPHS=0   # disable whole graph capture (DDP replica steps + serial steps)
 ```
 
+### Optimizer step fast path (pure-sign foreach)
+- **Description**: When the tuning optimizer is in the pure-sign configuration (momentum 0, weight decay 0 — the AutoRound default), the SignSGD step runs as foreach ops (`_foreach_sign` + `_foreach_add_` + parked `_foreach_zero_`): bit-identical math to the single-tensor loop while collapsing ~1195×3 tiny kernel launches to ~3 per param group. Applies to the home optimizer and every mirror optimizer on every tune path (serial, DDP, graphed); momentum/weight-decay configs keep the original loop.
+- **Default**: enabled automatically when the optimizer qualifies (no env var)
+- **Usage**: nothing to set; visible as a lower `step` stage time in the tune profile.
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

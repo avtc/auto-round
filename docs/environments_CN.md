@@ -418,6 +418,11 @@ export AR_TUNE_SERIAL_DEVICE_SCHEDULE=0   # 惰性 next_batch + 主机列表索�
 export AR_TUNE_CUDA_GRAPHS=0   # 禁用整体 graph 捕获（DDP replica step 与串行 step）
 ```
 
+### 优化器 step 快速路径（纯符号 foreach）
+- **描述**： 当调优优化器处于纯符号配置（momentum 为 0、weight decay 为 0——AutoRound 默认）时，SignSGD step 以 foreach 算子执行（`_foreach_sign` + `_foreach_add_` + 驻留 `_foreach_zero_`）：与单张量循环逐位一致，同时把约 1195×3 个微小 kernel 启动压缩为每参数组约 3 个。适用于所有调优路径（串行、DDP、图化）上的主优化器与每个镜像优化器；momentum/weight-decay 配置保持原循环。
+- **默认值**: 优化器满足条件时自动启用（无环境变量）
+- **用法**: 无需设置；体现为 tune profile 中更低的 `step` 阶段耗时。
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

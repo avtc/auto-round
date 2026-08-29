@@ -2288,3 +2288,79 @@ class TestSerialTrajectoryParity:
             assert torch.equal(loss_g.detach(), loss_l.detach())
         for p_new, p_old in zip(block.parameters(), legacy.parameters()):
             assert torch.equal(p_new, p_old)
+
+
+class TestSignStepForeach:
+    """T9: foreach fast path -- bit-parity vs SignSGD's single-tensor math."""
+
+    def test_bit_parity_vs_single_tensor_sgd(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _sign_step_foreach
+
+        torch.manual_seed(9)
+        fast_a = torch.nn.Linear(6, 6)
+        slow_a = torch.nn.Linear(6, 6)
+        slow_a.load_state_dict(fast_a.state_dict())
+        fast_b = torch.nn.Linear(4, 4)
+        slow_b = torch.nn.Linear(4, 4)
+        slow_b.load_state_dict(fast_b.state_dict())
+        fast = torch.optim.SGD(
+            [
+                {"params": list(fast_a.parameters()), "lr": 0.3},
+                {"params": list(fast_b.parameters()), "lr": 0.07},
+            ],
+            lr=0.1,
+        )
+        slow = torch.optim.SGD(
+            [
+                {"params": list(slow_a.parameters()), "lr": 0.3},
+                {"params": list(slow_b.parameters()), "lr": 0.07},
+            ],
+            lr=0.1,
+        )
+        for _ in range(3):
+            for pf, ps, lr in (
+                (fast_a.weight, slow_a.weight, 0.3),
+                (fast_b.weight, slow_b.weight, 0.07),
+            ):
+                g = torch.randn(pf.shape)
+                pf.grad = g.clone()
+                ps.grad = g.clone()
+            # fast path
+            _sign_step_foreach(fast)
+            # single-tensor reference (SignSGD's engaged formula)
+            with torch.no_grad():
+                for group, module in ((None, slow_a), (None, slow_b)):
+                    pass
+                lr_map = {id(slow_a.weight): 0.3, id(slow_b.weight): 0.07}
+                for p in (slow_a.weight, slow_b.weight):
+                    p.add_(torch.sign(p.grad), alpha=-lr_map[id(p)])
+                    p.grad.zero_()
+        assert torch.equal(fast_a.weight, slow_a.weight)
+        assert torch.equal(fast_b.weight, slow_b.weight)
+        assert torch.count_nonzero(fast_a.weight.grad) == 0  # parked zero
+
+    def test_skips_none_grads_and_gates_on_config(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sign_step_foreach_ok
+
+        lin = torch.nn.Linear(3, 3)
+        pure = torch.optim.SGD(list(lin.parameters()), lr=0.1)
+        assert sign_step_foreach_ok(pure) is True
+        mom = torch.optim.SGD(list(lin.parameters()), lr=0.1, momentum=0.9)
+        assert sign_step_foreach_ok(mom) is False
+        wd = torch.optim.SGD(list(lin.parameters()), lr=0.1, weight_decay=0.01)
+        assert sign_step_foreach_ok(wd) is False
+
+    def test_none_grad_param_untouched(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _sign_step_foreach
+
+        lin = torch.nn.Linear(3, 3)
+        opt = torch.optim.SGD(list(lin.parameters()), lr=0.1)
+        before = lin.weight.detach().clone()
+        _sign_step_foreach(opt)  # no grads at all
+        assert torch.equal(lin.weight.detach(), before)

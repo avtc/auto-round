@@ -1798,6 +1798,38 @@ def make_serial_graphed_step(
     )
 
 
+def sign_step_foreach_ok(optimizer) -> bool:
+    """Whether the optimizer qualifies for the foreach pure-sign fast path.
+
+    Mirrors SignSGD's engaged configuration (momentum 0, weight_decay 0 --
+    dampening/nesterov only apply with momentum). Checked on the OPTIMIZER's
+    own defaults so home and mirror optimizers qualify identically.
+    """
+    d = getattr(optimizer, "defaults", {}) or {}
+    return float(d.get("momentum", 0) or 0) == 0.0 and float(d.get("weight_decay", 0) or 0) == 0.0
+
+
+def _sign_step_foreach(optimizer) -> None:
+    """Pure-sign SignSGD step via foreach ops (bit-identical, ~3 kernels/group).
+
+    Same math as SignSGD's always-used ``_single_tensor_sgd`` for the engaged
+    configuration: ``param.add_(sign(grad), alpha=-lr)`` then a parked zero
+    (``set_to_none=False`` semantics). Params with ``grad=None`` are skipped,
+    exactly like the optimizer. The 1195-launch single-tensor loop collapses
+    to ~3 foreach kernels per param group.
+    """
+    with torch.no_grad():
+        for group in optimizer.param_groups:
+            pairs = [(p, p.grad) for p in group["params"] if p.grad is not None]
+            if not pairs:
+                continue
+            params = [p for p, _ in pairs]
+            grads = [g for _, g in pairs]
+            signs = torch._foreach_sign(grads)
+            torch._foreach_add_(params, signs, alpha=-float(group["lr"]))
+            torch._foreach_zero_(grads)
+
+
 def serial_step_vram_ok(needed_bytes, free_fn, margin: int = 1 << 30) -> bool:
     """Whole-iteration staging VRAM guard (T8c).
 
@@ -1854,11 +1886,15 @@ def make_serial_step_fn(optimizer, device):
                 lr_dev = group.get("_ar_neg_lr_dev")
                 if lr_dev is None:
                     continue
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    p.add_(torch.sign(p.grad) * lr_dev)
-                    p.grad.zero_()
+                pairs = [(p, p.grad) for p in group["params"] if p.grad is not None]
+                if not pairs:
+                    continue
+                params = [p for p, _ in pairs]
+                grads = [g for _, g in pairs]
+                signs = torch._foreach_sign(grads)
+                torch._foreach_mul_(signs, lr_dev)
+                torch._foreach_add_(params, signs)
+                torch._foreach_zero_(grads)
 
     return step_fn, pre_by_id
 
