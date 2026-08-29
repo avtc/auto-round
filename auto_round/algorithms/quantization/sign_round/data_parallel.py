@@ -659,17 +659,34 @@ def _debug_flat_leak_probe(tag: str) -> None:
         hist,
     )
     hits.sort(key=lambda t: -int(t.untyped_storage().nbytes()))
-    for t in hits[:4]:
+    for t in hits[:6]:
+        try:
+            ptr = t.data_ptr()
+        except Exception:  # noqa: BLE001 - FakeTensor/FunctionalTensor
+            continue
         names = []
         for r in gc.get_referrers(t)[:8]:
             kind = type(r).__name__
             if isinstance(r, dict):
                 kind += "[" + ",".join(str(k) for k in list(r.keys())[:3]) + "]"
             names.append(kind)
+            # a module __dict__ holder: name the module and WHAT HOLDS IT
+            if isinstance(r, dict) and {"training", "_parameters", "_buffers"} <= set(r.keys()):
+                for mod in gc.get_referrers(r):
+                    if isinstance(mod, torch.nn.Module):
+                        held_by = []
+                        for h in gc.get_referrers(mod)[:6]:
+                            hk = type(h).__name__
+                            if isinstance(h, (list, tuple)):
+                                hk += f"[len{len(h)}]"
+                            elif isinstance(h, dict):
+                                hk += "[" + ",".join(str(k) for k in list(h.keys())[:3]) + "]"
+                            held_by.append(hk)
+                        names.append(f"MODULE<{type(mod).__name__}#{id(mod) % 100000}> held-by: {held_by}")
         logger.info(
             "[leak-probe/%s]   ptr=%d %s numel=%d (%.2f GB) referrers: %s",
             tag,
-            t.data_ptr(),
+            ptr,
             t.dtype,
             int(t.numel()),
             int(t.untyped_storage().nbytes()) / 2**30,
