@@ -343,7 +343,7 @@ export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 ```
 
 ### AR_TUNE_DDP_DELAYED_LOSS
-- **描述**： DDP 调优循环中将每迭代的 loss 读取推迟一个迭代，使宿主的 `.item()` 排空等待与刚入队的前向/反向重叠，而不是在迭代之间卡住流水线。在 27B 模型、world=4 下实测：与常驻线程池（AR_TUNE_DDP_THREAD_POOL）合计每迭代快约 59 ms；该延迟读取还会在主设备上每迭代多驻留一份 block 调优参数（v/min-max）快照。关闭它可精确回收这份快照的显存（≈ 4 字节 × block 调优参数量——27B 稠密 block 约 1.3 GB，更大的稠密 block 按比例增加），代价是 loss 读取重新串行化：world=4 下大约每迭代慢 30-60 ms（+8-15%）。当 `dynamic_max_gap > 0` 时自动禁用（早停需要循环内 loss）。
+- **描述**： DDP 调优循环中将每迭代的 loss 读取推迟一个迭代，使宿主的 `.item()` 排空等待与刚入队的前向/反向重叠，而不是在迭代之间卡住流水线。在 27B 模型、world=4 下实测：与常驻线程池（AR_TUNE_DDP_THREAD_POOL）合计每迭代快约 59 ms；该延迟读取还会在主设备上每迭代多驻留一份 block 调优参数（v/min-max）快照。关闭它可精确回收这份快照的显存（≈ 4 字节 × block 调优参数量——27B 稠密 block 约 1.3 GB，更大的稠密 block 按比例增加），实测代价极小：world=4 隔离对比中开启/关闭均在 ~400 ms/iter（噪声内持平；loss 读取虽重新串行化，但两种方式都与 GPU 执行链重叠）。预期在宿主成为瓶颈时（world>=8）才有差异，且它是后续全异步 loss 读取方案的基础。当 `dynamic_max_gap > 0` 时自动禁用（早停需要循环内 loss）。
 - **默认值**: `1`
 - **有效值**: `1`, `0`
 - **用法**: 追求速度时保持开启；在显存紧张的场景（例如 24 GB 卡上 MoE 检查点的大型稠密 block）设为 `0`，可回收主设备上一份调优参数副本。
