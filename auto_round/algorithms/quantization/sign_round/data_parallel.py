@@ -1715,56 +1715,92 @@ class ReplicaThreadPool:
             t.join(timeout=30)
 
 
-class _DelayedBestTracker:
-    """Delayed-loss best-params selection for the DDP tune loop.
+class _AsyncBestTracker:
+    """Fence-free best-params selection: device compare, pinned flag, host poll.
 
-    The per-iteration host wait on ``loss.item()`` drains the whole GPU
-    chain of the iteration that just ran; deferring the read to the next
-    iteration overlaps that drain with the freshly enqueued forward instead
-    of stalling the pipeline between iterations. Selection semantics are
-    IDENTICAL to immediate selection -- the same (loss, pre-step params)
-    pairs are compared with the same strict-less rule; the comparison and
-    the ``.item()`` read simply happen one iteration later on the host.
+    stage() enqueues ONLY GPU work: the world-sum loss into ``all_losses[i]``
+    (fp64, summed left-to-right exactly like the legacy host float sum), the
+    strict-less compare against the running device minimum (updated by
+    ``torch.where`` in the same stream -- equality keeps the older best, the
+    Python ``<`` tie rule), and the boolean into a PINNED host byte guarded
+    by a CUDA event. poll() -- once per iteration -- resolves the oldest
+    READY flags without blocking and promotes by pointer swap over the
+    staged (pre-step) snapshots; a pending cap of 2 bounds snapshot VRAM
+    (the rare forced wait resolves the oldest flag). drain() performs the
+    one legal bounded wait at loop end and publishes init/best values.
 
-    Memory: the caller stages a FRESH ``collect_best_params`` allocation
-    every iteration, so the tracker only ever holds two snapshot copies
-    (the pending one and the promoted best) -- one more than the immediate
-    path, independent of iteration count.
+    Selection semantics are identical to immediate selection: same
+    (loss, pre-step params) pairs, same argmin, same first-wins ties.
     """
 
-    def __init__(self) -> None:
-        self._pending: Optional[Tuple[Optional[dict], Sequence, int]] = None  # (snapshot, losses, iter)
-        self.best_loss: Optional[float] = None
-        self.best_params: Optional[dict] = None
-        self.best_iter: Optional[int] = None
-        self.last_promoted = False
+    def __init__(self, iters: int, device: torch.device):
+        self.iters = iters
+        self.device = device
+        self._cuda = device.type == "cuda" and torch.cuda.is_available()
+        self.all_losses = torch.zeros(iters, dtype=torch.float64, device=device)
+        self.best = torch.full((), float("inf"), dtype=torch.float64, device=device)
+        self._flags = torch.zeros(iters, dtype=torch.uint8, pin_memory=self._cuda)
+        self._events = [torch.cuda.Event() if self._cuda else None for _ in range(iters)]
+        self._pending = []  # FIFO of (iter, snapshot); capped at 2
+        self.best_params = None
+        self.best_iter = None
+        self.init_loss = None
+        self.best_loss = None
+        self._just_promoted = False
 
-    def reset(self) -> None:
-        """Drop the pending iteration and the promotion (grid re-swap)."""
-        self.__init__()
+    # ── per-iteration enqueue (no host sync) ──────────────────────────────
+    def stage(self, snapshot, losses, i: int):
+        if not losses:
+            return
+        loss = losses[0].double()
+        for extra in losses[1:]:
+            loss = loss + extra.double()
+        self.all_losses[i].copy_(loss)
+        flag = loss < self.best
+        self.best = torch.where(flag, loss, self.best)
+        if self._cuda:
+            self._flags[i].copy_(flag.to(torch.uint8), non_blocking=True)
+            self._events[i].record()
+        else:
+            self._flags[i] = flag.to(torch.uint8).item()  # CPU: synchronous semantics
+        while len(self._pending) >= 2:  # bound snapshot VRAM: resolve oldest
+            self._resolve_oldest(wait=True)
+        self._pending.append((i, snapshot))
 
-    def stage(self, snapshot: Optional[dict], losses: Sequence, iter_index: int) -> None:
-        """Park iteration ``iter_index``'s pre-step snapshot and loss tensors."""
-        self._pending = (snapshot, losses, iter_index)
+    # ── non-blocking resolution ───────────────────────────────────────────
+    def _ready(self, i: int) -> bool:
+        return self._events[i].query() if self._cuda else True
 
-    def resolve(self) -> Optional[float]:
-        """Drain the parked iteration: return its loss, promote if best.
+    def _resolve_oldest(self, wait: bool):
+        i, snap = self._pending[0]
+        if wait and self._cuda:
+            self._events[i].synchronize()
+        elif not self._ready(i):
+            return
+        self._pending.pop(0)
+        if bool(self._flags[i].item()):  # pinned byte: landed before the event
+            self.best_params = snap
+            self.best_iter = i
+            self._just_promoted = True
 
-        Returns ``None`` when nothing is pending (loop start / post-drain).
-        ``snapshot=None`` iterations (loss-delay-only mode) never promote.
-        """
-        if self._pending is None:
-            return None
-        snapshot, losses, iter_index = self._pending
-        self._pending = None
-        self.last_promoted = False
-        loss = float(sum(l.item() for l in losses if l is not None))
-        if snapshot is not None and (self.best_loss is None or loss < self.best_loss):
-            self.best_loss = loss
-            self.best_params = snapshot  # fresh allocation -- safe by reference
-            self.best_iter = iter_index
-            self.last_promoted = True
-        return loss
+    def poll(self):
+        """Resolve ready flags (never blocks); call once per iteration."""
+        self._just_promoted = False
+        while self._pending and self._ready(self._pending[0][0]):
+            self._resolve_oldest(wait=False)
+
+    @property
+    def last_promoted(self) -> bool:
+        return self._just_promoted
+
+    # ── loop-end drain (the one legal wait) ───────────────────────────────
+    def drain(self):
+        while self._pending:
+            self._resolve_oldest(wait=True)
+        if self.iters > 0:
+            self.init_loss = float(self.all_losses[0])
+        if self.best_iter is not None:
+            self.best_loss = float(self.best)
 
 
 class ReplicaGroup:

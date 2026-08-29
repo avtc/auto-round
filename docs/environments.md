@@ -342,14 +342,14 @@ export AR_TOUCHUP_ITERS=5   # same AR_RESUME_DIR; no --enable_block_parallel_tun
 export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 ```
 
-### AR_TUNE_DDP_DELAYED_LOSS
-- **Description**: Defer the tune-loop's per-iteration loss read by one iteration under DDP tuning, so the host's `.item()` drain-wait overlaps the freshly enqueued forward/backward instead of stalling the pipeline between iterations. Measured at world=4 on a 27B model: ~59 ms/iter faster together with the persistent thread pool (AR_TUNE_DDP_THREAD_POOL); the deferred read also stages one extra snapshot of the block's tuning params (v/min-max) on the primary device every iteration. Turning it off reclaims exactly that snapshot's VRAM (≈ 4 bytes x the block's tuning-parameter count -- ~1.3 GB for a 27B dense block, proportionally more for larger dense blocks) at little measured wall cost: in the world=4 isolation runs the delayed read was time-neutral within noise (arms with and without it both ~400 ms/iter; the loss read re-serializes but overlaps the GPU chain either way). It is expected to matter when the host is the bottleneck (world>=8) and is the foundation for fully async loss resolution. Also disables when `dynamic_max_gap > 0` (early-stop needs the in-loop loss).
+### AR_TUNE_ASYNC_LOSS
+- **Description**: Fence-free best-params selection in the DDP tune loop. Loss values never leave the GPU during the loop: the world-sum loss is stored per iteration in a device buffer, compared against a device-side running minimum (strict-less, first-wins ties, identical selection to the immediate read), and the boolean travels to the host as a pinned flag byte guarded by a CUDA event. The host POLLS ready flags once per iteration (never blocks) and promotes by pointer swap over pre-step snapshots (pending cap 2 bounds the VRAM). One bounded wait at loop end (drain) publishes init/best values. Requires one extra snapshot slot of tuning params on the primary device (the promotion decision lags, so a pre-step snapshot must exist to promote) -- the same VRAM cost the old delayed-loss mode had. `dynamic_max_gap > 0` keeps the immediate read (early-stop needs in-loop values).
 - **Default**: `0`
 - **Valid Values**: `1`, `0`
-- **Usage**: Opt-in for the delayed-read pipeline structure (and for the future fully-async loss resolution); the default `0` keeps only current+best param copies on the primary device, reclaiming the pending snapshot slot (~tuning-params-size VRAM, e.g. ~1.3 GB for a 27B dense block).
+- **Usage**: Opt-in for the fully async loop (removes the last per-iteration host fence, ~15-19 ms/iter at world=4); the extra snapshot slot costs tuning-params-size VRAM on the primary device (~1.3 GB for a 27B dense block). Supersedes the removed AR_TUNE_DDP_DELAYED_LOSS mode (which still fenced once per iteration; the async path is strictly stronger).
 
 ```bash
-export AR_TUNE_DDP_DELAYED_LOSS=0   # reclaim ~params-size VRAM on the primary device, ~8-15% slower iters
+export AR_TUNE_ASYNC_LOSS=1   # async loss resolution (device compare + pinned flag poll)
 ```
 
 ### AR_TUNE_REPLICA_PACING

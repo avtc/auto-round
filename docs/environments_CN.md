@@ -342,14 +342,14 @@ export AR_TOUCHUP_ITERS=5   # 同一个 AR_RESUME_DIR；去掉 --enable_block_pa
 export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 ```
 
-### AR_TUNE_DDP_DELAYED_LOSS
-- **描述**： DDP 调优循环中将每迭代的 loss 读取推迟一个迭代，使宿主的 `.item()` 排空等待与刚入队的前向/反向重叠，而不是在迭代之间卡住流水线。在 27B 模型、world=4 下实测：与常驻线程池（AR_TUNE_DDP_THREAD_POOL）合计每迭代快约 59 ms；该延迟读取还会在主设备上每迭代多驻留一份 block 调优参数（v/min-max）快照。关闭它可精确回收这份快照的显存（≈ 4 字节 × block 调优参数量——27B 稠密 block 约 1.3 GB，更大的稠密 block 按比例增加），实测代价极小：world=4 隔离对比中开启/关闭均在 ~400 ms/iter（噪声内持平；loss 读取虽重新串行化，但两种方式都与 GPU 执行链重叠）。预期在宿主成为瓶颈时（world>=8）才有差异，且它是后续全异步 loss 读取方案的基础。当 `dynamic_max_gap > 0` 时自动禁用（早停需要循环内 loss）。
+### AR_TUNE_ASYNC_LOSS
+- **描述**： DDP 调优循环的无围栏最优参数选择。循环期间 loss 值完全不离开 GPU：每次迭代的 world 求和 loss 存入设备缓冲，与设备侧运行最小值比较（严格小于、平局先到先得，与立即读取的选择完全一致），布尔结果以受 CUDA 事件保护的 pinned 标志字节送达宿主。宿主每迭代轮询就绪标志（从不阻塞），通过预存快照的指针交换完成晋升（pending 上限 2 以约束显存）。循环结束时有唯一一次有界等待（drain）发布 init/best 值。需要在主设备上多占用一个调优参数快照槽（晋升决策滞后，必须存在可晋升的 pre-step 快照）——与旧 delayed-loss 模式相同的显存开销。`dynamic_max_gap > 0` 时保持立即读取（早停需要循环内数值）。
 - **默认值**: `0`
 - **有效值**: `1`, `0`
-- **用法**: 按需开启以获得延迟读取的流水线结构（以及后续全异步 loss 读取方案的基础）；默认 `0` 在主设备上只保留 current+best 两份参数副本，回收 pending 快照槽（约一份调优参数量大小的显存，27B 稠密 block 约 1.3 GB）。
+- **用法**: 按需开启全异步循环（移除每迭代最后一个宿主围栏，world=4 下约 15-19 ms/迭代）；额外快照槽在主设备占用约一份调优参数量大小的显存（27B 稠密 block 约 1.3 GB）。取代已移除的 AR_TUNE_DDP_DELAYED_LOSS 模式（该模式每迭代仍有一次围栏；异步路径严格更强）。
 
 ```bash
-export AR_TUNE_DDP_DELAYED_LOSS=0   # 回收主设备上约一份参数量大小的显存，每迭代慢约 8-15%
+export AR_TUNE_ASYNC_LOSS=1   # 异步 loss 解析（设备端比较 + pinned 标志轮询）
 ```
 
 ### AR_TUNE_REPLICA_PACING

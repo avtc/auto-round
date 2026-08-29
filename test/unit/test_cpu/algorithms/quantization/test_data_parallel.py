@@ -26,7 +26,7 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     ReplicaGroup,
     ReplicaThreadPool,
     _copy_into_static,
-    _DelayedBestTracker,
+    _AsyncBestTracker,
     _param_grad_buffers,
     _write_back_grads,
     halving_doubling_allreduce,
@@ -401,23 +401,28 @@ class TestReplicaThreadPool:
         pool.shutdown()
 
 
-class TestDelayedBestTracker:
-    """Ring + delayed-read selection must match immediate selection exactly.
+class TestAsyncBestTracker:
+    """Async selection must match immediate selection exactly.
 
-    The tracker defers loss(i).item() to iteration i+1 (host pipelining);
-    these tests pin the SELECTION contract: same argmin, same strict-less
-    tie rule, same promoted snapshot values as an immediate reference.
+    The tracker keeps losses on device, compares against a device-side
+    running minimum, and ships only a flag byte to the host; these tests
+    pin the SELECTION contract: same argmin, same strict-less tie rule,
+    same promoted snapshot values as an immediate reference, plus the
+    poll/drain/pending-cap mechanics.
     """
 
     @staticmethod
     def _snap(tag):
-        # nested dict mirroring collect_best_params shape, value-tagged
         return {"layers.0.mlp": {"v": torch.full((4,), float(tag))}}
 
     def _run(self, tracker, losses, track=True):
         for i, v in enumerate(losses):
-            tracker.stage(self._snap(i) if track else None, [torch.tensor(float(v), dtype=torch.float64)], i)
-            tracker.resolve()
+            tracker.stage(
+                self._snap(i) if track else None,
+                [torch.tensor(float(v), dtype=torch.float64)],
+                i,
+            )
+            tracker.poll()
 
     def test_selection_matches_immediate_reference(self):
         sequences = [
@@ -428,105 +433,49 @@ class TestDelayedBestTracker:
             [3.0, 2.0, 1.0, 0.5],  # min at last iter
             [7.0, 3.0, 3.0, 5.0, 9.0, 2.9],  # tie then near-tie
         ]
-        for losses in sequences:
-            ref_loss, ref_iter = min((v, i) for i, v in enumerate(losses))
-            tr = _DelayedBestTracker()
-            self._run(tr, losses)
-            assert tr.best_loss == ref_loss, losses
-            assert tr.best_iter == ref_iter, losses
-            won = tr.best_params["layers.0.mlp"]["v"]
-            assert torch.equal(won, torch.full((4,), float(ref_iter))), losses
+        for vals in sequences:
+            want_iter, want_loss = 0, vals[0]
+            for i, v in enumerate(vals):
+                if v < want_loss:
+                    want_iter, want_loss = i, v
+            tr = _AsyncBestTracker(len(vals), torch.device("cpu"))
+            self._run(tr, vals)
+            tr.drain()
+            assert tr.best_iter == want_iter, (vals, tr.best_iter, want_iter)
+            assert abs(tr.best_loss - want_loss) < 1e-12
+            assert tr.best_params["layers.0.mlp"]["v"][0].item() == float(want_iter)
+            assert abs(tr.init_loss - vals[0]) < 1e-12
 
-    def test_pending_required_before_resolve(self):
-        tr = _DelayedBestTracker()
-        assert tr.resolve() is None  # nothing staged yet
-        tr.stage(self._snap(0), [torch.tensor(1.0)], 0)
-        assert tr.resolve() == 1.0
-        assert tr.resolve() is None  # pending consumed
-
-    def test_unresolved_loss_value_is_exact(self):
-        # resolve returns the raw sum; caller applies its own scaling
-        tr = _DelayedBestTracker()
-        tr.stage(None, [torch.tensor(1.5), torch.tensor(2.5)], 3)
-        assert tr.resolve() == 4.0
-        assert tr.best_loss is None  # None snapshot never promotes
-        assert tr.best_params is None
-        assert tr.last_promoted is False
-
-    def test_last_promoted_flag_tracks_promotions(self):
-        tr = _DelayedBestTracker()
-        tr.stage(self._snap(0), [torch.tensor(5.0, dtype=torch.float64)], 0)
-        assert tr.resolve() == 5.0 and tr.last_promoted is True  # first stage promotes
-        tr.stage(self._snap(1), [torch.tensor(4.0, dtype=torch.float64)], 1)
-        assert tr.resolve() == 4.0 and tr.last_promoted is True
-        tr.stage(self._snap(2), [torch.tensor(6.0, dtype=torch.float64)], 2)
-        assert tr.resolve() == 6.0 and tr.last_promoted is False  # no improvement
-
-    def test_best_survives_staging_without_reuse_copies(self):
-        tr = _DelayedBestTracker()
-        losses = [5.0, 1.0, 4.0, 3.0, 2.0]  # best at iter 1, never improved
-        self._run(tr, losses)
+    def test_poll_before_any_stage_is_noop_and_drain_publishes(self):
+        tr = _AsyncBestTracker(3, torch.device("cpu"))
+        tr.poll()
+        assert tr.best_iter is None and tr.last_promoted is False
+        self._run(tr, [4.0, 1.0, 2.0])
+        tr.drain()
         assert tr.best_iter == 1
-        # snapshots are fresh allocations: the promoted best keeps the iter-1
-        # values unchanged while later iterations stage their own copies
-        assert torch.equal(tr.best_params["layers.0.mlp"]["v"], torch.full((4,), 1.0))
-        # at most two snapshot dicts alive at any time (pending + best)
-        tr.stage(self._snap(9), [torch.tensor(9.0, dtype=torch.float64)], 9)
-        assert tr.best_iter == 1  # pending staged, not yet resolved
+        assert tr.best_params is not None
 
-    def test_reset_clears_everything(self):
-        tr = _DelayedBestTracker()
-        self._run(tr, [3.0, 2.0])
-        tr.reset()
-        assert tr.best_loss is None and tr.best_params is None and tr.best_iter is None
-        assert tr.resolve() is None  # pending dropped too
-        # fresh selection after reset
-        self._run(tr, [9.0, 8.0])
-        assert tr.best_loss == 8.0 and tr.best_iter == 1
+    def test_pending_cap_bounds_snapshots(self):
+        tr = _AsyncBestTracker(5, torch.device("cpu"))
+        for i in range(5):  # never poll: the cap must still bound pending
+            tr.stage(self._snap(i), [torch.tensor(float(5 - i), dtype=torch.float64)], i)
+            assert len(tr._pending) <= 2
+        tr.drain()
+        assert tr.best_iter == 4
 
-    def test_delayed_wiring_init_and_best_share_scale(self):
-        """Quantizer wiring must divide the tracker's raw sum by world.
+    def test_no_best_mse_mode_tracks_no_snapshots(self):
+        tr = _AsyncBestTracker(3, torch.device("cpu"))
+        self._run(tr, [3.0, 1.0, 2.0], track=False)
+        tr.drain()
+        assert tr.best_loss is not None and tr.best_params is None
 
-        The tracker stores undivided replica-loss sums (its internal
-        comparisons are scale-consistent, so the argmin and promoted
-        snapshot are correct); the quantizer mirrors must convert to the
-        global-batch mean -- otherwise the reported best_loss is world-times
-        the true value (observed as "best above init" in server logs).
-        """
-        world = 4
-        vals = [9e-6 + 3e-7 * i for i in range(50)]  # rising trajectory, argmin=0
-        best_loss = torch.finfo(torch.float).max
-        init_loss = None
-        last_best_iter = 0
-        tracker = _DelayedBestTracker()
-        _init_done = False
-
-        def loop_body(i, losses):
-            nonlocal best_loss, init_loss, last_best_iter, _init_done
-            resolved = tracker.resolve()
-            if resolved is not None:
-                total = resolved / world
-                if not _init_done:
-                    init_loss = total
-                    _init_done = True
-                if tracker.last_promoted:
-                    best_loss = tracker.best_loss / world
-                    last_best_iter = tracker.best_iter
-            tracker.stage({}, losses, i)
-
-        for i in range(50):
-            loop_body(i, [torch.tensor(vals[i], dtype=torch.float64) for _ in range(world)])
-        loop_body(50, [])  # post-loop drain
-        assert init_loss == vals[0]
-        assert last_best_iter == 0
-        assert abs(best_loss - vals[0]) < 1e-12  # same scale as init, not world x
-
-    def test_delayed_env_gate_default_and_opt_in(self, monkeypatch):
+    def test_async_env_gate_default_off_opt_in(self, monkeypatch):
         from auto_round import envs
 
-        assert envs.AR_TUNE_DDP_DELAYED_LOSS is False  # default off: reclaims the pending snapshot slot
-        monkeypatch.setattr(envs, "AR_TUNE_DDP_DELAYED_LOSS", True)
-        assert envs.AR_TUNE_DDP_DELAYED_LOSS is True
+        monkeypatch.delenv("AR_TUNE_ASYNC_LOSS", raising=False)
+        assert envs.AR_TUNE_ASYNC_LOSS is False
+        monkeypatch.setenv("AR_TUNE_ASYNC_LOSS", "1")
+        assert envs.AR_TUNE_ASYNC_LOSS is True
 
 
 class TestRunThreaded:

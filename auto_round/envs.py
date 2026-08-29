@@ -197,7 +197,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grid re-swap). Falls back to the immediate read when dynamic_max_gap
     # is set (its early-stop decision needs the current loss in-loop). Set
     # to 0 to restore the immediate read.
-    "AR_TUNE_DDP_DELAYED_LOSS": lambda: os.getenv("AR_TUNE_DDP_DELAYED_LOSS", "0").lower() in ("1", "true", "yes"),
+    "AR_TUNE_ASYNC_LOSS": lambda: os.getenv("AR_TUNE_ASYNC_LOSS", "0").lower() in ("1", "true", "yes", "on"),
     # Pace graphed replica steps: run ALL prepares to completion (pool latch)
     # before ANY replay launches, so replays start in lockstep instead of
     # free-running behind prepare jitter (measured 34-73 ms replica drift).

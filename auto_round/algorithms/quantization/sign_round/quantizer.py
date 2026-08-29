@@ -1023,7 +1023,7 @@ class SignRoundQuantizer(BaseQuantizer):
         # pairs, same strict-less rule -- resolved one iteration later)
         _pacing = bool(_envs.AR_TUNE_REPLICA_PACING)
         _fence_free = bool(_envs.AR_TUNE_PREPARE_FENCE_FREE)
-        _delayed = replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and self.dynamic_max_gap <= 0
+        _async = replica_group is not None and _envs.AR_TUNE_ASYNC_LOSS and self.dynamic_max_gap <= 0
         _sign_ok = self.momentum is None or float(self.momentum) == 0.0
         _exch_session = None
         if (
@@ -1055,13 +1055,17 @@ class SignRoundQuantizer(BaseQuantizer):
                 "[tune-ddp] dynamic_max_gap is set: keeping the immediate loss read "
                 "(the early-stop decision needs the current loss in-loop)"
             )
-        _tracker = None
-        _init_done = False
+        _atracker = None
         _snap_dev = None
-        if _delayed:
-            from auto_round.algorithms.quantization.sign_round.data_parallel import _DelayedBestTracker
+        if _async:
+            from auto_round.algorithms.quantization.sign_round.data_parallel import _AsyncBestTracker
 
-            _tracker = _DelayedBestTracker()
+            _loss_dev = (
+                torch.device(loss_device)
+                if loss_device is not None
+                else (fp_outputs[0].device if fp_outputs else torch.device("cpu"))
+            )
+            _atracker = _AsyncBestTracker(self.iters, _loss_dev)
             # same parking policy as the legacy best-params snapshot below
             _snap_dev = (
                 _home
@@ -1221,22 +1225,14 @@ class SignRoundQuantizer(BaseQuantizer):
                 # asynchronous, so that drain-wait surfaces HERE, not in the
                 # allreduce stage -- keep it in its own bucket so "other" stays
                 # honest.
-                if _delayed:
-                    # resolve(i-1): the .item() drain now overlaps THIS
-                    # iteration's enqueued forward/backward instead of the
-                    # previous one's tail; then park iter i pre-step
+                if _async:
+                    # poll: resolve READY flags only -- the host never waits;
+                    # per-iter host loss values are gone entirely (values live
+                    # on device, reads happen once at the loop-end drain)
                     with tune_stage(tune_prof, "loss_sync"):
-                        _resolved = _tracker.resolve()
-                    if _resolved is not None:
-                        total_loss = _resolved / _world
-                        if not _init_done:
-                            init_loss = total_loss
-                            _init_done = True
-                        if _tracker.last_promoted:
-                            best_loss = _tracker.best_loss / _world  # tracker stores the raw sum
-                            last_best_iter = _tracker.best_iter
+                        _atracker.poll()
                     with tune_stage(tune_prof, "snapshot"):
-                        _tracker.stage(
+                        _atracker.stage(
                             None if self.not_use_best_mse else collect_best_params(block, _snap_dev), _losses, i
                         )
                 else:
@@ -1279,7 +1275,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         # clear memory to avoid OOM due to memory fragmentation
                         clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
 
-            if not _delayed:
+            if not _async:
                 if i == 0:
                     init_loss = total_loss
 
@@ -1304,7 +1300,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 if not self.not_use_best_mse:
                     if 0 < self.dynamic_max_gap <= i - last_best_iter:
                         break
-            elif _delayed and self.not_use_best_mse and i == self.iters - 1:
+            elif _async and self.not_use_best_mse and i == self.iters - 1:
                 # loss-delay-only mode keeps the single last-iter collection
                 best_params = collect_best_params(block, self.compress_context.cache_device)
             if replica_group is not None:
@@ -1367,19 +1363,19 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         if replica_group is not None:
             replica_group.teardown()
-        if _delayed:
-            # drain the final iteration: resolve, promote if best, publish
-            _resolved = _tracker.resolve()
-            if _resolved is not None:
-                total_loss = _resolved / _world
-                if not _init_done:
-                    init_loss = total_loss
-                    _init_done = True
-                if _tracker.last_promoted:
-                    best_loss = _tracker.best_loss / _world  # tracker stores the raw sum
-                    last_best_iter = _tracker.best_iter
+        if _async:
+            # the one legal fence in the whole loop: bounded wait, then the
+            # bulk value reads (init/best/last) and the final promotions
+            with tune_stage(tune_prof, "loss_sync"):
+                _atracker.drain()
+            if _atracker.init_loss is not None:
+                init_loss = _atracker.init_loss / _world
+                total_loss = init_loss
+            if _atracker.best_loss is not None:
+                best_loss = _atracker.best_loss / _world  # tracker stores the raw sum
+                last_best_iter = _atracker.best_iter
             if not self.not_use_best_mse:
-                best_params = _tracker.best_params or {}
+                best_params = _atracker.best_params or {}
         last_loss = total_loss
         if tune_prof is not None:
             tune_prof.log_summary(
