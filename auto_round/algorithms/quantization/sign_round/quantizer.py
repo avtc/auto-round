@@ -212,42 +212,6 @@ if TYPE_CHECKING:
 
 
 @register_pipeline_member(SignRoundConfig)
-def tune_block_forward_runner(block_fwd, override: str):
-    """Return the runner the TUNE loop should use under an AR_TUNE_COMPILE_BWD override.
-
-    "" (unset) -> the shared runner unchanged (follow the composer's
-    enable_torch_compile decision, which compiles collection AND tune).
-    "0" -> a shallow CLONE running the RAW block_forward (tune eager only);
-    "1" -> a shallow CLONE wrapping the raw callable in torch.compile (tune
-    compiled only). The shared runner is never mutated: collection keeps its
-    own decision either way. The tune loop's backward is AOTAutograd-derived
-    from the compiled forward when compiled.
-    """
-    if not override:
-        return block_fwd
-    import copy as _copy
-
-    clone = _copy.copy(block_fwd)
-    if override == "0":
-        from auto_round.compressors.utils import block_forward as _raw
-
-        clone.block_forward = _raw
-    else:
-        from auto_round.utils import compile_func as _compile_func
-
-        clone.block_forward = _compile_func(
-            _raw_callable_for_compile(block_fwd), str(getattr(block_fwd, "device", "cpu"))
-        )
-    return clone
-
-
-def _raw_callable_for_compile(block_fwd):
-    """The un-compiled block_forward callable (shared runner may hold a compiled one)."""
-    from auto_round.compressors.utils import block_forward as _raw
-
-    return _raw
-
-
 class SignRoundQuantizer(BaseQuantizer):
 
     def __init__(self, config: SignRoundConfig) -> None:
@@ -798,7 +762,7 @@ class SignRoundQuantizer(BaseQuantizer):
             and _envs.AR_TUNE_DDP_SHARD_SAMPLER
         ):
             _dp_samplers = shard_samplers(nsamples, replica_group.world, global_batch_size // replica_group.world)
-        block_fwd = tune_block_forward_runner(self.block_forward, str(_envs.AR_TUNE_COMPILE_BWD))
+        block_fwd = self.block_forward
 
         # CUDA graphs for the DDP tune loop: the per-replica step is split
         # into an eager per-iteration PREPARE (gather this iteration's shard

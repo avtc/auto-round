@@ -423,17 +423,6 @@ export AR_TUNE_CUDA_GRAPHS=0   # 禁用整体 graph 捕获（DDP replica step �
 - **默认值**: 优化器满足条件时自动启用（无环境变量）
 - **用法**: 无需设置；体现为 tune profile 中更低的 `step` 阶段耗时。
 
-### AR_TUNE_COMPILE_BWD
-- **描述**： 仅作用于调优循环的 block-forward `torch.compile` 开关。调优循环的反向由编译后的前向经 AOTAutograd 生成，因此该变量可独立于共享的 `enable_torch_compile`（后者通过同一个 runner 同时编译采集与调优前向）来评估编译反向。未设置 = 跟随共享决策；`1` = 强制编译调优循环前向（使用克隆 runner——共享 runner 不受影响）；`0` = 仅调优循环强制 eager。用于隔离测量编译反向收益的 A/B 开关。
-- **默认值**: 未设置（跟随 `enable_torch_compile`）
-- **有效值**: 未设置, `1`, `0`
-- **用法**: 在不改变采集行为的情况下对编译反向做服务器 A/B。
-
-```bash
-export AR_TUNE_COMPILE_BWD=0   # 调优循环 eager，采集不变
-export AR_TUNE_COMPILE_BWD=1   # 调优循环编译，采集不变
-```
-
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

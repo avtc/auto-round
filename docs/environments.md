@@ -423,17 +423,6 @@ export AR_TUNE_CUDA_GRAPHS=0   # disable whole graph capture (DDP replica steps 
 - **Default**: enabled automatically when the optimizer qualifies (no env var)
 - **Usage**: nothing to set; visible as a lower `step` stage time in the tune profile.
 
-### AR_TUNE_COMPILE_BWD
-- **Description**: Tune-loop-only override for the block-forward `torch.compile` decision. The tune loop's backward is AOTAutograd-derived from the compiled forward, so this controls the compiled-BACKWARD evaluation independently of the shared `enable_torch_compile` flag (which compiles the collection and tune forwards together via one runner). Unset = follow the shared decision; `1` = force-compile the tune loop's forward (a clone — the shared runner is untouched); `0` = force eager for the tune loop only. A/B lever for measuring the compiled backward in isolation.
-- **Default**: unset (follow `enable_torch_compile`)
-- **Valid Values**: unset, `1`, `0`
-- **Usage**: server A/B of the compiled backward without changing collection behavior.
-
-```bash
-export AR_TUNE_COMPILE_BWD=0   # tune loop eager, collection unchanged
-export AR_TUNE_COMPILE_BWD=1   # tune loop compiled, collection unchanged
-```
-
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

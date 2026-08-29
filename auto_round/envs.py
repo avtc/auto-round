@@ -230,7 +230,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # runs eager; "0" = force eager for the tune loop only. A/B lever for the
     # compiled-backward evaluation (the backward comes from AOTAutograd on the
     # compiled forward).
-    "AR_TUNE_COMPILE_BWD": lambda: os.getenv("AR_TUNE_COMPILE_BWD", ""),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.
