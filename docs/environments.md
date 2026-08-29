@@ -388,6 +388,16 @@ export AR_TUNE_EXCH_OVERLAP=0   # monolithic post-backward exchange
 export AR_TUNE_PROACTIVE_PREPARE=0   # prepare at iteration start (no run-ahead)
 ```
 
+### AR_TUNE_SERIAL_DELAYED_LOSS
+- **Description**: Serial tune paths (block-wise without DDP, and layers outside blocks) accumulate the loss on device (fp64, same left-to-right order as the legacy Python float sum) and read it once AFTER the backward enqueue, instead of fencing the host with `loss.item()` between the loss and the backward of every batch -- the GPU no longer idles mid-iteration waiting for the host to wake up and enqueue the backward.
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled; toggle off only for A/B isolation.
+
+```bash
+export AR_TUNE_SERIAL_DELAYED_LOSS=0   # per-batch .item() read before backward (legacy)
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

@@ -388,6 +388,16 @@ export AR_TUNE_EXCH_OVERLAP=0   # 反向完成后的整体交换
 export AR_TUNE_PROACTIVE_PREPARE=0   # 迭代开始时 prepare（不前瞻）
 ```
 
+### AR_TUNE_SERIAL_DELAYED_LOSS
+- **描述**： 串行调优路径（无 DDP 的逐 block，以及 block 外的逐层）在设备端累积 loss（fp64，与旧的 Python 浮点求和相同的从左到右顺序），并在反向入队之后一次性读取，取代每个 batch 在 loss 与反向之间用 `loss.item()` 围栏阻塞宿主——GPU 不再因等待宿主唤醒并 enqueue 反向而在迭代中途空转。
+- **默认值**: `1`
+- **有效值**: `1`, `0`
+- **用法**: 保持开启；仅在 A/B 隔离测试时设 `0`。
+
+```bash
+export AR_TUNE_SERIAL_DELAYED_LOSS=0   # 反向前逐 batch .item() 读取（旧行为）
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

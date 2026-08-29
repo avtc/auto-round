@@ -1831,3 +1831,26 @@ class TestProactivePacedSteps:
         assert envs.AR_TUNE_PROACTIVE_PREPARE is True
         monkeypatch.setenv("AR_TUNE_PROACTIVE_PREPARE", "0")
         assert envs.AR_TUNE_PROACTIVE_PREPARE is False
+
+
+class TestSerialDeferredLoss:
+    def test_accumulate_matches_python_float_sum(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import accumulate_serial_loss
+
+        terms = [0.25, 1.5, 3.75, 0.125]
+        want = 0.0
+        for t in terms:
+            want += t / 2.0
+        acc = None
+        for t in terms:
+            acc = accumulate_serial_loss(acc, torch.tensor(t, dtype=torch.float32), 2.0)
+        assert abs(float(acc) - want) < 1e-15  # same order, fp64 both sides
+        assert accumulate_serial_loss(None, torch.tensor(2.0)).item() == 2.0
+
+    def test_serial_delayed_env_gate_default_on_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_SERIAL_DELAYED_LOSS", raising=False)
+        assert envs.AR_TUNE_SERIAL_DELAYED_LOSS is True
+        monkeypatch.setenv("AR_TUNE_SERIAL_DELAYED_LOSS", "0")
+        assert envs.AR_TUNE_SERIAL_DELAYED_LOSS is False

@@ -26,6 +26,7 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     run_paced_replica_steps,
     run_proactive_paced_steps,
     use_one_shot,
+    accumulate_serial_loss,
 )
 from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
 from auto_round.algorithms.registry import register_pipeline_member
@@ -564,8 +565,6 @@ class SignRoundQuantizer(BaseQuantizer):
         _rehome_deferred = (active_inputs, fp_outputs, _home)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
-        from auto_round import envs as _envs
-
         batch_size = self.calibration_context.batch_size
         global_batch_size = batch_size * self.gradient_accumulate_steps
         global_batch_size = min(nsamples, global_batch_size)
@@ -580,6 +579,8 @@ class SignRoundQuantizer(BaseQuantizer):
         mirror_optimizers = []
         mirror_schedules = []
         params_per_replica = []
+        from auto_round import envs as _envs
+
         _dp_world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
         _dp_placed = False  # True once pools are distributed across the engaged plan
         _scaler_early = self._get_scaler()  # pylint: disable=assignment-from-none
@@ -738,6 +739,7 @@ class SignRoundQuantizer(BaseQuantizer):
         init_loss = None
         best_params = {}
         total_loss = 0
+        _loss_acc = None
         # Compute num_elm once before the loop (used to normalise the accumulated loss).
         # We assume the block input and output shape is same
         if self.gradient_accumulate_steps != 1 and not valid_token_mask:
@@ -1028,6 +1030,9 @@ class SignRoundQuantizer(BaseQuantizer):
         _pacing = bool(_envs.AR_TUNE_REPLICA_PACING)
         _fence_free = bool(_envs.AR_TUNE_PREPARE_FENCE_FREE)
         _proactive = bool(_envs.AR_TUNE_PROACTIVE_PREPARE)
+        from auto_round import envs as _envs
+
+        _serial_delayed = bool(_envs.AR_TUNE_SERIAL_DELAYED_LOSS)
         _proactive_schedule = None
         _graphs_prepared_iter = -2
         _async = replica_group is not None and _envs.AR_TUNE_ASYNC_LOSS and self.dynamic_max_gap <= 0
@@ -1294,7 +1299,13 @@ class SignRoundQuantizer(BaseQuantizer):
                             loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
                     num_elm = 1 if num_elm <= 0 else num_elm
                     with tune_stage(tune_prof, "sync"):
-                        total_loss += loss.item() / num_elm
+                        if _serial_delayed:
+                            # accumulate on device: no host fence between loss
+                            # and backward -- the single read happens after the
+                            # batch loop (all backwards already enqueued)
+                            _loss_acc = accumulate_serial_loss(_loss_acc, loss, num_elm)
+                        else:
+                            total_loss += loss.item() / num_elm
 
                     if mid_iter_mem_check:
                         # clear memory to avoid OOM due to memory fragmentation
@@ -1307,6 +1318,8 @@ class SignRoundQuantizer(BaseQuantizer):
                         # clear memory to avoid OOM due to memory fragmentation
                         clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
 
+            if _serial_delayed and _loss_acc is not None:
+                total_loss = float(_loss_acc)
             if not _async:
                 if i == 0:
                     init_loss = total_loss
@@ -1504,6 +1517,9 @@ class SignRoundQuantizer(BaseQuantizer):
         logger.info(f"quantizing layer {layer_name}")
         # Layer is already on the correct device (placed by the caller / AlgorithmComposer).
         device = layer.weight.device if hasattr(layer, "weight") else device_manager.device
+        from auto_round import envs as _layer_envs
+
+        _serial_delayed = bool(_layer_envs.AR_TUNE_SERIAL_DELAYED_LOSS)
         for i in range(len(fp_inputs)):
             fp_inputs[i] = fp_inputs[i].to(layer.weight.dtype)
             if q_inputs is not None:
@@ -1629,9 +1645,15 @@ class SignRoundQuantizer(BaseQuantizer):
                         )
 
                 num_elm = 1 if num_elm <= 0 else num_elm
-                total_loss += loss.item() / num_elm
+                if _serial_delayed:
+                    _term = loss.detach().double() / num_elm
+                else:
+                    total_loss += loss.item() / num_elm
 
                 self._scale_loss_and_backward(scaler, loss)
+                if _serial_delayed:
+                    # cumulative across iterations, exactly like the legacy sum
+                    total_loss += float(_term)
             if i == 0:
                 init_loss = total_loss
 

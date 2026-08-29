@@ -1637,6 +1637,18 @@ def run_proactive_paced_steps(group, steps, current_shards, next_shards, out_los
         group.run_threaded([lambda r=r: steps[r].prepare_only(next_shards[r]) for r in range(len(steps))])
 
 
+def accumulate_serial_loss(acc, loss, num_elm: float = 1.0):
+    """Accumulate one serial-batch loss term on device (fp64, left-to-right).
+
+    Mirrors the legacy ``total_loss += loss.item() / num_elm`` Python float
+    sum exactly (same order, same fp64 precision) while keeping the host off
+    the loss->backward critical path: read the accumulated total once AFTER
+    the batch loop's backward enqueues.
+    """
+    term = loss.detach().double() / num_elm
+    return term if acc is None else acc + term
+
+
 def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
     """Two-round graphed dispatch: all prepares (pool latch), then all replays.
 

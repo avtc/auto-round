@@ -214,6 +214,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GPU; stream FIFO orders the write-after-read on the static buffers).
     "AR_TUNE_PROACTIVE_PREPARE": lambda: os.getenv("AR_TUNE_PROACTIVE_PREPARE", "1").lower()
     in ("1", "true", "yes", "on"),
+    # Serial tune paths: accumulate the loss on device and read it once AFTER
+    # the backward enqueue (the legacy per-batch loss.item() fences between
+    # loss and backward, starving the GPU mid-iteration).
+    "AR_TUNE_SERIAL_DELAYED_LOSS": lambda: os.getenv("AR_TUNE_SERIAL_DELAYED_LOSS", "1").lower()
+    in ("1", "true", "yes", "on"),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.
