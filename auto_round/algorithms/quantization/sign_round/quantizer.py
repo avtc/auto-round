@@ -765,6 +765,7 @@ class SignRoundQuantizer(BaseQuantizer):
         # only (list inputs / not diffusion / no valid-token mask); anything
         # failing during prepare/capture/replay raises and halts the run.
         _graphs_active = False
+        _graphs_gate = None
         _graphed_steps = None
         _graphs_warmups_left = 0
         _graphs_capture_pending = False
@@ -789,6 +790,13 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         ):
             _graphs_active = True
+            _graphs_gate = getattr(block, "_graphs_capture_gate", None)
+            if _graphs_gate is not None:
+                # capture-first: hold bg pack/ready work until THIS block's
+                # graphs are captured (released right after, and at loop end;
+                # workers bound the wait at 600s so a failed tune cannot
+                # deadlock the pipeline)
+                _graphs_gate.clear()
 
         # When low_gpu_mem_usage is enabled, active_inputs / fp_outputs are intentionally
         # kept on CPU to limit GPU memory.  However block_fwd normally routes pred_output
@@ -1016,6 +1024,8 @@ class SignRoundQuantizer(BaseQuantizer):
                         for r in range(_world):
                             _losses[r] = _graphed_steps[r].capture_now()
                         _graphs_capture_pending = False
+                        if _graphs_gate is not None:
+                            _graphs_gate.set()  # release held bg pack/ready work
                         logger.info("[tune-ddp] cuda graphs captured %d replica step(s)", _world)
                 elif _graphed_steps is not None:
                     # warm-up AND deferred iterations both dispatch through
@@ -1166,6 +1176,8 @@ class SignRoundQuantizer(BaseQuantizer):
                 with tune_stage(tune_prof, "step"):
                     self._step(scaler, optimizer, lr_schedule)
 
+        if _graphs_gate is not None:
+            _graphs_gate.set()  # never hold bg work past the tune loop
         if _graphs_active and _graphed_steps is not None and any(st._graph is None for st in _graphed_steps):
             logger.warning(
                 "[tune-ddp] cuda graphs were never captured for this block "

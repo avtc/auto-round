@@ -1634,6 +1634,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         def _worker():
             from auto_round.algorithms.composer import BlockContext
 
+            gate = getattr(self, "_graphs_capture_gate", None)
+            if gate is not None and not gate.wait(timeout=600):
+                logger.warning("[stream] bg ready-transform waited 600s on the capture gate; proceeding")
             block = get_module(self.model, block_name)
             try:
                 if home.type == "cuda":
@@ -1711,6 +1714,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             import time as _wtime
 
             try:
+                gate = getattr(self, "_graphs_capture_gate", None)
+                if gate is not None and not gate.wait(timeout=600):
+                    logger.warning("[stream] bg pack waited 600s on the capture gate; proceeding")
                 _t0 = _wtime.perf_counter()
                 from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
@@ -2292,6 +2298,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # transform. The tune loop's CUDA-graph capture defers until
                 # they finish (global-mode capture needs the process quiet).
                 block._bg_cuda_threads = [t for t in (_bg_pack, _bg_thread) if t is not None]
+                # one shared capture gate per run: bg workers (pack of the
+                # previous block, ready-transform of the next) wait on it so
+                # the CURRENT block's tune loop captures its CUDA graphs
+                # first; the loop releases the gate right after capture
+                # (and at loop end). Default SET: no-op without graphs.
+                if getattr(self, "_graphs_capture_gate", None) is None:
+                    import threading as _th
+
+                    self._graphs_capture_gate = _th.Event()
+                    self._graphs_capture_gate.set()
+                block._graphs_capture_gate = self._graphs_capture_gate
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
