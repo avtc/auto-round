@@ -799,6 +799,91 @@ class SignRoundQuantizer(BaseQuantizer):
                 # also releases on every exit, so workers can wait unbounded)
                 _graphs_gate.clear()
 
+        def _make_graphed_step(r):
+            # Static buffers: the FIRST gather's tensors become the
+            # graph's baked inputs (their addresses must repeat);
+            # every later prepare refreshes them in place. Shared
+            # leaves (rotary tables) keep their identity -- no copy.
+            rep = replica_group.replicas[r]
+            dev_r = next(rep.parameters()).device
+            st = {"inputs": None, "others": None, "ref": None}
+            from auto_round.algorithms.quantization.sign_round.data_parallel import _copy_into_static
+
+            def prepare(shard):
+                with torch.cuda.device(dev_r):
+                    expect_pool_local([fp_outputs[j] for j in shard], dev_r, "ddp-ref")
+                    ref = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
+                    # same gather the runner performs inside forward()
+                    indices = torch.tensor(shard, dtype=torch.long, device=dev_r)
+                    bins, bother = [], []
+                    for i in range(0, len(indices), block_fwd.batch_size):
+                        bi = indices[i : i + block_fwd.batch_size]
+                        _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
+                        bins.append(_in)
+                        bother.append(_oth)
+
+                    def _to_dev(x):
+                        if isinstance(x, torch.Tensor) and x.device != dev_r:
+                            return x.to(dev_r)
+                        if isinstance(x, dict):
+                            return {k: _to_dev(v) for k, v in x.items()}
+                        if isinstance(x, (tuple, list)):
+                            return type(x)(_to_dev(v) for v in x)
+                        return x
+
+                    if st["ref"] is None:
+                        # shallow-copy the dict nodes: block_forward MUTATES
+                        # the kwargs it receives (pops keys); the static
+                        # structure must stay pristine for later compares.
+                        # Stage every leaf on dev_r: to_device() inside
+                        # the captured region must no-op (unpinned H2D
+                        # during capture is illegal); later prepares
+                        # refresh cross-device eagerly via copy_.
+                        st["ref"], st["inputs"] = _to_dev(ref), [_to_dev(b) for b in bins]
+                        st["others"] = [_to_dev(dict(o)) for o in bother]
+                        return
+                    _copy_into_static(st["ref"], ref)
+                    _copy_into_static(st["inputs"], bins)
+                    _copy_into_static(st["others"], bother)
+
+            def compute():
+                with torch.cuda.device(dev_r):
+                    outs = []
+                    for _in, _oth in zip(st["inputs"], st["others"]):
+                        # dict() per call: the runner pops keys from the
+                        # kwargs it receives (same tensor leaves -- the
+                        # graph-baked addresses are untouched)
+                        raw = block_fwd._forward_one_batch(rep, _in, dict(_oth))
+                        out = block_fwd._normalize_output(raw, rep)
+                        outs.append(out.to(dev_r) if out.device != dev_r else out)
+                    pred_r = outs[0] if len(outs) == 1 else torch.cat(outs, dim=block_fwd.batch_dim)
+                    # valid_token_mask is None on this path, so the
+                    # indices argument of _get_loss is never consumed
+                    loss_r = self._get_loss(pred_r, st["ref"], None, mse_loss, dev_r, None)
+                    loss_r.backward()
+                    return loss_r
+
+            from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+            return GraphedReplicaStep(prepare, compute, name=f"replica-{r}", device=dev_r)
+
+        def _dp_run(r):
+            _losses[r] = _graphed_steps[r](_shards[r])
+
+        if _graphs_active and _graphed_steps is None:
+            # built BEFORE the ddp warm-up pass: the warm-up backward must run
+            # on the steps' capture streams (see the warm-up site)
+            _graphed_steps = [_make_graphed_step(r) for r in range(replica_group.world)]]
+            _graphs_warmups_left = _graphed_steps[0].warmup_iters
+            logger.info(
+                "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
+                _world,
+                _graphs_warmups_left,
+            )
+
+        _bg_busy = [t for t in _bg_cuda_threads if t.is_alive()]
+        _prefetch_busy = _graphs_streamer is not None and _graphs_streamer.prefetch_pending()
+
         # When low_gpu_mem_usage is enabled, active_inputs / fp_outputs are intentionally
         # kept on CPU to limit GPU memory.  However block_fwd normally routes pred_output
         # through CPU (cache_device="cpu") and the very next line moves it back to
@@ -851,12 +936,31 @@ class SignRoundQuantizer(BaseQuantizer):
                     for r, rep in enumerate(replica_group.replicas):
                         _warm = list(range(r * _plan.shard_size, (r + 1) * _plan.shard_size))
                         _dev_r = next(rep.parameters()).device
+                        _warm_step = _graphed_steps[r] if _graphed_steps is not None else None
+                        _warm_stream = _warm_step._capture_stream if _warm_step is not None else None
                         with torch.cuda.device(_dev_r):
-                            expect_pool_local([fp_outputs[j] for j in _warm], _dev_r, "warmup-ref")
-                            _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
-                            _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
-                            _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
-                            _loss_w.backward()
+                            # graphs on: the FIRST backward per replica must run
+                            # on the capture stream -- AccumulateGrad nodes are
+                            # created once per parameter and keep their birth
+                            # stream; default-stream birth dooms every later
+                            # capture (legacy-stream dependency)
+                            if _warm_stream is not None:
+                                _warm_stream.wait_stream(torch.cuda.current_stream(_dev_r))
+                            import contextlib
+
+                            _sctx = (
+                                torch.cuda.stream(_warm_stream)
+                                if _warm_stream is not None
+                                else contextlib.nullcontext()
+                            )
+                            with _sctx:
+                                expect_pool_local([fp_outputs[j] for j in _warm], _dev_r, "warmup-ref")
+                                _ref_w = torch.cat([fp_outputs[j].to(_dev_r) for j in _warm], dim=0)
+                                _pred_w = block_fwd.forward(rep, active_inputs, input_others, _warm, _dev_r)
+                                _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
+                                _loss_w.backward()
+                            if _warm_stream is not None:
+                                torch.cuda.current_stream(_dev_r).wait_stream(_warm_stream)
                     for _opt in [optimizer] + mirror_optimizers:
                         # graphs replay backward into the captured grad
                         # addresses: the warm-up backward above allocated
@@ -956,88 +1060,6 @@ class SignRoundQuantizer(BaseQuantizer):
                         _losses[r] = loss_r.detach()
                         loss_r.backward()
 
-                def _make_graphed_step(r):
-                    # Static buffers: the FIRST gather's tensors become the
-                    # graph's baked inputs (their addresses must repeat);
-                    # every later prepare refreshes them in place. Shared
-                    # leaves (rotary tables) keep their identity -- no copy.
-                    rep = replica_group.replicas[r]
-                    dev_r = next(rep.parameters()).device
-                    st = {"inputs": None, "others": None, "ref": None}
-                    from auto_round.algorithms.quantization.sign_round.data_parallel import _copy_into_static
-
-                    def prepare(shard):
-                        with torch.cuda.device(dev_r):
-                            expect_pool_local([fp_outputs[j] for j in shard], dev_r, "ddp-ref")
-                            ref = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
-                            # same gather the runner performs inside forward()
-                            indices = torch.tensor(shard, dtype=torch.long, device=dev_r)
-                            bins, bother = [], []
-                            for i in range(0, len(indices), block_fwd.batch_size):
-                                bi = indices[i : i + block_fwd.batch_size]
-                                _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
-                                bins.append(_in)
-                                bother.append(_oth)
-
-                            def _to_dev(x):
-                                if isinstance(x, torch.Tensor) and x.device != dev_r:
-                                    return x.to(dev_r)
-                                if isinstance(x, dict):
-                                    return {k: _to_dev(v) for k, v in x.items()}
-                                if isinstance(x, (tuple, list)):
-                                    return type(x)(_to_dev(v) for v in x)
-                                return x
-
-                            if st["ref"] is None:
-                                # shallow-copy the dict nodes: block_forward MUTATES
-                                # the kwargs it receives (pops keys); the static
-                                # structure must stay pristine for later compares.
-                                # Stage every leaf on dev_r: to_device() inside
-                                # the captured region must no-op (unpinned H2D
-                                # during capture is illegal); later prepares
-                                # refresh cross-device eagerly via copy_.
-                                st["ref"], st["inputs"] = _to_dev(ref), [_to_dev(b) for b in bins]
-                                st["others"] = [_to_dev(dict(o)) for o in bother]
-                                return
-                            _copy_into_static(st["ref"], ref)
-                            _copy_into_static(st["inputs"], bins)
-                            _copy_into_static(st["others"], bother)
-
-                    def compute():
-                        with torch.cuda.device(dev_r):
-                            outs = []
-                            for _in, _oth in zip(st["inputs"], st["others"]):
-                                # dict() per call: the runner pops keys from the
-                                # kwargs it receives (same tensor leaves -- the
-                                # graph-baked addresses are untouched)
-                                raw = block_fwd._forward_one_batch(rep, _in, dict(_oth))
-                                out = block_fwd._normalize_output(raw, rep)
-                                outs.append(out.to(dev_r) if out.device != dev_r else out)
-                            pred_r = outs[0] if len(outs) == 1 else torch.cat(outs, dim=block_fwd.batch_dim)
-                            # valid_token_mask is None on this path, so the
-                            # indices argument of _get_loss is never consumed
-                            loss_r = self._get_loss(pred_r, st["ref"], None, mse_loss, dev_r, None)
-                            loss_r.backward()
-                            return loss_r
-
-                    from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
-
-                    return GraphedReplicaStep(prepare, compute, name=f"replica-{r}", device=dev_r)
-
-                def _dp_run(r):
-                    _losses[r] = _graphed_steps[r](_shards[r])
-
-                if _graphs_active and _graphed_steps is None:
-                    _graphed_steps = [_make_graphed_step(r) for r in range(_world)]
-                    _graphs_warmups_left = _graphed_steps[0].warmup_iters
-                    logger.info(
-                        "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
-                        _world,
-                        _graphs_warmups_left,
-                    )
-
-                _bg_busy = [t for t in _bg_cuda_threads if t.is_alive()]
-                _prefetch_busy = _graphs_streamer is not None and _graphs_streamer.prefetch_pending()
                 if _graphs_capture_pending and not _bg_busy and not _prefetch_busy:
                     # barrier point: pool workers are parked and no CUDA work
                     # is in flight process-wide -- torch.cuda.graph forbids
