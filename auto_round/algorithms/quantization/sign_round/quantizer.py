@@ -767,9 +767,15 @@ class SignRoundQuantizer(BaseQuantizer):
         _graphed_steps = None
         _graphs_warmups_left = 0
         _graphs_capture_pending = False
+        _graphs_defer_logged = False
         from auto_round.algorithms.quantization.sign_round.data_parallel import cuda_graphs_engage
 
-        _staged_src_probe = getattr(block, "_stream_prefetch_source", None)
+        # background pack / ready-transform threads that may issue CUDA
+        # concurrently with this block's tune loop (streaming pipeline):
+        # capture DEFERS until they finish -- global-mode capture needs the
+        # process CUDA-quiet, and joining the packer would serialize ~half
+        # the block wall
+        _bg_cuda_threads = [t for t in getattr(block, "_bg_cuda_threads", ()) or () if t is not None]
         if (
             _envs.AR_TUNE_CUDA_GRAPHS
             and replica_group is not None
@@ -778,7 +784,6 @@ class SignRoundQuantizer(BaseQuantizer):
                 inputs_are_list=isinstance(active_inputs, list),
                 is_diffusion=getattr(block_fwd, "is_diffusion", False),
                 has_valid_token_mask=valid_token_mask is not None,
-                streaming=_staged_src_probe is not None,
             )
         ):
             _graphs_active = True
@@ -995,7 +1000,8 @@ class SignRoundQuantizer(BaseQuantizer):
                         _graphs_warmups_left,
                     )
 
-                if _graphs_capture_pending:
+                _bg_busy = [t for t in _bg_cuda_threads if t.is_alive()]
+                if _graphs_capture_pending and not _bg_busy:
                     # barrier point: pool workers are parked and no CUDA work
                     # is in flight process-wide -- torch.cuda.graph forbids
                     # concurrent CUDA during capture, so all captures run
@@ -1008,6 +1014,13 @@ class SignRoundQuantizer(BaseQuantizer):
                             _losses[r] = _graphed_steps[r].capture_now()
                         _graphs_capture_pending = False
                         logger.info("[tune-ddp] cuda graphs captured %d replica step(s)", _world)
+                elif _graphs_capture_pending and _bg_busy and not _graphs_defer_logged:
+                    _graphs_defer_logged = True
+                    logger.warning(
+                        "[tune-ddp] cuda graph capture deferred: %d background pack/transform "
+                        "thread(s) still issuing CUDA (capturing at the first quiet iteration)",
+                        len(_bg_busy),
+                    )
                 elif _graphed_steps is not None:
                     with tune_stage(tune_prof, "fwd"):
                         replica_group.run_threaded([lambda r=r: _dp_run(r) for r in range(_world)])
@@ -1146,6 +1159,11 @@ class SignRoundQuantizer(BaseQuantizer):
                 with tune_stage(tune_prof, "step"):
                     self._step(scaler, optimizer, lr_schedule)
 
+        if _graphs_active and _graphed_steps is not None and any(st._graph is None for st in _graphed_steps):
+            logger.warning(
+                "[tune-ddp] cuda graphs were never captured for this block "
+                "(background pack/transform threads stayed busy through the tune window); it ran eager"
+            )
         if replica_group is not None:
             replica_group.teardown()
         if _delayed:

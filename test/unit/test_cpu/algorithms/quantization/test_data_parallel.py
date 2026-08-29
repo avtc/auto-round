@@ -1379,12 +1379,6 @@ class TestGraphedReplicaStepV2:
         assert r2.item() == 5.0  # earlier clone unaffected
         assert state["prepares"] == 2 and state["computes"] == 4
 
-    def test_uncaptured_beyond_warmup_raises(self):
-        step, _, _ = self._make(warmup=1)
-        step(1.0)
-        with pytest.raises(RuntimeError, match="capture_now"):
-            step(2.0)
-
     def test_replay_returns_clone_not_static(self):
         step, _, _ = self._make(warmup=1)
         a = step(1.0)
@@ -1392,6 +1386,17 @@ class TestGraphedReplicaStepV2:
         b = step(2.0)
         assert a is not b and a is not step._static_loss
         assert a.item() == 1.0 and b.item() == 2.0
+
+    def test_uncaptured_iterations_run_eagerly(self):
+        # deferral semantics: past the warm-up window and still uncaptured
+        # (background threads busy), the step must keep running eagerly
+        step, _, state = self._make(warmup=1)
+        assert step(1.0).item() == 1.0
+        assert step(2.0).item() == 2.0  # beyond warm-up, uncaptured -> eager
+        assert state["computes"] == 2
+        step.capture_now()
+        assert step(3.0).item() == 3.0  # replay path
+        assert state["computes"] == 5
 
     def test_capture_failure_halts(self, caplog):
         from auto_round.logger import logger as ar_logger
@@ -1478,22 +1483,6 @@ class TestStaticBufferLeafCopy:
 
 
 class TestCudaGraphsEngageV2:
-    def test_streaming_mode_skips_with_one_log(self, caplog, monkeypatch):
-        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
-
-        monkeypatch.setattr(dp, "_GRAPHS_STREAMING_SKIP_LOGGED", False)
-        from auto_round.logger import logger as ar_logger
-
-        ar_logger.addHandler(caplog.handler)
-        try:
-            assert dp.cuda_graphs_engage(object(), streaming=True) is False
-            assert any("streaming" in r.getMessage().lower() for r in caplog.records)
-            caplog.clear()
-            assert dp.cuda_graphs_engage(object(), streaming=True) is False
-            assert not any("streaming" in r.getMessage().lower() for r in caplog.records)
-        finally:
-            ar_logger.removeHandler(caplog.handler)
-
     def test_structural_gates(self):
         assert dp.cuda_graphs_engage(None) is False
         assert dp.cuda_graphs_engage(object(), inputs_are_list=False) is False

@@ -2287,6 +2287,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if _tgt is not None:
                         _home_next = stage_devices[(stream_block_idx + 1) % len(stage_devices)]
                         _bg_thread = self._start_bg_ready_transform(_tgt, _home_next, streamer)
+                # threads that may issue CUDA while THIS block tunes: the
+                # previous block's bg pack and the next block's ready
+                # transform. The tune loop's CUDA-graph capture defers until
+                # they finish (global-mode capture needs the process quiet).
+                block._bg_cuda_threads = [t for t in (_bg_pack, _bg_thread) if t is not None]
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,

@@ -1136,34 +1136,20 @@ def _cuda_graphs_supported() -> bool:
     return torch.cuda.is_available() and hasattr(torch.cuda, "CUDAGraph")
 
 
-_GRAPHS_STREAMING_SKIP_LOGGED = False
-
-
-def cuda_graphs_engage(
-    replica_group, *, inputs_are_list=True, is_diffusion=False, has_valid_token_mask=False, streaming=False
-) -> bool:
+def cuda_graphs_engage(replica_group, *, inputs_are_list=True, is_diffusion=False, has_valid_token_mask=False) -> bool:
     """Whether the DDP tune loop may capture per-replica CUDA graphs.
 
     Quiet refusals are environment properties only (serial path, no CUDA,
-    dict/diffusion inputs, valid-token-mask loss, streaming mode). The
-    streaming refusal is structural: the background pack/ready-transform
-    threads issue CUDA concurrently with the tune loop, and capture with
-    the global error mode would be invalidated. Everything failing during
+    dict/diffusion inputs, valid-token-mask loss). Streaming mode does NOT
+    refuse: background pack/ready-transform threads simply DEFER the capture
+    (the loop waits for them at iteration barriers, since global-mode
+    capture needs the process CUDA-quiet). Everything failing during
     prepare/capture/replay is a real fault and raises (see
     :class:`GraphedReplicaStep`).
     """
-    global _GRAPHS_STREAMING_SKIP_LOGGED
     if replica_group is None:
         return False
     if not (inputs_are_list and not is_diffusion and not has_valid_token_mask):
-        return False
-    if streaming:
-        if not _GRAPHS_STREAMING_SKIP_LOGGED:
-            _GRAPHS_STREAMING_SKIP_LOGGED = True
-            logger.info(
-                "[tune-ddp] streaming mode active: cuda graphs skipped "
-                "(background pack/transform threads issue concurrent CUDA during the tune loop)"
-            )
         return False
     return _cuda_graphs_supported()
 
@@ -1297,21 +1283,19 @@ class GraphedReplicaStep:
             raise
         if self._graph is None:
             self._calls += 1
-            if self._calls <= self.warmup_iters:
-                try:
-                    return self.compute().detach()
-                except Exception as exc:
-                    logger.error(
-                        "[tune-ddp] cuda-graph warm-up compute failed for %s (%s): "
-                        "set AR_TUNE_CUDA_GRAPHS=0 to disable",
-                        self.name,
-                        exc,
-                    )
-                    raise
-            raise RuntimeError(
-                f"cuda graph for {self.name} was not captured after {self.warmup_iters} warmup iteration(s) "
-                "-- capture_now() must run at the loop's barrier point"
-            )
+            # uncaptured iterations run eagerly: the first warmup_iters by
+            # design, later ones while the capture barrier DEFERS (background
+            # pack/transform threads still issue CUDA -- global-mode capture
+            # needs the process quiet, so capture waits for them to finish)
+            try:
+                return self.compute().detach()
+            except Exception as exc:
+                logger.error(
+                    "[tune-ddp] cuda-graph warm-up compute failed for %s (%s): " "set AR_TUNE_CUDA_GRAPHS=0 to disable",
+                    self.name,
+                    exc,
+                )
+                raise
         try:
             self._graph.replay()
         except Exception as exc:
