@@ -916,6 +916,9 @@ class SignRoundQuantizer(BaseQuantizer):
                 else self.compress_context.cache_device
             )
 
+        _graphs_t0 = time.perf_counter()
+        _graphs_capture_t = None
+        _graphs_capture_iter = -1
         for i in range(self.iters):
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
                 for n, m in block.named_modules():
@@ -1033,6 +1036,8 @@ class SignRoundQuantizer(BaseQuantizer):
                                 _graphs_gate.set()
                             raise
                         _graphs_capture_pending = False
+                        _graphs_capture_t = time.perf_counter()
+                        _graphs_capture_iter = i + 1
                         if _graphs_gate is not None:
                             _graphs_gate.set()  # release held bg pack/ready work
                         logger.info("[tune-ddp] cuda graphs captured %d replica step(s)", _world)
@@ -1185,6 +1190,18 @@ class SignRoundQuantizer(BaseQuantizer):
                 with tune_stage(tune_prof, "step"):
                     self._step(scaler, optimizer, lr_schedule)
 
+        if _graphs_capture_t is not None:
+            _pre = _graphs_capture_iter
+            _post = self.iters - _graphs_capture_iter
+            _pre_ms = (_graphs_capture_t - _graphs_t0) * 1000 / max(_pre, 1)
+            _post_ms = (time.perf_counter() - _graphs_capture_t) * 1000 / max(_post, 1)
+            logger.info(
+                "[tune-ddp] cuda graphs timing: eager %d iters %.1f ms/iter -> replay %d iters %.1f ms/iter",
+                _pre,
+                _pre_ms,
+                _post,
+                _post_ms,
+            )
         if _graphs_gate is not None:
             _graphs_gate.set()  # never hold bg work past the tune loop
         if _graphs_active and _graphed_steps is not None and any(st._graph is None for st in _graphed_steps):
