@@ -978,12 +978,25 @@ class SignRoundQuantizer(BaseQuantizer):
                                 _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
                                 bins.append(_in)
                                 bother.append(_oth)
+                            def _to_dev(x):
+                                if isinstance(x, torch.Tensor) and x.device != dev_r:
+                                    return x.to(dev_r)
+                                if isinstance(x, dict):
+                                    return {k: _to_dev(v) for k, v in x.items()}
+                                if isinstance(x, (tuple, list)):
+                                    return type(x)(_to_dev(v) for v in x)
+                                return x
+
                             if st["ref"] is None:
                                 # shallow-copy the dict nodes: block_forward MUTATES
                                 # the kwargs it receives (pops keys); the static
-                                # structure must stay pristine for later compares
-                                st["ref"], st["inputs"] = ref, bins
-                                st["others"] = [dict(o) for o in bother]
+                                # structure must stay pristine for later compares.
+                                # Stage every leaf on dev_r: to_device() inside
+                                # the captured region must no-op (unpinned H2D
+                                # during capture is illegal); later prepares
+                                # refresh cross-device eagerly via copy_.
+                                st["ref"], st["inputs"] = _to_dev(ref), [_to_dev(b) for b in bins]
+                                st["others"] = [_to_dev(dict(o)) for o in bother]
                                 return
                             _copy_into_static(st["ref"], ref)
                             _copy_into_static(st["inputs"], bins)
