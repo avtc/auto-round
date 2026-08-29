@@ -640,6 +640,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 _dp_placed = True
                 _staged_src = getattr(block, "_stream_prefetch_source", None)
                 if _staged_src is not None:
+                    _graphs_streamer = getattr(_staged_src, "streamer", None)
                     _staged_src = _staged_src.unpack()
                 replica_group = ReplicaGroup(
                     block, _plan, grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT, staged_source=_staged_src
@@ -768,6 +769,7 @@ class SignRoundQuantizer(BaseQuantizer):
         _graphs_warmups_left = 0
         _graphs_capture_pending = False
         _graphs_defer_logged = False
+        _graphs_streamer = None
         from auto_round.algorithms.quantization.sign_round.data_parallel import cuda_graphs_engage
 
         # background pack / ready-transform threads that may issue CUDA
@@ -1001,7 +1003,8 @@ class SignRoundQuantizer(BaseQuantizer):
                     )
 
                 _bg_busy = [t for t in _bg_cuda_threads if t.is_alive()]
-                if _graphs_capture_pending and not _bg_busy:
+                _prefetch_busy = _graphs_streamer is not None and _graphs_streamer.prefetch_pending()
+                if _graphs_capture_pending and not _bg_busy and not _prefetch_busy:
                     # barrier point: pool workers are parked and no CUDA work
                     # is in flight process-wide -- torch.cuda.graph forbids
                     # concurrent CUDA during capture, so all captures run
@@ -1014,14 +1017,18 @@ class SignRoundQuantizer(BaseQuantizer):
                             _losses[r] = _graphed_steps[r].capture_now()
                         _graphs_capture_pending = False
                         logger.info("[tune-ddp] cuda graphs captured %d replica step(s)", _world)
-                elif _graphs_capture_pending and _bg_busy and not _graphs_defer_logged:
-                    _graphs_defer_logged = True
-                    logger.warning(
-                        "[tune-ddp] cuda graph capture deferred: %d background pack/transform "
-                        "thread(s) still issuing CUDA (capturing at the first quiet iteration)",
-                        len(_bg_busy),
-                    )
                 elif _graphed_steps is not None:
+                    # warm-up AND deferred iterations both dispatch through
+                    # the pool: the uncaptured step path runs prepare+compute
+                    # eagerly, so a deferral never skips an iteration
+                    if _graphs_capture_pending and not _graphs_defer_logged:
+                        _graphs_defer_logged = True
+                        logger.warning(
+                            "[tune-ddp] cuda graph capture deferred: %d background thread(s), "
+                            "prefetch_pending=%s -- capturing at the first quiet iteration",
+                            len(_bg_busy),
+                            _prefetch_busy,
+                        )
                     with tune_stage(tune_prof, "fwd"):
                         replica_group.run_threaded([lambda r=r: _dp_run(r) for r in range(_world)])
                     if _graphs_warmups_left > 0:
