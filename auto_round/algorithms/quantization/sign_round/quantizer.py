@@ -978,6 +978,7 @@ class SignRoundQuantizer(BaseQuantizer):
                                 _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
                                 bins.append(_in)
                                 bother.append(_oth)
+
                             def _to_dev(x):
                                 if isinstance(x, torch.Tensor) and x.device != dev_r:
                                     return x.to(dev_r)
