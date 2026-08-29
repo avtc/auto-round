@@ -1159,8 +1159,9 @@ class SignRoundQuantizer(BaseQuantizer):
                 lambda pred, ref: self._get_loss(pred, ref, None, mse_loss, device, None),
                 torch.device(device),
             )
-            _serial_warmups_left = _serial_step.warmup_iters
-            logger.info("[tune-serial] cuda graphs enabled: capture after %d warmup iteration(s)", _serial_warmups_left)
+            logger.info(
+                "[tune-serial] cuda graphs enabled: capture after %d warmup iteration(s)", _serial_step.warmup_iters
+            )
 
         _serial_step_fn = None
         _serial_pre_by_id = None
@@ -1217,6 +1218,12 @@ class SignRoundQuantizer(BaseQuantizer):
                         "[tune-serial] whole-iteration capture unavailable (%s); eager step between replays", _se
                     )
                     _serial_step_fn, _serial_pre_by_id = None, None
+                    # R1-4: drop partially-injected device-lr keys (a later
+                    # state_dict() would carry them as opaque group options)
+                    for _g in optimizer.param_groups:
+                        _g.pop("_ar_neg_lr_dev", None)
+            # R1-3: warmups must reflect whichever step object is live
+            _serial_warmups_left = _serial_step.warmup_iters if _serial_step is not None else 0
 
         if _proactive and _pacing and _graphs_active and _dp_samplers is not None and replica_group is not None:
             # consume the whole shuffle schedule upfront (same RNG stream as
@@ -1589,7 +1596,16 @@ class SignRoundQuantizer(BaseQuantizer):
                 sync_gradients()
                 with tune_stage(tune_prof, "step"):
                     if _serial_step_fn is not None:
-                        lr_schedule.step()  # step ran inside the (re)play
+                        # the optimizer's host-side step() never runs in this
+                        # mode, so torch's 'skipping the first value' hint is
+                        # a false positive -- the lr sequence is identical
+                        # (verified); suppress just that warning
+                        import warnings as _warnings
+
+                        with _warnings.catch_warnings():
+                            _warnings.filterwarnings("ignore", message=".*seems to be deprecated.*")
+                            _warnings.filterwarnings("ignore", message="Detected call of `lr_scheduler.step()`.*")
+                            lr_schedule.step()  # step ran inside the (re)play
                     else:
                         self._step(scaler, optimizer, lr_schedule, keep_grads=_serial_step is not None)
 

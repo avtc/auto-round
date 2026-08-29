@@ -2087,3 +2087,90 @@ class TestSerialWholeIterationStep:
         assert serial_step_vram_ok(100, lambda: (1000, 2000), margin=500) is True
         assert serial_step_vram_ok(100, lambda: (50, 2000), margin=500) is False
         assert serial_step_vram_ok(100, None) is True  # no CUDA: staging still allowed on CPU tests
+
+    def test_multi_group_lr_bit_parity(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import make_serial_step_fn
+
+        torch.manual_seed(5)
+        a = torch.nn.Linear(4, 4)
+        b = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(
+            [
+                {"params": list(a.parameters()), "lr": 0.2},
+                {"params": list(b.parameters()), "lr": 0.05},
+            ],
+            lr=0.1,
+        )
+        la = torch.nn.Linear(4, 4)
+        lb = torch.nn.Linear(4, 4)
+        la.load_state_dict(a.state_dict())
+        lb.load_state_dict(b.state_dict())
+        step_fn, _ = make_serial_step_fn(opt, torch.device("cpu"))
+        for lr_a, lr_b in [(0.2, 0.05), (0.1, 0.025)]:
+            opt.param_groups[0]["_ar_neg_lr_dev"].fill_(-lr_a)
+            opt.param_groups[1]["_ar_neg_lr_dev"].fill_(-lr_b)
+            ga = torch.randn(4, 4)
+            gb = torch.randn(4, 4)
+            a.weight.grad = ga.clone()
+            b.weight.grad = gb.clone()
+            step_fn()
+            with torch.no_grad():
+                la.weight.add_(torch.sign(ga), alpha=-lr_a)
+                lb.weight.add_(torch.sign(gb), alpha=-lr_b)
+        assert torch.equal(a.weight, la.weight)
+        assert torch.equal(b.weight, lb.weight)
+
+    def test_capture_with_step_fn_fake_graph(self):
+        import contextlib
+        import torch
+
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            make_serial_graphed_step,
+            make_serial_step_fn,
+        )
+
+        torch.manual_seed(2)
+        block = torch.nn.Linear(5, 5)
+        block.orig_layer = True
+        block.params = {"weight": block.weight, "bias": block.bias}
+        pool = [(torch.arange(5, dtype=torch.float32) + 10.0 * i).unsqueeze(0) for i in range(4)]
+        fp_outputs = [block(x).detach() + 0.1 * torch.randn_like(x) for x in pool]
+        fwd = BlockForwardRunner(batch_size=4, amp=False, enable_torch_compile=False)
+        opt = torch.optim.SGD(list(block.parameters()), lr=0.1)
+        step_fn, pre_by_id = make_serial_step_fn(opt, torch.device("cpu"))
+        holder = {}
+
+        class FakeGraph:
+            def replay(self):
+                holder["step"]._static_loss.copy_(holder["step"].compute())
+
+        calls = []
+
+        def counting_step():
+            calls.append(float(block.weight.detach().sum()))
+            step_fn()
+
+        step = make_serial_graphed_step(
+            block,
+            fwd,
+            pool,
+            {"positional_inputs": None},
+            fp_outputs,
+            lambda pred, ref: torch.nn.functional.mse_loss(pred.float(), ref.float()),
+            torch.device("cpu"),
+            step_fn=counting_step,
+            graph_factory=lambda: FakeGraph(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        holder["step"] = step
+        step([0, 1, 2, 3])  # warmup: step_fn ran eagerly
+        p_after_warmup = float(block.weight.detach().sum())
+        assert len(calls) == 1
+        step.prepare_only([3, 2, 1, 0])
+        step.capture_now()  # records compute (incl. step_fn) + replays once
+        # record-execute + the immediate replay each ran the captured step
+        assert len(calls) == 3
+        assert torch.count_nonzero(block.weight.grad) == 0  # in-graph zero held
