@@ -423,6 +423,17 @@ export AR_TUNE_CUDA_GRAPHS=0   # 禁用整体 graph 捕获（DDP replica step �
 - **默认值**: 优化器满足条件时自动启用（无环境变量）
 - **用法**: 无需设置；体现为 tune profile 中更低的 `step` 阶段耗时。
 
+### AR_TUNE_GRAPH_TEMPLATE_CACHE
+- **描述**： 跨 block 缓存多少种不同 layer-module 模板的调优图状态（持久镜像模块 + 静态输入缓冲 + 已捕获的 replica graphs）。同模板 block（模块结构与形状完全一致——例如线性/全注意力交替排列）将自身数值同步进缓存镜像并 replay 其图，而不是重建镜像并重新捕获：每次命中节省镜像构建（约 1.4-3.9 秒）与镜像份额的捕获（约 2-4 秒），并消除逐 block 的图池churn（其会不断抬升 reserved-VRAM 高水位）。home replica 始终重新捕获（其参数地址每个 block 都变化）。`0` 禁用（逐 block 构建+捕获）；`1` 覆盖单模板模型；`2` 覆盖线性:全注意力交替；更多模板的模型可调大。
+- **默认值**: `2`
+- **有效值**: 非负整数
+- **用法**: 交替架构保持默认；3 种以上重复模板时调大；A/B 隔离时设 `0`。
+
+```bash
+export AR_TUNE_GRAPH_TEMPLATE_CACHE=0   # 逐 block 镜像构建 + 捕获（旧行为）
+export AR_TUNE_GRAPH_TEMPLATE_CACHE=3   # 三模板模型
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

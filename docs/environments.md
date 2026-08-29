@@ -423,6 +423,17 @@ export AR_TUNE_CUDA_GRAPHS=0   # disable whole graph capture (DDP replica steps 
 - **Default**: enabled automatically when the optimizer qualifies (no env var)
 - **Usage**: nothing to set; visible as a lower `step` stage time in the tune profile.
 
+### AR_TUNE_GRAPH_TEMPLATE_CACHE
+- **Description**: How many distinct layer-module templates keep their tune-loop graph state cached ACROSS blocks (persistent mirror modules + static input buffers + the CAPTURED replica graphs). A same-template block (identical module structure and shapes — e.g. the repeating linear/full-attention interleave) syncs its values into the cached mirrors and replays their graphs instead of rebuilding mirrors and re-capturing: saves the mirror build (~1.4-3.9 s) plus the mirror share of capture (~2-4 s) per hit and stops the per-block graph-pool churn that ratchets the reserved-VRAM watermark. The home replica always re-captures (its parameters change addresses every block). `0` disables (per-block build+capture); `1` covers single-template runs; `2` covers a linear:full interleave; larger values fit models with more templates.
+- **Default**: `2`
+- **Valid Values**: non-negative integers
+- **Usage**: keep default for interleaved architectures; raise for 3+ repeating templates; `0` for A/B isolation.
+
+```bash
+export AR_TUNE_GRAPH_TEMPLATE_CACHE=0   # per-block mirror build + capture (legacy)
+export AR_TUNE_GRAPH_TEMPLATE_CACHE=3   # three-template model
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

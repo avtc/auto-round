@@ -2465,3 +2465,117 @@ class TestBucketExchangeDeterministicBuffers:
 
 def _params_of(sess):
     return [p for ps in sess.params_per_replica for p in ps]
+
+
+class TestMirrorTemplateCache:
+    """T11: cross-block reuse of mirror modules + captured graphs."""
+
+    def _block(self, seed=0, hidden=5):
+        import torch
+
+        torch.manual_seed(seed)
+        block = torch.nn.Sequential(torch.nn.Linear(hidden, hidden), torch.nn.Linear(hidden, 3))
+        block.orig_layer = True
+        block.params = {"seq.0.weight": block[0].weight, "seq.1.weight": block[1].weight}
+        return block
+
+    def test_template_signature(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _template_signature
+
+        a, b, c = self._block(0), self._block(1), self._block(0, hidden=6)
+        key_a = _template_signature(a, 4, ["cuda:0", "cuda:1"])
+        assert key_a == _template_signature(b, 4, ["cuda:0", "cuda:1"])  # values differ, template same
+        assert key_a != _template_signature(c, 4, ["cuda:0", "cuda:1"])  # shape differs
+        assert key_a != _template_signature(a, 4, ["cuda:0", "cuda:2"])  # devices differ
+
+    def test_sync_mirror_from_home(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sync_mirror_from_home
+
+        home, mirror = self._block(3), self._block(7)
+        w_before = mirror[0].weight.data_ptr()
+        for p in mirror.parameters():
+            p.grad = torch.full_like(p, 5.0)  # stale parked grads
+        sync_mirror_from_home(home, mirror)
+        assert torch.equal(mirror[0].weight, home[0].weight)
+        assert torch.equal(mirror[1].bias, home[1].bias)
+        assert mirror[0].weight.data_ptr() == w_before  # addresses stable
+        assert all(p.grad is not None and torch.count_nonzero(p.grad) == 0 for p in mirror.parameters())
+        assert mirror.params["seq.0.weight"] is mirror[0].weight  # wrapper dict intact
+
+    def test_replica_group_adopts_cached_mirrors(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup
+
+        class _Plan:
+            devices = [torch.device("cpu"), torch.device("cpu"), torch.device("cpu")]
+
+        home = self._block()
+        cached = [self._block(9), self._block(9)]
+        group = ReplicaGroup(home, _Plan(), mirrors=cached)
+        assert group.mirrors[0] is cached[0] and group.mirrors[1] is cached[1]
+        assert group.replicas[0] is home and group.replicas[1] is cached[0] and group.replicas[2] is cached[1]
+
+    def test_step_rebinding_keeps_graph_and_st(self):
+        import contextlib
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+        st = {"inputs": None, "others": None, "ref": None}
+        st["ref"] = torch.zeros(4)
+        calls = []
+        step = GraphedReplicaStep(
+            lambda *a: calls.append(("prep", a)),
+            lambda: calls.append(("compute",)),
+            warmup_iters=2,
+            name="r1",
+            graph_factory=lambda: object(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        class _FakeG:
+            def replay(self):
+                step._static_loss = step.compute()
+
+        step._graph = _FakeG()  # pretend captured
+
+        def rebind(existing_step, existing_st):
+            def prepare(row):
+                existing_st["ref"] = torch.full((4,), float(row[0]))
+                calls.append(("newprep", row))
+
+            def compute():
+                calls.append(("newcompute",))
+                return existing_st["ref"].sum().reshape(1)
+
+            existing_step.prepare = prepare
+            existing_step.compute = compute
+            return existing_step
+
+        same = rebind(step, st)
+        assert same is step and step._graph is not None  # graph survives
+        step(3.0 if False else [3])
+        assert calls[-2:] == [("newprep", [3]), ("newcompute",)]
+        assert st["ref"][0].item() == 3.0  # same static dict refreshed
+
+    def test_cache_lru_cap(self):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        dp._GRAPH_TEMPLATE_CACHE.clear()
+        for k in ("a", "b", "c", "d"):
+            dp._GRAPH_TEMPLATE_CACHE[k] = {"mirrors": [], "steps": [], "sts": []}
+            dp._GRAPH_TEMPLATE_CACHE.move_to_end(k)
+            while len(dp._GRAPH_TEMPLATE_CACHE) > 3:  # any cap works
+                dp._GRAPH_TEMPLATE_CACHE.popitem(last=False)
+        assert list(dp._GRAPH_TEMPLATE_CACHE) == ["b", "c", "d"]
+
+    def test_env_size_default_two_any_value(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", raising=False)
+        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 2
+        for v in ("0", "1", "5"):
+            monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
+            assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)

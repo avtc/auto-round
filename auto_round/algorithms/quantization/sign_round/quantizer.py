@@ -577,6 +577,7 @@ class SignRoundQuantizer(BaseQuantizer):
         # mirrors exist -- and before tuning-parameter collection, so frozen
         # recipes remove the margin parameters everywhere consistently.
         replica_group = None
+        _tpl_entry = None
         mirror_optimizers = []
         mirror_schedules = []
         params_per_replica = []
@@ -649,9 +650,37 @@ class SignRoundQuantizer(BaseQuantizer):
                 if _staged_src is not None:
                     _graphs_streamer = getattr(_staged_src, "streamer", None)
                     _staged_src = _staged_src.unpack()
-                replica_group = ReplicaGroup(
-                    block, _plan, grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT, staged_source=_staged_src
+                from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                    _GRAPH_TEMPLATE_CACHE,
+                    _template_signature,
+                    sync_mirror_from_home,
+                    template_cache_size,
                 )
+
+                _tpl_entry = None
+                if template_cache_size() > 0:
+                    _tpl_key = _template_signature(block, _plan.world, _plan.devices)
+                    _tpl_entry = _GRAPH_TEMPLATE_CACHE.pop(_tpl_key, None)
+                    if _tpl_entry is not None and len(_tpl_entry["mirrors"]) != _plan.world - 1:
+                        _tpl_entry = None  # stale layout -- rebuild
+                if _tpl_entry is not None:
+                    for _mir in _tpl_entry["mirrors"]:
+                        sync_mirror_from_home(block, _mir)
+                    replica_group = ReplicaGroup(
+                        block,
+                        _plan,
+                        grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT,
+                        staged_source=None,
+                        mirrors=_tpl_entry["mirrors"],
+                    )
+                    logger.info(
+                        "[tune-ddp] graph template cache hit: %d mirror(s) adopted (captured graphs kept)",
+                        len(_tpl_entry["mirrors"]),
+                    )
+                else:
+                    replica_group = ReplicaGroup(
+                        block, _plan, grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT, staged_source=_staged_src
+                    )
                 for note in _plan.notes:
                     logger.info("[tune-ddp] %s", note)
                 with _bp_stage(_prof_bp, "sharded_anchor"):
@@ -806,14 +835,20 @@ class SignRoundQuantizer(BaseQuantizer):
                 # also releases on every exit, so workers can wait unbounded)
                 _graphs_gate.clear()
 
-        def _make_graphed_step(r):
+        def _make_graphed_step(r, st=None, step=None):
             # Static buffers: the FIRST gather's tensors become the
             # graph's baked inputs (their addresses must repeat);
             # every later prepare refreshes them in place. Shared
             # leaves (rotary tables) keep their identity -- no copy.
+            # A template-cache hit passes the PERSISTENT st (and the step
+            # object holding the captured graph): the fresh closures bind to
+            # THIS block's pools while the baked addresses stay alive.
             rep = replica_group.replicas[r]
             dev_r = next(rep.parameters()).device
-            st = {"inputs": None, "others": None, "ref": None}
+            if step is not None and st is None:
+                st = step._ar_st  # persistent static buffers of the cached graph
+            if st is None:
+                st = {"inputs": None, "others": None, "ref": None}
             from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner, _copy_into_static
 
             pinner = HostLeafPinner()
@@ -888,7 +923,14 @@ class SignRoundQuantizer(BaseQuantizer):
 
             from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
 
-            return GraphedReplicaStep(prepare, compute, name=f"replica-{r}", device=dev_r)
+            if step is not None:
+                step.prepare = prepare
+                step.compute = compute
+                step._ar_st = st  # template cache: the static dict travels with the step
+                return step
+            _gs = GraphedReplicaStep(prepare, compute, name=f"replica-{r}", device=dev_r)
+            _gs._ar_st = st
+            return _gs
 
         _graphed_worker_ms = [[] for _ in range(replica_group.world) if True] if replica_group is not None else []
 
@@ -900,7 +942,10 @@ class SignRoundQuantizer(BaseQuantizer):
         if _graphs_active and _graphed_steps is None:
             # built BEFORE the ddp warm-up pass: the warm-up backward must run
             # on the steps' capture streams (see the warm-up site)
-            _graphed_steps = [_make_graphed_step(r) for r in range(replica_group.world)]
+            _graphed_steps = [
+                _make_graphed_step(r, step=(_tpl_entry["steps"][r - 1] if _tpl_entry is not None and r >= 1 else None))
+                for r in range(replica_group.world)
+            ]
             _graphs_warmups_left = _graphed_steps[0].warmup_iters
             logger.info(
                 "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
@@ -1320,7 +1365,11 @@ class SignRoundQuantizer(BaseQuantizer):
                             _graphed_steps[r].prepare(_shards[r])
                         try:
                             for r in range(_world):
-                                _losses[r] = _graphed_steps[r].capture_now()
+                                if getattr(_graphed_steps[r], "_graph", None) is None:
+                                    _losses[r] = _graphed_steps[r].capture_now()
+                                else:
+                                    # template-cached mirror: keep replaying
+                                    _losses[r] = _graphed_steps[r].replay_only()
                         except BaseException:
                             # halt semantics: open the gate before the run
                             # aborts so held bg workers never outlive the
@@ -1645,6 +1694,27 @@ class SignRoundQuantizer(BaseQuantizer):
                 "(background pack/transform threads stayed busy through the tune window); it ran eager"
             )
         if replica_group is not None:
+            try:
+                from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                    _GRAPH_TEMPLATE_CACHE,
+                    _template_signature,
+                    template_cache_size,
+                )
+
+                if (
+                    template_cache_size() > 0
+                    and _graphed_steps is not None
+                    and all(getattr(_st, "_graph", None) is not None for _st in _graphed_steps)
+                ):
+                    _key = _template_signature(block, replica_group.world, replica_group.plan.devices)
+                    _GRAPH_TEMPLATE_CACHE[_key] = {
+                        "mirrors": list(replica_group.mirrors),
+                        "steps": list(_graphed_steps[1:]),
+                    }
+                    while len(_GRAPH_TEMPLATE_CACHE) > template_cache_size():
+                        _GRAPH_TEMPLATE_CACHE.popitem(last=False)
+            except Exception as _cache_err:  # noqa: BLE001 - caching is best-effort
+                logger.debug("[tune-ddp] graph template cache insert skipped (%r)", _cache_err)
             replica_group.teardown()
         if _async:
             # the one legal fence in the whole loop: bounded wait, then the

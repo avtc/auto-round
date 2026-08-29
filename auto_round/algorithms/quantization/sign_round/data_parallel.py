@@ -32,6 +32,7 @@ import copy
 import queue
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
@@ -2170,16 +2171,76 @@ class _AsyncBestTracker:
             self.best_loss = float(self.best)
 
 
+def _template_signature(home: torch.nn.Module, world: int, devices) -> tuple:
+    """Signature of a block's module template for cross-block graph reuse.
+
+    Two blocks share a template iff their module structure and every
+    parameter/buffer shape+dtype match -- exactly the condition under which a
+    captured replica graph (baked tensor addresses, static input buffers) can
+    be replayed for the other block after syncing values into the persistent
+    mirror modules. Devices participate: the cached mirrors must live on the
+    same plan.
+    """
+    mods = tuple((name, type(m).__name__) for name, m in home.named_modules())
+    params = tuple((tuple(p.shape), str(p.dtype)) for p in home.parameters())
+    buffers = tuple((tuple(b.shape), str(b.dtype)) for b in home.buffers())
+    return (mods, params, buffers, world, tuple(str(d) for d in devices))
+
+
+# Cross-block cache of layer-module TEMPLATES for graphs: entry holds the
+# persistent mirror modules, the per-replica GraphedReplicaStep objects (with
+# their CAPTURED graphs) and the static buffer dicts -- all address-stable, so
+# a same-template block syncs its values in and replays instead of rebuilding
+# mirrors and re-capturing. LRU-bounded by AR_TUNE_GRAPH_TEMPLATE_CACHE
+# (default 2; 0 disables -- qwen3.5's 3:1 linear:full interleave needs 2).
+_GRAPH_TEMPLATE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+
+
+def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> None:
+    """Copy a new block's state into a persistent mirror (template hit).
+
+    Values only -- addresses must stay stable for the captured graph: params
+    and buffers are ``copy_``-ed in place (cross-device D2D when needed), the
+    wrapper ``params`` dicts keep referencing the same Parameters, and parked
+    grads are ZEROED in place (never set to None: the replayed backward writes
+    into the baked grad addresses).
+    """
+    with torch.no_grad():
+        home_params = dict(home.named_parameters())
+        for name, p in mirror.named_parameters():
+            src = home_params.get(name)
+            if src is None or src.shape != p.shape or src.dtype != p.dtype:
+                raise RuntimeError(f"template drift at parameter {name!r} -- refusing to reuse the cached mirror")
+            if src.device != p.device:
+                p.data.copy_(src.data.to(p.device, non_blocking=False))
+            else:
+                p.data.copy_(src.data)
+            if p.grad is not None:
+                p.grad.zero_()
+        home_bufs = dict(home.named_buffers())
+        for name, b in mirror.named_buffers():
+            src = home_bufs.get(name)
+            if src is not None and src.shape == b.shape:
+                b.copy_(src.to(b.device) if src.device != b.device else src)
+
+
+def template_cache_size() -> int:
+    from auto_round import envs
+
+    return int(getattr(envs, "AR_TUNE_GRAPH_TEMPLATE_CACHE", 2) or 0)
+
+
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
-    def __init__(self, block, plan: DDPPlan, grad_transport: str = "fp32", staged_source=None) -> None:
+    def __init__(self, block, plan: DDPPlan, grad_transport: str = "fp32", staged_source=None, mirrors=None) -> None:
         global _PEER_ACCESS_LOGGED
         self.plan = plan
         self.grad_transport = grad_transport
         self.home = block
         self.mirrors: List[torch.nn.Module] = []
         self.adopted = 0
+        self.template_reused = mirrors is not None
         if not _PEER_ACCESS_LOGGED and any(d.type == "cuda" for d in plan.devices):
             _PEER_ACCESS_LOGGED = True
             _pairs = enable_peer_access(plan.devices)
@@ -2190,10 +2251,16 @@ class ReplicaGroup:
                     "[tune-ddp] P2P peer access NOT enabled (no accessible pairs); "
                     "cross-device copies may stage through host memory"
                 )
-        for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
-            mirror = self._make_mirror(block, dev, staged_source)
-            _relocate_params(mirror, dev)
-            self.mirrors.append(mirror)
+        if mirrors is not None:
+            # template cache hit: adopt the persistent mirror modules (values
+            # are synced by the caller BEFORE the recipe anchor re-pins the
+            # tuning grids); their captured graphs stay alive
+            self.mirrors = list(mirrors)
+        else:
+            for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
+                mirror = self._make_mirror(block, dev, staged_source)
+                _relocate_params(mirror, dev)
+                self.mirrors.append(mirror)
         self.replicas = [block] + self.mirrors
         self.world = len(self.replicas)
         # persistent replica worker pool (built lazily on first run_threaded
