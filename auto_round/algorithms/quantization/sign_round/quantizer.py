@@ -1024,6 +1024,20 @@ class SignRoundQuantizer(BaseQuantizer):
         _pacing = bool(_envs.AR_TUNE_REPLICA_PACING)
         _fence_free = bool(_envs.AR_TUNE_PREPARE_FENCE_FREE)
         _delayed = replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and self.dynamic_max_gap <= 0
+        _sign_ok = self.momentum is None or float(self.momentum) == 0.0
+        _exch_session = None
+        if (
+            replica_group is not None
+            and _envs.AR_TUNE_EXCH_OVERLAP
+            and _sign_ok
+            and _envs.AR_TUNE_DDP_SIGN_EXCHANGE
+            and replica_group.world >= 2
+            and (replica_group.world & (replica_group.world - 1)) == 0
+        ):
+            from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession
+
+            _exch_session = BucketExchangeSession(params_per_replica, replica_group.grad_transport)
+            _exch_session.arm()
         if replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and 0 < self.dynamic_max_gap:
             logger.warning(
                 "[tune-ddp] dynamic_max_gap is set: keeping the immediate loss read "
@@ -1107,6 +1121,15 @@ class SignRoundQuantizer(BaseQuantizer):
                         _losses[r] = loss_r.detach()
                         loss_r.backward()
 
+                # overlapped exchange only on steady iterations: hooks must not
+                # record CUDA events inside a capture (event record during
+                # stream capture is illegal)
+                _use_exch_overlap = _exch_session is not None and (
+                    _graphed_steps is None or all(getattr(_g, "_graph", None) is not None for _g in _graphed_steps)
+                )
+                if _use_exch_overlap:
+                    _exch_session.begin_iter()
+                    _exch_session.start()
                 if _graphs_capture_pending and not _bg_busy and not _prefetch_busy:
                     # barrier point: pool workers are parked and no CUDA work
                     # is in flight process-wide -- torch.cuda.graph forbids
@@ -1162,17 +1185,24 @@ class SignRoundQuantizer(BaseQuantizer):
                 else:
                     with tune_stage(tune_prof, "fwd"):
                         replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
-                # sync_grads stages itself (bufprep / exchange / writeback).
-                # sign_exchange: the update consumes only sign(mean-grad) and
-                # weight_decay is 0, so exchanging int8 signs after the
-                # reduce-scatter is bitwise-identical across ranks and at
-                # least as faithful as a lossy transport all-gather -- but a
-                # momentum buffer would mix magnitudes back in, so gate on it.
-                replica_group.sync_grads(
-                    params_per_replica,
-                    prof=tune_prof,
-                    sign_exchange=self.momentum is None or float(self.momentum) == 0.0,
-                )
+                if _use_exch_overlap:
+                    # bucket exchange ran concurrently with the backward tail;
+                    # every bucket has shipped -- drain the thread and check
+                    with tune_stage(tune_prof, "exchange"):
+                        _exch_session.join_and_check()
+                else:
+                    # sync_grads stages itself (bufprep / exchange / writeback).
+                    # sign_exchange: the update consumes only sign(mean-grad)
+                    # and weight_decay is 0, so exchanging int8 signs after
+                    # the reduce-scatter is bitwise-identical across ranks
+                    # and at least as faithful as a lossy transport
+                    # all-gather -- but a momentum buffer would mix
+                    # magnitudes back in, so gate on it.
+                    replica_group.sync_grads(
+                        params_per_replica,
+                        prof=tune_prof,
+                        sign_exchange=self.momentum is None or float(self.momentum) == 0.0,
+                    )
                 # report the global-batch mean: mean of equal-size shard means.
                 # .item() blocks the host until each replica's fwd+loss+bwd has
                 # drained; with P2P transport the allreduce enqueue above is fully
@@ -1300,6 +1330,8 @@ class SignRoundQuantizer(BaseQuantizer):
                 )
         except NameError:
             pass
+        if _exch_session is not None:
+            _exch_session.close()
         if _graphs_capture_t is not None:
             _pre = _graphs_capture_iter
             _post = self.iters - _graphs_capture_iter

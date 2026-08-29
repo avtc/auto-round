@@ -1632,3 +1632,112 @@ class TestHostLeafPinner:
 
         with pytest.raises(Boom):
             run_paced_replica_steps(FakeGroup(), [FailingPrep()], [[0]], [None])
+
+
+class TestBucketExchangeSession:
+    @staticmethod
+    def _mk_world(world=2, n_params=6, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        params_per_replica = []
+        base_grads = []
+        for r in range(world):
+            params = [torch.nn.Parameter(torch.randn(4 + i, dtype=torch.float64).mul(0)) for i in range(n_params)]
+            params_per_replica.append(params)
+        # each replica r sees grad values offset by r -> mean sign must match sign(mean)
+        for r, params in enumerate(params_per_replica):
+            for i, p in enumerate(params):
+                p.grad = torch.full_like(p.data, float(i + 1 + r), dtype=torch.float64)
+        return params_per_replica
+
+    def test_plan_buckets_covers_all_params(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _plan_buckets
+
+        params = [torch.nn.Parameter(torch.zeros(i + 1)) for i in range(10)]
+        buckets = _plan_buckets(params, 3)
+        flat = [p for b in buckets for p in b]
+        assert flat == params  # exact cover, order preserved
+        assert all(buckets)
+
+    def test_exchange_matches_monolithic_sign(self):
+        import copy
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession, sign_exchange_allreduce
+
+        params_per_replica = self._mk_world()
+        mono = copy.deepcopy(params_per_replica)
+        for r, ps in enumerate(mono):  # deepcopy drops leaf grads -- rebuild
+            for i, p in enumerate(ps):
+                p.grad = torch.full_like(p.data, float(i + 1 + r), dtype=torch.float64)
+        mono_bufs = [torch.cat([p.grad.reshape(-1) for p in ps]) for ps in mono]
+        sign_exchange_allreduce(mono_bufs, transport="fp32")
+        for ps, buf in zip(mono, mono_bufs):
+            off = 0
+            for p in ps:
+                n = p.grad.numel()
+                p.grad.copy_(buf[off : off + n].view_as(p.grad))
+                off += n
+
+        sess = BucketExchangeSession(params_per_replica, transport="fp32", num_buckets=3)
+        sess.arm()
+        sess.begin_iter()
+        sess.start()
+        # simulate backward completion in scrambled order
+        import threading, time
+
+        def fire():
+            for b in (2, 0, 1):
+                time.sleep(0.01)
+                for r in range(sess.world):
+                    sess._make_hook(r, b, None)(None)
+
+        threading.Thread(target=fire, daemon=True).start()
+        sess.join_and_check(timeout=10)
+        sess.close()
+        off = 0
+        for ps, mps in zip(params_per_replica, mono):
+            for p, mp in zip(ps, mps):
+                torch.testing.assert_close(p.grad, mp.grad)
+                off += p.grad.numel()
+
+    def test_bucket_waits_for_all_replicas(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession
+
+        calls = []
+        params_per_replica = self._mk_world()
+        sess = BucketExchangeSession(params_per_replica, transport="fp32", exchange_fn=calls.append, num_buckets=2)
+        sess.begin_iter()
+        sess.start()
+        hook = sess._make_hook(0, 0, None)
+        hook(None)  # only replica 0 ready
+        import time
+
+        time.sleep(0.05)
+        assert calls == []  # bucket not processed while a replica is missing
+        sess._make_hook(1, 0,None)(None)
+        for r in range(sess.world):  # complete the remaining bucket too
+            sess._make_hook(r, 1, None)(None)
+        sess.join_and_check(timeout=10)
+        assert 0 in calls and 1 in calls and calls[0] == 0  # b0 went first
+
+    def test_exchange_error_halts_via_join(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession
+
+        def boom(b):
+            raise RuntimeError("wire broke")
+
+        params_per_replica = self._mk_world()
+        sess = BucketExchangeSession(params_per_replica, transport="fp32", exchange_fn=boom, num_buckets=2)
+        sess.begin_iter()
+        sess.start()
+        for r in range(sess.world):
+            sess._make_hook(r, 0, None)(None)
+        with pytest.raises(RuntimeError, match="wire broke"):
+            sess.join_and_check(timeout=10)
+
+    def test_exch_overlap_env_gate_default_on_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_EXCH_OVERLAP", raising=False)
+        assert envs.AR_TUNE_EXCH_OVERLAP is True
+        monkeypatch.setenv("AR_TUNE_EXCH_OVERLAP", "0")
+        assert envs.AR_TUNE_EXCH_OVERLAP is False

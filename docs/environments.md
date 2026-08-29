@@ -368,6 +368,16 @@ export AR_TUNE_DDP_DELAYED_LOSS=0   # reclaim ~params-size VRAM on the primary d
 export AR_TUNE_PREPARE_FENCE_FREE=0   # legacy gather (device-indices tensor, pageable H2D)
 ```
 
+### AR_TUNE_EXCH_OVERLAP
+- **Description**: Overlap the DDP gradient exchange with the backward tail. Tuning-param gradients are split into ~12 buckets; as each bucket's backward completes (post-accumulate-grad hooks fire during eager backward or graph replay), a SINGLE exchange thread ships that bucket through the sign-cast exchange (reduce-scatter mean + int8 sign all-gather) on the recording streams, instead of one monolithic allreduce after the whole backward drains. Bit-identical per element (each element's halving tree is unchanged by bucketing); any exchange error halts. Applies to the pure sign-SGD path only (no momentum); warm-up/capture iterations use the monolithic path.
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled; set `0` to isolate the effect in A/B runs (restores the monolithic `sync_grads`).
+
+```bash
+export AR_TUNE_EXCH_OVERLAP=0   # monolithic post-backward exchange
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

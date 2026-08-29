@@ -1379,6 +1379,179 @@ class GraphedReplicaStep:
         return self._static_loss.detach().clone()
 
 
+def _plan_buckets(params: List[torch.nn.Parameter], num_buckets: int) -> List[List[torch.nn.Parameter]]:
+    """Split a flat param list into <=num_buckets contiguous, param-aligned buckets."""
+    total = sum(p.numel() for p in params)
+    target = max(1, total // max(1, num_buckets))
+    buckets: List[List[torch.nn.Parameter]] = []
+    cur: List[torch.nn.Parameter] = []
+    cur_n = 0
+    for p in params:
+        cur.append(p)
+        cur_n += p.numel()
+        if cur_n >= target and len(buckets) < num_buckets - 1:
+            buckets.append(cur)
+            cur, cur_n = [], 0
+    if cur:
+        buckets.append(cur)
+    return buckets
+
+
+class BucketExchangeSession:
+    """Overlapped gradient exchange: buckets ship as their backprops complete.
+
+    One daemon thread is the SINGLE issuer of all cross-device copies (the
+    removed hook-fan-out overlap destroyed the P2P fast path by issuing from
+    whichever autograd thread fired). Per-replica post-accumulate-grad hooks
+    fire during backward (eager or graph replay), mark their bucket ready and
+    record a CUDA event on the stream that wrote the grads; the thread waits
+    for all replicas' events, then runs the existing sign-exchange algorithm
+    on just that bucket's slice (bit-identical per element: the halving tree
+    of each element is unchanged by bucketing). Grads are written back in
+    place, so the end-of-iteration step is unchanged.
+
+    Any exchange error halts: join_and_check() re-raises (no silent latch).
+    """
+
+    def __init__(self, params_per_replica, transport: str, exchange_fn=None, num_buckets: int = 12):
+        self.world = len(params_per_replica)
+        if self.world < 2:
+            raise ValueError("BucketExchangeSession needs world >= 2")
+        self.params_per_replica = params_per_replica
+        if any(len(ps) != len(params_per_replica[0]) for ps in params_per_replica):
+            raise ValueError("BucketExchangeSession needs identical param layouts across replicas")
+        self.transport = transport
+        # buckets are INDEX RANGES over the flat param list: each replica owns
+        # its own Parameter objects at the same positions (mirrors)
+        self.bucket_ranges = []
+        start = 0
+        for bucket in _plan_buckets(params_per_replica[0], num_buckets):
+            self.bucket_ranges.append((start, start + len(bucket)))
+            start += len(bucket)
+        self._exchange_fn = exchange_fn if exchange_fn is not None else self._default_exchange
+        self._cv = threading.Condition(threading.Lock())
+        self._ready = [0] * self.num_buckets
+        self._processed: set = set()
+        self._error: Optional[BaseException] = None
+        self._iter_active = False
+        self._thread: Optional[threading.Thread] = None
+        self._handles: list = []
+        self._events: dict = {}  # (replica, bucket) -> torch.cuda.Event on CUDA
+
+    def _bucket_params(self, r: int, b: int) -> List[torch.nn.Parameter]:
+        lo, hi = self.bucket_ranges[b]
+        return self.params_per_replica[r][lo:hi]
+
+    @property
+    def num_buckets(self) -> int:
+        return len(self.bucket_ranges)
+
+    # ── arming ────────────────────────────────────────────────────────────
+    def arm(self):
+        """Register one completion hook per (replica, bucket). Call once per block."""
+        for r in range(self.world):
+            for b in range(self.num_buckets):
+                # backward completes last-module-first: the bucket's EARLIEST
+                # param is the last to finish, so it marks bucket completion
+                sentinel = self._bucket_params(r, b)[0]
+                self._handles.append(sentinel.register_post_accumulate_grad_hook(self._make_hook(r, b, sentinel)))
+
+    def close(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    def _make_hook(self, r, b, sentinel):
+        def hook(_param):
+            if not self._iter_active or self._error is not None:
+                return
+            try:
+                if torch.cuda.is_available() and sentinel.grad is not None and sentinel.grad.is_cuda:
+                    ev = torch.cuda.Event()
+                    ev.record(torch.cuda.current_stream(sentinel.grad.device))
+                    self._events[(r, b)] = ev
+            except Exception:  # noqa: BLE001 - event recording must not kill bwd
+                pass
+            with self._cv:
+                self._ready[b] += 1
+                self._cv.notify_all()
+
+        return hook
+
+    # ── per-iteration lifecycle ───────────────────────────────────────────
+    def begin_iter(self):
+        with self._cv:
+            self._ready = [0] * self.num_buckets
+            self._processed = set()
+            self._error = None
+            self._iter_active = True
+            self._events = {}
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="tune-bucket-exchange")
+        self._thread.start()
+
+    def join_and_check(self, timeout: Optional[float] = None):
+        assert self._thread is not None
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("bucket exchange did not finish (join timeout)")
+        err = self._error
+        with self._cv:
+            self._iter_active = False
+        if err is not None:
+            raise err
+
+    # ── worker ────────────────────────────────────────────────────────────
+    def _run(self):
+        try:
+            n = self.num_buckets
+            while len(self._processed) < n:
+                with self._cv:
+                    self._cv.wait_for(
+                        lambda: self._error is not None
+                        or any(self._ready[b] >= self.world for b in range(n) if b not in self._processed)
+                    )
+                    if self._error is not None:
+                        return
+                    pick = next(b for b in range(n) if b not in self._processed and self._ready[b] >= self.world)
+                    self._processed.add(pick)  # claim before releasing the lock
+                self._exchange_fn(pick)
+                with self._cv:
+                    self._cv.notify_all()
+        except BaseException as exc:  # noqa: BLE001 - halt, never latch silently
+            self._error = exc
+            with self._cv:
+                self._cv.notify_all()
+
+    def _default_exchange(self, b: int):
+        buckets = [self._bucket_params(r, b) for r in range(self.world)]
+        # order the copies after the grad writes (events recorded at hook time
+        # on whichever stream ran that replica's backward)
+        for r in range(self.world):
+            ev = self._events.get((r, b))
+            if ev is not None:
+                dev = self.params_per_replica[r][0].grad.device if self.params_per_replica[r][0].grad else None
+                if dev is not None and dev.type == "cuda":
+                    torch.cuda.current_stream(dev).wait_event(ev)
+        bufs = []
+        for bucket in buckets:
+            parts = [p.grad.detach().reshape(-1) for p in bucket if p.grad is not None]
+            if not parts:
+                raise RuntimeError(f"bucket {b} has no gradients on one replica -- cannot exchange")
+            buf = torch.cat(parts) if len(parts) > 1 else parts[0].clone()
+            bufs.append(buf.to(torch.float32) if buf.dtype != torch.float32 else buf)
+        sign_exchange_allreduce(bufs, transport=self.transport)
+        for buf, bucket in zip(bufs, buckets):
+            offset = 0
+            for p in bucket:
+                if p.grad is None:
+                    continue
+                n = p.grad.numel()
+                p.grad.copy_(buf[offset : offset + n].view_as(p.grad))
+                offset += n
+
+
 class HostLeafPinner:
     """Pin host-side tensor leaves that REPEAT by identity, pass fresh ones through.
 

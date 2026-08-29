@@ -207,6 +207,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # constant CPU leaves. 0 restores the device-indices gather verbatim.
     "AR_TUNE_PREPARE_FENCE_FREE": lambda: os.getenv("AR_TUNE_PREPARE_FENCE_FREE", "1").lower()
     in ("1", "true", "yes", "on"),
+    # Overlap the gradient exchange with the backward tail: buckets of
+    # tuning-param grads ship through a single exchange thread as their
+    # post-accumulate-grad hooks fire, instead of one monolithic allreduce
+    # after the whole backward drains. 0 restores the monolithic sync_grads.
+    "AR_TUNE_EXCH_OVERLAP": lambda: os.getenv("AR_TUNE_EXCH_OVERLAP", "1").lower() in ("1", "true", "yes", "on"),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.
