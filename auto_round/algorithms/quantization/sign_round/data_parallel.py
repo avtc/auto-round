@@ -1659,6 +1659,8 @@ def make_serial_graphed_step(
     device,
     fence_free: bool = True,
     warmup_iters: int = 2,
+    graph_factory=None,
+    capture_ctx=None,
 ):
     """Serial twin of the DDP graphed replica step (T8b).
 
@@ -1741,7 +1743,13 @@ def make_serial_graphed_step(
             return loss
 
     return GraphedReplicaStep(
-        prepare, compute, warmup_iters=warmup_iters, name="serial", device=device if dev_is_cuda else None
+        prepare,
+        compute,
+        warmup_iters=warmup_iters,
+        name="serial",
+        device=device if dev_is_cuda else None,
+        graph_factory=graph_factory,
+        capture_ctx=capture_ctx,
     )
 
 

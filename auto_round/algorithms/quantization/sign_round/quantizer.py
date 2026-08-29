@@ -1122,12 +1122,14 @@ class SignRoundQuantizer(BaseQuantizer):
 
         _serial_step = None
         _serial_warmups_left = 0
+        _serial_graphs_defer_logged = False
         _lfq_here = (
             block_ctx.block_index == block_ctx.block_cnt - 1
             and self.enable_lfq
             and input_ids is not None
             and self._is_text_decoder_block(block_ctx.block_name)
         )
+        _serial_streamer = getattr(getattr(block, "_stream_prefetch_source", None), "streamer", None)
         if (
             bool(_envs.AR_TUNE_CUDA_GRAPHS)
             and replica_group is None
@@ -1136,6 +1138,15 @@ class SignRoundQuantizer(BaseQuantizer):
             and not _lfq_here
             and (loss_device is None or torch.device(loss_device) == torch.device(device))
             and _fence_free
+            # mirror the DDP engage gate: list inputs only (dict/diffusion
+            # gathers can drift shape/type across iterations -> hard halt
+            # where the legacy loop worked)
+            and isinstance(active_inputs, list)
+            and not block_fwd.is_diffusion
+            # accum>1 splits the global batch into per-slice fwd+bwd rounds
+            # in the legacy loop; the graphed step forwards the WHOLE row
+            # before one backward -- accum x coexisting activations
+            and self.gradient_accumulate_steps == 1
         ):
             from auto_round.algorithms.quantization.sign_round.data_parallel import make_serial_graphed_step
 
@@ -1194,9 +1205,10 @@ class SignRoundQuantizer(BaseQuantizer):
                     global_indices = [j for sh in _shards for j in sh]
                 elif _serial_rows is not None:
                     global_indices = _serial_rows[i]
-                    if _serial_idx_dev is not None:
+                    if _serial_idx_dev is not None and _serial_step is None:
                         # one async pinned H2D per iteration (same stream as
-                        # the consumers -- FIFO-ordered, no event needed)
+                        # the consumers -- FIFO-ordered, no event needed);
+                        # the graphed step gathers from host rows instead
                         _serial_idx_dev.copy_(_sched_host[i], non_blocking=True)
                 else:
                     global_indices = index_sampler.next_batch()
@@ -1352,8 +1364,13 @@ class SignRoundQuantizer(BaseQuantizer):
                             # stream (AccumulateGrad birth-stream correctness)
                             _loss = _serial_step(global_indices)
                             _serial_warmups_left -= 1
-                        elif getattr(_serial_step, "_graph", None) is None and not any(
-                            t.is_alive() for t in _bg_cuda_threads
+                        elif (
+                            getattr(_serial_step, "_graph", None) is None
+                            and not any(t.is_alive() for t in _bg_cuda_threads)
+                            # the ckpt-prefetch thread issues CUDA (staging
+                            # copies / VRAM polling) regardless of DDP --
+                            # torch.cuda.graph needs the process quiet
+                            and not (_serial_streamer is not None and _serial_streamer.prefetch_pending())
                         ):
                             # capture barrier: single-threaded serial loop, but
                             # bg pack/transform threads from a previous block
@@ -1362,6 +1379,11 @@ class SignRoundQuantizer(BaseQuantizer):
                             # iteration's work
                             _serial_step.prepare_only(global_indices)
                             _loss = _serial_step.capture_now()
+                        elif getattr(_serial_step, "_graph", None) is None and not _serial_graphs_defer_logged:
+                            _serial_graphs_defer_logged = True
+                            logger.info(
+                                "[tune-serial] cuda graph capture deferred: background CUDA threads still active"
+                            )
                         else:
                             # steady state: prepare refresh + single replay
                             _loss = _serial_step(global_indices)

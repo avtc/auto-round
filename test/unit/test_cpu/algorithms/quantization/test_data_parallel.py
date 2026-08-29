@@ -1936,3 +1936,48 @@ class TestMakeSerialGraphedStep:
         g1 = block.weight.grad.clone()
         step([4, 5, 2, 1])
         assert not torch.equal(g1, block.weight.grad)  # accumulated fresh bwd
+
+    def test_factory_capture_with_fake_graph(self):
+        import contextlib
+        import torch
+
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.data_parallel import make_serial_graphed_step
+
+        torch.manual_seed(1)
+        block = torch.nn.Linear(5, 5)
+        pool = [(torch.arange(5, dtype=torch.float32) + 10.0 * i).unsqueeze(0) for i in range(4)]
+        fp_outputs = [block(x).detach() + 0.1 * torch.randn_like(x) for x in pool]
+        fwd = BlockForwardRunner(batch_size=4, amp=False, enable_torch_compile=False)
+        calls = {"compute": 0}
+
+        def loss_fn(pred, ref):
+            return torch.nn.functional.mse_loss(pred.float(), ref.float())
+
+        holder = {}
+
+        class FakeGraph:
+            def replay(self):
+                # simulate kernels rewriting the static loss buffer
+                holder["step"]._static_loss.copy_(holder["step"].compute())
+
+        step = make_serial_graphed_step(
+            block,
+            fwd,
+            pool,
+            {"positional_inputs": None},
+            fp_outputs,
+            loss_fn,
+            torch.device("cpu"),
+            graph_factory=lambda: FakeGraph(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        holder["step"] = step
+        row = [0, 1, 2, 3]
+        warm = step(row)  # warmup eager: prepare + compute
+        assert step.warmup_iters == 2
+        step.prepare_only(row)
+        cap = step.capture_now()  # records (nullcontext -> runs) + replays once
+        assert torch.allclose(cap, warm)
+        got = step(row)  # steady: prepare + replay (recompute -> clone)
+        assert torch.allclose(got, warm)
