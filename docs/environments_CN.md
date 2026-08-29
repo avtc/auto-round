@@ -342,6 +342,16 @@ export AR_TOUCHUP_ITERS=5   # 同一个 AR_RESUME_DIR；去掉 --enable_block_pa
 export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 ```
 
+### AR_TUNE_DDP_DELAYED_LOSS
+- **描述**： DDP 调优循环中将每迭代的 loss 读取推迟一个迭代，使宿主的 `.item()` 排空等待与刚入队的前向/反向重叠，而不是在迭代之间卡住流水线。在 27B 模型、world=4 下实测：与常驻线程池（AR_TUNE_DDP_THREAD_POOL）合计每迭代快约 59 ms；该延迟读取还会在主设备上每迭代多驻留一份 block 调优参数（v/min-max）快照。关闭它可精确回收这份快照的显存（≈ 4 字节 × block 调优参数量——27B 稠密 block 约 1.3 GB，更大的稠密 block 按比例增加），代价是 loss 读取重新串行化：world=4 下大约每迭代慢 30-60 ms（+8-15%）。当 `dynamic_max_gap > 0` 时自动禁用（早停需要循环内 loss）。
+- **默认值**: `1`
+- **有效值**: `1`, `0`
+- **用法**: 追求速度时保持开启；在显存紧张的场景（例如 24 GB 卡上 MoE 检查点的大型稠密 block）设为 `0`，可回收主设备上一份调优参数副本。
+
+```bash
+export AR_TUNE_DDP_DELAYED_LOSS=0   # 回收主设备上约一份参数量大小的显存，每迭代慢约 8-15%
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

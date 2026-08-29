@@ -342,6 +342,16 @@ export AR_TOUCHUP_ITERS=5   # same AR_RESUME_DIR; no --enable_block_parallel_tun
 export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 ```
 
+### AR_TUNE_DDP_DELAYED_LOSS
+- **Description**: Defer the tune-loop's per-iteration loss read by one iteration under DDP tuning, so the host's `.item()` drain-wait overlaps the freshly enqueued forward/backward instead of stalling the pipeline between iterations. Measured at world=4 on a 27B model: ~59 ms/iter faster together with the persistent thread pool (AR_TUNE_DDP_THREAD_POOL); the deferred read also stages one extra snapshot of the block's tuning params (v/min-max) on the primary device every iteration. Turning it off reclaims exactly that snapshot's VRAM (≈ 4 bytes x the block's tuning-parameter count -- ~1.3 GB for a 27B dense block, proportionally more for larger dense blocks) at the cost of re-serializing the loss read: expect roughly +30-60 ms/iter (+8-15%) slowdown at world=4. Also disables when `dynamic_max_gap > 0` (early-stop needs the in-loop loss).
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled for speed; set `0` on VRAM-tight setups (e.g. large dense blocks of MoE checkpoints on 24 GB cards) to reclaim one tuning-param copy on the primary device.
+
+```bash
+export AR_TUNE_DDP_DELAYED_LOSS=0   # reclaim ~params-size VRAM on the primary device, ~8-15% slower iters
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)
