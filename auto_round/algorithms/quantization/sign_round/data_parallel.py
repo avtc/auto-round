@@ -1176,6 +1176,45 @@ def cuda_graphs_engage(replica_group, *, inputs_are_list=True, is_diffusion=Fals
     return _cuda_graphs_supported()
 
 
+def serial_graphs_engage(
+    replica_group,
+    *,
+    device_is_cuda: bool = True,
+    inputs_are_list: bool = True,
+    is_diffusion: bool = False,
+    has_valid_token_mask: bool = False,
+    is_lfq_block: bool = False,
+    loss_on_tune_device: bool = True,
+    fence_free: bool = True,
+    accumulate_one: bool = True,
+) -> bool:
+    """Whether the serial tune loop may capture a whole-iteration CUDA graph.
+
+    Quiet refusals are environment properties only (DDP path, no CUDA,
+    dict/diffusion inputs, valid-token-mask loss, LFQ block, loss on another
+    device, fence-bound prepare, gradient accumulation). Streaming /
+    background threads do NOT refuse -- the capture barrier defers until the
+    process is CUDA-quiet. Everything failing during prepare/capture/replay is
+    a real fault and raises (see :class:`GraphedReplicaStep`). The env gate
+    (``AR_TUNE_CUDA_GRAPHS``) is the caller's concern, as is the step-capture
+    escalation (scaler/momentum/weight-decay/dynamic-gap/VRAM).
+    """
+    if replica_group is not None:
+        return False
+    if not (
+        device_is_cuda
+        and inputs_are_list
+        and not is_diffusion
+        and not has_valid_token_mask
+        and not is_lfq_block
+        and loss_on_tune_device
+        and fence_free
+        and accumulate_one
+    ):
+        return False
+    return _cuda_graphs_supported()
+
+
 def _copy_into_static(dst, src) -> None:
     """Refresh a static buffer tree from a freshly gathered one, leaf-wise.
 

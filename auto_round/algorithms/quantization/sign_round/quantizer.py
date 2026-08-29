@@ -1130,23 +1130,18 @@ class SignRoundQuantizer(BaseQuantizer):
             and self._is_text_decoder_block(block_ctx.block_name)
         )
         _serial_streamer = getattr(getattr(block, "_stream_prefetch_source", None), "streamer", None)
-        if (
-            bool(_envs.AR_TUNE_CUDA_GRAPHS)
-            and replica_group is None
-            and str(device).startswith("cuda")
-            and valid_token_mask is None
-            and not _lfq_here
-            and (loss_device is None or torch.device(loss_device) == torch.device(device))
-            and _fence_free
-            # mirror the DDP engage gate: list inputs only (dict/diffusion
-            # gathers can drift shape/type across iterations -> hard halt
-            # where the legacy loop worked)
-            and isinstance(active_inputs, list)
-            and not block_fwd.is_diffusion
-            # accum>1 splits the global batch into per-slice fwd+bwd rounds
-            # in the legacy loop; the graphed step forwards the WHOLE row
-            # before one backward -- accum x coexisting activations
-            and self.gradient_accumulate_steps == 1
+        from auto_round.algorithms.quantization.sign_round.data_parallel import serial_graphs_engage
+
+        if bool(_envs.AR_TUNE_CUDA_GRAPHS) and serial_graphs_engage(
+            replica_group,
+            device_is_cuda=str(device).startswith("cuda"),
+            inputs_are_list=isinstance(active_inputs, list),
+            is_diffusion=bool(block_fwd.is_diffusion),
+            has_valid_token_mask=valid_token_mask is not None,
+            is_lfq_block=_lfq_here,
+            loss_on_tune_device=(loss_device is None or torch.device(loss_device) == torch.device(device)),
+            fence_free=_fence_free,
+            accumulate_one=self.gradient_accumulate_steps == 1,
         ):
             from auto_round.algorithms.quantization.sign_round.data_parallel import make_serial_graphed_step
 

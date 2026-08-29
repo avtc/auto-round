@@ -2174,3 +2174,110 @@ class TestSerialWholeIterationStep:
         # record-execute + the immediate replay each ran the captured step
         assert len(calls) == 3
         assert torch.count_nonzero(block.weight.grad) == 0  # in-graph zero held
+
+
+class TestSerialGraphsEngage:
+    """T8d: serial whole-iteration graphs -- quiet-refusal predicate."""
+
+    @staticmethod
+    def _args(**over):
+        args = dict(
+            device_is_cuda=True,
+            inputs_are_list=True,
+            is_diffusion=False,
+            has_valid_token_mask=False,
+            is_lfq_block=False,
+            loss_on_tune_device=True,
+            fence_free=True,
+            accumulate_one=True,
+        )
+        args.update(over)
+        return args
+
+    def test_all_pass_engages(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import serial_graphs_engage
+
+        monkeypatch.setattr(dp, "_cuda_graphs_supported", lambda: True)  # CPU test box
+        assert serial_graphs_engage(None, **self._args()) is True
+
+    def test_each_disqualifier_refuses(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import serial_graphs_engage
+
+        for key in (
+            "device_is_cuda",
+            "inputs_are_list",
+            "is_diffusion",
+            "has_valid_token_mask",
+            "is_lfq_block",
+            "loss_on_tune_device",
+            "fence_free",
+            "accumulate_one",
+        ):
+            assert serial_graphs_engage(None, **self._args(**{key: not self._args()[key]})) is False, key
+
+    def test_ddp_path_refuses(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import serial_graphs_engage
+
+        class _FakeGroup:
+            pass
+
+        assert serial_graphs_engage(_FakeGroup(), **self._args()) is False
+
+
+class TestSerialTrajectoryParity:
+    """T8d: 6-iteration trajectory with an advancing LinearLR schedule."""
+
+    def test_linearlr_trajectory_matches_legacy(self):
+        import torch
+
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            make_serial_graphed_step,
+            make_serial_step_fn,
+        )
+
+        torch.manual_seed(11)
+        block = torch.nn.Linear(5, 5)
+        pool = [(torch.arange(5, dtype=torch.float32) + 10.0 * i).unsqueeze(0) for i in range(4)]
+        fp_outputs = [block(x).detach() + 0.3 * torch.randn_like(x) for x in pool]
+        fwd = BlockForwardRunner(batch_size=4, amp=False, enable_torch_compile=False)
+        opt = torch.optim.SGD(list(block.parameters()), lr=0.4)
+        sched = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=6)
+        step_fn, _ = make_serial_step_fn(opt, torch.device("cpu"))
+        step = make_serial_graphed_step(
+            block,
+            fwd,
+            pool,
+            {"positional_inputs": None},
+            fp_outputs,
+            lambda pred, ref: torch.nn.functional.mse_loss(pred.float(), ref.float()),
+            torch.device("cpu"),
+            step_fn=step_fn,
+        )
+        legacy = torch.nn.Linear(5, 5)
+        legacy.load_state_dict(block.state_dict())
+        l_sched = torch.optim.lr_scheduler.LinearLR(
+            torch.optim.SGD(list(legacy.parameters()), lr=0.4), start_factor=1.0, end_factor=0.0, total_iters=6
+        )
+        rows = [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1], [0, 2, 1, 3], [3, 1, 2, 0]]
+        for row in rows:
+            for g in opt.param_groups:
+                if "_ar_neg_lr_dev" in g:
+                    g["_ar_neg_lr_dev"].fill_(-float(g["lr"]))
+            loss_g = step(row)
+            sched.step()
+            ins = torch.cat([pool[j] for j in row], dim=0)
+            refs = torch.cat([fp_outputs[j] for j in row], dim=0)
+            loss_l = torch.nn.functional.mse_loss(legacy(ins), refs)
+            loss_l.backward()
+            lr = l_sched.optimizer.param_groups[0]["lr"]
+            with torch.no_grad():
+                for p in legacy.parameters():
+                    if p.grad is not None:
+                        p.add_(torch.sign(p.grad), alpha=-lr)
+                        p.grad.zero_()
+            l_sched.step()
+            assert torch.equal(loss_g.detach(), loss_l.detach())
+        for p_new, p_old in zip(block.parameters(), legacy.parameters()):
+            assert torch.equal(p_new, p_old)
