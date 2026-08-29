@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import random
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -1097,19 +1098,25 @@ class SignRoundQuantizer(BaseQuantizer):
             # tensor + one device buffer: no host RNG state machine and no
             # pageable H2D on the hot path; graph-capture-ready (static
             # address after allocator warmup)
-            _serial_rows = [index_sampler.next_batch() for _ in range(self.iters)]
+            # capture the global-RNG state after each draw so an early break
+            # (dynamic_max_gap) can restore the exact state the LAZY path
+            # would have left -- subsequent blocks' shuffles stay bit-identical
+            _serial_rng_states = [random.getstate()]
+            _serial_rows = []
+            for _ in range(self.iters):
+                _serial_rows.append(index_sampler.next_batch())
+                _serial_rng_states.append(random.getstate())
             try:
-                _sched_host = torch.tensor(_serial_rows, dtype=torch.long)
-                if torch.cuda.is_available():
-                    _sched_host = _sched_host.pin_memory()
-                    _first = active_inputs if isinstance(active_inputs, list) else next(iter(active_inputs.values()))
-                    if isinstance(_first, list):
-                        _first = _first[0]
-                    if torch.is_tensor(_first) and _first.device.type == "cuda":
-                        _serial_idx_dev = torch.empty(global_batch_size, dtype=torch.long, device=_first.device)
+                _first = active_inputs if isinstance(active_inputs, list) else next(iter(active_inputs.values()))
+                if isinstance(_first, list):
+                    _first = _first[0]
+                if torch.cuda.is_available() and torch.is_tensor(_first) and _first.device.type == "cuda":
+                    _sched_host = torch.tensor(_serial_rows, dtype=torch.long).pin_memory()
+                    _serial_idx_dev = torch.empty(global_batch_size, dtype=torch.long, device=_first.device)
             except (RuntimeError, OSError):
                 # pinning / staging is best-effort: host rows alone still
                 # remove the per-iteration RNG work (bit-identical draws)
+                logger.info("[tune-serial] schedule staging fell back to host rows (pin/alloc failed)")
                 _sched_host = None
                 _serial_idx_dev = None
 
@@ -1382,6 +1389,12 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 if not self.not_use_best_mse:
                     if 0 < self.dynamic_max_gap <= i - last_best_iter:
+                        if _serial_rows is not None:
+                            # the precompute consumed ALL iters draws; the lazy
+                            # path would have stopped after iteration i's draw --
+                            # restore that exact global-RNG state so the NEXT
+                            # block's IndexSampler shuffle stays bit-identical
+                            random.setstate(_serial_rng_states[i + 1])
                         break
             elif _async and self.not_use_best_mse and i == self.iters - 1:
                 # loss-delay-only mode keeps the single last-iter collection

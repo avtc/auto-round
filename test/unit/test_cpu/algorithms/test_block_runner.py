@@ -241,3 +241,49 @@ class TestSelectBatchHostIndices:
         t_in = {"hidden": inputs["hidden"]}
         t_out, _ = r._select_batch(t_in, {"positional_inputs": None}, idx)
         assert torch.equal(t_out["hidden"], legacy_inputs["hidden"])
+
+    def test_forward_plumb_multi_subbatch_tensor_plus_host(self):
+        import torch
+
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+
+        class Squared(torch.nn.Module):
+            def forward(self, x):  # noqa: A002
+                return x * x
+
+        r = BlockForwardRunner(batch_size=2, amp=False, enable_torch_compile=False)  # ragged tail
+        inputs = [(torch.arange(5, dtype=torch.float32) + 10.0 * i).unsqueeze(0) for i in range(6)]
+        others = {"positional_inputs": None}
+        idx = torch.tensor([4, 1, 3, 5, 0])
+        out_tensor = r.forward(Squared(), inputs, others, idx, host_indices=[4, 1, 3, 5, 0])
+        out_legacy = r.forward(Squared(), inputs, others, [4, 1, 3, 5, 0])
+        assert torch.equal(out_tensor, out_legacy)
+
+    def test_schedule_state_restore_on_early_break(self):
+        import random
+
+        from auto_round.compressors.utils import IndexSampler
+
+        # lazy path: draw 3 of 9 iterations, then next sampler starts from the
+        # post-draw-3 state
+        random.seed(7)
+        s1 = IndexSampler(12, 4)
+        for _ in range(3):
+            s1.next_batch()
+        state_lazy = random.getstate()
+        # precompute path: draw all 9, then restore the post-draw-3 state
+        random.seed(7)
+        s2 = IndexSampler(12, 4)
+        states = [random.getstate()]
+        rows = []
+        for _ in range(9):
+            rows.append(s2.next_batch())
+            states.append(random.getstate())
+        random.setstate(states[3])
+        assert random.getstate() == state_lazy
+        # subsequent draws identical from both states
+        random.setstate(state_lazy)
+        a = [random.random() for _ in range(4)]
+        random.setstate(states[3])
+        b = [random.random() for _ in range(4)]
+        assert a == b
