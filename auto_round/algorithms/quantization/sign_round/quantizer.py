@@ -788,16 +788,6 @@ class SignRoundQuantizer(BaseQuantizer):
             and _envs.AR_TUNE_DDP_SHARD_SAMPLER
         ):
             _dp_samplers = shard_samplers(nsamples, replica_group.world, global_batch_size // replica_group.world)
-
-        from auto_round.algorithms.quantization.sign_round.data_parallel import cuda_graphs_engage
-
-        # CUDA graphs replay the captured kernels verbatim, so they need
-        # static per-iteration data placement: engaged only without the shard
-        # sampler (sampler active -> skip + one INFO). Failures during
-        # capture/replay raise and halt the run (GraphedReplicaStep).
-        _graphs_active = _envs.AR_TUNE_CUDA_GRAPHS and cuda_graphs_engage(replica_group, _dp_samplers is not None)
-        _graphed_steps = None
-        _shard_index_tensors = None
         block_fwd = self.block_forward
 
         # When low_gpu_mem_usage is enabled, active_inputs / fp_outputs are intentionally
@@ -859,11 +849,7 @@ class SignRoundQuantizer(BaseQuantizer):
                             _loss_w = self._get_loss(_pred_w, _ref_w, _warm, mse_loss, _dev_r, None)
                             _loss_w.backward()
                     for _opt in [optimizer] + mirror_optimizers:
-                        # graphs replay backward into the captured grad
-                        # addresses: the warm-up backward above allocated
-                        # them, freeing here would make replay write into
-                        # recycled memory
-                        _opt.zero_grad(set_to_none=not _graphs_active)
+                        _opt.zero_grad()
             except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
                 replica_group.teardown()
                 raise RuntimeError(
@@ -941,7 +927,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     _shards = [global_indices[r * _shard : (r + 1) * _shard] for r in range(_world)]
                 _losses = [None] * _world
 
-                def _dp_replica_step(r, shard, indices_t=None):
+                def _dp_replica_step(r, shard):
                     rep = replica_group.replicas[r]
                     dev_r = next(rep.parameters()).device
                     with torch.cuda.device(dev_r):
@@ -951,49 +937,13 @@ class SignRoundQuantizer(BaseQuantizer):
                         # is the PRIMARY GPU -- parking a mirror's output there
                         # would both mismatch the loss and cost a cross-device
                         # copy every iteration
-                        pred_r = block_fwd.forward(
-                            rep, active_inputs, input_others, indices_t if indices_t is not None else shard, dev_r
-                        )
+                        pred_r = block_fwd.forward(rep, active_inputs, input_others, shard, dev_r)
                         loss_r = self._get_loss(pred_r, ref_r, shard, mse_loss, dev_r, None)
+                        _losses[r] = loss_r.detach()
                         loss_r.backward()
-                        return loss_r.detach()
-
-                def _dp_run(r):
-                    if _graphed_steps is not None:
-                        # the graph owns this replica's fwd+bwd; the clone it
-                        # returns is stored for the delayed loss read
-                        _losses[r] = _graphed_steps[r]()
-                    else:
-                        _losses[r] = _dp_replica_step(r, _shards[r])
-
-                if _graphs_active and _graphed_steps is None:
-                    # static shards only (engagement gate): the per-replica
-                    # index tensors are made ONCE and kept alive for the
-                    # block -- a fresh host tensor baked into a capture would
-                    # leave replay reading freed memory (H2D sources must
-                    # outlive the graph)
-                    from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
-
-                    _shard_index_tensors = []
-                    _graphed_steps = []
-                    for r in range(_world):
-                        rep = replica_group.replicas[r]
-                        dev_r = next(rep.parameters()).device
-                        _shard_index_tensors.append(torch.as_tensor(_shards[r], dtype=torch.long, device=dev_r))
-                        _graphed_steps.append(
-                            GraphedReplicaStep(
-                                lambda r=r, idx_t=_shard_index_tensors[r]: _dp_replica_step(r, _shards[r], idx_t),
-                                name=f"replica-{r}",
-                            )
-                        )
-                    logger.info(
-                        "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
-                        _world,
-                        _graphed_steps[0].warmup_iters,
-                    )
 
                 with tune_stage(tune_prof, "fwd"):
-                    replica_group.run_threaded([lambda r=r: _dp_run(r) for r in range(_world)])
+                    replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
                 # sync_grads stages itself (bufprep / exchange / writeback).
                 # sign_exchange: the update consumes only sign(mean-grad) and
                 # weight_decay is 0, so exchanging int8 signs after the
@@ -1099,11 +1049,11 @@ class SignRoundQuantizer(BaseQuantizer):
                 best_params = collect_best_params(block, self.compress_context.cache_device)
             if replica_group is not None:
                 with tune_stage(tune_prof, "step"):
-                    self._step(scaler, optimizer, lr_schedule, keep_grads=_graphs_active)
+                    self._step(scaler, optimizer, lr_schedule)
 
                     def _mirror_step(opt, sched):
                         opt.step()
-                        opt.zero_grad(set_to_none=not _graphs_active)
+                        opt.zero_grad()
                         sched.step()
 
                     # mirror optimizers exclude the HOME replica (its step ran
@@ -1450,7 +1400,7 @@ class SignRoundQuantizer(BaseQuantizer):
             htcore.mark_step()
         return scale_loss
 
-    def _step(self, scaler: Any, optimizer: Any, lr_schedule: Any, keep_grads: bool = False):
+    def _step(self, scaler: Any, optimizer: Any, lr_schedule: Any):
         """Performs a step in the optimization process.
 
         Args:
@@ -1465,7 +1415,5 @@ class SignRoundQuantizer(BaseQuantizer):
         # for hpu
         if is_hpex_available():
             htcore.mark_step()
-        # keep_grads=True (CUDA-graph tune loop): grads must stay parked at
-        # their captured addresses for the next replay
-        optimizer.zero_grad(set_to_none=not keep_grads)
+        optimizer.zero_grad()
         lr_schedule.step()

@@ -13,23 +13,18 @@
 # limitations under the License.
 """Tests for single-process data parallelism of the SignRound tuning loop."""
 
-import contextlib
 import copy
 
 import pytest
 import torch
 
-from auto_round import envs
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
     DDPPlan,
-    GraphedReplicaStep,
     ReplicaGroup,
     ReplicaThreadPool,
-    _cuda_graphs_supported,
     _DelayedBestTracker,
     _param_grad_buffers,
     _write_back_grads,
-    cuda_graphs_engage,
     halving_doubling_allreduce,
     resolve_ddp_plan,
     run_threaded_spawn,
@@ -1339,131 +1334,3 @@ class TestOverlapExchange:
         assert envs.AR_DISABLE_OVERLAP_EXCHANGE is False
         monkeypatch.setenv("AR_DISABLE_OVERLAP_EXCHANGE", "1")
         assert envs.AR_DISABLE_OVERLAP_EXCHANGE is True
-
-
-class TestGraphedReplicaStep:
-    """CPU-safe orchestration tests via a duck-typed fake CUDA graph."""
-
-    @staticmethod
-    def _make_step(warmup=2):
-        state = {"fn_calls": 0}
-
-        def fn():
-            state["fn_calls"] += 1
-            return torch.full((1,), float(state["fn_calls"]))
-
-        replays = []
-        step = None
-
-        class FakeGraph:
-            def replay(self):
-                replays.append(1)
-                # emulate the kernels rewriting the static output buffer
-                step._static_loss.copy_(fn())
-
-        step = GraphedReplicaStep(
-            fn,
-            warmup_iters=warmup,
-            name="r0",
-            graph_factory=lambda: FakeGraph(),
-            capture_ctx=lambda graph: contextlib.nullcontext(),
-        )
-        return step, state, replays
-
-    def test_warmup_passthrough_then_capture_and_replay(self):
-        step, state, replays = self._make_step(warmup=2)
-        r1 = step()
-        r2 = step()
-        assert r1.item() == 1.0 and r2.item() == 2.0
-        assert replays == []  # warmup is eager, nothing captured yet
-        r3 = step()  # capture call: records, then replays so the iter's work executes
-        # fake bookkeeping: the capture pass AND the immediate replay each
-        # count one fn run (real graphs record without executing)
-        assert len(replays) == 1 and r3.item() == 4.0
-        r4 = step()
-        assert len(replays) == 2 and r4.item() == 5.0
-        assert state["fn_calls"] == 5
-
-    def test_replay_returns_clones_not_static_buffer(self):
-        step, _, _ = self._make_step(warmup=1)
-        first = step()
-        second = step()
-        assert first is not step._static_loss
-        assert first is not second
-        assert first.item() == 1.0 and second.item() == 3.0  # clones track buffer
-
-    @staticmethod
-    def _capture_logs(caplog):
-        from auto_round.logger import logger as ar_logger
-
-        ar_logger.addHandler(caplog.handler)
-        return ar_logger
-
-    def test_capture_failure_halts(self, caplog):
-        import contextlib
-
-        ar_logger = self._capture_logs(caplog)
-
-        def boom(_graph):
-            raise RuntimeError("capture unsupported")
-
-        step = GraphedReplicaStep(
-            lambda: torch.zeros(1),
-            warmup_iters=0,
-            name="r1",
-            graph_factory=lambda: object(),
-            capture_ctx=boom,
-        )
-        with caplog.at_level("ERROR"):
-            with pytest.raises(RuntimeError, match="capture unsupported"):
-                step()
-        ar_logger.removeHandler(caplog.handler)
-        assert any("AR_TUNE_CUDA_GRAPHS=0" in r.getMessage() for r in caplog.records)
-        assert step._graph is None
-
-    def test_replay_failure_halts(self, caplog):
-        step, _, _ = self._make_step(warmup=1)
-        step()  # warmup
-        step()  # capture + replay
-
-        def boom():
-            raise RuntimeError("replay exploded")
-
-        step._graph.replay = boom
-        ar_logger = self._capture_logs(caplog)
-        with caplog.at_level("ERROR"):
-            with pytest.raises(RuntimeError, match="replay exploded"):
-                step()
-        ar_logger.removeHandler(caplog.handler)
-        assert any("AR_TUNE_CUDA_GRAPHS=0" in r.getMessage() for r in caplog.records)
-
-
-class TestCudaGraphsEngage:
-    def test_supported_helper_tracks_cuda_availability(self):
-        assert _cuda_graphs_supported() == torch.cuda.is_available()
-
-    def test_engage_requires_replica_group(self):
-        assert cuda_graphs_engage(None, samplers_active=False) is False
-
-    def test_engage_skips_sampler_mode_with_one_log(self, caplog, monkeypatch):
-        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
-
-        monkeypatch.setattr(dp, "_GRAPHS_SAMPLER_SKIP_LOGGED", False)
-        from auto_round.logger import logger as ar_logger
-
-        ar_logger.addHandler(caplog.handler)
-        try:
-            rg = object()  # only identity is checked pre-support
-            assert cuda_graphs_engage(rg, samplers_active=True) is False
-            assert any("sampler" in r.getMessage().lower() for r in caplog.records)
-            caplog.clear()
-            cuda_graphs_engage(rg, samplers_active=True)  # once-latched
-            assert not any("sampler" in r.getMessage().lower() for r in caplog.records)
-        finally:
-            ar_logger.removeHandler(caplog.handler)
-
-    def test_env_defaults_on(self, monkeypatch):
-        monkeypatch.delenv("AR_TUNE_CUDA_GRAPHS", raising=False)
-        assert envs.AR_TUNE_CUDA_GRAPHS is True
-        monkeypatch.setenv("AR_TUNE_CUDA_GRAPHS", "0")
-        assert envs.AR_TUNE_CUDA_GRAPHS is False
