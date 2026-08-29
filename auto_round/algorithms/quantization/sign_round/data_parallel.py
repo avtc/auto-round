@@ -1403,8 +1403,10 @@ class BucketExchangeSession:
     One daemon thread is the SINGLE issuer of all cross-device copies (the
     removed hook-fan-out overlap destroyed the P2P fast path by issuing from
     whichever autograd thread fired). Per-replica post-accumulate-grad hooks
-    fire during backward (eager or graph replay), mark their bucket ready and
-    record a CUDA event on the stream that wrote the grads; the thread waits
+    fire during EAGER backward only (autograd host callbacks do not run on
+    CUDA-graph replay -- the caller must gate overlap off when graphs are
+    active), mark their bucket ready and record a CUDA event on the stream
+    that wrote the grads; the thread waits
     for all replicas' events, then runs the existing sign-exchange algorithm
     on just that bucket's slice (bit-identical per element: the halving tree
     of each element is unchanged by bucketing). Grads are written back in
@@ -1491,10 +1493,17 @@ class BucketExchangeSession:
         self._thread = threading.Thread(target=self._run, daemon=True, name="tune-bucket-exchange")
         self._thread.start()
 
-    def join_and_check(self, timeout: Optional[float] = None):
+    def join_and_check(self, timeout: Optional[float] = 300.0):
         assert self._thread is not None
         self._thread.join(timeout)
         if self._thread.is_alive():
+            logger.error(
+                "[tune-ddp] bucket exchange stalled: ready=%s processed=%s -- a bucket never completed "
+                "(grad-less or frozen sentinel param?); set AR_TUNE_EXCH_OVERLAP=0 to fall back "
+                "to the monolithic exchange",
+                self._ready,
+                sorted(self._processed),
+            )
             raise TimeoutError("bucket exchange did not finish (join timeout)")
         err = self._error
         with self._cv:
@@ -1531,8 +1540,9 @@ class BucketExchangeSession:
         for r in range(self.world):
             ev = self._events.get((r, b))
             if ev is not None:
-                dev = self.params_per_replica[r][0].grad.device if self.params_per_replica[r][0].grad else None
-                if dev is not None and dev.type == "cuda":
+                lo, _hi = self.bucket_ranges[b]
+                dev = self.params_per_replica[r][lo].device
+                if dev.type == "cuda":
                     torch.cuda.current_stream(dev).wait_event(ev)
         bufs = []
         for bucket in buckets:

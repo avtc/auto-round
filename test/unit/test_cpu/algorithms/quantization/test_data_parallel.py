@@ -1661,7 +1661,10 @@ class TestBucketExchangeSession:
     def test_exchange_matches_monolithic_sign(self):
         import copy
 
-        from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession, sign_exchange_allreduce
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            BucketExchangeSession,
+            sign_exchange_allreduce,
+        )
 
         params_per_replica = self._mk_world()
         mono = copy.deepcopy(params_per_replica)
@@ -1682,7 +1685,8 @@ class TestBucketExchangeSession:
         sess.begin_iter()
         sess.start()
         # simulate backward completion in scrambled order
-        import threading, time
+        import threading
+        import time
 
         def fire():
             for b in (2, 0, 1):
@@ -1713,7 +1717,7 @@ class TestBucketExchangeSession:
 
         time.sleep(0.05)
         assert calls == []  # bucket not processed while a replica is missing
-        sess._make_hook(1, 0,None)(None)
+        sess._make_hook(1, 0, None)(None)
         for r in range(sess.world):  # complete the remaining bucket too
             sess._make_hook(r, 1, None)(None)
         sess.join_and_check(timeout=10)
@@ -1741,3 +1745,30 @@ class TestBucketExchangeSession:
         assert envs.AR_TUNE_EXCH_OVERLAP is True
         monkeypatch.setenv("AR_TUNE_EXCH_OVERLAP", "0")
         assert envs.AR_TUNE_EXCH_OVERLAP is False
+
+
+class TestBucketExchangeRealAutograd:
+    def test_hooks_fire_on_real_backward(self):
+        """Armed hooks complete buckets from an actual autograd backward."""
+        from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession
+
+        world = 2
+        mods = []
+        for r in range(world):
+            torch.manual_seed(7)
+            mods.append(torch.nn.Linear(5, 4, bias=False))
+        params_per_replica = [list(m.parameters()) for m in mods]
+        order = []
+        sess = BucketExchangeSession(
+            params_per_replica, transport="fp32", exchange_fn=lambda b: order.append(b), num_buckets=2
+        )
+        assert len(params_per_replica[0]) == 1  # single param -> single bucket
+        sess.arm()
+        sess.begin_iter()
+        sess.start()
+        x = torch.ones(3, 5, requires_grad=True)
+        for m in mods:  # both replicas' hooks fire from these backwards
+            m(x).sum().backward()
+        sess.join_and_check(timeout=10)
+        sess.close()
+        assert order == [0]

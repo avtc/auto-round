@@ -22,7 +22,7 @@ from torch import autocast
 
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
-from auto_round.algorithms.quantization.sign_round.data_parallel import run_paced_replica_steps
+from auto_round.algorithms.quantization.sign_round.data_parallel import run_paced_replica_steps, use_one_shot
 from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.compressors.utils import (
@@ -1033,6 +1033,18 @@ class SignRoundQuantizer(BaseQuantizer):
             and _envs.AR_TUNE_DDP_SIGN_EXCHANGE
             and replica_group.world >= 2
             and (replica_group.world & (replica_group.world - 1)) == 0
+            # eager backward only: post-accumulate-grad hooks (the completion
+            # signal) do not fire on CUDA-graph replay -- with graphs active
+            # the buckets would never complete and the join would stall
+            and not _graphs_active
+            # int8 transport scales per SEGMENT amax -- bucketing changes the
+            # segments, so restrict to transports where bucketing is exact
+            and replica_group.grad_transport in ("fp32", "bf16")
+            # the one-shot arm is a different algorithm; do not mix per phase
+            and not use_one_shot(replica_group.world, replica_group.grad_transport)
+            # frozen sentinels cannot register hooks; the monolithic path
+            # tolerates them, the bucketed one does not
+            and all(p.requires_grad for p in params_per_replica[0])
         ):
             from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession
 
