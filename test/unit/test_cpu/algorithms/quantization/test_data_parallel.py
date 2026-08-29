@@ -33,6 +33,7 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     resolve_ddp_plan,
     run_threaded_spawn,
     sign_exchange_allreduce,
+    SharedHandle,
 )
 
 
