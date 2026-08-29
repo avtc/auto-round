@@ -410,6 +410,28 @@ class WrapperLinear(torch.nn.Module):
             self.bias_quant_func = quant_tensor_asym_wo_round
             self.params["bias_v"] = self.bias_v
 
+    def _anchor_grid_inplace(self, _wmin, _wmax):
+        """Write anchored grids ADDRESS-STABLY when same-shape tensors exist.
+
+        A fresh wrapper can rebind ``weight_min/max`` freely, but a
+        template-cached mirror's captured graph baked the EXISTING storages --
+        rebinding would leave replays reading the previous block's grid. In
+        place ``copy_`` is value-identical for both cases.
+        """
+        wm, wx = getattr(self, "weight_min", None), getattr(self, "weight_max", None)
+        if (
+            isinstance(wm, torch.Tensor)
+            and isinstance(wx, torch.Tensor)
+            and wm.shape == _wmin.shape
+            and wx.shape == _wmax.shape
+        ):
+            wm.copy_(_wmin.to(device=wm.device, dtype=wm.dtype))
+            wx.copy_(_wmax.to(device=wx.device, dtype=wx.dtype))
+        else:
+            dev = wm.device if isinstance(wm, torch.Tensor) else self.device
+            self.weight_min = _wmin.to(device=dev, dtype=wm.dtype if isinstance(wm, torch.Tensor) else _wmin.dtype)
+            self.weight_max = _wmax.to(device=dev, dtype=wx.dtype if isinstance(wx, torch.Tensor) else _wmax.dtype)
+
     def anchor_recipe_grid(self):
         """Run the deferred AR_TUNE_RECIPE init-search and pin the grid now.
 
@@ -439,10 +461,9 @@ class WrapperLinear(torch.nn.Module):
         if _anchors is None:
             return False
         _wmin, _wmax, frozen = _anchors
+        self._anchor_grid_inplace(_wmin, _wmax)
         self._tune_recipe_frozen_margins = frozen
         self._tune_recipe = envs.AR_TUNE_RECIPE
-        self.weight_min = _wmin.to(self.weight_min.dtype)
-        self.weight_max = _wmax.to(self.weight_max.dtype)
         if frozen:
             self._pin_margins_frozen()
         return True

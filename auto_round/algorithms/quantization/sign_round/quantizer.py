@@ -141,8 +141,17 @@ def _shard_recipe_anchor(replica_group):
             if r == owner[n]:
                 continue
             dst = mods_by_rep[r][n]
-            dst.weight_min = src.weight_min.to(device=dst.device, dtype=dst.weight_min.dtype)
-            dst.weight_max = src.weight_max.to(device=dst.device, dtype=dst.weight_max.dtype)
+            # address-stable broadcast: template-cached mirrors' graphs baked
+            # the existing weight_min/max storages -- copy in place when the
+            # shapes match (value-identical for fresh replicas too)
+            _wm = src.weight_min.to(device=dst.device, dtype=dst.weight_min.dtype)
+            _wx = src.weight_max.to(device=dst.device, dtype=dst.weight_max.dtype)
+            if isinstance(dst.weight_min, torch.Tensor) and dst.weight_min.shape == _wm.shape:
+                dst.weight_min.copy_(_wm)
+                dst.weight_max.copy_(_wx)
+            else:
+                dst.weight_min = _wm
+                dst.weight_max = _wx
             dst._tune_recipe = src._tune_recipe
             dst._tune_recipe_frozen_margins = src._tune_recipe_frozen_margins
             dst._recipe_anchor_deferred = False  # grid arrived via broadcast
@@ -658,8 +667,21 @@ class SignRoundQuantizer(BaseQuantizer):
                 )
 
                 _tpl_entry = None
+                _tpl_key = None
                 if template_cache_size() > 0:
-                    _tpl_key = _template_signature(block, _plan.world, _plan.devices)
+                    _tpl_key = _template_signature(
+                        block,
+                        _plan.world,
+                        _plan.devices,
+                        extra=(
+                            str(_envs.AR_TUNE_RECIPE),
+                            getattr(self, "asym_search", None),
+                            self.enable_minmax_tuning,
+                            nsamples,
+                            global_batch_size,
+                            tuple(fp_outputs[0].shape) if isinstance(fp_outputs, list) and fp_outputs else None,
+                        ),  # per-module bits/group/data_type/sym travel via named_modules
+                    )
                     _tpl_entry = _GRAPH_TEMPLATE_CACHE.pop(_tpl_key, None)
                     if _tpl_entry is not None and len(_tpl_entry["mirrors"]) != _plan.world - 1:
                         _tpl_entry = None  # stale layout -- rebuild
@@ -835,7 +857,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 # also releases on every exit, so workers can wait unbounded)
                 _graphs_gate.clear()
 
-        def _make_graphed_step(r, st=None, step=None):
+        def _make_graphed_step(r, step=None):
             # Static buffers: the FIRST gather's tensors become the
             # graph's baked inputs (their addresses must repeat);
             # every later prepare refreshes them in place. Shared
@@ -845,8 +867,7 @@ class SignRoundQuantizer(BaseQuantizer):
             # THIS block's pools while the baked addresses stay alive.
             rep = replica_group.replicas[r]
             dev_r = next(rep.parameters()).device
-            if step is not None and st is None:
-                st = step._ar_st  # persistent static buffers of the cached graph
+            st = step._ar_st if step is not None else None  # persistent statics of the cached graph
             if st is None:
                 st = {"inputs": None, "others": None, "ref": None}
             from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner, _copy_into_static
@@ -1703,13 +1724,20 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 if (
                     template_cache_size() > 0
+                    and _tpl_key is not None
                     and _graphed_steps is not None
                     and all(getattr(_st, "_graph", None) is not None for _st in _graphed_steps)
                 ):
-                    _key = _template_signature(block, replica_group.world, replica_group.plan.devices)
-                    _GRAPH_TEMPLATE_CACHE[_key] = {
+                    _steps = list(_graphed_steps[1:])
+                    # neutralize the closures: they still close over THIS
+                    # block's pools -- a cache hit rebinds before any use, and
+                    # replay_only never calls them
+                    for _stp in _steps:
+                        _stp.prepare = lambda *a, **k: None
+                        _stp.compute = lambda: None
+                    _GRAPH_TEMPLATE_CACHE[_tpl_key] = {
                         "mirrors": list(replica_group.mirrors),
-                        "steps": list(_graphed_steps[1:]),
+                        "steps": _steps,
                     }
                     while len(_GRAPH_TEMPLATE_CACHE) > template_cache_size():
                         _GRAPH_TEMPLATE_CACHE.popitem(last=False)

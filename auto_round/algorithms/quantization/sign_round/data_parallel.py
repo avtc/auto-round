@@ -2171,7 +2171,7 @@ class _AsyncBestTracker:
             self.best_loss = float(self.best)
 
 
-def _template_signature(home: torch.nn.Module, world: int, devices) -> tuple:
+def _template_signature(home: torch.nn.Module, world: int, devices, extra=()) -> tuple:
     """Signature of a block's module template for cross-block graph reuse.
 
     Two blocks share a template iff their module structure and every
@@ -2179,12 +2179,25 @@ def _template_signature(home: torch.nn.Module, world: int, devices) -> tuple:
     captured replica graph (baked tensor addresses, static input buffers) can
     be replayed for the other block after syncing values into the persistent
     mirror modules. Devices participate: the cached mirrors must live on the
-    same plan.
+    same plan. ``extra`` carries everything value-shaping that no shape
+    encodes: the quant config (recipe, bits, data_type, sym, asym_search,
+    minmax flag) and the calibration geometry (nsamples, batch, pool shapes) --
+    a mixed-bits or config-changed run must never false-hit a cached template.
     """
-    mods = tuple((name, type(m).__name__) for name, m in home.named_modules())
+
+    def _qcfg(m):
+        # per-module quant config: mixed-bit layouts give different templates
+        return (
+            getattr(m, "bits", None),
+            getattr(m, "group_size", None),
+            getattr(m, "data_type", None),
+            getattr(m, "sym", None),
+        )
+
+    mods = tuple((name, type(m).__name__, _qcfg(m)) for name, m in home.named_modules())
     params = tuple((tuple(p.shape), str(p.dtype)) for p in home.parameters())
     buffers = tuple((tuple(b.shape), str(b.dtype)) for b in home.buffers())
-    return (mods, params, buffers, world, tuple(str(d) for d in devices))
+    return (mods, params, buffers, world, tuple(str(d) for d in devices), tuple(extra))
 
 
 # Cross-block cache of layer-module TEMPLATES for graphs: entry holds the
@@ -2211,17 +2224,31 @@ def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> Non
             src = home_params.get(name)
             if src is None or src.shape != p.shape or src.dtype != p.dtype:
                 raise RuntimeError(f"template drift at parameter {name!r} -- refusing to reuse the cached mirror")
-            if src.device != p.device:
-                p.data.copy_(src.data.to(p.device, non_blocking=False))
-            else:
-                p.data.copy_(src.data)
+            p.data.copy_(src.data)  # copy_ handles cross-device
             if p.grad is not None:
                 p.grad.zero_()
         home_bufs = dict(home.named_buffers())
         for name, b in mirror.named_buffers():
             src = home_bufs.get(name)
             if src is not None and src.shape == b.shape:
-                b.copy_(src.to(b.device) if src.device != b.device else src)
+                b.copy_(src)
+        # plain-tensor attrs the forward/anchor reads (imatrix feeds the
+        # recipe init-search and the dq in-forward search; its storage is
+        # baked into the cached graph) -- sync IN PLACE
+        home_mods = dict(home.named_modules())
+        for name, mm in mirror.named_modules():
+            hm = home_mods.get(name)
+            if hm is None:
+                continue
+            for attr in ("imatrix", "act_max"):
+                src = getattr(hm, attr, None)
+                dst = getattr(mm, attr, None)
+                if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor) and src.shape == dst.shape:
+                    dst.copy_(src)
+            # the deferred-anchor flag must say PENDING like a fresh mirror,
+            # or the sharded anchor no-ops and stale grids get broadcast
+            if getattr(hm, "_recipe_anchor_deferred", False):
+                mm._recipe_anchor_deferred = True
 
 
 def template_cache_size() -> int:

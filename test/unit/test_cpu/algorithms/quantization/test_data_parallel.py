@@ -2434,7 +2434,9 @@ class TestBucketExchangeDeterministicBuffers:
                     continue  # missing grad on this replica
                 p.grad = torch.full_like(p, float(r + 1))
         want = {
-            (r, i): (0.0 if (r != 0 and i == r) else float(r + 1)) for r in range(world) for i in range(len(per_replica[0]))
+            (r, i): (0.0 if (r != 0 and i == r) else float(r + 1))
+            for r in range(world)
+            for i in range(len(per_replica[0]))
         }
         for b in range(sess.num_buckets):
             sess._default_exchange(b)
@@ -2535,6 +2537,7 @@ class TestMirrorTemplateCache:
             graph_factory=lambda: object(),
             capture_ctx=lambda g: contextlib.nullcontext(),
         )
+
         class _FakeG:
             def replay(self):
                 step._static_loss = step.compute()
@@ -2579,3 +2582,78 @@ class TestMirrorTemplateCache:
         for v in ("0", "1", "5"):
             monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
             assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)
+
+    def test_two_block_composition_reuse_flow(self):
+        """Block A capture -> cache -> block B hit: sync + rebind + replay-only."""
+        import contextlib
+        import torch
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+        def make_block(seed):
+            torch.manual_seed(seed)
+            b = torch.nn.Linear(4, 4)
+            b.orig_layer = torch.nn.Linear(4, 4)  # fake wrapped structure
+            b.imatrix = torch.rand(1, 4)
+            b.weight_min = torch.zeros(4)
+            b.weight_max = torch.ones(4)
+            b._recipe_anchor_deferred = True
+            return b
+
+        block_a, block_b = make_block(1), make_block(2)
+        mirror = make_block(9)  # cached mirror with block-A state
+        world, devices = 2, ["cuda:0", "cuda:1"]
+        key_a = dp._template_signature(block_a, world, devices)
+        assert dp._template_signature(block_b, world, devices) == key_a
+
+        # block A: a captured step enters the cache with neutralized closures
+        st = {"inputs": None, "others": None, "ref": None}
+        calls = []
+
+        class _FakeG:
+            def replay(self):
+                step._static_loss = step.compute()
+
+        step = GraphedReplicaStep(
+            lambda *a: calls.append("prep"),
+            lambda: calls.append("compute"),
+            name="r1",
+            graph_factory=lambda: _FakeG(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        step._ar_st = st
+        step._graph = _FakeG()
+        step.prepare = lambda *a, **k: None  # neutralized at insert
+        step.compute = lambda: None
+        dp._GRAPH_TEMPLATE_CACHE.clear()
+        dp._GRAPH_TEMPLATE_CACHE[key_a] = {"mirrors": [mirror], "steps": [step]}
+
+        # block B: HIT -> sync (values, deferred flag, imatrix) ...
+        entry = dp._GRAPH_TEMPLATE_CACHE.pop(key_a)
+        assert len(entry["mirrors"]) == world - 1
+        a_w = mirror.weight.detach().clone()
+        mirror._recipe_anchor_deferred = False  # block-A anchor cleared it
+        dp.sync_mirror_from_home(block_b, mirror)
+        assert not torch.equal(mirror.weight.detach(), a_w)  # block-B weights in
+        assert torch.equal(mirror.weight.detach(), block_b.weight.detach())
+        assert torch.equal(mirror.imatrix, block_b.imatrix)  # in-place attr sync
+        assert mirror._recipe_anchor_deferred is True  # anchor will re-run
+        assert mirror.weight_min.data_ptr() != id(None)  # storage kept (rebind-safe writes)
+
+        # ... rebind closures onto the SAME step; replay works through them
+        def rebind(existing):
+            def prepare(row):
+                existing._ar_st["ref"] = torch.full((4,), float(row[0]))
+                calls.append("newprep")
+
+            def compute():
+                calls.append("newcompute")
+                return existing._ar_st["ref"].sum().reshape(1)
+
+            existing.prepare, existing.compute = prepare, compute
+
+        rebind(step)
+        loss = step([7])
+        assert calls[-2:] == ["newprep", "newcompute"]
+        assert loss.item() == 28.0  # 7*4 -- replayed compute read the refreshed static
