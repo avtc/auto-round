@@ -163,3 +163,11 @@ def test_select_batch_accepts_host_int_indices():
     runner.shared_cache_keys = ("shared",)
     sel = runner.select_batch({"shared": ["x", "y", "z", "w"]}, {}, [3])
     assert sel[0]["shared"] == "w"  # single-index selection picks val[3]
+
+
+def test_select_batch_host_indices_cover_tensor_others_branch():
+    """Bare-tensor others values (attention-mask style) take index_select."""
+    runner = BlockForwardRunner(batch_size=2, device="cpu", cache_device="cpu", amp=False)
+    others = {"attention_mask": torch.arange(8, dtype=torch.float32).reshape(4, 2)}
+    sel = runner.select_batch([torch.zeros(1, 2, 2)] * 4, others, [3, 1])
+    torch.testing.assert_close(sel[1]["attention_mask"], others["attention_mask"][[3, 1]])

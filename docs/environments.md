@@ -358,6 +358,16 @@ export AR_TUNE_DDP_DELAYED_LOSS=0   # reclaim ~params-size VRAM on the primary d
 - **Valid Values**: `1`, `0`
 - **Usage**: Keep enabled; set `0` only for A/B comparisons against the older single-closure prepare+replay dispatch.
 
+### AR_TUNE_PREPARE_FENCE_FREE
+- **Description**: Fence-free graphed prepare: batch indices are passed as host int lists (no per-iteration device indices tensor, no per-element `.item()` device syncs inside `select_batch`) and constant CPU leaves are pinned once (after their first repeat) so refresh copies are async pinned H2D instead of pageable staging. One-shot leaves (freshly cat-ed per-sample masks) always pass through unpinned. `0` restores the legacy device-indices gather verbatim for A/B isolation.
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled; toggle off only to isolate this improvement's speed/VRAM effect in A/B runs.
+
+```bash
+export AR_TUNE_PREPARE_FENCE_FREE=0   # legacy gather (device-indices tensor, pageable H2D)
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

@@ -446,7 +446,7 @@ class BlockForwardRunner:
                 else:
                     selected_others[key] = _cat_device_safe(batch_vals, batch_dim)
             elif isinstance(val, torch.Tensor):
-                selected_others[key] = torch.index_select(val, batch_dim, indices)
+                selected_others[key] = torch.index_select(val, batch_dim, _idx_tensor(val))
             elif isinstance(val, (str, bool, type(None))):
                 selected_others[key] = val
             else:

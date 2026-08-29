@@ -1380,31 +1380,52 @@ class GraphedReplicaStep:
 
 
 class HostLeafPinner:
-    """Pin host-side tensor leaves once, reuse the pinned copies afterwards.
+    """Pin host-side tensor leaves that REPEAT by identity, pass fresh ones through.
 
-    Prepare-time refresh copies of constant CPU leaves (masks, small metadata)
-    go through pageable H2D every iteration; a pinned source makes them async
-    staging-free copies. CUDA tensor leaves pass through untouched.
+    Prepare-time refresh copies of constant CPU leaves (shared caches, static
+    metadata) go through pageable H2D every iteration; a pinned source makes
+    them async staging-free copies. Only leaves seen AGAIN as the same object
+    get pinned: one-shot tensors (freshly cat-ed per-sample masks) never
+    repeat, so they pass through untouched -- pinning them would grow the
+    cache unboundedly, and caching by id() alone could hand back a previous
+    iteration's data after garbage collection recycles the address. CUDA
+    tensor leaves pass through untouched.
     """
 
     def __init__(self):
-        self._cache = {}
+        # id(src) -> (src, pinned|None); the strong src reference pins the id,
+        # first-sighting entries carry pinned=None until pin_repeats() runs
+        self._cache: dict = {}
 
     def wrap(self, tree):
         if isinstance(tree, torch.Tensor):
             if tree.device.type != "cpu" or not torch.cuda.is_available():
                 return tree
-            key = id(tree)
-            pinned = self._cache.get(key)
-            if pinned is None:
-                pinned = tree.pin_memory()
-                self._cache[key] = pinned
-            return pinned
+            entry = self._cache.get(id(tree))
+            if entry is not None:
+                src, pinned = entry
+                return pinned if (pinned is not None and src is tree) else tree
+            self._cache[id(tree)] = (tree, None)  # remember first sighting
+            return tree
         if isinstance(tree, dict):
             return {k: self.wrap(v) for k, v in tree.items()}
         if isinstance(tree, (tuple, list)):
             return type(tree)(self.wrap(v) for v in tree)
         return tree
+
+    def pin_repeats(self):
+        """Promote first-sightings to pinned copies (call after gather #1).
+
+        Constant leaves are exactly the ones the next wrap() will see again
+        as the same object; fresh one-shot tensors never re-appear, so their
+        remember-entries simply go unused (and die with the pinner).
+        """
+        if not torch.cuda.is_available():
+            return
+        for key, entry in list(self._cache.items()):
+            src, pinned = entry
+            if pinned is None:
+                self._cache[key] = (src, src.pin_memory())
 
 
 def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):

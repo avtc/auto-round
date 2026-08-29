@@ -202,6 +202,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before ANY replay launches, so replays start in lockstep instead of
     # free-running behind prepare jitter (measured 34-73 ms replica drift).
     "AR_TUNE_REPLICA_PACING": lambda: os.getenv("AR_TUNE_REPLICA_PACING", "1").lower() in ("1", "true", "yes", "on"),
+    # Fence-free graphed prepare: host-int batch indices (no device indices
+    # tensor, no per-element .item() syncs in select_batch) + repeat-pinned
+    # constant CPU leaves. 0 restores the device-indices gather verbatim.
+    "AR_TUNE_PREPARE_FENCE_FREE": lambda: os.getenv("AR_TUNE_PREPARE_FENCE_FREE", "1").lower()
+    in ("1", "true", "yes", "on"),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.

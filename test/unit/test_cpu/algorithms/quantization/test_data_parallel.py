@@ -1570,9 +1570,17 @@ class TestPacedDispatch:
         monkeypatch.setenv("AR_TUNE_REPLICA_PACING", "0")
         assert envs.AR_TUNE_REPLICA_PACING is False
 
+    def test_fence_free_env_gate_default_on_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_PREPARE_FENCE_FREE", raising=False)
+        assert envs.AR_TUNE_PREPARE_FENCE_FREE is True
+        monkeypatch.setenv("AR_TUNE_PREPARE_FENCE_FREE", "0")
+        assert envs.AR_TUNE_PREPARE_FENCE_FREE is False
+
 
 class TestHostLeafPinner:
-    def test_cpu_leaves_pinned_once_and_cached(self, monkeypatch):
+    def test_repeated_leaf_pinned_fresh_leaf_passthrough(self, monkeypatch):
         from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner
 
         def fake_pin(self):
@@ -1584,14 +1592,17 @@ class TestHostLeafPinner:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
         src = torch.arange(4, dtype=torch.float32)
-        tree = {"a": src, "b": torch.ones(2, 2), "c": [src, 7]}
         pinner = HostLeafPinner()
-        out1 = pinner.wrap(tree)
-        assert out1["a"].data_ptr() != src.data_ptr() and getattr(out1["a"], "_fake_pinned", False)
-        assert out1["c"][0] is out1["a"]  # same source object -> same pinned copy
-        assert out1["c"][1] == 7  # non-tensors pass through
-        out2 = pinner.wrap({"a": src})
-        assert out2["a"] is out1["a"]  # cache survives across calls
+        first = pinner.wrap({"a": src})["a"]
+        assert first is src  # first sighting passes through unpinned
+        pinner.pin_repeats()
+        second = pinner.wrap({"a": src})["a"]
+        assert second is not src and second.data_ptr() != src.data_ptr()
+        assert getattr(second, "_fake_pinned", False)
+
+        fresh = torch.arange(4, dtype=torch.float32)  # one-shot (cat-ed mask)
+        assert pinner.wrap({"a": fresh})["a"] is fresh  # never repeats -> passthrough
+        assert pinner.wrap({"a": fresh})["a"] is fresh  # and no stale handback on re-wrap
 
     def test_no_cuda_passes_leaves_through(self):
         from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner
@@ -1601,3 +1612,23 @@ class TestHostLeafPinner:
         src = torch.arange(4, dtype=torch.float32)
         out = HostLeafPinner().wrap({"a": src})
         assert out["a"] is src  # nothing to pin without an accelerator
+
+    def test_round1_failure_prevents_round2(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import run_paced_replica_steps
+
+        class Boom(Exception):
+            pass
+
+        class FailingPrep:
+            def prepare_only(self, shard):
+                raise Boom()
+
+            def replay_only(self):  # pragma: no cover - must not be reached
+                raise AssertionError("replay ran after prepare failure")
+
+        class FakeGroup:
+            def run_threaded(self, fns):
+                fns[0]()  # first worker raises
+
+        with pytest.raises(Boom):
+            run_paced_replica_steps(FakeGroup(), [FailingPrep()], [[0]], [None])

@@ -811,19 +811,33 @@ class SignRoundQuantizer(BaseQuantizer):
             from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner, _copy_into_static
 
             pinner = HostLeafPinner()
+            _pinned_once = False
 
             def prepare(shard):
+                nonlocal _pinned_once
                 with torch.cuda.device(dev_r):
                     expect_pool_local([fp_outputs[j] for j in shard], dev_r, "ddp-ref")
                     ref = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
-                    # host-int batches: no device indices tensor (pageable H2D)
-                    # and no per-element .item() fences inside select_batch
                     bins, bother = [], []
-                    for i in range(0, len(shard), block_fwd.batch_size):
-                        bi = shard[i : i + block_fwd.batch_size]
-                        _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
-                        bins.append(_in)
-                        bother.append(pinner.wrap(_oth))
+                    if _fence_free:
+                        # host-int batches: no device indices tensor (pageable
+                        # H2D) and no per-element .item() fences in select_batch
+                        for i in range(0, len(shard), block_fwd.batch_size):
+                            bi = shard[i : i + block_fwd.batch_size]
+                            _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
+                            bins.append(_in)
+                            bother.append(pinner.wrap(_oth))
+                        if not _pinned_once:
+                            _pinned_once = True
+                            pinner.pin_repeats()
+                    else:
+                        # legacy gather, verbatim (A/B isolation for the gate)
+                        indices = torch.tensor(shard, dtype=torch.long, device=dev_r)
+                        for i in range(0, len(indices), block_fwd.batch_size):
+                            bi = indices[i : i + block_fwd.batch_size]
+                            _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
+                            bins.append(_in)
+                            bother.append(_oth)
 
                     def _to_dev(x):
                         if isinstance(x, torch.Tensor) and x.device != dev_r:
@@ -1008,6 +1022,7 @@ class SignRoundQuantizer(BaseQuantizer):
         # selection semantics are unchanged (same (loss, pre-step params)
         # pairs, same strict-less rule -- resolved one iteration later)
         _pacing = bool(_envs.AR_TUNE_REPLICA_PACING)
+        _fence_free = bool(_envs.AR_TUNE_PREPARE_FENCE_FREE)
         _delayed = replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and self.dynamic_max_gap <= 0
         if replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and 0 < self.dynamic_max_gap:
             logger.warning(
@@ -1279,7 +1294,7 @@ class SignRoundQuantizer(BaseQuantizer):
             if _graphed_steps is not None and len(_graphed_worker_ms) and all(len(w) for w in _graphed_worker_ms):
                 _means = [sum(w) / len(w) for w in _graphed_worker_ms]
                 logger.info(
-                    "[tune-ddp] replica worker ms/iter (prepare+replay enqueue): %s (spread %.1f)",
+                    "[tune-ddp] replica worker ms/iter (unpaced: prepare+replay; paced: replay round): %s (spread %.1f)",
                     ["%.1f" % m for m in _means],
                     max(_means) - min(_means),
                 )
