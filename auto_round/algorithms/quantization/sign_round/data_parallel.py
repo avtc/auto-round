@@ -27,6 +27,7 @@ World size 1 (default) executes none of this code.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import queue
 import threading
@@ -1135,14 +1136,34 @@ def _cuda_graphs_supported() -> bool:
     return torch.cuda.is_available() and hasattr(torch.cuda, "CUDAGraph")
 
 
-def cuda_graphs_engage(replica_group) -> bool:
+_GRAPHS_STREAMING_SKIP_LOGGED = False
+
+
+def cuda_graphs_engage(
+    replica_group, *, inputs_are_list=True, is_diffusion=False, has_valid_token_mask=False, streaming=False
+) -> bool:
     """Whether the DDP tune loop may capture per-replica CUDA graphs.
 
-    Quiet refusals are environment properties only (serial path, no CUDA).
-    Everything that fails *during* prepare/capture/replay is a real fault
-    and raises (see :class:`GraphedReplicaStep`).
+    Quiet refusals are environment properties only (serial path, no CUDA,
+    dict/diffusion inputs, valid-token-mask loss, streaming mode). The
+    streaming refusal is structural: the background pack/ready-transform
+    threads issue CUDA concurrently with the tune loop, and capture with
+    the global error mode would be invalidated. Everything failing during
+    prepare/capture/replay is a real fault and raises (see
+    :class:`GraphedReplicaStep`).
     """
+    global _GRAPHS_STREAMING_SKIP_LOGGED
     if replica_group is None:
+        return False
+    if not (inputs_are_list and not is_diffusion and not has_valid_token_mask):
+        return False
+    if streaming:
+        if not _GRAPHS_STREAMING_SKIP_LOGGED:
+            _GRAPHS_STREAMING_SKIP_LOGGED = True
+            logger.info(
+                "[tune-ddp] streaming mode active: cuda graphs skipped "
+                "(background pack/transform threads issue concurrent CUDA during the tune loop)"
+            )
         return False
     return _cuda_graphs_supported()
 
@@ -1172,6 +1193,9 @@ def _copy_into_static(dst, src) -> None:
             if k not in src:
                 raise RuntimeError(f"static-buffer key vanished: {k!r}")
             _copy_into_static(dst[k], src[k])
+        extra = set(src) - set(dst)
+        if extra:
+            raise RuntimeError(f"static-buffer gained key(s): {sorted(extra)!r}")
         return
     if isinstance(dst, (tuple, list)):
         if len(dst) != len(src):
@@ -1226,7 +1250,15 @@ class GraphedReplicaStep:
         self._static_loss = None
         self._calls = 0
         self._graph_factory = graph_factory if graph_factory is not None else lambda: torch.cuda.CUDAGraph()
-        self._capture_ctx = capture_ctx if capture_ctx is not None else lambda g: torch.cuda.graph(g)
+        # explicit per-device capture stream: torch.cuda.graph() without
+        # stream= uses a process-wide singleton bound to whichever device
+        # captured first -- later replicas on other devices would fail
+        self._capture_stream = (
+            torch.cuda.Stream(device=device) if device is not None and _cuda_graphs_supported() else None
+        )
+        self._capture_ctx = (
+            capture_ctx if capture_ctx is not None else lambda g: torch.cuda.graph(g, stream=self._capture_stream)
+        )
 
     def capture_now(self):
         """Record the graph now (main thread, workers parked) and replay once.
@@ -1235,8 +1267,6 @@ class GraphedReplicaStep:
         a singleton capture stream, so captures must serialize even if a
         future caller forgets the parked-workers contract.
         """
-        import contextlib
-
         try:
             with _GRAPH_CAPTURE_LOCK:
                 with torch.cuda.device(self.device) if self.device is not None else contextlib.nullcontext():
@@ -1268,7 +1298,16 @@ class GraphedReplicaStep:
         if self._graph is None:
             self._calls += 1
             if self._calls <= self.warmup_iters:
-                return self.compute().detach()
+                try:
+                    return self.compute().detach()
+                except Exception as exc:
+                    logger.error(
+                        "[tune-ddp] cuda-graph warm-up compute failed for %s (%s): "
+                        "set AR_TUNE_CUDA_GRAPHS=0 to disable",
+                        self.name,
+                        exc,
+                    )
+                    raise
             raise RuntimeError(
                 f"cuda graph for {self.name} was not captured after {self.warmup_iters} warmup iteration(s) "
                 "-- capture_now() must run at the loop's barrier point"

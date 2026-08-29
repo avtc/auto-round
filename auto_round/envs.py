@@ -164,7 +164,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph and replay it per iteration; the per-iteration shard gather runs
     # eagerly into static buffers so rotating samples stay correct. Any
     # prepare/capture/replay failure halts the run -- set 0 to disable.
-    "AR_TUNE_CUDA_GRAPHS": lambda: os.getenv("AR_TUNE_CUDA_GRAPHS", "1").lower() in ("1", "true", "yes", "on"),
+    "AR_TUNE_CUDA_GRAPHS": lambda: os.getenv("AR_TUNE_CUDA_GRAPHS", "1").lower() in ("1", "true", "yes"),
     # Concurrent-shard cap for hook-carrying collection passes (default 4,
     # 0 = uncapped): forward hooks force dynamo graph breaks, leaving the
     # compiled block runner as python-bound eager sections that GIL-convoy

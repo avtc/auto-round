@@ -19,12 +19,13 @@ import copy
 import pytest
 import torch
 
+import auto_round.algorithms.quantization.sign_round.data_parallel as dp
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
-    GraphedReplicaStep,
-    _copy_into_static,
     DDPPlan,
+    GraphedReplicaStep,
     ReplicaGroup,
     ReplicaThreadPool,
+    _copy_into_static,
     _DelayedBestTracker,
     _param_grad_buffers,
     _write_back_grads,
@@ -1474,3 +1475,28 @@ class TestStaticBufferLeafCopy:
         src = {"a": torch.zeros(3)}
         with pytest.raises(RuntimeError, match="shape"):
             _copy_into_static(dst, src)
+
+
+class TestCudaGraphsEngageV2:
+    def test_streaming_mode_skips_with_one_log(self, caplog, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        monkeypatch.setattr(dp, "_GRAPHS_STREAMING_SKIP_LOGGED", False)
+        from auto_round.logger import logger as ar_logger
+
+        ar_logger.addHandler(caplog.handler)
+        try:
+            assert dp.cuda_graphs_engage(object(), streaming=True) is False
+            assert any("streaming" in r.getMessage().lower() for r in caplog.records)
+            caplog.clear()
+            assert dp.cuda_graphs_engage(object(), streaming=True) is False
+            assert not any("streaming" in r.getMessage().lower() for r in caplog.records)
+        finally:
+            ar_logger.removeHandler(caplog.handler)
+
+    def test_structural_gates(self):
+        assert dp.cuda_graphs_engage(None) is False
+        assert dp.cuda_graphs_engage(object(), inputs_are_list=False) is False
+        assert dp.cuda_graphs_engage(object(), is_diffusion=True) is False
+        assert dp.cuda_graphs_engage(object(), has_valid_token_mask=True) is False
+        assert dp.cuda_graphs_engage(object()) == torch.cuda.is_available()

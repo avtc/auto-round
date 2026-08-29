@@ -769,13 +769,17 @@ class SignRoundQuantizer(BaseQuantizer):
         _graphs_capture_pending = False
         from auto_round.algorithms.quantization.sign_round.data_parallel import cuda_graphs_engage
 
+        _staged_src_probe = getattr(block, "_stream_prefetch_source", None)
         if (
             _envs.AR_TUNE_CUDA_GRAPHS
             and replica_group is not None
-            and cuda_graphs_engage(replica_group)
-            and isinstance(active_inputs, list)
-            and not getattr(block_fwd, "is_diffusion", False)
-            and valid_token_mask is None
+            and cuda_graphs_engage(
+                replica_group,
+                inputs_are_list=isinstance(active_inputs, list),
+                is_diffusion=getattr(block_fwd, "is_diffusion", False),
+                has_valid_token_mask=valid_token_mask is not None,
+                streaming=_staged_src_probe is not None,
+            )
         ):
             _graphs_active = True
 
