@@ -160,6 +160,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies in every replica's reference/input cat, ~10-40 ms/iter at
     # world=8). Same per-epoch coverage; set to 0 for the global sampler.
     "AR_TUNE_DDP_SHARD_SAMPLER": lambda: os.getenv("AR_TUNE_DDP_SHARD_SAMPLER", "1").lower() in ("1", "true", "yes"),
+    # Capture each replica's DDP tune step (fwd + loss + backward) in a CUDA
+    # graph and replay it per iteration (default on; requires static shards,
+    # auto-skipped when the shard sampler engages). Capture/replay failures
+    # halt the run -- set 0 to disable.
+    "AR_TUNE_CUDA_GRAPHS": lambda: os.getenv("AR_TUNE_CUDA_GRAPHS", "1").lower() in ("1", "true", "yes", "on"),
     # Concurrent-shard cap for hook-carrying collection passes (default 4,
     # 0 = uncapped): forward hooks force dynamo graph breaks, leaving the
     # compiled block runner as python-bound eager sections that GIL-convoy
