@@ -1085,6 +1085,12 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
         rmod._buffers = new_buffers
         # ── plain attrs: clone tensors, deepcopy shared containers ───────
         for attr, val in list(rmod.__dict__.items()):
+            if attr == "_tune_flat_grad":
+                # the parked grad buffer is home-only state; mirrors park
+                # their own (cloning ~1 flat-storage per mirror would waste
+                # wire + VRAM for a buffer that is replaced anyway)
+                del rmod.__dict__[attr]
+                continue
             if attr.startswith("_") or attr in ("training", "T_destination"):
                 continue  # torch-internal bookkeeping / immutable scalars
             hval = hmod.__dict__.get(attr)
@@ -1238,6 +1244,22 @@ def build_flat_tuning_params(mod: torch.nn.Module, lr_fn, minmax_lr_fn) -> bool:
     return True
 
 
+def _release_flat_grads(mod: torch.nn.Module) -> None:
+    """Drop the parked flat grad buffer (plain attr: invisible to .to(meta)).
+
+    Module.to() moves only parameters and buffers, so a plain-attr grad
+    buffer would survive the block's meta-release and leak ~1 flat-storage
+    per finished block on its home GPU. The tune is over when this runs;
+    the buffer holds nothing worth keeping.
+    """
+    groups = getattr(mod, "_tune_flat_groups", None)
+    if groups is not None:
+        for gp in groups:
+            gp.grad = None
+    if getattr(mod, "_tune_flat_grad", None) is not None:
+        mod._tune_flat_grad = None
+
+
 def _park_flat_grads(mod: torch.nn.Module, force_new: bool = False) -> None:
     """Pre-assign each group param's grad as a view of one shared buffer.
 
@@ -1330,26 +1352,33 @@ def _deepcopy_flat_safe(block: torch.nn.Module, tuning: bool = True) -> torch.nn
                 m._buffers[key] = swapped
             else:
                 setattr(m, key, swapped)
-        if not tuning:
-            base = getattr(block, "_tune_flat_base", None)
-            if base is not None:
-                saved_state = (
-                    dict(block._buffers),
-                    [gp.data for gp in groups],
-                    {gp: gp.grad for gp in groups},
-                )
-                block._buffers["_tune_flat_base"] = torch.empty(0, device=base.device)
-                for gp in groups:
-                    gp.data = torch.empty(0, device=base.device)
+        base = getattr(block, "_tune_flat_base", None)
+        grad_buf = getattr(block, "_tune_flat_grad", None)
+        if not tuning and base is not None:
+            saved_state = (
+                dict(block._buffers),
+                [gp.data for gp in groups],
+                {gp: gp.grad for gp in groups},
+                grad_buf,
+            )
+            block._buffers["_tune_flat_base"] = torch.empty(0, device=base.device)
+            for gp in groups:
+                gp.data = torch.empty(0, device=base.device)
+            for gp in groups:
+                gp.grad = None
+        if grad_buf is not None:
+            block._tune_flat_grad = None  # never copy the parked grads
         mirror = copy.deepcopy(block)
     finally:
         if saved_state is not None:
-            bufs, datas, grads = saved_state
+            bufs, datas, grads, grad_buf = saved_state
             block._buffers.update(bufs)
             for gp, d in zip(groups, datas):
                 gp.data = d
             for gp, g in grads.items():
                 gp.grad = g
+        if grad_buf is not None:
+            block._tune_flat_grad = grad_buf
         if saved_state is not None:
             bufs, datas, grads = saved_state
             block._buffers.update(bufs)
@@ -1926,6 +1955,8 @@ class ReplicaGroup:
         pool, self._pool = getattr(self, "_pool", None), None
         if pool is not None:
             pool.shutdown()
+        for rep in [self.home] + list(self.mirrors):
+            _release_flat_grads(rep)
         self.mirrors = []
         self.replicas = [self.home]
 
