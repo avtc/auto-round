@@ -979,7 +979,11 @@ class SignRoundQuantizer(BaseQuantizer):
                                 bins.append(_in)
                                 bother.append(_oth)
                             if st["ref"] is None:
-                                st["ref"], st["inputs"], st["others"] = ref, bins, bother
+                                # shallow-copy the dict nodes: block_forward MUTATES
+                                # the kwargs it receives (pops keys); the static
+                                # structure must stay pristine for later compares
+                                st["ref"], st["inputs"] = ref, bins
+                                st["others"] = [dict(o) for o in bother]
                                 return
                             _copy_into_static(st["ref"], ref)
                             _copy_into_static(st["inputs"], bins)
@@ -989,7 +993,10 @@ class SignRoundQuantizer(BaseQuantizer):
                         with torch.cuda.device(dev_r):
                             outs = []
                             for _in, _oth in zip(st["inputs"], st["others"]):
-                                raw = block_fwd._forward_one_batch(rep, _in, _oth)
+                                # dict() per call: the runner pops keys from the
+                                # kwargs it receives (same tensor leaves -- the
+                                # graph-baked addresses are untouched)
+                                raw = block_fwd._forward_one_batch(rep, _in, dict(_oth))
                                 out = block_fwd._normalize_output(raw, rep)
                                 outs.append(out.to(dev_r) if out.device != dev_r else out)
                             pred_r = outs[0] if len(outs) == 1 else torch.cat(outs, dim=block_fwd.batch_dim)
