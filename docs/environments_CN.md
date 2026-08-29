@@ -389,7 +389,7 @@ export AR_TUNE_PROACTIVE_PREPARE=0   # 迭代开始时 prepare（不前瞻）
 ```
 
 ### AR_TUNE_SERIAL_DELAYED_LOSS
-- **描述**： 串行调优路径（无 DDP 的逐 block，以及 block 外的逐层）在设备端累积 loss（fp64，与旧的 Python 浮点求和相同的从左到右顺序），并在反向入队之后一次性读取，取代每个 batch 在 loss 与反向之间用 `loss.item()` 围栏阻塞宿主——GPU 不再因等待宿主唤醒并 enqueue 反向而在迭代中途空转。
+- **描述**： 串行调优路径（无 DDP 的逐 block，以及 block 外的逐层）在设备端累积 loss（fp64，与旧的 Python 浮点求和相同的从左到右顺序），并仅在反向入队之后读取（逐层路径每 batch 一次，逐 block 路径在 batch 循环后一次），取代每个 batch 在 loss 与反向之间用 `loss.item()` 围栏阻塞宿主——GPU 不再因等待宿主唤醒并 enqueue 反向而在迭代中途空转。
 - **默认值**: `1`
 - **有效值**: `1`, `0`
 - **用法**: 保持开启；仅在 A/B 隔离测试时设 `0`。

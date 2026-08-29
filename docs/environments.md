@@ -389,7 +389,7 @@ export AR_TUNE_PROACTIVE_PREPARE=0   # prepare at iteration start (no run-ahead)
 ```
 
 ### AR_TUNE_SERIAL_DELAYED_LOSS
-- **Description**: Serial tune paths (block-wise without DDP, and layers outside blocks) accumulate the loss on device (fp64, same left-to-right order as the legacy Python float sum) and read it once AFTER the backward enqueue, instead of fencing the host with `loss.item()` between the loss and the backward of every batch -- the GPU no longer idles mid-iteration waiting for the host to wake up and enqueue the backward.
+- **Description**: Serial tune paths (block-wise without DDP, and layers outside blocks) accumulate the loss on device (fp64, same left-to-right order as the legacy Python float sum) and read it only AFTER the backward is enqueued (per batch for the layer path, once after the batch loop for the block path), instead of fencing the host with `loss.item()` between the loss and the backward of every batch -- the GPU no longer idles mid-iteration waiting for the host to wake up and enqueue the backward.
 - **Default**: `1`
 - **Valid Values**: `1`, `0`
 - **Usage**: Keep enabled; toggle off only for A/B isolation.

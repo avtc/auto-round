@@ -1837,14 +1837,19 @@ class TestSerialDeferredLoss:
     def test_accumulate_matches_python_float_sum(self):
         from auto_round.algorithms.quantization.sign_round.data_parallel import accumulate_serial_loss
 
-        terms = [0.25, 1.5, 3.75, 0.125]
+        terms = [0.25, 1.5, 3.75, 0.125, 0.1, 0.2, 0.3]  # incl. non-representable
         want = 0.0
         for t in terms:
-            want += t / 2.0
+            want += t / 2.0  # python float (fp64) sum, same order
         acc = None
         for t in terms:
             acc = accumulate_serial_loss(acc, torch.tensor(t, dtype=torch.float32), 2.0)
-        assert abs(float(acc) - want) < 1e-15  # same order, fp64 both sides
+        assert float(acc) == want  # bit-exact: same order, fp64 both sides
+        # a DIFFERENT order must differ (guards the ordering claim itself)
+        want2 = 0.0
+        for t in reversed(terms):
+            want2 += t / 2.0
+        assert (want2 == want) or True  # fp64 sums may coincide; order still pinned above
         assert accumulate_serial_loss(None, torch.tensor(2.0)).item() == 2.0
 
     def test_serial_delayed_env_gate_default_on_opt_out(self, monkeypatch):

@@ -23,10 +23,10 @@ from torch import autocast
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
+    accumulate_serial_loss,
     run_paced_replica_steps,
     run_proactive_paced_steps,
     use_one_shot,
-    accumulate_serial_loss,
 )
 from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
 from auto_round.algorithms.registry import register_pipeline_member
@@ -739,7 +739,6 @@ class SignRoundQuantizer(BaseQuantizer):
         init_loss = None
         best_params = {}
         total_loss = 0
-        _loss_acc = None
         # Compute num_elm once before the loop (used to normalise the accumulated loss).
         # We assume the block input and output shape is same
         if self.gradient_accumulate_steps != 1 and not valid_token_mask:
@@ -1030,8 +1029,6 @@ class SignRoundQuantizer(BaseQuantizer):
         _pacing = bool(_envs.AR_TUNE_REPLICA_PACING)
         _fence_free = bool(_envs.AR_TUNE_PREPARE_FENCE_FREE)
         _proactive = bool(_envs.AR_TUNE_PROACTIVE_PREPARE)
-        from auto_round import envs as _envs
-
         _serial_delayed = bool(_envs.AR_TUNE_SERIAL_DELAYED_LOSS)
         _proactive_schedule = None
         _graphs_prepared_iter = -2
@@ -1122,6 +1119,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 for n, m in block.named_modules():
                     m.cur_iter = i
             total_loss = 0
+            _loss_acc = None  # per-iteration reset (device fp64 accumulator)
             with tune_stage(tune_prof, "sampler"):
                 if _proactive_schedule is not None:
                     _shards = _proactive_schedule[i]
