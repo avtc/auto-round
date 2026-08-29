@@ -378,6 +378,16 @@ export AR_TUNE_PREPARE_FENCE_FREE=0   # legacy gather (device-indices tensor, pa
 export AR_TUNE_EXCH_OVERLAP=0   # monolithic post-backward exchange
 ```
 
+### AR_TUNE_PROACTIVE_PREPARE
+- **Description**: Proactive next-iteration prepare for the graphed DDP tune loop. The per-block shuffle schedule is materialized once at loop entry (same RNG stream as the lazy per-iteration draws), and iteration i+1's static-buffer refresh is enqueued right after iteration i's replay round returns — while the GPU still executes iteration i. The per-device stream FIFO orders the write-after-read on the static buffers (they are only read by replay i+1), so no synchronization is needed. `0` restores prepare-at-iteration-start.
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled; toggle off only to isolate this improvement in A/B runs.
+
+```bash
+export AR_TUNE_PROACTIVE_PREPARE=0   # prepare at iteration start (no run-ahead)
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

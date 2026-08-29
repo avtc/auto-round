@@ -22,7 +22,11 @@ from torch import autocast
 
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
-from auto_round.algorithms.quantization.sign_round.data_parallel import run_paced_replica_steps, use_one_shot
+from auto_round.algorithms.quantization.sign_round.data_parallel import (
+    run_paced_replica_steps,
+    run_proactive_paced_steps,
+    use_one_shot,
+)
 from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.compressors.utils import (
@@ -1023,6 +1027,9 @@ class SignRoundQuantizer(BaseQuantizer):
         # pairs, same strict-less rule -- resolved one iteration later)
         _pacing = bool(_envs.AR_TUNE_REPLICA_PACING)
         _fence_free = bool(_envs.AR_TUNE_PREPARE_FENCE_FREE)
+        _proactive = bool(_envs.AR_TUNE_PROACTIVE_PREPARE)
+        _proactive_schedule = None
+        _graphs_prepared_iter = -2
         _async = replica_group is not None and _envs.AR_TUNE_ASYNC_LOSS and self.dynamic_max_gap <= 0
         _sign_ok = self.momentum is None or float(self.momentum) == 0.0
         _exch_session = None
@@ -1077,6 +1084,10 @@ class SignRoundQuantizer(BaseQuantizer):
         _graphs_capture_t = None
         _graphs_capture_wall = 0.0
         _graphs_capture_iter = -1
+        if _proactive and _dp_samplers is not None and replica_group is not None:
+            # consume the whole shuffle schedule upfront (same RNG stream as
+            # the lazy per-iteration next_batch sequence -- deterministic)
+            _proactive_schedule = [[s.next_batch() for s in _dp_samplers] for _ in range(self.iters)]
         _tprof_n = int(_envs.AR_TUNE_TORCH_PROF or 0)
         _tprof_start, _tprof_end = 5, 5 + _tprof_n
         _tprof_ctx = None
@@ -1107,7 +1118,10 @@ class SignRoundQuantizer(BaseQuantizer):
                     m.cur_iter = i
             total_loss = 0
             with tune_stage(tune_prof, "sampler"):
-                if _dp_samplers is not None:
+                if _proactive_schedule is not None:
+                    _shards = _proactive_schedule[i]
+                    global_indices = [j for sh in _shards for j in sh]
+                elif _dp_samplers is not None:
                     _shards = [s.next_batch() for s in _dp_samplers]
                     global_indices = [j for sh in _shards for j in sh]
                 else:
@@ -1190,8 +1204,26 @@ class SignRoundQuantizer(BaseQuantizer):
                         if _pacing and _all_captured:
                             # two rounds: every prepare completes (pool latch)
                             # before any replay launches -- replays start in
-                            # lockstep instead of trailing prepare jitter
-                            run_paced_replica_steps(replica_group, _graphed_steps, _shards, _losses, _graphed_worker_ms)
+                            # lockstep instead of trailing prepare jitter;
+                            # proactively, iteration i+1's prepare is enqueued
+                            # right after this replay round (stream FIFO orders
+                            # the static-buffer write-after-read)
+                            _was_prepared = _graphs_prepared_iter == i
+                            _next_sh = (
+                                _proactive_schedule[i + 1]
+                                if _proactive_schedule is not None and i + 1 < self.iters
+                                else None
+                            )
+                            run_proactive_paced_steps(
+                                replica_group,
+                                _graphed_steps,
+                                _shards,
+                                _next_sh,
+                                _losses,
+                                _graphed_worker_ms,
+                                prepared=_was_prepared,
+                            )
+                            _graphs_prepared_iter = (i + 1) if _next_sh is not None else i
                         else:
                             replica_group.run_threaded([lambda r=r: _dp_run(r) for r in range(_world)])
                     if _graphs_warmups_left > 0:

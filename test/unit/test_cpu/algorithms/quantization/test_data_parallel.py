@@ -1754,3 +1754,78 @@ class TestBucketExchangeRealAutograd:
         sess.join_and_check(timeout=10)
         sess.close()
         assert order == [0]
+
+
+class TestProactivePacedSteps:
+    def test_first_iteration_prepares_and_replays_then_prepares_next(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import run_proactive_paced_steps
+
+        order = []
+
+        class FakeStep:
+            def __init__(self, r):
+                self.r = r
+
+            def prepare_only(self, shard):
+                order.append(("p", self.r, tuple(shard)))
+
+            def replay_only(self):
+                order.append(("r", self.r))
+                return torch.tensor(float(self.r))
+
+        class FakeGroup:
+            def run_threaded(self, fns):
+                for fn in fns:
+                    fn()
+
+        steps = [FakeStep(i) for i in range(2)]
+        losses = [None, None]
+        ms = [[] for _ in range(2)]
+        run_proactive_paced_steps(FakeGroup(), steps, [[0, 1], [2, 3]], [[4, 5], [6, 7]], losses, ms, prepared=False)
+        assert [o[0] for o in order] == ["p", "p", "r", "r", "p", "p"]  # prepare(0) -> replay(0) -> prepare(1)
+        assert order[-1][2] == (6, 7)
+        assert [l.item() for l in losses] == [0.0, 1.0]
+
+    def test_prepared_iteration_replays_only_and_preps_next(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import run_proactive_paced_steps
+
+        order = []
+
+        class FakeStep:
+            def prepare_only(self, shard):
+                order.append(("p", tuple(shard)))
+
+            def replay_only(self):
+                order.append(("r",))
+                return torch.tensor(0.0)
+
+        class FakeGroup:
+            def run_threaded(self, fns):
+                for fn in fns:
+                    fn()
+
+        run_proactive_paced_steps(FakeGroup(), [FakeStep()], [[9]], None, [None], [[]], prepared=True)
+        assert order == [("r",)]  # last iteration: replay only, no next prepare
+
+    def test_schedule_precompute_matches_lazy_sampler_stream(self):
+        import random
+
+        from auto_round.compressors.utils import shard_samplers
+
+        def fresh():
+            random.seed(4242)
+            return shard_samplers(16, world=2, batch_per_replica=2)
+
+        lazy = fresh()
+        lazy_seq = [[s.next_batch() for s in lazy] for _ in range(5)]
+        pre = fresh()
+        pre_seq = [[s.next_batch() for s in pre] for _ in range(5)]
+        assert lazy_seq == pre_seq
+
+    def test_proactive_env_gate_default_on_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_PROACTIVE_PREPARE", raising=False)
+        assert envs.AR_TUNE_PROACTIVE_PREPARE is True
+        monkeypatch.setenv("AR_TUNE_PROACTIVE_PREPARE", "0")
+        assert envs.AR_TUNE_PROACTIVE_PREPARE is False

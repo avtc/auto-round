@@ -1611,6 +1611,32 @@ class HostLeafPinner:
                 self._cache[key] = (src, src.pin_memory())
 
 
+def run_proactive_paced_steps(group, steps, current_shards, next_shards, out_losses, worker_ms, prepared):
+    """Proactive pipeline: replay the current step, then prepare the NEXT one.
+
+    ``prepared`` says whether ``current_shards`` was already staged at the
+    previous iteration's tail (True -> replay-round only); False -> the first
+    steady iteration, which runs the full paced prepare+replay. After the
+    replay round returns, iteration i+1's prepare is enqueued while the GPU
+    still executes iteration i -- the static-buffer refresh is a
+    write-after-read ordered by the per-device stream FIFO.
+    """
+    if not prepared:
+        run_paced_replica_steps(group, steps, current_shards, out_losses, worker_ms)
+    else:
+        world = len(steps)
+
+        def _replay(r):
+            t0 = time.perf_counter()
+            out_losses[r] = steps[r].replay_only()
+            if worker_ms is not None:
+                worker_ms[r].append((time.perf_counter() - t0) * 1000.0)
+
+        group.run_threaded([lambda r=r: _replay(r) for r in range(world)])
+    if next_shards is not None:
+        group.run_threaded([lambda r=r: steps[r].prepare_only(next_shards[r]) for r in range(len(steps))])
+
+
 def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
     """Two-round graphed dispatch: all prepares (pool latch), then all replays.
 

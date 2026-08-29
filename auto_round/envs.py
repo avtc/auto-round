@@ -209,6 +209,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # post-accumulate-grad hooks fire, instead of one monolithic allreduce
     # after the whole backward drains. 0 restores the monolithic sync_grads.
     "AR_TUNE_EXCH_OVERLAP": lambda: os.getenv("AR_TUNE_EXCH_OVERLAP", "1").lower() in ("1", "true", "yes", "on"),
+    # Proactive next-iteration prepare: enqueue iteration i+1's static-buffer
+    # refresh right after iteration i's replay round (host runs ahead of the
+    # GPU; stream FIFO orders the write-after-read on the static buffers).
+    "AR_TUNE_PROACTIVE_PREPARE": lambda: os.getenv("AR_TUNE_PROACTIVE_PREPARE", "1").lower()
+    in ("1", "true", "yes", "on"),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.
