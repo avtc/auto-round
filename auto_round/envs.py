@@ -110,6 +110,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # plus CUDA-event GPU times and the host-sync bubble). Diagnostic only;
     # adds no per-iteration sync points.
     "AR_TUNE_PROFILE": lambda: os.getenv("AR_TUNE_PROFILE", "0").lower() in ("1", "true", "yes", "on"),
+    # Capture N tune-loop iterations (starting at iter 5, first block that
+    # reaches it) with torch.profiler and export a chrome trace
+    # (tune_torch_prof.json) -- per-device kernel timelines expose where the
+    # GPU waits (barrier skew / host handoff / wire) vs works. 0 = off.
+    "AR_TUNE_TORCH_PROF": lambda: int(os.getenv("AR_TUNE_TORCH_PROF", "0") or 0),
     # Single-process data parallelism for the block tuning loop: the global
     # calibration batch is sharded across AR_TUNE_DDP_WORLD GPUs (the block's
     # home + mirrors), gradients exchanged with a halving-doubling all-reduce

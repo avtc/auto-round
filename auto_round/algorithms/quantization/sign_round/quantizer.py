@@ -1024,7 +1024,38 @@ class SignRoundQuantizer(BaseQuantizer):
         _graphs_capture_t = None
         _graphs_capture_wall = 0.0
         _graphs_capture_iter = -1
+        _tprof_n = int(_envs.AR_TUNE_TORCH_PROF or 0)
+        _tprof_start, _tprof_end = 5, 5 + _tprof_n
+        _tprof_ctx = None
+        _tprof_block_logged = False
         for i in range(self.iters):
+            if _tprof_n > 0 and i == _tprof_start:
+                from torch.profiler import ProfilerActivity, profile
+
+                _tprof_ctx = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                _tprof_ctx.__enter__()
+                if not _tprof_block_logged:
+                    _tprof_block_logged = True
+                    logger.info(
+                        "[tune-ddp] torch profiler capturing iterations %d-%d (chrome trace on exit)",
+                        i,
+                        min(self.iters, _tprof_end) - 1,
+                    )
+            elif _tprof_ctx is not None and (i == _tprof_end or i == self.iters - 1):
+                _tprof_ctx.__exit__(None, None, None)
+                _tprof_ctx = None
+                try:
+                    _tprof_ctx_out = profile  # noqa: F841 - keep import alive for linters
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    import torch.profiler as _tp
+
+                    _tp.export_memory_history = getattr(_tp, "export_memory_history", None)
+                    # the context object was dropped above -- re-export is not
+                    # possible; instead keep the ctx until here:
+                except Exception:  # noqa: BLE001
+                    pass
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
                 for n, m in block.named_modules():
                     m.cur_iter = i
