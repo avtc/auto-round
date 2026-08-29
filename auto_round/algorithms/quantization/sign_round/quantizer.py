@@ -1050,7 +1050,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
             _exch_session = BucketExchangeSession(params_per_replica, replica_group.grad_transport)
             _exch_session.arm()
-        if replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and 0 < self.dynamic_max_gap:
+        if replica_group is not None and _envs.AR_TUNE_ASYNC_LOSS and 0 < self.dynamic_max_gap:
             logger.warning(
                 "[tune-ddp] dynamic_max_gap is set: keeping the immediate loss read "
                 "(the early-stop decision needs the current loss in-loop)"
@@ -1065,7 +1065,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 if loss_device is not None
                 else (fp_outputs[0].device if fp_outputs else torch.device("cpu"))
             )
-            _atracker = _AsyncBestTracker(self.iters, _loss_dev)
+            _atracker = _AsyncBestTracker(self.iters, _loss_dev, world=replica_group.world)
             # same parking policy as the legacy best-params snapshot below
             _snap_dev = (
                 _home
@@ -1370,7 +1370,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 _atracker.drain()
             if _atracker.init_loss is not None:
                 init_loss = _atracker.init_loss / _world
-                total_loss = init_loss
+            total_loss = float(_atracker.all_losses[self.iters - 1]) / _world if self.iters > 0 else init_loss
             if _atracker.best_loss is not None:
                 best_loss = _atracker.best_loss / _world  # tracker stores the raw sum
                 last_best_iter = _atracker.best_iter

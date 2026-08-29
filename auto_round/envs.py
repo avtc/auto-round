@@ -188,15 +188,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # semantics as the spawn path). Set to 0 to restore spawn-per-call
     # (collection passes always use the spawn path -- no lifecycle there).
     "AR_TUNE_DDP_THREAD_POOL": lambda: os.getenv("AR_TUNE_DDP_THREAD_POOL", "1").lower() in ("1", "true", "yes"),
-    # Delayed loss read + snapshot ring for the DDP tune loop (default ON):
-    # the per-iteration host wait on loss.item() drains the whole GPU chain
-    # of the finished iteration; deferring the read to the next iteration
-    # overlaps that drain with the newly enqueued forward. Best-params
-    # selection semantics are unchanged (same pairs, same strict-less rule,
-    # resolved one iteration later; unresolved iterations are dropped on a
-    # grid re-swap). Falls back to the immediate read when dynamic_max_gap
-    # is set (its early-stop decision needs the current loss in-loop). Set
-    # to 0 to restore the immediate read.
+    # Async loss resolution for the DDP tune loop (default OFF -- one extra
+    # snapshot slot of tuning params on the primary device): losses stay on
+    # the GPU, compared against a device-side running minimum; the promotion
+    # decision reaches the host as a pinned flag byte that poll() checks
+    # without blocking. The loop's only fence is the bounded drain at loop
+    # end. Immediate read is kept when dynamic_max_gap is set.
     "AR_TUNE_ASYNC_LOSS": lambda: os.getenv("AR_TUNE_ASYNC_LOSS", "0").lower() in ("1", "true", "yes", "on"),
     # Pace graphed replica steps: run ALL prepares to completion (pool latch)
     # before ANY replay launches, so replays start in lockstep instead of

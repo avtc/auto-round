@@ -1733,15 +1733,19 @@ class _AsyncBestTracker:
     (loss, pre-step params) pairs, same argmin, same first-wins ties.
     """
 
-    def __init__(self, iters: int, device: torch.device):
+    def __init__(self, iters: int, device: torch.device, world: int = 1):
         self.iters = iters
         self.device = device
+        self.world = world
         self._cuda = device.type == "cuda" and torch.cuda.is_available()
         self.all_losses = torch.zeros(iters, dtype=torch.float64, device=device)
         self.best = torch.full((), float("inf"), dtype=torch.float64, device=device)
         self._flags = torch.zeros(iters, dtype=torch.uint8, pin_memory=self._cuda)
         self._events = [torch.cuda.Event() if self._cuda else None for _ in range(iters)]
-        self._pending = []  # FIFO of (iter, snapshot); capped at 2
+        # per-replica staging slots on the loss device: replica losses live on
+        # their own devices, cross-device adds are illegal -- gather first
+        self._slots = [torch.zeros((), dtype=torch.float64, device=device) for _ in range(world)]
+        self._pending = []  # FIFO of (iter, snapshot); capped at 1 (parity with the old delayed mode)
         self.best_params = None
         self.best_iter = None
         self.init_loss = None
@@ -1752,9 +1756,13 @@ class _AsyncBestTracker:
     def stage(self, snapshot, losses, i: int):
         if not losses:
             return
-        loss = losses[0].double()
-        for extra in losses[1:]:
-            loss = loss + extra.double()
+        for r, l in enumerate(losses[: self.world]):
+            # cross-device copy_ into the loss-device slot (casts to fp64);
+            # subsequent ops on this device's stream are ordered after it
+            self._slots[r].copy_(l)
+        loss = self._slots[0]
+        for extra in self._slots[1 : len(losses[: self.world])]:
+            loss = loss + extra
         self.all_losses[i].copy_(loss)
         flag = loss < self.best
         self.best = torch.where(flag, loss, self.best)
@@ -1763,7 +1771,7 @@ class _AsyncBestTracker:
             self._events[i].record()
         else:
             self._flags[i] = flag.to(torch.uint8).item()  # CPU: synchronous semantics
-        while len(self._pending) >= 2:  # bound snapshot VRAM: resolve oldest
+        while self._pending:  # cap 1: same snapshot VRAM as the old delayed mode
             self._resolve_oldest(wait=True)
         self._pending.append((i, snapshot))
 

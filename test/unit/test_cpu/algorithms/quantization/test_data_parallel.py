@@ -469,6 +469,39 @@ class TestAsyncBestTracker:
         tr.drain()
         assert tr.best_loss is not None and tr.best_params is None
 
+    def test_drain_publishes_raw_world_sum_scale(self):
+        # wiring contract: init/best stay on the RAW world-sum scale; the
+        # caller (quantizer) divides by world -- mirrors the Wx-reporting bug
+        world = 4
+        tr = _AsyncBestTracker(2, torch.device("cpu"), world=world)
+        tr.stage(self._snap(0), [torch.tensor(0.2, dtype=torch.float64)] * world, 0)
+        tr.poll()
+        tr.stage(self._snap(1), [torch.tensor(0.15, dtype=torch.float64)] * world, 1)
+        tr.poll()
+        tr.drain()
+        assert abs(tr.init_loss - 0.8) < 1e-12 and abs(tr.best_loss - 0.6) < 1e-12
+
+    def test_stage_gathers_cross_device_losses_into_slots(self):
+        # replica losses arrive on their own devices (simulated by distinct
+        # source tensors): stage must gather via copy_ into per-replica slots
+        tr = _AsyncBestTracker(1, torch.device("cpu"), world=3)
+        losses = [torch.tensor(float(r + 1), dtype=torch.float32) for r in range(3)]
+        snap = self._snap(0)
+        copied = []
+        orig_copy = torch.Tensor.copy_
+
+        def spy_copy(dst, src, **kw):
+            copied.append(id(src))
+            return orig_copy(dst, src, **kw)
+
+        torch.Tensor.copy_ = spy_copy
+        try:
+            tr.stage(snap, losses, 0)
+        finally:
+            torch.Tensor.copy_ = orig_copy
+        assert len(copied) >= 3  # one gather per replica loss
+        assert tr._pending[0][1] is snap
+
     def test_async_env_gate_default_off_opt_in(self, monkeypatch):
         from auto_round import envs
 
