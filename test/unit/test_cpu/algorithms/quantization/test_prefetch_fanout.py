@@ -265,33 +265,6 @@ class TestReplicaRepair:
         # buffers independent
         assert rep.act_max is not home.act_max
 
-    def test_repair_survives_flat_views_in_shared_containers(self):
-        """Regression: repair's container copy must not deepcopy non-leaf views.
-
-        With flat v-params the wrapper ``params`` dict holds differentiable
-        views; ``copy.deepcopy`` on them raises ("Only Tensors created
-        explicitly by the user...") which used to crash replicate+repair and
-        silently demote every mirror to the slow deepcopy fallback.
-        """
-        from auto_round.algorithms.quantization.sign_round.data_parallel import (
-            _rebuild_flat_views,
-            _repair_replica,
-            build_flat_tuning_params,
-        )
-
-        home = self._home()
-        # upgrade the wrapper to the flat layout (params dict + attrs become views)
-        assert build_flat_tuning_params(home, lambda m: 0.01, lambda m: 0.02)
-        rep = self._replica_like(home)  # shallow copy: shares the view dict
-        _repair_replica(home, rep, torch.device("cpu"))  # must not raise
-        # the mirror's group params are repaired leaves; views re-narrow onto them
-        assert _rebuild_flat_views(rep) is True
-        assert rep.params["v"] is not home.params["v"]
-        torch.testing.assert_close(rep.params["v"].detach(), home.params["v"].detach())
-        # grads parked on the mirror's own buffer
-        for gp in rep._tune_flat_groups:
-            assert gp.grad is not None and gp.grad.data_ptr() != 0
-
     def test_repair_preserves_none_registrations(self):
         # Linear(bias=False) keeps ``bias: None`` in _parameters; the repair
         # must not drop the key (wrapper forwards read orig_layer.bias)

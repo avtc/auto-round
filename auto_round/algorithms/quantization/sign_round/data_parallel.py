@@ -911,10 +911,7 @@ def sharded_nograd_forward(
             reps.append(block)
             mirrors.append(None)
         else:
-            # flat-safe, value-only copy: plain deepcopy refuses (some torch
-            # versions) or slowly clones the full-flat storages per mirror;
-            # a no-grad collection forward reads only the per-wrapper values
-            m = _deepcopy_flat_safe(block, tuning=False).to(dev)
+            m = copy.deepcopy(block).to(dev)
             _relocate_params(m, dev)
             reps.append(m)
             mirrors.append(m)
@@ -1085,12 +1082,6 @@ def _repair_replica(home: torch.nn.Module, replica: torch.nn.Module, dev: torch.
         rmod._buffers = new_buffers
         # ── plain attrs: clone tensors, deepcopy shared containers ───────
         for attr, val in list(rmod.__dict__.items()):
-            if attr == "_tune_flat_grad":
-                # the parked grad buffer is home-only state; mirrors park
-                # their own (cloning ~1 flat-storage per mirror would waste
-                # wire + VRAM for a buffer that is replaced anyway)
-                del rmod.__dict__[attr]
-                continue
             if attr.startswith("_") or attr in ("training", "T_destination"):
                 continue  # torch-internal bookkeeping / immutable scalars
             hval = hmod.__dict__.get(attr)
@@ -1119,12 +1110,10 @@ _PEER_ACCESS_LOGGED = False
 def _copy_attr_value(value):
     """Deep-copy a shared attr value, cloning non-leaf tensors by value.
 
-    ``copy.deepcopy`` refuses non-leaf tensors (the flat v-param views stored
-    in wrapper ``params`` dicts); those are cloned detached instead -- for
-    flat layouts the views are re-narrowed onto the mirror's own group
-    parameters right after the repair (``_rebuild_flat_views``), so only the
-    non-tensor contents of containers matter here. Leaf tensors and
-    Parameters keep the plain deepcopy semantics.
+    ``copy.deepcopy`` refuses non-leaf tensors; any that appear inside shared
+    containers are cloned detached instead. Leaf tensors and Parameters keep
+    the plain deepcopy semantics, so with the ordinary per-parameter wrapper
+    layout this is behaviour-identical to copy.deepcopy.
     """
     if torch.is_tensor(value):
         if value.is_leaf:
@@ -1137,255 +1126,6 @@ def _copy_attr_value(value):
     if isinstance(value, set):
         return set(value)  # tensors are unhashable -- scalar members copy fine
     return copy.deepcopy(value)
-
-
-def _flat_grad_buffer(params: Sequence[torch.nn.Parameter]) -> Optional[torch.Tensor]:
-    """Zero-copy contiguous view over storage-adjacent flat group grads.
-
-    Returns None unless every parameter's grad is fp32, contiguous, and the
-    grads form an adjacent chain in one storage (the flat v-param layout by
-    construction) -- the caller then falls back to the legacy gather.
-    """
-    grads = [p.grad for p in params]
-    if not grads or any(g is None for g in grads):
-        return None
-    total = sum(g.numel() for g in grads)
-    ptr = grads[0].data_ptr()
-    for g in grads:
-        if g.dtype is not torch.float32 or not g.is_contiguous() or g.data_ptr() != ptr:
-            return None
-        ptr += g.numel() * g.element_size()
-    return torch.as_strided(grads[0], (total,), (1,))
-
-
-def build_flat_tuning_params(mod: torch.nn.Module, lr_fn, minmax_lr_fn) -> bool:
-    """Rebuild every wrapper tuning parameter as a view of flat group params.
-
-    One fp32 storage per block (``_tune_flat_base`` buffer) holds ALL tuning
-    params; per (kind, lr) group one REAL leaf Parameter spans its slice
-    (``_tune_flat_groups`` ParameterList), and each wrapper's ``m.params[key]``
-    becomes a narrow view of its group parameter (module attr re-pointed,
-    stale leaf registration removed). Autograd accumulates through the views
-    directly into the group parameters' contiguous grads, so the per-iteration
-    gradient gather/scatter in sync_grads collapses to a zero-copy strided
-    view over the group grads (see _flat_grad_buffer).
-
-    Validation happens BEFORE any mutation (dtype/device checks over the full
-    enumeration), so a False return leaves the module untouched (legacy path).
-    Group order: round groups by lr, then minmax groups by lr; within a group
-    the (module, key) order follows named_modules x params-key order -- the
-    same sequence the legacy collector produces, so exchange bytes are
-    identical between the two layouts.
-    """
-    entries = []  # (module_name, key, kind, lr, param)
-    device = None
-    for name, m in mod.named_modules():
-        params = getattr(m, "params", None)
-        if not hasattr(m, "orig_layer") or not isinstance(params, dict):
-            continue
-        rl, ml = float(lr_fn(m)), float(minmax_lr_fn(m))
-        for key, p in params.items():
-            if not isinstance(p, torch.nn.Parameter):
-                continue  # constants / metadata stay as plain dict entries
-            # a non-fp32 or mixed-device Parameter cannot join the flat --
-            # abort so the WHOLE block keeps the legacy layout (a partial
-            # flat would silently drop that parameter from optimizer+exchange)
-            if p.dtype is not torch.float32 or (device is not None and p.device != device):
-                return False
-            if device is None:
-                device = p.device
-            kind = "minmax" if ("min" in key or "max" in key) else "round"
-            entries.append((name, key, kind, ml if kind == "minmax" else rl, p))
-    if not entries:
-        return False
-
-    group_keys = sorted({(e[2], e[3]) for e in entries}, key=lambda gk: (0 if gk[0] == "round" else 1, gk[1]))
-    gidx_of = {gk: i for i, gk in enumerate(group_keys)}
-    sizes = [0] * len(group_keys)
-    for _n, _k, kind, lr, p in entries:
-        sizes[gidx_of[(kind, lr)]] += p.numel()
-    starts = []
-    acc = 0
-    for s in sizes:
-        starts.append(acc)
-        acc += s
-    base = torch.zeros(acc, dtype=torch.float32, device=device)
-    groups = torch.nn.ParameterList(
-        [torch.nn.Parameter(base[st : st + sz]) for (kind, lr), st, sz in zip(group_keys, starts, sizes)]
-    )
-    manifest = []
-    cursors = [0] * len(group_keys)
-    mods = {name: m for name, m in mod.named_modules()}
-    for name, key, kind, lr, p in entries:
-        gidx = gidx_of[(kind, lr)]
-        off = cursors[gidx]
-        n = p.numel()
-        base[starts[gidx] + off : starts[gidx] + off + n] = p.detach().reshape(-1)
-        m = mods[name]
-        gp = groups[gidx]
-        view = gp[off : off + n].view(p.shape)
-        if key in m._parameters:
-            del m._parameters[key]  # plain-tensor setattr below requires this
-        m.params[key] = view
-        # register as a NON-PERSISTENT BUFFER, not a plain attr: torch.compile
-        # lifts params/buffers to graph INPUTS, but BAKES plain-attr tensors as
-        # graph constants -- one baked view set per block meant a per-block
-        # guard-miss recompile AND retention of every block's views (+ their
-        # flat storage) in the dynamo cache, ~1.5 GB/block on the home GPU
-        m.register_buffer(key, view, persistent=False)
-        manifest.append((name, key, gidx, off, n, tuple(p.shape)))
-        cursors[gidx] += n
-
-    mod.register_buffer("_tune_flat_base", base, persistent=False)
-    mod._tune_flat_groups = groups
-    mod._tune_flat_group_lrs = [(kind, lr) for kind, lr in group_keys]
-    mod._tune_flat_manifest = manifest
-    _park_flat_grads(mod)
-    return True
-
-
-def _release_flat_grads(mod: torch.nn.Module) -> None:
-    """Drop the parked flat grad buffer (plain attr: invisible to .to(meta)).
-
-    Module.to() moves only parameters and buffers, so a plain-attr grad
-    buffer would survive the block's meta-release and leak ~1 flat-storage
-    per finished block on its home GPU. The tune is over when this runs;
-    the buffer holds nothing worth keeping.
-    """
-    groups = getattr(mod, "_tune_flat_groups", None)
-    if groups is not None:
-        for gp in groups:
-            gp.grad = None
-    if getattr(mod, "_tune_flat_grad", None) is not None:
-        mod._tune_flat_grad = None
-
-
-def _park_flat_grads(mod: torch.nn.Module, force_new: bool = False) -> None:
-    """Pre-assign each group param's grad as a view of one shared buffer.
-
-    Autograd allocates every leaf's grad independently, so parameters
-    sharing a storage do NOT imply storage-adjacent grads; parking the
-    grads as views of one buffer makes backward accumulate in place into a
-    single contiguous region, which is what the zero-copy exchange (and the
-    single-kernel zero) needs. The buffer starts zeroed; every zero_grad on
-    the tune path must use set_to_none=False so the parking survives (a
-    None grad would fall back to loose allocations -- detected, and then
-    the legacy gather runs, correct but slow).
-    """
-    base = getattr(mod, "_tune_flat_base", None)
-    groups = getattr(mod, "_tune_flat_groups", None)
-    if base is None or groups is None:
-        return
-    grad_buf = getattr(mod, "_tune_flat_grad", None)
-    if force_new or grad_buf is None or grad_buf.shape != base.shape:
-        grad_buf = torch.zeros_like(base)
-        mod._tune_flat_grad = grad_buf
-    offset = 0
-    for gp in groups:
-        n = gp.numel()
-        gp.grad = grad_buf[offset : offset + n]
-        offset += n
-
-
-def _rebuild_flat_views(mirror: torch.nn.Module) -> bool:
-    """Re-narrow every manifest view onto the mirror's own group params.
-
-    Required after ANY mirror construction: replicate+repair rebuilds the
-    group Parameters as fresh objects, Module.to() moves parameter storages
-    without following plain-attr views, and deepcopy+relocate rebinds
-    ``__dict__`` entries -- in all cases the copied views would reference a
-    foreign or stale storage (the silent-divergence bug class fixed by
-    76b0bc76 for leaf params) instead of the mirror's live tuning state.
-    """
-    manifest = getattr(mirror, "_tune_flat_manifest", None)
-    groups = getattr(mirror, "_tune_flat_groups", None)
-    if not manifest or groups is None:
-        return False
-    mods = dict(mirror.named_modules())
-    for name, key, gidx, off, n, shape in manifest:
-        m = mods[name]
-        if not isinstance(getattr(m, "params", None), dict):
-            continue  # stale entry: the wrapper was unwrapped already
-        gp = groups[gidx]
-        view = gp[off : off + n].view(shape)
-        if key in m._parameters:
-            del m._parameters[key]
-        m.params[key] = view
-        # buffer registration (see build_flat_tuning_params): lifted graph
-        # input, not a baked constant
-        m.register_buffer(key, view, persistent=False)
-    _park_flat_grads(mirror, force_new=True)  # fresh group params: park grads on the mirror's own buffer
-    return True
-
-
-def _deepcopy_flat_safe(block: torch.nn.Module, tuning: bool = True) -> torch.nn.Module:
-    """Deepcopy a flat-v-param block: swap views out for detached slices.
-
-    ``copy.deepcopy`` refuses non-leaf tensors (the differentiable views),
-    so every manifest view is temporarily replaced by a plain detached
-    slice -- deepcopy-safe -- the copy is made, home views are re-narrowed,
-    and the caller re-narrows the MIRROR's views from its copied groups
-    (values travel inside the group parameters, not the swapped slices).
-
-    ``tuning=False`` (no-grad collection mirrors): additionally swap the
-    flat base and the group parameters to empty tensors -- a collection
-    forward reads only the per-wrapper VALUES (already riding in the
-    slices), so the full-flat storages need not be cloned per mirror
-    (measured 1.4 s per pass when they were).
-    """
-    manifest = getattr(block, "_tune_flat_manifest", None)
-    groups = getattr(block, "_tune_flat_groups", None)
-    if not manifest or groups is None:
-        return copy.deepcopy(block)
-    mods = dict(block.named_modules())
-    saved = []
-    saved_state = None
-    try:
-        for name, key, gidx, off, n, shape in manifest:
-            m = mods[name]
-            if not isinstance(getattr(m, "params", None), dict):
-                continue  # stale entry: the wrapper was unwrapped already
-            saved.append((m, key, m.params[key], key in m._buffers))
-            swapped = groups[gidx].data[off : off + n].view(shape)
-            m.params[key] = swapped
-            if key in m._buffers:  # buffer-registered views swap in place
-                m._buffers[key] = swapped
-            else:
-                setattr(m, key, swapped)
-        base = getattr(block, "_tune_flat_base", None)
-        grad_buf = getattr(block, "_tune_flat_grad", None)
-        if not tuning and base is not None:
-            saved_state = (
-                dict(block._buffers),
-                [gp.data for gp in groups],
-                {gp: gp.grad for gp in groups},
-                grad_buf,
-            )
-            block._buffers["_tune_flat_base"] = torch.empty(0, device=base.device)
-            for gp in groups:
-                gp.data = torch.empty(0, device=base.device)
-            for gp in groups:
-                gp.grad = None
-        if grad_buf is not None:
-            block._tune_flat_grad = None  # never copy the parked grads
-        mirror = copy.deepcopy(block)
-    finally:
-        if saved_state is not None:
-            bufs, datas, grads, grad_buf = saved_state
-            block._buffers.update(bufs)
-            for gp, d in zip(groups, datas):
-                gp.data = d
-            for gp, g in grads.items():
-                gp.grad = g
-        if grad_buf is not None:
-            block._tune_flat_grad = grad_buf
-        for m, key, view, was_buffer in saved:
-            m.params[key] = view
-            if was_buffer:
-                m._buffers[key] = view
-            else:
-                setattr(m, key, view)
-    return mirror
 
 
 def run_threaded_spawn(fns: Sequence) -> None:
@@ -1609,16 +1349,13 @@ class ReplicaGroup:
                 if not _MIRROR_PATH_LOGGED:
                     _MIRROR_PATH_LOGGED = True
                     logger.info("[tune-ddp] mirror path: replicate+repair engaged (first mirror on %s)", dev)
-                _rebuild_flat_views(mirror)  # repair rebuilt the group params
                 return mirror
             except Exception as e:  # noqa: BLE001 - deepcopy fallback below
                 logger.info("[tune-ddp] replicate mirror onto %s failed (%r); using deepcopy", dev, e)
         if not adopt:
-            mirror = _deepcopy_flat_safe(block).to(dev)
-            _rebuild_flat_views(mirror)
-            return mirror
+            return copy.deepcopy(block).to(dev)
 
-        mirror = _deepcopy_flat_safe(block)
+        mirror = copy.deepcopy(block)
         swapped = []
         for name, param in mirror.named_parameters():
             if ".orig_layer." in name:
@@ -1633,7 +1370,6 @@ class ReplicaGroup:
         for name, key in swapped:
             params[name].data = staged[key].to(params[name].device)
         self.adopted += 1
-        _rebuild_flat_views(mirror)  # .to(dev) does not follow plain-attr views
         return mirror
 
     @staticmethod
@@ -1848,21 +1584,8 @@ class ReplicaGroup:
         if self._overlap is not None or self._init_overlap(params_per_replica):
             self._finish_overlap(params_per_replica, prof)
             return
-        # flat fast-path: when every replica's group grads are storage-adjacent
-        # (the flat v-param layout), exchange zero-copy strided views of the
-        # grads themselves and skip the writeback entirely -- the exchanges
-        # mutate their buffers in place (segment add_/copy_), which then IS
-        # the reduced grad
-        bufs: List[Optional[torch.Tensor]] = []
-        flat_zero_copy = True
         with _stage(prof, "bufprep"):
-            for params in params_per_replica:
-                fb = _flat_grad_buffer(params)
-                if fb is None:
-                    flat_zero_copy = False
-                    bufs = _param_grad_buffers(params_per_replica)
-                    break
-                bufs.append(fb)
+            bufs = _param_grad_buffers(params_per_replica)
         if any(b is None for b in bufs):
             # a replica without gradients means the collected params are not
             # the ones the forward/backward touched -- the tune would silently
@@ -1896,9 +1619,8 @@ class ReplicaGroup:
                 else:
                     halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
         with _stage(prof, "writeback"):
-            if not flat_zero_copy:
-                for buf, params in zip(bufs, params_per_replica):
-                    _write_back_grads(buf, params)
+            for buf, params in zip(bufs, params_per_replica):
+                _write_back_grads(buf, params)
 
     def broadcast_module_attrs(self, attr_names: Tuple[str, ...]) -> None:
         """Copy small anchor attrs (e.g. weight_min/max after a re-grid) to mirrors."""
@@ -1948,8 +1670,6 @@ class ReplicaGroup:
         pool, self._pool = getattr(self, "_pool", None), None
         if pool is not None:
             pool.shutdown()
-        for rep in [self.home] + list(self.mirrors):
-            _release_flat_grads(rep)
         self.mirrors = []
         self.replicas = [self.home]
 
