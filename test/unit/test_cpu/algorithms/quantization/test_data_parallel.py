@@ -2281,3 +2281,10 @@ class TestSerialTrajectoryParity:
             assert torch.equal(loss_g.detach(), loss_l.detach())
         for p_new, p_old in zip(block.parameters(), legacy.parameters()):
             assert torch.equal(p_new, p_old)
+
+    def test_unsupported_torch_build_quietly_refuses(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import serial_graphs_engage
+
+        # this CPU-only box has _cuda_graphs_supported() False natively --
+        # the capability check is the only refusal the refactor ADDED
+        assert serial_graphs_engage(None, **self._args()) is False
