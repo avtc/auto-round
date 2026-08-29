@@ -1489,3 +1489,16 @@ class TestCudaGraphsEngageV2:
         assert dp.cuda_graphs_engage(object(), is_diffusion=True) is False
         assert dp.cuda_graphs_engage(object(), has_valid_token_mask=True) is False
         assert dp.cuda_graphs_engage(object()) == torch.cuda.is_available()
+
+
+class TestSharedHandle:
+    def test_deepcopy_shares_underlying_object(self):
+        import threading
+
+        ev = threading.Event()
+        m = torch.nn.Linear(2, 2)
+        m._gate = SharedHandle(ev)
+        m2 = copy.deepcopy(m)
+        assert m2._gate is m._gate and m2._gate.value is ev
+        m2._gate.value.set()
+        assert ev.is_set()

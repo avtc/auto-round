@@ -778,7 +778,8 @@ class SignRoundQuantizer(BaseQuantizer):
         # capture DEFERS until they finish -- global-mode capture needs the
         # process CUDA-quiet, and joining the packer would serialize ~half
         # the block wall
-        _bg_cuda_threads = [t for t in getattr(block, "_bg_cuda_threads", ()) or () if t is not None]
+        _bg_attr = getattr(block, "_bg_cuda_threads", None)
+        _bg_cuda_threads = [t for t in (_bg_attr.value if _bg_attr is not None else ()) if t is not None]
         if (
             _envs.AR_TUNE_CUDA_GRAPHS
             and replica_group is not None
@@ -790,7 +791,8 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         ):
             _graphs_active = True
-            _graphs_gate = getattr(block, "_graphs_capture_gate", None)
+            _ga = getattr(block, "_graphs_capture_gate", None)
+            _graphs_gate = _ga.value if _ga is not None else None
             if _graphs_gate is not None:
                 # capture-first: hold bg pack/ready work until THIS block's
                 # graphs are captured (released right after; the gate OWNER

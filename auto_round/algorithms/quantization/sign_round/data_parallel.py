@@ -1131,6 +1131,27 @@ def _copy_attr_value(value):
 _GRAPH_CAPTURE_LOCK = threading.Lock()
 
 
+class SharedHandle:
+    """Deepcopy-transparent holder for process-wide handles (Events, Threads).
+
+    Blocks get handles attached as attributes and are later ``copy.deepcopy``
+    -ed (collection mirrors, replica builds); pickling a lock/thread raises.
+    Copies keep the SAME underlying object -- exactly the sharing semantics
+    these handles need.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __copy__(self):
+        return self
+
+
 def _cuda_graphs_supported() -> bool:
     """CUDA graphs need a CUDA build; CPU runs stay eager."""
     return torch.cuda.is_available() and hasattr(torch.cuda, "CUDAGraph")

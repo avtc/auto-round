@@ -2300,7 +2300,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # previous block's bg pack and the next block's ready
                 # transform. The tune loop's CUDA-graph capture defers until
                 # they finish (global-mode capture needs the process quiet).
-                block._bg_cuda_threads = [t for t in (_bg_pack, _bg_thread) if t is not None]
+                from auto_round.algorithms.quantization.sign_round.data_parallel import SharedHandle
+
+                block._bg_cuda_threads = SharedHandle([t for t in (_bg_pack, _bg_thread) if t is not None])
                 # one shared capture gate per run: bg workers (pack of the
                 # previous block, ready-transform of the next) wait on it so
                 # the CURRENT block's tune loop captures its CUDA graphs
@@ -2311,7 +2313,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                     self._graphs_capture_gate = _th.Event()
                     self._graphs_capture_gate.set()
-                block._graphs_capture_gate = self._graphs_capture_gate
+                block._graphs_capture_gate = SharedHandle(self._graphs_capture_gate)
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     try:
                         new_q_input, reference_output = self.alg_composer.compress_block(
