@@ -2378,3 +2378,51 @@ class TestSignStepForeach:
         lin.weight.grad = torch.zeros_like(lin.weight)
         _sign_step_foreach(opt, free_grads=True)
         assert lin.weight.grad is None
+
+
+class TestCompileBwdOverride:
+    """T10: tune-loop-only torch.compile override (A/B lever)."""
+
+    def test_env_default_follow_and_explicit_states(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_COMPILE_BWD", raising=False)
+        assert envs.AR_TUNE_COMPILE_BWD == ""  # follow the shared decision
+        monkeypatch.setenv("AR_TUNE_COMPILE_BWD", "1")
+        assert envs.AR_TUNE_COMPILE_BWD == "1"
+        monkeypatch.setenv("AR_TUNE_COMPILE_BWD", "0")
+        assert envs.AR_TUNE_COMPILE_BWD == "0"
+
+    def test_override_returns_clone_not_shared_runner(self):
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.quantizer import tune_block_forward_runner
+
+        base = BlockForwardRunner(batch_size=2, amp=False, enable_torch_compile=False)
+
+        def sentinel(*a, **k):
+            return "shared"
+
+        base.block_forward = sentinel  # simulate the shared (compiled) runner
+        clone = tune_block_forward_runner(base, "0")
+        assert clone is not base  # tune-only: the shared runner is untouched
+        assert base.block_forward is sentinel  # never mutated
+        assert clone.block_forward is not sentinel
+        assert clone.batch_size == base.batch_size and clone.amp == base.amp
+        forced = tune_block_forward_runner(base, "1")
+        assert forced.block_forward is not sentinel and forced is not base
+
+    def test_force_eager_swaps_raw_callable(self):
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.quantizer import tune_block_forward_runner
+        from auto_round.compressors.utils import block_forward as raw_block_forward
+
+        base = BlockForwardRunner(batch_size=2, amp=False, enable_torch_compile=False)
+        clone = tune_block_forward_runner(base, "0")
+        assert clone.block_forward is raw_block_forward
+
+    def test_unset_returns_runner_unchanged(self):
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.quantizer import tune_block_forward_runner
+
+        base = BlockForwardRunner(batch_size=2, amp=False, enable_torch_compile=False)
+        assert tune_block_forward_runner(base, "") is base
