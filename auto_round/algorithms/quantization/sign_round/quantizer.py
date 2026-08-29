@@ -877,7 +877,7 @@ class SignRoundQuantizer(BaseQuantizer):
             _graphs_warmups_left = _graphed_steps[0].warmup_iters
             logger.info(
                 "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
-                _world,
+                len(_graphed_steps),
                 _graphs_warmups_left,
             )
 
