@@ -398,6 +398,16 @@ export AR_TUNE_PROACTIVE_PREPARE=0   # prepare at iteration start (no run-ahead)
 export AR_TUNE_SERIAL_DELAYED_LOSS=0   # per-batch .item() read before backward (legacy)
 ```
 
+### AR_TUNE_SERIAL_DEVICE_SCHEDULE
+- **Description**: Serial tune loop (no DDP): the per-block shuffle schedule is materialized once at loop entry into a pinned host tensor plus one device index buffer (identical RNG stream to the lazy per-iteration `next_batch` sequence), and each iteration's sample selection runs as a device `index_select` with a host index row for the Python-level list branches -- no host RNG state machine, no pageable H2D, and no per-element tensor-index D2H syncs. Bit-identical draws and gathers.
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled; toggle off only for A/B isolation.
+
+```bash
+export AR_TUNE_SERIAL_DEVICE_SCHEDULE=0   # lazy next_batch + host-list indices (legacy)
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

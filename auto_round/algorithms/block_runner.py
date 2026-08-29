@@ -198,6 +198,7 @@ class BlockForwardRunner:
         input_others: dict,
         indices: torch.Tensor | None = None,
         cache_device=None,
+        host_indices=None,
     ) -> list[torch.Tensor] | torch.Tensor:
         """Run block forward with batching, output normalization, and cache transfer.
 
@@ -240,7 +241,10 @@ class BlockForwardRunner:
 
         for i in range(0, len(indices), self.batch_size):
             batch_indices = indices[i : i + self.batch_size]
-            batch_inputs, batch_others = self._select_batch(inputs, input_others, batch_indices)
+            batch_host = host_indices[i : i + self.batch_size] if host_indices is not None else None
+            batch_inputs, batch_others = self._select_batch(
+                inputs, input_others, batch_indices, host_indices=batch_host
+            )
             raw_output = self._forward_one_batch(block, batch_inputs, batch_others)
             batch_output_dict = self._get_output_dict(raw_output, block)
             output = self._normalize_output(raw_output, block)
@@ -388,16 +392,23 @@ class BlockForwardRunner:
                 output_dict[key] = output[idx]
         return output_dict or None
 
-    def _select_batch(self, inputs, input_others, indices):
+    def _select_batch(self, inputs, input_others, indices, host_indices=None):
         """Select a subset of inputs by indices.
 
         ``indices`` may be a tensor or a plain sequence of host ints -- the
         host-int form avoids per-element ``.item()`` device syncs in the list
         branches (the fence-free prepare path uses it); ``torch.index_select``
-        branches build a device tensor from it on the spot.
+        branches build a device tensor from it on the spot. When ``indices`` is
+        a DEVICE tensor, pass the matching ``host_indices`` row so the list
+        branches keep indexing with host ints instead of per-element tensor
+        ``__index__`` D2H syncs (and stays graph-capture-safe).
         """
         batch_dim = self.batch_dim
         shared_cache_keys = self.shared_cache_keys
+        # host-preferred row for python-level indexing (list branches, shared
+        # cache single-element picks); falls back to ``indices`` for the
+        # legacy host-int call shape
+        host_row = host_indices if host_indices is not None else indices
 
         def _idx_tensor(for_val):
             return indices if isinstance(indices, torch.Tensor) else torch.as_tensor(indices, device=for_val.device)
@@ -409,20 +420,20 @@ class BlockForwardRunner:
                     if isinstance(val, list) and len(val) == 1:
                         selected_inputs[key] = val[0]
                     elif isinstance(val, list) and len(val) > 1:
-                        idx = int(indices[0]) if len(indices) == 1 else 0
+                        idx = int(host_row[0]) if len(host_row) == 1 else 0
                         selected_inputs[key] = val[idx] if idx < len(val) else val[0]
                     else:
                         selected_inputs[key] = val
                 else:
                     if isinstance(val, list):
-                        selected_inputs[key] = _cat_device_safe([val[i] for i in indices], batch_dim)
+                        selected_inputs[key] = _cat_device_safe([val[i] for i in host_row], batch_dim)
                     elif isinstance(val, torch.Tensor):
                         selected_inputs[key] = torch.index_select(val, batch_dim, _idx_tensor(val))
                     else:
                         selected_inputs[key] = val
         else:
             if isinstance(inputs, list):
-                selected_inputs = _cat_device_safe([inputs[i] for i in indices], batch_dim)
+                selected_inputs = _cat_device_safe([inputs[i] for i in host_row], batch_dim)
             else:
                 selected_inputs = torch.index_select(inputs, batch_dim, _idx_tensor(inputs))
 
@@ -435,12 +446,12 @@ class BlockForwardRunner:
                 if isinstance(val, list) and len(val) == 1:
                     selected_others[key] = val[0]
                 elif isinstance(val, list) and len(val) > 1:
-                    idx = int(indices[0]) if len(indices) == 1 else 0
+                    idx = int(host_row[0]) if len(host_row) == 1 else 0
                     selected_others[key] = val[idx] if idx < len(val) else val[0]
                 else:
                     selected_others[key] = val
             elif isinstance(val, list):
-                batch_vals = [val[i] for i in indices]
+                batch_vals = [val[i] for i in host_row]
                 if len(batch_vals) == 1:
                     selected_others[key] = batch_vals[0]
                 else:

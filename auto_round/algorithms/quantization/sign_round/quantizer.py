@@ -1030,6 +1030,7 @@ class SignRoundQuantizer(BaseQuantizer):
         _fence_free = bool(_envs.AR_TUNE_PREPARE_FENCE_FREE)
         _proactive = bool(_envs.AR_TUNE_PROACTIVE_PREPARE)
         _serial_delayed = bool(_envs.AR_TUNE_SERIAL_DELAYED_LOSS)
+        _serial_sched_on = bool(_envs.AR_TUNE_SERIAL_DEVICE_SCHEDULE)
         _proactive_schedule = None
         _graphs_prepared_iter = -2
         _async = replica_group is not None and _envs.AR_TUNE_ASYNC_LOSS and self.dynamic_max_gap <= 0
@@ -1086,6 +1087,32 @@ class SignRoundQuantizer(BaseQuantizer):
         _graphs_capture_t = None
         _graphs_capture_wall = 0.0
         _graphs_capture_iter = -1
+        _serial_rows = None
+        _sched_host = None
+        _serial_idx_dev = None
+        if _serial_sched_on and replica_group is None:
+            # T8a: consume the whole shuffle schedule upfront (identical RNG
+            # stream to the lazy per-iteration next_batch sequence -- tested)
+            # and stage each iteration's indices through one pinned host
+            # tensor + one device buffer: no host RNG state machine and no
+            # pageable H2D on the hot path; graph-capture-ready (static
+            # address after allocator warmup)
+            _serial_rows = [index_sampler.next_batch() for _ in range(self.iters)]
+            try:
+                _sched_host = torch.tensor(_serial_rows, dtype=torch.long)
+                if torch.cuda.is_available():
+                    _sched_host = _sched_host.pin_memory()
+                    _first = active_inputs if isinstance(active_inputs, list) else next(iter(active_inputs.values()))
+                    if isinstance(_first, list):
+                        _first = _first[0]
+                    if torch.is_tensor(_first) and _first.device.type == "cuda":
+                        _serial_idx_dev = torch.empty(global_batch_size, dtype=torch.long, device=_first.device)
+            except (RuntimeError, OSError):
+                # pinning / staging is best-effort: host rows alone still
+                # remove the per-iteration RNG work (bit-identical draws)
+                _sched_host = None
+                _serial_idx_dev = None
+
         if _proactive and _pacing and _graphs_active and _dp_samplers is not None and replica_group is not None:
             # consume the whole shuffle schedule upfront (same RNG stream as
             # the lazy per-iteration next_batch sequence -- deterministic)
@@ -1127,6 +1154,12 @@ class SignRoundQuantizer(BaseQuantizer):
                 elif _dp_samplers is not None:
                     _shards = [s.next_batch() for s in _dp_samplers]
                     global_indices = [j for sh in _shards for j in sh]
+                elif _serial_rows is not None:
+                    global_indices = _serial_rows[i]
+                    if _serial_idx_dev is not None:
+                        # one async pinned H2D per iteration (same stream as
+                        # the consumers -- FIFO-ordered, no event needed)
+                        _serial_idx_dev.copy_(_sched_host[i], non_blocking=True)
                 else:
                     global_indices = index_sampler.next_batch()
                 if valid_token_mask:
@@ -1280,8 +1313,15 @@ class SignRoundQuantizer(BaseQuantizer):
                         _loss_dev = torch.device(loss_device) if loss_device is not None else fp_outputs[0].device
                         expect_pool_local([fp_outputs[i] for i in indices], _loss_dev, "serial-ref")
                         ref_output = torch.cat([fp_outputs[i].to(_loss_dev) for i in indices], dim=0)
+                    if _serial_idx_dev is not None:
+                        _idx_arg = _serial_idx_dev[batch_start : batch_start + batch_size]
+                        _host_arg = indices
+                    else:
+                        _idx_arg, _host_arg = indices, None
                     with tune_stage(tune_prof, "fwd"):
-                        pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
+                        pred_output = block_fwd.forward(
+                            block, active_inputs, input_others, _idx_arg, _fwd_cache_device, host_indices=_host_arg
+                        )
                         if loss_device is not None:
                             pred_output = pred_output.to(loss_device)
                     if (

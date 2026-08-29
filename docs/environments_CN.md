@@ -398,6 +398,16 @@ export AR_TUNE_PROACTIVE_PREPARE=0   # 迭代开始时 prepare（不前瞻）
 export AR_TUNE_SERIAL_DELAYED_LOSS=0   # 反向前逐 batch .item() 读取（旧行为）
 ```
 
+### AR_TUNE_SERIAL_DEVICE_SCHEDULE
+- **描述**： 串行调优循环（无 DDP）：整个 block 的洗牌调度在循环入口一次性物化为一块锁页主机张量加一个设备索引缓冲（与逐迭代惰性 `next_batch` 序列使用相同的 RNG 流），每次迭代的样本选择以设备端 `index_select` 执行，并为 Python 层列表分支提供主机索引行——消除宿主 RNG 状态机、可分页 H2D 以及逐元素张量索引的 D2H 同步。抽取与 gather 均为位一致。
+- **默认值**: `1`
+- **有效值**: `1`, `0`
+- **用法**: 保持开启；仅在 A/B 隔离测试时设 `0`。
+
+```bash
+export AR_TUNE_SERIAL_DEVICE_SCHEDULE=0   # 惰性 next_batch + 主机列表索引（旧行为）
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

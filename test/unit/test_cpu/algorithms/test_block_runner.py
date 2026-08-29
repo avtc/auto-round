@@ -171,3 +171,73 @@ def test_select_batch_host_indices_cover_tensor_others_branch():
     others = {"attention_mask": torch.arange(8, dtype=torch.float32).reshape(4, 2)}
     sel = runner.select_batch([torch.zeros(1, 2, 2)] * 4, others, [3, 1])
     torch.testing.assert_close(sel[1]["attention_mask"], others["attention_mask"][[3, 1]])
+
+
+class TestSerialDeviceSchedule:
+    """T8a: per-block schedule precompute + pinned device-index staging."""
+
+    def test_schedule_matches_lazy_sampler_across_reshuffle(self):
+        import random
+
+        from auto_round.compressors.utils import IndexSampler
+
+        random.seed(1234)
+        lazy = IndexSampler(nsamples=20, batch_size=6)  # forces reshuffles
+        want = [list(lazy.next_batch()) for _ in range(9)]
+        random.seed(1234)
+        eager = IndexSampler(nsamples=20, batch_size=6)
+        pre = [list(eager.next_batch()) for _ in range(9)]
+        assert pre == want  # identical RNG stream incl. reshuffle boundaries
+
+    def test_env_gate_default_on_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_SERIAL_DEVICE_SCHEDULE", raising=False)
+        assert envs.AR_TUNE_SERIAL_DEVICE_SCHEDULE is True
+        monkeypatch.setenv("AR_TUNE_SERIAL_DEVICE_SCHEDULE", "0")
+        assert envs.AR_TUNE_SERIAL_DEVICE_SCHEDULE is False
+
+    def test_staged_index_tensor_round_trip(self):
+        import torch
+
+        rows = [[3, 1, 4], [5, 9, 2], [6, 5, 3]]
+        host = torch.tensor(rows, dtype=torch.long)  # pin_memory only under CUDA
+        dev_buf = torch.zeros(3, dtype=torch.long)
+        for i in range(3):
+            dev_buf.copy_(host[i], non_blocking=True)
+            assert dev_buf.tolist() == rows[i]
+
+
+class TestSelectBatchHostIndices:
+    """T8a: tensor indices + host row must equal legacy host-int selection."""
+
+    def _runner(self):
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+
+        return BlockForwardRunner.__new__(BlockForwardRunner)
+
+    def test_mixed_dict_tensor_plus_host_equals_legacy(self):
+        import torch
+
+        r = self._runner()
+        r.batch_dim = 0
+        r.shared_cache_keys = {"past"}
+        inputs = {
+            "hidden": torch.arange(24, dtype=torch.float32).reshape(6, 4),
+            "past": [torch.full((2, 2), float(i)) for i in range(6)],
+        }
+        others = {"positional_inputs": None, "mask": [torch.ones(2, 4) * i for i in range(6)]}
+        idx = torch.tensor([4, 1, 3])
+        legacy_inputs, legacy_others = r._select_batch(
+            {"hidden": inputs["hidden"].clone(), "past": list(inputs["past"])},
+            {"positional_inputs": None, "mask": list(others["mask"])},
+            [4, 1, 3],
+        )
+        new_inputs, new_others = r._select_batch(inputs, others, idx, host_indices=[4, 1, 3])
+        assert torch.equal(new_inputs["hidden"], legacy_inputs["hidden"])
+        assert torch.equal(new_inputs["past"], legacy_inputs["past"])
+        assert torch.equal(new_others["mask"], legacy_others["mask"])
+        # tensor path without host row must still work for pure-tensor inputs
+        t_in = {"hidden": inputs["hidden"]}
+        t_out, _ = r._select_batch(t_in, {"positional_inputs": None}, idx)
+        assert torch.equal(t_out["hidden"], legacy_inputs["hidden"])

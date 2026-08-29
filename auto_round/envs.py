@@ -219,6 +219,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # loss and backward, starving the GPU mid-iteration).
     "AR_TUNE_SERIAL_DELAYED_LOSS": lambda: os.getenv("AR_TUNE_SERIAL_DELAYED_LOSS", "1").lower()
     in ("1", "true", "yes", "on"),
+    # Serial tune loop: per-block schedule precompute + pinned device-index
+    # staging (T8a -- eager-safe stepping stone for the serial whole-iteration
+    # CUDA graph family).
+    "AR_TUNE_SERIAL_DEVICE_SCHEDULE": lambda: os.getenv("AR_TUNE_SERIAL_DEVICE_SCHEDULE", "1").lower()
+    in ("1", "true", "yes", "on"),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.
