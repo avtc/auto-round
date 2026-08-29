@@ -918,6 +918,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
         _graphs_t0 = time.perf_counter()
         _graphs_capture_t = None
+        _graphs_capture_wall = 0.0
         _graphs_capture_iter = -1
         for i in range(self.iters):
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
@@ -1022,6 +1023,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     # concurrent CUDA during capture, so all captures run
                     # sequentially here on the main thread; the immediate
                     # replay inside capture_now executes this iteration's work
+                    _cap_t0 = time.perf_counter()
                     with tune_stage(tune_prof, "fwd"):
                         for r in range(_world):
                             _graphed_steps[r].prepare(_shards[r])
@@ -1037,6 +1039,7 @@ class SignRoundQuantizer(BaseQuantizer):
                             raise
                         _graphs_capture_pending = False
                         _graphs_capture_t = time.perf_counter()
+                        _graphs_capture_wall = _graphs_capture_t - _cap_t0
                         _graphs_capture_iter = i + 1
                         if _graphs_gate is not None:
                             _graphs_gate.set()  # release held bg pack/ready work
@@ -1196,11 +1199,13 @@ class SignRoundQuantizer(BaseQuantizer):
             _pre_ms = (_graphs_capture_t - _graphs_t0) * 1000 / max(_pre, 1)
             _post_ms = (time.perf_counter() - _graphs_capture_t) * 1000 / max(_post, 1)
             logger.info(
-                "[tune-ddp] cuda graphs timing: eager %d iters %.1f ms/iter -> replay %d iters %.1f ms/iter",
+                "[tune-ddp] cuda graphs timing: eager %d iters %.1f ms/iter -> replay %d iters %.1f ms/iter "
+                "(capture %.2fs)",
                 _pre,
                 _pre_ms,
                 _post,
                 _post_ms,
+                _graphs_capture_wall,
             )
         if _graphs_gate is not None:
             _graphs_gate.set()  # never hold bg work past the tune loop
