@@ -793,9 +793,8 @@ class SignRoundQuantizer(BaseQuantizer):
             _graphs_gate = getattr(block, "_graphs_capture_gate", None)
             if _graphs_gate is not None:
                 # capture-first: hold bg pack/ready work until THIS block's
-                # graphs are captured (released right after, and at loop end;
-                # workers bound the wait at 600s so a failed tune cannot
-                # deadlock the pipeline)
+                # graphs are captured (released right after; the gate OWNER
+                # also releases on every exit, so workers can wait unbounded)
                 _graphs_gate.clear()
 
         # When low_gpu_mem_usage is enabled, active_inputs / fp_outputs are intentionally
@@ -1021,8 +1020,16 @@ class SignRoundQuantizer(BaseQuantizer):
                     with tune_stage(tune_prof, "fwd"):
                         for r in range(_world):
                             _graphed_steps[r].prepare(_shards[r])
-                        for r in range(_world):
-                            _losses[r] = _graphed_steps[r].capture_now()
+                        try:
+                            for r in range(_world):
+                                _losses[r] = _graphed_steps[r].capture_now()
+                        except BaseException:
+                            # halt semantics: open the gate before the run
+                            # aborts so held bg workers never outlive the
+                            # failure (the owner's finally is the backstop)
+                            if _graphs_gate is not None:
+                                _graphs_gate.set()
+                            raise
                         _graphs_capture_pending = False
                         if _graphs_gate is not None:
                             _graphs_gate.set()  # release held bg pack/ready work

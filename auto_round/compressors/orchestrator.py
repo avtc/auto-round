@@ -1634,9 +1634,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         def _worker():
             from auto_round.algorithms.composer import BlockContext
 
+            # unbounded wait: the gate owner (compress_block caller) releases
+            # on every exit path; a set gate (graphs disabled) passes through
             gate = getattr(self, "_graphs_capture_gate", None)
-            if gate is not None and not gate.wait(timeout=600):
-                logger.warning("[stream] bg ready-transform waited 600s on the capture gate; proceeding")
+            if gate is not None:
+                gate.wait()
             block = get_module(self.model, block_name)
             try:
                 if home.type == "cuda":
@@ -1714,9 +1716,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             import time as _wtime
 
             try:
+                # unbounded wait: the gate owner releases on every exit path
                 gate = getattr(self, "_graphs_capture_gate", None)
-                if gate is not None and not gate.wait(timeout=600):
-                    logger.warning("[stream] bg pack waited 600s on the capture gate; proceeding")
+                if gate is not None:
+                    gate.wait()
                 _t0 = _wtime.perf_counter()
                 from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
@@ -2310,14 +2313,22 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self._graphs_capture_gate.set()
                 block._graphs_capture_gate = self._graphs_capture_gate
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
-                    new_q_input, reference_output = self.alg_composer.compress_block(
-                        block,
-                        calib_state["fp_inputs"],
-                        calib_state["input_others"],
-                        block_ctx=ctx,
-                        q_inputs=calib_state.get("q_inputs"),
-                        input_ids=calib_state.get("token_ids"),
-                    )
+                    try:
+                        new_q_input, reference_output = self.alg_composer.compress_block(
+                            block,
+                            calib_state["fp_inputs"],
+                            calib_state["input_others"],
+                            block_ctx=ctx,
+                            q_inputs=calib_state.get("q_inputs"),
+                            input_ids=calib_state.get("token_ids"),
+                        )
+                    finally:
+                        # the gate OWNER releases on every exit: normal end,
+                        # capture failure, any exception -- bg workers wait
+                        # unbounded, so no path may leave the gate cleared
+                        _gate = getattr(self, "_graphs_capture_gate", None)
+                        if _gate is not None:
+                            _gate.set()
                     calib_state["fp_inputs"] = reference_output
                     if self.alg_composer.need_quanted_input():
                         # qon: the next block tunes against this block's
