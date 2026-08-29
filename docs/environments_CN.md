@@ -309,15 +309,6 @@ export AR_POST_SCALE_REFIT=1
 export AR_BIAS_CORRECT=1
 ```
 
-### AR_ALT2_ITERS2
-- **描述**: `AR_TUNE_RECIPE=alt2`（交替重定网格）时第二轮调优的迭代数。第一轮在初始搜索网格上调优舍入 `iters - iters2` 次；随后每个 alt2 层在受扰动的等效权重上重跑 NeUQI 搜索、重新锚定网格、将舍入参数清零，第二轮在新网格上再调优 `iters2` 次。切换时丢弃第一轮的最佳参数缓存（网格已改变）。
-- **默认值**: `0`（取 `--iters` 的一半）
-- **有效值**: `0`（自动：一半），或 `1` … `iters-1`
-
-```bash
-export AR_TUNE_RECIPE=alt2 AR_ALT2_ITERS2=10   # + --iters 20 --asym
-```
-
 ### AR_QOFF_NOISE
 - **描述**: qoff（FP 参考链）调优解锁器。BPT/串行 qoff 调优针对 FP 参考输入优化每个 block，而部署的量化链根本不会产生这些输入——正是实测的部署失配回退。启用后，调优前向将逐通道量化噪声 `mean + std*eps`（上一个量化 block 的输出漂移统计量，`eps` 按 block 种子确定性生成）注入 FP 输入；缓存的 FP 输入绝不会被原地修改。block 0 跳过注入（其输入是 embedding）。守卫：qon 下（量化输入链已看到真实输入）、未设置 `AR_QOFF_NOISE_STATS`、统计文件缺失或宽度不匹配时均硬报错。
 - **默认值**: `0`（关闭）
@@ -344,7 +335,7 @@ export AR_TOUCHUP_ITERS=5   # 同一个 AR_RESUME_DIR；去掉 --enable_block_pa
 ### AR_TUNE_RECIPE
 - **描述**: SignRound 调优路径（`--iters > 0`）的实验性初始化搜索配方。配方用搜索到的网格替换逐组 min/max 调优网格：`neuqi_*` 锚定联合（scale、整数零点）搜索（`neuqi_search_scale_zero`，imatrix 加权）；`opt_rtn_qon` 锚定对称 scale-clip 搜索。`neuqi_frozen_qon` 额外把 `min_scale`/`max_scale` 调优边距固定为 1.0（网格完全固定，仅调舍入）。`neuqi_fp` 与 `neuqi_qon` 的区别仅在于初始化 imatrix 来自哪条链（FP 参考链 vs 量化链）——流式 qon 下实时 imatrix 本身就是链一致的。配方适用于标准（非 tuple）group size 的 int 数据类型；不支持的布局保持 min/max 网格。
 - **默认值**: 未设置（保持现状 min/max 初始化）
-- **有效值**: `minmax_qon`（显式对照臂）、`neuqi_qon`、`neuqi_frozen_qon`、`neuqi_fp`（兼容 BPT/qoff）、`opt_rtn_qon`（仅对称）、`alt2`（尚未实现）、`neuqi_it0`（零样本参考标记；需 `--iters 0`）
+- **有效值**: `minmax_qon`（显式对照臂）、`neuqi_qon`、`neuqi_frozen_qon`、`neuqi_fp`（兼容 BPT/qoff）、`opt_rtn_qon`（仅对称）、`neuqi_it0`（零样本参考标记；需 `--iters 0`）
 - **用法**: 在小模型上按 KLD 对比分量配方。`neuqi_*` 需要 `--asym`；`opt_rtn_qon` 需要对称。可与 `AR_POST_SCALE_REFIT`、`AR_BIAS_CORRECT` 组合。
 
 ```bash

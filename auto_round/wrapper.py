@@ -115,7 +115,7 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
         for dev_idx in range(torch.cuda.device_count()):
             torch.cuda.synchronize(dev_idx)
 
-    if recipe.startswith("neuqi_") or recipe == "alt2":
+    if recipe.startswith("neuqi_"):
         from auto_round.data_type.neuqi import neuqi_search_scale_zero
 
         # the extension Triton sweep stays the default here as everywhere
@@ -409,62 +409,6 @@ class WrapperLinear(torch.nn.Module):
 
             self.bias_quant_func = quant_tensor_asym_wo_round
             self.params["bias_v"] = self.bias_v
-
-    def alt2_regrid(self):
-        """alt2 mid-tune re-grid: re-run the init search on the perturbed
-        effective weights, re-anchor weight_min/weight_max, reset the rounding
-        params to zero (and the margins to 1.0). Returns mean |delta scale|
-        telemetry, or None when this layer does not participate.
-        """
-        from auto_round.data_type.neuqi import neuqi_search_scale_zero
-
-        if getattr(self, "_tune_recipe", "") != "alt2" or self.orig_layer.bits >= 16:
-            return None
-        gs = self.orig_layer.group_size
-        if isinstance(gs, tuple):
-            return None
-        import transformers
-
-        with torch.no_grad():
-            w = self.orig_layer.weight.detach().to(device=self.device, dtype=torch.float32)
-            if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
-                w = w.t()  # Conv1D stores [in, out]; groups follow rows
-            w_reshape, _shape, _pad = reshape_pad_tensor_by_group_size(w, gs)
-            maxq = float(2**self.orig_layer.bits - 1)
-            # fold the tuned margins into the grid the rounding acted on --
-            # quant_tensor_asym multiplies wmin/wmax by min_scale/max_scale
-            min_scale = self.min_scale.detach().float().reshape(-1, 1)
-            max_scale = self.max_scale.detach().float().reshape(-1, 1)
-            s_cur = (
-                self.weight_max.float().reshape(-1, 1) * max_scale - self.weight_min.float().reshape(-1, 1) * min_scale
-            ) / maxq
-            w_eff = w_reshape + self.value.detach().reshape(w_reshape.shape) * s_cur
-            imatrix = getattr(self.orig_layer, "imatrix", None)
-            qw = _prepare_recipe_imatrix(imatrix, w_eff, self.orig_layer.bits, gs) if imatrix is not None else None
-            scale, zp = neuqi_search_scale_zero(
-                w_eff,
-                self.orig_layer.bits,
-                qw=qw.to(self.device) if qw is not None else None,
-                q_scale_thresh=self.q_scale_thresh,
-                coarse_n=int(envs.AR_NEUQI_COARSE),
-                fine_n=int(envs.AR_NEUQI_FINE),
-            )
-            self.weight_min = (-zp * scale).squeeze(-1).to(self.weight_min.dtype)
-            self.weight_max = ((maxq - zp) * scale).squeeze(-1).to(self.weight_max.dtype)
-            # margins restart from 1.0 against the fresh anchors: leaving the
-            # tuned values would shift round 2 off the searched grid
-            for pname in ("min_scale", "max_scale"):
-                pm = self.params.get(pname) if isinstance(self.params, dict) else None
-                if pm is not None:
-                    pm.data.fill_(1.0)
-                else:
-                    getattr(self, pname).fill_(1.0)
-            v = self.params.get("value") if isinstance(self.params, dict) else None
-            if v is not None:
-                v.data.zero_()
-            elif isinstance(self.value, torch.Tensor):
-                self.value.zero_()
-            return (scale - s_cur).abs().mean().item()
 
     def anchor_recipe_grid(self):
         """Run the deferred AR_TUNE_RECIPE init-search and pin the grid now.

@@ -145,14 +145,6 @@ class TestGuardMatrix:
         with pytest.raises(ValueError, match="zero-shot reference"):
             self._g()
 
-    def test_alt2_guards(self, monkeypatch):
-        monkeypatch.setenv("AR_TUNE_RECIPE", "alt2")
-        self._g()  # implemented now: resolves cleanly
-        with pytest.raises(ValueError, match="alt2"):
-            self._g(sym=True)
-        with pytest.raises(ValueError, match="2 tuning iterations"):
-            self._g(iters=1)
-
     def test_neuqi_requires_asym(self, monkeypatch):
         monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
         with pytest.raises(ValueError, match="asymmetric"):
@@ -373,94 +365,6 @@ class TestBiasCorrect:
         import auto_round.envs as envs
 
         assert not envs.AR_BIAS_CORRECT
-
-
-class TestAlt2:
-    """alt2: alternating re-grid — switch math, dispatch, wrapper re-grid."""
-
-    def test_switch_iter_math(self):
-        from auto_round.algorithms.quantization.sign_round.quantizer import alt2_switch_iter
-
-        assert alt2_switch_iter(20, "alt2", 0) == 10  # default half
-        assert alt2_switch_iter(20, "alt2", 5) == 15
-        assert alt2_switch_iter(20, "neuqi_qon", 5) is None  # other recipes
-        assert alt2_switch_iter(1, "alt2", 0) is None  # needs >= 2 iters
-        assert alt2_switch_iter(0, "alt2", 0) is None
-
-    def test_switch_iter_bounds_guard(self):
-        from auto_round.algorithms.quantization.sign_round.quantizer import alt2_switch_iter
-
-        for bad in (0, -1, 20, 21):
-            if bad == 0:  # 0 = half, valid
-                continue
-            try:
-                alt2_switch_iter(20, "alt2", bad)
-                raised = False
-            except ValueError as e:
-                raised = "AR_ALT2_ITERS2" in str(e)
-            if bad in (-1, 20, 21):
-                assert raised, f"bounds guard failed for {bad}"
-
-    def test_dispatch_alt2_no_longer_raises(self, monkeypatch):
-        from auto_round.data_type import get_quant_func
-
-        monkeypatch.setenv("AR_TUNE_RECIPE", "alt2")
-        fn, dt = get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=20, asym_search="auto")
-        assert callable(fn)
-        # sym alt2 and iters<2 must fail fast
-        for sym, iters in ((True, 20), (False, 1)):
-            try:
-                get_quant_func("int", 4, sym, disable_opt_rtn=True, group_size=128, iters=iters, asym_search="auto")
-                raised = False
-            except ValueError:
-                raised = True
-            assert raised, f"alt2 guard missing for sym={sym} iters={iters}"
-
-    def test_wrapper_regrid_anchors_and_resets_v(self, monkeypatch):
-        from auto_round.wrapper import WrapperLinear
-
-        monkeypatch.setenv("AR_TUNE_RECIPE", "alt2")
-        layer = TestWrapperIntegration._armed_linear()
-        w = WrapperLinear(
-            layer,
-            enable_minmax_tuning=True,
-            enable_round_tuning=True,
-            enable_norm_bias_tuning=False,
-            device="cpu",
-            enable_torch_compile=False,
-            disable_opt_rtn=True,
-            asym_search="auto",
-            iters=20,
-        )
-        assert w._tune_recipe == "alt2"
-        assert "value" in w.params
-        with torch.no_grad():  # perturb v as round 1 would
-            w.params["value"].uniform_(-0.4, 0.4)
-        min_before, max_before = w.weight_min.clone(), w.weight_max.clone()
-
-        ds = w.alt2_regrid()
-        assert ds is not None and ds >= 0
-        assert torch.equal(w.params["value"].data, torch.zeros_like(w.params["value"])), "v reset to 0"
-        # anchors are a fresh search on the perturbed weights -> may move
-        assert w.weight_min.shape == min_before.shape
-
-    def test_regrid_skips_non_alt2_layers(self, monkeypatch):
-        from auto_round.wrapper import WrapperLinear
-
-        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
-        layer = TestWrapperIntegration._armed_linear()
-        w = WrapperLinear(
-            layer,
-            enable_minmax_tuning=True,
-            enable_round_tuning=True,
-            enable_norm_bias_tuning=False,
-            device="cpu",
-            enable_torch_compile=False,
-            disable_opt_rtn=True,
-            asym_search="auto",
-            iters=20,
-        )
-        assert w.alt2_regrid() is None  # not an alt2 layer
 
 
 class TestQoffNoise:
@@ -684,6 +588,20 @@ class TestTouchup:
 class TestReviewFixes:
     """Regression tests for the code-review findings (imatrix, sym, act-path, Conv1D)."""
 
+    def test_cross_env_guards(self, monkeypatch):
+        import auto_round.envs as envs
+        from auto_round.data_type import get_quant_func
+
+        monkeypatch.setenv("AR_QOFF_NOISE", "1")
+        with pytest.raises(ValueError, match="AR_QOFF_NOISE=1 injects"):
+            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=0, asym_search="auto")
+
+        monkeypatch.delenv("AR_QOFF_NOISE", raising=False)
+        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
+        monkeypatch.setenv("AR_TOUCHUP_ITERS", "5")
+        with pytest.raises(ValueError, match="one or the other"):
+            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=20, asym_search="auto")
+
     def test_recipe_anchor_with_1d_imatrix(self, monkeypatch):
         """The standard 1D [in_features] imatrix must not crash the anchor search."""
         from auto_round.wrapper import _compute_recipe_anchors
@@ -768,76 +686,6 @@ class TestReviewFixes:
             enable_act_quant=True,
         )
         assert w.act_quant_func is not None
-
-    def test_cross_env_guards(self, monkeypatch):
-        import auto_round.envs as envs
-        from auto_round.data_type import get_quant_func
-
-        monkeypatch.setenv("AR_ALT2_ITERS2", "10")
-        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
-        with pytest.raises(ValueError, match="AR_ALT2_ITERS2 only applies"):
-            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=20, asym_search="auto")
-
-        monkeypatch.setenv("AR_ALT2_ITERS2", "0")
-        monkeypatch.setenv("AR_QOFF_NOISE", "1")
-        with pytest.raises(ValueError, match="AR_QOFF_NOISE=1 injects"):
-            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=0, asym_search="auto")
-
-        monkeypatch.delenv("AR_QOFF_NOISE", raising=False)
-        monkeypatch.setenv("AR_TOUCHUP_ITERS", "5")
-        with pytest.raises(ValueError, match="one or the other"):
-            get_quant_func("int", 4, False, disable_opt_rtn=True, group_size=128, iters=20, asym_search="auto")
-
-    def test_regrid_rederives_searched_grid(self, monkeypatch):
-        """After alt2_regrid the STE grid equals a manual search on w + v*s (R1-17)."""
-        from auto_round.data_type.int import quant_tensor_asym
-        from auto_round.data_type.neuqi import neuqi_search_scale_zero
-        from auto_round.wrapper import WrapperLinear
-
-        monkeypatch.setenv("AR_TUNE_RECIPE", "alt2")
-        layer = TestWrapperIntegration._armed_linear()
-        w = WrapperLinear(
-            layer,
-            enable_minmax_tuning=True,
-            enable_round_tuning=True,
-            enable_norm_bias_tuning=False,
-            device="cpu",
-            enable_torch_compile=False,
-            disable_opt_rtn=True,
-            asym_search="auto",
-            iters=20,
-        )
-        with torch.no_grad():
-            w.params["value"].uniform_(-0.4, 0.4)
-            # simulate tuned margins != 1.0
-            w.params["min_scale"].fill_(0.95)
-            w.params["max_scale"].fill_(1.05)
-            # snapshot the pre-switch state the manual reference must replay
-            v_snap = w.params["value"].detach().clone()
-            maxq = float(2**4 - 1)
-            s_eff = (w.weight_max.float().reshape(-1, 1) * 1.05 - w.weight_min.float().reshape(-1, 1) * 0.95) / maxq
-            w_eff_snap = layer.weight.float().reshape(16, 16) + v_snap.reshape(16, 16) * s_eff
-            w.alt2_regrid()
-        # margins must be back at 1.0 against the new anchors
-        torch.testing.assert_close(w.min_scale.detach(), torch.full_like(w.min_scale.detach(), 1.0), rtol=0, atol=1e-6)
-        torch.testing.assert_close(w.max_scale.detach(), torch.full_like(w.max_scale.detach(), 1.0), rtol=0, atol=1e-6)
-        # STE re-derivation matches a manual search on the pre-switch effective weights
-        with torch.no_grad():
-            s_man, zp_man = neuqi_search_scale_zero(w_eff_snap, 4)
-            _, scale_out, zp_out = quant_tensor_asym(
-                layer.weight,
-                bits=4,
-                group_size=16,
-                tensor_min=w.weight_min,
-                tensor_max=w.weight_max,
-                scale_dtype=torch.float32,
-            )
-        torch.testing.assert_close(scale_out.squeeze(-1), s_man.squeeze(-1), rtol=0, atol=1e-7)
-        torch.testing.assert_close(zp_out.squeeze(-1), zp_man.squeeze(-1), rtol=0, atol=1e-5)
-
-
-class TestBackendOverride:
-    """Recipe wrapper-init searches pin the compile backend (Triton race workaround)."""
 
     def test_override_disables_triton_enables_compile(self):
         from auto_round.data_type.neuqi import _zp_wants_compile, _zp_wants_triton, backend_override

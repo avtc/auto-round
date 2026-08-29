@@ -475,7 +475,7 @@ class TestDelayedBestTracker:
         tr.reset()
         assert tr.best_loss is None and tr.best_params is None and tr.best_iter is None
         assert tr.resolve() is None  # pending dropped too
-        # fresh selection after reset (alt2 re-grid semantics)
+        # fresh selection after reset
         self._run(tr, [9.0, 8.0])
         assert tr.best_loss == 8.0 and tr.best_iter == 1
 

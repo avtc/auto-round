@@ -143,24 +143,6 @@ def _shard_recipe_anchor(replica_group):
                 dst._pin_margins_frozen()
 
 
-def alt2_switch_iter(iters: int, recipe: str, iters2_env: int):
-    """Iteration index (exclusive) at which the alt2 re-grid fires, or None.
-
-    Round 1 tunes on the init-search grid for ``iters - iters2`` iterations;
-    the re-grid then re-anchors every alt2 layer to a fresh search over the
-    perturbed effective weights and resets the rounding params; round 2 tunes
-    for ``iters2`` more. ``iters2_env=0`` means "half of iters".
-    """
-    if recipe != "alt2" or iters < 2:
-        return None
-    if iters2_env < 0:
-        raise ValueError(f"AR_ALT2_ITERS2={iters2_env} must be >= 0 (0 = half of iters).")
-    iters2 = iters2_env if iters2_env > 0 else iters // 2
-    if not 1 <= iters2 < iters:
-        raise ValueError(f"AR_ALT2_ITERS2={iters2} must be in [1, {iters - 1}] (iters={iters}).")
-    return iters - iters2
-
-
 def _maybe_qoff_noise(active_inputs, block_index: int, enable_quanted_input: bool):
     """Inject per-channel quantization noise into FP chain inputs (AR_QOFF_NOISE).
 
@@ -213,22 +195,6 @@ def _maybe_qoff_noise(active_inputs, block_index: int, enable_quanted_input: boo
         shift = mean + std * torch.randn(t.shape, generator=gen, dtype=torch.float32)
         out.append(t + shift.to(dtype=t.dtype, device=t.device))
     return out
-
-
-def _alt2_regrid_block(block) -> float:
-    """Re-grid every participating wrapper in the block; returns mean |delta scale|."""
-    deltas = []
-    for _, m in block.named_modules():
-        if getattr(m, "_tune_recipe", "") != "alt2":
-            continue
-        ds = m.alt2_regrid()
-        if ds is not None:
-            deltas.append(ds)
-    if not deltas:
-        return 0.0
-    mean_ds = sum(deltas) / len(deltas)
-    logger.info("[alt2] re-grid %d layers, mean |delta scale| %.3e", len(deltas), mean_ds)
-    return mean_ds
 
 
 from auto_round.utils.distributed import setup_ddp_if_needed_
@@ -878,9 +844,6 @@ class SignRoundQuantizer(BaseQuantizer):
                 nsamples=nsamples,
             )
 
-        _alt2_switch = alt2_switch_iter(self.iters, _envs.AR_TUNE_RECIPE, _envs.AR_ALT2_ITERS2)
-        _alt2_regridded = False
-
         # delayed-loss mode (DDP only): read loss(i).item() at iteration i+1 so
         # the drain overlaps the next iteration's already-enqueued GPU work
         # instead of stalling the pipeline between iterations; best-params
@@ -1072,24 +1035,6 @@ class SignRoundQuantizer(BaseQuantizer):
                 with tune_stage(tune_prof, "step"):
                     self._step(scaler, optimizer, lr_schedule)
 
-            if _alt2_switch is not None and (i + 1) == _alt2_switch and not _alt2_regridded:
-                _alt2_regrid_block(block)
-                _alt2_regridded = True
-                if replica_group is not None:
-                    replica_group.broadcast_module_attrs(("weight_min", "weight_max"))
-                    for _mopt in mirror_optimizers:
-                        _mopt.state = defaultdict(dict) if hasattr(_mopt.state, "default_factory") else {}
-                # the grid changed: round-1 best params/cache and any optimizer
-                # moments reference the old grid -- drop them all
-                best_loss = torch.finfo(torch.float).max
-                best_params = {}
-                last_best_iter = i
-                optimizer.state = defaultdict(dict) if hasattr(optimizer.state, "default_factory") else {}
-                init_loss = None
-                if _delayed:
-                    _tracker.reset()  # pending iteration + ring belong to the old grid
-                    _init_done = True  # keep init_loss None (iter 0 was on the old grid)
-
         if replica_group is not None:
             replica_group.teardown()
         if _delayed:
@@ -1121,7 +1066,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 f"quantized {len(quantized_layer_names)}/{(len(quantized_layer_names) + len(unquantized_layer_names))} "
                 f"layers in the block, loss iter 0: {init_loss:.6f} -> iter {best_iter}: {last_loss:.6f}"
             )
-        elif self.iters > 0:  # alt2: iter 0 belonged to the superseded round-1 grid
+        elif self.iters > 0:  # no iter-0 loss recorded (e.g. loss read skipped)
             dump_info = (
                 f"quantized {len(quantized_layer_names)}/{(len(quantized_layer_names) + len(unquantized_layer_names))} "
                 f"layers in the block, best iter {best_iter}: {last_loss:.6f}"

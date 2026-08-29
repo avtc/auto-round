@@ -246,9 +246,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # re-enable; the structure is kept for a single-threaded fan-out rework.
     "AR_DISABLE_OVERLAP_EXCHANGE": lambda: os.getenv("AR_DISABLE_OVERLAP_EXCHANGE", "1").lower()
     in ("1", "true", "yes"),
-    # alt2 (alternating re-grid): iterations of the SECOND tuning round after
-    # the mid-tune re-grid; 0 = half of --iters.
-    "AR_ALT2_ITERS2": lambda: int(os.getenv("AR_ALT2_ITERS2", "0") or 0),
     # qoff (FP-reference-chain) tuning unblocker: inject per-channel
     # quantization noise into the FP block inputs during SignRound tuning.
     "AR_QOFF_NOISE": lambda: os.getenv("AR_QOFF_NOISE", "0").lower() in ("1", "true", "yes"),

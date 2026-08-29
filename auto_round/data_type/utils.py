@@ -154,16 +154,12 @@ def get_quant_func(
             f"AR_TOUCHUP_ITERS anchors every layer from the stored result grid; AR_TUNE_RECIPE={recipe!r} "
             "would fight it on layers without results. Use one or the other."
         )
-    if weight_path and envs.AR_ALT2_ITERS2 > 0 and recipe != "alt2":
-        raise ValueError(
-            f"AR_ALT2_ITERS2 only applies to AR_TUNE_RECIPE=alt2 (current: {recipe!r}). Unset it or set alt2."
-        )
     if weight_path and envs.AR_QOFF_NOISE and iters == 0:
         raise ValueError(
             "AR_QOFF_NOISE=1 injects noise during SignRound tuning; the zero-shot path (iters=0) never "
             "tunes. Unset AR_QOFF_NOISE."
         )
-    _tuning_recipes = ("minmax_qon", "neuqi_qon", "neuqi_frozen_qon", "neuqi_fp", "opt_rtn_qon", "alt2")
+    _tuning_recipes = ("minmax_qon", "neuqi_qon", "neuqi_frozen_qon", "neuqi_fp", "opt_rtn_qon")
     _valid = ("",) + _tuning_recipes + ("neuqi_it0",)
     if recipe not in _valid:
         raise ValueError(f"AR_TUNE_RECIPE={recipe!r} is not one of {_valid}.")
@@ -177,11 +173,6 @@ def get_quant_func(
             f"AR_TUNE_RECIPE={recipe!r} anchors the SignRound tuning path (iters>0); with iters=0 "
             "the zero-shot search dispatch already runs. Unset the variable or use neuqi_it0."
         )
-    if recipe == "alt2":
-        if sym:
-            raise ValueError('AR_TUNE_RECIPE="alt2" requires the asymmetric path (sym=False).')
-        if iters < 2:
-            raise ValueError('AR_TUNE_RECIPE="alt2" needs at least 2 tuning iterations to alternate grids.')
     if recipe.startswith("neuqi_") and recipe != "neuqi_it0" and sym:
         raise ValueError(f"AR_TUNE_RECIPE={recipe!r} requires the asymmetric path (sym=False).")
     if recipe == "opt_rtn_qon" and not sym:
