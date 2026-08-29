@@ -1838,9 +1838,11 @@ class TestSerialDeferredLoss:
         from auto_round.algorithms.quantization.sign_round.data_parallel import accumulate_serial_loss
 
         terms = [0.25, 1.5, 3.75, 0.125, 0.1, 0.2, 0.3]  # incl. non-representable
+        # legacy reference: loss.item() is the EXACT fp32->fp64 lift, then fp64 math
+        lifted = [float(torch.tensor(t, dtype=torch.float32).item()) for t in terms]
         want = 0.0
-        for t in terms:
-            want += t / 2.0  # python float (fp64) sum, same order
+        for lt in lifted:
+            want += lt / 2.0  # python float (fp64) sum, same order
         acc = None
         for t in terms:
             acc = accumulate_serial_loss(acc, torch.tensor(t, dtype=torch.float32), 2.0)
