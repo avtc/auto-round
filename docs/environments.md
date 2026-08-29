@@ -344,9 +344,9 @@ export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 
 ### AR_TUNE_DDP_DELAYED_LOSS
 - **Description**: Defer the tune-loop's per-iteration loss read by one iteration under DDP tuning, so the host's `.item()` drain-wait overlaps the freshly enqueued forward/backward instead of stalling the pipeline between iterations. Measured at world=4 on a 27B model: ~59 ms/iter faster together with the persistent thread pool (AR_TUNE_DDP_THREAD_POOL); the deferred read also stages one extra snapshot of the block's tuning params (v/min-max) on the primary device every iteration. Turning it off reclaims exactly that snapshot's VRAM (≈ 4 bytes x the block's tuning-parameter count -- ~1.3 GB for a 27B dense block, proportionally more for larger dense blocks) at little measured wall cost: in the world=4 isolation runs the delayed read was time-neutral within noise (arms with and without it both ~400 ms/iter; the loss read re-serializes but overlaps the GPU chain either way). It is expected to matter when the host is the bottleneck (world>=8) and is the foundation for fully async loss resolution. Also disables when `dynamic_max_gap > 0` (early-stop needs the in-loop loss).
-- **Default**: `1`
+- **Default**: `0`
 - **Valid Values**: `1`, `0`
-- **Usage**: Keep enabled for speed; set `0` on VRAM-tight setups (e.g. large dense blocks of MoE checkpoints on 24 GB cards) to reclaim one tuning-param copy on the primary device.
+- **Usage**: Opt-in for the delayed-read pipeline structure (and for the future fully-async loss resolution); the default `0` keeps only current+best param copies on the primary device, reclaiming the pending snapshot slot (~tuning-params-size VRAM, e.g. ~1.3 GB for a 27B dense block).
 
 ```bash
 export AR_TUNE_DDP_DELAYED_LOSS=0   # reclaim ~params-size VRAM on the primary device, ~8-15% slower iters

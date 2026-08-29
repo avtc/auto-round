@@ -521,12 +521,12 @@ class TestDelayedBestTracker:
         assert last_best_iter == 0
         assert abs(best_loss - vals[0]) < 1e-12  # same scale as init, not world x
 
-    def test_delayed_env_gate_default_and_opt_out(self, monkeypatch):
+    def test_delayed_env_gate_default_and_opt_in(self, monkeypatch):
         from auto_round import envs
 
+        assert envs.AR_TUNE_DDP_DELAYED_LOSS is False  # default off: reclaims the pending snapshot slot
+        monkeypatch.setattr(envs, "AR_TUNE_DDP_DELAYED_LOSS", True)
         assert envs.AR_TUNE_DDP_DELAYED_LOSS is True
-        monkeypatch.setattr(envs, "AR_TUNE_DDP_DELAYED_LOSS", False)
-        assert envs.AR_TUNE_DDP_DELAYED_LOSS is False
 
 
 class TestRunThreaded:

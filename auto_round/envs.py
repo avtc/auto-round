@@ -197,7 +197,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grid re-swap). Falls back to the immediate read when dynamic_max_gap
     # is set (its early-stop decision needs the current loss in-loop). Set
     # to 0 to restore the immediate read.
-    "AR_TUNE_DDP_DELAYED_LOSS": lambda: os.getenv("AR_TUNE_DDP_DELAYED_LOSS", "1").lower() in ("1", "true", "yes"),
+    "AR_TUNE_DDP_DELAYED_LOSS": lambda: os.getenv("AR_TUNE_DDP_DELAYED_LOSS", "0").lower() in ("1", "true", "yes"),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.
