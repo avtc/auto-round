@@ -901,7 +901,11 @@ def sharded_nograd_forward(
             reps.append(block)
             mirrors.append(None)
         else:
-            m = copy.deepcopy(block).to(dev)
+            # flat-safe copy: plain deepcopy refuses (some torch versions) or
+            # slowly clones non-leaf view buffers; the swapped-out detached
+            # slices carry the VALUES, which is all a no-grad collection
+            # forward reads
+            m = _deepcopy_flat_safe(block).to(dev)
             _relocate_params(m, dev)
             reps.append(m)
             mirrors.append(m)
