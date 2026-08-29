@@ -22,6 +22,7 @@ from torch import autocast
 
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+from auto_round.algorithms.quantization.sign_round.data_parallel import run_paced_replica_steps
 from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.compressors.utils import (
@@ -807,20 +808,22 @@ class SignRoundQuantizer(BaseQuantizer):
             rep = replica_group.replicas[r]
             dev_r = next(rep.parameters()).device
             st = {"inputs": None, "others": None, "ref": None}
-            from auto_round.algorithms.quantization.sign_round.data_parallel import _copy_into_static
+            from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner, _copy_into_static
+
+            pinner = HostLeafPinner()
 
             def prepare(shard):
                 with torch.cuda.device(dev_r):
                     expect_pool_local([fp_outputs[j] for j in shard], dev_r, "ddp-ref")
                     ref = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
-                    # same gather the runner performs inside forward()
-                    indices = torch.tensor(shard, dtype=torch.long, device=dev_r)
+                    # host-int batches: no device indices tensor (pageable H2D)
+                    # and no per-element .item() fences inside select_batch
                     bins, bother = [], []
-                    for i in range(0, len(indices), block_fwd.batch_size):
-                        bi = indices[i : i + block_fwd.batch_size]
+                    for i in range(0, len(shard), block_fwd.batch_size):
+                        bi = shard[i : i + block_fwd.batch_size]
                         _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
                         bins.append(_in)
-                        bother.append(_oth)
+                        bother.append(pinner.wrap(_oth))
 
                     def _to_dev(x):
                         if isinstance(x, torch.Tensor) and x.device != dev_r:
@@ -1004,6 +1007,7 @@ class SignRoundQuantizer(BaseQuantizer):
         # instead of stalling the pipeline between iterations; best-params
         # selection semantics are unchanged (same (loss, pre-step params)
         # pairs, same strict-less rule -- resolved one iteration later)
+        _pacing = bool(_envs.AR_TUNE_REPLICA_PACING)
         _delayed = replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and self.dynamic_max_gap <= 0
         if replica_group is not None and _envs.AR_TUNE_DDP_DELAYED_LOSS and 0 < self.dynamic_max_gap:
             logger.warning(
@@ -1127,8 +1131,15 @@ class SignRoundQuantizer(BaseQuantizer):
                             len(_bg_busy),
                             _prefetch_busy,
                         )
+                    _all_captured = all(getattr(_g, "_graph", None) is not None for _g in _graphed_steps)
                     with tune_stage(tune_prof, "fwd"):
-                        replica_group.run_threaded([lambda r=r: _dp_run(r) for r in range(_world)])
+                        if _pacing and _all_captured:
+                            # two rounds: every prepare completes (pool latch)
+                            # before any replay launches -- replays start in
+                            # lockstep instead of trailing prepare jitter
+                            run_paced_replica_steps(replica_group, _graphed_steps, _shards, _losses, _graphed_worker_ms)
+                        else:
+                            replica_group.run_threaded([lambda r=r: _dp_run(r) for r in range(_world)])
                     if _graphs_warmups_left > 0:
                         _graphs_warmups_left -= 1
                         if _graphs_warmups_left == 0:

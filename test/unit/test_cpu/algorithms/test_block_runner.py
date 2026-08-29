@@ -143,3 +143,23 @@ def test_outputs_are_moved_to_cache_device_before_next_batch(monkeypatch):
 
     assert len(outputs) == len(inputs)
     assert call_count == len(inputs)
+
+
+def test_select_batch_accepts_host_int_indices():
+    """Host-int indices select identically to tensor indices (no per-element fences)."""
+    runner = BlockForwardRunner(batch_size=2, device="cpu", cache_device="cpu", amp=False)
+    inputs = [torch.full((1, 2, 2), v, dtype=torch.float32) for v in range(4)]
+
+    tensor_sel = runner.select_batch(inputs, {}, torch.tensor([3, 1]))
+    host_sel = runner.select_batch(inputs, {}, [3, 1])
+    torch.testing.assert_close(tensor_sel[0], host_sel[0])
+
+    stacked = torch.stack(inputs).squeeze(1)  # tensor input -> index_select path
+    torch.testing.assert_close(
+        runner.select_batch(stacked, {}, torch.tensor([3, 1]))[0],
+        runner.select_batch(stacked, {}, [3, 1])[0],
+    )
+
+    runner.shared_cache_keys = ("shared",)
+    sel = runner.select_batch({"shared": ["x", "y", "z", "w"]}, {}, [3])
+    assert sel[0]["shared"] == "w"  # single-index selection picks val[3]

@@ -198,6 +198,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is set (its early-stop decision needs the current loss in-loop). Set
     # to 0 to restore the immediate read.
     "AR_TUNE_DDP_DELAYED_LOSS": lambda: os.getenv("AR_TUNE_DDP_DELAYED_LOSS", "0").lower() in ("1", "true", "yes"),
+    # Pace graphed replica steps: run ALL prepares to completion (pool latch)
+    # before ANY replay launches, so replays start in lockstep instead of
+    # free-running behind prepare jitter (measured 34-73 ms replica drift).
+    "AR_TUNE_REPLICA_PACING": lambda: os.getenv("AR_TUNE_REPLICA_PACING", "1").lower() in ("1", "true", "yes", "on"),
     # Diagnostic (default OFF): after each block, scan gc for flat-scale cuda:0
     # fp32 tensors that survived the block teardown and log their referrers --
     # attributes the per-block VRAM growth without a debugger.

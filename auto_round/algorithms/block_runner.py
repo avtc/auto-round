@@ -389,9 +389,18 @@ class BlockForwardRunner:
         return output_dict or None
 
     def _select_batch(self, inputs, input_others, indices):
-        """Select a subset of inputs by indices."""
+        """Select a subset of inputs by indices.
+
+        ``indices`` may be a tensor or a plain sequence of host ints -- the
+        host-int form avoids per-element ``.item()`` device syncs in the list
+        branches (the fence-free prepare path uses it); ``torch.index_select``
+        branches build a device tensor from it on the spot.
+        """
         batch_dim = self.batch_dim
         shared_cache_keys = self.shared_cache_keys
+
+        def _idx_tensor(for_val):
+            return indices if isinstance(indices, torch.Tensor) else torch.as_tensor(indices, device=for_val.device)
 
         if isinstance(inputs, dict):
             selected_inputs = {}
@@ -408,14 +417,14 @@ class BlockForwardRunner:
                     if isinstance(val, list):
                         selected_inputs[key] = _cat_device_safe([val[i] for i in indices], batch_dim)
                     elif isinstance(val, torch.Tensor):
-                        selected_inputs[key] = torch.index_select(val, batch_dim, indices)
+                        selected_inputs[key] = torch.index_select(val, batch_dim, _idx_tensor(val))
                     else:
                         selected_inputs[key] = val
         else:
             if isinstance(inputs, list):
                 selected_inputs = _cat_device_safe([inputs[i] for i in indices], batch_dim)
             else:
-                selected_inputs = torch.index_select(inputs, batch_dim, indices)
+                selected_inputs = torch.index_select(inputs, batch_dim, _idx_tensor(inputs))
 
         selected_others = {"positional_inputs": input_others.get("positional_inputs")}
 

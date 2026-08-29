@@ -352,6 +352,12 @@ export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 export AR_TUNE_DDP_DELAYED_LOSS=0   # reclaim ~params-size VRAM on the primary device, ~8-15% slower iters
 ```
 
+### AR_TUNE_REPLICA_PACING
+- **Description**: Two-round dispatch of the graphed DDP tune step: ALL replicas' prepares (sample gather into static buffers) complete first (the thread-pool latch is the barrier), then every replay launches, so forward/backward starts in lockstep instead of trailing prepare jitter (host `.item()` fences, pageable H2D) into 34-73 ms of replica phase drift. Companion prepare changes: batch indices as host int lists (no device indices tensor, no per-element `.item()` syncs inside select_batch) and constant CPU leaves pinned once via `HostLeafPinner` for async copies.
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled; set `0` only for A/B comparisons against the older single-closure prepare+replay dispatch.
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

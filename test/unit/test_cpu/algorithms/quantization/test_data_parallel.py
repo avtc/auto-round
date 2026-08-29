@@ -1503,3 +1503,101 @@ class TestSharedHandle:
         assert m2._gate is m._gate and m2._gate.value is ev
         m2._gate.value.set()
         assert ev.is_set()
+
+
+class TestGraphedStepSplit:
+    """prepare_only/replay_only: the paced-dispatch primitives."""
+
+    def test_prepare_only_refreshes_without_consuming(self):
+        step, _, state = TestGraphedReplicaStepV2._make(warmup=1)
+        step(1.0)
+        step.capture_now()
+        # warmup compute #1 + capture records compute #2 + mandatory replay #3
+        assert state["prepares"] == 1 and state["computes"] == 3
+        step.prepare_only(7.0)
+        assert state["prepares"] == 2 and state["computes"] == 3  # no compute consumed
+        out = step.replay_only()
+        assert out.item() == 7.0 and out is not step._static_loss
+
+    def test_replay_only_before_capture_raises(self):
+        step, _, _ = TestGraphedReplicaStepV2._make(warmup=2)
+        step(1.0)
+        with pytest.raises(RuntimeError):
+            step.replay_only()
+
+    def test_prepare_only_failure_propagates(self):
+        step, _, _ = TestGraphedReplicaStepV2._make(warmup=1)
+        with pytest.raises(TypeError):
+            step.prepare_only(None, undefined_kw=1)  # prepare() takes one positional arg
+
+
+class TestPacedDispatch:
+    def test_all_prepares_complete_before_any_replay(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import run_paced_replica_steps
+
+        order = []
+
+        class FakeStep:
+            def __init__(self, r):
+                self.r = r
+
+            def prepare_only(self, shard):
+                order.append(("p", self.r, tuple(shard)))
+
+            def replay_only(self):
+                order.append(("r", self.r))
+                return torch.tensor(float(self.r))
+
+        class FakeGroup:
+            def run_threaded(self, fns):
+                for fn in fns:
+                    fn()
+
+        losses = [None] * 3
+        worker_ms = [[] for _ in range(3)]
+        run_paced_replica_steps(
+            FakeGroup(), [FakeStep(i) for i in range(3)], [[0, 1], [2, 3], [4, 5]], losses, worker_ms
+        )
+        assert [o[0] for o in order] == ["p", "p", "p", "r", "r", "r"]
+        assert [l.item() for l in losses] == [0.0, 1.0, 2.0]
+        assert all(len(m) == 1 and m[0] >= 0 for m in worker_ms)
+
+    def test_pacing_env_gate_default_on_opt_out(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_REPLICA_PACING", raising=False)
+        assert envs.AR_TUNE_REPLICA_PACING is True
+        monkeypatch.setenv("AR_TUNE_REPLICA_PACING", "0")
+        assert envs.AR_TUNE_REPLICA_PACING is False
+
+
+class TestHostLeafPinner:
+    def test_cpu_leaves_pinned_once_and_cached(self, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner
+
+        def fake_pin(self):
+            out = self.clone()
+            out._fake_pinned = True
+            return out
+
+        monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        src = torch.arange(4, dtype=torch.float32)
+        tree = {"a": src, "b": torch.ones(2, 2), "c": [src, 7]}
+        pinner = HostLeafPinner()
+        out1 = pinner.wrap(tree)
+        assert out1["a"].data_ptr() != src.data_ptr() and getattr(out1["a"], "_fake_pinned", False)
+        assert out1["c"][0] is out1["a"]  # same source object -> same pinned copy
+        assert out1["c"][1] == 7  # non-tensors pass through
+        out2 = pinner.wrap({"a": src})
+        assert out2["a"] is out1["a"]  # cache survives across calls
+
+    def test_no_cuda_passes_leaves_through(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import HostLeafPinner
+
+        if torch.cuda.is_available():
+            pytest.skip("covers the CPU-only passthrough branch")
+        src = torch.arange(4, dtype=torch.float32)
+        out = HostLeafPinner().wrap({"a": src})
+        assert out["a"] is src  # nothing to pin without an accelerator

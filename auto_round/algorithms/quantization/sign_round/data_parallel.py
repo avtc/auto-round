@@ -31,6 +31,7 @@ import contextlib
 import copy
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
@@ -1309,6 +1310,33 @@ class GraphedReplicaStep:
             raise
         return self._static_loss.detach().clone()
 
+    def prepare_only(self, *args, **kwargs):
+        """Run just the eager prepare (paced dispatch round 1). Failures halt."""
+        try:
+            self.prepare(*args, **kwargs)
+        except Exception as exc:
+            logger.error(
+                "[tune-ddp] cuda-graph prepare failed for %s (%s): set AR_TUNE_CUDA_GRAPHS=0 to disable",
+                self.name,
+                exc,
+            )
+            raise
+
+    def replay_only(self):
+        """Replay the captured step and clone the static loss (round 2)."""
+        if self._graph is None:
+            raise RuntimeError(f"replay_only() called before capture for {self.name}")
+        try:
+            self._graph.replay()
+        except Exception as exc:
+            logger.error(
+                "[tune-ddp] cuda-graph replay failed for %s (%s): set AR_TUNE_CUDA_GRAPHS=0 to disable",
+                self.name,
+                exc,
+            )
+            raise
+        return self._static_loss.detach().clone()
+
     def __call__(self, *args, **kwargs):
         try:
             self.prepare(*args, **kwargs)
@@ -1349,6 +1377,54 @@ class GraphedReplicaStep:
             )
             raise
         return self._static_loss.detach().clone()
+
+
+class HostLeafPinner:
+    """Pin host-side tensor leaves once, reuse the pinned copies afterwards.
+
+    Prepare-time refresh copies of constant CPU leaves (masks, small metadata)
+    go through pageable H2D every iteration; a pinned source makes them async
+    staging-free copies. CUDA tensor leaves pass through untouched.
+    """
+
+    def __init__(self):
+        self._cache = {}
+
+    def wrap(self, tree):
+        if isinstance(tree, torch.Tensor):
+            if tree.device.type != "cpu" or not torch.cuda.is_available():
+                return tree
+            key = id(tree)
+            pinned = self._cache.get(key)
+            if pinned is None:
+                pinned = tree.pin_memory()
+                self._cache[key] = pinned
+            return pinned
+        if isinstance(tree, dict):
+            return {k: self.wrap(v) for k, v in tree.items()}
+        if isinstance(tree, (tuple, list)):
+            return type(tree)(self.wrap(v) for v in tree)
+        return tree
+
+
+def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
+    """Two-round graphed dispatch: all prepares (pool latch), then all replays.
+
+    The pool's per-round completion event is the barrier: replays launch within
+    microseconds of each other once every prepare has finished, restoring the
+    lockstep the eager host enqueue used to provide. Falls back nowhere -- the
+    caller gates this on every step being captured.
+    """
+    world = len(steps)
+    group.run_threaded([lambda r=r: steps[r].prepare_only(shards[r]) for r in range(world)])
+
+    def _replay(r):
+        t0 = time.perf_counter()
+        out_losses[r] = steps[r].replay_only()
+        if worker_ms is not None:
+            worker_ms[r].append((time.perf_counter() - t0) * 1000.0)
+
+    group.run_threaded([lambda r=r: _replay(r) for r in range(world)])
 
 
 def run_threaded_spawn(fns: Sequence) -> None:

@@ -352,6 +352,12 @@ export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 export AR_TUNE_DDP_DELAYED_LOSS=0   # 回收主设备上约一份参数量大小的显存，每迭代慢约 8-15%
 ```
 
+### AR_TUNE_REPLICA_PACING
+- **描述**： DDP 图化调优步的两轮派发：所有副本的 prepare（收集样本到静态缓冲）全部完成后（线程池闩锁即屏障），再统一触发 replay，使各 GPU 的前向/反向从锁步起点开始，而不是被 prepare 抖动（宿主 `.item()` 围栏、分页 H2D）拖出 34-73 ms 的相位漂移。配套的 prepare 改动：批次索引用宿主 int 列表（不再构造设备索引张量，select_batch 内无逐元素 `.item()` 同步），常驻 CPU 叶子经 `HostLeafPinner` 固定一次后异步拷贝。
+- **默认值**: `1`
+- **有效值**: `1`, `0`
+- **用法**: 保持开启；仅在与早期版本做 A/B 对比时设 `0` 恢复单闭包 prepare+replay 派发。
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)
