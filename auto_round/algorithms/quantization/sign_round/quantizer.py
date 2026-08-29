@@ -867,8 +867,12 @@ class SignRoundQuantizer(BaseQuantizer):
 
             return GraphedReplicaStep(prepare, compute, name=f"replica-{r}", device=dev_r)
 
+        _graphed_worker_ms = [[] for _ in range(replica_group.world) if True] if replica_group is not None else []
+
         def _dp_run(r):
+            _t0 = time.perf_counter()
             _losses[r] = _graphed_steps[r](_shards[r])
+            _graphed_worker_ms[r].append((time.perf_counter() - _t0) * 1000.0)
 
         if _graphs_active and _graphed_steps is None:
             # built BEFORE the ddp warm-up pass: the warm-up backward must run
@@ -1043,19 +1047,12 @@ class SignRoundQuantizer(BaseQuantizer):
                     )
             elif _tprof_ctx is not None and (i == _tprof_end or i == self.iters - 1):
                 _tprof_ctx.__exit__(None, None, None)
+                try:
+                    _tprof_ctx.export_chrome_trace("tune_torch_prof.json")
+                    logger.info("[tune-ddp] torch profiler trace saved to tune_torch_prof.json")
+                except Exception as _pe:  # noqa: BLE001 - profiling must never break tuning
+                    logger.warning("[tune-ddp] torch profiler trace export failed: %s", _pe)
                 _tprof_ctx = None
-                try:
-                    _tprof_ctx_out = profile  # noqa: F841 - keep import alive for linters
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    import torch.profiler as _tp
-
-                    _tp.export_memory_history = getattr(_tp, "export_memory_history", None)
-                    # the context object was dropped above -- re-export is not
-                    # possible; instead keep the ctx until here:
-                except Exception:  # noqa: BLE001
-                    pass
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
                 for n, m in block.named_modules():
                     m.cur_iter = i
@@ -1267,6 +1264,16 @@ class SignRoundQuantizer(BaseQuantizer):
                 with tune_stage(tune_prof, "step"):
                     self._step(scaler, optimizer, lr_schedule)
 
+        try:
+            if _graphed_steps is not None and len(_graphed_worker_ms) and all(len(w) for w in _graphed_worker_ms):
+                _means = [sum(w) / len(w) for w in _graphed_worker_ms]
+                logger.info(
+                    "[tune-ddp] replica worker ms/iter (prepare+replay enqueue): %s (spread %.1f)",
+                    ["%.1f" % m for m in _means],
+                    max(_means) - min(_means),
+                )
+        except NameError:
+            pass
         if _graphs_capture_t is not None:
             _pre = _graphs_capture_iter
             _post = self.iters - _graphs_capture_iter
