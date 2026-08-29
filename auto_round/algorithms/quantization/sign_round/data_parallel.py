@@ -1465,10 +1465,28 @@ class BucketExchangeSession:
         # buckets are INDEX RANGES over the flat param list: each replica owns
         # its own Parameter objects at the same positions (mirrors)
         self.bucket_ranges = []
+        # FIXED per-bucket flat layouts derived from the PARAM SHAPES (never
+        # from which grads happen to exist at exchange time): every replica's
+        # exchange buffer has the SAME length, with zero at positions whose
+        # param has no grad on that replica. (Building the buffer by cat-ing
+        # the not-None grads made lengths DIVERGE across replicas when grad
+        # presence differed -- the halving reduce-scatter then sliced two
+        # different-sized buffers and crashed with a size-mismatch.)
+        self.bucket_layouts: List[List[tuple]] = []
+        self.bucket_sizes: List[int] = []
         start = 0
         for bucket in _plan_buckets(params_per_replica[0], num_buckets):
             self.bucket_ranges.append((start, start + len(bucket)))
+            off, layout = 0, []
+            for p in bucket:
+                layout.append((off, p.numel()))
+                off += p.numel()
+            self.bucket_layouts.append(layout)
+            self.bucket_sizes.append(off)
             start += len(bucket)
+        self._flat_bufs: List[List[Optional[torch.Tensor]]] = [
+            [None] * len(self.bucket_ranges) for _ in range(self.world)
+        ]
         self._exchange_fn = exchange_fn if exchange_fn is not None else self._default_exchange
         self._cv = threading.Condition(threading.Lock())
         self._ready = [0] * self.num_buckets
@@ -1584,21 +1602,22 @@ class BucketExchangeSession:
                 if dev.type == "cuda":
                     torch.cuda.current_stream(dev).wait_event(ev)
         bufs = []
-        for bucket in buckets:
-            parts = [p.grad.detach().reshape(-1) for p in bucket if p.grad is not None]
-            if not parts:
-                raise RuntimeError(f"bucket {b} has no gradients on one replica -- cannot exchange")
-            buf = torch.cat(parts) if len(parts) > 1 else parts[0].clone()
-            bufs.append(buf.to(torch.float32) if buf.dtype != torch.float32 else buf)
+        for r, bucket in enumerate(buckets):
+            buf = self._flat_bufs[r][b]
+            if buf is None:
+                dev = bucket[0].device if bucket else self.params_per_replica[r][self.bucket_ranges[b][0]].device
+                buf = torch.zeros(self.bucket_sizes[b], dtype=torch.float32, device=dev)
+                self._flat_bufs[r][b] = buf
+            buf.zero_()  # no-grad positions contribute zero on this replica
+            for p, (off, n) in zip(bucket, self.bucket_layouts[b]):
+                if p.grad is not None:
+                    buf[off : off + n].copy_(p.grad.detach().reshape(-1))
+            bufs.append(buf)
         sign_exchange_allreduce(bufs, transport=self.transport)
         for buf, bucket in zip(bufs, buckets):
-            offset = 0
-            for p in bucket:
-                if p.grad is None:
-                    continue
-                n = p.grad.numel()
-                p.grad.copy_(buf[offset : offset + n].view_as(p.grad))
-                offset += n
+            for p, (off, n) in zip(bucket, self.bucket_layouts[b]):
+                if p.grad is not None:
+                    p.grad.copy_(buf[off : off + n].view_as(p.grad))
 
 
 class HostLeafPinner:

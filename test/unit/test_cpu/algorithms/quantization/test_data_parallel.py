@@ -2396,3 +2396,72 @@ class TestSignStepForeach:
             _sign_step_foreach(opt)
             sched.step()
             assert not [x for x in w if "before `optimizer.step()`" in str(x.message)]
+
+
+class TestBucketExchangeDeterministicBuffers:
+    """T2 regression: cross-replica grad-presence divergence + ragged buckets.
+
+    The server crash: bucket buffers were cat-ed from the not-None grads, so
+    replicas whose grad presence differed produced DIFFERENT-LENGTH buffers
+    and the halving reduce-scatter crashed with a size mismatch. Buffers are
+    now fixed-length from the param layout, zero-filled at no-grad positions.
+    """
+
+    def _session(self, n_params=9, world=4):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import BucketExchangeSession
+
+        torch.manual_seed(0)
+        per_replica = []
+        for _ in range(world):
+            ps = [torch.nn.Parameter(torch.randn(3 + i)) for i in range(n_params)]  # ragged total
+            per_replica.append(ps)
+        sess = BucketExchangeSession(per_replica, "fp32", num_buckets=2)
+        return sess, per_replica
+
+    def test_fixed_length_buffers_with_divergent_grad_presence(self):
+        import torch
+
+        sess, per_replica = self._session()
+        world = sess.world
+        # replica r misses param r's grad (r>0); every other replica has it.
+        # The old cat-based build produced different-length buffers per
+        # replica -> halving reduce-scatter size-mismatch crash (server).
+        for r, ps in enumerate(per_replica):
+            for i, p in enumerate(ps):
+                if r != 0 and i == r:
+                    continue  # missing grad on this replica
+                p.grad = torch.full_like(p, float(r + 1))
+        want = {
+            (r, i): (0.0 if (r != 0 and i == r) else float(r + 1)) for r in range(world) for i in range(len(per_replica[0]))
+        }
+        for b in range(sess.num_buckets):
+            sess._default_exchange(b)
+        for i, p in enumerate(per_replica[0]):
+            mean = sum(want[(r, i)] for r in range(world)) / world  # missing -> 0
+            expected = float(torch.sign(torch.tensor(mean)))  # sign exchange
+            assert torch.allclose(p.grad, torch.full_like(p.grad, expected), atol=1e-6)
+
+    def test_bucket_sizes_from_layout_are_world_consistent(self):
+        sess, _ = self._session()
+        assert all(sess._flat_bufs[r][b] is None for r in range(sess.world) for b in range(sess.num_buckets))
+        assert len(sess.bucket_sizes) == sess.num_buckets
+        assert sum(sess.bucket_sizes) == sum(p.numel() for p in sess.params_per_replica[0])
+
+    def test_ragged_total_exchanges_without_size_error(self):
+        import torch
+
+        sess, per_replica = self._session(n_params=7)  # total 3+4+..+9=42, not %4
+        for ps in per_replica:
+            for p in ps:
+                p.grad = torch.randn_like(p)
+        for b in range(sess.num_buckets):
+            sess._default_exchange(b)  # must not raise size mismatch
+        for ps in per_replica:  # all replicas converged on the mean
+            for p, ref in zip(ps, per_replica[0]):
+                assert torch.allclose(p.grad, ref.grad, atol=1e-6)
+
+
+def _params_of(sess):
+    return [p for ps in sess.params_per_replica for p in ps]
