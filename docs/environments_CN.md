@@ -408,6 +408,16 @@ export AR_TUNE_SERIAL_DELAYED_LOSS=0   # 反向前逐 batch .item() 读取（旧
 export AR_TUNE_SERIAL_DEVICE_SCHEDULE=0   # 惰性 next_batch + 主机列表索引（旧行为）
 ```
 
+### 串行调优 CUDA graphs（T8）
+- **描述**： 当启用 `AR_TUNE_CUDA_GRAPHS` 且调优循环以串行方式运行（单设备、无 DDP、未使用 `valid_token_mask`、非 LFQ block、loss 与调优设备一致）时，每个 block 的 前向+loss+反向 会在 2 个 eager 预热迭代后被捕获进 CUDA graph：每次迭代的样本 gather 刷新静态设备缓冲（`_copy_into_static`，形状/ dtype 漂移即停机），迭代主体变为一次 graph replay（预热迭代在捕获侧流上 eager 执行，使 autograd 节点诞生于捕获流）。梯度保持驻留（`set_to_none=False`），反向累积进捕获时固化的地址；优化器 step 与 best-params 快照保持 eager。任何捕获/replay 失败都会记录错误并提示 `AR_TUNE_CUDA_GRAPHS=0`，随后停机。另见 DDP 变体在 `AR_TUNE_EXCH_OVERLAP` 下的约束（仅 eager 反向）。
+- **默认值**: `1`
+- **有效值**: `1`, `0`
+- **用法**: 在 CUDA 上保持开启；纯 CPU 运行会安静地跳过捕获（同一条静态缓冲路径上 eager 计算）。
+
+```bash
+export AR_TUNE_CUDA_GRAPHS=0   # 禁用整体 graph 捕获（DDP replica step 与串行 step）
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

@@ -1649,6 +1649,102 @@ def accumulate_serial_loss(acc, loss, num_elm: float = 1.0):
     return term if acc is None else acc + term
 
 
+def make_serial_graphed_step(
+    block,
+    block_fwd,
+    active_inputs,
+    input_others,
+    fp_outputs,
+    loss_fn,
+    device,
+    fence_free: bool = True,
+    warmup_iters: int = 2,
+):
+    """Serial twin of the DDP graphed replica step (T8b).
+
+    ``prepare(row)`` gathers the iteration's samples into SINGLE-DEVICE static
+    buffers (first call materializes, later calls ``_copy_into_static``-refresh
+    -- addresses must stay stable for CUDA graph replay); ``compute()`` is the
+    pure-GPU region (forward + loss + backward on the static buffers). The
+    returned :class:`GraphedReplicaStep` handles warmup/capture/replay; the
+    optimizer step stays EAGER (extended into the graph by T8c).
+
+    ``loss_fn(pred, ref)`` must not consume sample indices: the engaged serial
+    path has ``valid_token_mask=None`` so the indices argument of the loss is
+    never read.
+    """
+    st = {"inputs": None, "others": None, "ref": None}
+    pinner = HostLeafPinner()
+    _pinned_once = False
+    dev_is_cuda = getattr(device, "type", "") == "cuda"
+    dev_ctx = torch.cuda.device(device) if dev_is_cuda else contextlib.nullcontext()
+
+    def _to_dev(x):
+        if isinstance(x, torch.Tensor) and x.device != device:
+            return x.to(device)
+        if isinstance(x, dict):
+            return {k: _to_dev(v) for k, v in x.items()}
+        if isinstance(x, (tuple, list)):
+            return type(x)(_to_dev(v) for v in x)
+        return x
+
+    def prepare(row):
+        nonlocal _pinned_once
+        with dev_ctx:
+            expect_pool_local([fp_outputs[j] for j in row], device, "serial-ref")
+            ref = torch.cat([fp_outputs[j].to(device) for j in row], dim=0)
+            bins, bother = [], []
+            if fence_free:
+                # host-int batches: no device indices tensor (pageable H2D)
+                # and no per-element .item() fences in select_batch
+                for i in range(0, len(row), block_fwd.batch_size):
+                    bi = row[i : i + block_fwd.batch_size]
+                    _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
+                    bins.append(_in)
+                    bother.append(pinner.wrap(_oth))
+                if not _pinned_once:
+                    _pinned_once = True
+                    pinner.pin_repeats()
+            else:
+                indices = torch.tensor(row, dtype=torch.long, device=device)
+                for i in range(0, len(indices), block_fwd.batch_size):
+                    bi = indices[i : i + block_fwd.batch_size]
+                    _in, _oth = block_fwd.select_batch(active_inputs, input_others, bi)
+                    bins.append(_in)
+                    bother.append(_oth)
+            if st["ref"] is None:
+                # shallow-copy the dict nodes: the runner pops keys from the
+                # kwargs it receives; the static structure must stay pristine.
+                # Stage every leaf on the device: to_device() inside the
+                # captured region must no-op (unpinned H2D during capture is
+                # illegal); later prepares refresh cross-device eagerly.
+                st["ref"], st["inputs"] = _to_dev(ref), [_to_dev(b) for b in bins]
+                st["others"] = [_to_dev(dict(o)) for o in bother]
+                return
+            _copy_into_static(st["ref"], ref)
+            _copy_into_static(st["inputs"], bins)
+            _copy_into_static(st["others"], bother)
+
+    def compute():
+        with dev_ctx:
+            outs = []
+            for _in, _oth in zip(st["inputs"], st["others"]):
+                # dict() per call: the runner pops keys from the kwargs it
+                # receives (same tensor leaves -- the graph-baked addresses
+                # are untouched)
+                raw = block_fwd._forward_one_batch(block, _in, dict(_oth))
+                out = block_fwd._normalize_output(raw, block)
+                outs.append(out.to(device) if out.device != device else out)
+            pred = outs[0] if len(outs) == 1 else torch.cat(outs, dim=block_fwd.batch_dim)
+            loss = loss_fn(pred, st["ref"])
+            loss.backward()
+            return loss
+
+    return GraphedReplicaStep(
+        prepare, compute, warmup_iters=warmup_iters, name="serial", device=device if dev_is_cuda else None
+    )
+
+
 def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
     """Two-round graphed dispatch: all prepares (pool latch), then all replays.
 

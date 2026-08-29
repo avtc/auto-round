@@ -1120,6 +1120,37 @@ class SignRoundQuantizer(BaseQuantizer):
                 _sched_host = None
                 _serial_idx_dev = None
 
+        _serial_step = None
+        _serial_warmups_left = 0
+        _lfq_here = (
+            block_ctx.block_index == block_ctx.block_cnt - 1
+            and self.enable_lfq
+            and input_ids is not None
+            and self._is_text_decoder_block(block_ctx.block_name)
+        )
+        if (
+            bool(_envs.AR_TUNE_CUDA_GRAPHS)
+            and replica_group is None
+            and str(device).startswith("cuda")
+            and valid_token_mask is None
+            and not _lfq_here
+            and (loss_device is None or torch.device(loss_device) == torch.device(device))
+            and _fence_free
+        ):
+            from auto_round.algorithms.quantization.sign_round.data_parallel import make_serial_graphed_step
+
+            _serial_step = make_serial_graphed_step(
+                block,
+                block_fwd,
+                active_inputs,
+                input_others,
+                fp_outputs,
+                lambda pred, ref: self._get_loss(pred, ref, None, mse_loss, device, None),
+                torch.device(device),
+            )
+            _serial_warmups_left = _serial_step.warmup_iters
+            logger.info("[tune-serial] cuda graphs enabled: capture after %d warmup iteration(s)", _serial_warmups_left)
+
         if _proactive and _pacing and _graphs_active and _dp_samplers is not None and replica_group is not None:
             # consume the whole shuffle schedule upfront (same RNG stream as
             # the lazy per-iteration next_batch sequence -- deterministic)
@@ -1314,54 +1345,88 @@ class SignRoundQuantizer(BaseQuantizer):
                     with tune_stage(tune_prof, "loss_sync"):
                         total_loss = sum(l.item() for l in _losses if l is not None) / _world
             else:
-                for batch_start in range(0, len(global_indices), batch_size):
-                    indices = global_indices[batch_start : batch_start + batch_size]
-                    with tune_stage(tune_prof, "ref_h2d"):
-                        _loss_dev = torch.device(loss_device) if loss_device is not None else fp_outputs[0].device
-                        expect_pool_local([fp_outputs[i] for i in indices], _loss_dev, "serial-ref")
-                        ref_output = torch.cat([fp_outputs[i].to(_loss_dev) for i in indices], dim=0)
-                    if _serial_idx_dev is not None:
-                        _idx_arg = _serial_idx_dev[batch_start : batch_start + batch_size]
-                        _host_arg = indices
-                    else:
-                        _idx_arg, _host_arg = indices, None
+                if _serial_step is not None:
                     with tune_stage(tune_prof, "fwd"):
-                        pred_output = block_fwd.forward(
-                            block, active_inputs, input_others, _idx_arg, _fwd_cache_device, host_indices=_host_arg
-                        )
-                        if loss_device is not None:
-                            pred_output = pred_output.to(loss_device)
-                    if (
-                        block_ctx.block_index == block_ctx.block_cnt - 1
-                        and self.enable_lfq
-                        and input_ids is not None
-                        and self._is_text_decoder_block(block_ctx.block_name)
-                    ):
-                        with tune_stage(tune_prof, "loss"):
-                            loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in indices], dim=0))
-                    else:
-                        with tune_stage(tune_prof, "loss"):
-                            loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
+                        if _serial_warmups_left > 0:
+                            # warm-up: prepare + EAGER compute on the capture
+                            # stream (AccumulateGrad birth-stream correctness)
+                            _loss = _serial_step(global_indices)
+                            _serial_warmups_left -= 1
+                        elif getattr(_serial_step, "_graph", None) is None and not any(
+                            t.is_alive() for t in _bg_cuda_threads
+                        ):
+                            # capture barrier: single-threaded serial loop, but
+                            # bg pack/transform threads from a previous block
+                            # may still issue CUDA -- torch.cuda.graph needs the
+                            # process quiet; capture records AND replays this
+                            # iteration's work
+                            _serial_step.prepare_only(global_indices)
+                            _loss = _serial_step.capture_now()
+                        else:
+                            # steady state: prepare refresh + single replay
+                            _loss = _serial_step(global_indices)
                     num_elm = 1 if num_elm <= 0 else num_elm
                     with tune_stage(tune_prof, "sync"):
                         if _serial_delayed:
-                            # accumulate on device: no host fence between loss
-                            # and backward -- the single read happens after the
-                            # batch loop (all backwards already enqueued)
-                            _loss_acc = accumulate_serial_loss(_loss_acc, loss, num_elm)
+                            _loss_acc = accumulate_serial_loss(_loss_acc, _loss, num_elm)
                         else:
-                            total_loss += loss.item() / num_elm
-
+                            total_loss += _loss.item() / num_elm
                     if mid_iter_mem_check:
-                        # clear memory to avoid OOM due to memory fragmentation
-                        clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
-
-                    with tune_stage(tune_prof, "bwd"):
-                        self._scale_loss_and_backward(scaler, loss)
-
-                    if mid_iter_mem_check:
-                        # clear memory to avoid OOM due to memory fragmentation
+                        # between iterations only: the legacy in-loop checks
+                        # sit between loss and backward -- INSIDE the captured
+                        # region here
                         clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
+                else:
+                    for batch_start in range(0, len(global_indices), batch_size):
+                        indices = global_indices[batch_start : batch_start + batch_size]
+                        with tune_stage(tune_prof, "ref_h2d"):
+                            _loss_dev = torch.device(loss_device) if loss_device is not None else fp_outputs[0].device
+                            expect_pool_local([fp_outputs[i] for i in indices], _loss_dev, "serial-ref")
+                            ref_output = torch.cat([fp_outputs[i].to(_loss_dev) for i in indices], dim=0)
+                        if _serial_idx_dev is not None:
+                            _idx_arg = _serial_idx_dev[batch_start : batch_start + batch_size]
+                            _host_arg = indices
+                        else:
+                            _idx_arg, _host_arg = indices, None
+                        with tune_stage(tune_prof, "fwd"):
+                            pred_output = block_fwd.forward(
+                                block, active_inputs, input_others, _idx_arg, _fwd_cache_device, host_indices=_host_arg
+                            )
+                            if loss_device is not None:
+                                pred_output = pred_output.to(loss_device)
+                        if (
+                            block_ctx.block_index == block_ctx.block_cnt - 1
+                            and self.enable_lfq
+                            and input_ids is not None
+                            and self._is_text_decoder_block(block_ctx.block_name)
+                        ):
+                            with tune_stage(tune_prof, "loss"):
+                                loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in indices], dim=0))
+                        else:
+                            with tune_stage(tune_prof, "loss"):
+                                loss = self._get_loss(
+                                    pred_output, ref_output, indices, mse_loss, device, valid_token_mask
+                                )
+                        num_elm = 1 if num_elm <= 0 else num_elm
+                        with tune_stage(tune_prof, "sync"):
+                            if _serial_delayed:
+                                # accumulate on device: no host fence between loss
+                                # and backward -- the single read happens after the
+                                # batch loop (all backwards already enqueued)
+                                _loss_acc = accumulate_serial_loss(_loss_acc, loss, num_elm)
+                            else:
+                                total_loss += loss.item() / num_elm
+
+                        if mid_iter_mem_check:
+                            # clear memory to avoid OOM due to memory fragmentation
+                            clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
+
+                        with tune_stage(tune_prof, "bwd"):
+                            self._scale_loss_and_backward(scaler, loss)
+
+                        if mid_iter_mem_check:
+                            # clear memory to avoid OOM due to memory fragmentation
+                            clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
 
             if _serial_delayed and _loss_acc is not None:
                 total_loss = float(_loss_acc)
@@ -1422,7 +1487,7 @@ class SignRoundQuantizer(BaseQuantizer):
             else:
                 sync_gradients()
                 with tune_stage(tune_prof, "step"):
-                    self._step(scaler, optimizer, lr_schedule)
+                    self._step(scaler, optimizer, lr_schedule, keep_grads=_serial_step is not None)
 
         try:
             if _graphed_steps is not None and len(_graphed_worker_ms) and all(len(w) for w in _graphed_worker_ms):

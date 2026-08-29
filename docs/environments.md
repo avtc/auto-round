@@ -408,6 +408,16 @@ export AR_TUNE_SERIAL_DELAYED_LOSS=0   # per-batch .item() read before backward 
 export AR_TUNE_SERIAL_DEVICE_SCHEDULE=0   # lazy next_batch + host-list indices (legacy)
 ```
 
+### Serial tune CUDA graphs (T8)
+- **Description**: When `AR_TUNE_CUDA_GRAPHS` is enabled and the tune loop runs serially (single device, no DDP, `valid_token_mask` unused, non-LFQ block, loss on the tune device), each block's forward+loss+backward is captured into a CUDA graph after 2 warmup eager iterations: per-iteration sample gathers refresh STATIC device buffers (`_copy_into_static`, shape/dtype drift halts) and the iteration body becomes a single graph replay (warmup iterations run eagerly on the capture side stream so autograd nodes are born on the capturing stream). Grads stay parked (`set_to_none=False`) so backward accumulates into the addresses baked at capture; the optimizer step and best-params snapshot stay eager. Any capture/replay failure logs an error with the `AR_TUNE_CUDA_GRAPHS=0` hint and halts the run. See also the DDP variant under `AR_TUNE_EXCH_OVERLAP` constraints (eager backward only).
+- **Default**: `1`
+- **Valid Values**: `1`, `0`
+- **Usage**: Keep enabled on CUDA; CPU-only runs quietly skip capture (eager compute on the same static-buffer path).
+
+```bash
+export AR_TUNE_CUDA_GRAPHS=0   # disable whole graph capture (DDP replica steps + serial steps)
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

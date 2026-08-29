@@ -1861,3 +1861,78 @@ class TestSerialDeferredLoss:
         assert envs.AR_TUNE_SERIAL_DELAYED_LOSS is True
         monkeypatch.setenv("AR_TUNE_SERIAL_DELAYED_LOSS", "0")
         assert envs.AR_TUNE_SERIAL_DELAYED_LOSS is False
+
+
+class TestMakeSerialGraphedStep:
+    """T8b: serial graphed step factory -- static buffers + fence-free prepare."""
+
+    @staticmethod
+    def _fixture():
+        import torch
+
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.data_parallel import make_serial_graphed_step
+
+        torch.manual_seed(0)
+        block = torch.nn.Linear(5, 5)
+        pool = [(torch.arange(5, dtype=torch.float32) + 10.0 * i).unsqueeze(0) for i in range(6)]
+        fp_outputs = [block(x).detach() + 0.1 * torch.randn_like(x) for x in pool]
+        fwd = BlockForwardRunner(batch_size=2, amp=False, enable_torch_compile=False)
+
+        def loss_fn(pred, ref):
+            return torch.nn.functional.mse_loss(pred.float(), ref.float())
+
+        step = make_serial_graphed_step(
+            block,
+            fwd,
+            pool,
+            {"positional_inputs": None},
+            fp_outputs,
+            loss_fn,
+            torch.device("cpu"),
+        )
+        return block, pool, fp_outputs, loss_fn, step
+
+    def test_prepare_materialize_then_refresh(self):
+        import torch
+
+        block, pool, fp_outputs, loss_fn, step = self._fixture()
+
+        def manual(row):
+            ins = torch.cat([pool[j] for j in row], dim=0)
+            refs = torch.cat([fp_outputs[j] for j in row], dim=0)
+            return loss_fn(block(ins), refs)
+
+        row_a, row_b = [0, 1, 2, 3], [4, 5, 1, 0]
+        got_a = step(row_a)  # first prepare materializes statics + eager compute
+        assert torch.allclose(got_a, manual(row_a))
+        got_b = step(row_b)  # second prepare refreshes in place
+        assert torch.allclose(got_b, manual(row_b))
+        assert not torch.allclose(got_a, got_b)
+
+    def test_shape_drift_halts(self):
+        _, _, _, _, step = self._fixture()
+        step([0, 1, 2, 3])
+        import pytest
+
+        with pytest.raises(RuntimeError):
+            step([0, 1, 2])  # different row length -> static shape drift
+
+    def test_prepare_is_fence_free(self, monkeypatch):
+        import torch
+
+        def boom(self):  # noqa: A002
+            raise AssertionError("prepare called .item()")
+
+        monkeypatch.setattr(torch.Tensor, "item", boom)
+        step = self._fixture()[4]
+        step([1, 2, 3, 4])  # must not fence
+
+    def test_backward_populates_grads_each_iteration(self):
+        block, _, _, _, step = self._fixture()
+        block.zero_grad(set_to_none=True)
+        step([0, 1, 2, 3])
+        assert block.weight.grad is not None
+        g1 = block.weight.grad.clone()
+        step([4, 5, 2, 1])
+        assert not torch.equal(g1, block.weight.grad)  # accumulated fresh bwd
