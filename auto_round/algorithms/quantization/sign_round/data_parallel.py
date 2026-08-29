@@ -1839,6 +1839,10 @@ def _sign_step_foreach(optimizer, free_grads: bool = False) -> None:
     ``set_to_none=True`` between-iterations behavior for non-graph callers).
     """
     with torch.no_grad():
+        # the wrapped optimizer.step() would set this; the foreach fast path
+        # replaces that call, so set it here -- LRScheduler.step() otherwise
+        # fires a false-positive "before optimizer.step()" warning
+        optimizer._opt_called = True  # noqa: B010  (torch's own protocol)
         for group in optimizer.param_groups:
             pairs = [(p, p.grad) for p in group["params"] if p.grad is not None]
             if not pairs:
@@ -1904,6 +1908,7 @@ def make_serial_step_fn(optimizer, device):
 
     def step_fn():
         with torch.no_grad():  # leaf in-place updates (SignSGD step decorator)
+            optimizer._opt_called = True  # noqa: B010  (see _sign_step_foreach)
             for p, pre in pre_step:
                 pre.copy_(p)
             for group in optimizer.param_groups:

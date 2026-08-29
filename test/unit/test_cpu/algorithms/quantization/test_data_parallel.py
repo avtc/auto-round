@@ -2378,3 +2378,21 @@ class TestSignStepForeach:
         lin.weight.grad = torch.zeros_like(lin.weight)
         _sign_step_foreach(opt, free_grads=True)
         assert lin.weight.grad is None
+
+    def test_fast_path_silences_scheduler_false_positive(self):
+        import warnings
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _sign_step_foreach
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+        lin = torch.nn.Linear(3, 3)
+        opt = SignSGD(list(lin.parameters()), lr=0.1)
+        sched = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=5)
+        lin(torch.randn(2, 3)).sum().backward()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _sign_step_foreach(opt)
+            sched.step()
+            assert not [x for x in w if "before `optimizer.step()`" in str(x.message)]
