@@ -1084,7 +1084,7 @@ class SignRoundQuantizer(BaseQuantizer):
         _graphs_capture_t = None
         _graphs_capture_wall = 0.0
         _graphs_capture_iter = -1
-        if _proactive and _dp_samplers is not None and replica_group is not None:
+        if _proactive and _pacing and _graphs_active and _dp_samplers is not None and replica_group is not None:
             # consume the whole shuffle schedule upfront (same RNG stream as
             # the lazy per-iteration next_batch sequence -- deterministic)
             _proactive_schedule = [[s.next_batch() for s in _dp_samplers] for _ in range(self.iters)]

@@ -1804,8 +1804,10 @@ class TestProactivePacedSteps:
                 for fn in fns:
                     fn()
 
-        run_proactive_paced_steps(FakeGroup(), [FakeStep()], [[9]], None, [None], [[]], prepared=True)
+        ms = [[]]
+        run_proactive_paced_steps(FakeGroup(), [FakeStep()], [[9]], None, [None], ms, prepared=True)
         assert order == [("r",)]  # last iteration: replay only, no next prepare
+        assert len(ms[0]) == 1 and ms[0][0] >= 0  # replay-round timing recorded
 
     def test_schedule_precompute_matches_lazy_sampler_stream(self):
         import random
