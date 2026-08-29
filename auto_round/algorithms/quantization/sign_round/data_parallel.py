@@ -1267,6 +1267,23 @@ class GraphedReplicaStep:
             capture_ctx if capture_ctx is not None else lambda g: torch.cuda.graph(g, stream=self._capture_stream)
         )
 
+    def _run_eager(self):
+        """Uncaptured fwd+loss+bwd, on the capture stream when CUDA.
+
+        prepare() copies run on the default stream: order them in (side waits
+        default), run compute under the side stream so the autograd nodes it
+        creates match the capture stream, then order the default stream after
+        it (the exchange/step that follow read the grads).
+        """
+        if self._capture_stream is None:
+            return self.compute()
+        cur = torch.cuda.current_stream(self.device)
+        self._capture_stream.wait_stream(cur)
+        with torch.cuda.device(self.device), torch.cuda.stream(self._capture_stream):
+            loss = self.compute()
+        cur.wait_stream(self._capture_stream)
+        return loss
+
     def capture_now(self):
         """Record the graph now (main thread, workers parked) and replay once.
 
@@ -1307,9 +1324,14 @@ class GraphedReplicaStep:
             # uncaptured iterations run eagerly: the first warmup_iters by
             # design, later ones while the capture barrier DEFERS (background
             # pack/transform threads still issue CUDA -- global-mode capture
-            # needs the process quiet, so capture waits for them to finish)
+            # needs the process quiet, so capture waits for them to finish).
+            # Eager iterations run on the CAPTURE stream: AccumulateGrad nodes
+            # must be created on the same stream that later captures, or the
+            # engine's cross-stream sync makes the legacy stream depend on the
+            # capturing stream (cudaErrorStreamCaptureImplicit) -- the
+            # make_graphed_callables pattern.
             try:
-                return self.compute().detach()
+                return self._run_eager().detach()
             except Exception as exc:
                 logger.error(
                     "[tune-ddp] cuda-graph warm-up compute failed for %s (%s): " "set AR_TUNE_CUDA_GRAPHS=0 to disable",
