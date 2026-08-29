@@ -235,17 +235,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # runs at a time. Set to 1 to opt out.
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
     # Overlapped gradient exchange (default ON when eligible): per-parameter
-    # post-accumulate-grad hooks fire DURING backward, encode each bucket on a
-    # per-device side stream and P2P-copy it into preallocated staging on all
-    # peers; sync_grads then only waits the side streams and runs the canonical
-    # per-bucket sum. DEFAULT OFF: the per-hook fan-out issues copies from
-    # multiple autograd threads with per-copy device/stream context switches,
-    # which drops the P2P fast path (~2 GB/s vs ~13 GB/s single-threaded),
-    # making the overlapped exchange SLOWER than the classic sequential one
-    # (world=4 bf16: 825 vs 472 ms/iter; int8: 580 vs 458). Set to "0" to
-    # re-enable; the structure is kept for a single-threaded fan-out rework.
-    "AR_DISABLE_OVERLAP_EXCHANGE": lambda: os.getenv("AR_DISABLE_OVERLAP_EXCHANGE", "1").lower()
-    in ("1", "true", "yes"),
     # qoff (FP-reference-chain) tuning unblocker: inject per-channel
     # quantization noise into the FP block inputs during SignRound tuning.
     "AR_QOFF_NOISE": lambda: os.getenv("AR_QOFF_NOISE", "0").lower() in ("1", "true", "yes"),

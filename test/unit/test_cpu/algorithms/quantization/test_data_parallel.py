@@ -1294,9 +1294,8 @@ class TestOverlapExchange:
             expected = torch.stack(base).mean(0)
             torch.testing.assert_close(first / 4.0, expected, rtol=0, atol=atol)
 
-    def test_cpu_group_stays_on_sequential_path(self):
-        # the overlap machinery is CUDA-only; a CPU group must keep working
-        # through the classic exchange and leave _overlap unset
+    def test_cpu_group_exchanges_grads(self):
+        # a CPU group must keep working through the classic exchange
         from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup
 
         class _Tiny(torch.nn.Module):
@@ -1320,17 +1319,4 @@ class TestOverlapExchange:
         for ps in per_rep:
             for p in ps:
                 assert p.grad is not None
-        assert group._overlap is None
         group.teardown()
-
-    def test_env_opt_out_blocks_overlap(self, monkeypatch):
-        from auto_round import envs
-
-        # default off: the per-hook fan-out regresses the exchange (see the
-        # AR_DISABLE_OVERLAP_EXCHANGE comment in envs.py)
-        monkeypatch.delenv("AR_DISABLE_OVERLAP_EXCHANGE", raising=False)
-        assert envs.AR_DISABLE_OVERLAP_EXCHANGE is True
-        monkeypatch.setenv("AR_DISABLE_OVERLAP_EXCHANGE", "0")
-        assert envs.AR_DISABLE_OVERLAP_EXCHANGE is False
-        monkeypatch.setenv("AR_DISABLE_OVERLAP_EXCHANGE", "1")
-        assert envs.AR_DISABLE_OVERLAP_EXCHANGE is True
