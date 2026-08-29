@@ -873,7 +873,7 @@ class SignRoundQuantizer(BaseQuantizer):
         if _graphs_active and _graphed_steps is None:
             # built BEFORE the ddp warm-up pass: the warm-up backward must run
             # on the steps' capture streams (see the warm-up site)
-            _graphed_steps = [_make_graphed_step(r) for r in range(replica_group.world)]]
+            _graphed_steps = [_make_graphed_step(r) for r in range(replica_group.world)]
             _graphs_warmups_left = _graphed_steps[0].warmup_iters
             logger.info(
                 "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
