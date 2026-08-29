@@ -1981,3 +1981,109 @@ class TestMakeSerialGraphedStep:
         assert torch.allclose(cap, warm)
         got = step(row)  # steady: prepare + replay (recompute -> clone)
         assert torch.allclose(got, warm)
+
+
+class TestSerialWholeIterationStep:
+    """T8c: step_fn inside the captured region + pre-step staging semantics."""
+
+    @staticmethod
+    def _fixture():
+        import torch
+
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            make_serial_graphed_step,
+            make_serial_step_fn,
+        )
+
+        torch.manual_seed(3)
+        block = torch.nn.Linear(5, 5)
+        # wrapper-style params so collect_best_params(_pre) walks them
+        block.orig_layer = True
+        block.params = {"weight": block.weight, "bias": block.bias}
+        pool = [(torch.arange(5, dtype=torch.float32) + 10.0 * i).unsqueeze(0) for i in range(4)]
+        fp_outputs = [block(x).detach() + 0.1 * torch.randn_like(x) for x in pool]
+        fwd = BlockForwardRunner(batch_size=4, amp=False, enable_torch_compile=False)
+        optimizer = torch.optim.SGD(list(block.parameters()), lr=0.1)  # stand-in param_groups
+
+        def loss_fn(pred, ref):
+            return torch.nn.functional.mse_loss(pred.float(), ref.float())
+
+        step_fn, pre_by_id = make_serial_step_fn(optimizer, torch.device("cpu"))
+        step = make_serial_graphed_step(
+            block,
+            fwd,
+            pool,
+            {"positional_inputs": None},
+            fp_outputs,
+            loss_fn,
+            torch.device("cpu"),
+            step_fn=step_fn,
+        )
+        return block, pool, fp_outputs, optimizer, step, pre_by_id
+
+    def test_backward_ran_and_grads_zeroed_in_step(self):
+        import torch
+
+        block, _, _, _, step, _ = self._fixture()
+        step([0, 1, 2, 3])
+        # backward populated grads, then step_fn zeroed them (ordering proof)
+        assert block.weight.grad is not None
+        assert torch.count_nonzero(block.weight.grad) == 0
+
+    def test_pre_step_staging_holds_previous_iterate(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import collect_best_params_pre
+
+        block, _, _, _, step, pre_by_id = self._fixture()
+        w0 = block.weight.detach().clone()
+        step([0, 1, 2, 3])  # staging <- w0, then params updated
+        assert torch.equal(pre_by_id[id(block.weight)], w0)
+        assert not torch.equal(block.weight.detach(), w0)
+        best = collect_best_params_pre(block, "cpu", pre_by_id)
+        assert torch.equal(best["weight"], w0)  # pairing (L0, P0) preserved
+
+    def test_bit_parity_vs_legacy_alpha_step(self):
+        import torch
+
+        block, pool, fp_outputs, optimizer, step, _ = self._fixture()
+        legacy = torch.nn.Linear(5, 5)
+        legacy.load_state_dict(block.state_dict())
+        lrs = [0.1, 0.05, 0.025]
+        rows = [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2]]
+        for lr, row in zip(lrs, rows):
+            for group in optimizer.param_groups:
+                group["_ar_neg_lr_dev"].fill_(-float(lr))
+            step(row)
+            ins = torch.cat([pool[j] for j in row], dim=0)
+            refs = torch.cat([fp_outputs[j] for j in row], dim=0)
+            torch.nn.functional.mse_loss(legacy(ins), refs).backward()
+            with torch.no_grad():
+                for p in legacy.parameters():
+                    if p.grad is not None:
+                        p.add_(torch.sign(p.grad), alpha=-float(lr))
+                        p.grad.zero_()
+        for p_new, p_old in zip(block.parameters(), legacy.parameters()):
+            assert torch.equal(p_new, p_old)
+
+    def test_lr_refresh_changes_update_magnitude(self):
+        import torch
+
+        block, _, _, optimizer, step, _ = self._fixture()
+        for group in optimizer.param_groups:
+            group["_ar_neg_lr_dev"].fill_(0.0)
+        before = block.weight.detach().clone()
+        step([0, 1, 2, 3])
+        assert torch.equal(block.weight.detach(), before)  # lr=0: no movement
+        for group in optimizer.param_groups:
+            group["_ar_neg_lr_dev"].fill_(-0.5)
+        step([0, 1, 2, 3])
+        assert not torch.equal(block.weight.detach(), before)
+
+    def test_vram_guard_seam(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import serial_step_vram_ok
+
+        assert serial_step_vram_ok(100, lambda: (1000, 2000), margin=500) is True
+        assert serial_step_vram_ok(100, lambda: (50, 2000), margin=500) is False
+        assert serial_step_vram_ok(100, None) is True  # no CUDA: staging still allowed on CPU tests

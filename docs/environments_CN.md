@@ -409,7 +409,7 @@ export AR_TUNE_SERIAL_DEVICE_SCHEDULE=0   # 惰性 next_batch + 主机列表索�
 ```
 
 ### AR_TUNE_CUDA_GRAPHS（串行调优路径）
-- **描述**： 当启用 `AR_TUNE_CUDA_GRAPHS` 且调优循环以串行方式运行（单设备、无 DDP、列表输入且非 diffusion 路径、`gradient_accumulate_steps=1`、fence-free prepare 开启、未使用 `valid_token_mask`、非 LFQ block、loss 与调优设备一致）时，每个 block 的 前向+loss+反向 会在 2 个 eager 预热迭代后被捕获进 CUDA graph：每次迭代的样本 gather 刷新静态设备缓冲（`_copy_into_static`，形状/ dtype 漂移即停机），迭代主体变为一次 graph replay（预热迭代在捕获侧流上 eager 执行，使 autograd 节点诞生于捕获流）。梯度保持驻留（`set_to_none=False`），反向累积进捕获时固化的地址；优化器 step 与 best-params 快照保持 eager。当后台 CUDA 线程（bg pack、checkpoint prefetch）仍活跃时捕获会推迟并记录一次日志。任何捕获/replay 失败都会记录错误并提示 `AR_TUNE_CUDA_GRAPHS=0`，随后停机。不符合条件或纯 CPU 的运行保持旧版串行 batch 循环。另见 DDP 变体在 `AR_TUNE_EXCH_OVERLAP` 下的约束（仅 eager 反向）。
+- **描述**： 当启用 `AR_TUNE_CUDA_GRAPHS` 且调优循环以串行方式运行（单设备、无 DDP、列表输入且非 diffusion 路径、`gradient_accumulate_steps=1`、fence-free prepare 开启、未使用 `valid_token_mask`、非 LFQ block、loss 与调优设备一致）时，每个 block 的 前向+loss+反向 会在 2 个 eager 预热迭代后被捕获进 CUDA graph：每次迭代的样本 gather 刷新静态设备缓冲（`_copy_into_static`，形状/ dtype 漂移即停机），迭代主体变为一次 graph replay（预热迭代在捕获侧流上 eager 执行，使 autograd 节点诞生于捕获流）。梯度保持驻留（`set_to_none=False`），反向累积进捕获时固化的地址；优化器 step 与 best-params 快照保持 eager。当满足纯符号配置（无 scaler、momentum 为 0、无 dynamic 早停）且设备能容纳一份额外调优参数（带 VRAM 守卫）时，优化器 step 也会被捕获进 graph（整迭代捕获）：lr 从每组设备张量读取并逐迭代刷新（lr 随调度变化的情形保持精确），best-params 快照读取 graph 内的 PRE-STEP 暂存，从而位精确地保持（loss, step 前参数）配对。当后台 CUDA 线程（bg pack、checkpoint prefetch）仍活跃时捕获会推迟并记录一次日志。任何捕获/replay 失败都会记录错误并提示 `AR_TUNE_CUDA_GRAPHS=0`，随后停机。不符合条件或纯 CPU 的运行保持旧版串行 batch 循环。另见 DDP 变体在 `AR_TUNE_EXCH_OVERLAP` 下的约束（仅 eager 反向）。
 - **默认值**: `1`
 - **有效值**: `1`, `0`
 - **用法**: 在 CUDA 上保持开启；在 A/B 测试中可关闭以隔离 graph 影响。

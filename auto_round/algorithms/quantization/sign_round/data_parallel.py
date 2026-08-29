@@ -1661,6 +1661,7 @@ def make_serial_graphed_step(
     warmup_iters: int = 2,
     graph_factory=None,
     capture_ctx=None,
+    step_fn=None,
 ):
     """Serial twin of the DDP graphed replica step (T8b).
 
@@ -1740,6 +1741,11 @@ def make_serial_graphed_step(
             pred = outs[0] if len(outs) == 1 else torch.cat(outs, dim=block_fwd.batch_dim)
             loss = loss_fn(pred, st["ref"])
             loss.backward()
+            if step_fn is not None:
+                # T8c: the optimizer step runs INSIDE the captured region --
+                # warmup iterations execute it eagerly with the same
+                # device-lr tensors the replay will read
+                step_fn()
             return loss
 
     return GraphedReplicaStep(
@@ -1751,6 +1757,94 @@ def make_serial_graphed_step(
         graph_factory=graph_factory,
         capture_ctx=capture_ctx,
     )
+
+
+def serial_step_vram_ok(needed_bytes, free_fn, margin: int = 1 << 30) -> bool:
+    """Whole-iteration staging VRAM guard (T8c).
+
+    The pre-step parameter staging costs one full tuning-param set; engage
+    whole-iteration capture only when the device holds it plus a margin.
+    ``free_fn=None`` (no CUDA context) always allows -- CPU tests stage freely.
+    """
+    if free_fn is None:
+        return True
+    free, _total = free_fn()
+    return needed_bytes + margin <= free
+
+
+def make_serial_step_fn(optimizer, device):
+    """Capture-safe whole-iteration step (T8c) for the serial tune loop.
+
+    Returns ``(step_fn, pre_by_id)``:
+
+    - ``step_fn`` must run AFTER backward (inside the captured region, or
+      eagerly during warmup): it first stages every optimizer parameter into
+      its PRE-STEP twin (the best-params snapshot must pair loss L_i with the
+      pre-step iterate P_i -- a post-replay live read would see P_{i+1}), then
+      applies the SignSGD update ``param.add_(sign(grad), alpha=-lr)`` with the
+      lr read from a per-group 0-dim DEVICE tensor (``group['_ar_neg_lr_dev']``,
+      param dtype -- a baked python-float lr would freeze the schedule), and
+      zeroes grads in place (parked addresses, ``set_to_none=False`` semantics).
+      Mirrors SignSGD's engaged configuration (momentum=0, weight_decay=0)
+      bit-for-bit: the single fp64->dtype rounding of ``-lr`` matches the
+      in-kernel alpha cast.
+    - ``pre_by_id`` maps ``id(param)`` -> staging twin for
+      :func:`collect_best_params_pre`.
+    """
+    pre_step = []
+    pre_by_id = {}
+    for group in optimizer.param_groups:
+        params = [p for p in group["params"] if p.requires_grad]
+        if not params:
+            continue
+        dtype = params[0].dtype
+        if any(p.dtype != dtype for p in params):
+            raise ValueError("mixed dtypes inside a param group: device-lr twin cannot stay bit-exact")
+        group["_ar_neg_lr_dev"] = torch.full((), -float(group["lr"]), dtype=dtype, device=device)
+        for p in params:
+            pre = torch.empty_like(p)
+            pre.copy_(p)  # staging starts at the current iterate
+            pre_step.append((p, pre))
+            pre_by_id[id(p)] = pre
+
+    def step_fn():
+        with torch.no_grad():  # leaf in-place updates (SignSGD step decorator)
+            for p, pre in pre_step:
+                pre.copy_(p)
+            for group in optimizer.param_groups:
+                lr_dev = group.get("_ar_neg_lr_dev")
+                if lr_dev is None:
+                    continue
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    p.add_(torch.sign(p.grad) * lr_dev)
+                    p.grad.zero_()
+
+    return step_fn, pre_by_id
+
+
+def collect_best_params_pre(block, cache_device, pre_by_id):
+    """:func:`collect_best_params` reading PRE-STEP staging twins (T8c).
+
+    Identical walk; each tuning parameter is read from its pre-step twin so the
+    snapshot pairs loss L_i with iterate P_i even though the optimizer step ran
+    inside the replay. Frozen (non-optimizer) params fall through to the live
+    tensor -- they never step, so live == pre.
+    """
+    params = {}
+    if hasattr(block, "orig_layer"):
+        for key in block.params.keys():
+            src = pre_by_id.get(id(block.params[key]), block.params[key])
+            params[key] = src.data.to(cache_device, copy=True)
+    else:
+        for n, m in block.named_modules():
+            if hasattr(m, "orig_layer"):
+                params[n] = {}
+                for key in m.params.keys():
+                    src = pre_by_id.get(id(m.params[key]), m.params[key])
+                    params[n][key] = src.data.to(cache_device, copy=True)
+    return params
 
 
 def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):

@@ -1162,6 +1162,62 @@ class SignRoundQuantizer(BaseQuantizer):
             _serial_warmups_left = _serial_step.warmup_iters
             logger.info("[tune-serial] cuda graphs enabled: capture after %d warmup iteration(s)", _serial_warmups_left)
 
+        _serial_step_fn = None
+        _serial_pre_by_id = None
+        if _serial_step is not None:
+            # T8c escalation: capture the OPTIMIZER STEP inside the region too
+            # (whole-iteration graph). Requires the pure-sign configuration
+            # (momentum/wd zero -- the captured update mirrors exactly that
+            # SignSGD path) and no dynamic early-stop (conservative: the
+            # immediate-mode loss read stays on the T8b path).
+            _serial_step_ok = (
+                scaler is None
+                and (self.momentum is None or float(self.momentum) == 0.0)
+                and self.dynamic_max_gap <= 0
+                and all(float(g.get("weight_decay", 0.0) or 0.0) == 0.0 for g in optimizer.param_groups)
+            )
+            if _serial_step_ok:
+                try:
+                    from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                        make_serial_step_fn,
+                        serial_step_vram_ok,
+                    )
+
+                    _needed = sum(
+                        p.numel() * p.element_size()
+                        for g in optimizer.param_groups
+                        for p in g["params"]
+                        if p.requires_grad
+                    )
+                    _free_fn = (lambda: torch.cuda.mem_get_info(device)) if str(device).startswith("cuda") else None
+                    if serial_step_vram_ok(_needed, _free_fn):
+                        _serial_step_fn, _serial_pre_by_id = make_serial_step_fn(optimizer, torch.device(device))
+                        _serial_step = make_serial_graphed_step(
+                            block,
+                            block_fwd,
+                            active_inputs,
+                            input_others,
+                            fp_outputs,
+                            lambda pred, ref: self._get_loss(pred, ref, None, mse_loss, device, None),
+                            torch.device(device),
+                            step_fn=_serial_step_fn,
+                        )
+                        logger.info(
+                            "[tune-serial] whole-iteration capture: optimizer step inside the graph "
+                            "(staging %.2f GiB)",
+                            _needed / 2**30,
+                        )
+                    else:
+                        logger.info(
+                            "[tune-serial] whole-iteration capture skipped: staging needs %.2f GiB free",
+                            _needed / 2**30,
+                        )
+                except (RuntimeError, ValueError) as _se:
+                    logger.info(
+                        "[tune-serial] whole-iteration capture unavailable (%s); eager step between replays", _se
+                    )
+                    _serial_step_fn, _serial_pre_by_id = None, None
+
         if _proactive and _pacing and _graphs_active and _dp_samplers is not None and replica_group is not None:
             # consume the whole shuffle schedule upfront (same RNG stream as
             # the lazy per-iteration next_batch sequence -- deterministic)
@@ -1358,6 +1414,13 @@ class SignRoundQuantizer(BaseQuantizer):
                         total_loss = sum(l.item() for l in _losses if l is not None) / _world
             else:
                 if _serial_step is not None:
+                    if _serial_step_fn is not None:
+                        # whole-iteration mode: refresh the DEVICE lr the
+                        # captured step reads (host float cast; the schedule
+                        # advances below -- ordering matches _step's tail)
+                        for _g in optimizer.param_groups:
+                            if "_ar_neg_lr_dev" in _g:
+                                _g["_ar_neg_lr_dev"].fill_(-float(_g["lr"]))
                     with tune_stage(tune_prof, "fwd"):
                         if _serial_warmups_left > 0:
                             # warm-up: prepare + EAGER compute on the capture
@@ -1469,10 +1532,26 @@ class SignRoundQuantizer(BaseQuantizer):
                             else self.compress_context.cache_device
                         )
                         with tune_stage(tune_prof, "snapshot"):
-                            best_params = collect_best_params(block, _snap_dev)
+                            if _serial_step_fn is not None:
+                                from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                                    collect_best_params_pre,
+                                )
+
+                                best_params = collect_best_params_pre(block, _snap_dev, _serial_pre_by_id)
+                            else:
+                                best_params = collect_best_params(block, _snap_dev)
                         last_best_iter = i
                 if self.not_use_best_mse and i == self.iters - 1:
-                    best_params = collect_best_params(block, self.compress_context.cache_device)
+                    if _serial_step_fn is not None:
+                        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                            collect_best_params_pre,
+                        )
+
+                        best_params = collect_best_params_pre(
+                            block, self.compress_context.cache_device, _serial_pre_by_id
+                        )
+                    else:
+                        best_params = collect_best_params(block, self.compress_context.cache_device)
 
                 if not self.not_use_best_mse:
                     if 0 < self.dynamic_max_gap <= i - last_best_iter:
@@ -1509,7 +1588,10 @@ class SignRoundQuantizer(BaseQuantizer):
             else:
                 sync_gradients()
                 with tune_stage(tune_prof, "step"):
-                    self._step(scaler, optimizer, lr_schedule, keep_grads=_serial_step is not None)
+                    if _serial_step_fn is not None:
+                        lr_schedule.step()  # step ran inside the (re)play
+                    else:
+                        self._step(scaler, optimizer, lr_schedule, keep_grads=_serial_step is not None)
 
         try:
             if _graphed_steps is not None and len(_graphed_worker_ms) and all(len(w) for w in _graphed_worker_ms):
