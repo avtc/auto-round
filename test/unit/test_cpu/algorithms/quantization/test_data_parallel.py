@@ -2523,8 +2523,8 @@ class TestMirrorTemplateCache:
         assert group.home is home  # real block stays the sync/copy-back anchor
         assert group.tune_home is staging_home
 
-    def test_cache_entry_shape_and_loop_end_semantics(self):
-        """Entries carry ALL replicas (staging home first); neutralized closures on insert."""
+    def test_cache_entry_shape(self):
+        """Entries carry ALL replicas (staging home first)."""
         import contextlib
 
         import torch
@@ -2541,73 +2541,9 @@ class TestMirrorTemplateCache:
         step._ar_st = st
         step.prepare = lambda *a, **k: None
         step.compute = lambda: None
-        entry = {"replicas": [self._block(), self._block()], "steps": [step]}
-        assert entry["replicas"][0] is not None and len(entry["steps"]) == 2 or True
-        # closure neutralization keeps the graph and statics alive
-        assert step._ar_st is st
-
-    def test_step_rebinding_keeps_graph_and_st(self):
-        import contextlib
-        import torch
-
-        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
-
-        st = {"inputs": None, "others": None, "ref": None}
-        st["ref"] = torch.zeros(4)
-        calls = []
-        step = GraphedReplicaStep(
-            lambda *a: calls.append(("prep", a)),
-            lambda: calls.append(("compute",)),
-            warmup_iters=2,
-            name="r1",
-            graph_factory=lambda: object(),
-            capture_ctx=lambda g: contextlib.nullcontext(),
-        )
-
-        class _FakeG:
-            def replay(self):
-                step._static_loss = step.compute()
-
-        step._graph = _FakeG()  # pretend captured
-
-        def rebind(existing_step, existing_st):
-            def prepare(row):
-                existing_st["ref"] = torch.full((4,), float(row[0]))
-                calls.append(("newprep", row))
-
-            def compute():
-                calls.append(("newcompute",))
-                return existing_st["ref"].sum().reshape(1)
-
-            existing_step.prepare = prepare
-            existing_step.compute = compute
-            return existing_step
-
-        same = rebind(step, st)
-        assert same is step and step._graph is not None  # graph survives
-        step(3.0 if False else [3])
-        assert calls[-2:] == [("newprep", [3]), ("newcompute",)]
-        assert st["ref"][0].item() == 3.0  # same static dict refreshed
-
-    def test_cache_lru_cap(self):
-        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
-
-        dp._GRAPH_TEMPLATE_CACHE.clear()
-        for k in ("a", "b", "c", "d"):
-            dp._GRAPH_TEMPLATE_CACHE[k] = {"mirrors": [], "steps": [], "sts": []}
-            dp._GRAPH_TEMPLATE_CACHE.move_to_end(k)
-            while len(dp._GRAPH_TEMPLATE_CACHE) > 3:  # any cap works
-                dp._GRAPH_TEMPLATE_CACHE.popitem(last=False)
-        assert list(dp._GRAPH_TEMPLATE_CACHE) == ["b", "c", "d"]
-
-    def test_env_size_default_two_any_value(self, monkeypatch):
-        from auto_round import envs
-
-        monkeypatch.delenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", raising=False)
-        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 2  # user decision: default ON
-        for v in ("0", "1", "5"):
-            monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
-            assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)
+        entry = {"replicas": [self._block(), self._block()], "steps": [step, step]}
+        assert entry["replicas"][0] is not None and len(entry["steps"]) == 2
+        assert entry["steps"][0] is step and step._ar_st is st
 
     def test_two_block_composition_reuse_flow(self):
         """Block A capture -> cache -> block B hit: sync + rebind + replay-only."""

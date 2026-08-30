@@ -797,7 +797,13 @@ class SignRoundQuantizer(BaseQuantizer):
             return {}
 
         # Build optimizer param groups with a per-layer lr for the rounding
-        # parameters (and min-max parameters when enabled).
+        # parameters (and min-max parameters when enabled). Under the template
+        # cache the loop tunes the STAGING home -- the optimizer must step the
+        # staging params (the real block's copies never receive grads).
+        if replica_group is not None and replica_group.tune_home is not block:
+            round_params, minmax_params, round_lr_groups, minmax_lr_groups = _collect_tuning_params(
+                replica_group.tune_home
+            )
         params = [{"params": ps, "lr": torch.tensor(group_lr)} for group_lr, ps in round_lr_groups.items()]
         if self.enable_minmax_tuning:
             params += [{"params": ps, "lr": torch.tensor(group_lr)} for group_lr, ps in minmax_lr_groups.items()]
@@ -1006,6 +1012,10 @@ class SignRoundQuantizer(BaseQuantizer):
             _graphs_warmups_left = (
                 0 if getattr(_graphed_steps[0], "_graph", None) is not None else _graphed_steps[0].warmup_iters
             )
+            if all(getattr(_gs, "_graph", None) is not None for _gs in _graphed_steps):
+                # full template hit: nothing will be captured -- do not hold
+                # the bg gate or wait for a quiet process (replays need neither)
+                _graphs_capture_pending = False
             logger.info(
                 "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
                 len(_graphed_steps),
@@ -1774,12 +1784,12 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         if replica_group is not None:
             if _tpl_home is not None and _tpl_home is not block:
-                # copy the final iterate back: downstream readers (refit/
-                # pack) must see the tuned end state exactly like an
-                # in-place-tuned block
-                from auto_round.algorithms.quantization.sign_round.data_parallel import sync_module_values
+                # copy the TUNED end state back: downstream readers (unwrapper/
+                # pack/refit) walk the real block -- grids, frozen-pin layout,
+                # flags and all (a plain value sync leaves unanchored grids)
+                from auto_round.algorithms.quantization.sign_round.data_parallel import sync_tuned_state_back
 
-                sync_module_values(_tpl_home, block)
+                sync_tuned_state_back(_tpl_home, block)
             try:
                 from auto_round.algorithms.quantization.sign_round.data_parallel import (
                     _GRAPH_TEMPLATE_CACHE,

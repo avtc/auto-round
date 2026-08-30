@@ -2212,12 +2212,46 @@ _GRAPH_TEMPLATE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 def sync_module_values(src: torch.nn.Module, dst: torch.nn.Module) -> None:
     """One-way address-stable value sync between same-template modules.
 
-    Used in BOTH directions of the template cache: real block -> persistent
-    replicas (block start) and persistent home staging -> real block (loop
-    end, so downstream readers see the final iterate exactly like an
-    in-place-tuned block).
+    Real block -> persistent replicas (block start) and staging home -> real
+    block (loop end). See :func:`sync_mirror_from_home`.
     """
     sync_mirror_from_home(src, dst)
+
+
+def sync_tuned_state_back(staging: torch.nn.Module, block: torch.nn.Module) -> None:
+    """Copy the TUNED end state of the home staging replica into the real block.
+
+    The recipe anchor ran on the STAGING set only -- the real block's wrappers
+    still carry unanchored grids and pending flags, and frozen-margin recipes
+    pinned (unregistered) their min/max params on staging while the real block
+    still has them registered. Downstream readers (unwrapper/pack/refit) walk
+    the REAL block, so: pin frozen margins on it exactly like staging did
+    (making the parameter layouts match), sync parameter/buffer/imatrix
+    values, copy the anchored weight_min/max grids IN PLACE, and copy the
+    recipe flags (clearing the pending-anchor marker).
+    """
+    st_mods = dict(staging.named_modules())
+    with torch.no_grad():
+        for name, dm in block.named_modules():
+            sm = st_mods.get(name)
+            if sm is None:
+                continue
+            if getattr(sm, "_tune_recipe_frozen_margins", False) and hasattr(dm, "_pin_margins_frozen"):
+                dm._pin_margins_frozen()  # match staging's unregistered layout BEFORE the value sync
+        sync_mirror_from_home(staging, block)
+        for name, dm in block.named_modules():
+            sm = st_mods.get(name)
+            if sm is None or not hasattr(dm, "weight_min"):
+                continue
+            for attr in ("weight_min", "weight_max"):
+                src_t, dst_t = getattr(sm, attr, None), getattr(dm, attr, None)
+                if isinstance(src_t, torch.Tensor) and isinstance(dst_t, torch.Tensor) and src_t.shape == dst_t.shape:
+                    dst_t.copy_(src_t.to(dst_t.device, dst_t.dtype))
+            if getattr(sm, "_tune_recipe", None) is not None:
+                dm._tune_recipe = sm._tune_recipe
+            if getattr(sm, "_tune_recipe_frozen_margins", False):
+                dm._tune_recipe_frozen_margins = True
+            dm._recipe_anchor_deferred = False  # grids arrived via the tuned staging copy
 
 
 def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> None:
@@ -2297,8 +2331,6 @@ class ReplicaGroup:
             # are synced by the caller BEFORE the recipe anchor re-pins the
             # tuning grids); their captured graphs stay alive
             self.mirrors = list(mirrors)
-        elif home_replica is not None:
-            pass  # home-staging-only reuse (world == 1)
         else:
             for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
                 mirror = self._make_mirror(block, dev, staged_source)
