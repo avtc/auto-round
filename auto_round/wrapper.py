@@ -486,11 +486,21 @@ class WrapperLinear(torch.nn.Module):
 
         Removes them from ``self.params`` (collectors iterate ``params.keys()``)
         and unregisters the Parameters so plain-tensor assignment is legal.
+        The pin must REUSE the existing storage (fill in place): captured
+        graphs bake the storage pointer, and a re-anchor on a template-cache
+        hit must not orphan it (the freed storage gets recycled and the graph
+        would read foreign memory as the scale margins).
         """
         for _key in ("min_scale", "max_scale"):
             self.params.pop(_key, None)
             self._parameters.pop(_key, None)
-            setattr(self, _key, torch.tensor(1.0, device=self.device, dtype=self.weight_min.dtype))
+            cur = getattr(self, _key, None)
+            if isinstance(cur, torch.Tensor) and cur.device.type == torch.device(self.device).type:
+                with torch.no_grad():
+                    cur.fill_(1.0)
+                setattr(self, _key, cur.view(-1) if cur.dim() else cur)
+            else:
+                setattr(self, _key, torch.tensor(1.0, device=self.device, dtype=self.weight_min.dtype))
 
     def _init_params(self, name, dtype, shape, value, tunable):
         """Initializes a parameter for tuning or uses a constant if tuning is disabled.

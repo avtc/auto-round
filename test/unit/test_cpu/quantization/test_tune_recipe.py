@@ -970,6 +970,29 @@ class TestDeferredRecipeAnchor:
             assert float(w.min_scale) == 1.0 and float(w.max_scale) == 1.0
         assert w_def._tune_recipe_frozen_margins is True
 
+    def test_reanchor_preserves_pinned_margin_storage(self, monkeypatch):
+        """Template-cache hit: a re-anchor must not orphan the pinned margin
+        storage. Captured graphs bake the storage pointer of ``min_scale``/
+        ``max_scale``; the frozen-recipe pin must FILL IN PLACE (same storage)
+        instead of allocating a fresh 1.0 tensor, or the cached graph reads
+        recycled foreign memory as the scale margins (deterministic huge loss
+        from iter 0 while eager stays correct)."""
+        w = self._wrap("neuqi_frozen_qon", monkeypatch, defer=True)
+        assert w.anchor_recipe_grid() is True
+        ptr_min, ptr_max = w.min_scale.data_ptr(), w.max_scale.data_ptr()
+        # hit flow: sync re-arms the deferred flag, the anchor runs AGAIN on
+        # the adopted mirror (same wrapper object the graph was captured on)
+        w._recipe_anchor_deferred = True
+        assert w.anchor_recipe_grid() is True
+        assert w.min_scale.data_ptr() == ptr_min, "pin orphaned min_scale storage"
+        assert w.max_scale.data_ptr() == ptr_max, "pin orphaned max_scale storage"
+        assert float(w.min_scale) == 1.0 and float(w.max_scale) == 1.0
+        # registration semantics unchanged: constants, out of the tuned pool
+        assert "min_scale" not in w.params and "max_scale" not in w.params
+        assert "min_scale" not in dict(w.named_parameters())
+        assert "max_scale" not in dict(w.named_parameters())
+        assert not isinstance(w.min_scale, torch.nn.Parameter)
+
     def test_shard_helper_broadcasts_grids(self, monkeypatch):
         from auto_round.algorithms.quantization.sign_round.quantizer import _shard_recipe_anchor
 
