@@ -1724,7 +1724,11 @@ def run_proactive_paced_steps(group, steps, current_shards, next_shards, out_los
 
         def _replay(r):
             t0 = time.perf_counter()
-            out_losses[r] = steps[r].replay_only()
+            # device context: replay launches onto the calling thread's
+            # current stream -- without this a mirror's graph launches from
+            # cuda:0's stream, unordered against its own prepare copies
+            with torch.cuda.device(steps[r].device):
+                out_losses[r] = steps[r].replay_only()
             if worker_ms is not None:
                 worker_ms[r].append((time.perf_counter() - t0) * 1000.0)
 
@@ -2041,7 +2045,8 @@ def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
 
     def _replay(r):
         t0 = time.perf_counter()
-        out_losses[r] = steps[r].replay_only()
+        with torch.cuda.device(steps[r].device):
+            out_losses[r] = steps[r].replay_only()
         if worker_ms is not None:
             worker_ms[r].append((time.perf_counter() - t0) * 1000.0)
 
