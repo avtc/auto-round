@@ -1706,6 +1706,18 @@ class HostLeafPinner:
                 self._cache[key] = (src, src.pin_memory())
 
 
+def _replay_step_on_device(step, out_losses, r, worker_ms, t0):
+    """Replay one step under its own device context (test steps may lack one)."""
+    dev = getattr(step, "device", None)
+    if dev is not None:
+        with torch.cuda.device(dev):
+            out_losses[r] = step.replay_only()
+    else:
+        out_losses[r] = step.replay_only()
+    if worker_ms is not None:
+        worker_ms[r].append((time.perf_counter() - t0) * 1000.0)
+
+
 def run_proactive_paced_steps(group, steps, current_shards, next_shards, out_losses, worker_ms, prepared):
     """Proactive pipeline: replay the current step, then prepare the NEXT one.
 
@@ -1723,14 +1735,10 @@ def run_proactive_paced_steps(group, steps, current_shards, next_shards, out_los
         _debug_sync_prepared_steps()
 
         def _replay(r):
-            t0 = time.perf_counter()
             # device context: replay launches onto the calling thread's
             # current stream -- without this a mirror's graph launches from
             # cuda:0's stream, unordered against its own prepare copies
-            with torch.cuda.device(steps[r].device):
-                out_losses[r] = steps[r].replay_only()
-            if worker_ms is not None:
-                worker_ms[r].append((time.perf_counter() - t0) * 1000.0)
+            _replay_step_on_device(steps[r], out_losses, r, worker_ms, time.perf_counter())
 
         group.run_threaded([lambda r=r: _replay(r) for r in range(world)])
     if next_shards is not None:
@@ -2044,11 +2052,7 @@ def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
     _debug_sync_prepared_steps()
 
     def _replay(r):
-        t0 = time.perf_counter()
-        with torch.cuda.device(steps[r].device):
-            out_losses[r] = steps[r].replay_only()
-        if worker_ms is not None:
-            worker_ms[r].append((time.perf_counter() - t0) * 1000.0)
+        _replay_step_on_device(steps[r], out_losses, r, worker_ms, time.perf_counter())
 
     group.run_threaded([lambda r=r: _replay(r) for r in range(world)])
 
