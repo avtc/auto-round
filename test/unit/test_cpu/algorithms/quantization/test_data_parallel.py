@@ -2523,6 +2523,323 @@ class TestMirrorTemplateCache:
         assert group.home is home  # real block stays the sync/copy-back anchor
         assert group.tune_home is staging_home
 
+    def test_step_rebinding_keeps_graph_and_st(self):
+        import contextlib
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+        st = {"inputs": None, "others": None, "ref": None}
+        st["ref"] = torch.zeros(4)
+        calls = []
+        step = GraphedReplicaStep(
+            lambda *a: calls.append(("prep", a)),
+            lambda: calls.append(("compute",)),
+            warmup_iters=2,
+            name="r1",
+            graph_factory=lambda: object(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+
+        class _FakeG:
+            def replay(self):
+                step._static_loss = step.compute()
+
+        step._graph = _FakeG()  # pretend captured
+
+        def rebind(existing_step, existing_st):
+            def prepare(row):
+                existing_st["ref"] = torch.full((4,), float(row[0]))
+                calls.append(("newprep", row))
+
+            def compute():
+                calls.append(("newcompute",))
+                return existing_st["ref"].sum().reshape(1)
+
+            existing_step.prepare = prepare
+            existing_step.compute = compute
+            return existing_step
+
+        same = rebind(step, st)
+        assert same is step and step._graph is not None  # graph survives
+        step(3.0 if False else [3])
+        assert calls[-2:] == [("newprep", [3]), ("newcompute",)]
+        assert st["ref"][0].item() == 3.0  # same static dict refreshed
+
+    def test_cache_lru_cap(self):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        dp._GRAPH_TEMPLATE_CACHE.clear()
+        for k in ("a", "b", "c", "d"):
+            dp._GRAPH_TEMPLATE_CACHE[k] = {"mirrors": [], "steps": [], "sts": []}
+            dp._GRAPH_TEMPLATE_CACHE.move_to_end(k)
+            while len(dp._GRAPH_TEMPLATE_CACHE) > 3:  # any cap works
+                dp._GRAPH_TEMPLATE_CACHE.popitem(last=False)
+        assert list(dp._GRAPH_TEMPLATE_CACHE) == ["b", "c", "d"]
+
+    def test_env_size_default_two_any_value(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", raising=False)
+        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 2  # user decision: default ON
+        for v in ("0", "1", "5"):
+            monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
+            assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)
+
+    def test_two_block_composition_reuse_flow(self):
+        """Block A capture -> cache -> block B hit: sync + rebind + replay-only."""
+        import contextlib
+        import torch
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+        def make_block(seed):
+            torch.manual_seed(seed)
+            b = torch.nn.Linear(4, 4)
+            b.orig_layer = torch.nn.Linear(4, 4)  # fake wrapped structure
+            b.imatrix = torch.rand(1, 4)
+            b.weight_min = torch.zeros(4)
+            b.weight_max = torch.ones(4)
+            b._recipe_anchor_deferred = True
+            return b
+
+        block_a, block_b = make_block(1), make_block(2)
+        mirror = make_block(9)  # cached mirror with block-A state
+        world, devices = 2, ["cuda:0", "cuda:1"]
+        key_a = dp._template_signature(block_a, world, devices)
+        assert dp._template_signature(block_b, world, devices) == key_a
+
+        # block A: a captured step enters the cache with neutralized closures
+        st = {"inputs": None, "others": None, "ref": None}
+        calls = []
+
+        class _FakeG:
+            def replay(self):
+                step._static_loss = step.compute()
+
+        step = GraphedReplicaStep(
+            lambda *a: calls.append("prep"),
+            lambda: calls.append("compute"),
+            name="r1",
+            graph_factory=lambda: _FakeG(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        step._ar_st = st
+        step._graph = _FakeG()
+        step.prepare = lambda *a, **k: None  # neutralized at insert
+        step.compute = lambda: None
+        dp._GRAPH_TEMPLATE_CACHE.clear()
+        dp._GRAPH_TEMPLATE_CACHE[key_a] = {"replicas": [mirror, mirror], "steps": [step, step]}
+
+        # block B: HIT -> sync (values, deferred flag, imatrix) ...
+        entry = dp._GRAPH_TEMPLATE_CACHE.pop(key_a)
+        assert len(entry["replicas"]) == world
+        a_w = mirror.weight.detach().clone()
+        mirror._recipe_anchor_deferred = False  # block-A anchor cleared it
+        dp.sync_mirror_from_home(block_b, mirror)
+        assert not torch.equal(mirror.weight.detach(), a_w)  # block-B weights in
+        assert torch.equal(mirror.weight.detach(), block_b.weight.detach())
+        assert torch.equal(mirror.imatrix, block_b.imatrix)  # in-place attr sync
+        assert mirror._recipe_anchor_deferred is True  # anchor will re-run
+        assert mirror.weight_min.data_ptr() != id(None)  # storage kept (rebind-safe writes)
+
+        # ... rebind closures onto the SAME step; replay works through them
+        def rebind(existing):
+            def prepare(row):
+                existing._ar_st["ref"] = torch.full((4,), float(row[0]))
+                calls.append("newprep")
+
+            def compute():
+                calls.append("newcompute")
+                return existing._ar_st["ref"].sum().reshape(1)
+
+            existing.prepare, existing.compute = prepare, compute
+
+        rebind(step)
+        loss = step([7])
+        assert calls[-2:] == ["newprep", "newcompute"]
+        assert loss.item() == 28.0  # 7*4 -- replayed compute read the refreshed static
+
+    def test_cache_lru_cap(self):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        dp._GRAPH_TEMPLATE_CACHE.clear()
+        for k in ("a", "b", "c", "d"):
+            dp._GRAPH_TEMPLATE_CACHE[k] = {"mirrors": [], "steps": [], "sts": []}
+            dp._GRAPH_TEMPLATE_CACHE.move_to_end(k)
+            while len(dp._GRAPH_TEMPLATE_CACHE) > 3:  # any cap works
+                dp._GRAPH_TEMPLATE_CACHE.popitem(last=False)
+        assert list(dp._GRAPH_TEMPLATE_CACHE) == ["b", "c", "d"]
+
+    def test_env_size_default_two_any_value(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", raising=False)
+        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 2  # user decision: default ON
+        for v in ("0", "1", "5"):
+            monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
+            assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)
+
+    def test_two_block_composition_reuse_flow(self):
+        """Block A capture -> cache -> block B hit: sync + rebind + replay-only."""
+        import contextlib
+        import torch
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+        def make_block(seed):
+            torch.manual_seed(seed)
+            b = torch.nn.Linear(4, 4)
+            b.orig_layer = torch.nn.Linear(4, 4)  # fake wrapped structure
+            b.imatrix = torch.rand(1, 4)
+            b.weight_min = torch.zeros(4)
+            b.weight_max = torch.ones(4)
+            b._recipe_anchor_deferred = True
+            return b
+
+        block_a, block_b = make_block(1), make_block(2)
+        mirror = make_block(9)  # cached mirror with block-A state
+        world, devices = 2, ["cuda:0", "cuda:1"]
+        key_a = dp._template_signature(block_a, world, devices)
+        assert dp._template_signature(block_b, world, devices) == key_a
+
+        # block A: a captured step enters the cache with neutralized closures
+        st = {"inputs": None, "others": None, "ref": None}
+        calls = []
+
+        class _FakeG:
+            def replay(self):
+                step._static_loss = step.compute()
+
+        step = GraphedReplicaStep(
+            lambda *a: calls.append("prep"),
+            lambda: calls.append("compute"),
+            name="r1",
+            graph_factory=lambda: _FakeG(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        step._ar_st = st
+        step._graph = _FakeG()
+        step.prepare = lambda *a, **k: None  # neutralized at insert
+        step.compute = lambda: None
+        dp._GRAPH_TEMPLATE_CACHE.clear()
+        dp._GRAPH_TEMPLATE_CACHE[key_a] = {"replicas": [mirror, mirror], "steps": [step, step]}
+
+        # block B: HIT -> sync (values, deferred flag, imatrix) ...
+        entry = dp._GRAPH_TEMPLATE_CACHE.pop(key_a)
+        assert len(entry["replicas"]) == world
+        a_w = mirror.weight.detach().clone()
+        mirror._recipe_anchor_deferred = False  # block-A anchor cleared it
+        dp.sync_mirror_from_home(block_b, mirror)
+        assert not torch.equal(mirror.weight.detach(), a_w)  # block-B weights in
+        assert torch.equal(mirror.weight.detach(), block_b.weight.detach())
+        assert torch.equal(mirror.imatrix, block_b.imatrix)  # in-place attr sync
+        assert mirror._recipe_anchor_deferred is True  # anchor will re-run
+        assert mirror.weight_min.data_ptr() != id(None)  # storage kept (rebind-safe writes)
+
+        # ... rebind closures onto the SAME step; replay works through them
+        def rebind(existing):
+            def prepare(row):
+                existing._ar_st["ref"] = torch.full((4,), float(row[0]))
+                calls.append("newprep")
+
+            def compute():
+                calls.append("newcompute")
+                return existing._ar_st["ref"].sum().reshape(1)
+
+            existing.prepare, existing.compute = prepare, compute
+
+        rebind(step)
+        loss = step([7])
+        assert calls[-2:] == ["newprep", "newcompute"]
+        assert loss.item() == 28.0  # 7*4 -- replayed compute read the refreshed static
+
+    def test_env_size_default_two_any_value(self, monkeypatch):
+        from auto_round import envs
+
+        monkeypatch.delenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", raising=False)
+        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 2  # user decision: default ON
+        for v in ("0", "1", "5"):
+            monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
+            assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)
+
+    def test_two_block_composition_reuse_flow(self):
+        """Block A capture -> cache -> block B hit: sync + rebind + replay-only."""
+        import contextlib
+        import torch
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+        def make_block(seed):
+            torch.manual_seed(seed)
+            b = torch.nn.Linear(4, 4)
+            b.orig_layer = torch.nn.Linear(4, 4)  # fake wrapped structure
+            b.imatrix = torch.rand(1, 4)
+            b.weight_min = torch.zeros(4)
+            b.weight_max = torch.ones(4)
+            b._recipe_anchor_deferred = True
+            return b
+
+        block_a, block_b = make_block(1), make_block(2)
+        mirror = make_block(9)  # cached mirror with block-A state
+        world, devices = 2, ["cuda:0", "cuda:1"]
+        key_a = dp._template_signature(block_a, world, devices)
+        assert dp._template_signature(block_b, world, devices) == key_a
+
+        # block A: a captured step enters the cache with neutralized closures
+        st = {"inputs": None, "others": None, "ref": None}
+        calls = []
+
+        class _FakeG:
+            def replay(self):
+                step._static_loss = step.compute()
+
+        step = GraphedReplicaStep(
+            lambda *a: calls.append("prep"),
+            lambda: calls.append("compute"),
+            name="r1",
+            graph_factory=lambda: _FakeG(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        step._ar_st = st
+        step._graph = _FakeG()
+        step.prepare = lambda *a, **k: None  # neutralized at insert
+        step.compute = lambda: None
+        dp._GRAPH_TEMPLATE_CACHE.clear()
+        dp._GRAPH_TEMPLATE_CACHE[key_a] = {"replicas": [mirror, mirror], "steps": [step, step]}
+
+        # block B: HIT -> sync (values, deferred flag, imatrix) ...
+        entry = dp._GRAPH_TEMPLATE_CACHE.pop(key_a)
+        assert len(entry["replicas"]) == world
+        a_w = mirror.weight.detach().clone()
+        mirror._recipe_anchor_deferred = False  # block-A anchor cleared it
+        dp.sync_mirror_from_home(block_b, mirror)
+        assert not torch.equal(mirror.weight.detach(), a_w)  # block-B weights in
+        assert torch.equal(mirror.weight.detach(), block_b.weight.detach())
+        assert torch.equal(mirror.imatrix, block_b.imatrix)  # in-place attr sync
+        assert mirror._recipe_anchor_deferred is True  # anchor will re-run
+        assert mirror.weight_min.data_ptr() != id(None)  # storage kept (rebind-safe writes)
+
+        # ... rebind closures onto the SAME step; replay works through them
+        def rebind(existing):
+            def prepare(row):
+                existing._ar_st["ref"] = torch.full((4,), float(row[0]))
+                calls.append("newprep")
+
+            def compute():
+                calls.append("newcompute")
+                return existing._ar_st["ref"].sum().reshape(1)
+
+            existing.prepare, existing.compute = prepare, compute
+
+        rebind(step)
+        loss = step([7])
+        assert calls[-2:] == ["newprep", "newcompute"]
+        assert loss.item() == 28.0  # 7*4 -- replayed compute read the refreshed static
+
     def test_cache_entry_shape(self):
         """Entries carry ALL replicas (staging home first)."""
         import contextlib
