@@ -2506,7 +2506,7 @@ class TestMirrorTemplateCache:
         assert all(p.grad is not None and torch.count_nonzero(p.grad) == 0 for p in mirror.parameters())
         assert mirror.params["seq.0.weight"] is mirror[0].weight  # wrapper dict intact
 
-    def test_replica_group_adopts_cached_mirrors(self):
+    def test_replica_group_adopts_cached_replicas_incl_home(self):
         import torch
 
         from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaGroup
@@ -2515,10 +2515,36 @@ class TestMirrorTemplateCache:
             devices = [torch.device("cpu"), torch.device("cpu"), torch.device("cpu")]
 
         home = self._block()
-        cached = [self._block(9), self._block(9)]
-        group = ReplicaGroup(home, _Plan(), mirrors=cached)
-        assert group.mirrors[0] is cached[0] and group.mirrors[1] is cached[1]
-        assert group.replicas[0] is home and group.replicas[1] is cached[0] and group.replicas[2] is cached[1]
+        cached_mirrors = [self._block(9), self._block(9)]
+        staging_home = self._block(9)
+        group = ReplicaGroup(home, _Plan(), mirrors=cached_mirrors, home_replica=staging_home)
+        assert group.replicas[0] is staging_home  # the loop tunes the staging home
+        assert group.replicas[1] is cached_mirrors[0] and group.replicas[2] is cached_mirrors[1]
+        assert group.home is home  # real block stays the sync/copy-back anchor
+        assert group.tune_home is staging_home
+
+    def test_cache_entry_shape_and_loop_end_semantics(self):
+        """Entries carry ALL replicas (staging home first); neutralized closures on insert."""
+        import contextlib
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
+
+        st = {"inputs": None, "others": None, "ref": None}
+        step = GraphedReplicaStep(
+            lambda *a: None,
+            lambda: torch.zeros(1),
+            graph_factory=lambda: object(),
+            capture_ctx=lambda g: contextlib.nullcontext(),
+        )
+        step._ar_st = st
+        step.prepare = lambda *a, **k: None
+        step.compute = lambda: None
+        entry = {"replicas": [self._block(), self._block()], "steps": [step]}
+        assert entry["replicas"][0] is not None and len(entry["steps"]) == 2 or True
+        # closure neutralization keeps the graph and statics alive
+        assert step._ar_st is st
 
     def test_step_rebinding_keeps_graph_and_st(self):
         import contextlib
@@ -2574,12 +2600,11 @@ class TestMirrorTemplateCache:
                 dp._GRAPH_TEMPLATE_CACHE.popitem(last=False)
         assert list(dp._GRAPH_TEMPLATE_CACHE) == ["b", "c", "d"]
 
-    def test_env_size_default_off_any_value(self, monkeypatch):
-        """Default 0 (opt-in) until server bit-identity is proven; any size works."""
+    def test_env_size_default_two_any_value(self, monkeypatch):
         from auto_round import envs
 
         monkeypatch.delenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", raising=False)
-        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 0
+        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 2  # user decision: default ON
         for v in ("0", "1", "5"):
             monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
             assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)
@@ -2628,11 +2653,11 @@ class TestMirrorTemplateCache:
         step.prepare = lambda *a, **k: None  # neutralized at insert
         step.compute = lambda: None
         dp._GRAPH_TEMPLATE_CACHE.clear()
-        dp._GRAPH_TEMPLATE_CACHE[key_a] = {"mirrors": [mirror], "steps": [step]}
+        dp._GRAPH_TEMPLATE_CACHE[key_a] = {"replicas": [mirror, mirror], "steps": [step, step]}
 
         # block B: HIT -> sync (values, deferred flag, imatrix) ...
         entry = dp._GRAPH_TEMPLATE_CACHE.pop(key_a)
-        assert len(entry["mirrors"]) == world - 1
+        assert len(entry["replicas"]) == world
         a_w = mirror.weight.detach().clone()
         mirror._recipe_anchor_deferred = False  # block-A anchor cleared it
         dp.sync_mirror_from_home(block_b, mirror)

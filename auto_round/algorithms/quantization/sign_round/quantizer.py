@@ -668,6 +668,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 _tpl_entry = None
                 _tpl_key = None
+                _tpl_home = None  # persistent HOME staging replica (template cache)
                 if template_cache_size() > 0:
                     _tpl_key = _template_signature(
                         block,
@@ -683,31 +684,45 @@ class SignRoundQuantizer(BaseQuantizer):
                         ),  # per-module bits/group/data_type/sym travel via named_modules
                     )
                     _tpl_entry = _GRAPH_TEMPLATE_CACHE.pop(_tpl_key, None)
-                    if _tpl_entry is not None and len(_tpl_entry["mirrors"]) != _plan.world - 1:
+                    if _tpl_entry is not None and len(_tpl_entry["replicas"]) != _plan.world:
                         _tpl_entry = None  # stale layout -- rebuild
                 if _tpl_entry is not None:
-                    for _mir in _tpl_entry["mirrors"]:
-                        sync_mirror_from_home(block, _mir)
+                    _tpl_home = _tpl_entry["replicas"][0]
+                    for _rep in _tpl_entry["replicas"]:
+                        sync_mirror_from_home(block, _rep)
                     replica_group = ReplicaGroup(
                         block,
                         _plan,
                         grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT,
                         staged_source=None,
-                        mirrors=_tpl_entry["mirrors"],
+                        mirrors=_tpl_entry["replicas"][1:],
+                        home_replica=_tpl_home,
                     )
                     logger.info(
-                        "[tune-ddp] graph template cache hit: %d mirror(s) adopted (captured graphs kept)",
-                        len(_tpl_entry["mirrors"]),
+                        "[tune-ddp] graph template cache hit: %d replica(s) adopted incl. home staging "
+                        "(captured graphs kept)",
+                        len(_tpl_entry["replicas"]),
                     )
                 else:
+                    # miss: a DEDICATED home staging copy (the real block is
+                    # packed/meta'd by the orchestrator after the block -- it
+                    # must never enter the cache). Uniform flow: the loop
+                    # always tunes the staging home and copies the final
+                    # iterate back at loop end.
+                    if template_cache_size() > 0:
+                        _tpl_home = copy.deepcopy(block)
                     replica_group = ReplicaGroup(
-                        block, _plan, grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT, staged_source=_staged_src
+                        block,
+                        _plan,
+                        grad_transport=_envs.AR_TUNE_DDP_GRAD_TRANSPORT,
+                        staged_source=_staged_src,
+                        home_replica=_tpl_home,
                     )
                 for note in _plan.notes:
                     logger.info("[tune-ddp] %s", note)
                 if _tpl_entry is not None:
                     _mods_h = dict(block.named_modules())
-                    for _r, _mir in enumerate(replica_group.mirrors, start=1):
+                    for _r, _mir in enumerate(replica_group.replicas[1:], start=1):
                         _dh, _dm = 0.0, 0.0
                         for _n, _hm in _mods_h.items():
                             _mm = dict(_mir.named_modules()).get(_n)
@@ -985,10 +1000,12 @@ class SignRoundQuantizer(BaseQuantizer):
             # built BEFORE the ddp warm-up pass: the warm-up backward must run
             # on the steps' capture streams (see the warm-up site)
             _graphed_steps = [
-                _make_graphed_step(r, step=(_tpl_entry["steps"][r - 1] if _tpl_entry is not None and r >= 1 else None))
+                _make_graphed_step(r, step=(_tpl_entry["steps"][r] if _tpl_entry is not None else None))
                 for r in range(replica_group.world)
             ]
-            _graphs_warmups_left = _graphed_steps[0].warmup_iters
+            _graphs_warmups_left = (
+                0 if getattr(_graphed_steps[0], "_graph", None) is not None else _graphed_steps[0].warmup_iters
+            )
             logger.info(
                 "[tune-ddp] cuda graphs enabled: %d replica step(s), capture after %d warmup iteration(s)",
                 len(_graphed_steps),
@@ -1217,6 +1234,10 @@ class SignRoundQuantizer(BaseQuantizer):
             and self._is_text_decoder_block(block_ctx.block_name)
         )
         _serial_streamer = getattr(getattr(block, "_stream_prefetch_source", None), "streamer", None)
+        # snapshots collect from the module the loop actually tunes (the
+        # persistent HOME staging replica on a template-cache hit; the real
+        # block otherwise)
+        _tune_src = replica_group.tune_home if replica_group is not None else block
         from auto_round.algorithms.quantization.sign_round.data_parallel import (
             _sign_step_foreach,
             serial_graphs_engage,
@@ -1341,8 +1362,9 @@ class SignRoundQuantizer(BaseQuantizer):
                     logger.warning("[tune-ddp] torch profiler trace export failed: %s", _pe)
                 _tprof_ctx = None
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
-                for n, m in block.named_modules():
-                    m.cur_iter = i
+                for _src in {_tune_src, block}:
+                    for n, m in _src.named_modules():
+                        m.cur_iter = i
             total_loss = 0
             _loss_acc = None  # per-iteration reset (device fp64 accumulator)
             with tune_stage(tune_prof, "sampler"):
@@ -1511,7 +1533,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         _atracker.poll()
                     with tune_stage(tune_prof, "snapshot"):
                         _atracker.stage(
-                            None if self.not_use_best_mse else collect_best_params(block, _snap_dev), _losses, i
+                            None if self.not_use_best_mse else collect_best_params(_tune_src, _snap_dev), _losses, i
                         )
                 else:
                     with tune_stage(tune_prof, "loss_sync"):
@@ -1651,7 +1673,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
                                 best_params = collect_best_params_pre(block, _snap_dev, _serial_pre_by_id)
                             else:
-                                best_params = collect_best_params(block, _snap_dev)
+                                best_params = collect_best_params(_tune_src, _snap_dev)
                         last_best_iter = i
                 if self.not_use_best_mse and i == self.iters - 1:
                     if _serial_step_fn is not None:
@@ -1663,7 +1685,7 @@ class SignRoundQuantizer(BaseQuantizer):
                             block, self.compress_context.cache_device, _serial_pre_by_id
                         )
                     else:
-                        best_params = collect_best_params(block, self.compress_context.cache_device)
+                        best_params = collect_best_params(_tune_src, self.compress_context.cache_device)
 
                 if not self.not_use_best_mse:
                     if 0 < self.dynamic_max_gap <= i - last_best_iter:
@@ -1676,7 +1698,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         break
             elif _async and self.not_use_best_mse and i == self.iters - 1:
                 # loss-delay-only mode keeps the single last-iter collection
-                best_params = collect_best_params(block, self.compress_context.cache_device)
+                best_params = collect_best_params(_tune_src, self.compress_context.cache_device)
             if replica_group is not None:
                 with tune_stage(tune_prof, "step"):
                     self._step(scaler, optimizer, lr_schedule, keep_grads=_graphs_active)
@@ -1751,10 +1773,16 @@ class SignRoundQuantizer(BaseQuantizer):
                 "(background pack/transform threads stayed busy through the tune window); it ran eager"
             )
         if replica_group is not None:
+            if _tpl_home is not None and _tpl_home is not block:
+                # copy the final iterate back: downstream readers (refit/
+                # pack) must see the tuned end state exactly like an
+                # in-place-tuned block
+                from auto_round.algorithms.quantization.sign_round.data_parallel import sync_module_values
+
+                sync_module_values(_tpl_home, block)
             try:
                 from auto_round.algorithms.quantization.sign_round.data_parallel import (
                     _GRAPH_TEMPLATE_CACHE,
-                    _template_signature,
                     template_cache_size,
                 )
 
@@ -1764,7 +1792,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     and _graphed_steps is not None
                     and all(getattr(_st, "_graph", None) is not None for _st in _graphed_steps)
                 ):
-                    _steps = list(_graphed_steps[1:])
+                    _steps = list(_graphed_steps)
                     # neutralize the closures: they still close over THIS
                     # block's pools -- a cache hit rebinds before any use, and
                     # replay_only never calls them
@@ -1772,7 +1800,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         _stp.prepare = lambda *a, **k: None
                         _stp.compute = lambda: None
                     _GRAPH_TEMPLATE_CACHE[_tpl_key] = {
-                        "mirrors": list(replica_group.mirrors),
+                        "replicas": list(replica_group.replicas),
                         "steps": _steps,
                     }
                     while len(_GRAPH_TEMPLATE_CACHE) > template_cache_size():

@@ -2209,6 +2209,17 @@ def _template_signature(home: torch.nn.Module, world: int, devices, extra=()) ->
 _GRAPH_TEMPLATE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 
 
+def sync_module_values(src: torch.nn.Module, dst: torch.nn.Module) -> None:
+    """One-way address-stable value sync between same-template modules.
+
+    Used in BOTH directions of the template cache: real block -> persistent
+    replicas (block start) and persistent home staging -> real block (loop
+    end, so downstream readers see the final iterate exactly like an
+    in-place-tuned block).
+    """
+    sync_mirror_from_home(src, dst)
+
+
 def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> None:
     """Copy a new block's state into a persistent mirror (template hit).
 
@@ -2260,14 +2271,17 @@ def template_cache_size() -> int:
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
-    def __init__(self, block, plan: DDPPlan, grad_transport: str = "fp32", staged_source=None, mirrors=None) -> None:
+    def __init__(
+        self, block, plan: DDPPlan, grad_transport: str = "fp32", staged_source=None, mirrors=None, home_replica=None
+    ) -> None:
         global _PEER_ACCESS_LOGGED
         self.plan = plan
         self.grad_transport = grad_transport
-        self.home = block
+        self.home = block  # the REAL block (sync source / copy-back target)
+        self.tune_home = home_replica if home_replica is not None else block  # module the loop tunes
         self.mirrors: List[torch.nn.Module] = []
         self.adopted = 0
-        self.template_reused = mirrors is not None
+        self.template_reused = mirrors is not None or home_replica is not None
         if not _PEER_ACCESS_LOGGED and any(d.type == "cuda" for d in plan.devices):
             _PEER_ACCESS_LOGGED = True
             _pairs = enable_peer_access(plan.devices)
@@ -2283,12 +2297,14 @@ class ReplicaGroup:
             # are synced by the caller BEFORE the recipe anchor re-pins the
             # tuning grids); their captured graphs stay alive
             self.mirrors = list(mirrors)
+        elif home_replica is not None:
+            pass  # home-staging-only reuse (world == 1)
         else:
             for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
                 mirror = self._make_mirror(block, dev, staged_source)
                 _relocate_params(mirror, dev)
                 self.mirrors.append(mirror)
-        self.replicas = [block] + self.mirrors
+        self.replicas = [self.tune_home] + self.mirrors
         self.world = len(self.replicas)
         # persistent replica worker pool (built lazily on first run_threaded
         # when AR_TUNE_DDP_THREAD_POOL is on; None keeps spawn-per-call)
