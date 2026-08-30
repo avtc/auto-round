@@ -102,6 +102,39 @@ def revert_tensor_by_pad(data: torch.Tensor, orig_shape: tuple, pad_len: Union[i
         return data_new
 
 
+_MIXED_SYM_POOL = False  # latched by parse_scheme for mixed sym/asym AutoScheme pools
+_MIXED_SKIP_LOGGED = False
+
+
+def mark_mixed_sym_pool():
+    """Latch that the active scheme mixes symmetric and asymmetric int options.
+
+    Set by ``parse_scheme`` when an AutoScheme option pool contains both.
+    While latched, the AR_TUNE_RECIPE guards become per-layer: a ``neuqi_*``
+    recipe anchors only asym layers (sym layers keep the default min/max grid
+    plus SignRound tuning) and ``opt_rtn_qon`` anchors only sym layers, instead
+    of the uniform-scheme hard errors.
+    """
+    global _MIXED_SYM_POOL
+    _MIXED_SYM_POOL = True
+
+
+def recipe_applies_to_layer(recipe, sym):
+    """Whether AR_TUNE_RECIPE anchors a layer of this symmetry.
+
+    Mixed sym/asym pools: recipes apply only to layers of their sym class
+    (``neuqi_*`` -> asym, ``opt_rtn_qon`` -> sym); the other layers keep the
+    default min/max grid. Recipes that never anchor return False regardless.
+    """
+    if not recipe or recipe in ("minmax_qon", "neuqi_it0", "touchup"):
+        return False
+    if recipe.startswith("neuqi_"):
+        return not sym
+    if recipe == "opt_rtn_qon":
+        return bool(sym)
+    return True
+
+
 def get_quant_func(
     dtype: str,
     bits: int,
@@ -173,13 +206,32 @@ def get_quant_func(
             f"AR_TUNE_RECIPE={recipe!r} anchors the SignRound tuning path (iters>0); with iters=0 "
             "the zero-shot search dispatch already runs. Unset the variable or use neuqi_it0."
         )
+    global _MIXED_SKIP_LOGGED
     if recipe.startswith("neuqi_") and recipe != "neuqi_it0" and sym:
-        raise ValueError(f"AR_TUNE_RECIPE={recipe!r} requires the asymmetric path (sym=False).")
+        if _MIXED_SYM_POOL:
+            if not _MIXED_SKIP_LOGGED:
+                _MIXED_SKIP_LOGGED = True
+                logger.info(
+                    "mixed sym/asym pool: AR_TUNE_RECIPE=%r anchors asym layers only; sym layers "
+                    "keep the default min/max grid plus round tuning",
+                    recipe,
+                )
+        else:
+            raise ValueError(f"AR_TUNE_RECIPE={recipe!r} requires the asymmetric path (sym=False).")
     if recipe == "opt_rtn_qon" and not sym:
-        raise ValueError(
-            'AR_TUNE_RECIPE="opt_rtn_qon" anchors the symmetric scale-clip search; use a neuqi_* '
-            "recipe for the asymmetric path."
-        )
+        if _MIXED_SYM_POOL:
+            if not _MIXED_SKIP_LOGGED:
+                _MIXED_SKIP_LOGGED = True
+                logger.info(
+                    "mixed sym/asym pool: AR_TUNE_RECIPE=%r anchors sym layers only; asym layers "
+                    "keep the default min/max grid plus round tuning",
+                    recipe,
+                )
+        else:
+            raise ValueError(
+                'AR_TUNE_RECIPE="opt_rtn_qon" anchors the symmetric scale-clip search; use a neuqi_* '
+                "recipe for the asymmetric path."
+            )
     if weight_path and asym_search == "neuqi" and iters > 0 and not recipe:
         raise ValueError(
             'asym_search="neuqi" applies only to the zero-shot path (iters=0), where it replaces the '

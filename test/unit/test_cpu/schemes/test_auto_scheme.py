@@ -1679,3 +1679,34 @@ class TestAsymPresetSuffix:
         from auto_round.schemes import preset_name_to_scheme
 
         assert preset_name_to_scheme("w4a16g32asym").sym is False
+
+
+class TestMixedSymPoolLatch:
+    """parse_scheme latches mixed sym/asym pools so recipe guards go per-layer."""
+
+    def test_mixed_pool_sets_latch(self, monkeypatch):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.data_type import utils as dt_utils
+        from auto_round.schemes import parse_scheme
+
+        monkeypatch.setattr(dt_utils, "_MIXED_SYM_POOL", False, raising=False)
+        parse_scheme(AutoScheme(options="W4A16,W4A16G32ASYM", avg_bits=4.0), {})
+        assert dt_utils._MIXED_SYM_POOL is True
+
+    def test_uniform_sym_pool_does_not_set_latch(self, monkeypatch):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.data_type import utils as dt_utils
+        from auto_round.schemes import parse_scheme
+
+        monkeypatch.setattr(dt_utils, "_MIXED_SYM_POOL", False, raising=False)
+        parse_scheme(AutoScheme(options="W3A16,W4A16,W4A16G64", avg_bits=4.0), {})
+        assert dt_utils._MIXED_SYM_POOL is False
+
+    def test_asym_flag_flattened_pool_is_not_mixed(self, monkeypatch):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.data_type import utils as dt_utils
+        from auto_round.schemes import parse_scheme
+
+        monkeypatch.setattr(dt_utils, "_MIXED_SYM_POOL", False, raising=False)
+        parse_scheme(AutoScheme(options="W4A16,W4A16G32ASYM", avg_bits=4.0), {"sym": False})
+        assert dt_utils._MIXED_SYM_POOL is False

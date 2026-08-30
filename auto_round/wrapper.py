@@ -325,7 +325,14 @@ class WrapperLinear(torch.nn.Module):
             and not isinstance(orig_layer.group_size, tuple)
             and self.orig_layer.data_type == "int"
         ):
-            if self._defer_anchor_requested:
+            from auto_round.data_type.utils import recipe_applies_to_layer
+
+            _recipe_applies = recipe_applies_to_layer(envs.AR_TUNE_RECIPE, bool(getattr(orig_layer, "sym", True)))
+            if not _recipe_applies:
+                # mixed sym/asym pool: this layer is not of the recipe's sym
+                # class -- keep the default min/max grid plus round tuning
+                _anchors = None
+            elif self._defer_anchor_requested:
                 # DDP mirrors-first flow: the (deterministic) init-search runs
                 # sharded across the replica devices AFTER the mirrors exist;
                 # anchor_recipe_grid() recomputes the grouped weight locally
@@ -444,6 +451,12 @@ class WrapperLinear(torch.nn.Module):
         non-deferred init would).
         """
         if not getattr(self, "_recipe_anchor_deferred", False):
+            return False
+        from auto_round.data_type.utils import recipe_applies_to_layer
+
+        if not recipe_applies_to_layer(envs.AR_TUNE_RECIPE, bool(getattr(self.orig_layer, "sym", True))):
+            # mixed sym/asym pool: sym-class mismatch -- nothing to anchor
+            self._recipe_anchor_deferred = False
             return False
         self._recipe_anchor_deferred = False
         _ow = getattr(self.orig_layer, "get_weight", lambda: self.orig_layer.weight)()

@@ -530,6 +530,33 @@ def parse_scheme(
                     opt_i,
                 )
 
+        # Mixed sym/asym pool detection: latch it so the AR_TUNE_RECIPE guards
+        # (get_quant_func) and the wrapper anchor path go per-layer instead of
+        # raising -- neuqi_* recipes then anchor the asym layers only, and
+        # opt_rtn_qon the sym layers only. Only sub-16-bit int options count:
+        # BF16/16-bit options carry no meaningful sym semantics here.
+        _pool_syms = []
+        for opt in scheme.options:
+            if isinstance(opt, QuantizationScheme):
+                if opt.data_type == "int" and opt.bits < 16:
+                    _pool_syms.append(bool(opt.sym))
+            elif isinstance(opt, str):
+                try:
+                    _resolved = preset_name_to_scheme(opt)
+                except KeyError:
+                    continue
+                if _resolved.data_type == "int" and _resolved.bits < 16:
+                    _pool_syms.append(bool(_resolved.sym))
+        if any(_pool_syms) and not all(_pool_syms):
+            from auto_round.data_type.utils import mark_mixed_sym_pool
+
+            mark_mixed_sym_pool()
+            logger.info(
+                "AutoScheme: mixed sym/asym option pool detected -- AR_TUNE_RECIPE anchors and the "
+                "NeUQI init apply per-layer (neuqi_* recipes to asym layers, opt_rtn_qon to sym "
+                "layers); other layers keep the default min/max grid."
+            )
+
         # Select the primary scheme for attribute binding (skipping BF16)
         default_scheme = scheme.options[0]
         for opt in scheme.options:
