@@ -1708,15 +1708,25 @@ class SignRoundQuantizer(BaseQuantizer):
                                         .sum()
                                     )
                                     _stale = abs(_sums["ref"] - _exp) > 1e-2 * max(1.0, abs(_exp))
+                                    _exp_in = 0.0
+                                    try:
+                                        for _j in _probe_next[_r]:
+                                            _b = active_inputs[_j]
+                                            _exp_in += float(_b.to(torch.float32).sum())
+                                    except Exception:  # noqa: BLE001 - probe only
+                                        _exp_in = float("nan")
+                                    _stale_in = abs(_sums["in"] - _exp_in) > 1e-2 * max(1.0, abs(_exp_in))
                                     _w_now = _weight_sums(replica_group.replicas[_r])
                                     _w_drift = abs(_w_now - _engage_wsums[_r]) > 1e-3 * max(1.0, abs(_engage_wsums[_r]))
                                     logger.info(
                                         "[tune-ddp] template-cache probe statics r=%d ref=%.4f (want %.4f) "
-                                        "in=%.4f %s %s wsum=%.2f%s ref_ptr=%s",
+                                        "in=%.4f (want %.4f)%s %s %s wsum=%.2f%s ref_ptr=%s",
                                         _r,
                                         _sums["ref"],
                                         _exp,
                                         _sums["in"],
+                                        _exp_in,
+                                        " STALE-IN" if _stale_in else "",
                                         "STALE-REF" if _stale else "ok",
                                         "prep=%d" % getattr(_graphed_steps[_r], "_prepare_calls", -1),
                                         _w_now,
