@@ -774,26 +774,47 @@ class SignRoundQuantizer(BaseQuantizer):
                 with _bp_stage(_prof_bp, "sharded_anchor"):
                     _shard_recipe_anchor(replica_group)
                 if _tpl_entry is not None:
-                    _mods_h = dict(block.named_modules())
+                    # staging-vs-mirror is the REAL invariant post-T12: the real
+                    # block is unanchored until shell-bind, so comparing it to
+                    # mirrors cannot distinguish anchored-correct from stale.
+                    # Per-tensor-class checksums name the diverging state.
+                    _mods_s = dict(replica_group.replicas[0].named_modules())
+
+                    def _cls_sums(mods):
+                        cls = {k: 0.0 for k in ("w", "v", "wmin", "wmax", "imat", "minmax")}
+                        for _n, _m in mods.items():
+                            for _pn, _p in _m.named_parameters(recurse=False):
+                                if hasattr(_m, "orig_layer"):
+                                    cls["w"] += float(_p.detach().to(torch.float32).sum())
+                                else:
+                                    cls["v"] += float(_p.detach().to(torch.float32).sum())
+                            for _attr, _key in (("weight_min", "wmin"), ("weight_max", "wmax"), ("imatrix", "imat")):
+                                _t = getattr(_m, _attr, None)
+                                if isinstance(_t, torch.Tensor):
+                                    cls[_key] += float(_t.detach().to(torch.float32).sum())
+                                _t2 = getattr(getattr(_m, "orig_layer", None), "imatrix", None)
+                                if _attr == "imatrix" and isinstance(_t2, torch.Tensor):
+                                    cls["imat"] += float(_t2.detach().to(torch.float32).sum())
+                            for _k2 in ("min_scale", "max_scale"):
+                                _t3 = getattr(_m, _k2, None)
+                                if isinstance(_t3, torch.Tensor):
+                                    cls["minmax"] += float(_t3.detach().to(torch.float32).sum())
+                        return cls
+
+                    _ref_sums = _cls_sums(_mods_s)
                     for _r, _mir in enumerate(replica_group.replicas[1:], start=1):
-                        _dh, _dm = 0.0, 0.0
-                        for _n, _hm in _mods_h.items():
-                            _mm = dict(_mir.named_modules()).get(_n)
-                            if _mm is None:
-                                continue
-                            for _attr in ("weight_min", "weight_max"):
-                                _a, _b = getattr(_hm, _attr, None), getattr(_mm, _attr, None)
-                                if isinstance(_a, torch.Tensor) and isinstance(_b, torch.Tensor):
-                                    _dh += float(_a.to(torch.float32).sum())
-                                    _dm += float(_b.to(torch.float32).sum())
-                        if abs(_dh - _dm) > 1e-3 * max(1.0, abs(_dh)):
-                            logger.warning(
-                                "[tune-ddp] template cache: mirror %d grids diverge from home "
-                                "(home sum %.4f vs mirror %.4f) -- stale anchor path",
-                                _r,
-                                _dh,
-                                _dm,
-                            )
+                        _ms = _cls_sums(dict(_mir.named_modules()))
+                        for _k in _ref_sums:
+                            _a, _b = _ref_sums[_k], _ms[_k]
+                            if abs(_a - _b) > 1e-3 * max(1.0, abs(_a)):
+                                logger.warning(
+                                    "[tune-ddp] template cache hit: mirror %d %s diverges from staging "
+                                    "(staging sum %.6f vs mirror %.6f)",
+                                    _r,
+                                    _k,
+                                    _a,
+                                    _b,
+                                )
                 if _tpl_home is not None and _tpl_home is not block:
                     # T12 inverted ownership: the cached home set holds this
                     # block's fresh values (deepcopy build on a miss, sync on a
