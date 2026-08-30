@@ -436,6 +436,15 @@ export AR_TUNE_GRAPH_TEMPLATE_CACHE=0   # 逐 block 镜像构建 + 捕获（旧�
 export AR_TUNE_GRAPH_TEMPLATE_CACHE=3   # 三模板模型
 ```
 
+### AR_TUNE_TEMPLATE_RECAPTURE
+- **描述**： 图模板缓存命中时，在采用的 replica 集合上重新捕获全新的 CUDA graph，而不是 replay 缓存的图。采用的 replica 本身已被证明正确（同一批模块的 eager 执行产生正确 loss），但缓存的图跨 block replay 出错误结果（状态与地址均验证为新鲜）。重新捕获保留镜像/暂存集合的复用（数秒的构建与 `ddp_setup`）以及图池稳定性，代价是每个命中块一次捕获（约 1-3 秒）。`0` 表示 replay 缓存图（仅用于排查）。
+- **默认值**: `1`
+- **有效值**: `0`/`false`/`no` 关闭，其他值开启
+
+```bash
+export AR_TUNE_TEMPLATE_RECAPTURE=0   # replay 缓存图（已知有问题，仅调试用）
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

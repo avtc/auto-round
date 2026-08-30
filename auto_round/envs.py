@@ -169,6 +169,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph and replay it per iteration; the per-iteration shard gather runs
     # eagerly into static buffers so rotating samples stay correct. Any
     # prepare/capture/replay failure halts the run -- set 0 to disable.
+    # Re-capture CUDA graphs on template-cache hits: the adopted replica set
+    # is reused, but fresh steps are captured against current tensor
+    # addresses. The cached graphs replay stale results despite verified
+    # fresh state (eager execution of the same modules is correct); =0 keeps
+    # the cached graphs (investigation only)
+    "AR_TUNE_TEMPLATE_RECAPTURE": lambda: os.getenv("AR_TUNE_TEMPLATE_RECAPTURE", "1").lower()
+    not in ("0", "false", "no"),
     # DEBUG: force a full device sync between prepare and replay rounds of
     # the paced graphed dispatch -- discriminates a stream-ordering race from
     # baked-address staleness on template-cache hits

@@ -436,6 +436,15 @@ export AR_TUNE_GRAPH_TEMPLATE_CACHE=0   # per-block mirror build + capture (lega
 export AR_TUNE_GRAPH_TEMPLATE_CACHE=3   # three-template model
 ```
 
+### AR_TUNE_TEMPLATE_RECAPTURE
+- **Description**: On graph template-cache hits, re-capture fresh CUDA graphs over the adopted replica set instead of replaying the cached ones. The adopted replicas themselves are proven correct (eager execution of the same modules produces correct losses), but the cached graphs replay stale results across blocks despite verified-fresh state and stable addresses. Re-capturing keeps the reuse of mirrors/staging (the multi-second build and `ddp_setup`) and the graph-pool stability, at the cost of one capture (~1-3 s) per hit block. `0` replays the cached graphs (investigation only).
+- **Default**: `1`
+- **Valid Values**: `0`/`false`/`no` to disable, anything else enables
+
+```bash
+export AR_TUNE_TEMPLATE_RECAPTURE=0   # replay cached graphs (broken; debugging only)
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)
