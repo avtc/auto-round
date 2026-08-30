@@ -224,6 +224,8 @@ def _addr_fingerprint(module):
     """Addresses + checksums of the graph-read state (grids, imatrix, v params)."""
     fp = {}
     for name, m in module.named_modules():
+        for pname, p in m.named_parameters(recurse=False):
+            fp[f"{name}.p.{pname}"] = (p.data_ptr(), float(p.detach().to(torch.float32).sum()))
         wm = getattr(m, "weight_min", None)
         if isinstance(wm, torch.Tensor):
             fp[f"{name}.wmin"] = (wm.data_ptr(), float(wm.to(torch.float32).sum()))
@@ -1699,7 +1701,7 @@ class SignRoundQuantizer(BaseQuantizer):
                                     _stale = abs(_sums["ref"] - _exp) > 1e-2 * max(1.0, abs(_exp))
                                     logger.info(
                                         "[tune-ddp] template-cache probe statics r=%d ref=%.4f (want %.4f) "
-                                        "in=%.4f %s ref_ptr=%s",
+                                        "in=%.4f %s %s ref_ptr=%s",
                                         _r,
                                         _sums["ref"],
                                         _exp,
