@@ -2980,3 +2980,88 @@ class TestAddrFingerprint:
         m.imatrix = torch.tensor([0.5])  # single-element tensor also fine
         fp = _addr_fingerprint(m)
         assert any(k.endswith(".imat") for k in fp)
+
+
+class TestTemplateCachePerGroupCap:
+    """Cache cap is PER DDP GROUP, not global.
+
+    Captured graphs pin replicas on one group's physical GPUs, so entries
+    are only ever reusable within their own group. A global LRU lets one
+    group's template diversity (3rd template: MTP/dense variants) evict the
+    OTHER group's working set; the per-group cap isolates them and makes the
+    default 2 correct for any ping-pong topology."""
+
+    def _entry(self, group):
+        blk = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        return {"replicas": [blk], "steps": [], "group": tuple(group)}
+
+    def test_third_template_on_group_a_keeps_group_b_entries(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _GRAPH_TEMPLATE_CACHE,
+            _trim_template_cache,
+        )
+
+        _GRAPH_TEMPLATE_CACHE.clear()
+        A, B = ("cuda:0", "cuda:1", "cuda:2", "cuda:3"), ("cuda:4", "cuda:5", "cuda:6", "cuda:7")
+        _GRAPH_TEMPLATE_CACHE[("kA1", A)] = self._entry(A)
+        _GRAPH_TEMPLATE_CACHE[("kB1", B)] = self._entry(B)
+        _GRAPH_TEMPLATE_CACHE[("kA2", A)] = self._entry(A)
+        _GRAPH_TEMPLATE_CACHE[("kA3", A)] = self._entry(A)  # 3rd template on A
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "auto_round.algorithms.quantization.sign_round.data_parallel.template_cache_size", return_value=2
+        ):
+            _trim_template_cache()
+        keys = set(_GRAPH_TEMPLATE_CACHE.keys())
+        # A keeps its NEWEST 2 (kA3 survived, oldest kA1 evicted); B untouched
+        assert keys == {("kA2", A), ("kA3", A), ("kB1", B)}
+
+    def test_single_group_behaviour_unchanged(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _GRAPH_TEMPLATE_CACHE,
+            _trim_template_cache,
+        )
+
+        _GRAPH_TEMPLATE_CACHE.clear()
+        A = ("cuda:0",)
+        for i in range(3):
+            _GRAPH_TEMPLATE_CACHE[(f"k{i}", A)] = self._entry(A)
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "auto_round.algorithms.quantization.sign_round.data_parallel.template_cache_size", return_value=2
+        ):
+            _trim_template_cache()
+        assert set(_GRAPH_TEMPLATE_CACHE.keys()) == {("k1", A), ("k2", A)}
+
+    def test_lru_touch_within_group(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _GRAPH_TEMPLATE_CACHE,
+            _trim_template_cache,
+        )
+
+        _GRAPH_TEMPLATE_CACHE.clear()
+        A = ("cuda:0",)
+        _GRAPH_TEMPLATE_CACHE[("old", A)] = self._entry(A)
+        _GRAPH_TEMPLATE_CACHE[("mid", A)] = self._entry(A)
+        _GRAPH_TEMPLATE_CACHE[("new", A)] = self._entry(A)
+        _GRAPH_TEMPLATE_CACHE.move_to_end(("old", A))  # touched: now newest
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "auto_round.algorithms.quantization.sign_round.data_parallel.template_cache_size", return_value=2
+        ):
+            _trim_template_cache()
+        assert set(_GRAPH_TEMPLATE_CACHE.keys()) == {("new", A), ("old", A)}
+
+    def test_missing_group_field_buckets_together(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _GRAPH_TEMPLATE_CACHE,
+            _trim_template_cache,
+        )
+
+        _GRAPH_TEMPLATE_CACHE.clear()
+        for i in range(3):
+            _GRAPH_TEMPLATE_CACHE[(f"k{i}",)] = {"replicas": [], "steps": []}  # no group field
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "auto_round.algorithms.quantization.sign_round.data_parallel.template_cache_size", return_value=2
+        ):
+            _trim_template_cache()
+        assert len(_GRAPH_TEMPLATE_CACHE) == 2

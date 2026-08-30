@@ -226,8 +226,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_TUNE_SERIAL_DEVICE_SCHEDULE": lambda: os.getenv("AR_TUNE_SERIAL_DEVICE_SCHEDULE", "1").lower()
     in ("1", "true", "yes", "on"),
     # Cross-block reuse of captured tune-loop graphs: how many distinct
-    # layer-module templates to keep cached (mirror modules + static buffers +
-    # captured replica graphs). 0 disables reuse (per-block build+capture);
+    # layer-module templates to keep cached per DDP GROUP (mirror modules +
+    # static buffers + captured replica graphs -- reusable only within the
+    # group whose GPUs they pin). 0 disables reuse (per-block build+capture);
     # 2 covers a linear/full interleave; larger models with more templates
     # may want more.
     "AR_TUNE_GRAPH_TEMPLATE_CACHE": lambda: max(0, int(os.getenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", "2") or 0)),

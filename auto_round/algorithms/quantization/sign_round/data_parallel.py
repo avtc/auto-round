@@ -2424,6 +2424,32 @@ def template_cache_size() -> int:
     return int(getattr(envs, "AR_TUNE_GRAPH_TEMPLATE_CACHE", 2) or 0)
 
 
+def _trim_template_cache() -> None:
+    """Enforce the template-cache cap PER DDP GROUP.
+
+    Captured graphs pin replicas on one group's physical GPUs: an entry is
+    only ever reusable within its own group. A global LRU lets one group's
+    template diversity (a 3rd template -- MTP/dense variants -- landing
+    mostly on one group) evict the OTHER group's working set, so each group
+    keeps its own newest ``template_cache_size()`` entries. With a single
+    group this is identical to the old global cap.
+    """
+    cap = template_cache_size()
+    if cap <= 0:
+        return
+    counts: dict = {}
+    for key in list(_GRAPH_TEMPLATE_CACHE.keys())[::-1]:  # newest first
+        group = _GRAPH_TEMPLATE_CACHE[key].get("group", ())
+        counts[group] = counts.get(group, 0) + 1
+        if counts[group] > cap:
+            _GRAPH_TEMPLATE_CACHE.pop(key)
+            logger.info(
+                "[tune-ddp] graph template cache: evicted LRU entry for group %s (per-group cap %d)",
+                list(group)[:1] or "<unknown>",
+                cap,
+            )
+
+
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 

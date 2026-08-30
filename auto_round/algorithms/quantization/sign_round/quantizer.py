@@ -1889,13 +1889,18 @@ class SignRoundQuantizer(BaseQuantizer):
                     _GRAPH_TEMPLATE_CACHE[_tpl_key] = {
                         "replicas": list(replica_group.replicas),
                         "steps": _steps,
+                        # owning DDP group (devices the replicas/graphs pin):
+                        # the cache cap is enforced PER GROUP so one group's
+                        # template diversity cannot evict the other's entries
+                        "group": tuple(str(d) for d in _plan.devices),
                         # address fingerprint: every tensor the captured graphs read
                         # must still live at these addresses on a hit -- drift means
                         # something REBOUND instead of refreshing in place
                         "ptrs": [_addr_fingerprint(rep) for rep in replica_group.replicas],
                     }
-                    while len(_GRAPH_TEMPLATE_CACHE) > template_cache_size():
-                        _GRAPH_TEMPLATE_CACHE.popitem(last=False)
+                    from auto_round.algorithms.quantization.sign_round.data_parallel import _trim_template_cache
+
+                    _trim_template_cache()
             except Exception as _cache_err:  # noqa: BLE001 - caching is best-effort
                 # WARNING, not debug: a dead insert silently zeroes the whole
                 # cache (every block pays full mirror rebuild + capture) and it
