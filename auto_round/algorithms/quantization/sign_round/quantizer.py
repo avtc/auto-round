@@ -1679,19 +1679,32 @@ class SignRoundQuantizer(BaseQuantizer):
                                         out["ref"] = out["in"] = float("nan")
                                     return out
 
+                                # by probe time the proactive pacing has already
+                                # staged iteration i+1's shards -- the EXPECTED
+                                # values are the NEXT iteration's gathers, not
+                                # the ones iteration i replayed against
+                                _probe_next = (
+                                    _proactive_schedule[i + 1]
+                                    if _proactive_schedule is not None and i + 1 < self.iters
+                                    else _shards
+                                )
                                 for _r in range(_world):
                                     _st_r = getattr(_graphed_steps[_r], "_ar_st", None) or {}
                                     _sums = _static_sums(_st_r)
                                     _exp = float(
-                                        torch.cat([fp_outputs[j] for j in _shards[_r]], dim=0).to(torch.float32).sum()
+                                        torch.cat([fp_outputs[j] for j in _probe_next[_r]], dim=0)
+                                        .to(torch.float32)
+                                        .sum()
                                     )
+                                    _stale = abs(_sums["ref"] - _exp) > 1e-2 * max(1.0, abs(_exp))
                                     logger.info(
-                                        "[tune-ddp] template-cache probe statics r=%d ref=%.4f in=%.4f "
-                                        "expected_ref=%.4f ref_ptr=%s",
+                                        "[tune-ddp] template-cache probe statics r=%d ref=%.4f (want %.4f) "
+                                        "in=%.4f %s ref_ptr=%s",
                                         _r,
                                         _sums["ref"],
-                                        _sums["in"],
                                         _exp,
+                                        _sums["in"],
+                                        "STALE-REF" if _stale else "ok",
                                         _st_r["ref"].data_ptr() if isinstance(_st_r.get("ref"), torch.Tensor) else None,
                                     )
                         total_loss = sum(l.item() for l in _losses if l is not None) / _world
