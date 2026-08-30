@@ -1720,6 +1720,7 @@ def run_proactive_paced_steps(group, steps, current_shards, next_shards, out_los
         run_paced_replica_steps(group, steps, current_shards, out_losses, worker_ms)
     else:
         world = len(steps)
+        _debug_sync_prepared_steps()
 
         def _replay(r):
             t0 = time.perf_counter()
@@ -2010,6 +2011,22 @@ def collect_best_params_pre(block, cache_device, pre_by_id):
     return params
 
 
+def _debug_sync_prepared_steps() -> None:
+    """AR_TUNE_TEMPLATE_DEBUG_SYNC=1: drain every device between the prepare
+    and replay rounds. If cached-mirror losses heal with this on, the wrong
+    replays are a stream-ordering race; if they stay wrong, the captured
+    graphs read addresses other than the current statics."""
+    from auto_round import envs
+
+    if not getattr(envs, "AR_TUNE_TEMPLATE_DEBUG_SYNC", False):
+        return
+    for idx in range(torch.cuda.device_count()):
+        try:
+            torch.cuda.synchronize(idx)
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pass
+
+
 def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
     """Two-round graphed dispatch: all prepares (pool latch), then all replays.
 
@@ -2020,6 +2037,7 @@ def run_paced_replica_steps(group, steps, shards, out_losses, worker_ms=None):
     """
     world = len(steps)
     group.run_threaded([lambda r=r: steps[r].prepare_only(shards[r]) for r in range(world)])
+    _debug_sync_prepared_steps()
 
     def _replay(r):
         t0 = time.perf_counter()
