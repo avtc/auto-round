@@ -741,7 +741,18 @@ class SignRoundQuantizer(BaseQuantizer):
                     # must never enter the cache). Uniform flow: the loop
                     # always tunes the staging home and copies the final
                     # iterate back at loop end.
+                    # Cached OTHER-template entries stay resident during this
+                    # build -- evict LRU until the fresh replica set + graph
+                    # pools fit (a second template on 24 GB cards OOMs).
                     if template_cache_size() > 0:
+                        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+                            evict_template_cache_for_free,
+                        )
+
+                        _block_bytes = sum(pp.numel() * pp.element_size() for pp in block.parameters())
+                        evict_template_cache_for_free(
+                            int(_block_bytes * _plan.world * 3.0 + (2 << 30)), devices=_plan.devices
+                        )
                         _tpl_home = copy.deepcopy(block)
                     replica_group = ReplicaGroup(
                         block,
@@ -1489,14 +1500,13 @@ class SignRoundQuantizer(BaseQuantizer):
                         _graphs_capture_iter = i + 1
                         if _graphs_gate is not None:
                             _graphs_gate.set()  # release held bg pack/ready work
-                        _cached = sum(1 for _g in _graphed_steps if getattr(_g, "_graph", None) is not None) - (
-                            1 if getattr(_graphed_steps[0], "_graph", None) is not None else 0
-                        )
+                        _pre_captured = sum(1 for _g in _graphed_steps if getattr(_g, "_graph", None) is not None)
                         logger.info(
                             "[tune-ddp] cuda graphs captured %d replica step(s)%s",
-                            _world - max(0, _cached),
-                            f" (+{max(0, _cached)} template-cached replays)" if _cached > 0 else "",
+                            _world - _pre_captured,
+                            f" (+{_pre_captured} template-cached replays)" if _pre_captured > 0 else "",
                         )
+
                 elif _graphed_steps is not None:
                     # warm-up AND deferred iterations both dispatch through
                     # the pool: the uncaptured step path runs prepare+compute
