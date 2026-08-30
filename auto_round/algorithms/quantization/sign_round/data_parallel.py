@@ -876,6 +876,26 @@ def sharded_nograd_forward(
     """
     world = len(devices)
     n = sample_count if sample_count is not None else (len(inputs) if isinstance(inputs, list) else 0)
+    _vram_devs = []
+    try:
+        import torch.cuda as _tc
+
+        if _tc.is_available():
+            _seen = set()
+            for _pd in [block] if not isinstance(block, (list, tuple)) else list(block):
+                for _pp in _pd.parameters():
+                    if _pp.device.type == "cuda":
+                        _seen.add(_pp.device)
+            _vram_devs = sorted(_seen, key=lambda d: d.index or 0)
+            if _vram_devs:
+                logger.info(
+                    "[tune-vram] collect start, standing reserved: %s",
+                    ", ".join(f"{_d.index}:{_tc.memory_reserved(_d) / 2**30:.2f}G" for _d in _vram_devs),
+                )
+                for _d in _vram_devs:
+                    _tc.reset_peak_memory_stats(_d)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        _vram_devs = []
     if max_devices and 0 < max_devices < world:
         logger.info(
             "[tune-ddp] sharded collect: capping concurrent shards at %d of %d device(s) (hook pass)",
@@ -991,6 +1011,20 @@ def sharded_nograd_forward(
     # per-block view to separate warmup from steady state.
     _walls = sorted(fwd_walls)
     _gpus = sorted(fwd_gpu)
+    if _vram_devs:
+        try:
+            import torch.cuda as _tc
+
+            logger.info(
+                "[tune-vram] collect done, %s",
+                ", ".join(
+                    f"{_d.index}:peak {_tc.max_memory_reserved(_d) / 2**30:.2f}G"
+                    f"/now {_tc.memory_reserved(_d) / 2**30:.2f}G"
+                    for _d in _vram_devs
+                ),
+            )
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pass
     logger.info(
         "[tune-ddp] sharded collect breakdown: world=%d n=%d setup=%.0fms "
         "fwd_wall[min/med/max]=%.0f/%.0f/%.0fms fwd_gpu[min/med/max]=%.0f/%.0f/%.0fms "
