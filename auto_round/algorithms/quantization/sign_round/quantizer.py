@@ -1705,6 +1705,7 @@ class SignRoundQuantizer(BaseQuantizer):
                                         _exp,
                                         _sums["in"],
                                         "STALE-REF" if _stale else "ok",
+                                        "prep=%d" % getattr(_graphed_steps[_r], "_prepare_calls", -1),
                                         _st_r["ref"].data_ptr() if isinstance(_st_r.get("ref"), torch.Tensor) else None,
                                     )
                         total_loss = sum(l.item() for l in _losses if l is not None) / _world

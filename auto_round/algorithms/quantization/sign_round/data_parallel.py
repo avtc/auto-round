@@ -1386,6 +1386,7 @@ class GraphedReplicaStep:
 
     def prepare_only(self, *args, **kwargs):
         """Run just the eager prepare (paced dispatch round 1). Failures halt."""
+        self._prepare_calls = getattr(self, "_prepare_calls", 0) + 1
         try:
             self.prepare(*args, **kwargs)
         except Exception as exc:
@@ -1412,6 +1413,7 @@ class GraphedReplicaStep:
         return self._static_loss.detach().clone()
 
     def __call__(self, *args, **kwargs):
+        self._prepare_calls = getattr(self, "_prepare_calls", 0) + 1
         try:
             self.prepare(*args, **kwargs)
         except Exception as exc:
