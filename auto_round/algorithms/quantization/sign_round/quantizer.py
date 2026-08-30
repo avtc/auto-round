@@ -723,6 +723,22 @@ class SignRoundQuantizer(BaseQuantizer):
                                         _old[0],
                                         _new[0],
                                     )
+                    for _r, _stp in enumerate(_tpl_entry.get("steps", [])):
+                        _cap_ptrs = getattr(_stp, "_capture_ptrs", None)
+                        if not _cap_ptrs:
+                            continue
+                        _cur = dict(_tpl_entry["replicas"][_r].named_parameters())
+                        for _pn, _old_ptr in _cap_ptrs.items():
+                            _p = _cur.get(_pn)
+                            if _p is not None and _p.data_ptr() != _old_ptr:
+                                logger.warning(
+                                    "[tune-ddp] template cache: replica %d %s REBOUND since capture "
+                                    "(capture %s -> now %s) -- the graph reads the ORPHANED storage",
+                                    _r,
+                                    _pn,
+                                    _old_ptr,
+                                    _p.data_ptr(),
+                                )
                     _tpl_home = _tpl_entry["replicas"][0]
                     for _rep in _tpl_entry["replicas"]:
                         sync_mirror_from_home(block, _rep)
@@ -1563,6 +1579,14 @@ class SignRoundQuantizer(BaseQuantizer):
                             if _graphs_gate is not None:
                                 _graphs_gate.set()
                             raise
+                        # capture-time param addresses: if anything rebinds a
+                        # replica's params between here and the cache insert,
+                        # the captured graphs read orphaned storage forever
+                        # while the insert-time fingerprint matches happily
+                        for _r in range(_world):
+                            _graphed_steps[_r]._capture_ptrs = {
+                                _pn: _p.data_ptr() for _pn, _p in replica_group.replicas[_r].named_parameters()
+                            }
                         _graphs_capture_pending = False
                         _graphs_capture_t = time.perf_counter()
                         _graphs_capture_wall = _graphs_capture_t - _cap_t0
