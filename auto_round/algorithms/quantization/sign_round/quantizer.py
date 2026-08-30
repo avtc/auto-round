@@ -1728,15 +1728,12 @@ class SignRoundQuantizer(BaseQuantizer):
                                 try:
                                     _eager_losses = []
                                     for _r in range(_world):
-                                        with torch.no_grad():
-                                            _le = None
-                                            _stp = _graphed_steps[_r]
-                                            _cmp = _stp.compute
-                                            # re-run forward only (compute calls
-                                            # backward too); approximate by
-                                            # calling it and discarding grads
-                                            _le = _cmp()
-                                        _eager_losses.append(float(_le))
+                                        # grads ON: compute ends with backward
+                                        _le = _graphed_steps[_r].compute()
+                                        _eager_losses.append(float(_le.detach()))
+                                        for _p in replica_group.replicas[_r].parameters():
+                                            if _p.grad is not None:
+                                                _p.grad.zero_()  # discard probe grads
                                     logger.info(
                                         "[tune-ddp] template-cache probe eager losses: %s",
                                         ["%.3e" % _v for _v in _eager_losses],
