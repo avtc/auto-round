@@ -1891,11 +1891,22 @@ class BaseOrchestrator(object):
                     "Keeping `low_cpu_mem_usage` enabled in RTN mode (iters=0): "
                     "RTN path uses blockwise quantization and supports per-block offloading."
                 )
-            elif self.has_qlayer_outside_block and not isinstance(self.quantize_config, RTNConfig):
+            elif (
+                self.has_qlayer_outside_block
+                and not isinstance(self.quantize_config, RTNConfig)
+                and not self.stream_quantization
+            ):
+                # Non-RTN quantizer (SignRound, iters>0) with quantized layers
+                # outside blocks: the legacy full-materialize path downgrades
+                # low_cpu_mem_usage. stream_quantization runs are exempt --
+                # they REQUIRE low_cpu_mem_usage for progressive shard writes
+                # (immediate saving); downgrading here would trip the
+                # streaming immediate-saving guard before the first block.
                 logger.warning(
                     "`low_cpu_mem_usage` is not fully supported "
-                    "when there are quantized layers outside blocks and optimized RTN is disabled. "
-                    "Setting low_cpu_mem_usage to False."
+                    "when there are quantized layers outside blocks and the quantizer is not "
+                    "RTN (SignRound tuning path). Setting low_cpu_mem_usage to False. "
+                    "(stream_quantization runs are exempt: they require it for progressive saving.)"
                 )
                 self.compress_context.low_cpu_mem_usage = False
                 self.compress_context.is_immediate_saving = False
