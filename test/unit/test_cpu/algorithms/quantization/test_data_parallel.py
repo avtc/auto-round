@@ -3065,3 +3065,66 @@ class TestTemplateCachePerGroupCap:
         ):
             _trim_template_cache()
         assert len(_GRAPH_TEMPLATE_CACHE) == 2
+
+
+class TestEvictTemplateCacheForFree:
+    """VRAM eviction: per-device target + only competing entries evicted.
+
+    Server regression: the free target charged the whole world's replicas
+    against EVERY device (28.75 GiB on 24 GB cards), so every miss drained
+    the entire cache and no block ever hit. Eviction must now skip entries
+    whose replicas live outside the building plan's devices."""
+
+    def _mk_entries(self, n=3):
+        entries = []
+        for i in range(n):
+            blk = torch.nn.Sequential(torch.nn.Linear(4, 4))
+            entries.append({"replicas": [blk], "steps": [], "group": ("cpu",)})
+        return entries
+
+    def test_only_devices_spare_foreign_entries(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _GRAPH_TEMPLATE_CACHE,
+            evict_template_cache_for_free,
+        )
+
+        _GRAPH_TEMPLATE_CACHE.clear()
+        for k, e in zip(("k1", "k2", "k3"), self._mk_entries(3)):
+            _GRAPH_TEMPLATE_CACHE[k] = e
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "torch.cuda.mem_get_info", return_value=(0, 24 << 30)
+        ):
+            # replicas live on cpu; the build plan is cuda:0 -- nothing competes
+            evict_template_cache_for_free(8 << 30, devices=[torch.device("cuda", 0)], only_devices=["cuda:0"])
+        assert len(_GRAPH_TEMPLATE_CACHE) == 3  # all spared
+
+    def test_matching_entries_evicted_lru_first(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _GRAPH_TEMPLATE_CACHE,
+            evict_template_cache_for_free,
+        )
+
+        _GRAPH_TEMPLATE_CACHE.clear()
+        for k, e in zip(("k1", "k2", "k3"), self._mk_entries(3)):
+            _GRAPH_TEMPLATE_CACHE[k] = e
+        frees = iter([(0, 24 << 30), (1 << 40, 1 << 40)])  # low once, then plenty
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "torch.cuda.mem_get_info", side_effect=lambda *a, **k: next(frees)
+        ):
+            evict_template_cache_for_free(8 << 30, devices=[torch.device("cuda", 0)], only_devices=None)
+        assert set(_GRAPH_TEMPLATE_CACHE.keys()) == {"k2", "k3"}  # oldest first
+
+    def test_no_eligible_entry_stops_cleanly(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _GRAPH_TEMPLATE_CACHE,
+            evict_template_cache_for_free,
+        )
+
+        _GRAPH_TEMPLATE_CACHE.clear()
+        for k, e in zip(("k1",), self._mk_entries(1)):
+            _GRAPH_TEMPLATE_CACHE[k] = e
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "torch.cuda.mem_get_info", return_value=(0, 24 << 30)
+        ):
+            evict_template_cache_for_free(8 << 30, devices=[torch.device("cuda", 0)], only_devices=["cuda:9"])
+        assert len(_GRAPH_TEMPLATE_CACHE) == 1  # cannot buy VRAM: leaves cache intact

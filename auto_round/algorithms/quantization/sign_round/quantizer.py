@@ -752,8 +752,14 @@ class SignRoundQuantizer(BaseQuantizer):
                         )
 
                         _block_bytes = sum(pp.numel() * pp.element_size() for pp in block.parameters())
+                        # PER-DEVICE target: the build adds ~one replica + graph pools
+                        # + transients on EACH plan device, and _free() is the min per
+                        # device -- charging the whole world's replicas against every
+                        # device made the target exceed the card and drained the cache
+                        # at every miss. Only entries ON THESE DEVICES compete for the
+                        # same VRAM; other groups' entries must survive.
                         evict_template_cache_for_free(
-                            int(_block_bytes * _plan.world * 3.0 + (2 << 30)), devices=_plan.devices
+                            int(_block_bytes * 3.0 + (2 << 30)), devices=_plan.devices, only_devices=_plan.devices
                         )
                         _tpl_home = copy.deepcopy(block)
                     replica_group = ReplicaGroup(

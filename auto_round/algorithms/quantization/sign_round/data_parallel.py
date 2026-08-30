@@ -2378,7 +2378,7 @@ def _shell_bind_home(cached_home: torch.nn.Module, block: torch.nn.Module) -> No
             dm._recipe_anchor_deferred = False  # grids arrive via the views
 
 
-def evict_template_cache_for_free(min_free_bytes: int, devices=None) -> None:
+def evict_template_cache_for_free(min_free_bytes: int, devices=None, only_devices=None) -> None:
     """Evict LRU template-cache entries until the devices hold enough free VRAM.
 
     A MISS block builds a fresh replica set while cached entries from other
@@ -2387,6 +2387,11 @@ def evict_template_cache_for_free(min_free_bytes: int, devices=None) -> None:
     block with the linear entry cached). Evicted entries drop their module/
     graph references; empty_cache on the affected devices returns the
     reserved segments so the check reflects reality.
+
+    ``only_devices`` restricts eviction to entries whose replicas live on
+    those devices: with ping-pong groups, an entry pinned to the OTHER
+    group's GPUs does not compete with this build for VRAM and must survive
+    (min_free_bytes is a PER-DEVICE requirement -- see _free()).
     """
     if not _GRAPH_TEMPLATE_CACHE:
         return
@@ -2395,17 +2400,31 @@ def evict_template_cache_for_free(min_free_bytes: int, devices=None) -> None:
             [torch.device("cuda", i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
         )
     devs = [d for d in devices if getattr(d, "type", "") == "cuda"]
+    only = {str(d) for d in only_devices} if only_devices is not None else None
 
     def _free():
         return min(torch.cuda.mem_get_info(d)[0] for d in devs) if devs else 1 << 62
 
-    freed_devs = set()
-    while _GRAPH_TEMPLATE_CACHE and _free() < min_free_bytes:
-        _key, entry = _GRAPH_TEMPLATE_CACHE.popitem(last=False)
+    def _entry_devices(entry):
+        out = set()
         for rep in entry.get("replicas", []):
             p = next(rep.parameters(), None)
             if p is not None:
-                freed_devs.add(p.device)
+                out.add(str(p.device))
+        return out
+
+    freed_devs = set()
+    while _GRAPH_TEMPLATE_CACHE and _free() < min_free_bytes:
+        _key, entry = None, None
+        for k in _GRAPH_TEMPLATE_CACHE.keys():  # oldest first
+            e = _GRAPH_TEMPLATE_CACHE[k]
+            if only is None or (_entry_devices(e) & only):
+                _key, entry = k, e
+                break
+        if _key is None:
+            break  # no eligible entry left -- cannot buy more VRAM on these devices
+        _GRAPH_TEMPLATE_CACHE.pop(_key)
+        freed_devs |= _entry_devices(entry)
         entry.clear()  # drop refs: mirrors, staging, graphs, statics
         logger.info(
             "[tune-ddp] graph template cache: evicted an entry for VRAM (free target %.2f GiB)",
@@ -2413,7 +2432,8 @@ def evict_template_cache_for_free(min_free_bytes: int, devices=None) -> None:
         )
     for d in freed_devs:
         try:
-            torch.cuda.empty_cache(torch.cuda.current_device() if d.index is None else d.index)
+            dev = torch.device(d)
+            torch.cuda.empty_cache(0 if dev.index is None else dev.index)
         except Exception:  # noqa: BLE001 - best-effort release
             pass
 
