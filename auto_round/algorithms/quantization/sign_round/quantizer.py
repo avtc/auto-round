@@ -705,6 +705,27 @@ class SignRoundQuantizer(BaseQuantizer):
                     )
                 for note in _plan.notes:
                     logger.info("[tune-ddp] %s", note)
+                if _tpl_entry is not None:
+                    _mods_h = dict(block.named_modules())
+                    for _r, _mir in enumerate(replica_group.mirrors, start=1):
+                        _dh, _dm = 0.0, 0.0
+                        for _n, _hm in _mods_h.items():
+                            _mm = dict(_mir.named_modules()).get(_n)
+                            if _mm is None:
+                                continue
+                            for _attr in ("weight_min", "weight_max"):
+                                _a, _b = getattr(_hm, _attr, None), getattr(_mm, _attr, None)
+                                if isinstance(_a, torch.Tensor) and isinstance(_b, torch.Tensor):
+                                    _dh += float(_a.to(torch.float32).sum())
+                                    _dm += float(_b.to(torch.float32).sum())
+                        if abs(_dh - _dm) > 1e-3 * max(1.0, abs(_dh)):
+                            logger.warning(
+                                "[tune-ddp] template cache: mirror %d grids diverge from home "
+                                "(home sum %.4f vs mirror %.4f) -- stale anchor path",
+                                _r,
+                                _dh,
+                                _dm,
+                            )
                 with _bp_stage(_prof_bp, "sharded_anchor"):
                     _shard_recipe_anchor(replica_group)
                 logger.info(
@@ -1404,7 +1425,14 @@ class SignRoundQuantizer(BaseQuantizer):
                         _graphs_capture_iter = i + 1
                         if _graphs_gate is not None:
                             _graphs_gate.set()  # release held bg pack/ready work
-                        logger.info("[tune-ddp] cuda graphs captured %d replica step(s)", _world)
+                        _cached = sum(1 for _g in _graphed_steps if getattr(_g, "_graph", None) is not None) - (
+                            1 if getattr(_graphed_steps[0], "_graph", None) is not None else 0
+                        )
+                        logger.info(
+                            "[tune-ddp] cuda graphs captured %d replica step(s)%s",
+                            _world - max(0, _cached),
+                            f" (+{max(0, _cached)} template-cached replays)" if _cached > 0 else "",
+                        )
                 elif _graphed_steps is not None:
                     # warm-up AND deferred iterations both dispatch through
                     # the pool: the uncaptured step path runs prepare+compute
@@ -1487,6 +1515,14 @@ class SignRoundQuantizer(BaseQuantizer):
                         )
                 else:
                     with tune_stage(tune_prof, "loss_sync"):
+                        if _tpl_entry is not None and i in (0, 5) and _losses and all(l is not None for l in _losses):
+                            # template-cache diagnostic: per-replica losses -- a mirror
+                            # diverging from the home here pins stale replay state
+                            logger.info(
+                                "[tune-ddp] template-cache probe blk iter=%d replica losses: %s",
+                                i,
+                                ["%.3e" % float(l) for l in _losses],
+                            )
                         total_loss = sum(l.item() for l in _losses if l is not None) / _world
             else:
                 if _serial_step is not None:

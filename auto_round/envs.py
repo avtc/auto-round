@@ -229,7 +229,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # captured replica graphs). 0 disables reuse (per-block build+capture);
     # 2 covers a linear/full interleave; larger models with more templates
     # may want more.
-    "AR_TUNE_GRAPH_TEMPLATE_CACHE": lambda: max(0, int(os.getenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", "2") or 0)),
+    "AR_TUNE_GRAPH_TEMPLATE_CACHE": lambda: max(0, int(os.getenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", "0") or 0)),
     # Tune-loop-only torch.compile override for the block forward: unset =
     # follow the shared enable_torch_compile decision (collection + tune);
     # "1" = force compile the tune loop's forward even when the shared runner

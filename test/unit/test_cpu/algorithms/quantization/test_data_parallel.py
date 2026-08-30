@@ -2574,11 +2574,12 @@ class TestMirrorTemplateCache:
                 dp._GRAPH_TEMPLATE_CACHE.popitem(last=False)
         assert list(dp._GRAPH_TEMPLATE_CACHE) == ["b", "c", "d"]
 
-    def test_env_size_default_two_any_value(self, monkeypatch):
+    def test_env_size_default_off_any_value(self, monkeypatch):
+        """Default 0 (opt-in) until server bit-identity is proven; any size works."""
         from auto_round import envs
 
         monkeypatch.delenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", raising=False)
-        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 2
+        assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == 0
         for v in ("0", "1", "5"):
             monkeypatch.setenv("AR_TUNE_GRAPH_TEMPLATE_CACHE", v)
             assert envs.AR_TUNE_GRAPH_TEMPLATE_CACHE == int(v)
