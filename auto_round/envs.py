@@ -194,6 +194,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decision reaches the host as a pinned flag byte that poll() checks
     # without blocking. The loop's only fence is the bounded drain at loop
     # end. Immediate read is kept when dynamic_max_gap is set.
+    "AR_TUNE_FOREACH_STEP": lambda: os.getenv("AR_TUNE_FOREACH_STEP", "1").lower() in ("1", "true", "yes", "on"),
     "AR_TUNE_ASYNC_LOSS": lambda: os.getenv("AR_TUNE_ASYNC_LOSS", "0").lower() in ("1", "true", "yes", "on"),
     # Pace graphed replica steps: run ALL prepares to completion (pool latch)
     # before ANY replay launches, so replays start in lockstep instead of

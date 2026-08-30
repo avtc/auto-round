@@ -343,6 +343,7 @@ export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 ```
 
 ### AR_TUNE_ASYNC_LOSS
+| `AR_TUNE_FOREACH_STEP` | Whether the pure-sign SignSGD step uses the foreach fast path (bit-identical to the legacy per-group single-tensor loop); `0` falls back to the legacy loop for bisecting | 1 |
 - **Description**: Fence-free best-params selection in the DDP tune loop. Loss values never leave the GPU during the loop: the world-sum loss is stored per iteration in a device buffer, compared against a device-side running minimum (strict-less, first-wins ties, identical selection to the immediate read), and the boolean travels to the host as a pinned flag byte guarded by a CUDA event. The host POLLS ready flags once per iteration (non-blocking) and promotes by pointer swap over pre-step snapshots. Fences: the bounded drain at loop end, plus a rare bounded wait on the oldest flag if it lags a full iteration behind (pending is capped at one snapshot -- the same VRAM as the old delayed-loss mode: one extra tuning-params slot on the primary device, ~1.3 GB for a 27B dense block). `dynamic_max_gap > 0` keeps the immediate read (early-stop needs in-loop values).
 - **Default**: `0`
 - **Valid Values**: `1`, `0`

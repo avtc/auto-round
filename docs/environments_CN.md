@@ -343,6 +343,7 @@ export AR_TUNE_RECIPE=neuqi_qon   # + --iters 20 --asym --imatrix_enabled true
 ```
 
 ### AR_TUNE_ASYNC_LOSS
+| `AR_TUNE_FOREACH_STEP` | 纯符号 SignSGD 步进是否使用 foreach 快速路径（与逐组单张量循环按位一致）；`0` 回退到旧版循环，用于二分排查 | 1 |
 - **描述**： DDP 调优循环的无围栏最优参数选择。循环期间 loss 值完全不离开 GPU：每次迭代的 world 求和 loss 存入设备缓冲，与设备侧运行最小值比较（严格小于、平局先到先得，与立即读取的选择完全一致），布尔结果以受 CUDA 事件保护的 pinned 标志字节送达宿主。宿主每迭代轮询就绪标志（非阻塞），通过预存快照的指针交换完成晋升。围栏：循环结束时的有界 drain，以及当最旧标志滞后满一个迭代时的罕见有界等待（pending 上限为一个快照——与旧 delayed-loss 模式显存相同：主设备多一个调优参数槽，27B 稠密 block 约 1.3 GB）。`dynamic_max_gap > 0` 时保持立即读取（早停需要循环内数值）。
 - **默认值**: `0`
 - **有效值**: `1`, `0`

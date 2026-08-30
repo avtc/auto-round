@@ -1828,8 +1828,11 @@ def sign_step_foreach_ok(optimizer) -> bool:
     Checked on the optimizer's own state so home and mirror optimizers
     qualify identically.
     """
+    from auto_round import envs as _envs
     from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
 
+    if not _envs.AR_TUNE_FOREACH_STEP:
+        return False  # bisect/rollback lever: legacy single-tensor loop
     if not isinstance(optimizer, SignSGD):
         return False
     d = getattr(optimizer, "defaults", {}) or {}
