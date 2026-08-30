@@ -2323,10 +2323,24 @@ def _shell_bind_home(cached_home: torch.nn.Module, block: torch.nn.Module) -> No
     storages, so an eviction that drops the entry cannot dangle a live shell.
     """
     cached_mods = dict(cached_home.named_modules())
+    # frozen-margin layout parity FIRST: the anchor pinned (unregistered) the
+    # min/max margin params on the CACHED set while the real block still
+    # carries them registered -- pin the real block's too, or its
+    # named_parameters walk below would see params the cached set no longer
+    # has. The pin is a value-neutral layout op (unregister + constant 1.0):
+    # no views are created before validation completes, so a drift raise
+    # still leaves no partially VIEW-bound block behind.
+    with torch.no_grad():
+        for name, dm in block.named_modules():
+            cm = cached_mods.get(name)
+            if cm is None:
+                continue
+            if getattr(cm, "_tune_recipe_frozen_margins", False) and hasattr(dm, "_pin_margins_frozen"):
+                dm._pin_margins_frozen()
     cached_params = dict(cached_home.named_parameters())
     cached_bufs = dict(cached_home.named_buffers())
-    # validate EVERYTHING first: drift must raise before any mutation, or a
-    # partially rebound block (some params views, some not) is left behind
+    # validate EVERYTHING before creating any views: drift must raise before
+    # a partially rebound block (some params views, some not) is left behind
     for name, p in block.named_parameters():
         src = cached_params.get(name)
         if src is None or src.shape != p.shape or src.dtype != p.dtype:
@@ -2344,15 +2358,6 @@ def _shell_bind_home(cached_home: torch.nn.Module, block: torch.nn.Module) -> No
             if isinstance(src_t, torch.Tensor) and isinstance(dst_t, torch.Tensor) and src_t.shape != dst_t.shape:
                 raise RuntimeError(f"template drift at {name!r}.{attr} -- refusing to shell-bind the block")
     with torch.no_grad():
-        for name, dm in block.named_modules():
-            cm = cached_mods.get(name)
-            if cm is None:
-                continue
-            # frozen-margin layout parity BEFORE binding: the cached set
-            # unregistered its min/max params during the anchor -- the real
-            # block must match so _parameters enumeration agrees downstream
-            if getattr(cm, "_tune_recipe_frozen_margins", False) and hasattr(dm, "_pin_margins_frozen"):
-                dm._pin_margins_frozen()
         for name, p in block.named_parameters():
             p.data = cached_params[name].data  # view: storage shared, Parameter object untouched
         for name, b in block.named_buffers():

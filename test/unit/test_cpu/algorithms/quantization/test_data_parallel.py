@@ -2910,3 +2910,39 @@ class TestShellBindHome:
         assert torch.equal(mirror[0].weight_min, home[0].weight_min)
         assert torch.equal(mirror[0].weight_max, home[0].weight_max)
         assert mirror[0].weight_min.data_ptr() == p_wmin  # in place: graph addresses stable
+
+    def test_frozen_margin_polarity_cached_pinned_real_registered(self):
+        """Server regression (block 0, neuqi_frozen_qon): the anchor pins the
+        CACHED set's margins (unregisters min/max) while the REAL block still
+        carries them registered -- validation must run after the layout pin,
+        not before, or the bind refuses with 'template drift at min_scale'."""
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        def mk(seed, pinned):
+            torch.manual_seed(seed)
+            m = torch.nn.Linear(5, 5)
+            # wrapper-style registered margins (setattr of a Parameter registers it)
+            m.min_scale = torch.nn.Parameter(torch.ones(5, 1))
+            m.max_scale = torch.nn.Parameter(torch.ones(5, 1))
+            if pinned:
+                for key in ("min_scale", "max_scale"):
+                    m._parameters.pop(key, None)
+                    setattr(m, key, torch.tensor(1.0))
+            return m
+
+        real = mk(0, pinned=False)
+        cached = mk(1, pinned=True)
+        cached._tune_recipe_frozen_margins = True
+
+        def _pin(module=real):
+            for key in ("min_scale", "max_scale"):
+                module._parameters.pop(key, None)
+                setattr(module, key, torch.tensor(1.0))
+
+        real._pin_margins_frozen = _pin
+        _shell_bind_home(cached, real)  # must not raise
+        assert "min_scale" not in dict(real.named_parameters())  # pin ran first
+        assert real.weight.data_ptr() == cached.weight.data_ptr()
+        assert real._tune_recipe_frozen_margins is True
