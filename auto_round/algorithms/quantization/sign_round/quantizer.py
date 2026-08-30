@@ -1052,6 +1052,11 @@ class SignRoundQuantizer(BaseQuantizer):
                 _make_graphed_step(r, step=(_tpl_entry["steps"][r] if _tpl_entry is not None else None))
                 for r in range(replica_group.world)
             ]
+            # count BEFORE any capture runs: steps adopted from the cache
+            # carry graphs, freshly-built ones do not -- counting later
+            # (after the lazy capture fires on the first steady replay)
+            # mislabels every fresh capture as a cached replay
+            _tpl_pre_captured = sum(1 for _g in _graphed_steps if getattr(_g, "_graph", None) is not None)
             _graphs_warmups_left = (
                 0 if getattr(_graphed_steps[0], "_graph", None) is not None else _graphed_steps[0].warmup_iters
             )
@@ -1500,11 +1505,10 @@ class SignRoundQuantizer(BaseQuantizer):
                         _graphs_capture_iter = i + 1
                         if _graphs_gate is not None:
                             _graphs_gate.set()  # release held bg pack/ready work
-                        _pre_captured = sum(1 for _g in _graphed_steps if getattr(_g, "_graph", None) is not None)
                         logger.info(
                             "[tune-ddp] cuda graphs captured %d replica step(s)%s",
-                            _world - _pre_captured,
-                            f" (+{_pre_captured} template-cached replays)" if _pre_captured > 0 else "",
+                            _world - _tpl_pre_captured,
+                            f" (+{_tpl_pre_captured} template-cached replays)" if _tpl_pre_captured > 0 else "",
                         )
 
                 elif _graphed_steps is not None:
