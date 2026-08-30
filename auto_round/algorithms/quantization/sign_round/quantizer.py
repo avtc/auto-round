@@ -220,7 +220,6 @@ if TYPE_CHECKING:
     from auto_round.algorithms.composer import BlockContext
 
 
-@register_pipeline_member(SignRoundConfig)
 def _addr_fingerprint(module):
     """Addresses + checksums of the graph-read state (grids, imatrix, v params)."""
     fp = {}
@@ -237,6 +236,7 @@ def _addr_fingerprint(module):
     return fp
 
 
+@register_pipeline_member(SignRoundConfig)
 class SignRoundQuantizer(BaseQuantizer):
 
     def __init__(self, config: SignRoundConfig) -> None:

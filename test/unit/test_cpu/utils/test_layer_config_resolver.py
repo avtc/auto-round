@@ -88,3 +88,17 @@ def test_extract_regex_config_keeps_pattern_separate_from_expanded_layers():
 def test_has_quantized_layer_outside_blocks_is_derived_from_final_mapping():
     assert has_quantized_layer_outside_blocks({"layer": {"bits": 4, "in_blocks": False}})
     assert not has_quantized_layer_outside_blocks({"layer": {"bits": 16, "in_blocks": False}})
+
+
+def test_pipeline_member_registry_maps_configs_to_classes():
+    """Regression: a module-level helper accidentally stole the
+    ``@register_pipeline_member(SignRoundConfig)`` decorator, so the config
+    resolved to a plain function and every instance-config entry crashed with
+    ``issubclass() arg 1 must be a class``."""
+    from auto_round.algorithms.config_resolver import get_algorithm_class, is_block_quantizer_config
+    from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+    from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+    cls = get_algorithm_class(SignRoundConfig(iters=1))
+    assert cls is SignRoundQuantizer
+    assert is_block_quantizer_config(SignRoundConfig(iters=1))
