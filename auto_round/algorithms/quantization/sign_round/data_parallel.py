@@ -2621,7 +2621,15 @@ class ReplicaGroup:
                     (prefix + "." + name.replace(".orig_layer.", ".")) if prefix else name.replace(".orig_layer.", ".")
                 )
                 if key in staged:
-                    param.data = staged[key].to(param.device)
+                    # OWN storage, never an alias: staged tensors already live
+                    # on this device, so .to() alone would hand the mirror the
+                    # streamer's staging buffer itself -- the prefetcher keeps
+                    # staging into those buffers and would silently overwrite
+                    # the mirror's weights mid-tune (observed: cached mirrors
+                    # replayed garbage while every engage-time value check
+                    # passed). The clone costs one buffer at build time; the
+                    # staged copy is released back right after.
+                    param.data = staged[key].to(param.device).clone()
         return replica
 
     def round_params(self) -> List[List[torch.nn.Parameter]]:

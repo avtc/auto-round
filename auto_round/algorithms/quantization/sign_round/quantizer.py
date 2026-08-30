@@ -1681,6 +1681,15 @@ class SignRoundQuantizer(BaseQuantizer):
                                         out["ref"] = out["in"] = float("nan")
                                     return out
 
+                                def _weight_sums(rep):
+                                    total = 0.0
+                                    for _m in rep.modules():
+                                        if hasattr(_m, "orig_layer"):
+                                            total += float(_m.orig_layer.weight.detach().to(torch.float32).sum())
+                                    return total
+
+                                _engage_wsums = [_weight_sums(_rep) for _rep in replica_group.replicas]
+
                                 # by probe time the proactive pacing has already
                                 # staged iteration i+1's shards -- the EXPECTED
                                 # values are the NEXT iteration's gathers, not
@@ -1699,15 +1708,19 @@ class SignRoundQuantizer(BaseQuantizer):
                                         .sum()
                                     )
                                     _stale = abs(_sums["ref"] - _exp) > 1e-2 * max(1.0, abs(_exp))
+                                    _w_now = _weight_sums(replica_group.replicas[_r])
+                                    _w_drift = abs(_w_now - _engage_wsums[_r]) > 1e-3 * max(1.0, abs(_engage_wsums[_r]))
                                     logger.info(
                                         "[tune-ddp] template-cache probe statics r=%d ref=%.4f (want %.4f) "
-                                        "in=%.4f %s %s ref_ptr=%s",
+                                        "in=%.4f %s %s wsum=%.2f%s ref_ptr=%s",
                                         _r,
                                         _sums["ref"],
                                         _exp,
                                         _sums["in"],
                                         "STALE-REF" if _stale else "ok",
                                         "prep=%d" % getattr(_graphed_steps[_r], "_prepare_calls", -1),
+                                        _w_now,
+                                        " WEIGHT-DRIFT" if _w_drift else "",
                                         _st_r["ref"].data_ptr() if isinstance(_st_r.get("ref"), torch.Tensor) else None,
                                     )
                         total_loss = sum(l.item() for l in _losses if l is not None) / _world
