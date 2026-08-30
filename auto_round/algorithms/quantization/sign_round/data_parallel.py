@@ -2296,6 +2296,46 @@ def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> Non
                 mm._recipe_anchor_deferred = True
 
 
+def evict_template_cache_for_free(min_free_bytes: int, devices=None) -> None:
+    """Evict LRU template-cache entries until the devices hold enough free VRAM.
+
+    A MISS block builds a fresh replica set while cached entries from other
+    templates stay resident -- on 24 GB cards the second template's build
+    OOMs (observed: 23.24/23.58 GB on cuda:0 during the first full-attention
+    block with the linear entry cached). Evicted entries drop their module/
+    graph references; empty_cache on the affected devices returns the
+    reserved segments so the check reflects reality.
+    """
+    if not _GRAPH_TEMPLATE_CACHE:
+        return
+    if devices is None:
+        devices = (
+            [torch.device("cuda", i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+        )
+    devs = [d for d in devices if getattr(d, "type", "") == "cuda"]
+
+    def _free():
+        return min(torch.cuda.mem_get_info(d)[0] for d in devs) if devs else 1 << 62
+
+    freed_devs = set()
+    while _GRAPH_TEMPLATE_CACHE and _free() < min_free_bytes:
+        _key, entry = _GRAPH_TEMPLATE_CACHE.popitem(last=False)
+        for rep in entry.get("replicas", []):
+            p = next(rep.parameters(), None)
+            if p is not None:
+                freed_devs.add(p.device)
+        entry.clear()  # drop refs: mirrors, staging, graphs, statics
+        logger.info(
+            "[tune-ddp] graph template cache: evicted an entry for VRAM (free target %.2f GiB)",
+            min_free_bytes / 2**30,
+        )
+    for d in freed_devs:
+        try:
+            torch.cuda.empty_cache(torch.cuda.current_device() if d.index is None else d.index)
+        except Exception:  # noqa: BLE001 - best-effort release
+            pass
+
+
 def template_cache_size() -> int:
     from auto_round import envs
 
