@@ -227,7 +227,9 @@ def _addr_fingerprint(module):
         wm = getattr(m, "weight_min", None)
         if isinstance(wm, torch.Tensor):
             fp[f"{name}.wmin"] = (wm.data_ptr(), float(wm.to(torch.float32).sum()))
-        im = getattr(m, "imatrix", None) or getattr(getattr(m, "orig_layer", None), "imatrix", None)
+        im = getattr(m, "imatrix", None)
+        if not isinstance(im, torch.Tensor):  # NB: never `or` on tensors -- bool() of a
+            im = getattr(getattr(m, "orig_layer", None), "imatrix", None)  # multi-element imatrix raises
         if isinstance(im, torch.Tensor):
             fp[f"{name}.imat"] = (im.data_ptr(), float(im.to(torch.float32).sum()))
         v = getattr(getattr(m, "params", {}), "get", lambda _k: None)("value")
@@ -1895,7 +1897,10 @@ class SignRoundQuantizer(BaseQuantizer):
                     while len(_GRAPH_TEMPLATE_CACHE) > template_cache_size():
                         _GRAPH_TEMPLATE_CACHE.popitem(last=False)
             except Exception as _cache_err:  # noqa: BLE001 - caching is best-effort
-                logger.debug("[tune-ddp] graph template cache insert skipped (%r)", _cache_err)
+                # WARNING, not debug: a dead insert silently zeroes the whole
+                # cache (every block pays full mirror rebuild + capture) and it
+                # took a full server run to notice once
+                logger.warning("[tune-ddp] graph template cache insert skipped (%r)", _cache_err)
             replica_group.teardown()
         if _async:
             # the one legal fence in the whole loop: bounded wait, then the

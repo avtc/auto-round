@@ -2946,3 +2946,37 @@ class TestShellBindHome:
         assert "min_scale" not in dict(real.named_parameters())  # pin ran first
         assert real.weight.data_ptr() == cached.weight.data_ptr()
         assert real._tune_recipe_frozen_margins is True
+
+
+class TestAddrFingerprint:
+    """Insert-path probe: must not raise on real wrapper state.
+
+    Server regression (since the probe landed): `tensor or x` calls bool() on
+    a multi-element imatrix -> ValueError -> the insert's except swallowed it
+    at DEBUG and NO template entry was ever stored (zero hits, every block
+    rebuilt mirrors + re-captured graphs). The skip now logs at WARNING.
+    """
+
+    def test_fingerprint_with_imatrix_and_value_param(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import _addr_fingerprint
+
+        block = torch.nn.Sequential(torch.nn.Linear(6, 6))
+        block[0].imatrix = torch.rand(6, 1)  # multi-element: bool() would raise
+        block[0].orig_layer = None  # probe must fall through to orig_layer safely
+        v = torch.nn.Parameter(torch.zeros(6, 1))
+        block[0].params = {"value": v}
+        fp = _addr_fingerprint(block)  # must not raise
+        assert fp["0.value"][0] == v.data_ptr()
+        assert fp["0.imat"][1] == float(block[0].imatrix.to(torch.float32).sum())
+
+    def test_fingerprint_single_layer_key_shape(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import _addr_fingerprint
+
+        m = torch.nn.Linear(3, 3)
+        m.imatrix = torch.tensor([0.5])  # single-element tensor also fine
+        fp = _addr_fingerprint(m)
+        assert any(k.endswith(".imat") for k in fp)
