@@ -1723,6 +1723,26 @@ class SignRoundQuantizer(BaseQuantizer):
                                     if _proactive_schedule is not None and i + 1 < self.iters
                                     else _shards
                                 )
+                                # eager-vs-replay discriminator: run the SAME
+                                # closure (module + statics) outside the graph
+                                try:
+                                    _eager_losses = []
+                                    for _r in range(_world):
+                                        with torch.no_grad():
+                                            _le = None
+                                            _stp = _graphed_steps[_r]
+                                            _cmp = _stp.compute
+                                            # re-run forward only (compute calls
+                                            # backward too); approximate by
+                                            # calling it and discarding grads
+                                            _le = _cmp()
+                                        _eager_losses.append(float(_le))
+                                    logger.info(
+                                        "[tune-ddp] template-cache probe eager losses: %s",
+                                        ["%.3e" % _v for _v in _eager_losses],
+                                    )
+                                except Exception as _eager_err:  # noqa: BLE001 - probe only
+                                    logger.warning("[tune-ddp] eager probe failed: %r", _eager_err)
                                 for _r in range(_world):
                                     _st_r = getattr(_graphed_steps[_r], "_ar_st", None) or {}
                                     _sums = _static_sums(_st_r)
