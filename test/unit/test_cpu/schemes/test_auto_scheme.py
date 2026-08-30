@@ -1593,3 +1593,50 @@ def test_serial_scoring_device_safe():
     assert (
         _weights_span_multiple_gpus([torch.device("cuda:0"), torch.device("cuda:1")]) is True
     )  # the unsafe case _serial_scoring_device_safe keys on
+
+
+class TestGroupSizeVariantPresets:
+    """W{3..7}A16G{32,64} presets: resolution, field values, AS pool usage."""
+
+    def test_all_variant_presets_resolve(self):
+        from auto_round.schemes import PRESET_SCHEMES, preset_name_to_scheme
+
+        for bits in (3, 4, 5, 6, 7):
+            for g in (64, 32):
+                name = f"W{bits}A16G{g}"
+                assert name in PRESET_SCHEMES
+                s = preset_name_to_scheme(name)
+                assert s.bits == bits
+                assert s.group_size == g
+                assert s.data_type == "int"
+                assert s.act_bits == 16
+                assert s.sym is True
+
+    def test_bare_presets_still_default_to_g128(self):
+        from auto_round.schemes import preset_name_to_scheme
+
+        for bits in (3, 4, 5, 6, 7):
+            assert preset_name_to_scheme(f"W{bits}A16").group_size == 128
+
+    def test_no_w8_group_variants(self):
+        """8-bit has no sub-group presets: asym is unrepresentable and sym sub-groups
+        carry only scale-storage overhead."""
+        from auto_round.schemes import PRESET_SCHEMES
+
+        assert "W8A16G64" not in PRESET_SCHEMES
+        assert "W8A16G32" not in PRESET_SCHEMES
+
+    def test_variants_are_distinct_schemes_for_dedup(self):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+
+        scheme = AutoScheme(options="W4A16,W4A16G64,W4A16G32", avg_bits=4.0)
+        assert len(scheme.options) == 3
+
+    def test_options_string_accepts_variants(self):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.schemes import QuantizationScheme, preset_name_to_scheme
+
+        scheme = AutoScheme(options="W3A16G64,W5A16G32", avg_bits=4.0)
+        resolved = [preset_name_to_scheme(o) for o in scheme.options]
+        assert all(isinstance(r, QuantizationScheme) for r in resolved)
+        assert [r.group_size for r in resolved] == [64, 32]

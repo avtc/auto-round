@@ -827,6 +827,24 @@ BF16 = QuantizationScheme.from_dict(
     }
 )
 
+# Group-size variants for the 3-7 bit int presets. The bare presets (W3A16..W7A16)
+# default to group_size 128; these finer-group variants allow per-layer group-size
+# selection via --scheme/layer_config and mixed-group AutoScheme pools, e.g.
+# options="W3A16,W4A16,W4A16G64,W4A16G32". 8-bit gets no variants: asymmetric 8-bit
+# is unrepresentable in int8-packed export formats (auto-pinned symmetric) and
+# symmetric sub-groups at 8 bits carry only scale-storage overhead.
+for _bits in (3, 4, 5, 6, 7):
+    for _g in (64, 32):
+        globals()[f"W{_bits}A16G{_g}"] = QuantizationScheme.from_dict(
+            {
+                "bits": _bits,
+                "sym": True,
+                "group_size": _g,
+                "data_type": "int",
+                "act_bits": 16,
+            }
+        )
+
 PRESET_SCHEMES = {
     "W4A16": W4A16,
     "W2A16": W2A16,
@@ -845,6 +863,7 @@ PRESET_SCHEMES = {
     "FPW8A16": FPW8A16,
     "W2A16G64": W2A16G64,
     "W2A16G32": W2A16G32,
+    **{f"W{_bits}A16G{_g}": globals()[f"W{_bits}A16G{_g}"] for _bits in (3, 4, 5, 6, 7) for _g in (64, 32)},
     "FP8_STATIC": FP8_STATIC,
     "BF16": BF16,
     "W4A16_MIXED": W4A16,
