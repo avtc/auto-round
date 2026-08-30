@@ -221,6 +221,22 @@ if TYPE_CHECKING:
 
 
 @register_pipeline_member(SignRoundConfig)
+def _addr_fingerprint(module):
+    """Addresses + checksums of the graph-read state (grids, imatrix, v params)."""
+    fp = {}
+    for name, m in module.named_modules():
+        wm = getattr(m, "weight_min", None)
+        if isinstance(wm, torch.Tensor):
+            fp[f"{name}.wmin"] = (wm.data_ptr(), float(wm.to(torch.float32).sum()))
+        im = getattr(m, "imatrix", None) or getattr(getattr(m, "orig_layer", None), "imatrix", None)
+        if isinstance(im, torch.Tensor):
+            fp[f"{name}.imat"] = (im.data_ptr(), float(im.to(torch.float32).sum()))
+        v = getattr(getattr(m, "params", {}), "get", lambda _k: None)("v")
+        if v is not None:
+            fp[f"{name}.v"] = (v.data_ptr(), float(v.to(torch.float32).sum()))
+    return fp
+
+
 class SignRoundQuantizer(BaseQuantizer):
 
     def __init__(self, config: SignRoundConfig) -> None:
@@ -687,6 +703,22 @@ class SignRoundQuantizer(BaseQuantizer):
                     if _tpl_entry is not None and len(_tpl_entry["replicas"]) != _plan.world:
                         _tpl_entry = None  # stale layout -- rebuild
                 if _tpl_entry is not None:
+                    if "ptrs" in _tpl_entry:
+                        for _r, _rep in enumerate(_tpl_entry["replicas"]):
+                            _old_fp, _new_fp = _tpl_entry["ptrs"][_r], _addr_fingerprint(_rep)
+                            for _k, _old in _old_fp.items():
+                                _new = _new_fp.get(_k)
+                                if _new is None or _old is None:
+                                    continue
+                                if _new[0] != _old[0]:
+                                    logger.warning(
+                                        "[tune-ddp] template cache: replica %d %s REBOUND between blocks "
+                                        "(ptr %s -> %s) -- the captured graph still reads the OLD address",
+                                        _r,
+                                        _k,
+                                        _old[0],
+                                        _new[0],
+                                    )
                     _tpl_home = _tpl_entry["replicas"][0]
                     for _rep in _tpl_entry["replicas"]:
                         sync_mirror_from_home(block, _rep)
@@ -720,6 +752,8 @@ class SignRoundQuantizer(BaseQuantizer):
                     )
                 for note in _plan.notes:
                     logger.info("[tune-ddp] %s", note)
+                with _bp_stage(_prof_bp, "sharded_anchor"):
+                    _shard_recipe_anchor(replica_group)
                 if _tpl_entry is not None:
                     _mods_h = dict(block.named_modules())
                     for _r, _mir in enumerate(replica_group.replicas[1:], start=1):
@@ -741,8 +775,6 @@ class SignRoundQuantizer(BaseQuantizer):
                                 _dh,
                                 _dm,
                             )
-                with _bp_stage(_prof_bp, "sharded_anchor"):
-                    _shard_recipe_anchor(replica_group)
                 logger.info(
                     "[tune-ddp] engaged: world=%d shard=%d devices=%s grad_transport=%s",
                     _plan.world,
@@ -1812,6 +1844,10 @@ class SignRoundQuantizer(BaseQuantizer):
                     _GRAPH_TEMPLATE_CACHE[_tpl_key] = {
                         "replicas": list(replica_group.replicas),
                         "steps": _steps,
+                        # address fingerprint: every tensor the captured graphs read
+                        # must still live at these addresses on a hit -- drift means
+                        # something REBOUND instead of refreshing in place
+                        "ptrs": [_addr_fingerprint(rep) for rep in replica_group.replicas],
                     }
                     while len(_GRAPH_TEMPLATE_CACHE) > template_cache_size():
                         _GRAPH_TEMPLATE_CACHE.popitem(last=False)
