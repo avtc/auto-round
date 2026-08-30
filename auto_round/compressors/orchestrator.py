@@ -2250,12 +2250,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                             block_name,
                             getattr(block, "_bg_ready_failed", ""),
                         )
+                    # non-streaming fallback: the block was loaded on the
+                    # quant device by the regular path
+                    load_device = str(self.device)
                     if streamer is not None:
                         if stage_devices:
                             # round-robin home: the block was staged here, quantize in place
                             load_device = stage_devices[stream_block_idx % len(stage_devices)]
-                        else:
-                            load_device = str(self.device)
                         streamer.load_module_(block, block_name, device=load_device)
                     materialize_model_(block)
                     strip_stale_device_hooks_(block)
