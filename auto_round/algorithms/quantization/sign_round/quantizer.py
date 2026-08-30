@@ -230,9 +230,9 @@ def _addr_fingerprint(module):
         im = getattr(m, "imatrix", None) or getattr(getattr(m, "orig_layer", None), "imatrix", None)
         if isinstance(im, torch.Tensor):
             fp[f"{name}.imat"] = (im.data_ptr(), float(im.to(torch.float32).sum()))
-        v = getattr(getattr(m, "params", {}), "get", lambda _k: None)("v")
+        v = getattr(getattr(m, "params", {}), "get", lambda _k: None)("value")
         if v is not None:
-            fp[f"{name}.v"] = (v.data_ptr(), float(v.to(torch.float32).sum()))
+            fp[f"{name}.value"] = (v.data_ptr(), float(v.to(torch.float32).sum()))
     return fp
 
 

@@ -2276,8 +2276,9 @@ def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> Non
         home_bufs = dict(home.named_buffers())
         for name, b in mirror.named_buffers():
             src = home_bufs.get(name)
-            if src is not None and src.shape == b.shape:
-                b.copy_(src)
+            if src is None or src.shape != b.shape or src.dtype != b.dtype:
+                raise RuntimeError(f"template drift at buffer {name!r} -- refusing to reuse the cached mirror")
+            b.copy_(src)
         # plain-tensor attrs the forward/anchor reads (imatrix feeds the
         # recipe init-search and the dq in-forward search; its storage is
         # baked into the cached graph) -- sync IN PLACE
@@ -2286,6 +2287,15 @@ def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> Non
             hm = home_mods.get(name)
             if hm is None:
                 continue
+            for attr in ("weight_min", "weight_max"):
+                # the quant grids MUST arrive with the fresh block: when the
+                # recipe anchor bails (no recipe / ineligible layout) nothing
+                # else refreshes them, and stale per-group grids from the
+                # PREVIOUS block would silently quantize this one
+                src = getattr(hm, attr, None)
+                dst = getattr(mm, attr, None)
+                if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor) and src.shape == dst.shape:
+                    dst.copy_(src)
             for attr in ("imatrix", "act_max"):
                 src = getattr(hm, attr, None)
                 dst = getattr(mm, attr, None)
@@ -2313,6 +2323,26 @@ def _shell_bind_home(cached_home: torch.nn.Module, block: torch.nn.Module) -> No
     storages, so an eviction that drops the entry cannot dangle a live shell.
     """
     cached_mods = dict(cached_home.named_modules())
+    cached_params = dict(cached_home.named_parameters())
+    cached_bufs = dict(cached_home.named_buffers())
+    # validate EVERYTHING first: drift must raise before any mutation, or a
+    # partially rebound block (some params views, some not) is left behind
+    for name, p in block.named_parameters():
+        src = cached_params.get(name)
+        if src is None or src.shape != p.shape or src.dtype != p.dtype:
+            raise RuntimeError(f"template drift at parameter {name!r} -- refusing to shell-bind the block")
+    for name, b in block.named_buffers():
+        src = cached_bufs.get(name)
+        if src is None or src.shape != b.shape or src.dtype != b.dtype:
+            raise RuntimeError(f"template drift at buffer {name!r} -- refusing to shell-bind the block")
+    for name, dm in block.named_modules():
+        cm = cached_mods.get(name)
+        if cm is None:
+            continue
+        for attr in ("weight_min", "weight_max", "imatrix", "act_max"):
+            src_t, dst_t = getattr(cm, attr, None), getattr(dm, attr, None)
+            if isinstance(src_t, torch.Tensor) and isinstance(dst_t, torch.Tensor) and src_t.shape != dst_t.shape:
+                raise RuntimeError(f"template drift at {name!r}.{attr} -- refusing to shell-bind the block")
     with torch.no_grad():
         for name, dm in block.named_modules():
             cm = cached_mods.get(name)
@@ -2323,17 +2353,10 @@ def _shell_bind_home(cached_home: torch.nn.Module, block: torch.nn.Module) -> No
             # block must match so _parameters enumeration agrees downstream
             if getattr(cm, "_tune_recipe_frozen_margins", False) and hasattr(dm, "_pin_margins_frozen"):
                 dm._pin_margins_frozen()
-        cached_params = dict(cached_home.named_parameters())
         for name, p in block.named_parameters():
-            src = cached_params.get(name)
-            if src is None or src.shape != p.shape or src.dtype != p.dtype:
-                raise RuntimeError(f"template drift at parameter {name!r} -- refusing to shell-bind the block")
-            p.data = src.data  # view: same storage, Parameter object (and wrapper dicts) untouched
-        cached_bufs = dict(cached_home.named_buffers())
+            p.data = cached_params[name].data  # view: storage shared, Parameter object untouched
         for name, b in block.named_buffers():
-            src = cached_bufs.get(name)
-            if src is not None and src.shape == b.shape:
-                b.data = src.data
+            b.data = cached_bufs[name].data
         for name, dm in block.named_modules():
             cm = cached_mods.get(name)
             if cm is None:
@@ -2342,8 +2365,6 @@ def _shell_bind_home(cached_home: torch.nn.Module, block: torch.nn.Module) -> No
             for attr in ("weight_min", "weight_max", "imatrix", "act_max"):
                 src_t, dst_t = getattr(cm, attr, None), getattr(dm, attr, None)
                 if isinstance(src_t, torch.Tensor) and isinstance(dst_t, torch.Tensor):
-                    if src_t.shape != dst_t.shape:
-                        raise RuntimeError(f"template drift at {name!r}.{attr} -- refusing to shell-bind the block")
                     setattr(dm, attr, src_t)
             if getattr(cm, "_tune_recipe", None) is not None:
                 dm._tune_recipe = cm._tune_recipe

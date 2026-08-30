@@ -2835,3 +2835,78 @@ class TestShellBindHome:
             assert "template drift" in str(e)
         else:
             raise AssertionError("expected RuntimeError on grid shape drift")
+
+    def test_buffer_binding_and_dtype_drift(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        cached.register_buffer("persist", torch.zeros(3))
+        real.register_buffer("persist", torch.zeros(3))
+        _shell_bind_home(cached, real)
+        assert real.persist.data_ptr() == cached.persist.data_ptr()
+        cached2, real2 = self._pair()
+        cached2.register_buffer("persist", torch.zeros(3, dtype=torch.float64))
+        real2.register_buffer("persist", torch.zeros(3))
+        import pytest
+
+        with pytest.raises(RuntimeError, match="template drift at buffer"):
+            _shell_bind_home(cached2, real2)
+
+    def test_param_drift_raises_before_any_mutation(self):
+        import pytest
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        cached[1].weight = torch.nn.Parameter(torch.randn(4, 5))  # drift on the SECOND module
+        ptr0 = real[0].weight.data_ptr()
+        with pytest.raises(RuntimeError, match="template drift at parameter"):
+            _shell_bind_home(cached, real)
+        # atomic: nothing was rebound before the raise
+        assert real[0].weight.data_ptr() == ptr0
+
+    def test_requires_grad_and_grad_state_preserved(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        real[0].weight.requires_grad_(True)
+        real[0].weight.grad = torch.zeros_like(real[0].weight)
+        _shell_bind_home(cached, real)
+        assert real[0].weight.requires_grad  # leaf flag/grad-mode survive the view rebind
+        assert real[0].weight.grad is not None and real[0].weight.grad.data_ptr() != real[0].weight.data_ptr()
+
+    def test_pin_not_propagated_when_cached_not_frozen(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        pins = []
+
+        def _pin(module=real[0]):
+            pins.append(module)
+
+        real[0]._pin_margins_frozen = _pin
+        _shell_bind_home(cached, real)  # cached has no _tune_recipe_frozen_margins
+        assert pins == []
+
+    def test_sync_mirror_refreshes_grids_in_place(self):
+        """Regression: on a hit the quant grids MUST travel with the fresh
+        block -- when the recipe anchor bails (no recipe / ineligible layout)
+        nothing else refreshes them, and the previous block's grids would
+        silently quantize this one."""
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sync_mirror_from_home
+
+        home, mirror = self._pair(11, 22)
+        p_wmin = mirror[0].weight_min.data_ptr()
+        sync_mirror_from_home(home, mirror)
+        assert torch.equal(mirror[0].weight_min, home[0].weight_min)
+        assert torch.equal(mirror[0].weight_max, home[0].weight_max)
+        assert mirror[0].weight_min.data_ptr() == p_wmin  # in place: graph addresses stable

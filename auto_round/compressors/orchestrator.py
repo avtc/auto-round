@@ -2250,9 +2250,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                             block_name,
                             getattr(block, "_bg_ready_failed", ""),
                         )
-                    # non-streaming fallback: the block was loaded on the
-                    # quant device by the regular path
-                    load_device = str(self.device)
+                    # non-streaming fallback: keep the block on whatever device
+                    # it was loaded on (device_map blocks may live off the primary)
+                    _p0 = next(block.parameters(), None)
+                    load_device = str(_p0.device) if _p0 is not None and _p0.device.type != "meta" else str(self.device)
                     if streamer is not None:
                         if stage_devices:
                             # round-robin home: the block was staged here, quantize in place
