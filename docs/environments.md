@@ -370,6 +370,7 @@ export AR_TUNE_PREPARE_FENCE_FREE=0   # legacy gather (device-indices tensor, pa
 ```
 
 ### AR_TUNE_EXCH_OVERLAP
+| `AR_TUNE_BG_PACK` | Background pack pipeline mode for finished blocks: `auto` (default) engages only with >=2 DDP device groups (with a single device group or serial streaming the pack shares the tune loop's devices, so the tail runs foreground); `1` restores the legacy behavior (eligible whenever hard prerequisites hold); `0` disables entirely | auto |
 - **Description**: Overlap the DDP gradient exchange with the backward tail. Tuning-param gradients are split into ~12 buckets; as each bucket's backward completes (post-accumulate-grad hooks fire during eager backward or graph replay), a SINGLE exchange thread ships that bucket through the sign-cast exchange (reduce-scatter mean + int8 sign all-gather) on the recording streams, instead of one monolithic allreduce after the whole backward drains. Bit-identical per element (each element's halving tree is unchanged by bucketing); any exchange error halts. Applies to the pure sign-SGD path with fp32/bf16 transport and EAGER backward only (post-accumulate-grad hooks -- the completion signal -- do not fire on CUDA-graph replay, so with AR_TUNE_CUDA_GRAPHS=1 the monolithic exchange runs instead). A stalled bucket aborts with a diagnostic after a bounded timeout.
 - **Default**: `1`
 - **Valid Values**: `1`, `0`

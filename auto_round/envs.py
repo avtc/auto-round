@@ -282,7 +282,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block's tune on the other group. Eligibility still requires >=2 staging
     # groups + streaming + immediate packing; exactly one pipeline thread
     # runs at a time. Set to 1 to opt out.
-    "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
+    "AR_TUNE_BG_PACK": lambda: os.getenv("AR_TUNE_BG_PACK", "auto").lower(),
     # Overlapped gradient exchange (default ON when eligible): per-parameter
     # qoff (FP-reference-chain) tuning unblocker: inject per-channel
     # quantization noise into the FP block inputs during SignRound tuning.

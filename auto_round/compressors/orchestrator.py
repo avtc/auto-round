@@ -1783,7 +1783,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             raise RuntimeError(
                 f"background pack pipeline for a block failed ({exc!r}); refusing to continue -- "
                 "the checkpoint would silently miss packed tensors. Fix the underlying failure "
-                "or set AR_DISABLE_BG_PACK=1."
+                "or set AR_TUNE_BG_PACK=0."
             ) from exc
 
     @staticmethod
@@ -2167,21 +2167,29 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         _bg_thread = None
 
-        # ── Background pack pipeline (default ON; AR_DISABLE_BG_PACK opts out)
+        # ── Background pack pipeline (AR_TUNE_BG_PACK: auto default)
         # The finished block's immediate-pack + shard-write tail runs in a
         # background thread on its (now idle) ping-pong home while the loop
-        # advances to the next block's tune on the other group. Eligible only
-        # with >=2 staging groups (the finished block must stay GPU-resident
-        # on a group nobody else needs) and immediate packing; exactly one
-        # pipeline thread runs at a time (the loop joins the previous one
-        # before spawning the next, ordering shard writes and serializing the
-        # lock-free ShardWriter behind a single writer at any moment).
+        # advances to the next block's tune on the other group. Hard
+        # prerequisites: streamer, >=2 staging device groups (the finished
+        # block must stay GPU-resident on a group nobody else needs), and
+        # immediate packing; exactly one pipeline thread runs at a time (the
+        # loop joins the previous one before spawning the next, ordering
+        # shard writes and serializing the lock-free ShardWriter behind a
+        # single writer at any moment).
+        # AR_TUNE_BG_PACK=auto: only with >=2 DDP device groups -- with a
+        # single device group (one DDP world covering every staging GPU) or
+        # serial streaming the pack shares the devices the tune loop is
+        # using, so the tail runs foreground instead. "1" forces the legacy
+        # behavior (eligible whenever the hard prerequisites hold), "0"
+        # disables the pipeline entirely.
+        _bg_pack_mode = envs.AR_TUNE_BG_PACK
         _bg_pack_eligible = bool(
             streamer is not None
             and stage_devices
             and len(stage_devices) >= 2
             and self.compress_context.is_immediate_packing
-            and not envs.AR_DISABLE_BG_PACK
+            and (_bg_pack_mode in ("1", "true", "yes", "on") or (_bg_pack_mode == "auto" and _ddp_world > 1))
         )
         _bg_pack = None
 

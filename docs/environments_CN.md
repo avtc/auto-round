@@ -370,6 +370,7 @@ export AR_TUNE_PREPARE_FENCE_FREE=0   # 旧收集路径（设备索引张量、�
 ```
 
 ### AR_TUNE_EXCH_OVERLAP
+| `AR_TUNE_BG_PACK` | 已完成块的后台打包流水线模式：`auto`（默认）仅在 >=2 个 DDP 设备组时启用（单设备组 DDP 与串行流式下打包与调优循环共享设备，改为前台执行）；`1` 恢复旧行为（满足硬性条件即启用）；`0` 完全禁用 | auto |
 - **描述**： 将 DDP 梯度交换与反向传播尾部重叠。调优参数梯度被切分为约 12 个桶；每个桶的反向完成时（post-accumulate-grad 钩子在 eager 反向或图回放期间触发），由单一的交换线程在记录流上立即执行该桶的 sign-cast 交换（reduce-scather 均值 + int8 符号 all-gather），取代整个反向排空后的单次整体 allreduce。逐元素位一致（分桶不改变每个元素的折半树）；任何交换错误都会使运行停止。仅适用于纯 sign-SGD、fp32/bf16 传输且 EAGER 反向的路径（作为完成信号的 post-accumulate-grad 钩子不会在 CUDA 图回放时触发，因此 AR_TUNE_CUDA_GRAPHS=1 时自动回退整体交换）。桶停滞时会在有界超时后带诊断信息中止。
 - **默认值**: `1`
 - **有效值**: `1`, `0`

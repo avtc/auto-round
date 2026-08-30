@@ -58,13 +58,15 @@ class _RS:
 
 
 class TestBgPackEnv:
-    def test_default_on_and_opt_out(self, monkeypatch):
+    def test_mode_default_and_overrides(self, monkeypatch):
         from auto_round import envs
 
-        monkeypatch.delenv("AR_DISABLE_BG_PACK", raising=False)
-        assert envs.AR_DISABLE_BG_PACK is False
-        monkeypatch.setenv("AR_DISABLE_BG_PACK", "1")
-        assert envs.AR_DISABLE_BG_PACK is True
+        monkeypatch.delenv("AR_TUNE_BG_PACK", raising=False)
+        assert envs.AR_TUNE_BG_PACK == "auto"
+        monkeypatch.setenv("AR_TUNE_BG_PACK", "0")
+        assert envs.AR_TUNE_BG_PACK == "0"
+        monkeypatch.setenv("AR_TUNE_BG_PACK", "1")
+        assert envs.AR_TUNE_BG_PACK == "1"
 
 
 class TestBgPackWorker:
