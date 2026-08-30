@@ -437,12 +437,12 @@ export AR_TUNE_GRAPH_TEMPLATE_CACHE=3   # 三模板模型
 ```
 
 ### AR_TUNE_TEMPLATE_RECAPTURE
-- **描述**： 图模板缓存命中时，在采用的 replica 集合上重新捕获全新的 CUDA graph，而不是 replay 缓存的图。采用的 replica 本身已被证明正确（同一批模块的 eager 执行产生正确 loss），但缓存的图跨 block replay 出错误结果（状态与地址均验证为新鲜）。重新捕获保留镜像/暂存集合的复用（数秒的构建与 `ddp_setup`）以及图池稳定性，代价是每个命中块一次捕获（约 1-3 秒）。`0` 表示 replay 缓存图（仅用于排查）。
-- **默认值**: `1`
-- **有效值**: `0`/`false`/`no` 关闭，其他值开启
+- **描述**： 图模板缓存命中时，在采用的 replica 集合上重新捕获全新的 CUDA graph，而不是 replay 缓存的图。历史上的过期 replay 问题已根因定位并修复（frozen-recipe 的 margin 固定操作过去会在每次重新锚定时孤儿化缓存图所绑定的存储，现在已改为原地固定），因此缓存的图 replay 结果正确，默认值 `0` 保留它们——命中时完全跳过预热与捕获，也不会新增图池。`1` 作为调试回退方案，每个命中块重新捕获（约 1-3 秒，外加一套新的图池）。
+- **默认值**: `0`
+- **有效值**: `1`/`true`/`yes` 开启，其他值关闭
 
 ```bash
-export AR_TUNE_TEMPLATE_RECAPTURE=0   # replay 缓存图（已知有问题，仅调试用）
+export AR_TUNE_TEMPLATE_RECAPTURE=1   # 调试回退：每个命中块重新捕获
 ```
 
 ### AR_RESUME_DIR

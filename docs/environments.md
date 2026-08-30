@@ -437,12 +437,12 @@ export AR_TUNE_GRAPH_TEMPLATE_CACHE=3   # three-template model
 ```
 
 ### AR_TUNE_TEMPLATE_RECAPTURE
-- **Description**: On graph template-cache hits, re-capture fresh CUDA graphs over the adopted replica set instead of replaying the cached ones. The adopted replicas themselves are proven correct (eager execution of the same modules produces correct losses), but the cached graphs replay stale results across blocks despite verified-fresh state and stable addresses. Re-capturing keeps the reuse of mirrors/staging (the multi-second build and `ddp_setup`) and the graph-pool stability, at the cost of one capture (~1-3 s) per hit block. `0` replays the cached graphs (investigation only).
-- **Default**: `1`
-- **Valid Values**: `0`/`false`/`no` to disable, anything else enables
+- **Description**: On graph template-cache hits, re-capture fresh CUDA graphs over the adopted replica set instead of replaying the cached ones. The historical stale-replay breakage is root-caused and fixed (the frozen-recipe margin pin used to orphan the storage the cached graphs had baked in at every re-anchor; it now pins in place), so cached graphs replay correct results and the default `0` keeps them -- hits skip warmup and capture entirely and add no new graph-pool set. `1` re-captures per hit as a debugging fallback (~1-3 s plus a fresh graph-pool set per hit).
+- **Default**: `0`
+- **Valid Values**: `1`/`true`/`yes` to enable, anything else disables
 
 ```bash
-export AR_TUNE_TEMPLATE_RECAPTURE=0   # replay cached graphs (broken; debugging only)
+export AR_TUNE_TEMPLATE_RECAPTURE=1   # debugging fallback: re-capture per hit
 ```
 
 ### AR_RESUME_DIR

@@ -755,10 +755,10 @@ class SignRoundQuantizer(BaseQuantizer):
                         "(captured graphs kept)",
                         len(_tpl_entry["replicas"]),
                     )
-                    if bool(getattr(_envs, "AR_TUNE_TEMPLATE_RECAPTURE", True)):
+                    if bool(getattr(_envs, "AR_TUNE_TEMPLATE_RECAPTURE", False)):
                         logger.info(
                             "[tune-ddp] template cache: re-capturing graphs on the adopted replica set "
-                            "(cached graphs replay stale results)"
+                            "(AR_TUNE_TEMPLATE_RECAPTURE=1 debugging fallback; cached replays are correct)"
                         )
                 else:
                     # miss: a DEDICATED home staging copy (the real block is
@@ -1112,7 +1112,7 @@ class SignRoundQuantizer(BaseQuantizer):
         if _graphs_active and _graphed_steps is None:
             # built BEFORE the ddp warm-up pass: the warm-up backward must run
             # on the steps' capture streams (see the warm-up site)
-            _tpl_recapture = _tpl_entry is not None and bool(getattr(_envs, "AR_TUNE_TEMPLATE_RECAPTURE", True))
+            _tpl_recapture = _tpl_entry is not None and bool(getattr(_envs, "AR_TUNE_TEMPLATE_RECAPTURE", False))
             _graphed_steps = [
                 _make_graphed_step(
                     r, step=(_tpl_entry["steps"][r] if _tpl_entry is not None and not _tpl_recapture else None)
