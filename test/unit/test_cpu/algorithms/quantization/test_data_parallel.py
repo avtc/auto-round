@@ -25,15 +25,15 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     GraphedReplicaStep,
     ReplicaGroup,
     ReplicaThreadPool,
-    _copy_into_static,
+    SharedHandle,
     _AsyncBestTracker,
+    _copy_into_static,
     _param_grad_buffers,
     _write_back_grads,
     halving_doubling_allreduce,
     resolve_ddp_plan,
     run_threaded_spawn,
     sign_exchange_allreduce,
-    SharedHandle,
 )
 
 
@@ -1939,6 +1939,7 @@ class TestMakeSerialGraphedStep:
 
     def test_factory_capture_with_fake_graph(self):
         import contextlib
+
         import torch
 
         from auto_round.algorithms.block_runner import BlockForwardRunner
@@ -2124,6 +2125,7 @@ class TestSerialWholeIterationStep:
 
     def test_capture_with_step_fn_fake_graph(self):
         import contextlib
+
         import torch
 
         from auto_round.algorithms.block_runner import BlockForwardRunner
@@ -2366,7 +2368,6 @@ class TestSignStepForeach:
         import torch
 
         from auto_round.algorithms.quantization.sign_round.data_parallel import _sign_step_foreach
-
         from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
 
         lin = torch.nn.Linear(3, 3)
@@ -2546,6 +2547,7 @@ class TestMirrorTemplateCache:
 
     def test_step_rebinding_keeps_graph_and_st(self):
         import contextlib
+
         import torch
 
         from auto_round.algorithms.quantization.sign_round.data_parallel import GraphedReplicaStep
@@ -2610,6 +2612,7 @@ class TestMirrorTemplateCache:
     def test_two_block_composition_reuse_flow(self):
         """Block A capture -> cache -> block B hit: sync + rebind + replay-only."""
         import contextlib
+
         import torch
 
         import auto_round.algorithms.quantization.sign_round.data_parallel as dp
@@ -2703,3 +2706,132 @@ class TestMirrorTemplateCache:
         entry = {"replicas": [self._block(), self._block()], "steps": [step, step]}
         assert entry["replicas"][0] is not None and len(entry["steps"]) == 2
         assert entry["steps"][0] is step and step._ar_st is st
+
+
+class TestShellBindHome:
+    """T12: inverted-ownership staging -- the real block becomes a shell.
+
+    After the cached home set is value-refreshed, the real block's tensors are
+    rebound as views of the cached storages: the duplicate set on the home GPU
+    disappears during tune, and downstream readers (unwrapper/pack/refit) walk
+    views that hold the tuned values by construction -- no sync-back pass.
+    """
+
+    def _pair(self, seed_real=0, seed_cached=1, hidden=5):
+        import torch
+
+        def mk(seed):
+            torch.manual_seed(seed)
+            block = torch.nn.Sequential(torch.nn.Linear(hidden, hidden), torch.nn.Linear(hidden, 3))
+            block.params = {"seq.0.weight": block[0].weight, "seq.1.weight": block[1].weight}
+            block[0].weight_min = torch.randn(hidden, 1)
+            block[0].weight_max = torch.randn(hidden, 1)
+            block[0].imatrix = torch.rand(hidden, 1)
+            return block
+
+        return mk(seed_real), mk(seed_cached)
+
+    def test_shell_bind_shares_storages(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        _shell_bind_home(cached, real)
+        cp = dict(cached.named_parameters())
+        for name, p in real.named_parameters():
+            assert p.data_ptr() == cp[name].data_ptr(), name
+        # wrapper dict keeps the SAME Parameter objects, now viewing cached storages
+        assert real.params["seq.0.weight"] is real[0].weight
+        assert real.params["seq.0.weight"].data_ptr() == cached.params["seq.0.weight"].data_ptr()
+        # plain-tensor grid/imatrix attrs are bound by reference
+        assert real[0].weight_min is cached[0].weight_min
+        assert real[0].weight_max is cached[0].weight_max
+        assert real[0].imatrix is cached[0].imatrix
+
+    def test_values_flow_through_views(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        _shell_bind_home(cached, real)
+        with torch.no_grad():
+            cached[0].weight.add_(1.0)
+            cached[0].weight_min.mul_(2.0)
+        assert torch.equal(real[0].weight, cached[0].weight)
+        assert torch.equal(real[0].weight_min, cached[0].weight_min)
+        # and the reverse direction: the unwrapper writes best values through
+        # the shell into the cached storages
+        with torch.no_grad():
+            real[0].weight.mul_(3.0)
+        assert torch.equal(cached[0].weight, real[0].weight)
+
+    def test_unwrap_write_through(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        _shell_bind_home(cached, real)
+        best_v = torch.full_like(real.params["seq.0.weight"], 0.5)
+        with torch.no_grad():
+            real.params["seq.0.weight"].data.copy_(best_v)  # unwrapper-style best write
+        assert torch.equal(cached.params["seq.0.weight"].data, best_v)
+
+    def test_refcount_survives_cache_drop(self):
+        import gc
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        _shell_bind_home(cached, real)
+        snap = (real[0].weight.clone(), real[0].weight_min.clone())
+        del cached
+        gc.collect()
+        # views keep the storages alive: an eviction that drops the entry
+        # cannot dangle a live shell
+        assert torch.equal(real[0].weight, snap[0])
+        assert torch.equal(real[0].weight_min, snap[1])
+
+    def test_frozen_margin_layout_parity(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair()
+        pins = []
+        for m in (real[0], real[1]):
+
+            def _pin(module=m):
+                pins.append(module)
+                for key in ("min_scale", "max_scale"):
+                    module._parameters.pop(key, None)
+                    setattr(module, key, torch.tensor(1.0))
+
+            m._pin_margins_frozen = _pin
+        cached[0]._tune_recipe_frozen_margins = True
+        cached[0]._tune_recipe = "recipe-x"
+        cached[0]._recipe_anchor_deferred = False
+        _shell_bind_home(cached, real)
+        assert real[0] in pins  # pin ran BEFORE the bind (layout parity)
+        assert "min_scale" not in dict(real[0].named_parameters())
+        assert real[0]._tune_recipe == "recipe-x"
+        assert real[0]._tune_recipe_frozen_margins is True
+        assert real[0]._recipe_anchor_deferred is False
+
+    def test_shape_drift_refuses(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+        real, cached = self._pair(seed_real=0, seed_cached=1, hidden=5)
+        cached[0].weight_min = torch.randn(9, 1)  # template drift on a grid
+        try:
+            _shell_bind_home(cached, real)
+        except RuntimeError as e:
+            assert "template drift" in str(e)
+        else:
+            raise AssertionError("expected RuntimeError on grid shape drift")

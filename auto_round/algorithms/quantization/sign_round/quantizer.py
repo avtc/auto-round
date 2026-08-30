@@ -786,6 +786,18 @@ class SignRoundQuantizer(BaseQuantizer):
                                 _dh,
                                 _dm,
                             )
+                if _tpl_home is not None and _tpl_home is not block:
+                    # T12 inverted ownership: the cached home set holds this
+                    # block's fresh values (deepcopy build on a miss, sync on a
+                    # hit) and the anchor pinned its grids -- rebind the real
+                    # block as a shell of views. Its own storages free (~2 GB on
+                    # the home GPU) and every downstream reader (unwrapper/
+                    # pack/refit) walks the tuned state directly: no loop-end
+                    # copy-back pass.
+                    from auto_round.algorithms.quantization.sign_round.data_parallel import _shell_bind_home
+
+                    _shell_bind_home(_tpl_home, block)
+                    logger.info("[tune-ddp] shell-bound the real block to the persistent home staging set")
                 logger.info(
                     "[tune-ddp] engaged: world=%d shard=%d devices=%s grad_transport=%s",
                     _plan.world,
@@ -1850,13 +1862,9 @@ class SignRoundQuantizer(BaseQuantizer):
                 "(background pack/transform threads stayed busy through the tune window); it ran eager"
             )
         if replica_group is not None:
-            if _tpl_home is not None and _tpl_home is not block:
-                # copy the TUNED end state back: downstream readers (unwrapper/
-                # pack/refit) walk the real block -- grids, frozen-pin layout,
-                # flags and all (a plain value sync leaves unanchored grids)
-                from auto_round.algorithms.quantization.sign_round.data_parallel import sync_tuned_state_back
-
-                sync_tuned_state_back(_tpl_home, block)
+            # (T12) the real block is shell-bound to the persistent home
+            # staging set -- unwrapper/pack/refit read the tuned state through
+            # views; no copy-back pass is needed or correct here
             try:
                 from auto_round.algorithms.quantization.sign_round.data_parallel import (
                     _GRAPH_TEMPLATE_CACHE,

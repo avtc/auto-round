@@ -2255,42 +2255,6 @@ def sync_module_values(src: torch.nn.Module, dst: torch.nn.Module) -> None:
     sync_mirror_from_home(src, dst)
 
 
-def sync_tuned_state_back(staging: torch.nn.Module, block: torch.nn.Module) -> None:
-    """Copy the TUNED end state of the home staging replica into the real block.
-
-    The recipe anchor ran on the STAGING set only -- the real block's wrappers
-    still carry unanchored grids and pending flags, and frozen-margin recipes
-    pinned (unregistered) their min/max params on staging while the real block
-    still has them registered. Downstream readers (unwrapper/pack/refit) walk
-    the REAL block, so: pin frozen margins on it exactly like staging did
-    (making the parameter layouts match), sync parameter/buffer/imatrix
-    values, copy the anchored weight_min/max grids IN PLACE, and copy the
-    recipe flags (clearing the pending-anchor marker).
-    """
-    st_mods = dict(staging.named_modules())
-    with torch.no_grad():
-        for name, dm in block.named_modules():
-            sm = st_mods.get(name)
-            if sm is None:
-                continue
-            if getattr(sm, "_tune_recipe_frozen_margins", False) and hasattr(dm, "_pin_margins_frozen"):
-                dm._pin_margins_frozen()  # match staging's unregistered layout BEFORE the value sync
-        sync_mirror_from_home(staging, block)
-        for name, dm in block.named_modules():
-            sm = st_mods.get(name)
-            if sm is None or not hasattr(dm, "weight_min"):
-                continue
-            for attr in ("weight_min", "weight_max"):
-                src_t, dst_t = getattr(sm, attr, None), getattr(dm, attr, None)
-                if isinstance(src_t, torch.Tensor) and isinstance(dst_t, torch.Tensor) and src_t.shape == dst_t.shape:
-                    dst_t.copy_(src_t.to(dst_t.device, dst_t.dtype))
-            if getattr(sm, "_tune_recipe", None) is not None:
-                dm._tune_recipe = sm._tune_recipe
-            if getattr(sm, "_tune_recipe_frozen_margins", False):
-                dm._tune_recipe_frozen_margins = True
-            dm._recipe_anchor_deferred = False  # grids arrived via the tuned staging copy
-
-
 def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> None:
     """Copy a new block's state into a persistent mirror (template hit).
 
@@ -2331,6 +2295,61 @@ def sync_mirror_from_home(home: torch.nn.Module, mirror: torch.nn.Module) -> Non
             # or the sharded anchor no-ops and stale grids get broadcast
             if getattr(hm, "_recipe_anchor_deferred", False):
                 mm._recipe_anchor_deferred = True
+
+
+def _shell_bind_home(cached_home: torch.nn.Module, block: torch.nn.Module) -> None:
+    """Rebind the REAL block's tensors as views of the cached home set (T12).
+
+    Inverted ownership: the cached home set owns the persistent storages the
+    captured graphs read; the real block becomes a zero-storage shell. After
+    the cached set is value-refreshed from the fresh block (sync_mirror_from_home
+    on a hit, deepcopy on a miss), every downstream reader (unwrapper/pack/
+    refit) that walks the REAL block sees the tuned values through views by
+    construction -- the loop-end sync-back pass disappears, and the duplicate
+    set on the home GPU (~2 GB on 27B-class blocks) is freed at rebind.
+
+    Rebinding is safe HERE because the real block carries no captured graphs
+    (they live on the cached replicas); views hold references to their
+    storages, so an eviction that drops the entry cannot dangle a live shell.
+    """
+    cached_mods = dict(cached_home.named_modules())
+    with torch.no_grad():
+        for name, dm in block.named_modules():
+            cm = cached_mods.get(name)
+            if cm is None:
+                continue
+            # frozen-margin layout parity BEFORE binding: the cached set
+            # unregistered its min/max params during the anchor -- the real
+            # block must match so _parameters enumeration agrees downstream
+            if getattr(cm, "_tune_recipe_frozen_margins", False) and hasattr(dm, "_pin_margins_frozen"):
+                dm._pin_margins_frozen()
+        cached_params = dict(cached_home.named_parameters())
+        for name, p in block.named_parameters():
+            src = cached_params.get(name)
+            if src is None or src.shape != p.shape or src.dtype != p.dtype:
+                raise RuntimeError(f"template drift at parameter {name!r} -- refusing to shell-bind the block")
+            p.data = src.data  # view: same storage, Parameter object (and wrapper dicts) untouched
+        cached_bufs = dict(cached_home.named_buffers())
+        for name, b in block.named_buffers():
+            src = cached_bufs.get(name)
+            if src is not None and src.shape == b.shape:
+                b.data = src.data
+        for name, dm in block.named_modules():
+            cm = cached_mods.get(name)
+            if cm is None:
+                continue
+            # plain-tensor attrs the anchor/unwrapper/pack read -- bind by reference
+            for attr in ("weight_min", "weight_max", "imatrix", "act_max"):
+                src_t, dst_t = getattr(cm, attr, None), getattr(dm, attr, None)
+                if isinstance(src_t, torch.Tensor) and isinstance(dst_t, torch.Tensor):
+                    if src_t.shape != dst_t.shape:
+                        raise RuntimeError(f"template drift at {name!r}.{attr} -- refusing to shell-bind the block")
+                    setattr(dm, attr, src_t)
+            if getattr(cm, "_tune_recipe", None) is not None:
+                dm._tune_recipe = cm._tune_recipe
+            if getattr(cm, "_tune_recipe_frozen_margins", False):
+                dm._tune_recipe_frozen_margins = True
+            dm._recipe_anchor_deferred = False  # grids arrive via the views
 
 
 def evict_template_cache_for_free(min_free_bytes: int, devices=None) -> None:
