@@ -685,7 +685,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 _tpl_entry = None
                 _tpl_key = None
                 _tpl_home = None  # persistent HOME staging replica (template cache)
-                if template_cache_size() > 0:
+                if bool(_envs.AR_TUNE_CUDA_GRAPHS) and template_cache_size() > 0:
                     _tpl_key = _template_signature(
                         block,
                         _plan.world,
@@ -744,7 +744,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     # Cached OTHER-template entries stay resident during this
                     # build -- evict LRU until the fresh replica set + graph
                     # pools fit (a second template on 24 GB cards OOMs).
-                    if template_cache_size() > 0:
+                    if bool(_envs.AR_TUNE_CUDA_GRAPHS) and template_cache_size() > 0:
                         from auto_round.algorithms.quantization.sign_round.data_parallel import (
                             evict_template_cache_for_free,
                         )
