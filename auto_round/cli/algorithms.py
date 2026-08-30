@@ -391,6 +391,9 @@ class RTN(AlgorithmHandler):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
         asym_search = "neuqi" if getattr(args, "enable_neuqi", False) else "auto"
+        from auto_round.data_type.utils import maybe_default_tune_recipe
+
+        maybe_default_tune_recipe(asym_search, getattr(args, "iters", 0))
         cfg = RTNConfig(
             disable_opt_rtn=getattr(args, "disable_opt_rtn", None),
             asym_search=asym_search,

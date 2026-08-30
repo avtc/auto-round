@@ -272,6 +272,21 @@ class BaseOrchestrator(object):
 
             self.quantize_config = _RTNConfig()
             self._alg_configs.append(self.quantize_config)
+        # --enable_neuqi + iters>0: default AR_TUNE_RECIPE so the NeUQI init
+        # reaches SignRound tuning through the recipe anchor (env is the
+        # channel every consumer -- wrapper anchor, guards, template cache
+        # signature -- reads). CLI runs get this in build_configs; this covers
+        # API-constructed configs.
+        _asym = next(
+            (getattr(c, "asym_search", None) for c in self._alg_configs if getattr(c, "asym_search", None)), None
+        )
+        _iters = next(
+            (getattr(c, "iters", None) for c in self._alg_configs if getattr(c, "iters", None) is not None), None
+        )
+        if _asym is not None or _iters is not None:
+            from auto_round.data_type.utils import maybe_default_tune_recipe
+
+            maybe_default_tune_recipe(_asym, _iters)
         for _cfg in self._alg_configs:
             if isinstance(_cfg, BaseRotationConfig):
                 if hasattr(_cfg, "block_size") and _cfg.block_size is None:

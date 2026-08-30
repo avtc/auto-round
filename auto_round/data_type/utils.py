@@ -135,6 +135,35 @@ def recipe_applies_to_layer(recipe, sym):
     return True
 
 
+def maybe_default_tune_recipe(asym_search, iters):
+    """--enable_neuqi on the SignRound tuning path defaults AR_TUNE_RECIPE.
+
+    The NeUQI joint search reaches tuning only through the recipe anchor
+    (the wrapper's init grid); ``asym_search="neuqi"`` alone is a zero-shot
+    switch. When the user enabled NeUQI and runs iters>0 without an explicit
+    recipe, default to ``neuqi_frozen_qon`` so the flag keeps meaning "use the
+    NeUQI search wherever it applies" (asym layers only -- mixed pools skip
+    sym layers per ``recipe_applies_to_layer``). Materializes the default in
+    the environment because every consumer (wrapper anchor, guards, template
+    cache signature) reads ``AR_TUNE_RECIPE`` from there.
+
+    Returns the defaulted recipe name, or None when no default was applied.
+    """
+    import os
+
+    if asym_search != "neuqi" or not iters or iters <= 0:
+        return None
+    if os.environ.get("AR_TUNE_RECIPE"):
+        return None
+    os.environ["AR_TUNE_RECIPE"] = "neuqi_frozen_qon"
+    logger.info(
+        "--enable_neuqi with iters>0: defaulting AR_TUNE_RECIPE to neuqi_frozen_qon (the NeUQI "
+        "init reaches SignRound tuning through the recipe anchor); set AR_TUNE_RECIPE explicitly "
+        "to override"
+    )
+    return "neuqi_frozen_qon"
+
+
 def get_quant_func(
     dtype: str,
     bits: int,

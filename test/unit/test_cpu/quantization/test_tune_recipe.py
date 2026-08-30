@@ -1027,3 +1027,64 @@ class TestFanOutDefault:
 
         cfg = RTNConfig()
         assert cfg.parallel_tuning is False
+
+
+class TestEnableNeuqiDefaultRecipe:
+    """--enable_neuqi + iters>0: AR_TUNE_RECIPE defaults to neuqi_frozen_qon
+    (the NeUQI init reaches SignRound through the recipe anchor)."""
+
+    def test_helper_defaults_frozen_recipe(self, monkeypatch):
+        import os
+
+        from auto_round.data_type.utils import maybe_default_tune_recipe
+
+        monkeypatch.delenv("AR_TUNE_RECIPE", raising=False)
+        try:
+            assert maybe_default_tune_recipe("neuqi", 200) == "neuqi_frozen_qon"
+            assert os.environ["AR_TUNE_RECIPE"] == "neuqi_frozen_qon"
+        finally:
+            os.environ.pop("AR_TUNE_RECIPE", None)
+
+    def test_helper_respects_explicit_recipe(self, monkeypatch):
+        import os
+
+        from auto_round.data_type.utils import maybe_default_tune_recipe
+
+        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
+        assert maybe_default_tune_recipe("neuqi", 200) is None
+        assert os.environ["AR_TUNE_RECIPE"] == "neuqi_qon"
+
+    def test_helper_no_default_at_iters0_or_without_neuqi(self, monkeypatch):
+        import os
+
+        from auto_round.data_type.utils import maybe_default_tune_recipe
+
+        monkeypatch.delenv("AR_TUNE_RECIPE", raising=False)
+        try:
+            assert maybe_default_tune_recipe("neuqi", 0) is None
+            assert maybe_default_tune_recipe("auto", 200) is None
+            assert maybe_default_tune_recipe("minmax", 200) is None
+            assert "AR_TUNE_RECIPE" not in os.environ
+        finally:
+            os.environ.pop("AR_TUNE_RECIPE", None)
+
+    def test_wrapper_anchors_from_defaulted_recipe(self, monkeypatch):
+        # the compressor materializes the default in the env; the wrapper then
+        # anchors asym layers and skips sym layers in a mixed pool
+        from auto_round.data_type import utils as dt_utils
+
+        monkeypatch.setattr(dt_utils, "_MIXED_SYM_POOL", True, raising=False)
+        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_frozen_qon")
+        w = TestWrapperMixedSymPool()._wrapper("neuqi_frozen_qon", sym=False, monkeypatch=monkeypatch)
+        assert w._tune_recipe == "neuqi_frozen_qon"
+        assert float(w.min_scale) == 1.0 and float(w.max_scale) == 1.0
+        w_sym = TestWrapperMixedSymPool()._wrapper("neuqi_frozen_qon", sym=True, monkeypatch=monkeypatch)
+        assert w_sym._tune_recipe == ""
+        assert "min_scale" in w_sym.params
+
+    def test_get_quant_func_accepts_neuqi_iters_with_defaulted_recipe(self, monkeypatch):
+        # compressor-driven runs always see a materialized recipe; the direct
+        # call path with the defaulted recipe resolves the asym STE function
+        monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_frozen_qon")
+        fn, name = TestGuardMatrix()._g(asym_search="neuqi")
+        assert name.startswith("int_asym")
