@@ -845,6 +845,25 @@ for _bits in (3, 4, 5, 6, 7):
             }
         )
 
+# Asymmetrical variants (ASYM suffix) for the 2-7 bit int presets: W4A16ASYM,
+# W4A16G64ASYM, W4A16G32ASYM, ... They let a single options string mix sym and
+# asym per option (e.g. options="W4A16,W4A16G32ASYM") instead of the
+# all-or-nothing --asym flag. 8-bit gets no asym presets: asymmetric 8-bit is
+# unrepresentable in int8-packed export formats (parse_scheme re-pins those
+# options symmetric).
+for _bits in (2, 3, 4, 5, 6, 7):
+    for _g in (None, 64, 32):
+        _name = f"W{_bits}A16" + ("" if _g is None else f"G{_g}") + "ASYM"
+        globals()[_name] = QuantizationScheme.from_dict(
+            {
+                "bits": _bits,
+                "sym": False,
+                "group_size": _g or 128,
+                "data_type": "int",
+                "act_bits": 16,
+            }
+        )
+
 PRESET_SCHEMES = {
     "W4A16": W4A16,
     "W2A16": W2A16,
@@ -864,6 +883,13 @@ PRESET_SCHEMES = {
     "W2A16G64": W2A16G64,
     "W2A16G32": W2A16G32,
     **{f"W{_bits}A16G{_g}": globals()[f"W{_bits}A16G{_g}"] for _bits in (3, 4, 5, 6, 7) for _g in (64, 32)},
+    **{
+        f"W{_bits}A16"
+        + ("" if _g is None else f"G{_g}")
+        + "ASYM": globals()[f"W{_bits}A16" + ("" if _g is None else f"G{_g}") + "ASYM"]
+        for _bits in (2, 3, 4, 5, 6, 7)
+        for _g in (None, 64, 32)
+    },
     "FP8_STATIC": FP8_STATIC,
     "BF16": BF16,
     "W4A16_MIXED": W4A16,

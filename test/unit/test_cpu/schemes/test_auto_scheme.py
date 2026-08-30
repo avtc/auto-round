@@ -1640,3 +1640,42 @@ class TestGroupSizeVariantPresets:
         resolved = [preset_name_to_scheme(o) for o in scheme.options]
         assert all(isinstance(r, QuantizationScheme) for r in resolved)
         assert [r.group_size for r in resolved] == [64, 32]
+
+
+class TestAsymPresetSuffix:
+    """ASYM-suffix presets: per-option asymmetry inside one --options string."""
+
+    def test_all_asym_presets_resolve(self):
+        from auto_round.schemes import PRESET_SCHEMES, preset_name_to_scheme
+
+        for bits in (2, 3, 4, 5, 6, 7):
+            for g in (128, 64, 32):
+                name = f"W{bits}A16ASYM" if g == 128 else f"W{bits}A16G{g}ASYM"
+                assert name in PRESET_SCHEMES
+                s = preset_name_to_scheme(name)
+                assert s.sym is False
+                assert s.bits == bits
+                assert s.group_size == g
+                assert s.data_type == "int"
+
+    def test_sym_counterparts_unchanged(self):
+        from auto_round.schemes import preset_name_to_scheme
+
+        assert preset_name_to_scheme("W4A16").sym is True
+        assert preset_name_to_scheme("W4A16G32").sym is True
+
+    def test_mixed_sym_asym_pool_survives_dedup(self):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+
+        scheme = AutoScheme(options="W4A16,W4A16G32ASYM,W3A16ASYM", avg_bits=4.0)
+        assert len(scheme.options) == 3
+
+    def test_no_w8_asym_preset(self):
+        from auto_round.schemes import PRESET_SCHEMES
+
+        assert "W8A16ASYM" not in PRESET_SCHEMES
+
+    def test_resolution_is_case_insensitive(self):
+        from auto_round.schemes import preset_name_to_scheme
+
+        assert preset_name_to_scheme("w4a16g32asym").sym is False
