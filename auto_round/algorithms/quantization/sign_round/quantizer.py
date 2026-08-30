@@ -1173,6 +1173,27 @@ class SignRoundQuantizer(BaseQuantizer):
 
         _debug_flat_leak_probe(f"{getattr(block_ctx, 'block_name', 'block')}-start")
         _tune_wall_t0 = time.perf_counter() if tune_prof is not None else None
+        _vram_devs = []
+        if tune_prof is not None:
+            # per-stage VRAM attribution: standing usage entering the tune loop
+            # (post-collect) and a fresh peak counter that the loop's summary
+            # reports -- separates tune-loop spikes from collect/pack maxima
+            try:
+                import torch.cuda as _tc
+
+                if _tc.is_available():
+                    _seen = set()
+                    for _pd in ([block] if not isinstance(block, (list, tuple)) else list(block)):
+                        for _pp in _pd.parameters():
+                            if _pp.device.type == "cuda":
+                                _seen.add(_pp.device)
+                    _vram_devs = sorted(_seen, key=lambda d: d.index or 0)
+                    _stand = ", ".join(f"{_d.index}:{_tc.memory_reserved(_d) / 2**30:.2f}G" for _d in _vram_devs)
+                    logger.info("[tune-vram] entering tune loop, standing reserved: %s", _stand)
+                    for _d in _vram_devs:
+                        _tc.reset_peak_memory_stats(_d)
+            except Exception:  # noqa: BLE001 - diagnostic only
+                _vram_devs = []
         if tune_prof is not None and tune_prof.debug:
             _ai = active_inputs if isinstance(active_inputs, list) else []
             tune_prof.log_placement(
@@ -1883,6 +1904,18 @@ class SignRoundQuantizer(BaseQuantizer):
                 best_params = _atracker.best_params or {}
         last_loss = total_loss
         if tune_prof is not None:
+            if _vram_devs:
+                try:
+                    import torch.cuda as _tc
+
+                    _peaks = ", ".join(
+                        f"{_d.index}:peak {_tc.max_memory_reserved(_d) / 2**30:.2f}G"
+                        f"/now {_tc.memory_reserved(_d) / 2**30:.2f}G"
+                        for _d in _vram_devs
+                    )
+                    logger.info("[tune-vram] tune loop done, %s", _peaks)
+                except Exception:  # noqa: BLE001 - diagnostic only
+                    pass
             tune_prof.log_summary(
                 block_name=getattr(block_ctx, "block_name", ""),
                 iters_done=(i + 1) if self.iters > 0 else 0,
