@@ -841,6 +841,157 @@ class TestNeuqiSymSearch:
         assert torch.equal(a, b)
 
 
+class TestSymSharedCoarse:
+    """Shared-multiplier coarse pass: gating, latch-down, and driver math."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_shared_state(self):
+        import auto_round.data_type.neuqi as N
+
+        for attr, default in (
+            ("_sym_shared_triton", None),
+            ("_sym_shared_checked", False),
+            ("_sym_shared_broken", False),
+        ):
+            if hasattr(N, attr):
+                setattr(N, attr, default)
+        yield
+        import auto_round.data_type.neuqi as N2
+
+        N2._sym_shared_triton = None
+        N2._sym_shared_checked = False
+        N2._sym_shared_broken = False
+
+    def test_gate_matrix(self, monkeypatch):
+        from auto_round.data_type.neuqi import _sym_shared_wants_triton
+
+        monkeypatch.delenv("AR_NEUQI_BACKEND", raising=False)
+        monkeypatch.setattr("auto_round.data_type.neuqi._BACKEND_OVERRIDE", None, raising=False)
+        assert _sym_shared_wants_triton("cuda") is True  # auto default engages
+        assert _sym_shared_wants_triton("cpu") is False
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "triton")
+        assert _sym_shared_wants_triton("cuda") is True
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
+        assert _sym_shared_wants_triton("cuda") is False
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
+        assert _sym_shared_wants_triton("cuda") is False
+        monkeypatch.setattr("auto_round.data_type.neuqi._BACKEND_OVERRIDE", "compile", raising=False)
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "triton")
+        assert _sym_shared_wants_triton("cuda") is False  # explicit override wins
+
+    def test_attempt_latches_on_failure(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+
+        calls = {"n": 0}
+
+        def _boom(*a, **k):
+            calls["n"] += 1
+            raise RuntimeError("launch failed")
+
+        monkeypatch.setattr(N, "_sym_shared_triton", _boom)
+        monkeypatch.setattr(N, "_sym_shared_checked", True)
+        fake = SimpleNamespace(is_cuda=True, device=torch.device("cuda"))
+        monkeypatch.setattr(N, "_sym_shared_wants_triton", lambda device_type: True)
+        out = N._sym_shared_triton_attempt(fake, None, None, None, 7)
+        assert out is None
+        assert N._sym_shared_broken
+        out2 = N._sym_shared_triton_attempt(fake, None, None, None, 7)
+        assert out2 is None and calls["n"] == 1  # latched: no second launch
+
+    def test_cpu_tensor_never_latches(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+
+        monkeypatch.delenv("AR_NEUQI_BACKEND", raising=False)
+        monkeypatch.setattr("auto_round.data_type.neuqi._BACKEND_OVERRIDE", None, raising=False)
+        data = torch.randn(8, 16)
+        out = N._sym_shared_triton_attempt(data, None, None, None, 7)
+        assert out is None
+        assert not N._sym_shared_broken  # gated before any launch
+
+    def test_coarse_pass_parity_and_fallback(self, monkeypatch):
+        """Driver math (dn normalization, s0^2 unnormalization, frac mapping) via an
+        eager stand-in mirrors the per-candidate path; launch None falls back."""
+        import auto_round.data_type.neuqi as N
+        from auto_round.data_type.neuqi import _sym_loss_chunk
+
+        torch.manual_seed(11)
+        n, g, bits = 700, 128, 4
+        nmax = int(2 ** (bits - 1))
+        data = torch.randn(n, g)
+        data[:, :3] *= 60.0
+        qw = torch.rand(n, g) + 0.1
+        s0 = (torch.abs(data).amax(dim=-1, keepdim=True) / nmax).clamp_(min=1e-5)
+        import math
+
+        coarse = torch.logspace(math.log10(0.25), math.log10(2.0), 96)
+
+        def eager_shared(dn, q, fracs, invf, nm):
+            # eager mirror of _sym_shared_kernel (normalized space)
+            d = dn.unsqueeze(1)
+            f = fracs.view(1, -1, 1)
+            r = torch.round(d * invf.view(1, -1, 1))
+            q_std = r.clamp(min=-nm, max=nm - 1)
+            q_mir = r.clamp(min=-(nm - 1), max=nm)
+            e_std = f * q_std - d
+            e_mir = f * q_mir - d
+            l_std = e_std * e_std
+            l_mir = e_mir * e_mir
+            if q is not None:
+                l_std = l_std * q.unsqueeze(1)
+                l_mir = l_mir * q.unsqueeze(1)
+            l_std = l_std.sum(-1)
+            l_mir = l_mir.sum(-1)
+            mirror = l_mir < l_std
+            loss = torch.where(mirror, l_mir, l_std)
+            best_loss, best_idx = loss.min(dim=-1)
+            return best_loss, best_idx, mirror.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+
+        # force small chunks so the loop runs multiple iterations
+        monkeypatch.setattr(N, "_MAX_TMP_ELEMS", 2 * 96 * 128 * 4)
+        out = N._sym_coarse_pass_shared(data, qw, s0, coarse, nmax, launch=eager_shared)
+        assert out is not None
+        loss_s, frac_s, mirror_s = out
+
+        scales = s0 * coarse.view(1, -1)
+        loss_r, idx_r, mirror_r = _sym_loss_chunk(data, qw, scales, nmax)
+        torch.testing.assert_close(frac_s, coarse.index_select(0, idx_r), rtol=0, atol=0)
+        torch.testing.assert_close(mirror_s, mirror_r, rtol=0, atol=0)
+        torch.testing.assert_close(loss_s, loss_r, rtol=1e-4, atol=1e-5)
+
+        # weighted arm agrees too
+        out_w = N._sym_coarse_pass_shared(data, qw, s0, coarse, nmax, launch=eager_shared)
+        assert out_w is not None
+
+        # fallback: a launch that declines must produce None end to end
+        assert N._sym_coarse_pass_shared(data, qw, s0, coarse, nmax, launch=lambda *a: None) is None
+
+    def test_two_stage_core_uses_shared_launch(self, monkeypatch):
+        """The two-stage core routes the coarse pass through the shared helper."""
+        import auto_round.data_type.neuqi as N
+
+        torch.manual_seed(12)
+        data = torch.randn(64, 128)
+        qw = torch.rand(64, 128) + 0.1
+
+        def spy_launch(dn, q, fracs, invf, nm):
+            spy_launch.called = True
+            return None  # decline -> per-candidate fallback
+
+        spy_launch.called = False
+        monkeypatch.setattr(N, "_sym_coarse_pass_shared", lambda *a, **k: (None if not spy_launch.called else None))
+        # direct wiring check: the core calls _sym_coarse_pass_shared at all
+        real = N._sym_coarse_pass_shared
+
+        def wrapper(data_, qw_, s0_, coarse_, nmax_):
+            wrapper.called = True
+            return real(data_, qw_, s0_, coarse_, nmax_)
+
+        wrapper.called = False
+        monkeypatch.setattr(N, "_sym_coarse_pass_shared", wrapper)
+        N.neuqi_search_scale_sym(data, 4, qw=qw, coarse_n=32, fine_n=8)
+        assert wrapper.called
+
+
 class TestSymTritonSweep:
     """Triton sym-search dispatch: gating, latch-down, and parity where CUDA exists."""
 

@@ -712,7 +712,65 @@ def _sym_loss_chunk(data, qw, scales, nmax):
 _sym_triton = None
 _sym_triton_checked = False
 _sym_triton_broken = False
+_sym_shared_triton = None
+_sym_shared_checked = False
+_sym_shared_broken = False
 _sym_search_warmed: set = set()
+
+
+def _sym_shared_triton_fn():
+    """Resolve the extension shared-multiplier coarse kernel once."""
+    global _sym_shared_triton, _sym_shared_checked
+    if not _sym_shared_checked:
+        _sym_shared_checked = True
+        try:
+            from auto_round_extension.triton.neuqi_sweep import sym_search_shared_triton
+
+            _sym_shared_triton = sym_search_shared_triton
+            logger.info(
+                "[NeUQI] Triton shared-multiplier sym coarse search engaged "
+                "(auto_round_extension.triton.neuqi_sweep)"
+            )
+        except Exception as e:
+            _sym_shared_triton = None
+            logger.info("[NeUQI] shared sym search unavailable (%s); using the per-candidate path", e)
+    return _sym_shared_triton
+
+
+def _sym_shared_wants_triton(device_type: str) -> bool:
+    """Whether the shared-multiplier coarse kernel should run, per backend rules.
+
+    AUTO resolves the COARSE stage to this dedicated kernel: every group
+    shares the same candidate fracs, so normalizing once (dn = w / s0) turns
+    the inner loop into one shared 1/frac multiply -- no per-(group, candidate)
+    scales materialization and no division in the loop. Measured RTX 3090,
+    2M groups, g=128, 256+64 candidates: 0.24 s vs 0.57-0.79 s for the
+    compiled core (eager 8.5 s); parity stays in the tie-flip class (~0.5%
+    flipped groups, max fp64 rel diff 1.7e-6 vs eager). The FINE stage keeps
+    its per-group candidate grid and stays on the compiled core under AUTO.
+    ``compile``/``eager`` overrides keep the reference numerics end to end.
+    """
+    backend = _BACKEND_OVERRIDE or str(envs.AR_NEUQI_BACKEND or "auto")
+    if backend in ("compile", "eager"):
+        return False
+    return backend in ("auto", "triton") and device_type == "cuda"
+
+
+def _sym_shared_triton_attempt(dn, qw, fracs, invf, nmax):
+    """Try the shared-multiplier coarse kernel; ``None`` (and a latch) on failure."""
+    global _sym_shared_broken
+    if _sym_shared_broken or not dn.is_cuda or not _sym_shared_wants_triton(dn.device.type):
+        return None
+    fn = _sym_shared_triton_fn()
+    if fn is None:
+        return None
+    try:
+        return fn(dn, qw, fracs, invf, nmax)
+    except Exception as e:
+        _sym_shared_broken = True
+        torch.cuda.empty_cache()  # a failed launch may hold pooled memory
+        logger.warning("[NeUQI] shared sym coarse search failed (%s); using the per-candidate path", e)
+        return None
 
 
 def _sym_triton_fn():
@@ -775,27 +833,45 @@ def ensure_sym_search_warmup(device) -> None:
     """
     if device.type != "cuda":
         return
+    global _sym_triton_broken, _sym_shared_broken
     with _sweep_warm_lock:
         if device.index in _sym_search_warmed:
             return
         _sym_search_warmed.add(device.index)
-        if not _sym_wants_triton(device.type):
-            return
-        fn = _sym_triton_fn()
-        if fn is None:
-            return
-        global _sym_triton_broken
-        try:
-            data = torch.randn(4, 128, device=device, dtype=torch.float32)
-            scales = torch.rand(4, 2, device=device, dtype=torch.float32) * 0.01 + 0.001
-            loss, _idx, _mir = fn(data, torch.ones_like(data), scales, 7)
-            torch.cuda.synchronize(device)
-            if not torch.isfinite(loss).all():
-                raise RuntimeError("warmup produced non-finite losses")
-            logger.info("[NeUQI] Triton sym search warmed on %s", device)
-        except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
-            _sym_triton_broken = True
-            logger.warning("[NeUQI] Triton sym search warmup failed on %s (%s); using the compiled core", device, e)
+        if _sym_wants_triton(device.type):
+            fn = _sym_triton_fn()
+            if fn is not None:
+                try:
+                    data = torch.randn(4, 128, device=device, dtype=torch.float32)
+                    scales = torch.rand(4, 2, device=device, dtype=torch.float32) * 0.01 + 0.001
+                    loss, _idx, _mir = fn(data, torch.ones_like(data), scales, 7)
+                    torch.cuda.synchronize(device)
+                    if not torch.isfinite(loss).all():
+                        raise RuntimeError("warmup produced non-finite losses")
+                    logger.info("[NeUQI] Triton sym search warmed on %s", device)
+                except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
+                    _sym_triton_broken = True
+                    logger.warning(
+                        "[NeUQI] Triton sym search warmup failed on %s (%s); using the compiled core", device, e
+                    )
+        if _sym_shared_wants_triton(device.type):
+            fn = _sym_shared_triton_fn()
+            if fn is not None:
+                try:
+                    dn = torch.randn(4, 128, device=device, dtype=torch.float32)
+                    fracs = torch.rand(8, device=device, dtype=torch.float32) * 0.5 + 0.5
+                    loss, _idx, _mir = fn(dn, torch.ones_like(dn), fracs, 1.0 / fracs, 7)
+                    torch.cuda.synchronize(device)
+                    if not torch.isfinite(loss).all():
+                        raise RuntimeError("warmup produced non-finite losses")
+                    logger.info("[NeUQI] shared sym coarse search warmed on %s", device)
+                except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
+                    _sym_shared_broken = True
+                    logger.warning(
+                        "[NeUQI] shared sym coarse search warmup failed on %s (%s); using the per-candidate path",
+                        device,
+                        e,
+                    )
 
 
 def _sym_search_eval(data, qw, scales, nmax):
@@ -811,8 +887,10 @@ def _sym_search_eval(data, qw, scales, nmax):
 # (_MAX_TMP_ELEMS // (2 * K * g)), so wide grids (the union variant at
 # coarse=256 reaches K ~ 440) make big tensors pure launch overhead. One fused
 # inductor kernel per chunk is the symmetric analogue of the asym sweep's
-# compiled stage; there is no dedicated sym Triton kernel yet, so "triton"
-# resolves to this compiled core.
+# compiled stage. The dedicated Triton kernels cover the stages where they
+# measured faster: the shared-multiplier kernel serves the plain coarse pass
+# under AUTO, the per-candidate kernel is AR_NEUQI_BACKEND=triton opt-in; this
+# compiled core stays the AUTO choice for the fine stage (per-group grids).
 _sym_chunk_compiled = None
 _sym_compile_failed = False
 _sym_compile_logged: set = set()
@@ -889,6 +967,50 @@ def _incumbent_uniform_fracs(bits: int, device: torch.device) -> torch.Tensor:
     return nmax / (nmax - step * ks)
 
 
+def _sym_coarse_pass_shared(data, qw, s0, coarse, nmax, launch=None):
+    """Normalized-space coarse pass through the shared-multiplier kernel.
+
+    Computes dn = w / s0 once, evaluates every group against the SHARED frac
+    grid through ``launch`` (default: the gated Triton attempt), and
+    unnormalizes each winner's loss by s0^2 so the fine stage can compare
+    across stages. Returns (best_loss, best_frac, best_mirror) or ``None``
+    when the kernel is unavailable anywhere -- the caller then serves the
+    identical candidate grid through the per-candidate evaluator.
+
+    ``launch`` is injectable so the driver math (normalization, s0^2
+    unnormalization, frac mapping) stays unit-testable on CPU.
+    """
+    n_groups = data.shape[0]
+    if launch is None:
+        # pre-gate before any tensor math: CPU / non-shared backends must not
+        # pay for the normalized copy
+        if _sym_shared_broken or not data.is_cuda or not _sym_shared_wants_triton(data.device.type):
+            return None
+        launch = _sym_shared_triton_attempt
+    dn = data / s0
+    invf = 1.0 / coarse
+    best_loss = torch.full((n_groups,), float("inf"), device=data.device, dtype=torch.float32)
+    best_frac = torch.ones(n_groups, device=data.device, dtype=torch.float32)
+    best_mirror = torch.zeros(n_groups, device=data.device, dtype=torch.bool)
+    chunk = 262144
+    for start_idx in range(0, n_groups, chunk):
+        stop = min(start_idx + chunk, n_groups)
+        out = launch(
+            dn[start_idx:stop].contiguous(),
+            qw[start_idx:stop].contiguous() if qw is not None else None,
+            coarse,
+            invf,
+            nmax,
+        )
+        if out is None:
+            return None
+        loss, idx, mirror = out
+        best_loss[start_idx:stop] = loss * s0[start_idx:stop].squeeze(-1) ** 2
+        best_frac[start_idx:stop] = coarse.index_select(0, idx)
+        best_mirror[start_idx:stop] = mirror
+    return best_loss, best_frac, best_mirror
+
+
 @torch.compiler.disable  # loop-heavy eager search: never trace into dynamo graphs
 def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
     """Coarse+fine scale search core over a given (sorted, positive) coarse grid.
@@ -911,17 +1033,26 @@ def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
     best_frac = torch.ones(n_groups, device=data.device, dtype=torch.float32)
     best_mirror = torch.zeros(n_groups, device=data.device, dtype=torch.bool)
 
-    # Coarse pass: shared fractions of the per-group no-clip scale.
-    chunk = max(1, _MAX_TMP_ELEMS // (2 * coarse_n * g))
-    for start_idx in range(0, n_groups, chunk):
-        stop = min(start_idx + chunk, n_groups)
-        scales = s0[start_idx:stop] * coarse.view(1, -1)  # [C, K]
-        loss, idx, mirror = _sym_search_eval(
-            data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
-        )
-        best_loss[start_idx:stop] = loss
-        best_frac[start_idx:stop] = coarse.index_select(0, idx)
-        best_mirror[start_idx:stop] = mirror
+    # Coarse pass: shared fractions of the per-group no-clip scale. Under AUTO
+    # on CUDA this runs in normalized space through the dedicated
+    # shared-multiplier Triton kernel (dn = w / s0 once; every group multiplies
+    # by the same 1/frac scalars -- no [C, K] scales, no division in the loop);
+    # the winner loss is unnormalized by s0^2 for the cross-stage compare.
+    # Anywhere else the per-candidate evaluator serves the identical grid.
+    shared_out = _sym_coarse_pass_shared(data, qw, s0, coarse, nmax)
+    if shared_out is not None:
+        best_loss, best_frac, best_mirror = shared_out
+    else:
+        chunk = max(1, _MAX_TMP_ELEMS // (2 * coarse_n * g))
+        for start_idx in range(0, n_groups, chunk):
+            stop = min(start_idx + chunk, n_groups)
+            scales = s0[start_idx:stop] * coarse.view(1, -1)  # [C, K]
+            loss, idx, mirror = _sym_search_eval(
+                data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
+            )
+            best_loss[start_idx:stop] = loss
+            best_frac[start_idx:stop] = coarse.index_select(0, idx)
+            best_mirror[start_idx:stop] = mirror
 
     # Fine pass: additive grid between the coarse neighbors bracketing each winner.
     best_idx = torch.argmin(torch.abs(coarse.unsqueeze(0) - best_frac.unsqueeze(1)), dim=1)

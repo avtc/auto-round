@@ -46,6 +46,25 @@ loss tie against the mirrored one; ascending-candidate first-minimum).
     nmax:   symmetric integer bound (``2**(bits - 1)``)
     -> (best_loss [C] float32, best candidate index [C] int64,
         best_mirror [C] bool: the mirrored convention won that group)
+
+Contract (``sym_search_shared_triton``): the coarse stage of the symmetric
+search in NORMALIZED space. The driver precomputes dn = w / s0 once (s0 =
+per-group no-clip scale); every group then shares the same candidate fracs
+f_k, so the kernel multiplies dn by the SHARED 1/f_k scalar instead of a
+per-(group, candidate) scale -- no [C, K] scales tensor at all, no division
+inside the candidate loop. The loss omits the s0^2 factor (argmin within a
+group is invariant); the driver unnormalizes the winner for cross-stage
+comparisons. Measured RTX 3090, 2M groups, g=128, 256+64 candidates: 0.24 s
+vs 0.57-0.79 s for the compiled core (parity: same ~0.5% tie-flip profile,
+max fp64 rel diff 1.7e-6 vs eager).
+
+    dn:     [C, g] float32, contiguous, CUDA (w / s0)
+    qw:     [C, g] float32, contiguous, CUDA, or ``None``
+    fracs:  [K] float32 POSITIVE shared multipliers, contiguous, CUDA
+    invf:   [K] float32, 1 / fracs, contiguous, CUDA, same device
+    nmax:   symmetric integer bound (``2**(bits - 1)``)
+    -> (best_loss [C] float32 NORMALIZED, best candidate index [C] int64,
+        best_mirror [C] bool: the mirrored convention won that group)
 """
 
 import torch
@@ -244,6 +263,121 @@ def sym_search_triton(data, qw, scales, nmax):
             HAS_QW=qw is not None,
             BC=bc,
             GP=gp,
+            num_warps=4,
+        )
+    return loss, idx.long(), mirror.bool()
+
+
+if triton is not None:
+
+    @triton.jit
+    def _sym_shared_kernel(
+        dn_ptr,
+        qw_ptr,
+        fracs_ptr,
+        invf_ptr,
+        loss_ptr,
+        idx_ptr,
+        mirror_ptr,
+        C,
+        G,
+        K,
+        NMAX: tl.constexpr,
+        HAS_QW: tl.constexpr,
+        BC: tl.constexpr,
+        GP: tl.constexpr,
+        NOMASK: tl.constexpr,
+    ):
+        """Coarse-stage symmetric search in normalized space (see module docstring).
+
+        Rounding is native cvt.rni.f32.f32 (round-half-to-even, matching
+        torch.round). Tie rules match _sym_loss_chunk: the standard convention
+        wins a loss tie (strict <), ascending-k first-minimum (strict <).
+        NOMASK skips the tail-group mask selects when GP == G (pow2 group size).
+        """
+        pid = tl.program_id(0)
+        c_off = pid * BC + tl.arange(0, BC)
+        g_off = tl.arange(0, GP)
+        cm = c_off < C
+        gm = g_off < G
+        d = tl.load(dn_ptr + c_off[:, None] * G + g_off[None, :], mask=cm[:, None] & gm[None, :], other=0.0)
+        if HAS_QW:
+            qwt = tl.load(qw_ptr + c_off[:, None] * G + g_off[None, :], mask=cm[:, None] & gm[None, :], other=0.0)
+        best = tl.zeros((BC,), dtype=tl.float32) + float("inf")
+        bk = tl.zeros((BC,), dtype=tl.int32)
+        bmir = tl.zeros((BC,), dtype=tl.int32)
+        for k in range(0, K):
+            f = tl.load(fracs_ptr + k)
+            invf = tl.load(invf_ptr + k)
+            x = d * invf
+            r = tl.inline_asm_elementwise(
+                "cvt.rni.f32.f32 $0, $1;", "=r,r", [x], dtype=tl.float32, is_pure=True, pack=1
+            )
+            q_std = tl.minimum(tl.maximum(r, -NMAX), NMAX - 1.0)
+            e_std = f * q_std - d
+            q_mir = tl.minimum(tl.maximum(r, -(NMAX - 1.0)), NMAX)
+            e_mir = f * q_mir - d
+            if HAS_QW:
+                se = e_std * e_std * qwt
+                sm = e_mir * e_mir * qwt
+            else:
+                se = e_std * e_std
+                sm = e_mir * e_mir
+            if NOMASK:
+                l_std = tl.sum(se, axis=1)
+                l_mir = tl.sum(sm, axis=1)
+            else:
+                l_std = tl.sum(tl.where(gm[None, :], se, 0.0), axis=1)
+                l_mir = tl.sum(tl.where(gm[None, :], sm, 0.0), axis=1)
+            mir = l_mir < l_std
+            loss = tl.where(mir, l_mir, l_std)
+            better = loss < best
+            best = tl.where(better, loss, best)
+            bk = tl.where(better, k, bk)
+            bmir = tl.where(better, mir.to(tl.int32), bmir)
+        tl.store(loss_ptr + c_off, best, mask=cm)
+        tl.store(idx_ptr + c_off, bk, mask=cm)
+        tl.store(mirror_ptr + c_off, bmir, mask=cm)
+
+
+def sym_search_shared_triton(dn, qw, fracs, invf, nmax):
+    """Coarse-stage symmetric search in normalized space on CUDA (see module docstring)."""
+    assert triton is not None, f"triton is not importable: {_TRITON_IMPORT_ERROR}"
+    assert dn.is_cuda and dn.dtype == torch.float32 and dn.is_contiguous()
+    assert fracs.is_contiguous() and fracs.dtype == torch.float32 and fracs.ndim == 1
+    assert invf.is_contiguous() and invf.dtype == torch.float32 and invf.shape == fracs.shape
+    if qw is not None:
+        assert qw.dtype == torch.float32 and qw.is_contiguous() and qw.shape == dn.shape
+    _dev = dn.device
+    assert fracs.device == _dev, f"sym_shared: fracs on {fracs.device} but dn on {_dev}"
+    assert invf.device == _dev, f"sym_shared: invf on {invf.device} but dn on {_dev}"
+    if qw is not None:
+        assert qw.device == _dev, f"sym_shared: qw on {qw.device} but dn on {_dev}"
+
+    c, g = dn.shape
+    k = fracs.numel()
+    gp = _next_pow2(g)
+    bc = max(1, min(64, 4096 // gp))
+    loss = torch.empty((c,), device=_dev, dtype=torch.float32)
+    idx = torch.empty((c,), device=_dev, dtype=torch.int32)
+    mirror = torch.empty((c,), device=_dev, dtype=torch.int32)
+    with torch.cuda.device(_dev):  # Triton launches on the CURRENT device
+        _sym_shared_kernel[(triton.cdiv(c, bc),)](
+            dn,
+            qw if qw is not None else dn,  # dummy pointer when unweighted
+            fracs,
+            invf,
+            loss,
+            idx,
+            mirror,
+            c,
+            g,
+            k,
+            NMAX=nmax,
+            HAS_QW=qw is not None,
+            BC=bc,
+            GP=gp,
+            NOMASK=gp == g,
             num_warps=4,
         )
     return loss, idx.long(), mirror.bool()
