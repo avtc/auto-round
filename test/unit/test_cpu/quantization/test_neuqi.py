@@ -839,6 +839,17 @@ class TestNeuqiSymSearch:
         assert torch.equal(a, b)
 
 
+class TestNeuqiSymDynamoGuard:
+    def test_sym_search_never_traced_by_dynamo(self):
+        """The sym search is loop-heavy and eager-shaped; under
+        --enable_torch_compile it must be skipped by dynamo (tracing it unrolls
+        the chunk loops into giant graphs - minutes of CPU compile, GPU idle)."""
+        from auto_round.data_type.neuqi import _two_stage_sym_core, neuqi_search_scale_sym
+
+        for fn in (neuqi_search_scale_sym, _two_stage_sym_core):
+            assert getattr(fn, "_torchdynamo_disable", False), fn.__name__
+
+
 class TestNeuqiSymIntegration:
     def test_sym_neuqi_dispatch(self):
         fn, name = get_quant_func(

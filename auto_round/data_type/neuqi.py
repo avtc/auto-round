@@ -736,6 +736,7 @@ def _incumbent_uniform_fracs(bits: int, device: torch.device) -> torch.Tensor:
     return nmax / (nmax - step * ks)
 
 
+@torch.compiler.disable  # loop-heavy eager search: never trace into dynamo graphs
 def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
     """Coarse+fine scale search core over a given (sorted, positive) coarse grid.
 
@@ -798,6 +799,7 @@ def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
     return scale, best_loss
 
 
+@torch.compiler.disable  # loop-heavy eager search: never trace into dynamo graphs
 def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=None, fine_n=None):
     """Two-stage (coarse log-spaced + fine additive) scale search, symmetric.
 
