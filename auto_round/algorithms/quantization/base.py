@@ -242,6 +242,12 @@ class BaseQuantizer(BaseAlgorithm):
                     "Use `--enable_opt_rtn` to force-enable it for MoE layers."
                 )
             layer = layer.to(tuning_device)
+            # a plain-tensor imatrix attribute does not travel with
+            # module.to(); move it with the module or the scale/zp search
+            # receives cross-device (weights, qw) inputs
+            _imatrix = getattr(layer, "imatrix", None)
+            if _imatrix is not None and _imatrix.device != tuning_device:
+                layer.imatrix = _imatrix.to(tuning_device)
             layer = WrapperLinear(
                 layer,
                 device=tuning_device,

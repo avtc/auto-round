@@ -82,6 +82,20 @@ from auto_round.logger import logger
 _MAX_TMP_ELEMS = 2**25
 
 
+def _align_qw(qw, data):
+    """Move per-element loss weights onto the data device when they disagree.
+
+    Parallel fan-out workers relocate a module to their GPU for the search;
+    a plain-tensor ``imatrix`` attribute does not travel with ``module.to()``,
+    leaving qw on the block's home device. Cross-device inputs would trip the
+    kernel same-device asserts mid-run (and, under a compiled caller, dynamo's
+    fake-tensor device propagation), so align once here.
+    """
+    if qw is not None and qw.device != data.device:
+        qw = qw.to(data.device)
+    return qw
+
+
 @lru_cache(maxsize=1)
 def _log_search_engaged(coarse_n: int, fine_n: int) -> None:
     logger.info("[NeUQI] joint (scale, zero-point) search active (coarse=%d, fine=%d)", coarse_n, fine_n)
@@ -615,6 +629,7 @@ def _lower_scale_ratio(bits: int) -> float:
     return 0.05
 
 
+@torch.compiler.disable  # loop-heavy eager search: never trace into dynamo graphs
 def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=None, fine_n=None):
     """Joint near-optimal (scale, integer zero-point) search per quantization group.
 
@@ -642,7 +657,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     maxq = int(2**bits) - 1
     data = data.to(torch.float32)
     if qw is not None:
-        qw = qw.to(torch.float32)
+        qw = _align_qw(qw, data).to(torch.float32)
 
     zp_grid = torch.arange(0, maxq + 1, device=data.device, dtype=data.dtype)
     chunk = max(1, _MAX_TMP_ELEMS // (data.shape[1] * (maxq + 1)))
@@ -1245,7 +1260,7 @@ def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=No
 
     data = data.to(torch.float32)
     if qw is not None:
-        qw = qw.to(torch.float32)
+        qw = _align_qw(qw, data).to(torch.float32)
 
     log_grid = _coarse_grid(_lower_scale_ratio(bits), coarse_n, data.device, torch.float32, hi=_SYM_UPPER_SCALE_RATIO)
     scale, _ = _two_stage_sym_core(data, qw, bits, log_grid, fine_n, q_scale_thresh)
@@ -1293,6 +1308,7 @@ def quant_tensor_opt_rtn_sym_neuqi(
 
     qw = None
     if imatrix is not None:
+        imatrix = _align_qw(imatrix, tensor)
         if imatrix.dim() == 1:
             qw = imatrix.reshape(1, -1)
             qw = reshape_pad_tensor_by_group_size(qw, group_size, val=1e-5)[0].view(1, -1)
@@ -1345,6 +1361,7 @@ def quant_tensor_opt_rtn_asym(
 
     qw = None
     if imatrix is not None:
+        imatrix = _align_qw(imatrix, tensor)
         if imatrix.dim() == 1:
             # per-column importance shared by every row of this tensor
             qw = imatrix.reshape(1, -1)
