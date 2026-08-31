@@ -232,7 +232,7 @@ export AR_NEUQI_SYM_UNION=1
 ```
 
 ### AR_NEUQI_BACKEND
-- **描述**：NeUQI 零点扫描的后端链。`"auto"`（默认）在 CPU 上保持参考的分块 eager 扫描，在 CUDA 上优先用 `auto_round_extension.triton.neuqi_sweep` 中的手写 Triton 内核服务批量扫描（寄存器驻留：每个权重元素只加载一次，所有（候选，零点）损失都在寄存器中计算），Triton 不可用时回退到 `torch.compile` 融合扫描；`"triton"` 强制使用 Triton 内核；`"compile"` 在任意设备上强制使用 `torch.compile` 融合扫描；`"eager"` 始终使用参考扫描。所有后端在完全相同的候选网格上计算完全相同的损失（选择仅在近似并列时不同：少于约 0.1% 的组会翻转，RTX 3090 上实测最坏相对损失差约 5e-5，Triton 内核的并列特征与其完全一致），并消除大规模批量专家搜索中暴力网格的显存带宽瓶颈（200 万组的 RTX 3090 扫描实测：eager 12.3 秒 → 单候选融合 0.59 秒 → 编译批量 0.49 秒 → Triton 0.22 秒，约 57 倍）。每一级失败都会永久逐级回退：Triton → 编译批量 → 编译逐候选 → eager。Triton/编译批量阶段需要启用 `AR_NEUQI_BATCH`（默认启用）。
+- **描述**：NeUQI 零点扫描的后端链。`"auto"`（默认）在 CPU 上保持参考的分块 eager 扫描，在 CUDA 上优先用 `auto_round_extension.triton.neuqi_sweep` 中的手写 Triton 内核服务批量扫描（寄存器驻留：每个权重元素只加载一次，所有（候选，零点）损失都在寄存器中计算），Triton 不可用时回退到 `torch.compile` 融合扫描；`"triton"` 强制使用 Triton 内核；`"compile"` 在任意设备上强制使用 `torch.compile` 融合扫描；`"eager"` 始终使用参考扫描。所有后端在完全相同的候选网格上计算完全相同的损失（选择仅在近似并列时不同：少于约 0.1% 的组会翻转，RTX 3090 上实测最坏相对损失差约 5e-5，Triton 内核的并列特征与其完全一致），并消除大规模批量专家搜索中暴力网格的显存带宽瓶颈（200 万组的 RTX 3090 扫描实测：eager 12.3 秒 → 单候选融合 0.59 秒 → 编译批量 0.49 秒 → Triton 0.22 秒，约 57 倍）。每一级失败都会永久逐级回退：Triton → 编译批量 → 编译逐候选 → eager。Triton/编译批量阶段需要启用 `AR_NEUQI_BATCH`（默认启用）。同一后端链也作用于对称两阶段搜索（`opt_rtn_int_sym_neuqi`）：`auto`/`compile` 通过 `torch.compile` 融合核心计算每个分块（目前没有专用的对称 Triton 内核，因此 `triton` 解析为编译核心），`eager` 保持参考路径；编译核心失败时永久回退（例如缺少 inductor 代码生成所需 C++ 编译器的机器）。
 - **默认值**：`"auto"`
 - **有效值**：`"auto"`、`"triton"`、`"compile"`、`"eager"`（无法识别的值按 `"eager"` 处理）
 - **用法**：固定某一阶段做 A/B 对比，或彻底禁用编译
