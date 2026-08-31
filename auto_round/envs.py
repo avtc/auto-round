@@ -88,6 +88,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NeUQI search in ``auto_round.data_type.neuqi``.
     "AR_NEUQI_COARSE": lambda: int(os.getenv("AR_NEUQI_COARSE", "64")),
     "AR_NEUQI_FINE": lambda: int(os.getenv("AR_NEUQI_FINE", "32")),
+    # symmetric two-stage search: sym-specific pins win, the shared
+    # AR_NEUQI_COARSE/FINE pins still apply, then the 256/64 defaults (the
+    # grid every measured sym result used)
+    "AR_NEUQI_SYM_COARSE": lambda: int(os.getenv("AR_NEUQI_SYM_COARSE", os.getenv("AR_NEUQI_COARSE", "256"))),
+    "AR_NEUQI_SYM_FINE": lambda: int(os.getenv("AR_NEUQI_SYM_FINE", os.getenv("AR_NEUQI_FINE", "64"))),
     # symmetric two-stage search variant C: additionally evaluate the incumbent
     # uniform search_scales candidate set (per-group argmin over the union grid).
     "AR_NEUQI_SYM_UNION": lambda: os.getenv("AR_NEUQI_SYM_UNION", "0").strip().lower() in ("1", "true", "yes"),

@@ -992,6 +992,42 @@ class TestSymSharedCoarse:
         assert wrapper.called
 
 
+class TestSymGridDefaults:
+    """Sym two-stage grid resolution: sym-specific env > shared env > 256/64."""
+
+    def _captured(self, monkeypatch, **env):
+        import auto_round.data_type.neuqi as N
+
+        for k in ("AR_NEUQI_COARSE", "AR_NEUQI_FINE", "AR_NEUQI_SYM_COARSE", "AR_NEUQI_SYM_FINE"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, str(v))
+        seen = {}
+
+        def spy(data, qw, bits, coarse, fine_n, q_scale_thresh):
+            seen["coarse"] = coarse.numel()
+            seen["fine"] = fine_n
+            return torch.ones(data.shape[0], 1), torch.zeros(data.shape[0])
+
+        monkeypatch.setattr(N, "_two_stage_sym_core", spy)
+        N.neuqi_search_scale_sym(torch.randn(4, 8), 4)
+        return seen
+
+    def test_defaults_are_256_64(self, monkeypatch):
+        seen = self._captured(monkeypatch)
+        assert seen == {"coarse": 256, "fine": 64}
+
+    def test_shared_env_pins_still_apply(self, monkeypatch):
+        seen = self._captured(monkeypatch, AR_NEUQI_COARSE=96, AR_NEUQI_FINE=24)
+        assert seen == {"coarse": 96, "fine": 24}
+
+    def test_sym_specific_env_wins(self, monkeypatch):
+        seen = self._captured(
+            monkeypatch, AR_NEUQI_COARSE=96, AR_NEUQI_FINE=24, AR_NEUQI_SYM_COARSE=128, AR_NEUQI_SYM_FINE=16
+        )
+        assert seen == {"coarse": 128, "fine": 16}
+
+
 class TestZpSharedCoarse:
     """Shared-multiplier coarse pass (joint search): gating, latch, driver math."""
 

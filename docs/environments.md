@@ -202,7 +202,7 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 ```
 
 ### AR_NEUQI_COARSE
-- **Description**: Number of coarse (log-spaced) scale candidates explored by the NeUQI searches (the asymmetric joint scale/zero-point sweep and the symmetric two-stage scale search engaged via `asym_search=neuqi` with `sym=True`) before the fine additive refinement.
+- **Description**: Number of coarse (log-spaced) scale candidates explored by the asymmetric joint scale/zero-point NeUQI search before the fine additive refinement. The symmetric two-stage search reads this too as its fallback (see `AR_NEUQI_SYM_COARSE`). A real-model KL A/B (Qwen3.8-27B, g128, iters0) measured 64/32 vs 128/64 at 0.02570 vs 0.02571 -- the grid is saturated for real weight groups at the default; denser grids cost ~linear search time for no measured end-to-end gain.
 - **Default**: `"64"`
 - **Valid Values**: any positive integer
 - **Usage**: Lower for faster searches, raise for exhaustive scale sweeps
@@ -212,13 +212,33 @@ export AR_NEUQI_COARSE=64
 ```
 
 ### AR_NEUQI_FINE
-- **Description**: Number of fine (additive) scale refinement candidates per coarse candidate in the NeUQI searches (asymmetric joint sweep and symmetric two-stage variant).
+- **Description**: Number of fine (additive) scale refinement candidates per coarse candidate in the asymmetric joint NeUQI search (and the symmetric search's fallback; see `AR_NEUQI_SYM_FINE`). The fine stage is the cheapest quality lever: it brackets each group's own winner, so a fine doubling buys 3-5x the gap reduction of a coarse doubling at ~10% of the cost (measured on the synthetic convergence sweep).
 - **Default**: `"32"`
 - **Valid Values**: any positive integer
 - **Usage**: Lower for faster searches, raise for finer scale resolution
 
 ```bash
 export AR_NEUQI_FINE=32
+```
+
+### AR_NEUQI_SYM_COARSE
+- **Description**: Coarse candidate count for the symmetric two-stage scale search only. Precedence: this variable, then `AR_NEUQI_COARSE`, then the built-in default. The default 256 matches the grid every measured symmetric result used (pinned via `AR_NEUQI_COARSE` historically; the pin keeps working).
+- **Default**: `"256"`
+- **Valid Values**: any positive integer
+- **Usage**: Pin the symmetric grid independently of the asymmetric one
+
+```bash
+export AR_NEUQI_SYM_COARSE=256
+```
+
+### AR_NEUQI_SYM_FINE
+- **Description**: Fine candidate count for the symmetric two-stage scale search only. Precedence: this variable, then `AR_NEUQI_FINE`, then the built-in default (64, the grid every measured symmetric result used).
+- **Default**: `"64"`
+- **Valid Values**: any positive integer
+- **Usage**: Pin the symmetric grid independently of the asymmetric one
+
+```bash
+export AR_NEUQI_SYM_FINE=64
 ```
 
 ### AR_NEUQI_SYM_UNION

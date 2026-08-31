@@ -1225,17 +1225,21 @@ def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=No
         bits: quantization bit width.
         qw: optional [N, g] float32 per-element loss weights (e.g. imatrix).
         q_scale_thresh: minimum scale magnitude.
-        coarse_n: number of coarse log-spaced candidates (env ``AR_NEUQI_COARSE``).
-        fine_n: number of fine additive candidates (env ``AR_NEUQI_FINE``).
+        coarse_n: number of coarse log-spaced candidates (env
+            ``AR_NEUQI_SYM_COARSE`` falling back to ``AR_NEUQI_COARSE``; default 256).
+        fine_n: number of fine additive candidates (env
+            ``AR_NEUQI_SYM_FINE`` falling back to ``AR_NEUQI_FINE``; default 64).
 
     Returns:
         scale: [N, 1] float32 per-group signed scales (negative = mirrored clamp
         convention won for that group).
     """
     if coarse_n is None:
-        coarse_n = envs.AR_NEUQI_COARSE if envs.AR_NEUQI_COARSE else 64
+        # 256/64 default: the grid every measured sym result used; sym-specific
+        # pins win, shared AR_NEUQI_COARSE/FINE pins still apply (see envs.py)
+        coarse_n = envs.AR_NEUQI_SYM_COARSE
     if fine_n is None:
-        fine_n = envs.AR_NEUQI_FINE if envs.AR_NEUQI_FINE else 32
+        fine_n = envs.AR_NEUQI_SYM_FINE
     _log_sym_search_engaged(coarse_n, fine_n)
     ensure_sym_search_warmup(data.device)
 
