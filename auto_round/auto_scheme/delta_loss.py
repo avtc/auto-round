@@ -3298,6 +3298,15 @@ def _gen_layer_config(
 
         scheme_cache_meta = []
         score_fn = _autoscheme_score_fn()
+        logger.info(
+            "AutoScheme: scoring mode '%s'%s",
+            score_fn,
+            (
+                " (KL divergence to the bf16 teacher distribution)"
+                if score_fn == "kld"
+                else " (model CE loss on calibration text)"
+            ),
+        )
         for index, scheme in enumerate(schemes):
             if check_bf16_scheme(scheme) or _model_id_for_cache is None:
                 scheme_cache_meta.append((None, None, None))

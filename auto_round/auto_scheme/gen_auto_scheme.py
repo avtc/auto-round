@@ -40,12 +40,19 @@ class AutoScheme:
     enable_torch_compile: Optional[bool] = None
     low_gpu_mem_usage: bool = True
     low_cpu_mem_usage: bool = True
+    score_fn: Optional[str] = None  # scoring loss; resolved from AR_AUTO_SCHEME_SCORE below
 
     def __post_init__(self):
+        from auto_round.auto_scheme.delta_loss import _autoscheme_score_fn
+
         if isinstance(self.options, str):
             options = self.options.upper().replace(" ", "")
             self.options = options.split(",")
         self.options = self._deduplicate_options(self.options)
+        # resolve and validate here so a bad AR_AUTO_SCHEME_SCORE fails at
+        # scheme construction, before any model work; also lets callers read
+        # the effective scoring mode off the generator for logging/provenance.
+        self.score_fn = _autoscheme_score_fn()
 
     @staticmethod
     def _deduplicate_options(

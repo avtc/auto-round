@@ -1102,9 +1102,11 @@ class BaseOrchestrator(object):
         model_avg = model_bits / model_params if model_params else float("nan")
         has_target = isinstance(target_avg_bits, (int, float))
 
+        scheme_score_fn = getattr(self.scheme_generator, "score_fn", None)
         logger.info(
-            "AutoScheme final avg_bits: quant layers=%.4f (target=%.4f, %d layers, %d params, total_bits=%d); "
-            "whole model=%.4f (%d layers, %d params, total_bits=%d, informational only)",
+            "AutoScheme final avg_bits (scoring=%s): quant layers=%.4f (target=%.4f, %d layers, %d params, "
+            "total_bits=%d); whole model=%.4f (%d layers, %d params, total_bits=%d, informational only)",
+            scheme_score_fn or "cross-entropy",
             quant_avg,
             float(target_avg_bits) if has_target else float("nan"),
             quant_count,
