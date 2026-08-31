@@ -574,6 +574,62 @@ class TestAutoScheme:
             )
 
 
+class TestAutoSchemeDatasetOverride:
+    """AR_AUTO_SCHEME_DATASET: scoring-only dataset override."""
+
+    def test_override_changes_cache_config_and_identity(self):
+        from auto_round.auto_scheme.delta_loss import _autoscheme_cache_config, _teacher_shard_identity
+
+        base = dict(
+            model_name="test-model",
+            nsamples=16,
+            seqlen=256,
+            batch_size=8,
+            quant_layer_names=["layer.0"],
+            fixed_layer_scheme={},
+            scheme="W4A16",
+            force_mllm=False,
+            low_gpu_mem_usage=True,
+        )
+        ce = _autoscheme_cache_config(dataset="pile-10k", **base)
+        other = _autoscheme_cache_config(dataset="wikitext", **base)
+        assert ce != other and other["dataset"] == "wikitext"
+        name_a, meta_a = _teacher_shard_identity("test-model", "pile-10k", 16, 256, 8)
+        name_b, meta_b = _teacher_shard_identity("test-model", "wikitext", 16, 256, 8)
+        assert name_a != name_b
+
+    def test_override_end_toend_uses_override_for_scoring(self, tiny_opt_model_path, tmp_path, monkeypatch):
+        import glob
+        import json
+
+        from auto_round.auto_scheme.delta_loss import _load_autoscheme_scores
+
+        monkeypatch.chdir(tmp_path)  # relative dataset paths: Windows drive-colon bug
+        cache_dir = str(tmp_path / "as_cache")
+        monkeypatch.setenv("AR_AUTO_SCHEME_CACHE", cache_dir)
+        _make_local_calibration_dataset(tmp_path)
+        # second, distinct dataset file for scoring
+        alt = tmp_path / "alt.json"
+        alt.write_text(json.dumps(["alternative scoring corpus sample for override test. " * 64]))
+
+        scheme = AutoScheme(avg_bits=3, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
+        ar = AutoRound(
+            model=tiny_opt_model_path,
+            scheme=scheme,
+            iters=0,
+            nsamples=1,
+            seqlen=8,
+            dataset="calibration.json",
+        )
+        monkeypatch.setenv("AR_AUTO_SCHEME_DATASET", "alt.json")
+        _, layer_config = ar.quantize()
+        assert layer_config
+        files = glob.glob(os.path.join(cache_dir, "scheme_*.json"))
+        assert files
+        data = _load_autoscheme_scores(files[0])
+        assert data["cache_config"]["dataset"] == "alt.json", "scoring cache must record the override dataset"
+
+
 class TestAutoSchemeKldScoring:
     """AR_AUTO_SCHEME_SCORE=kld: teacher-logit shards + KL loss substitution."""
 

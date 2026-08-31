@@ -2782,6 +2782,21 @@ def _gen_layer_config(
     forward+backward calibration to accumulate ``mix_score`` (weight + activation loss), then
     unwraps and records the result before moving to the next scheme.
     """
+    from auto_round import envs as _envs
+
+    # Scoring-dataset override: affects ONLY AutoScheme scoring (loss collection,
+    # per-scheme cache identity, and teacher-logit shards). The quantization
+    # calibration dataset (imatrix / tuning chain) is unaffected.
+    if _envs.AR_AUTO_SCHEME_DATASET:
+        if _envs.AR_AUTO_SCHEME_DATASET != dataset:
+            logger.info(
+                "AutoScheme: scoring dataset overridden by AR_AUTO_SCHEME_DATASET: %r (main dataset %r stays "
+                "responsible for quantization calibration)",
+                _envs.AR_AUTO_SCHEME_DATASET,
+                dataset,
+            )
+        dataset = _envs.AR_AUTO_SCHEME_DATASET
+
     # Initialize memory tracking for AutoScheme
     memory_monitor = MemoryMonitor()
     # memory_monitor.reset()

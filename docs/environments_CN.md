@@ -141,6 +141,16 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
 export AR_AUTO_SCHEME_SCORE=kld
 ```
 
+### AR_AUTO_SCHEME_DATASET
+- **描述**：仅覆盖 AutoScheme 打分（损失收集、逐 scheme 缓存标识、kld 教师 logits 分片）所用的数据集。量化校准数据集（imatrix / 调整链）不受影响——可以在一个语料上测量 scheme 敏感度，同时在另一个语料上进行量化。
+- **默认值**：未设置 → 打分使用主 `--dataset`（兼容旧行为）
+- **合法取值**：`--dataset` 接受的任何数据集名称或本地路径
+- **用法**：在 wikitext 上打分，同时在 pile-10k 上做量化校准：
+
+```bash
+export AR_AUTO_SCHEME_DATASET=wikitext
+```
+
 ### AR_AUTO_SCHEME_NSAMPLES
 - **描述**：控制 AutoScheme 评分时使用的校准样本数默认值，仅在 `AutoScheme.nsamples` 未显式设置时生效。
 - **默认值**：未设置 → 16

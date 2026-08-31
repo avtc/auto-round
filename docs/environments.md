@@ -147,6 +147,19 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
 export AR_AUTO_SCHEME_SCORE=kld
 ```
 
+### AR_AUTO_SCHEME_DATASET
+- **Description**: Overrides ONLY the dataset used for AutoScheme scoring (loss
+  collection, per-scheme cache identity, and kld teacher-logit shards). The
+  quantization calibration dataset (imatrix / tuning chain) is unaffected — this
+  enables measuring scheme sensitivity on one corpus while quantizing on another.
+- **Default**: unset → the main `--dataset` is used for scoring (legacy behavior)
+- **Valid Values**: any dataset name or local path accepted by `--dataset`
+- **Usage**: Score schemes on wikitext while calibrating quantization on pile-10k:
+
+```bash
+export AR_AUTO_SCHEME_DATASET=wikitext
+```
+
 ### AR_AUTO_SCHEME_NSAMPLES
 - **Description**: Controls the default number of calibration samples used by AutoScheme scoring when `AutoScheme.nsamples` is not explicitly set.
 - **Default**: unset → 16
