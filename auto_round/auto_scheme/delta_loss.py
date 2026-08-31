@@ -2014,11 +2014,28 @@ def _build_teacher_logit_shards(
     vocab_size = None
     was_training = model.training
     model.eval()
+
     # Under the low-GPU staged parent state, blocks live on CPU (or on meta devices
     # in disk-stream mode) while non-block leaves sit on ``major_device``. Reuse the
     # scoring capture machinery: materialize non-block params once, and wrap every
     # block forward so each block moves/materializes on demand and back.
-    staged_forward = low_gpu_mem_usage or disk_index is not None
+    # Forward regime, decided from the actual placement of the block weights:
+    # - disk_index set (meta skeleton): stream blocks from the checkpoint via
+    #   prepare_model_low_gpu + materialize_non_block_params.
+    # - block weights on CPU (low-gpu staged parent): prepare_model_low_gpu
+    #   shuttles each block to major_device for its forward and back.
+    # - block weights already resident on GPU(s) (accelerate dispatch across
+    #   device_map): plain forward -- accelerate's own hooks keep activations
+    #   coherent across devices; forcing everything to major_device would fight
+    #   the dispatch placement (mixed-device matmul crash).
+    def _block_weights_on_cpu():
+        for block_name_ in get_block_names(model)[0]:
+            for param_ in get_module(model, block_name_).parameters():
+                if param_.device.type == "cpu":
+                    return True
+        return False
+
+    staged_forward = disk_index is not None or _block_weights_on_cpu()
     if disk_index is not None:
         from auto_round.utils.disk_stream_util import materialize_non_block_params
 
