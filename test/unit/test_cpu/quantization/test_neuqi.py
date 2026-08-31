@@ -185,20 +185,33 @@ class TestNeuqiLogging:
 
 
 class TestNeuqiSymLogging:
-    def test_sym_engaged_logs_once_per_unique_grid(self, caplog):
+    def test_sym_engaged_logs_once_per_unique_grid(self):
         """Grid sweeps cycle configs in one process; the engaged line must fire
-        once per unique (coarse, fine), not once per call."""
+        once per unique (coarse, fine), not once per call. The project logger
+        ("autoround") does not propagate, so capture with a direct handler
+        (same pattern as TestNeuqiLogging._LogCapture)."""
         import logging
 
         from auto_round.data_type.neuqi import _log_sym_search_engaged
 
-        with caplog.at_level(logging.INFO, logger="auto_round"):
+        records = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        lg = logging.getLogger("autoround")
+        h = _Cap()
+        lg.addHandler(h)
+        try:
             _log_sym_search_engaged.cache_clear()
             _log_sym_search_engaged(64, 32)
             _log_sym_search_engaged(64, 32)
             _log_sym_search_engaged(128, 64)
             _log_sym_search_engaged(64, 32)
-        msgs = [r.message for r in caplog.records if "two-stage symmetric" in r.message]
+        finally:
+            lg.removeHandler(h)
+        msgs = [m for m in records if "two-stage symmetric" in m]
         assert len(msgs) == 2  # (64,32) once + (128,64) once
 
 
