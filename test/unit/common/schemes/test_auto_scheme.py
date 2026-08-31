@@ -574,6 +574,75 @@ class TestAutoScheme:
             )
 
 
+def test_autoscheme_cache_key_default_score_fn_matches_legacy_ce_key():
+    """Default score_fn must NOT change the cache key: existing cross-entropy caches stay valid."""
+    from auto_round.auto_scheme.delta_loss import _autoscheme_cache_config
+
+    kwargs = dict(
+        model_name="test-model",
+        dataset="pile-10k",
+        nsamples=16,
+        seqlen=256,
+        batch_size=8,
+        quant_layer_names=["layer.0"],
+        fixed_layer_scheme={},
+        scheme="W4A16",
+        force_mllm=False,
+        low_gpu_mem_usage=True,
+    )
+    legacy = _autoscheme_cache_config(**kwargs)
+    defaulted = _autoscheme_cache_config(**kwargs)  # score_fn unset -> default
+    assert defaulted == legacy, "default score_fn must leave cache_config byte-identical to legacy"
+    assert "score_fn" not in defaulted, "default score_fn must be omitted for backward compatibility"
+
+    # Explicit default is also omitted (no key churn for users passing the default)
+    explicit = _autoscheme_cache_config(score_fn="cross-entropy", **kwargs)
+    assert explicit == legacy
+
+
+def test_autoscheme_cache_key_kld_separates_from_ce():
+    """kld score_fn must land in cache_config so kld and ce caches never collide."""
+    from auto_round.auto_scheme.delta_loss import _autoscheme_cache_config, _autoscheme_cache_key
+
+    kwargs = dict(
+        model_name="test-model",
+        dataset="pile-10k",
+        nsamples=16,
+        seqlen=256,
+        batch_size=8,
+        quant_layer_names=["layer.0"],
+        fixed_layer_scheme={},
+        scheme="W4A16",
+        force_mllm=False,
+        low_gpu_mem_usage=True,
+    )
+    ce_cfg = _autoscheme_cache_config(**kwargs)
+    kld_cfg = _autoscheme_cache_config(score_fn="kld", **kwargs)
+    assert kld_cfg["score_fn"] == "kld"
+    assert ce_cfg != kld_cfg
+    ce_key = _autoscheme_cache_key(**kwargs)
+    kld_key = _autoscheme_cache_key(score_fn="kld", **kwargs)
+    assert ce_key != kld_key
+
+
+def test_autoscheme_score_fn_env_validation(monkeypatch):
+    """AR_AUTO_SCHEME_SCORE accepts only cross-entropy|kld; anything else must fail loud."""
+    from auto_round.auto_scheme.delta_loss import _autoscheme_score_fn
+
+    monkeypatch.delenv("AR_AUTO_SCHEME_SCORE", raising=False)
+    assert _autoscheme_score_fn() == "cross-entropy"
+
+    monkeypatch.setenv("AR_AUTO_SCHEME_SCORE", "kld")
+    assert _autoscheme_score_fn() == "kld"
+
+    monkeypatch.setenv("AR_AUTO_SCHEME_SCORE", "KLD")
+    assert _autoscheme_score_fn() == "kld"  # case-insensitive
+
+    monkeypatch.setenv("AR_AUTO_SCHEME_SCORE", "mse")
+    with pytest.raises(ValueError, match="AR_AUTO_SCHEME_SCORE"):
+        _autoscheme_score_fn()
+
+
 def test_autoscheme_cache_key_different_for_different_schemes():
     """Per-scheme cache: different schemes should produce different cache keys."""
     from auto_round.auto_scheme.delta_loss import _autoscheme_cache_key

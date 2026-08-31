@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     AR_AUTO_SCHEME_NSAMPLES: Optional[int] = None
     AR_AUTO_SCHEME_BATCH_SIZE: Optional[int] = None
     AR_AUTO_SCHEME_CACHE: Optional[str] = None
+    AR_AUTO_SCHEME_SCORE: str = "cross-entropy"
     AR_AUTO_SCHEME_NO_SERIAL_FALLBACK: bool = False
     AR_ENABLE_AUTO_SCHEME_PARALLEL: bool = True
     AR_NVFP4_E5M3_CACHE_HP_WEIGHT: bool = False
@@ -105,6 +106,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Stores persistent AutoScheme scoring results independently from AR_WORK_SPACE,
     # whose contents are temporary working data and may be cleaned after a run.
     "AR_AUTO_SCHEME_CACHE": lambda: os.getenv("AR_AUTO_SCHEME_CACHE", None),
+    # AutoScheme scoring loss: "cross-entropy" (default, legacy behavior) or "kld"
+    # (KL divergence to the bf16 teacher's full output distribution).
+    "AR_AUTO_SCHEME_SCORE": lambda: os.getenv("AR_AUTO_SCHEME_SCORE", "cross-entropy"),
     "AR_AUTO_SCHEME_NO_SERIAL_FALLBACK": lambda: os.getenv("AR_AUTO_SCHEME_NO_SERIAL_FALLBACK", "0").lower()
     in ("1", "true", "yes"),
     # Enables AutoScheme to score schemes in parallel. Enabled by default;

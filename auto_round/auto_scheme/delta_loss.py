@@ -1874,6 +1874,26 @@ def _stable_model_id(model_name):
     return os.path.basename(normalized) or normalized
 
 
+_AUTOSCHEME_SCORE_FNS = ("cross-entropy", "kld")
+
+
+def _autoscheme_score_fn():
+    """Resolve and validate the AutoScheme scoring loss from ``AR_AUTO_SCHEME_SCORE``.
+
+    Accepts ``cross-entropy`` (default; the model's own CE loss on calibration text)
+    or ``kld`` (KL divergence to the bf16 teacher's output distribution). Any other
+    value fails loud at resolution time -- never a silent fallback to the default.
+    """
+    from auto_round import envs as _envs
+
+    value = str(_envs.AR_AUTO_SCHEME_SCORE or "cross-entropy").strip().lower()
+    if value not in _AUTOSCHEME_SCORE_FNS:
+        raise ValueError(
+            f"AR_AUTO_SCHEME_SCORE must be one of {list(_AUTOSCHEME_SCORE_FNS)} " f"(case-insensitive), got {value!r}."
+        )
+    return value
+
+
 def _autoscheme_cache_config(
     model_name,
     dataset,
@@ -1886,9 +1906,15 @@ def _autoscheme_cache_config(
     force_mllm,
     low_gpu_mem_usage,
     need_weight_grad=False,
+    score_fn="cross-entropy",
 ):
-    """Build the portable, implementation-independent identity of a scoring run."""
-    return {
+    """Build the portable, implementation-independent identity of a scoring run.
+
+    ``score_fn`` is omitted from the identity when it equals the default so that
+    legacy ``cross-entropy`` cache files keep validating; ``kld`` runs land in
+    separate cache files automatically.
+    """
+    config = {
         "model_id": _stable_model_id(model_name),
         "dataset": dataset,
         "nsamples": nsamples,
@@ -1901,6 +1927,9 @@ def _autoscheme_cache_config(
         "low_gpu_mem_usage": low_gpu_mem_usage,
         "need_weight_grad": need_weight_grad,
     }
+    if score_fn != "cross-entropy":
+        config["score_fn"] = score_fn
+    return config
 
 
 def _autoscheme_cache_key(
@@ -1915,6 +1944,7 @@ def _autoscheme_cache_key(
     force_mllm,
     low_gpu_mem_usage,
     need_weight_grad=False,
+    score_fn="cross-entropy",
 ):
     """Return a 16-char hex digest that uniquely identifies a **single-scheme** scoring run.
 
@@ -1936,6 +1966,7 @@ def _autoscheme_cache_key(
         force_mllm,
         low_gpu_mem_usage,
         need_weight_grad,
+        score_fn,
     )
     key_str = json.dumps(key_data, sort_keys=True, default=str)
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
@@ -2910,6 +2941,7 @@ def _gen_layer_config(
             )
 
         scheme_cache_meta = []
+        score_fn = _autoscheme_score_fn()
         for index, scheme in enumerate(schemes):
             if check_bf16_scheme(scheme) or _model_id_for_cache is None:
                 scheme_cache_meta.append((None, None, None))
@@ -2934,6 +2966,7 @@ def _gen_layer_config(
                 force_mllm=force_mllm,
                 low_gpu_mem_usage=auto_scheme.low_gpu_mem_usage,
                 need_weight_grad=need_weight_grad,
+                score_fn=score_fn,
             )
             cache_key = hashlib.sha256(json.dumps(cache_config, sort_keys=True, default=str).encode()).hexdigest()[:16]
             cache_path = _autoscheme_cache_path(cache_key, index)
