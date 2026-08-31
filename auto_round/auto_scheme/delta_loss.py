@@ -2029,15 +2029,19 @@ def _build_teacher_logit_shards(
     #   accelerate's own hooks keep activations coherent across devices; the
     #   shuttling would fight the per-module placement (mixed-device matmul
     #   crash, because move_module_to_tuning_device respects tuning_device).
-    def _all_block_weights_on_cpu():
+    def _all_block_weights_off_gpu():
+        # True only when every block weight is on CPU (staged parent) or on the
+        # meta device (disk-stream skeleton). ANY GPU-resident block weight
+        # means accelerate owns placement (dispatch across device_map, possibly
+        # with partial CPU offload) and the plain-forward regime must be used.
         for block_name_ in get_block_names(model)[0]:
             for param_ in get_module(model, block_name_).parameters():
-                if param_.device.type != "cpu":
+                if param_.device.type not in ("cpu", "meta"):
                     return False
         return True
 
-    staged_forward = disk_index is not None or _all_block_weights_on_cpu()
-    if disk_index is not None:
+    staged_forward = _all_block_weights_off_gpu()
+    if staged_forward and disk_index is not None:
         from auto_round.utils.disk_stream_util import materialize_non_block_params
 
         materialize_non_block_params(model, get_block_names(model)[0], disk_index, device="cpu")
