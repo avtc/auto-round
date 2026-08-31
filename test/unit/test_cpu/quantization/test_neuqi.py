@@ -803,6 +803,30 @@ class TestNeuqiSymIntegration:
         assert torch.allclose(qdq, manual, rtol=1e-3, atol=1e-4)
         assert (scale < 0).any()  # mirrored family won somewhere
 
+    def test_sym_wrapper_supports_imatrix_off_1d_2d(self):
+        """qw=None (imatrix off), per-column 1-D and per-row 2-D weights all flow;
+        weighting must steer the search (lower weighted loss than the unweighted
+        solution under the same weights)."""
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym, quant_tensor_opt_rtn_sym_neuqi
+
+        torch.manual_seed(17)
+        w = torch.randn(32, 256)
+        w[:, :24] *= -40.0
+        for im in (None, torch.rand(256) + 0.05, torch.rand(32, 256) + 0.05):
+            qdq, scale, _ = quant_tensor_opt_rtn_sym_neuqi(w.clone(), bits=4, group_size=32, imatrix=im)
+            assert torch.isfinite(qdq).all()
+
+        d = w.reshape(-1, 32)
+        qw = (torch.rand(32, 256) + 0.05).reshape(-1, 32)
+        s_q = neuqi_search_scale_sym(d.clone(), bits=4, qw=qw.clone())
+        s_p = neuqi_search_scale_sym(d.clone(), bits=4, qw=None)
+
+        def wloss(s):
+            iq = (d / s).round().clamp(-8, 7)
+            return ((s * iq - d) ** 2 * qw).sum().item()
+
+        assert wloss(s_q) < wloss(s_p)
+
     def test_config_allows_neuqi_sym_rejects_minmax_sym(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
