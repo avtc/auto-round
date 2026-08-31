@@ -2064,7 +2064,19 @@ def _build_teacher_logit_shards(
             else:
                 _record_homes(block_module)
                 block_module.to(forward_device)
-            return original_forward(*args, **kwargs)
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                # Restore immediately after THIS block's forward: without this,
+                # every processed block stays on forward_device and the pass
+                # OOMs mid-model. The block's output tensor already lives on
+                # forward_device and flows to the next block unharmed.
+                if is_meta_model:
+                    from auto_round.utils.disk_stream_util import free_module
+
+                    free_module(block_module)
+                else:
+                    _restore_homes(block_module)
 
         return new_forward
 
@@ -2095,15 +2107,6 @@ def _build_teacher_logit_shards(
                     os.path.join(tmp_dir, f"batch_{batch_idx:04d}.pt"),
                 )
                 num_batches = batch_idx
-                for name in block_names:
-                    block_module = get_module(model, name)
-                    if is_meta_model:
-                        from auto_round.utils.disk_stream_util import free_module
-
-                        free_module(block_module)
-                    else:
-                        _restore_homes(block_module)
-                    block_module.forward = block_module.orig_forward
         if num_batches == 0:
             raise RuntimeError("teacher shard build produced zero batches; check dataset/nsamples")
         manifest = {
