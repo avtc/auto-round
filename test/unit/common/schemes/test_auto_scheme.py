@@ -660,10 +660,15 @@ class TestAutoSchemeKldScoring:
         z_q = (torch.randn(5, 11, 37) * 0.2 + z_fp).requires_grad_(True)
         # force many tiny chunks
         got = _kld_loss(z_q, z_fp, chunk_tokens=3)
+        z_ref = z_q.detach().clone().requires_grad_(True)
         lp_t = torch.log_softmax(z_fp.float(), dim=-1)
-        lq = torch.log_softmax(z_q.float(), dim=-1)
-        ref = (lp_t.exp() * (lp_t - lq)).sum()
+        lq_ref = torch.log_softmax(z_ref.float(), dim=-1)
+        ref = (lp_t.exp() * (lp_t - lq_ref)).sum()
         assert torch.allclose(got, ref, rtol=1e-5, atol=1e-4)
+        # analytic chunk backward must reproduce the autograd gradient
+        got.backward()
+        ref.backward()
+        assert torch.allclose(z_q.grad, z_ref.grad, rtol=1e-4, atol=1e-5)
         # teacher on a different device (cpu) than student works too
         if torch.cuda.is_available():
             zq_cuda = z_q.detach().cuda().requires_grad_(True)

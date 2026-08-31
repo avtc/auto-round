@@ -1902,14 +1902,40 @@ def _stable_model_id(model_name):
     return os.path.basename(normalized) or normalized
 
 
-def _kld_loss(z_q, z_fp, chunk_tokens=2048):
-    """Full-vocabulary KL(teacher || student) summed over all positions, fp32 chunked.
+class _KLChunkToTeacher(torch.autograd.Function):
+    """KL(teacher || student) for one token chunk with an analytic backward.
 
-    ``z_fp`` is a detached teacher-logits tensor (any float dtype, any device);
-    gradients flow through ``z_q`` only. Teacher chunks are transferred to the
-    student's device one at a time so the teacher never needs full GPU residency.
-    Note: per-chunk autograd state is retained until backward, exactly like the
-    CE path's full-vocab loss computation over the same logits tensor.
+    The gradient of KL w.r.t. the student logits is exactly ``p_student - p_teacher``,
+    so backward recomputes the softmaxes instead of autograd retaining a fp32
+    log-softmax output per chunk (which OOMed scoring workers on large-vocab
+    models). Saves only the bf16 chunk views; the student view shares storage
+    with the model's logits tensor.
+    """
+
+    @staticmethod
+    def forward(ctx, q, t):  # pylint: disable=arguments-differ
+        ctx.save_for_backward(q, t)
+        with torch.no_grad():
+            log_q = torch.log_softmax(q.float(), dim=-1)
+            log_t = torch.log_softmax(t.float(), dim=-1)
+            return (log_t.exp() * (log_t - log_q)).sum()
+
+    @staticmethod
+    def backward(ctx, grad_out):  # pylint: disable=arguments-differ
+        q, t = ctx.saved_tensors
+        with torch.no_grad():
+            p_q = torch.log_softmax(q.float(), dim=-1).exp()
+            p_t = torch.log_softmax(t.float(), dim=-1).exp()
+            grad = grad_out * (p_q - p_t)
+        return grad.to(q.dtype), None
+
+
+def _kld_loss(z_q, z_fp, chunk_tokens=1024):
+    """Full-vocabulary KL(teacher || student) summed over all positions, fp32 math.
+
+    ``z_fp`` is a detached teacher-logits tensor (any float dtype, typically CPU
+    bf16); gradients flow through ``z_q`` only via the analytic chunk backward.
+    Teacher chunks are transferred to the student's device one at a time.
     """
     if tuple(z_fp.shape) != tuple(z_q.shape):
         raise RuntimeError(
@@ -1922,10 +1948,7 @@ def _kld_loss(z_q, z_fp, chunk_tokens=2048):
     for start in range(0, z_q2.shape[0], chunk_tokens):
         sl = slice(start, start + chunk_tokens)
         t_chunk = z_fp2[sl].to(device=z_q2.device, dtype=z_q2.dtype)
-        log_q = torch.log_softmax(z_q2[sl].float(), dim=-1)
-        with torch.no_grad():
-            log_t = torch.log_softmax(t_chunk.float(), dim=-1)
-        total = total + (log_t.exp() * (log_t - log_q)).sum()
+        total = total + _KLChunkToTeacher.apply(z_q2[sl], t_chunk)
     return total
 
 
