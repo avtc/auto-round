@@ -264,6 +264,9 @@ def _zp_wants_compile(device_type: str) -> bool:
 _triton_sweep = None
 _triton_checked = False
 _triton_broken = False
+_neuqi_shared_sweep = None
+_neuqi_shared_checked = False
+_neuqi_shared_broken = False
 
 
 def _triton_sweep_fn():
@@ -280,6 +283,94 @@ def _triton_sweep_fn():
             logger.info("[NeUQI] Triton sweep unavailable (%s); using the torch.compile sweeps", e)
             _triton_sweep = None
     return _triton_sweep
+
+
+def _neuqi_shared_sweep_fn():
+    """Resolve the extension shared-multiplier coarse kernel once."""
+    global _neuqi_shared_sweep, _neuqi_shared_checked
+    if not _neuqi_shared_checked:
+        _neuqi_shared_checked = True
+        try:
+            from auto_round_extension.triton.neuqi_sweep import neuqi_shared_sweep_triton
+
+            _neuqi_shared_sweep = neuqi_shared_sweep_triton
+            logger.info(
+                "[NeUQI] Triton shared-multiplier coarse sweep engaged (auto_round_extension.triton.neuqi_sweep)"
+            )
+        except Exception as e:
+            _neuqi_shared_sweep = None
+            logger.info("[NeUQI] shared coarse sweep unavailable (%s); using the batched path", e)
+    return _neuqi_shared_sweep
+
+
+def _neuqi_shared_attempt(dn, qw, fracs, invf, maxq):
+    """Try the shared-multiplier coarse kernel; ``None`` (and a latch) on failure."""
+    global _neuqi_shared_broken
+    if _neuqi_shared_broken or not dn.is_cuda:
+        return None
+    if not _zp_wants_triton(dn.device.type) or not _zp_batch_wanted(dn.device.type):
+        return None
+    fn = _neuqi_shared_sweep_fn()
+    if fn is None:
+        return None
+    try:
+        return fn(dn, qw, fracs, invf, maxq)
+    except Exception as e:
+        _neuqi_shared_broken = True
+        torch.cuda.empty_cache()  # a failed launch may hold pooled memory
+        logger.warning("[NeUQI] shared coarse sweep failed (%s); using the batched path", e)
+        return None
+
+
+def _zp_coarse_pass_shared(data, qw, s0, coarse, maxq, launch=None):
+    """Coarse pass of the joint search in normalized space (shared-multiplier grid).
+
+    Computes dn = w / s0 once, evaluates every group against the SHARED frac
+    grid through ``launch`` (default: the gated Triton attempt), and
+    unnormalizes each winner's loss by s0^2 so the fine stage can compare
+    across stages. Returns (best_loss, best_frac, best_zp) or ``None`` when
+    the kernel is unavailable -- the caller then serves the identical
+    candidate grid through the batched / per-candidate paths.
+
+    ``launch`` is injectable so the driver math (normalization, s0^2
+    unnormalization, frac/zp mapping) stays unit-testable on CPU.
+    """
+    n_groups = data.shape[0]
+    if launch is None:
+        # pre-gate before any tensor math: CPU / non-triton backends must not
+        # pay for the normalized copy
+        if (
+            _neuqi_shared_broken
+            or not data.is_cuda
+            or not _zp_wants_triton(data.device.type)
+            or not _zp_batch_wanted(data.device.type)
+        ):
+            return None
+        launch = _neuqi_shared_attempt
+    dn = data / s0
+    invf = 1.0 / coarse
+    best_loss = torch.full((n_groups,), float("inf"), device=data.device, dtype=torch.float32)
+    best_frac = torch.ones(n_groups, device=data.device, dtype=torch.float32)
+    best_zp = torch.zeros(n_groups, device=data.device, dtype=torch.float32)
+    chunk = 262144
+    for start in range(0, n_groups, chunk):
+        stop = min(start + chunk, n_groups)
+        out = launch(
+            dn[start:stop].contiguous(),
+            qw[start:stop].contiguous() if qw is not None else None,
+            coarse,
+            invf,
+            maxq,
+        )
+        if out is None:
+            return None
+        loss_n, k_idx, zp = out
+        loss = loss_n * s0[start:stop].squeeze(-1) ** 2
+        frac = coarse.index_select(0, k_idx)
+        best_loss[start:stop] = loss
+        best_frac[start:stop] = frac
+        best_zp[start:stop] = zp.to(torch.float32)
+    return best_loss, best_frac, best_zp
 
 
 _BACKEND_OVERRIDE = None  # set by backend_override(); None = env-driven
@@ -324,28 +415,45 @@ def ensure_sweep_warmup(device) -> None:
     """
     if device.type != "cuda":
         return
+    global _triton_broken, _neuqi_shared_broken
     with _sweep_warm_lock:
         if device.index in _sweep_warmed_devices:
             return
         _sweep_warmed_devices.add(device.index)
-        if not _zp_wants_triton(device.type):
-            return
-        fn = _triton_sweep_fn()
-        if fn is None:
-            return
-        global _triton_broken
-        try:
-            data = torch.randn(4, 128, device=device, dtype=torch.float32)
-            scales = torch.rand(4, 2, device=device, dtype=torch.float32) * 0.01 + 0.001
-            with torch.cuda.device(device):  # Triton launches on the CURRENT device
-                loss, _zp = fn(data, torch.ones_like(data), scales, 15)
-            torch.cuda.synchronize(device)
-            if not torch.isfinite(loss).all():
-                raise RuntimeError("warmup produced non-finite losses")
-            logger.info("[NeUQI] Triton sweep warmed on %s", device)
-        except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
-            _triton_broken = True
-            logger.warning("[NeUQI] Triton sweep warmup failed on %s (%s); using torch.compile sweeps", device, e)
+        if _zp_wants_triton(device.type):
+            fn = _triton_sweep_fn()
+            if fn is not None:
+                try:
+                    data = torch.randn(4, 128, device=device, dtype=torch.float32)
+                    scales = torch.rand(4, 2, device=device, dtype=torch.float32) * 0.01 + 0.001
+                    with torch.cuda.device(device):  # Triton launches on the CURRENT device
+                        loss, _zp = fn(data, torch.ones_like(data), scales, 15)
+                    torch.cuda.synchronize(device)
+                    if not torch.isfinite(loss).all():
+                        raise RuntimeError("warmup produced non-finite losses")
+                    logger.info("[NeUQI] Triton sweep warmed on %s", device)
+                except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
+                    _triton_broken = True
+                    logger.warning(
+                        "[NeUQI] Triton sweep warmup failed on %s (%s); using torch.compile sweeps", device, e
+                    )
+        if _zp_wants_triton(device.type) and _zp_batch_wanted(device.type):
+            fn = _neuqi_shared_sweep_fn()
+            if fn is not None:
+                try:
+                    dn = torch.randn(4, 128, device=device, dtype=torch.float32)
+                    fracs = torch.rand(8, device=device, dtype=torch.float32) * 0.5 + 0.5
+                    with torch.cuda.device(device):
+                        loss, _k, _z = fn(dn, torch.ones_like(dn), fracs, 1.0 / fracs, 15)
+                    torch.cuda.synchronize(device)
+                    if not torch.isfinite(loss).all():
+                        raise RuntimeError("warmup produced non-finite losses")
+                    logger.info("[NeUQI] shared coarse sweep warmed on %s", device)
+                except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
+                    _neuqi_shared_broken = True
+                    logger.warning(
+                        "[NeUQI] shared coarse sweep warmup failed on %s (%s); using the batched path", device, e
+                    )
 
 
 class backend_override:
@@ -553,10 +661,17 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     batch_wanted = _zp_batch_wanted(data.device.type)
 
     # Coarse pass: shared log-spaced fractions of the per-group min-max scale.
-    # Batched fast path first: every candidate in one fused call per group chunk
-    # (AR_NEUQI_BATCH); the per-candidate loop is the reference and the fallback.
+    # Fastest path: the shared-multiplier Triton kernel evaluates the whole
+    # grid in normalized space (dn = w / s0; one shared 1/frac multiply per
+    # candidate, argmin over (k, z) in-kernel). Batched fast path next: every
+    # candidate in one fused call per group chunk (AR_NEUQI_BATCH); the
+    # per-candidate loop is the reference and the fallback.
+    shared_out = _zp_coarse_pass_shared(data, qw, s0, coarse, maxq)
     coarse_done = False
-    if batch_wanted:
+    if shared_out is not None:
+        best_loss, best_frac, best_zp = shared_out
+        coarse_done = True
+    elif batch_wanted:
         chunk_b = max(1, _MAX_TMP_ELEMS // (coarse_n * (maxq + 1)))
         for start in range(0, n_groups, chunk_b):
             stop = min(start + chunk_b, n_groups)

@@ -83,6 +83,11 @@ except Exception as e:  # pragma: no cover - depends on host toolchain
 if triton is not None:
 
     @triton.jit
+    def _rint_f32(x):
+        """Native round-half-to-even: cvt.rni.f32.f32 (exact torch.round)."""
+        return tl.inline_asm_elementwise("cvt.rni.f32.f32 $0, $1;", "=r,r", [x], dtype=tl.float32, is_pure=True, pack=1)
+
+    @triton.jit
     def _neuqi_sweep_kernel(
         data_ptr,
         qw_ptr,
@@ -97,7 +102,18 @@ if triton is not None:
         HAS_QW: tl.constexpr,
         BC: tl.constexpr,
         GP: tl.constexpr,
+        NOMASK: tl.constexpr,
+        ZU: tl.constexpr,
     ):
+        """Registers-resident (candidate, zero-point) sweep.
+
+        Rounding is native cvt.rni.f32.f32 (round-half-to-even, exactly
+        torch.round; measured selection-identical to the previous arithmetic
+        emulation). NOMASK skips the tail-group mask selects when GP == G
+        (pow2 group size). ZU statically unrolls the zero-point loop when
+        MAXQ + 1 <= 32 (bits <= 5) for ILP -- wider bit widths keep the
+        runtime loop to bound compile time and register pressure.
+        """
         pid = tl.program_id(0)
         c_off = pid * BC + tl.arange(0, BC)
         g_off = tl.arange(0, GP)
@@ -111,23 +127,34 @@ if triton is not None:
         for k in range(0, K):
             sc = tl.load(scales_ptr + c_off * K + k, mask=cm, other=1.0)  # [BC]
             x = d / sc[:, None]
-            fl = tl.floor(x)
-            fr = x - fl
-            # round-half-to-even (matches torch.round)
-            fl_odd = fl - 2.0 * tl.floor(fl * 0.5) == 1.0
-            take_up = (fr > 0.5) | ((fr == 0.5) & fl_odd)
-            r = fl + take_up.to(tl.float32)
+            r = _rint_f32(x)
             r = tl.minimum(tl.maximum(r, -MAXQ - 1.0), 2.0 * MAXQ + 1.0)
             best = tl.zeros((BC,), dtype=tl.float32) + float("inf")
             bz = tl.zeros((BC,), dtype=tl.int32)
-            for z in range(0, NZ):
-                q = tl.minimum(tl.maximum(r + z, 0.0), MAXQ)
-                err = sc[:, None] * (q - z) - d
-                loss2 = err * err * qwt
-                acc = tl.sum(tl.where(gm[None, :], loss2, 0.0), axis=1)
-                better = acc < best  # strict: ascending z keeps the first minimum
-                best = tl.where(better, acc, best)
-                bz = tl.where(better, z, bz)
+            if ZU:
+                for z in tl.static_range(0, MAXQ + 1):
+                    q = tl.minimum(tl.maximum(r + z, 0.0), MAXQ)
+                    err = sc[:, None] * (q - z) - d
+                    loss2 = err * err * qwt
+                    if NOMASK:
+                        acc = tl.sum(loss2, axis=1)
+                    else:
+                        acc = tl.sum(tl.where(gm[None, :], loss2, 0.0), axis=1)
+                    better = acc < best  # strict: ascending z keeps the first minimum
+                    best = tl.where(better, acc, best)
+                    bz = tl.where(better, z, bz)
+            else:
+                for z in range(0, NZ):
+                    q = tl.minimum(tl.maximum(r + z, 0.0), MAXQ)
+                    err = sc[:, None] * (q - z) - d
+                    loss2 = err * err * qwt
+                    if NOMASK:
+                        acc = tl.sum(loss2, axis=1)
+                    else:
+                        acc = tl.sum(tl.where(gm[None, :], loss2, 0.0), axis=1)
+                    better = acc < best
+                    best = tl.where(better, acc, best)
+                    bz = tl.where(better, z, bz)
             tl.store(loss_ptr + c_off * K + k, best, mask=cm)
             tl.store(zp_ptr + c_off * K + k, bz, mask=cm)
 
@@ -189,6 +216,142 @@ if triton is not None:
         tl.store(loss_ptr + c_off, best, mask=cm)
         tl.store(idx_ptr + c_off, bk, mask=cm)
         tl.store(mirror_ptr + c_off, bmir, mask=cm)
+
+
+if triton is not None:
+
+    @triton.jit
+    def _neuqi_shared_kernel(
+        dn_ptr,
+        qw_ptr,
+        fracs_ptr,
+        invf_ptr,
+        loss_ptr,
+        kp_ptr,
+        zp_ptr,
+        C,
+        G,
+        K,
+        MAXQ: tl.constexpr,
+        HAS_QW: tl.constexpr,
+        BC: tl.constexpr,
+        GP: tl.constexpr,
+        NOMASK: tl.constexpr,
+        ZU: tl.constexpr,
+    ):
+        """Coarse stage of the joint (scale, zero-point) search in NORMALIZED space.
+
+        The driver precomputes dn = w / s0 once (s0 = per-group min-max
+        scale); every group then shares the same candidate fracs f_k, so the
+        kernel multiplies dn by the SHARED 1/f_k scalar -- no [C, K] scales
+        tensor, no division inside the candidate loop. The loss omits the
+        s0^2 factor (the argmin over (k, z) within a group is invariant); the
+        driver unnormalizes the winner. In-kernel argmin over k keeps the
+        ascending-k first-minimum rule of torch's min(dim=1). Rounding is
+        native cvt.rni.f32.f32; tie rules match the reference sweep (ascending
+        z keeps the first minimum, strict <).
+        """
+        pid = tl.program_id(0)
+        c_off = pid * BC + tl.arange(0, BC)
+        g_off = tl.arange(0, GP)
+        cm = c_off < C
+        gm = g_off < G
+        d = tl.load(dn_ptr + c_off[:, None] * G + g_off[None, :], mask=cm[:, None] & gm[None, :], other=0.0)
+        if HAS_QW:
+            qwt = tl.load(qw_ptr + c_off[:, None] * G + g_off[None, :], mask=cm[:, None] & gm[None, :], other=0.0)
+        else:
+            qwt = tl.zeros((BC, GP), dtype=tl.float32) + 1.0
+        best = tl.zeros((BC,), dtype=tl.float32) + float("inf")
+        bk = tl.zeros((BC,), dtype=tl.int32)
+        bz = tl.zeros((BC,), dtype=tl.int32)
+        for k in range(0, K):
+            f = tl.load(fracs_ptr + k)
+            invf = tl.load(invf_ptr + k)
+            x = d * invf
+            r = _rint_f32(x)
+            r = tl.minimum(tl.maximum(r, -MAXQ - 1.0), 2.0 * MAXQ + 1.0)
+            l_best = tl.zeros((BC,), dtype=tl.float32) + float("inf")
+            l_bz = tl.zeros((BC,), dtype=tl.int32)
+            if ZU:
+                for z in tl.static_range(0, MAXQ + 1):
+                    q = tl.minimum(tl.maximum(r + z, 0.0), MAXQ)
+                    err = f * (q - z) - d
+                    loss2 = err * err * qwt
+                    if NOMASK:
+                        acc = tl.sum(loss2, axis=1)
+                    else:
+                        acc = tl.sum(tl.where(gm[None, :], loss2, 0.0), axis=1)
+                    better = acc < l_best
+                    l_best = tl.where(better, acc, l_best)
+                    l_bz = tl.where(better, z, l_bz)
+            else:
+                for z in range(0, MAXQ + 1):
+                    q = tl.minimum(tl.maximum(r + z, 0.0), MAXQ)
+                    err = f * (q - z) - d
+                    loss2 = err * err * qwt
+                    if NOMASK:
+                        acc = tl.sum(loss2, axis=1)
+                    else:
+                        acc = tl.sum(tl.where(gm[None, :], loss2, 0.0), axis=1)
+                    better = acc < l_best
+                    l_best = tl.where(better, acc, l_best)
+                    l_bz = tl.where(better, z, l_bz)
+            better_k = l_best < best
+            best = tl.where(better_k, l_best, best)
+            bk = tl.where(better_k, k, bk)
+            bz = tl.where(better_k, l_bz, bz)
+        tl.store(loss_ptr + c_off, best, mask=cm)
+        tl.store(kp_ptr + c_off, bk, mask=cm)
+        tl.store(zp_ptr + c_off, bz, mask=cm)
+
+
+def neuqi_shared_sweep_triton(dn, qw, fracs, invf, maxq):
+    """Coarse-stage joint (scale, zero-point) search in normalized space on CUDA.
+
+    Returns (best NORMALIZED loss [C] float32, best candidate index [C] int64,
+    best zero point [C] int32); the driver unnormalizes the loss by s0^2 and
+    maps the index through the shared frac grid.
+    """
+    assert triton is not None, f"triton is not importable: {_TRITON_IMPORT_ERROR}"
+    assert dn.is_cuda and dn.dtype == torch.float32 and dn.is_contiguous()
+    assert fracs.is_contiguous() and fracs.dtype == torch.float32 and fracs.ndim == 1
+    assert invf.is_contiguous() and invf.dtype == torch.float32 and invf.shape == fracs.shape
+    if qw is not None:
+        assert qw.dtype == torch.float32 and qw.is_contiguous() and qw.shape == dn.shape
+    _dev = dn.device
+    assert fracs.device == _dev, f"neuqi_shared: fracs on {fracs.device} but dn on {_dev}"
+    assert invf.device == _dev, f"neuqi_shared: invf on {invf.device} but dn on {_dev}"
+    if qw is not None:
+        assert qw.device == _dev, f"neuqi_shared: qw on {qw.device} but dn on {_dev}"
+
+    c, g = dn.shape
+    k = fracs.numel()
+    gp = _next_pow2(g)
+    bc = max(1, min(64, 4096 // gp))
+    loss = torch.empty((c,), device=_dev, dtype=torch.float32)
+    kp = torch.empty((c,), device=_dev, dtype=torch.int32)
+    zp = torch.empty((c,), device=_dev, dtype=torch.int32)
+    with torch.cuda.device(_dev):  # Triton launches on the CURRENT device
+        _neuqi_shared_kernel[(triton.cdiv(c, bc),)](
+            dn,
+            qw if qw is not None else dn,  # dummy pointer when unweighted (dead lanes)
+            fracs,
+            invf,
+            loss,
+            kp,
+            zp,
+            c,
+            g,
+            k,
+            MAXQ=maxq,
+            HAS_QW=qw is not None,
+            BC=bc,
+            GP=gp,
+            NOMASK=gp == g,
+            ZU=maxq + 1 <= 32,
+            num_warps=4,
+        )
+    return loss, kp.long(), zp
 
 
 def _next_pow2(n):
@@ -398,6 +561,8 @@ def _launch_sweep(data, qw, scales, loss, zp, c, g, k, nz, maxq, bc, gp):
         HAS_QW=qw is not None,
         BC=bc,
         GP=gp,
+        NOMASK=gp == g,
+        ZU=maxq + 1 <= 32,
         num_warps=4,
     )
     return loss, zp

@@ -992,6 +992,153 @@ class TestSymSharedCoarse:
         assert wrapper.called
 
 
+class TestZpSharedCoarse:
+    """Shared-multiplier coarse pass (joint search): gating, latch, driver math."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_shared_state(self):
+        import auto_round.data_type.neuqi as N
+
+        for attr, default in (
+            ("_neuqi_shared_sweep", None),
+            ("_neuqi_shared_checked", False),
+            ("_neuqi_shared_broken", False),
+        ):
+            if hasattr(N, attr):
+                setattr(N, attr, default)
+        yield
+        import auto_round.data_type.neuqi as N2
+
+        N2._neuqi_shared_sweep = None
+        N2._neuqi_shared_checked = False
+        N2._neuqi_shared_broken = False
+
+    def test_attempt_respects_backend_and_batch_gates(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+
+        fake = SimpleNamespace(is_cuda=True, device=torch.device("cuda"))
+        for wants, batched, should_call in ((False, True, False), (True, False, False), (True, True, True)):
+            calls = {"n": 0}
+
+            def _fn(*a, **k):
+                calls["n"] += 1
+                return "sentinel"
+
+            monkeypatch.setattr(N, "_zp_wants_triton", lambda dt: wants)
+            monkeypatch.setattr(N, "_zp_batch_wanted", lambda dt: batched)
+            monkeypatch.setattr(N, "_neuqi_shared_sweep", _fn)
+            monkeypatch.setattr(N, "_neuqi_shared_checked", True)
+            out = N._neuqi_shared_attempt(fake, None, None, None, 15)
+            if should_call:
+                assert out == "sentinel" and calls["n"] == 1
+            else:
+                assert out is None and calls["n"] == 0
+
+    def test_attempt_latches_on_failure(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+
+        calls = {"n": 0}
+
+        def _boom(*a, **k):
+            calls["n"] += 1
+            raise RuntimeError("launch failed")
+
+        monkeypatch.setattr(N, "_neuqi_shared_sweep", _boom)
+        monkeypatch.setattr(N, "_neuqi_shared_checked", True)
+        fake = SimpleNamespace(is_cuda=True, device=torch.device("cuda"))
+        monkeypatch.setattr(N, "_zp_wants_triton", lambda dt: True)
+        monkeypatch.setattr(N, "_zp_batch_wanted", lambda dt: True)
+        out = N._neuqi_shared_attempt(fake, None, None, None, 15)
+        assert out is None
+        assert N._neuqi_shared_broken
+        out2 = N._neuqi_shared_attempt(fake, None, None, None, 15)
+        assert out2 is None and calls["n"] == 1  # latched: no second launch
+
+    def test_cpu_tensor_never_latches(self):
+        import auto_round.data_type.neuqi as N
+
+        data = torch.randn(8, 16)
+        out = N._zp_coarse_pass_shared(data, None, torch.full((8, 1), 0.1), torch.tensor([0.5, 1.0]), 15)
+        assert out is None
+        assert not N._neuqi_shared_broken  # gated before any launch
+
+    def test_coarse_pass_parity_and_fallback(self, monkeypatch):
+        """Driver math (dn normalization, s0^2 unnormalization, frac/zp mapping) via
+        an eager stand-in mirrors the per-candidate reference; launch None falls back."""
+        import auto_round.data_type.neuqi as N
+
+        torch.manual_seed(13)
+        n, g, bits = 600, 128, 4
+        maxq = 2**bits - 1
+        data = torch.randn(n, g)
+        data[:, :3] *= 70.0
+        qw = torch.rand(n, g) + 0.1
+        wmin = torch.clamp(data.min(dim=-1).values, max=0).unsqueeze(-1)
+        wmax = torch.clamp(data.max(dim=-1).values, min=0).unsqueeze(-1)
+        s0 = ((wmax - wmin) / maxq).clamp_(min=1e-5)
+        import math
+
+        coarse = torch.logspace(math.log10(0.25), 0.0, 80)
+
+        def eager_shared(dn, q, fracs, invf, mq):
+            # eager mirror of _neuqi_shared_kernel (normalized space)
+            d = dn.unsqueeze(-2).unsqueeze(-2)  # [C, 1, 1, g]
+            f = fracs.view(1, -1, 1, 1)  # [1, K, 1, 1]
+            zp = torch.arange(0, mq + 1, device=dn.device, dtype=dn.dtype).view(1, 1, -1, 1)
+            r = torch.round(d * invf.view(1, -1, 1, 1)).clamp_(min=-mq - 1, max=2 * mq + 1)
+            qd = (r + zp).clamp_(0, mq)
+            err = f * (qd - zp) - d
+            loss = err * err
+            if q is not None:
+                loss = loss * q.unsqueeze(-2).unsqueeze(-2)
+            loss = loss.sum(dim=-1)  # [C, K, Z]
+            best_z, zp_arg = loss.min(dim=-1)
+            best, k_arg = best_z.min(dim=1)  # first-minimum over k
+            zp_best = zp_arg.gather(1, k_arg.unsqueeze(1)).squeeze(1)
+            return best, k_arg, zp_best
+
+        # force small chunks so the loop runs multiple iterations
+        monkeypatch.setattr(N, "_MAX_TMP_ELEMS", 262144 * 3)
+        loss_s, frac_s, zp_s = N._zp_coarse_pass_shared(data, qw, s0, coarse, maxq, launch=eager_shared)
+
+        # per-candidate reference over the identical grid
+        scales = s0 * coarse.view(1, -1)  # [C, K]
+        d = data.unsqueeze(-2).unsqueeze(-2)
+        zp = torch.arange(0, maxq + 1).view(1, 1, -1, 1)
+        r = torch.round(d / scales.unsqueeze(-1).unsqueeze(-1)).clamp_(min=-maxq - 1, max=2 * maxq + 1)
+        qd = (r + zp).clamp_(0, maxq)
+        err = scales.unsqueeze(-1).unsqueeze(-1) * (qd - zp) - d
+        loss = err * err * qw.unsqueeze(-2).unsqueeze(-2)
+        loss = loss.sum(dim=-1)  # [C, K, Z]
+        best_z, zp_arg = loss.min(dim=-1)
+        loss_ref, k_ref = best_z.min(dim=1)
+        zp_ref = zp_arg.gather(1, k_ref.unsqueeze(1)).squeeze(1)
+
+        torch.testing.assert_close(frac_s, coarse.index_select(0, k_ref), rtol=0, atol=0)
+        torch.testing.assert_close(zp_s, zp_ref.to(torch.float32), rtol=0, atol=0)
+        torch.testing.assert_close(loss_s, loss_ref, rtol=1e-4, atol=1e-4)
+
+        # fallback: a launch that declines must produce None end to end
+        assert N._zp_coarse_pass_shared(data, qw, s0, coarse, maxq, launch=lambda *a: None) is None
+
+    def test_search_wires_shared_coarse(self, monkeypatch):
+        """neuqi_search_scale_zero routes its coarse pass through the shared helper."""
+        import auto_round.data_type.neuqi as N
+
+        torch.manual_seed(14)
+        data = torch.randn(64, 128)
+        qw = torch.rand(64, 128) + 0.1
+
+        def wrapper(data_, qw_, s0_, coarse_, maxq_):
+            wrapper.called = True
+            return None  # decline -> batched fallback still correct
+
+        wrapper.called = False
+        monkeypatch.setattr(N, "_zp_coarse_pass_shared", wrapper)
+        N.neuqi_search_scale_zero(data, 4, qw=qw, coarse_n=32, fine_n=8)
+        assert wrapper.called
+
+
 class TestSymTritonSweep:
     """Triton sym-search dispatch: gating, latch-down, and parity where CUDA exists."""
 
