@@ -15,7 +15,10 @@
 """CLI wiring for --enable_neuqi and --enable_presinq: parsed flags must reach
 the built algorithm configs (RTNConfig.asym_search, PreSINQConfig composition)."""
 
+import os
 import unittest
+
+import pytest
 
 from auto_round.cli.algorithms import AlgorithmHandler
 from auto_round.cli.parser import build_quantize_parser
@@ -48,6 +51,59 @@ class TestEnableNeuqiFlag(unittest.TestCase):
         rtn = [c for c in configs if isinstance(c, RTNConfig)]
         self.assertTrue(rtn)
         self.assertEqual(rtn[0].asym_search, "neuqi")
+
+
+class TestParallelQuantizationFlag:
+    def test_default_off_keeps_serial_and_env_untouched(self, monkeypatch):
+        monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
+        args = _parse(['--iters', '0'])
+        (cfg,) = _build(args)
+        assert cfg.parallel_tuning is False
+        assert "AR_TUNE_DDP_WORLD" not in os.environ
+
+    def test_auto_at_iters0_sets_fanout(self, monkeypatch):
+        monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
+        args = _parse(['--iters', '0', '--parallel_quantization', 'auto'])
+        (cfg,) = _build(args)
+        assert cfg.parallel_tuning
+        assert cfg.parallel_tuning_workers is None
+
+    def test_n_at_iters0_pins_workers(self, monkeypatch):
+        monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
+        args = _parse(['--iters', '0', '--parallel_quantization', '3'])
+        (cfg,) = _build(args)
+        assert cfg.parallel_tuning
+        assert cfg.parallel_tuning_workers == 3
+
+    def test_auto_at_iters_positive_sets_ddp_world_from_device_map(self, monkeypatch):
+        monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
+        args = _parse(['--iters', '20', '--parallel_quantization', 'auto', '--device_map', '0,1,2,3'])
+        _build(args)
+        assert os.environ["AR_TUNE_DDP_WORLD"] == "4"
+
+    def test_n_at_iters_positive_sets_ddp_world(self, monkeypatch):
+        monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
+        args = _parse(['--iters', '20', '--parallel_quantization', '2'])
+        _build(args)
+        assert os.environ["AR_TUNE_DDP_WORLD"] == "2"
+
+    def test_off_leaves_explicit_env_alone(self, monkeypatch):
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "4")
+        args = _parse(['--iters', '20'])
+        _build(args)
+        assert os.environ["AR_TUNE_DDP_WORLD"] == "4"
+
+    def test_conflicting_flag_and_env_raises(self, monkeypatch):
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        args = _parse(['--iters', '20', '--parallel_quantization', '4'])
+        with pytest.raises(ValueError):
+            _build(args)
+
+    def test_parser_rejects_one_and_garbage(self):
+        with pytest.raises(SystemExit):
+            _parse(['--parallel_quantization', '1'])
+        with pytest.raises(SystemExit):
+            _parse(['--parallel_quantization', 'bogus'])
 
 
 class TestEnablePreSINQFlag(unittest.TestCase):

@@ -164,6 +164,16 @@ def test_direct_enable_opt_rtn_forces_optimized_rtn():
     assert configs[0].orig_disable_opt_rtn is False
 
 
+def test_direct_parallel_tuning_routes_to_rtn():
+    configs = _normalize_alg_configs(
+        None, direct_kwargs={"iters": 0, "parallel_tuning": True, "parallel_tuning_workers": 2}
+    )
+
+    assert isinstance(configs[0], RTNConfig)
+    assert configs[0].parallel_tuning is True
+    assert configs[0].parallel_tuning_workers == 2
+
+
 def test_rtn_switches_only_when_iters_is_zero():
     configs = _normalize_alg_configs(None, direct_kwargs={"disable_opt_rtn": True})
 

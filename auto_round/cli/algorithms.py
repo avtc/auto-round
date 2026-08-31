@@ -17,6 +17,9 @@ import argparse
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
+import os
+
+from auto_round.logger import logger
 from auto_round.algorithms.registry import (
     get_algorithm_entry,
     iter_algorithm_entries,
@@ -340,6 +343,44 @@ class SVDQuant(AlgorithmHandler):
         )
 
 
+def _fanout_kwargs(args) -> dict[str, Any]:
+    """Map --parallel_quantization onto the iters=0 per-module search fan-out."""
+    pq = getattr(args, "parallel_quantization", "off")
+    if pq == "off":
+        return {"parallel_tuning": False, "parallel_tuning_workers": None}
+    if pq == "auto":
+        return {"parallel_tuning": True, "parallel_tuning_workers": None}
+    return {"parallel_tuning": True, "parallel_tuning_workers": int(pq)}
+
+
+def _apply_ddp_world_from_flag(args) -> None:
+    """Map --parallel_quantization onto AR_TUNE_DDP_WORLD for the iters>0 path.
+
+    The env is the single channel every DDP consumer already reads, so the
+    flag resolves into it before any config is used. An explicitly set env
+    that disagrees with the flag is a hard error; 'off' leaves the env alone.
+    """
+    pq = getattr(args, "parallel_quantization", "off")
+    if pq == "off":
+        return
+    if pq == "auto":
+        dm = str(getattr(args, "device_map", "0") or "0")
+        world = len([e for e in dm.split(",") if e.strip()])
+    else:
+        world = int(pq)
+    if world < 2:
+        logger.info("[parallel_quantization] resolved a single device; data parallelism stays off.")
+        return
+    explicit = os.environ.get("AR_TUNE_DDP_WORLD")
+    if explicit not in (None, "", "1") and int(explicit) != world:
+        raise ValueError(
+            f"--parallel_quantization resolves AR_TUNE_DDP_WORLD={world}, but the environment "
+            f"already sets it to {explicit}. Unset one of them; they must not disagree."
+        )
+    os.environ["AR_TUNE_DDP_WORLD"] = str(world)
+    logger.info("[parallel_quantization] iters>0 data-parallel world=%d (AR_TUNE_DDP_WORLD).", world)
+
+
 class RTN(AlgorithmHandler):
     name = "rtn"
     aliases = ("rtn",)
@@ -397,6 +438,7 @@ class RTN(AlgorithmHandler):
         cfg = RTNConfig(
             disable_opt_rtn=getattr(args, "disable_opt_rtn", None),
             asym_search=asym_search,
+            **_fanout_kwargs(args),
             **common_kwargs,
         )
         imatrix = getattr(args, "imatrix_enabled", "auto")
@@ -497,6 +539,7 @@ class AutoRound(AlgorithmHandler):
     def build(self, args, common_kwargs: dict[str, Any]):
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
+        _apply_ddp_world_from_flag(args)
         return SignRoundConfig(
             iters=getattr(args, "iters", 200),
             lr=getattr(args, "lr", None),

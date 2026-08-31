@@ -91,6 +91,24 @@ def add_common_quantization_arguments(group) -> None:
     )
 
 
+def _parse_parallel_quantization(value):
+    """Normalize --parallel_quantization: 'off', 'auto', or an integer >= 2."""
+    v = str(value).strip().lower()
+    if v in ("off", "none", "false"):
+        return "off"
+    if v == "auto":
+        return "auto"
+    try:
+        n = int(v)
+    except ValueError:
+        n = -1
+    if n < 2:
+        raise argparse.ArgumentTypeError(
+            f"--parallel_quantization accepts off, auto, or an integer >= 2 (got {value!r})."
+        )
+    return n
+
+
 def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.ArgumentParser:
     """Build the quantize parser with all argument groups."""
     parser = argparse.ArgumentParser(prog=prog)
@@ -116,6 +134,19 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         "--device_map", "--device", "--devices", default="0", type=str, help="Device mapping used for quantization."
     )
     rt.add_argument("--dataset", default=None, type=str, help="Calibration dataset or local dataset path.")
+    rt.add_argument(
+        "--parallel_quantization",
+        dest="parallel_quantization",
+        default="off",
+        type=_parse_parallel_quantization,
+        help=(
+            "Parallelize quantization across the GPUs in --device_map. iters=0: fan the per-module "
+            "search (OptRTN/NeUQI/RTN) round-robin across devices; iters>0: set the data-parallel "
+            "world size (AR_TUNE_DDP_WORLD). 'off' (default) keeps both serial; 'auto' uses every "
+            "--device_map device; N (>=2) pins the count. Cross-block multi-process tuning is a "
+            "separate flag (--enable_block_parallel_tuning)."
+        ),
+    )
     rt.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility.")
     rt.add_argument(
         "--format", "--formats", default="auto_round", type=str, help="Output format for the quantized model."

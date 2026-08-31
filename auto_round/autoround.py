@@ -377,7 +377,7 @@ _SIGNROUND_FIELDS = {
     "enable_adam",
     "enable_lfq",
 }
-_RTN_FIELDS = {"disable_opt_rtn", "enable_opt_rtn"}
+_RTN_FIELDS = {"disable_opt_rtn", "enable_opt_rtn", "parallel_tuning", "parallel_tuning_workers"}
 _AWQ_FIELDS = {
     "duo_scaling",
     "n_grid",

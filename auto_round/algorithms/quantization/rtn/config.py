@@ -26,6 +26,7 @@ class RTNConfig(QuantizationConfig):
         disable_opt_rtn: bool = None,
         asym_search: str = "auto",
         parallel_tuning: bool = None,
+        parallel_tuning_workers: int = None,
         batch_expert_tuning: bool = True,
         **kwargs,
     ) -> None:
@@ -91,6 +92,12 @@ class RTNConfig(QuantizationConfig):
             # compat; opt back in with parallel_tuning=True.
             parallel_tuning = False
         self.parallel_tuning = parallel_tuning
+        self.parallel_tuning_workers = parallel_tuning_workers
+        if parallel_tuning_workers is not None:
+            if parallel_tuning_workers < 2:
+                raise ValueError(f"parallel_tuning_workers must be >= 2, got {parallel_tuning_workers}.")
+            if parallel_tuning is not True:
+                raise ValueError("parallel_tuning_workers requires parallel_tuning=True.")
         self.batch_expert_tuning = batch_expert_tuning
         valid_asym_search = ("auto", "neuqi", "minmax")
         if asym_search not in valid_asym_search:

@@ -15,6 +15,8 @@
 
 from unittest import mock
 
+import pytest
+
 import torch
 import torch.nn as nn
 
@@ -107,6 +109,20 @@ class TestQuantizeTargetsFanout:
         q = _RecordingQuantizer(RTNConfig(parallel_tuning=True))
         q._quantize_targets([])
         assert q.calls == []
+
+
+class TestParallelTuningWorkersCap:
+    def test_workers_above_visible_gpus_raises(self):
+        q = _RecordingQuantizer(RTNConfig(parallel_tuning=True, parallel_tuning_workers=8))
+        with mock.patch("torch.cuda.device_count", return_value=4), pytest.raises(ValueError):
+            q._quantize_targets(_dense_targets(3))
+
+    def test_workers_cap_limits_round_robin_devices(self):
+        q = _RecordingQuantizer(RTNConfig(parallel_tuning=True, parallel_tuning_workers=2))
+        with mock.patch("torch.cuda.device_count", return_value=4):
+            q._quantize_targets(_dense_targets(4))
+        by_name = {m.global_name: dev for m, dev in q.calls}
+        assert sorted(set(by_name.values())) == ["cuda:0", "cuda:1"]
 
 
 class TestExpertBatching:

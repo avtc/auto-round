@@ -322,7 +322,13 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                     len(batches),
                 )
 
-        n_workers = min(len(batches) + len(targets), n_gpu) if parallel_tuning and n_gpu > 1 else 1
+        if parallel_tuning and n_gpu > 1:
+            workers = getattr(self.config, "parallel_tuning_workers", None)
+            if workers is not None and workers > n_gpu:
+                raise ValueError(f"parallel_tuning_workers={workers} exceeds the {n_gpu} visible CUDA devices.")
+            n_workers = min(len(batches) + len(targets), workers or n_gpu)
+        else:
+            n_workers = 1
 
         def _run_batch(mods, device):
             if not self._quantize_expert_batch(mods, device):
