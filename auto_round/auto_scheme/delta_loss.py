@@ -2019,46 +2019,62 @@ def _build_teacher_logit_shards(
     # in disk-stream mode) while non-block leaves sit on ``major_device``. Reuse the
     # scoring capture machinery: materialize non-block params once, and wrap every
     # block forward so each block moves/materializes on demand and back.
-    # Forward regime, decided from the actual placement of the block weights:
-    # - disk_index set (meta skeleton): stream blocks from the checkpoint via
-    #   prepare_model_low_gpu + materialize_non_block_params.
-    # - ALL block weights on CPU (low-gpu staged parent): prepare_model_low_gpu
-    #   shuttles each block to major_device for its forward and back.
-    # - ANY block weight on a GPU (accelerate dispatch across device_map,
-    #   including partially offloaded mixed cpu+cuda placement): plain forward --
-    #   accelerate's own hooks keep activations coherent across devices; the
-    #   shuttling would fight the per-module placement (mixed-device matmul
-    #   crash, because move_module_to_tuning_device respects tuning_device).
-    def _all_block_weights_off_gpu():
-        # True only when every block weight is on CPU (staged parent) or on the
-        # meta device (disk-stream skeleton). ANY GPU-resident block weight
-        # means accelerate owns placement (dispatch across device_map, possibly
-        # with partial CPU offload) and the plain-forward regime must be used.
-        for block_name_ in get_block_names(model)[0]:
-            for param_ in get_module(model, block_name_).parameters():
-                if param_.device.type not in ("cpu", "meta"):
-                    return False
-        return True
-
-    staged_forward = _all_block_weights_off_gpu()
-    if staged_forward and disk_index is not None:
+    # The teacher pass runs ONE full-model forward in the parent, whose weight
+    # placement is never guaranteed coherent for a vanilla forward (auto-round
+    # scatters blocks across device_map / stages them on CPU / keeps a meta
+    # skeleton under disk streaming, and qwen3_5-style force_accelerate_hooks
+    # assumes whole-block device coherence). Instead of relying on any of that,
+    # wrap each block with a minimal device hook: align incoming tensors, move
+    # the ENTIRE block subtree to the forward device (plain .to(), honoring no
+    # per-module attrs), and restore every leaf to its recorded home device
+    # afterwards. Meta blocks (disk streaming) materialize from the checkpoint
+    # and free back to meta instead.
+    forward_device = major_device
+    block_names = get_block_names(model)[0]
+    is_meta_model = disk_index is not None and any(p.is_meta for p in model.parameters())
+    if is_meta_model:
         from auto_round.utils.disk_stream_util import materialize_non_block_params
 
-        materialize_non_block_params(model, get_block_names(model)[0], disk_index, device="cpu")
-    block_inputs = {}
-    # prepare_model_low_gpu replaces each block's forward with a recording wrapper
-    # and only the CALLER can undo it (model_forward_low_gpu restores via
-    # ``module.orig_forward`` before its replay). Save the pristine forwards here
-    # and restore after every batch so the wraps never leak into scoring.
-    block_names = get_block_names(model)[0] if staged_forward else []
+        materialize_non_block_params(model, block_names, disk_index, device="cpu")
+
+    leaf_homes = {}
+
+    def _record_homes(block_module):
+        for leaf_name, leaf in block_module.named_modules():
+            own = list(leaf.parameters(recurse=False)) + list(leaf.buffers(recurse=False))
+            if own:
+                leaf_homes[leaf_name] = own[0].device
+
+    def _restore_homes(block_module):
+        for leaf_name, leaf in block_module.named_modules():
+            home = leaf_homes.get(leaf_name)
+            if home is not None:
+                leaf.to(home)
+
+    def _teacher_block_hook(block_module, block_name):
+        original_forward = block_module.forward
+
+        def new_forward(*args, **kwargs):
+            args = tuple(a.to(forward_device) if isinstance(a, torch.Tensor) else a for a in args)
+            kwargs = {k: v.to(forward_device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+            if is_meta_model:
+                from auto_round.utils.disk_stream_util import free_module, materialize_module
+
+                materialize_module(block_module, block_name, disk_index, device=forward_device)
+            else:
+                _record_homes(block_module)
+                block_module.to(forward_device)
+            return original_forward(*args, **kwargs)
+
+        return new_forward
+
     for name in block_names:
         module = get_module(model, name)
         module.orig_forward = module.forward
+        module.forward = _teacher_block_hook(module, name)
     try:
         with torch.no_grad():
             for batch_idx, data in enumerate(loader, start=1):
-                if staged_forward:
-                    prepare_model_low_gpu(model, block_inputs, major_device=major_device, disk_index=disk_index)
                 src = data if isinstance(data, dict) else None
                 labels = (
                     src["labels"]
@@ -2079,10 +2095,15 @@ def _build_teacher_logit_shards(
                     os.path.join(tmp_dir, f"batch_{batch_idx:04d}.pt"),
                 )
                 num_batches = batch_idx
-                if staged_forward:
-                    for name in block_names:
-                        block_module = get_module(model, name)
-                        block_module.forward = block_module.orig_forward
+                for name in block_names:
+                    block_module = get_module(model, name)
+                    if is_meta_model:
+                        from auto_round.utils.disk_stream_util import free_module
+
+                        free_module(block_module)
+                    else:
+                        _restore_homes(block_module)
+                    block_module.forward = block_module.orig_forward
         if num_batches == 0:
             raise RuntimeError("teacher shard build produced zero batches; check dataset/nsamples")
         manifest = {
@@ -2108,10 +2129,18 @@ def _build_teacher_logit_shards(
             total_bytes / 2**30,
         )
     finally:
-        if staged_forward:  # failure path: never leave recording wraps installed
-            for name in block_names:
-                block_module = get_module(model, name)
-                block_module.forward = block_module.orig_forward
+        for name in block_names:  # failure path: never leave hooks installed
+            block_module = get_module(model, name)
+            try:
+                if is_meta_model:
+                    from auto_round.utils.disk_stream_util import free_module
+
+                    free_module(block_module)
+                else:
+                    _restore_homes(block_module)
+            except Exception:  # noqa: BLE001  best-effort cleanup on a failing path
+                pass
+            block_module.forward = block_module.orig_forward
         if os.path.isdir(tmp_dir):  # failure path: never leave stale tmp shards behind
             import shutil
 
