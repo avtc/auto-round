@@ -839,6 +839,97 @@ class TestNeuqiSymSearch:
         assert torch.equal(a, b)
 
 
+class TestSymCompiledCore:
+    """The compiled sym chunk core: parity with eager, backend gating, latch-down."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_core_state(self):
+        import auto_round.data_type.neuqi as N
+
+        N._sym_chunk_compiled = None
+        N._sym_compile_failed = False
+        N._sym_compile_logged.clear()
+        yield
+        N._sym_chunk_compiled = None
+        N._sym_compile_failed = False
+
+    def test_compiled_matches_eager(self, monkeypatch):
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
+        torch.manual_seed(0)
+        from auto_round.data_type.neuqi import _sym_loss_chunk, _sym_loss_chunk_eval
+
+        data = torch.randn(64, 32)
+        scales = torch.rand(64, 5) + 0.5
+        for qw in (torch.rand(64, 32) + 0.1, None):
+            out_e = _sym_loss_chunk(data, qw, scales, 7)
+            out_c = _sym_loss_chunk_eval(data, qw, scales, 7)
+            torch.testing.assert_close(out_c[0], out_e[0], rtol=1e-5, atol=1e-6)
+            assert torch.equal(out_c[1], out_e[1])
+            assert torch.equal(out_c[2], out_e[2])
+        # where the toolchain allows inductor codegen the compiled core must
+        # have ENGAGED (not silently latched down to eager); environments
+        # without a C++ compiler (e.g. Windows without MSVC) latch by design
+        import auto_round.data_type.neuqi as N
+
+        if not N._sym_compile_failed:
+            assert N._sym_chunk_compiled is not None
+
+    def test_eager_backend_never_compiles(self, monkeypatch):
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
+        from auto_round.data_type import neuqi
+
+        def _boom(*a, **k):
+            raise AssertionError("torch.compile must not be called under backend=eager")
+
+        monkeypatch.setattr(neuqi.torch, "compile", _boom)
+        out = neuqi._sym_loss_chunk_eval(torch.randn(8, 32), None, torch.rand(8, 2) + 0.5, 7)
+        assert out[0].shape == (8,)
+
+    def test_failure_latches_down_to_eager(self, monkeypatch):
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
+        from auto_round.data_type import neuqi
+
+        calls = {"n": 0}
+
+        def _flaky_compile(fn):
+            def _raise(*a, **k):
+                calls["n"] += 1
+                raise RuntimeError("inductor unavailable")
+
+            return _raise
+
+        monkeypatch.setattr(neuqi.torch, "compile", _flaky_compile)
+        data, scales = torch.randn(8, 32), torch.rand(8, 2) + 0.5
+        for _ in range(2):  # second call must go straight to eager
+            out = neuqi._sym_loss_chunk_eval(data, None, scales, 7)
+            assert torch.isfinite(out[0]).all()
+        assert calls["n"] == 1
+        assert neuqi._sym_compile_failed
+
+    def test_search_end_to_end_matches_eager_backend(self, monkeypatch):
+        """Both variants (B plain, C union) route every chunk through the
+        compiled core; results must match an eager-backend run."""
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+        torch.manual_seed(1)
+        data = torch.randn(128, 32)
+
+        def _run():
+            return neuqi_search_scale_sym(data.clone(), 4, coarse_n=8, fine_n=4)
+
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
+        eager_plain = _run()
+        monkeypatch.setenv("AR_NEUQI_SYM_UNION", "1")
+        eager_union = _run()
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "compile")
+        monkeypatch.setenv("AR_NEUQI_SYM_UNION", "0")
+        comp_plain = _run()
+        monkeypatch.setenv("AR_NEUQI_SYM_UNION", "1")
+        comp_union = _run()
+        torch.testing.assert_close(comp_plain, eager_plain, rtol=0, atol=0)
+        torch.testing.assert_close(comp_union, eager_union, rtol=0, atol=0)
+
+
 class TestNeuqiSymDynamoGuard:
     def test_sym_search_never_traced_by_dynamo(self):
         """The sym search is loop-heavy and eager-shaped; under

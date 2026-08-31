@@ -667,9 +667,11 @@ def _sym_loss_chunk(data, qw, scales, nmax):
     weighted loss when the family is unreachable). Searching ``|s|`` plus a sign
     per group covers both families explicitly.
 
-    Plain eager math: with a single zero-point-free axis there is no
-    (candidate, zero-point) expansion, so the whole chunk is a handful of
-    elementwise kernels and no fused sweep is needed.
+    Plain eager math (the reference path): with a single zero-point-free axis
+    there is no (candidate, zero-point) expansion, so the chunk is a handful of
+    elementwise kernels. Wide grids make the chunking fine-grained enough to
+    become launch-bound; ``_sym_loss_chunk_eval`` routes these calls through a
+    torch.compile-fused core while this function stays the eager reference.
 
     Args:
         data: [chunk, g] float32 group data.
@@ -703,6 +705,58 @@ def _sym_loss_chunk(data, qw, scales, nmax):
     best_loss, best_idx = loss.min(dim=-1)
     best_mirror = mirror.gather(1, best_idx.unsqueeze(1)).squeeze(1)
     return best_loss, best_idx, best_mirror
+
+
+# Compiled core for the symmetric search chunk: each eager chunk is ~20 small
+# kernel launches and the chunk size shrinks with the candidate count
+# (_MAX_TMP_ELEMS // (2 * K * g)), so wide grids (the union variant at
+# coarse=256 reaches K ~ 440) make big tensors pure launch overhead. One fused
+# inductor kernel per chunk is the symmetric analogue of the asym sweep's
+# compiled stage; there is no dedicated sym Triton kernel yet, so "triton"
+# resolves to this compiled core.
+_sym_chunk_compiled = None
+_sym_compile_failed = False
+_sym_compile_logged: set = set()
+
+
+def _sym_backend_wants_compile() -> bool:
+    return str(envs.AR_NEUQI_BACKEND or "auto") in ("auto", "compile", "triton")
+
+
+@torch.compiler.disable  # logging side effect: graph-break instead of tracing
+def _log_sym_compile_engaged(backend: str) -> None:
+    if backend in _sym_compile_logged:
+        return
+    _sym_compile_logged.add(backend)
+    logger.info("[NeUQI] sym search chunk core compiled (backend=%s)", backend)
+
+
+def _sym_loss_chunk_eval(data, qw, scales, nmax):
+    """``_sym_loss_chunk`` through a lazily compiled core, latching down to eager.
+
+    Called only from inside ``torch.compiler.disable``-decorated search
+    functions, so the explicit compile unit is the sole dynamo boundary and
+    implicit tracing never reaches it. Any failure latches down permanently:
+    retrying per chunk would repeat the failure cost every chunk.
+    """
+    global _sym_chunk_compiled, _sym_compile_failed
+    backend = str(envs.AR_NEUQI_BACKEND or "auto")
+    if _sym_compile_failed or backend not in ("auto", "compile", "triton"):
+        return _sym_loss_chunk(data, qw, scales, nmax)
+    if _sym_chunk_compiled is None:
+        try:
+            _sym_chunk_compiled = torch.compile(_sym_loss_chunk)
+        except Exception:  # pragma: no cover - compilation unavailable in this environment
+            _sym_compile_failed = True
+            return _sym_loss_chunk(data, qw, scales, nmax)
+        _log_sym_compile_engaged(backend)
+    try:
+        return _sym_chunk_compiled(data, qw, scales, nmax)
+    except Exception:
+        _sym_chunk_compiled = None
+        _sym_compile_failed = True
+        logger.warning("[NeUQI] sym compiled chunk core failed; using eager for the rest of this process.")
+        return _sym_loss_chunk(data, qw, scales, nmax)
 
 
 # Fraction of the no-clip max-abs scale above which coarser grids are never
@@ -763,7 +817,7 @@ def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
     for start_idx in range(0, n_groups, chunk):
         stop = min(start_idx + chunk, n_groups)
         scales = s0[start_idx:stop] * coarse.view(1, -1)  # [C, K]
-        loss, idx, mirror = _sym_loss_chunk(
+        loss, idx, mirror = _sym_loss_chunk_eval(
             data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
         )
         best_loss[start_idx:stop] = loss
@@ -782,7 +836,7 @@ def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
             stop = min(start_idx + chunk, n_groups)
             fracs = frac_lo[start_idx:stop].unsqueeze(1) * one_m_steps + frac_hi[start_idx:stop].unsqueeze(1) * steps
             scales = s0[start_idx:stop] * fracs  # [C, F]
-            loss, k, mirror = _sym_loss_chunk(
+            loss, k, mirror = _sym_loss_chunk_eval(
                 data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
             )
             frac = fracs.gather(1, k.unsqueeze(1)).squeeze(1)
@@ -853,7 +907,7 @@ def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=No
     # seed the plain two-stage result as one more per-group candidate: the
     # union grid's fine bracketing does not formally cover the plain grid's
     # fine winners, so this closes the last dominance gap over variant B
-    take_plain = _sym_loss_chunk(data, qw, scale.reshape(-1, 1), nmax := int(2 ** (bits - 1)))[0] < u_loss
+    take_plain = _sym_loss_chunk_eval(data, qw, scale.reshape(-1, 1), nmax := int(2 ** (bits - 1)))[0] < u_loss
     return torch.where(take_plain.unsqueeze(-1), scale, u_scale)
 
 
