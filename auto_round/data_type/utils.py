@@ -122,14 +122,18 @@ def mark_mixed_sym_pool():
 def recipe_applies_to_layer(recipe, sym):
     """Whether AR_TUNE_RECIPE anchors a layer of this symmetry.
 
-    Mixed sym/asym pools: recipes apply only to layers of their sym class
-    (``neuqi_*`` -> asym, ``opt_rtn_qon`` -> sym); the other layers keep the
-    default min/max grid. Recipes that never anchor return False regardless.
+    ``neuqi_*`` recipes anchor BOTH symmetry classes -- asym layers through the
+    joint (scale, zero-point) search, sym layers through the two-stage
+    symmetric scale search (either search's winning qdq grid reproduces
+    exactly through the (wmin, wmax) anchor). ``opt_rtn_qon`` anchors sym
+    layers only (the incumbent uniform scale search); in a mixed pool its asym
+    layers keep the default min/max grid. Recipes that never anchor return
+    False regardless.
     """
     if not recipe or recipe in ("minmax_qon", "neuqi_it0", "touchup"):
         return False
     if recipe.startswith("neuqi_"):
-        return not sym
+        return True  # asym layers: joint (scale, zp) search; sym layers: two-stage scale search
     if recipe == "opt_rtn_qon":
         return bool(sym)
     return True
@@ -142,8 +146,9 @@ def maybe_default_tune_recipe(asym_search, iters):
     (the wrapper's init grid); ``asym_search="neuqi"`` alone is a zero-shot
     switch. When the user enabled NeUQI and runs iters>0 without an explicit
     recipe, default to ``neuqi_frozen_qon`` so the flag keeps meaning "use the
-    NeUQI search wherever it applies" (asym layers only -- mixed pools skip
-    sym layers per ``recipe_applies_to_layer``). Materializes the default in
+    NeUQI search wherever it applies" (per layer symmetry: the joint search
+    anchors asym layers, the two-stage scale search anchors sym layers).
+    Materializes the default in
     the environment because every consumer (wrapper anchor, guards, template
     cache signature) reads ``AR_TUNE_RECIPE`` from there.
 
@@ -238,17 +243,6 @@ def get_quant_func(
             "the zero-shot search dispatch already runs. Unset the variable or use neuqi_it0."
         )
     global _MIXED_SKIP_LOGGED
-    if recipe.startswith("neuqi_") and recipe != "neuqi_it0" and sym:
-        if _MIXED_SYM_POOL:
-            if not _MIXED_SKIP_LOGGED:
-                _MIXED_SKIP_LOGGED = True
-                logger.info(
-                    "mixed sym/asym pool: AR_TUNE_RECIPE=%r anchors asym layers only; sym layers "
-                    "keep the default min/max grid plus round tuning",
-                    recipe,
-                )
-        else:
-            raise ValueError(f"AR_TUNE_RECIPE={recipe!r} requires the asymmetric path (sym=False).")
     if recipe == "opt_rtn_qon" and not sym:
         if _MIXED_SYM_POOL:
             if not _MIXED_SKIP_LOGGED:

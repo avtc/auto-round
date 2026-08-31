@@ -153,10 +153,11 @@ class TestGuardMatrix:
         with pytest.raises(ValueError, match="zero-shot reference"):
             self._g()
 
-    def test_neuqi_requires_asym(self, monkeypatch):
+    def test_neuqi_applies_to_sym(self, monkeypatch):
+        """neuqi_* recipes anchor sym layers too (two-stage scale search)."""
         monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_qon")
-        with pytest.raises(ValueError, match="asymmetric"):
-            self._g(sym=True)
+        fn, name = self._g(sym=True)
+        assert name.startswith("int_sym")  # sym STE path with the recipe anchor
 
     def test_opt_rtn_requires_sym(self, monkeypatch):
         monkeypatch.setenv("AR_TUNE_RECIPE", "opt_rtn_qon")
@@ -178,13 +179,13 @@ class TestGuardMatrix:
         fn, name = self._g()
         assert name.startswith("int_asym")
 
-    def test_mixed_pool_neuqi_recipe_skips_sym_layers(self, monkeypatch):
+    def test_mixed_pool_neuqi_anchors_sym_layers(self, monkeypatch):
         from auto_round.data_type import utils as dt_utils
 
         monkeypatch.setattr(dt_utils, "_MIXED_SYM_POOL", True, raising=False)
         monkeypatch.setenv("AR_TUNE_RECIPE", "neuqi_frozen_qon")
         fn, name = self._g(sym=True)
-        assert name.startswith("int_sym")
+        assert name.startswith("int_sym")  # anchored via the sym two-stage search
 
     def test_mixed_pool_opt_rtn_skips_asym_layers(self, monkeypatch):
         from auto_round.data_type import utils as dt_utils
@@ -203,16 +204,45 @@ class TestGuardMatrix:
             self._g()
 
 
+class TestSymRecipeAnchor:
+    """neuqi_* on sym layers: anchored via the two-stage sym scale search."""
+
+    def test_anchor_matches_sym_search(self, monkeypatch):
+        torch.manual_seed(5)
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+        from auto_round.wrapper import _compute_recipe_anchors
+
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
+        monkeypatch.setenv("AR_NEUQI_COARSE", "64")
+        monkeypatch.setenv("AR_NEUQI_FINE", "32")
+        w = torch.randn(64, 32)
+        s_ref = neuqi_search_scale_sym(w.clone(), 4).abs().reshape(-1)
+        wmin, wmax, frozen = _compute_recipe_anchors(w, 4, 32, None, "neuqi_frozen_qon", "cpu", sym=True)
+        nmax = float(2**3)
+        torch.testing.assert_close(wmax, s_ref * nmax, rtol=0, atol=0)
+        torch.testing.assert_close(wmin, -(s_ref * nmax), rtol=0, atol=0)
+        assert frozen is True
+
+    def test_frozen_flag_follows_recipe(self, monkeypatch):
+        torch.manual_seed(6)
+        from auto_round.wrapper import _compute_recipe_anchors
+
+        monkeypatch.setenv("AR_NEUQI_BACKEND", "eager")
+        w = torch.randn(16, 32)
+        _wmin, _wmax, frozen = _compute_recipe_anchors(w, 4, 32, None, "neuqi_qon", "cpu", sym=True)
+        assert frozen is False
+
+
 class TestRecipeAppliesToLayer:
     """recipe_applies_to_layer: mixed pools anchor only matching layers."""
 
     def test_matrix(self):
         from auto_round.data_type.utils import recipe_applies_to_layer
 
-        # neuqi_* anchors the asymmetric path only
+        # neuqi_* anchors BOTH symmetry classes (joint search / two-stage sym search)
         assert recipe_applies_to_layer("neuqi_frozen_qon", sym=False) is True
-        assert recipe_applies_to_layer("neuqi_qon", sym=True) is False
-        assert recipe_applies_to_layer("neuqi_fp", sym=True) is False
+        assert recipe_applies_to_layer("neuqi_qon", sym=True) is True
+        assert recipe_applies_to_layer("neuqi_fp", sym=True) is True
         # opt_rtn_qon anchors the symmetric path only
         assert recipe_applies_to_layer("opt_rtn_qon", sym=True) is True
         assert recipe_applies_to_layer("opt_rtn_qon", sym=False) is False
@@ -312,18 +342,25 @@ class TestWrapperMixedSymPool:
             iters=20,
         )
 
-    def test_neuqi_recipe_skips_sym_layer(self, monkeypatch):
+    def test_neuqi_recipe_anchors_sym_layer(self, monkeypatch):
+        """Mixed pool: neuqi_* anchors sym layers via the two-stage sym search."""
         from auto_round.data_type import utils as dt_utils
 
         # latch mirrors a real mixed-pool run (parse_scheme sets it on the scheme)
         monkeypatch.setattr(dt_utils, "_MIXED_SYM_POOL", True, raising=False)
         w = self._wrapper("neuqi_frozen_qon", sym=True, monkeypatch=monkeypatch)
-        assert w._tune_recipe == "", "sym layer must not take a neuqi anchor"
-        assert "min_scale" in w.params, "margins stay tunable (no frozen pin)"
+        assert w._tune_recipe == "neuqi_frozen_qon", "sym layer takes the neuqi anchor"
+        assert "min_scale" not in w.params, "frozen margins (sym anchors pin too)"
+        assert float(w.min_scale) == 1.0 and float(w.max_scale) == 1.0
         import torch as _t
 
-        gmin = _t.clamp(w.orig_layer.weight.reshape(8, 2, 16).amin(dim=-1).flatten(), max=0)
-        _t.testing.assert_close(w.weight_min, gmin, rtol=0, atol=1e-7)
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+        w_reshaped = w.orig_layer.weight.detach().reshape(16, 16)
+        s_ref = neuqi_search_scale_sym(w_reshaped.clone(), 4).abs().reshape(-1)
+        nmax = float(2**3)
+        _t.testing.assert_close(w.weight_max, s_ref * nmax, rtol=0, atol=0)
+        _t.testing.assert_close(w.weight_min, -(s_ref * nmax), rtol=0, atol=0)
 
     def test_opt_rtn_recipe_skips_asym_layer(self, monkeypatch):
         from auto_round.data_type import utils as dt_utils
@@ -1093,7 +1130,8 @@ class TestEnableNeuqiDefaultRecipe:
 
     def test_wrapper_anchors_from_defaulted_recipe(self, monkeypatch):
         # the compressor materializes the default in the env; the wrapper then
-        # anchors asym layers and skips sym layers in a mixed pool
+        # anchors asym layers (joint search) and sym layers (sym two-stage
+        # search) alike in a mixed pool
         from auto_round.data_type import utils as dt_utils
 
         monkeypatch.setattr(dt_utils, "_MIXED_SYM_POOL", True, raising=False)
@@ -1102,8 +1140,8 @@ class TestEnableNeuqiDefaultRecipe:
         assert w._tune_recipe == "neuqi_frozen_qon"
         assert float(w.min_scale) == 1.0 and float(w.max_scale) == 1.0
         w_sym = TestWrapperMixedSymPool()._wrapper("neuqi_frozen_qon", sym=True, monkeypatch=monkeypatch)
-        assert w_sym._tune_recipe == ""
-        assert "min_scale" in w_sym.params
+        assert w_sym._tune_recipe == "neuqi_frozen_qon"
+        assert "min_scale" not in w_sym.params, "frozen margins pin on sym anchors too"
 
     def test_get_quant_func_accepts_neuqi_iters_with_defaulted_recipe(self, monkeypatch):
         # compressor-driven runs always see a materialized recipe; the direct

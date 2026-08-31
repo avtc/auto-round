@@ -77,7 +77,7 @@ def _prepare_recipe_imatrix(imatrix, weight_reshape, bits, group_size):
     return _imatrix_handle_zero(qw, weight_reshape, bits, group_size)
 
 
-def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
+def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device, sym=False):
     """Searched (scale, zp) grid for AR_TUNE_RECIPE init, expressed as the
     per-group (tensor_min, tensor_max) pair the STE quant functions
     re-derive the grid from.
@@ -86,6 +86,13 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
     zp=round(-wmin/scale)):  min=-zp*s, max=(maxq-zp)*s  reproduces (s, zp)
     exactly. Sym anchoring (quant_tensor_sym: scale=max(|wmax|,|wmin|)/maxq,
     signed): min=-s*maxq, max=+s*maxq.
+
+    ``neuqi_*`` recipes anchor both symmetry classes: asym layers through the
+    joint (scale, zero-point) search, sym layers (``sym=True``) through the
+    two-stage symmetric scale search. The sym search returns a SIGNED scale
+    whose sign cancels in qdq reconstruction (the mirrored convention is the
+    arithmetic of a negative scale through the standard formula), so anchoring
+    the magnitude reproduces the winning qdq grid exactly.
 
     Returns (wmin, wmax, frozen_margins) or None when the recipe needs no
     anchoring.
@@ -121,10 +128,22 @@ def _compute_recipe_anchors(weight, bits, group_size, imatrix, recipe, device):
         # the extension Triton sweep stays the default here as everywhere
         # else; ensure_sweep_warmup (inside the search) serializes its
         # first launch per device to keep it race-free
-        s, zp = neuqi_search_scale_zero(w, bits, qw=qw)
-        maxq = int(2**bits) - 1
-        wmin = -(zp * s)
-        wmax = (maxq - zp) * s
+        if sym:
+            from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+            # two-stage symmetric scale search; the returned scale is SIGNED
+            # (negative = mirrored clamp convention won) and the sign cancels
+            # in qdq reconstruction -- anchoring the magnitude on the STE
+            # path's positive convention reproduces the winning grid exactly
+            s = neuqi_search_scale_sym(w, bits, qw=qw).abs()
+            nmax = int(2 ** (bits - 1))
+            wmin = -(s * nmax)
+            wmax = s * nmax
+        else:
+            s, zp = neuqi_search_scale_zero(w, bits, qw=qw)
+            maxq = int(2**bits) - 1
+            wmin = -(zp * s)
+            wmax = (maxq - zp) * s
         frozen = recipe == "neuqi_frozen_qon"
     else:  # opt_rtn_qon (symmetric scale-clip search)
         from auto_round.data_type.int import search_scales
@@ -346,6 +365,7 @@ class WrapperLinear(torch.nn.Module):
                     getattr(orig_layer, "imatrix", None),
                     envs.AR_TUNE_RECIPE,
                     self.device,
+                    sym=bool(getattr(orig_layer, "sym", True)),
                 )
             _touch_scale = getattr(orig_layer, "_touchup_scale", None)
             if _touch_scale is not None:
@@ -470,6 +490,7 @@ class WrapperLinear(torch.nn.Module):
             getattr(self.orig_layer, "imatrix", None),
             envs.AR_TUNE_RECIPE,
             self.device,
+            sym=bool(getattr(self.orig_layer, "sym", True)),
         )
         if _anchors is None:
             return False

@@ -732,13 +732,20 @@ def _sym_triton_fn():
 
 
 def _sym_wants_triton(device_type: str) -> bool:
-    """Whether the extension Triton sym search should be tried, per backend rules."""
+    """Whether the extension Triton sym search should be tried, per backend rules.
+
+    AUTO resolves to the compiled core, not the Triton kernel: the sym chunk
+    keeps the whole [C, g] data tile L2-resident (chunking bounds the [C, K, g]
+    expansion), so the compiled core's wide-vector candidate re-reads from L2
+    beat the registers-resident kernel's serialized candidate loop -- measured
+    RTX 3090, 2M groups, g=128, 256+64 candidates: compiled 0.72 s vs Triton
+    1.35 s (eager 8.53 s). Parity is identical either way (same ~0.5% tie
+    flips, max fp64 rel diff 1.7e-6 vs eager). The kernel stays available
+    under AR_NEUQI_BACKEND=triton and is the tuning base if a shape regime
+    where it wins shows up.
+    """
     backend = _BACKEND_OVERRIDE or str(envs.AR_NEUQI_BACKEND or "auto")
-    if backend == "triton":
-        return True
-    if _BACKEND_OVERRIDE in ("compile", "eager"):
-        return False
-    return backend == "auto" and device_type == "cuda"
+    return backend == "triton"
 
 
 def _sym_triton_attempt(data, qw, scales, nmax):
