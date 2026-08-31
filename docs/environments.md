@@ -221,6 +221,16 @@ export AR_NEUQI_COARSE=64
 export AR_NEUQI_FINE=32
 ```
 
+### AR_NEUQI_SYM_UNION
+- **Description**: Variant switch for the symmetric two-stage scale search (`asym_search=neuqi` with `sym=True`): `"1"` additionally evaluates the incumbent `search_scales` uniform candidate set and keeps the per-group best over the union grid, so the result dominates both searches per group by construction (no basin either grid catches can be missed); `"0"` (default) runs the plain two-stage grid only.
+- **Default**: `"0"`
+- **Valid Values**: `"0"`, `"1"`
+- **Usage**: Enable for the dominating-union arm of a symmetric-search A/B comparison
+
+```bash
+export AR_NEUQI_SYM_UNION=1
+```
+
 ### AR_NEUQI_BACKEND
 - **Description**: Backend chain for the NeUQI zero-point sweep. `"auto"` (default) keeps the reference chunked eager sweep on CPU and, on CUDA, serves the batched sweep with the hand-written Triton kernel from `auto_round_extension.triton.neuqi_sweep` (registers-resident: each weight element is loaded once and every (candidate, zero-point) loss is computed from registers), falling back to the `torch.compile`-fused sweep when Triton is unavailable. `"triton"` forces the Triton kernel, `"compile"` forces the `torch.compile` sweeps on any device, and `"eager"` always uses the reference sweep. All backends evaluate the exact same losses over the exact same candidate grid (selections identical up to near-ties: <~0.1% of groups flip, worst observed relative loss difference ~5e-5 on an RTX 3090, with the Triton kernel matching that tie profile exactly) and remove the HBM-traffic bottleneck of the brute-force grid on large batched expert searches (measured on a 2M-group RTX 3090 sweep: 12.3 s eager -> 0.59 s fused per-candidate -> 0.49 s compiled-batched -> 0.22 s Triton, ~57x). Every stage latches down permanently on failure: Triton -> compiled batched -> compiled per-candidate -> eager. Requires `AR_NEUQI_BATCH` to be enabled for the Triton/compiled-batched stages (it is by default).
 - **Default**: `"auto"`

@@ -775,6 +775,39 @@ class TestNeuqiSymSearch:
         assert l_neuqi <= l_old * 1.001
 
 
+    def test_union_variant_dominates_both_parents_per_group(self, monkeypatch):
+        """AR_NEUQI_SYM_UNION=1: per-group loss must be <= BOTH the incumbent
+        search_scales result and the plain two-stage result (candidate superset)."""
+        from auto_round.data_type.int import search_scales
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+        data = self._skewed_data(256, 96, seed=23)
+        qw = torch.rand(*data.shape) + 0.05
+        monkeypatch.setenv("AR_NEUQI_SYM_UNION", "0")
+        s_b = neuqi_search_scale_sym(data.clone(), bits=4, qw=qw.clone(), coarse_n=64, fine_n=32)
+        s_a = search_scales(data.clone(), bits=4, qw=qw.clone())
+        monkeypatch.setenv("AR_NEUQI_SYM_UNION", "1")
+        s_c = neuqi_search_scale_sym(data.clone(), bits=4, qw=qw.clone(), coarse_n=64, fine_n=32)
+        monkeypatch.delenv("AR_NEUQI_SYM_UNION")
+        l_c = self._sym_loss(data, qw, s_c)
+        l_b = self._sym_loss(data, qw, s_b)
+        l_a = self._sym_loss(data, qw, s_a)
+        # dominance up to fp32 summation slack
+        assert (l_c <= l_a + 1e-2 * l_a.abs() + 1e-3).all()
+        assert (l_c <= l_b + 1e-2 * l_b.abs() + 1e-3).all()
+        assert (l_c < l_b - 1e-3).any() or (l_c < l_a - 1e-3).any()  # union actually adds wins
+
+    def test_union_env_off_matches_plain_two_stage_exactly(self, monkeypatch):
+        monkeypatch.setenv("AR_NEUQI_SYM_UNION", "0")
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+        data = self._skewed_data(128, 96, seed=29)
+        qw = torch.rand(*data.shape) + 0.05
+        a = neuqi_search_scale_sym(data.clone(), bits=4, qw=qw.clone(), coarse_n=32, fine_n=16)
+        monkeypatch.delenv("AR_NEUQI_SYM_UNION")
+        b = neuqi_search_scale_sym(data.clone(), bits=4, qw=qw.clone(), coarse_n=32, fine_n=16)
+        assert torch.equal(a, b)
+
 class TestNeuqiSymIntegration:
     def test_sym_neuqi_dispatch(self):
         fn, name = get_quant_func(

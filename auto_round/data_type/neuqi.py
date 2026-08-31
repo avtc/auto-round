@@ -699,6 +699,93 @@ def _sym_loss_chunk(data, qw, scales, nmax):
 _SYM_UPPER_SCALE_RATIO = 2.0
 
 
+def _incumbent_uniform_fracs(bits: int, device: torch.device) -> torch.Tensor:
+    """The incumbent ``search_scales`` candidate set, as fractions of the no-clip scale.
+
+    Reproduces the uniform ``nmax'`` stepping of ``search_scales`` (int.py):
+    ``scale = group_max_signed / nmax'`` with ``nmax'`` stepped around ``nmax``.
+    Because ``|group_max| == max|w|`` by construction, ``|scale| / s0 == nmax / nmax'``
+    for every candidate, so the whole signed set is expressed exactly as positive
+    fracs -- the mirrored-clamp evaluation of ``_sym_loss_chunk`` covers the
+    negative-anchor groups. Includes the incumbent's ``AR_SEARCH_SCALE_RATIO``
+    span and its bits==2 special case.
+    """
+    nmax = float(2 ** (bits - 1))
+    if bits == 2:
+        search_min = 18 * 5
+        step = 0.01
+    else:
+        grid = 200
+        search_ratio = envs.AR_SEARCH_SCALE_RATIO if envs.AR_SEARCH_SCALE_RATIO is not None else 0.75
+        search_min = nmax * search_ratio
+        step = search_min / grid * 2
+        search_min = int(search_min / step)
+    ks = torch.arange(-search_min, search_min + 1, device=device, dtype=torch.float32)
+    return nmax / (nmax - step * ks)
+
+
+def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
+    """Coarse+fine scale search core over a given (sorted, positive) coarse grid.
+
+    Runs the batched coarse evaluation, then the additive fine refinement
+    bracketed by the value-neighbors of each group's winning coarse entry,
+    under both clamp conventions (see ``_sym_loss_chunk``). Strict-improvement
+    updates only, so the result never worsens versus any evaluated candidate.
+
+    Returns:
+        (signed per-group scale [N, 1], per-group best weighted loss [N]).
+    """
+    nmax = int(2 ** (bits - 1))
+    g = data.shape[1]
+    n_groups = data.shape[0]
+    s0 = (torch.abs(data).amax(dim=-1, keepdim=True) / nmax).clamp_(min=q_scale_thresh)  # [N, 1]
+    coarse_n = coarse.numel()
+
+    best_loss = torch.full((n_groups,), float("inf"), device=data.device, dtype=torch.float32)
+    best_frac = torch.ones(n_groups, device=data.device, dtype=torch.float32)
+    best_mirror = torch.zeros(n_groups, device=data.device, dtype=torch.bool)
+
+    # Coarse pass: shared fractions of the per-group no-clip scale.
+    chunk = max(1, _MAX_TMP_ELEMS // (2 * coarse_n * g))
+    for start_idx in range(0, n_groups, chunk):
+        stop = min(start_idx + chunk, n_groups)
+        scales = s0[start_idx:stop] * coarse.view(1, -1)  # [C, K]
+        loss, idx, mirror = _sym_loss_chunk(
+            data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
+        )
+        best_loss[start_idx:stop] = loss
+        best_frac[start_idx:stop] = coarse.index_select(0, idx)
+        best_mirror[start_idx:stop] = mirror
+
+    # Fine pass: additive grid between the coarse neighbors bracketing each winner.
+    best_idx = torch.argmin(torch.abs(coarse.unsqueeze(0) - best_frac.unsqueeze(1)), dim=1)
+    frac_lo = coarse[(best_idx - 1).clamp_(min=0)]
+    frac_hi = coarse[(best_idx + 1).clamp_(max=coarse_n - 1)]
+    if fine_n:
+        steps = torch.arange(1, fine_n + 1, device=data.device, dtype=torch.float32) / (fine_n + 1)
+        one_m_steps = 1.0 - steps
+        chunk = max(1, _MAX_TMP_ELEMS // (2 * fine_n * g))
+        for start_idx in range(0, n_groups, chunk):
+            stop = min(start_idx + chunk, n_groups)
+            fracs = frac_lo[start_idx:stop].unsqueeze(1) * one_m_steps + frac_hi[start_idx:stop].unsqueeze(1) * steps
+            scales = s0[start_idx:stop] * fracs  # [C, F]
+            loss, k, mirror = _sym_loss_chunk(
+                data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
+            )
+            frac = fracs.gather(1, k.unsqueeze(1)).squeeze(1)
+            improved = loss < best_loss[start_idx:stop]
+            best_loss[start_idx:stop] = torch.where(improved, loss, best_loss[start_idx:stop])
+            best_frac[start_idx:stop] = torch.where(improved, frac, best_frac[start_idx:stop])
+            best_mirror[start_idx:stop] = torch.where(improved, mirror, best_mirror[start_idx:stop])
+
+    scale = best_frac.unsqueeze(-1) * s0
+    scale = torch.where(best_mirror.unsqueeze(-1), -scale, scale)
+    # magnitude floor on both signs (the incumbent keeps the sign and clamps
+    # the magnitude), so a near-zero winner never produces a degenerate scale
+    scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
+    return scale, best_loss
+
+
 def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=None, fine_n=None):
     """Two-stage (coarse log-spaced + fine additive) scale search, symmetric.
 
@@ -706,17 +793,19 @@ def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=No
     fixed at 0 and the integer range is clamped to
     ``[-2**(bits-1), 2**(bits-1) - 1]``. The grid is anchored at the per-group
     no-clip scale ``s0 = max|w| / nmax`` and searches log-spaced fractions in
-    ``[_lower_scale_ratio(bits), 2.0]`` followed by an additive refinement
-    between the coarse neighbors bracketing each winner -- the same two-stage
-    scheme as the asymmetric search, applied to the zero-point-free slice.
-    Both clamp conventions of the asymmetric-bounds symmetric grid are searched
-    per group (negative scales, the family the incumbent reaches implicitly via
-    its signed anchor; see ``_sym_loss_chunk``), and the returned scale carries
-    the winning sign. Compared with the incumbent uniform ``search_scales``
-    grid this adds coverage in the deep-clip region (below its ~0.57x floor at
-    4-bit) at the price of first-stage basin selection; which grid wins is an
-    empirical question per landscape, which is why the variant is opt-in via
-    ``asym_search="neuqi"`` with ``sym=True``.
+    ``[_lower_scale_ratio(bits), _SYM_UPPER_SCALE_RATIO]`` followed by an
+    additive refinement between the coarse neighbors bracketing each winner --
+    the same two-stage scheme as the asymmetric search, applied to the
+    zero-point-free slice. Both clamp conventions of the one-level-asymmetric
+    symmetric grid are searched per group (negative scales, the family the
+    incumbent reaches implicitly via its signed anchor; see
+    ``_sym_loss_chunk``), and the returned scale carries the winning sign.
+
+    ``AR_NEUQI_SYM_UNION=1`` (variant C) additionally evaluates the incumbent
+    ``search_scales`` uniform candidate set in the coarse stage and seeds the
+    plain two-stage result as an extra per-group candidate, so the outcome
+    dominates BOTH parent searches per group by candidate-set inclusion (no
+    basin either grid catches can be missed).
 
     Args:
         data: [N, g] float32 tensor of already-grouped weights.
@@ -736,59 +825,22 @@ def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=No
         fine_n = envs.AR_NEUQI_FINE if envs.AR_NEUQI_FINE else 32
     _log_sym_search_engaged(coarse_n, fine_n)
 
-    nmax = int(2 ** (bits - 1))
     data = data.to(torch.float32)
     if qw is not None:
         qw = qw.to(torch.float32)
 
-    g = data.shape[1]
-    n_groups = data.shape[0]
-    s0 = (torch.abs(data).amax(dim=-1, keepdim=True) / nmax).clamp_(min=q_scale_thresh)  # [N, 1]
+    log_grid = _coarse_grid(_lower_scale_ratio(bits), coarse_n, data.device, torch.float32, hi=_SYM_UPPER_SCALE_RATIO)
+    scale, _ = _two_stage_sym_core(data, qw, bits, log_grid, fine_n, q_scale_thresh)
+    if not envs.AR_NEUQI_SYM_UNION:
+        return scale
 
-    lo = _lower_scale_ratio(bits)
-    coarse = _coarse_grid(lo, coarse_n, data.device, torch.float32, hi=_SYM_UPPER_SCALE_RATIO)
-
-    best_loss = torch.full((n_groups,), float("inf"), device=data.device, dtype=torch.float32)
-    best_frac = torch.ones(n_groups, device=data.device, dtype=torch.float32)
-    best_mirror = torch.zeros(n_groups, device=data.device, dtype=torch.bool)
-
-    # Coarse pass: shared log-spaced fractions of the per-group no-clip scale.
-    chunk = max(1, _MAX_TMP_ELEMS // (2 * coarse_n * g))
-    for start in range(0, n_groups, chunk):
-        stop = min(start + chunk, n_groups)
-        scales = s0[start:stop] * coarse.view(1, -1)  # [C, K]
-        loss, idx, mirror = _sym_loss_chunk(data[start:stop], qw[start:stop] if qw is not None else None, scales, nmax)
-        best_loss[start:stop] = loss
-        best_frac[start:stop] = coarse.index_select(0, idx)
-        best_mirror[start:stop] = mirror
-
-    # Fine pass: additive grid between the coarse neighbors bracketing each winner.
-    best_idx = torch.argmin(torch.abs(coarse.unsqueeze(0) - best_frac.unsqueeze(1)), dim=1)
-    frac_lo = coarse[(best_idx - 1).clamp_(min=0)]
-    frac_hi = coarse[(best_idx + 1).clamp_(max=coarse_n - 1)]
-    if fine_n:
-        steps = torch.arange(1, fine_n + 1, device=data.device, dtype=torch.float32) / (fine_n + 1)
-        one_m_steps = 1.0 - steps
-        chunk = max(1, _MAX_TMP_ELEMS // (2 * fine_n * g))
-        for start in range(0, n_groups, chunk):
-            stop = min(start + chunk, n_groups)
-            fracs = frac_lo[start:stop].unsqueeze(1) * one_m_steps + frac_hi[start:stop].unsqueeze(1) * steps
-            scales = s0[start:stop] * fracs  # [C, F]
-            loss, k, mirror = _sym_loss_chunk(
-                data[start:stop], qw[start:stop] if qw is not None else None, scales, nmax
-            )
-            frac = fracs.gather(1, k.unsqueeze(1)).squeeze(1)
-            improved = loss < best_loss[start:stop]
-            best_loss[start:stop] = torch.where(improved, loss, best_loss[start:stop])
-            best_frac[start:stop] = torch.where(improved, frac, best_frac[start:stop])
-            best_mirror[start:stop] = torch.where(improved, mirror, best_mirror[start:stop])
-
-    scale = best_frac.unsqueeze(-1) * s0
-    scale = torch.where(best_mirror.unsqueeze(-1), -scale, scale)
-    # magnitude floor on both signs (the incumbent keeps the sign and clamps
-    # the magnitude), so a near-zero winner never produces a degenerate scale
-    scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
-    return scale
+    union_grid = torch.unique(torch.cat([log_grid, _incumbent_uniform_fracs(bits, data.device)]))
+    u_scale, u_loss = _two_stage_sym_core(data, qw, bits, union_grid, fine_n, q_scale_thresh)
+    # seed the plain two-stage result as one more per-group candidate: the
+    # union grid's fine bracketing does not formally cover the plain grid's
+    # fine winners, so this closes the last dominance gap over variant B
+    take_plain = _sym_loss_chunk(data, qw, scale.reshape(-1, 1), nmax := int(2 ** (bits - 1)))[0] < u_loss
+    return torch.where(take_plain.unsqueeze(-1), scale, u_scale)
 
 
 @register_dtype("opt_rtn_int_sym_neuqi")

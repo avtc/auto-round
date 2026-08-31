@@ -88,6 +88,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NeUQI search in ``auto_round.data_type.neuqi``.
     "AR_NEUQI_COARSE": lambda: int(os.getenv("AR_NEUQI_COARSE", "64")),
     "AR_NEUQI_FINE": lambda: int(os.getenv("AR_NEUQI_FINE", "32")),
+    # symmetric two-stage search variant C: additionally evaluate the incumbent
+    # uniform search_scales candidate set (per-group argmin over the union grid).
+    "AR_NEUQI_SYM_UNION": lambda: os.getenv("AR_NEUQI_SYM_UNION", "0").strip().lower() in ("1", "true", "yes"),
     # Zero-point sweep backend for the NeUQI search: "auto" serves the batched
     # sweep with the extension Triton kernel on CUDA and falls back to the
     # torch.compile-fused sweep (reference eager sweep elsewhere); "triton"

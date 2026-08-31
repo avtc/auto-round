@@ -221,6 +221,16 @@ export AR_NEUQI_COARSE=64
 export AR_NEUQI_FINE=32
 ```
 
+### AR_NEUQI_SYM_UNION
+- **描述**: 对称两阶段 scale 搜索的变体开关（`asym_search=neuqi` 加 `sym=True`）：`"1"` 额外评估现有 `search_scales` 均匀候选集，并保留并集网格上的逐组最优，从而按构造同时支配两个搜索（任一网格能捕获的盆地形都不会漏掉）；`"0"`（默认）仅运行普通两阶段网格。
+- **默认值**: `"0"`
+- **有效值**: `"0"`, `"1"`
+- **用法**: 在对称搜索 A/B 对比中启用"支配并集"臂
+
+```bash
+export AR_NEUQI_SYM_UNION=1
+```
+
 ### AR_NEUQI_BACKEND
 - **描述**：NeUQI 零点扫描的后端链。`"auto"`（默认）在 CPU 上保持参考的分块 eager 扫描，在 CUDA 上优先用 `auto_round_extension.triton.neuqi_sweep` 中的手写 Triton 内核服务批量扫描（寄存器驻留：每个权重元素只加载一次，所有（候选，零点）损失都在寄存器中计算），Triton 不可用时回退到 `torch.compile` 融合扫描；`"triton"` 强制使用 Triton 内核；`"compile"` 在任意设备上强制使用 `torch.compile` 融合扫描；`"eager"` 始终使用参考扫描。所有后端在完全相同的候选网格上计算完全相同的损失（选择仅在近似并列时不同：少于约 0.1% 的组会翻转，RTX 3090 上实测最坏相对损失差约 5e-5，Triton 内核的并列特征与其完全一致），并消除大规模批量专家搜索中暴力网格的显存带宽瓶颈（200 万组的 RTX 3090 扫描实测：eager 12.3 秒 → 单候选融合 0.59 秒 → 编译批量 0.49 秒 → Triton 0.22 秒，约 57 倍）。每一级失败都会永久逐级回退：Triton → 编译批量 → 编译逐候选 → eager。Triton/编译批量阶段需要启用 `AR_NEUQI_BATCH`（默认启用）。
 - **默认值**：`"auto"`
