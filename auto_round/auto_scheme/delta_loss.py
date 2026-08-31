@@ -2022,20 +2022,21 @@ def _build_teacher_logit_shards(
     # Forward regime, decided from the actual placement of the block weights:
     # - disk_index set (meta skeleton): stream blocks from the checkpoint via
     #   prepare_model_low_gpu + materialize_non_block_params.
-    # - block weights on CPU (low-gpu staged parent): prepare_model_low_gpu
+    # - ALL block weights on CPU (low-gpu staged parent): prepare_model_low_gpu
     #   shuttles each block to major_device for its forward and back.
-    # - block weights already resident on GPU(s) (accelerate dispatch across
-    #   device_map): plain forward -- accelerate's own hooks keep activations
-    #   coherent across devices; forcing everything to major_device would fight
-    #   the dispatch placement (mixed-device matmul crash).
-    def _block_weights_on_cpu():
+    # - ANY block weight on a GPU (accelerate dispatch across device_map,
+    #   including partially offloaded mixed cpu+cuda placement): plain forward --
+    #   accelerate's own hooks keep activations coherent across devices; the
+    #   shuttling would fight the per-module placement (mixed-device matmul
+    #   crash, because move_module_to_tuning_device respects tuning_device).
+    def _all_block_weights_on_cpu():
         for block_name_ in get_block_names(model)[0]:
             for param_ in get_module(model, block_name_).parameters():
-                if param_.device.type == "cpu":
-                    return True
-        return False
+                if param_.device.type != "cpu":
+                    return False
+        return True
 
-    staged_forward = disk_index is not None or _block_weights_on_cpu()
+    staged_forward = disk_index is not None or _all_block_weights_on_cpu()
     if disk_index is not None:
         from auto_round.utils.disk_stream_util import materialize_non_block_params
 
