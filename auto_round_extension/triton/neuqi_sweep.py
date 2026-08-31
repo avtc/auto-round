@@ -33,6 +33,19 @@ Contract (``neuqi_sweep_triton``):
     scales: [C, K] float32, contiguous, CUDA
     maxq:   maximum integer value (``2**bits - 1``)
     -> (loss [C, K] float32, argmin zero point [C, K] int32)
+
+Contract (``sym_search_triton``): the symmetric scale search with the same
+registers-resident structure, one data load per element and all K candidates
+under BOTH clamp conventions computed from registers. Rounding and tie rules
+match ``_sym_loss_chunk`` (round-half-to-even; the standard convention wins a
+loss tie against the mirrored one; ascending-candidate first-minimum).
+
+    data:   [C, g] float32, contiguous, CUDA
+    qw:     [C, g] float32, contiguous, CUDA, or ``None``
+    scales: [C, K] float32 POSITIVE per-group candidates, contiguous, CUDA
+    nmax:   symmetric integer bound (``2**(bits - 1)``)
+    -> (best_loss [C] float32, best candidate index [C] int64,
+        best_mirror [C] bool: the mirrored convention won that group)
 """
 
 import torch
@@ -100,6 +113,65 @@ if triton is not None:
             tl.store(zp_ptr + c_off * K + k, bz, mask=cm)
 
 
+if triton is not None:
+
+    @triton.jit
+    def _sym_search_kernel(
+        data_ptr,
+        qw_ptr,
+        scales_ptr,
+        loss_ptr,
+        idx_ptr,
+        mirror_ptr,
+        C,
+        G,
+        K,
+        NMAX: tl.constexpr,
+        HAS_QW: tl.constexpr,
+        BC: tl.constexpr,
+        GP: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        c_off = pid * BC + tl.arange(0, BC)
+        g_off = tl.arange(0, GP)
+        cm = c_off < C
+        gm = g_off < G
+        d = tl.load(data_ptr + c_off[:, None] * G + g_off[None, :], mask=cm[:, None] & gm[None, :], other=0.0)
+        if HAS_QW:
+            qwt = tl.load(qw_ptr + c_off[:, None] * G + g_off[None, :], mask=cm[:, None] & gm[None, :], other=0.0)
+        else:
+            qwt = tl.zeros((BC, GP), dtype=tl.float32) + 1.0
+        best = tl.zeros((BC,), dtype=tl.float32) + float("inf")
+        bk = tl.zeros((BC,), dtype=tl.int32)
+        bmir = tl.zeros((BC,), dtype=tl.int32)
+        for k in range(0, K):
+            sc = tl.load(scales_ptr + c_off * K + k, mask=cm, other=1.0)  # [BC]
+            x = d / sc[:, None]
+            fl = tl.floor(x)
+            fr = x - fl
+            # round-half-to-even (matches torch.round)
+            fl_odd = fl - 2.0 * tl.floor(fl * 0.5) == 1.0
+            take_up = (fr > 0.5) | ((fr == 0.5) & fl_odd)
+            r = fl + take_up.to(tl.float32)
+            # standard convention: clamp(-nmax, nmax - 1), dequant s * q
+            q_std = tl.minimum(tl.maximum(r, -NMAX), NMAX - 1.0)
+            e_std = sc[:, None] * q_std - d
+            l_std = tl.sum(tl.where(gm[None, :], e_std * e_std * qwt, 0.0), axis=1)
+            # mirrored convention (negative-scale family): clamp(-(nmax - 1), nmax)
+            q_mir = tl.minimum(tl.maximum(r, -(NMAX - 1.0)), NMAX)
+            e_mir = sc[:, None] * q_mir - d
+            l_mir = tl.sum(tl.where(gm[None, :], e_mir * e_mir * qwt, 0.0), axis=1)
+            mir = l_mir < l_std  # strict: the standard convention wins a tie
+            loss = tl.where(mir, l_mir, l_std)
+            better = loss < best  # strict: ascending k keeps the first minimum
+            best = tl.where(better, loss, best)
+            bk = tl.where(better, k, bk)
+            bmir = tl.where(better, mir.to(tl.int32), bmir)
+        tl.store(loss_ptr + c_off, best, mask=cm)
+        tl.store(idx_ptr + c_off, bk, mask=cm)
+        tl.store(mirror_ptr + c_off, bmir, mask=cm)
+
+
 def _next_pow2(n):
     p = 1
     while p < n:
@@ -135,6 +207,46 @@ def neuqi_sweep_triton(data, qw, scales, maxq):
     # context to the data's device for the launch.
     with torch.cuda.device(_dev):
         return _launch_sweep(data, qw, scales, loss, zp, c, g, k, nz, maxq, bc, gp)
+
+
+def sym_search_triton(data, qw, scales, nmax):
+    """Evaluate all per-group scale candidates under both symmetric clamp
+    conventions on CUDA (see module docstring)."""
+    assert triton is not None, f"triton is not importable: {_TRITON_IMPORT_ERROR}"
+    assert data.is_cuda and data.dtype == torch.float32 and data.is_contiguous()
+    assert scales.is_contiguous() and scales.dtype == torch.float32
+    if qw is not None:
+        assert qw.dtype == torch.float32 and qw.is_contiguous() and qw.shape == data.shape
+    _dev = data.device
+    assert scales.device == _dev, f"sym_search: scales on {scales.device} but data on {_dev}"
+    if qw is not None:
+        assert qw.device == _dev, f"sym_search: qw on {qw.device} but data on {_dev}"
+
+    c, g = data.shape
+    k = scales.shape[1]
+    gp = _next_pow2(g)
+    bc = max(1, min(64, 4096 // gp))
+    loss = torch.empty((c,), device=_dev, dtype=torch.float32)
+    idx = torch.empty((c,), device=_dev, dtype=torch.int32)
+    mirror = torch.empty((c,), device=_dev, dtype=torch.int32)
+    with torch.cuda.device(_dev):  # Triton launches on the CURRENT device
+        _sym_search_kernel[(triton.cdiv(c, bc),)](
+            data,
+            qw if qw is not None else data,  # dummy pointer when unweighted
+            scales,
+            loss,
+            idx,
+            mirror,
+            c,
+            g,
+            k,
+            NMAX=nmax,
+            HAS_QW=qw is not None,
+            BC=bc,
+            GP=gp,
+            num_warps=4,
+        )
+    return loss, idx.long(), mirror.bool()
 
 
 def _launch_sweep(data, qw, scales, loss, zp, c, g, k, nz, maxq, bc, gp):

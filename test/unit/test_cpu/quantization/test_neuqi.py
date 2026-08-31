@@ -13,6 +13,8 @@
 # limitations under the License.
 import logging
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -837,6 +839,107 @@ class TestNeuqiSymSearch:
         monkeypatch.delenv("AR_NEUQI_SYM_UNION")
         b = neuqi_search_scale_sym(data.clone(), bits=4, qw=qw.clone(), coarse_n=32, fine_n=16)
         assert torch.equal(a, b)
+
+
+class TestSymTritonSweep:
+    """Triton sym-search dispatch: gating, latch-down, and parity where CUDA exists."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_backend_state(self):
+        import auto_round.data_type.neuqi as N
+
+        for attr in ("_sym_triton", "_sym_triton_checked", "_sym_triton_broken"):
+            if hasattr(N, attr):
+                setattr(N, attr, None if attr != "_sym_triton_broken" else False)
+        N._sym_triton_checked = False
+        N._sym_search_warmed.clear()
+        N._sym_chunk_compiled = None
+        N._sym_compile_failed = False
+        yield
+        import auto_round.data_type.neuqi as N2
+
+        N2._sym_triton_broken = False
+        N2._sym_triton_checked = False
+        N2._sym_triton = None
+
+    def test_eval_on_cpu_matches_reference(self):
+        from auto_round.data_type.neuqi import _sym_loss_chunk, _sym_search_eval
+
+        torch.manual_seed(3)
+        data = torch.randn(96, 32)
+        scales = torch.rand(96, 7) + 0.5
+        qw = torch.rand(96, 32) + 0.1
+        for q in (qw, None):
+            ref = _sym_loss_chunk(data, q, scales, 7)
+            out = _sym_search_eval(data, q, scales, 7)
+            torch.testing.assert_close(out[0], ref[0], rtol=1e-5, atol=1e-6)
+            mism = (out[1] != ref[1]).float().mean().item()
+            assert mism < 5e-3, f"candidate index mismatch fraction {mism}"
+            mism_m = (out[2] != ref[2]).float().mean().item()
+            assert mism_m < 5e-2, f"convention mismatch fraction {mism_m}"
+
+    def test_attempt_skips_and_latches_on_failure(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+
+        calls = {"n": 0}
+
+        def _boom(*a, **k):
+            calls["n"] += 1
+            raise RuntimeError("launch failed")
+
+        monkeypatch.setattr(N, "_sym_triton", _boom)
+        monkeypatch.setattr(N, "_sym_triton_checked", True)
+        # a CUDA-shaped stand-in: the gate only consults is_cuda/device before
+        # the launch attempt (real-CUDA parity is covered by the skipif test)
+        fake = SimpleNamespace(is_cuda=True, device=torch.device("cuda"))
+
+        def _wants(device_type):
+            return True
+
+        monkeypatch.setattr(N, "_sym_wants_triton", _wants)
+        out = N._sym_triton_attempt(fake, None, None, 7)
+        assert out is None
+        assert N._sym_triton_broken
+        out2 = N._sym_triton_attempt(fake, None, None, 7)
+        assert out2 is None and calls["n"] == 1  # latched: no second launch
+
+    def test_cpu_never_reaches_triton(self, monkeypatch):
+        import auto_round.data_type.neuqi as N
+
+        def _boom(*a, **k):
+            raise AssertionError("CPU tensors must never reach the Triton kernel")
+
+        monkeypatch.setattr(N, "_sym_triton", _boom)
+        monkeypatch.setattr(N, "_sym_triton_checked", True)
+        out = N._sym_search_eval(torch.randn(8, 32), None, torch.rand(8, 2) + 0.5, 7)
+        assert out[0].shape == (8,)
+
+    def test_wrapper_rejects_cpu_tensors(self):
+        pytest.importorskip("auto_round_extension.triton.neuqi_sweep")
+        from auto_round_extension.triton.neuqi_sweep import sym_search_triton
+
+        with pytest.raises(AssertionError):
+            sym_search_triton(torch.randn(4, 32), None, torch.rand(4, 2) + 0.5, 7)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the Triton kernel")
+    def test_triton_matches_reference_on_cuda(self):
+        from auto_round.data_type.neuqi import _sym_loss_chunk
+        from auto_round_extension.triton.neuqi_sweep import sym_search_triton
+
+        torch.manual_seed(4)
+        dev = torch.device("cuda")
+        data = torch.randn(4096, 128, device=dev)
+        data[:, :5] *= 120.0  # outlier columns like real weights
+        scales = torch.rand(4096, 33, device=dev) + 0.25
+        qw = torch.rand(4096, 128, device=dev) + 0.1
+        for q in (qw, None):
+            ref = _sym_loss_chunk(data, q, scales, 7)
+            out = sym_search_triton(data.contiguous(), q.contiguous() if q is not None else None, scales, 7)
+            torch.testing.assert_close(out[0], ref[0], rtol=1e-4, atol=1e-5)
+            mism = (out[1] != ref[1]).float().mean().item()
+            assert mism < 1e-2, f"candidate index mismatch fraction {mism}"
+            mism_m = (out[2] != ref[2]).float().mean().item()
+            assert mism_m < 5e-2, f"convention mismatch fraction {mism_m}"
 
 
 class TestSymCompiledCore:

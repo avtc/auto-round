@@ -707,6 +707,98 @@ def _sym_loss_chunk(data, qw, scales, nmax):
     return best_loss, best_idx, best_mirror
 
 
+# Symmetric-search Triton backend (auto_round_extension.triton.neuqi_sweep), lazily
+# resolved once; ``None`` when the extension/triton is unavailable on the host.
+_sym_triton = None
+_sym_triton_checked = False
+_sym_triton_broken = False
+_sym_search_warmed: set = set()
+
+
+def _sym_triton_fn():
+    """Resolve the extension symmetric-search Triton kernel once."""
+    global _sym_triton, _sym_triton_checked
+    if not _sym_triton_checked:
+        _sym_triton_checked = True
+        try:
+            from auto_round_extension.triton.neuqi_sweep import sym_search_triton
+
+            _sym_triton = sym_search_triton
+            logger.info("[NeUQI] Triton symmetric scale search engaged (auto_round_extension.triton.neuqi_sweep)")
+        except Exception as e:
+            _sym_triton = None
+            logger.info("[NeUQI] Triton sym search unavailable (%s); using the compiled core", e)
+    return _sym_triton
+
+
+def _sym_wants_triton(device_type: str) -> bool:
+    """Whether the extension Triton sym search should be tried, per backend rules."""
+    backend = _BACKEND_OVERRIDE or str(envs.AR_NEUQI_BACKEND or "auto")
+    if backend == "triton":
+        return True
+    if _BACKEND_OVERRIDE in ("compile", "eager"):
+        return False
+    return backend == "auto" and device_type == "cuda"
+
+
+def _sym_triton_attempt(data, qw, scales, nmax):
+    """Try the Triton sym search once; ``None`` (and a permanent latch) on failure."""
+    global _sym_triton_broken
+    if _sym_triton_broken or not data.is_cuda or not _sym_wants_triton(data.device.type):
+        return None
+    fn = _sym_triton_fn()
+    if fn is None:
+        return None
+    try:
+        return fn(data, qw, scales, nmax)
+    except Exception as e:
+        _sym_triton_broken = True
+        torch.cuda.empty_cache()  # a failed launch may hold pooled memory
+        logger.warning("[NeUQI] Triton sym search failed (%s); using the compiled core", e)
+        return None
+
+
+def ensure_sym_search_warmup(device) -> None:
+    """Serialized, synchronized first launch of the sym search kernel.
+
+    Same rationale as :func:`ensure_sweep_warmup`: the first launch JIT-compiles
+    the kernel and writes the on-disk cache; doing that concurrently with other
+    GPU work has been observed to corrupt selections. Failures latch the
+    Triton fallback instead of raising.
+    """
+    if device.type != "cuda":
+        return
+    with _sweep_warm_lock:
+        if device.index in _sym_search_warmed:
+            return
+        _sym_search_warmed.add(device.index)
+        if not _sym_wants_triton(device.type):
+            return
+        fn = _sym_triton_fn()
+        if fn is None:
+            return
+        global _sym_triton_broken
+        try:
+            data = torch.randn(4, 128, device=device, dtype=torch.float32)
+            scales = torch.rand(4, 2, device=device, dtype=torch.float32) * 0.01 + 0.001
+            loss, _idx, _mir = fn(data, torch.ones_like(data), scales, 7)
+            torch.cuda.synchronize(device)
+            if not torch.isfinite(loss).all():
+                raise RuntimeError("warmup produced non-finite losses")
+            logger.info("[NeUQI] Triton sym search warmed on %s", device)
+        except Exception as e:  # noqa: BLE001  warmup failure must never kill a run
+            _sym_triton_broken = True
+            logger.warning("[NeUQI] Triton sym search warmup failed on %s (%s); using the compiled core", device, e)
+
+
+def _sym_search_eval(data, qw, scales, nmax):
+    """Best evaluator for one chunk: Triton (registers-resident) -> compiled core -> eager."""
+    out = _sym_triton_attempt(data, qw, scales, nmax)
+    if out is not None:
+        return out
+    return _sym_loss_chunk_eval(data, qw, scales, nmax)
+
+
 # Compiled core for the symmetric search chunk: each eager chunk is ~20 small
 # kernel launches and the chunk size shrinks with the candidate count
 # (_MAX_TMP_ELEMS // (2 * K * g)), so wide grids (the union variant at
@@ -740,7 +832,7 @@ def _sym_loss_chunk_eval(data, qw, scales, nmax):
     retrying per chunk would repeat the failure cost every chunk.
     """
     global _sym_chunk_compiled, _sym_compile_failed
-    backend = str(envs.AR_NEUQI_BACKEND or "auto")
+    backend = _BACKEND_OVERRIDE or str(envs.AR_NEUQI_BACKEND or "auto")
     if _sym_compile_failed or backend not in ("auto", "compile", "triton"):
         return _sym_loss_chunk(data, qw, scales, nmax)
     if _sym_chunk_compiled is None:
@@ -817,7 +909,7 @@ def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
     for start_idx in range(0, n_groups, chunk):
         stop = min(start_idx + chunk, n_groups)
         scales = s0[start_idx:stop] * coarse.view(1, -1)  # [C, K]
-        loss, idx, mirror = _sym_loss_chunk_eval(
+        loss, idx, mirror = _sym_search_eval(
             data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
         )
         best_loss[start_idx:stop] = loss
@@ -836,7 +928,7 @@ def _two_stage_sym_core(data, qw, bits, coarse, fine_n, q_scale_thresh):
             stop = min(start_idx + chunk, n_groups)
             fracs = frac_lo[start_idx:stop].unsqueeze(1) * one_m_steps + frac_hi[start_idx:stop].unsqueeze(1) * steps
             scales = s0[start_idx:stop] * fracs  # [C, F]
-            loss, k, mirror = _sym_loss_chunk_eval(
+            loss, k, mirror = _sym_search_eval(
                 data[start_idx:stop], qw[start_idx:stop] if qw is not None else None, scales, nmax
             )
             frac = fracs.gather(1, k.unsqueeze(1)).squeeze(1)
@@ -892,6 +984,7 @@ def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=No
     if fine_n is None:
         fine_n = envs.AR_NEUQI_FINE if envs.AR_NEUQI_FINE else 32
     _log_sym_search_engaged(coarse_n, fine_n)
+    ensure_sym_search_warmup(data.device)
 
     data = data.to(torch.float32)
     if qw is not None:
@@ -907,7 +1000,7 @@ def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=No
     # seed the plain two-stage result as one more per-group candidate: the
     # union grid's fine bracketing does not formally cover the plain grid's
     # fine winners, so this closes the last dominance gap over variant B
-    take_plain = _sym_loss_chunk_eval(data, qw, scale.reshape(-1, 1), nmax := int(2 ** (bits - 1)))[0] < u_loss
+    take_plain = _sym_search_eval(data, qw, scale.reshape(-1, 1), nmax := int(2 ** (bits - 1)))[0] < u_loss
     return torch.where(take_plain.unsqueeze(-1), scale, u_scale)
 
 
