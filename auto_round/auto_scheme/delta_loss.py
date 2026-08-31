@@ -1092,8 +1092,7 @@ def model_forward_low_gpu(
 
             try:
                 if score_fn == "kld":
-                    z_fp = _load_teacher_shard(teacher_shard_dir, batch_idx, _teacher_input_ids(data))
-                    _kld_loss(output.logits, z_fp).backward()
+                    _backward_scoring_loss(output, score_fn, teacher_shard_dir, batch_idx, data)
                 else:
                     output.loss.to(torch.float32).backward()
             except MyCustomError:
@@ -1225,8 +1224,11 @@ def get_score_for_scheme(
     """
     score_fn = score_fn or _autoscheme_score_fn()
     if score_fn == "kld":
-        if force_mllm:
-            raise NotImplementedError("AR_AUTO_SCHEME_SCORE=kld does not support VLM (force_mllm) scoring yet")
+        if force_mllm or is_vlm:
+            raise NotImplementedError(
+                "AR_AUTO_SCHEME_SCORE=kld does not support VLM scoring yet; "
+                "unset AR_AUTO_SCHEME_SCORE for multimodal models"
+            )
         if teacher_shard_dir is None:
             shard_name, _meta = _teacher_shard_identity(model_name or "", dataset, nsamples, seqlen, batch_size)
             teacher_shard_dir = os.path.join(_teacher_shards_root(), shard_name)
@@ -1533,11 +1535,7 @@ def get_score_for_scheme(
                 # model.dtype, handles dict-with-text/str/tuple paths the same
                 # way the multimodal compressor calibration does).
                 output, _prepared = model_forward(model, data_for_forward, labels=labels, use_cache=False)
-                if score_fn == "kld":
-                    z_fp = _load_teacher_shard(teacher_shard_dir, batch_idx, _teacher_input_ids(data))
-                    _kld_loss(output.logits, z_fp).backward()
-                else:
-                    output.loss.backward()
+                _backward_scoring_loss(output, score_fn, teacher_shard_dir, batch_idx, data)
 
                 # One-shot sanity check: when scoring vision layers, the batch
                 # MUST carry image data, otherwise the vision tower is bypassed
@@ -1901,25 +1899,29 @@ def _stable_model_id(model_name):
     return os.path.basename(normalized) or normalized
 
 
-def _kld_loss(z_q, z_fp, chunk_tokens=4096):
+def _kld_loss(z_q, z_fp, chunk_tokens=2048):
     """Full-vocabulary KL(teacher || student) summed over all positions, fp32 chunked.
 
-    ``z_fp`` is a detached teacher-logits tensor (any float dtype); gradients flow
-    through ``z_q`` only.
+    ``z_fp`` is a detached teacher-logits tensor (any float dtype, any device);
+    gradients flow through ``z_q`` only. Teacher chunks are transferred to the
+    student's device one at a time so the teacher never needs full GPU residency.
+    Note: per-chunk autograd state is retained until backward, exactly like the
+    CE path's full-vocab loss computation over the same logits tensor.
     """
-    z_q2 = z_q.reshape(-1, z_q.shape[-1])
-    z_fp2 = z_fp.reshape(-1, z_fp.shape[-1]).to(device=z_q2.device, dtype=z_q2.dtype)
-    if z_fp2.shape != z_q2.shape:
+    if tuple(z_fp.shape) != tuple(z_q.shape):
         raise RuntimeError(
-            f"teacher logits shape {tuple(z_fp2.shape)} does not match student {tuple(z_q2.shape)}; "
+            f"teacher logits shape {tuple(z_fp.shape)} does not match student {tuple(z_q.shape)}; "
             "teacher shards were probably built against a different model/tokenizer"
         )
+    z_q2 = z_q.reshape(-1, z_q.shape[-1])
+    z_fp2 = z_fp.reshape(-1, z_fp.shape[-1])
     total = z_q2.new_zeros((), dtype=torch.float32)
     for start in range(0, z_q2.shape[0], chunk_tokens):
         sl = slice(start, start + chunk_tokens)
+        t_chunk = z_fp2[sl].to(device=z_q2.device, dtype=z_q2.dtype)
         log_q = torch.log_softmax(z_q2[sl].float(), dim=-1)
         with torch.no_grad():
-            log_t = torch.log_softmax(z_fp2[sl].float(), dim=-1)
+            log_t = torch.log_softmax(t_chunk.float(), dim=-1)
         total = total + (log_t.exp() * (log_t - log_q)).sum()
     return total
 
@@ -1966,6 +1968,8 @@ def _build_teacher_logit_shards(
     model_name,
     cache_root=None,
     force_mllm=False,
+    low_gpu_mem_usage=False,
+    major_device="cpu",
 ):
     """Build (or reuse) the per-batch bf16 teacher-logit shard cache for kld scoring.
 
@@ -1977,6 +1981,12 @@ def _build_teacher_logit_shards(
         raise NotImplementedError(
             "AR_AUTO_SCHEME_SCORE=kld does not support VLM (force_mllm) scoring yet; "
             "use the default cross-entropy scoring for multimodal models."
+        )
+    if any(param.is_meta for param in model.parameters()):
+        raise NotImplementedError(
+            "AR_AUTO_SCHEME_SCORE=kld teacher-logit shards cannot be built from a meta-device "
+            "skeleton (AR_DISK_STREAM_MODEL / disk-stream runs). Run scoring once from a "
+            "materialized-model run to populate the shard cache, or unset AR_AUTO_SCHEME_SCORE."
         )
     shard_name, meta = _teacher_shard_identity(model_name, dataset, nsamples, seqlen, batch_size)
     shard_dir = os.path.join(_teacher_shards_root(cache_root), shard_name)
@@ -1994,12 +2004,30 @@ def _build_teacher_logit_shards(
     from auto_round.calib_dataset import get_dataloader
 
     loader = get_dataloader(tokenizer, seqlen, dataset_name=str(dataset), seed=42, bs=batch_size, nsamples=nsamples)
-    tmp_dir = shard_dir + ".tmp"
+    tmp_dir = f"{shard_dir}.tmp.{os.getpid()}"
     os.makedirs(tmp_dir, exist_ok=True)
     num_batches = 0
     vocab_size = None
     was_training = model.training
     model.eval()
+    # R1: under the low-GPU staged parent state, blocks live on CPU behind offload
+    # hooks while non-block leaves sit on ``major_device``. Register the same
+    # per-block move hooks ``cal_imatrix_low_gpu`` uses so the plain forward works.
+    block_move_hooks = []
+    if low_gpu_mem_usage and str(major_device).startswith("cuda"):
+        block_names = flatten_list(get_block_names(model, quant_vision=False))
+        for block_name in block_names:
+            block_module = get_module(model, block_name)
+
+            def _to_gpu(module, inputs, _dev=major_device):
+                module.to(_dev)
+                to_device(inputs, _dev)
+
+            def _to_cpu(module, inputs, outputs):
+                module.to("cpu")
+
+            block_move_hooks.append(block_module.register_forward_pre_hook(_to_gpu))
+            block_move_hooks.append(block_module.register_forward_hook(_to_cpu))
     try:
         with torch.no_grad():
             for batch_idx, data in enumerate(loader, start=1):
@@ -2039,13 +2067,37 @@ def _build_teacher_logit_shards(
 
             shutil.rmtree(shard_dir, ignore_errors=True)
         os.rename(tmp_dir, shard_dir)
+        total_bytes = sum(os.path.getsize(os.path.join(shard_dir, name)) for name in os.listdir(shard_dir))
         logger.info(
-            "AutoScheme(kld): teacher shards built at %s (%d batches, vocab=%s)", shard_dir, num_batches, vocab_size
+            "AutoScheme(kld): teacher shards built at %s (%d batches, vocab=%s, %.2f GiB on disk)",
+            shard_dir,
+            num_batches,
+            vocab_size,
+            total_bytes / 2**30,
         )
     finally:
+        for hook in block_move_hooks:
+            hook.remove()
+        if os.path.isdir(tmp_dir):  # failure path: never leave stale tmp shards behind
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         if was_training:
             model.train()
     return shard_dir
+
+
+def _backward_scoring_loss(output, score_fn, teacher_shard_dir, batch_idx, data):
+    """Backward the scoring loss: model CE (cross-entropy) or KL to teacher shards (kld).
+
+    Single entry point shared by the low-GPU capture pass and the plain forward loop
+    so the two sites cannot drift apart.
+    """
+    if score_fn == "kld":
+        z_fp = _load_teacher_shard(teacher_shard_dir, batch_idx, _teacher_input_ids(data))
+        _kld_loss(output.logits, z_fp).backward()
+    else:
+        output.loss.backward()
 
 
 def _load_teacher_shard(shard_dir, batch_idx, input_ids):
@@ -2607,8 +2659,10 @@ def _score_scheme_worker(args):
         progress_queue,
         disk_stream_model,
         worker_cache_path,
+        teacher_shard_dir,
     ) = args
 
+    score_fn = _autoscheme_score_fn()  # fail loud in the worker too, before any scoring
     from auto_round.auto_scheme.utils import _scheme_short_name as _short_name
     from auto_round.auto_scheme.utils import apply_quant_scheme as _apply_quant_scheme
     from auto_round.auto_scheme.utils import compute_layer_bits as _compute_layer_bits
@@ -2749,6 +2803,8 @@ def _score_scheme_worker(args):
             model_name=model_name,
             scheme_tag=f"{index + 1}/{total_schemes} {_short_name(scheme)}",
             disk_index=disk_index,
+            score_fn=score_fn,
+            teacher_shard_dir=teacher_shard_dir,
         )
     except RuntimeError as exc:
         if "out of memory" not in str(exc).lower():
@@ -2783,6 +2839,8 @@ def _gen_layer_config(
     unwraps and records the result before moving to the next scheme.
     """
     from auto_round import envs as _envs
+
+    _autoscheme_score_fn()  # validate AR_AUTO_SCHEME_SCORE up front: fail loud, never mid-run
 
     # Scoring-dataset override: affects ONLY AutoScheme scoring (loss collection,
     # per-scheme cache identity, and teacher-logit shards). The quantization
@@ -3197,8 +3255,9 @@ def _gen_layer_config(
         # kld scoring needs teacher-logit shards before any scheme is applied.
         # Build them once here (wrapper-free bf16 model); parallel workers and all
         # per-scheme scoring passes only READ the shards afterwards.
+        teacher_shard_dir = None
         if score_fn == "kld" and uncached_indices:
-            _build_teacher_logit_shards(
+            teacher_shard_dir = _build_teacher_logit_shards(
                 model,
                 tokenizer,
                 dataset=dataset,
@@ -3206,6 +3265,9 @@ def _gen_layer_config(
                 seqlen=seqlen,
                 batch_size=batch_size,
                 model_name=model_name or "",
+                force_mllm=force_mllm,
+                low_gpu_mem_usage=auto_scheme.low_gpu_mem_usage,
+                major_device=major_device,
             )
         worker_device_pool = [device for device in device_list if str(device).startswith("cuda:")]
         num_gpus = len(worker_device_pool)
@@ -3367,6 +3429,7 @@ def _gen_layer_config(
                             progress_queue,
                             worker_disk_stream_model,
                             scheme_cache_meta[index][1],  # cache_path for batch checkpoints
+                            teacher_shard_dir,
                         )
                         for slot, index in enumerate(uncached_indices)
                     ]
@@ -3561,6 +3624,8 @@ def _gen_layer_config(
                             model_name=model_name,
                             scheme_tag=scheme_tag,
                             disk_index=disk_index,
+                            score_fn=score_fn,
+                            teacher_shard_dir=teacher_shard_dir,
                         )
                     memory_monitor.update()
                     memory_monitor.log_summary()

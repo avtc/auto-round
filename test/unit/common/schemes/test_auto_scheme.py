@@ -651,6 +651,25 @@ class TestAutoSchemeKldScoring:
         got.backward()
         assert z_q.grad is not None and torch.isfinite(z_q.grad).all()
 
+    def test_kld_loss_chunking_matches_reference(self):
+        import torch
+        from auto_round.auto_scheme.delta_loss import _kld_loss
+
+        torch.manual_seed(1)
+        z_fp = torch.randn(5, 11, 37)
+        z_q = (torch.randn(5, 11, 37) * 0.2 + z_fp).requires_grad_(True)
+        # force many tiny chunks
+        got = _kld_loss(z_q, z_fp, chunk_tokens=3)
+        lp_t = torch.log_softmax(z_fp.float(), dim=-1)
+        lq = torch.log_softmax(z_q.float(), dim=-1)
+        ref = (lp_t.exp() * (lp_t - lq)).sum()
+        assert torch.allclose(got, ref, rtol=1e-5, atol=1e-4)
+        # teacher on a different device (cpu) than student works too
+        if torch.cuda.is_available():
+            zq_cuda = z_q.detach().cuda().requires_grad_(True)
+            got_cuda = _kld_loss(zq_cuda, z_fp, chunk_tokens=7)
+            assert torch.allclose(got_cuda.cpu(), ref, rtol=1e-4, atol=1e-3)
+
     def test_teacher_shards_build_load_and_verify(self, tiny_opt_model_path, tmp_path, monkeypatch):
         import torch
         from auto_round.auto_scheme.delta_loss import (
@@ -728,7 +747,7 @@ class TestAutoSchemeKldScoring:
             seqlen=8,
             dataset="calibration.json",  # relative: avoid Windows drive-colon dataset bug
         )
-        monkeypatch.setenv("AR_AUTO_SCHEME_SCORE", "kld")  # noqa: E501
+        monkeypatch.setenv("AR_AUTO_SCHEME_SCORE", "kld")
         _, layer_config = ar.quantize()
         assert layer_config, "kld scoring must produce a layer_config"
 
