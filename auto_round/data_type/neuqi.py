@@ -631,8 +631,20 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     return scale, best_zp.unsqueeze(-1)
 
 
-@lru_cache(maxsize=None)  # once per unique grid: grid sweeps cycle configs in one process
+_sym_engaged_logged: set = set()
+
+
+@torch.compiler.disable  # logging side effect: graph-break here instead of tracing
 def _log_sym_search_engaged(coarse_n: int, fine_n: int) -> None:
+    """Once per unique grid: grid sweeps cycle configs in one process.
+
+    Set-based memo instead of ``lru_cache`` so dynamo (the search runs inside
+    compiled regions under ``--enable_torch_compile``) never has to reason
+    about a cache wrapper; the decorator makes the logging call graph-break.
+    """
+    if (coarse_n, fine_n) in _sym_engaged_logged:
+        return
+    _sym_engaged_logged.add((coarse_n, fine_n))
     logger.info("[NeUQI] two-stage symmetric scale search active (coarse=%d, fine=%d)", coarse_n, fine_n)
 
 

@@ -192,7 +192,7 @@ class TestNeuqiSymLogging:
         (same pattern as TestNeuqiLogging._LogCapture)."""
         import logging
 
-        from auto_round.data_type.neuqi import _log_sym_search_engaged
+        import auto_round.data_type.neuqi as N
 
         records = []
 
@@ -204,11 +204,11 @@ class TestNeuqiSymLogging:
         h = _Cap()
         lg.addHandler(h)
         try:
-            _log_sym_search_engaged.cache_clear()
-            _log_sym_search_engaged(64, 32)
-            _log_sym_search_engaged(64, 32)
-            _log_sym_search_engaged(128, 64)
-            _log_sym_search_engaged(64, 32)
+            N._sym_engaged_logged.clear()
+            N._log_sym_search_engaged(64, 32)
+            N._log_sym_search_engaged(64, 32)
+            N._log_sym_search_engaged(128, 64)
+            N._log_sym_search_engaged(64, 32)
         finally:
             lg.removeHandler(h)
         msgs = [m for m in records if "two-stage symmetric" in m]
