@@ -344,28 +344,38 @@ class SVDQuant(AlgorithmHandler):
 
 
 def _fanout_kwargs(args) -> dict[str, Any]:
-    """Map --parallel_quantization onto the iters=0 per-module search fan-out."""
+    """Map --parallel_quantization onto the iters=0 per-module search fan-out.
+
+    ``auto`` no longer engages the fan-out: under ``--stream_quantization``
+    the round-robin block staging already spreads the per-module searches
+    across the same GPUs (hopping weights there only adds device-to-device
+    contention), and ``auto`` instead resolves the DDP world for the sharded
+    collect (see ``_apply_ddp_world_from_flag``). An explicit worker count
+    stays as the manual fan-out opt-in.
+    """
     pq = getattr(args, "parallel_quantization", "off")
-    if pq == "off":
+    if pq in ("off", "auto"):
         return {"parallel_tuning": False, "parallel_tuning_workers": None}
-    if pq == "auto":
-        return {"parallel_tuning": True, "parallel_tuning_workers": None}
     return {"parallel_tuning": True, "parallel_tuning_workers": int(pq)}
 
 
 def _apply_ddp_world_from_flag(args) -> None:
-    """Map --parallel_quantization onto AR_TUNE_DDP_WORLD for the iters>0 path.
+    """Map --parallel_quantization onto AR_TUNE_DDP_WORLD.
 
     The env is the single channel every DDP consumer already reads, so the
-    flag resolves into it before any config is used. An explicitly set env
-    that disagrees with the flag is a hard error; 'off' leaves the env alone.
+    flag resolves into it before any config is used. At iters>0 that shards
+    the SignRound tuning; at iters=0 it shards the streaming calibration
+    collect (both are env-driven, neither is iters-gated). CPU entries in
+    --device_map are not eligible data-parallel workers. An explicitly set
+    env that disagrees with the flag is a hard error; 'off' leaves the env
+    alone.
     """
     pq = getattr(args, "parallel_quantization", "off")
     if pq == "off":
         return
     if pq == "auto":
         dm = str(getattr(args, "device_map", "0") or "0")
-        world = len([e for e in dm.split(",") if e.strip()])
+        world = len([e for e in dm.split(",") if e.strip() and e.strip().lower() != "cpu"])
     else:
         world = int(pq)
     if world < 2:
@@ -435,6 +445,7 @@ class RTN(AlgorithmHandler):
         from auto_round.data_type.utils import maybe_default_tune_recipe
 
         maybe_default_tune_recipe(asym_search, getattr(args, "iters", 0))
+        _apply_ddp_world_from_flag(args)
         cfg = RTNConfig(
             disable_opt_rtn=getattr(args, "disable_opt_rtn", None),
             asym_search=asym_search,

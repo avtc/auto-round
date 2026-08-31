@@ -140,11 +140,14 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         default="off",
         type=_parse_parallel_quantization,
         help=(
-            "Parallelize quantization across the GPUs in --device_map. iters=0: fan the per-module "
-            "search (OptRTN/NeUQI/RTN) round-robin across devices; iters>0: set the data-parallel "
-            "world size (AR_TUNE_DDP_WORLD). 'off' (default) keeps both serial; 'auto' uses every "
-            "--device_map device; N (>=2) pins the count. Cross-block multi-process tuning is a "
-            "separate flag (--enable_block_parallel_tuning)."
+            "Parallelize quantization across the GPUs in --device_map (CPU entries are not "
+            "eligible). 'auto' resolves the data-parallel world size (AR_TUNE_DDP_WORLD) from "
+            "--device_map: it shards the SignRound tuning at iters>0 and the streaming "
+            "calibration collect at iters=0. The iters=0 per-module search fan-out is no longer "
+            "engaged by 'auto' (under --stream_quantization the round-robin block staging already "
+            "spreads the searches across the same GPUs); pass an explicit N (>=2) to force the "
+            "fan-out with N workers. 'off' (default) keeps both serial. Cross-block multi-process "
+            "tuning is a separate flag (--enable_block_parallel_tuning)."
         ),
     )
     rt.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility.")

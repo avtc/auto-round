@@ -61,12 +61,31 @@ class TestParallelQuantizationFlag:
         assert cfg.parallel_tuning is False
         assert "AR_TUNE_DDP_WORLD" not in os.environ
 
-    def test_auto_at_iters0_sets_fanout(self, monkeypatch):
+    def test_auto_at_iters0_resolves_ddp_not_fanout(self, monkeypatch):
+        """auto at iters=0 resolves the DDP world (sharded collect) instead of
+        the per-module fan-out: under --stream_quantization the round-robin
+        block staging already spreads the searches across the same GPUs, so
+        the fan-out only adds device-to-device contention."""
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '0', '--parallel_quantization', 'auto'])
+        args = _parse(['--iters', '0', '--parallel_quantization', 'auto', '--device_map', '0,1,2,3'])
         (cfg,) = _build(args)
-        assert cfg.parallel_tuning
+        assert cfg.parallel_tuning is False
         assert cfg.parallel_tuning_workers is None
+        assert os.environ["AR_TUNE_DDP_WORLD"] == "4"
+
+    def test_auto_at_iters0_excludes_cpu_devices(self, monkeypatch):
+        monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
+        args = _parse(['--iters', '0', '--parallel_quantization', 'auto', '--device_map', '0,cpu,1'])
+        (cfg,) = _build(args)
+        assert cfg.parallel_tuning is False
+        assert os.environ["AR_TUNE_DDP_WORLD"] == "2"
+
+    def test_auto_at_iters0_single_gpu_stays_off(self, monkeypatch):
+        monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
+        args = _parse(['--iters', '0', '--parallel_quantization', 'auto', '--device_map', '0'])
+        (cfg,) = _build(args)
+        assert cfg.parallel_tuning is False
+        assert "AR_TUNE_DDP_WORLD" not in os.environ
 
     def test_n_at_iters0_pins_workers(self, monkeypatch):
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
