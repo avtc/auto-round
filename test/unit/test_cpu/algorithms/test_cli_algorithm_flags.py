@@ -56,7 +56,7 @@ class TestEnableNeuqiFlag(unittest.TestCase):
 class TestParallelQuantizationFlag:
     def test_default_off_keeps_serial_and_env_untouched(self, monkeypatch):
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '0'])
+        args = _parse(["--iters", "0"])
         (cfg,) = _build(args)
         assert cfg.parallel_tuning is False
         assert "AR_TUNE_DDP_WORLD" not in os.environ
@@ -67,7 +67,7 @@ class TestParallelQuantizationFlag:
         block staging already spreads the searches across the same GPUs, so
         the fan-out only adds device-to-device contention."""
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '0', '--parallel_quantization', 'auto', '--device_map', '0,1,2,3'])
+        args = _parse(["--iters", "0", "--parallel_quantization", "auto", "--device_map", "0,1,2,3"])
         (cfg,) = _build(args)
         assert cfg.parallel_tuning is False
         assert cfg.parallel_tuning_workers is None
@@ -75,54 +75,56 @@ class TestParallelQuantizationFlag:
 
     def test_auto_at_iters0_excludes_cpu_devices(self, monkeypatch):
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '0', '--parallel_quantization', 'auto', '--device_map', '0,cpu,1'])
+        args = _parse(["--iters", "0", "--parallel_quantization", "auto", "--device_map", "0,cpu,1"])
         (cfg,) = _build(args)
         assert cfg.parallel_tuning is False
         assert os.environ["AR_TUNE_DDP_WORLD"] == "2"
 
     def test_auto_at_iters0_single_gpu_stays_off(self, monkeypatch):
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '0', '--parallel_quantization', 'auto', '--device_map', '0'])
+        args = _parse(["--iters", "0", "--parallel_quantization", "auto", "--device_map", "0"])
         (cfg,) = _build(args)
         assert cfg.parallel_tuning is False
         assert "AR_TUNE_DDP_WORLD" not in os.environ
 
-    def test_n_at_iters0_pins_workers(self, monkeypatch):
+    def test_n_at_iters0_pins_ddp_world(self, monkeypatch):
+        """N pins the DDP world at iters=0 as well; the fan-out is API-only."""
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '0', '--parallel_quantization', '3'])
+        args = _parse(["--iters", "0", "--parallel_quantization", "3"])
         (cfg,) = _build(args)
-        assert cfg.parallel_tuning
-        assert cfg.parallel_tuning_workers == 3
+        assert cfg.parallel_tuning is False
+        assert cfg.parallel_tuning_workers is None
+        assert os.environ["AR_TUNE_DDP_WORLD"] == "3"
 
     def test_auto_at_iters_positive_sets_ddp_world_from_device_map(self, monkeypatch):
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '20', '--parallel_quantization', 'auto', '--device_map', '0,1,2,3'])
+        args = _parse(["--iters", "20", "--parallel_quantization", "auto", "--device_map", "0,1,2,3"])
         _build(args)
         assert os.environ["AR_TUNE_DDP_WORLD"] == "4"
 
     def test_n_at_iters_positive_sets_ddp_world(self, monkeypatch):
         monkeypatch.delenv("AR_TUNE_DDP_WORLD", raising=False)
-        args = _parse(['--iters', '20', '--parallel_quantization', '2'])
+        args = _parse(["--iters", "20", "--parallel_quantization", "2"])
         _build(args)
         assert os.environ["AR_TUNE_DDP_WORLD"] == "2"
 
     def test_off_leaves_explicit_env_alone(self, monkeypatch):
         monkeypatch.setenv("AR_TUNE_DDP_WORLD", "4")
-        args = _parse(['--iters', '20'])
+        args = _parse(["--iters", "20"])
         _build(args)
         assert os.environ["AR_TUNE_DDP_WORLD"] == "4"
 
     def test_conflicting_flag_and_env_raises(self, monkeypatch):
         monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
-        args = _parse(['--iters', '20', '--parallel_quantization', '4'])
+        args = _parse(["--iters", "20", "--parallel_quantization", "4"])
         with pytest.raises(ValueError):
             _build(args)
 
     def test_parser_rejects_one_and_garbage(self):
         with pytest.raises(SystemExit):
-            _parse(['--parallel_quantization', '1'])
+            _parse(["--parallel_quantization", "1"])
         with pytest.raises(SystemExit):
-            _parse(['--parallel_quantization', 'bogus'])
+            _parse(["--parallel_quantization", "bogus"])
 
 
 class TestEnablePreSINQFlag(unittest.TestCase):

@@ -344,19 +344,17 @@ class SVDQuant(AlgorithmHandler):
 
 
 def _fanout_kwargs(args) -> dict[str, Any]:
-    """Map --parallel_quantization onto the iters=0 per-module search fan-out.
+    """--parallel_quantization never engages the iters=0 fan-out anymore.
 
-    ``auto`` no longer engages the fan-out: under ``--stream_quantization``
-    the round-robin block staging already spreads the per-module searches
-    across the same GPUs (hopping weights there only adds device-to-device
-    contention), and ``auto`` instead resolves the DDP world for the sharded
-    collect (see ``_apply_ddp_world_from_flag``). An explicit worker count
-    stays as the manual fan-out opt-in.
+    The flag maps onto AR_TUNE_DDP_WORLD uniformly (``auto`` = every eligible
+    --device_map device, ``N`` = pinned world) at both iters=0 and iters>0 --
+    see ``_apply_ddp_world_from_flag``. Under ``--stream_quantization`` the
+    round-robin block staging already spreads the per-module searches across
+    the same GPUs, so hopping weights to them only adds device-to-device
+    contention. The per-module fan-out stays reachable from the API via
+    ``RTNConfig(parallel_tuning=True)``.
     """
-    pq = getattr(args, "parallel_quantization", "off")
-    if pq in ("off", "auto"):
-        return {"parallel_tuning": False, "parallel_tuning_workers": None}
-    return {"parallel_tuning": True, "parallel_tuning_workers": int(pq)}
+    return {"parallel_tuning": False, "parallel_tuning_workers": None}
 
 
 def _apply_ddp_world_from_flag(args) -> None:
@@ -377,7 +375,7 @@ def _apply_ddp_world_from_flag(args) -> None:
         dm = str(getattr(args, "device_map", "0") or "0")
         world = len([e for e in dm.split(",") if e.strip() and e.strip().lower() != "cpu"])
     else:
-        world = int(pq)
+        world = int(pq)  # explicit N pins the world at both iters=0 and iters>0
     if world < 2:
         logger.info("[parallel_quantization] resolved a single device; data parallelism stays off.")
         return
