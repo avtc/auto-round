@@ -1223,12 +1223,11 @@ def get_score_for_scheme(
     shards from ``teacher_shard_dir`` (derived from the scoring identity when omitted).
     """
     score_fn = score_fn or _autoscheme_score_fn()
-    if score_fn == "kld":
-        if force_mllm or is_vlm:
-            raise NotImplementedError(
-                "AR_AUTO_SCHEME_SCORE=kld does not support VLM scoring yet; "
-                "unset AR_AUTO_SCHEME_SCORE for multimodal models"
-            )
+    if score_fn == "kld" and force_mllm:
+        raise NotImplementedError(
+            "AR_AUTO_SCHEME_SCORE=kld does not support multimodal (vision) scoring yet; "
+            "unset AR_AUTO_SCHEME_SCORE when scoring vision towers"
+        )
         if teacher_shard_dir is None:
             shard_name, _meta = _teacher_shard_identity(model_name or "", dataset, nsamples, seqlen, batch_size)
             teacher_shard_dir = os.path.join(_teacher_shards_root(), shard_name)
@@ -1477,7 +1476,9 @@ def get_score_for_scheme(
                     teacher_shard_dir=teacher_shard_dir,
                 )
             except Exception as exc:  # noqa: BLE001
-                if not is_vlm:
+                if not is_vlm or score_fn == "kld":
+                    # kld has text-only teacher shards; the multimodal fallback would
+                    # silently rescore against a different corpus -- fail loud instead.
                     raise
                 logger.warning(
                     f"Text-only calibration failed on VLM ({exc}); "
@@ -1577,7 +1578,9 @@ def get_score_for_scheme(
             try:
                 _run_forward_loop(_build_calib_dataloader())
             except Exception as exc:  # noqa: BLE001
-                if not is_vlm:
+                if not is_vlm or score_fn == "kld":
+                    # kld has text-only teacher shards; the multimodal fallback would
+                    # silently rescore against a different corpus -- fail loud instead.
                     raise
                 logger.warning(
                     f"Text-only calibration failed on VLM ({exc}); "
@@ -1970,6 +1973,7 @@ def _build_teacher_logit_shards(
     force_mllm=False,
     low_gpu_mem_usage=False,
     major_device="cpu",
+    disk_index=None,
 ):
     """Build (or reuse) the per-batch bf16 teacher-logit shard cache for kld scoring.
 
@@ -1979,14 +1983,14 @@ def _build_teacher_logit_shards(
     """
     if force_mllm:
         raise NotImplementedError(
-            "AR_AUTO_SCHEME_SCORE=kld does not support VLM (force_mllm) scoring yet; "
-            "use the default cross-entropy scoring for multimodal models."
+            "AR_AUTO_SCHEME_SCORE=kld does not support multimodal (vision) scoring yet; "
+            "use the default cross-entropy scoring with quant_nontext_module."
         )
-    if any(param.is_meta for param in model.parameters()):
+    if disk_index is None and any(param.is_meta for param in model.parameters()):
         raise NotImplementedError(
             "AR_AUTO_SCHEME_SCORE=kld teacher-logit shards cannot be built from a meta-device "
-            "skeleton (AR_DISK_STREAM_MODEL / disk-stream runs). Run scoring once from a "
-            "materialized-model run to populate the shard cache, or unset AR_AUTO_SCHEME_SCORE."
+            "skeleton without a disk index. Run scoring with the regular model-loading flow, "
+            "or unset AR_AUTO_SCHEME_SCORE."
         )
     shard_name, meta = _teacher_shard_identity(model_name, dataset, nsamples, seqlen, batch_size)
     shard_dir = os.path.join(_teacher_shards_root(cache_root), shard_name)
@@ -2010,27 +2014,29 @@ def _build_teacher_logit_shards(
     vocab_size = None
     was_training = model.training
     model.eval()
-    # R1: under the low-GPU staged parent state, blocks live on CPU behind offload
-    # hooks while non-block leaves sit on ``major_device``. Register the same
-    # per-block move hooks ``cal_imatrix_low_gpu`` uses so the plain forward works.
-    block_move_hooks = []
-    if low_gpu_mem_usage and str(major_device).startswith("cuda"):
-        block_names = flatten_list(get_block_names(model, quant_vision=False))
-        for block_name in block_names:
-            block_module = get_module(model, block_name)
+    # Under the low-GPU staged parent state, blocks live on CPU (or on meta devices
+    # in disk-stream mode) while non-block leaves sit on ``major_device``. Reuse the
+    # scoring capture machinery: materialize non-block params once, and wrap every
+    # block forward so each block moves/materializes on demand and back.
+    staged_forward = low_gpu_mem_usage or disk_index is not None
+    if disk_index is not None:
+        from auto_round.utils.disk_stream_util import materialize_non_block_params
 
-            def _to_gpu(module, inputs, _dev=major_device):
-                module.to(_dev)
-                to_device(inputs, _dev)
-
-            def _to_cpu(module, inputs, outputs):
-                module.to("cpu")
-
-            block_move_hooks.append(block_module.register_forward_pre_hook(_to_gpu))
-            block_move_hooks.append(block_module.register_forward_hook(_to_cpu))
+        materialize_non_block_params(model, get_block_names(model)[0], disk_index, device="cpu")
+    block_inputs = {}
+    # prepare_model_low_gpu replaces each block's forward with a recording wrapper
+    # and only the CALLER can undo it (model_forward_low_gpu restores via
+    # ``module.orig_forward`` before its replay). Save the pristine forwards here
+    # and restore after every batch so the wraps never leak into scoring.
+    block_names = get_block_names(model)[0] if staged_forward else []
+    for name in block_names:
+        module = get_module(model, name)
+        module.orig_forward = module.forward
     try:
         with torch.no_grad():
             for batch_idx, data in enumerate(loader, start=1):
+                if staged_forward:
+                    prepare_model_low_gpu(model, block_inputs, major_device=major_device, disk_index=disk_index)
                 src = data if isinstance(data, dict) else None
                 labels = (
                     src["labels"]
@@ -2051,6 +2057,10 @@ def _build_teacher_logit_shards(
                     os.path.join(tmp_dir, f"batch_{batch_idx:04d}.pt"),
                 )
                 num_batches = batch_idx
+                if staged_forward:
+                    for name in block_names:
+                        block_module = get_module(model, name)
+                        block_module.forward = block_module.orig_forward
         if num_batches == 0:
             raise RuntimeError("teacher shard build produced zero batches; check dataset/nsamples")
         manifest = {
@@ -2076,8 +2086,10 @@ def _build_teacher_logit_shards(
             total_bytes / 2**30,
         )
     finally:
-        for hook in block_move_hooks:
-            hook.remove()
+        if staged_forward:  # failure path: never leave recording wraps installed
+            for name in block_names:
+                block_module = get_module(model, name)
+                block_module.forward = block_module.orig_forward
         if os.path.isdir(tmp_dir):  # failure path: never leave stale tmp shards behind
             import shutil
 
@@ -2157,7 +2169,7 @@ def _autoscheme_cache_config(
     """Build the portable, implementation-independent identity of a scoring run.
 
     ``score_fn`` is omitted from the identity when it equals the default so that
-    legacy ``cross-entropy`` cache files keep validating; ``kld`` runs land in
+    existing ``cross-entropy`` cache files keep validating; ``kld`` runs land in
     separate cache files automatically.
     """
     config = {
@@ -3268,6 +3280,7 @@ def _gen_layer_config(
                 force_mllm=force_mllm,
                 low_gpu_mem_usage=auto_scheme.low_gpu_mem_usage,
                 major_device=major_device,
+                disk_index=disk_index,
             )
         worker_device_pool = [device for device in device_list if str(device).startswith("cuda:")]
         num_gpus = len(worker_device_pool)

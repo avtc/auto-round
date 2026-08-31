@@ -107,7 +107,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Stores persistent AutoScheme scoring results independently from AR_WORK_SPACE,
     # whose contents are temporary working data and may be cleaned after a run.
     "AR_AUTO_SCHEME_CACHE": lambda: os.getenv("AR_AUTO_SCHEME_CACHE", None),
-    # AutoScheme scoring loss: "cross-entropy" (default, legacy behavior) or "kld"
+    # AutoScheme scoring loss: "cross-entropy" (default) or "kld"
     # (KL divergence to the bf16 teacher's full output distribution).
     "AR_AUTO_SCHEME_SCORE": lambda: os.getenv("AR_AUTO_SCHEME_SCORE", "cross-entropy"),
     # Overrides ONLY the dataset used for AutoScheme scoring (loss collection); the

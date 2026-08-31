@@ -139,7 +139,7 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
   KL measurement reports. `kld` builds (once, then reuses) a teacher-logit shard cache
   beside the per-scheme caches under `AR_AUTO_SCHEME_CACHE`; kld-scored schemes land in
   separate cache files and never collide with cross-entropy caches.
-- **Default**: unset → `cross-entropy` (legacy behavior; existing caches stay valid)
+- **Default**: unset -> `cross-entropy` (default behavior; existing caches stay valid)
 - **Valid Values**: `cross-entropy`, `kld` (case-insensitive; anything else fails loud)
 - **Usage**: Optimize bit allocation for the KL-to-base objective:
 
@@ -152,7 +152,7 @@ export AR_AUTO_SCHEME_SCORE=kld
   collection, per-scheme cache identity, and kld teacher-logit shards). The
   quantization calibration dataset (imatrix / tuning chain) is unaffected — this
   enables measuring scheme sensitivity on one corpus while quantizing on another.
-- **Default**: unset → the main `--dataset` is used for scoring (legacy behavior)
+- **Default**: unset -> the main `--dataset` is used for scoring (default behavior)
 - **Valid Values**: any dataset name or local path accepted by `--dataset`
 - **Usage**: Score schemes on wikitext while calibrating quantization on pile-10k:
 
