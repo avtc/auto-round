@@ -191,7 +191,9 @@ def get_quant_func(
             NeUQI search is opt-in: only ``"neuqi"`` considers the
             ``opt_rtn_*_asym`` candidates; ``"auto"`` (default) and
             ``"minmax"`` resolve the plain min/max ``rtn_*_asym`` function
-            for ``sym=False``. Ignored for ``sym=True``.
+            for ``sym=False``. For ``sym=True`` only ``"neuqi"`` matters: it
+            prefers the two-stage symmetric scale search
+            (``opt_rtn_int_sym_neuqi``) over the uniform ``search_scales`` grid.
 
     Returns:
         function: The quantization function corresponding to the specified parameters.
@@ -275,6 +277,10 @@ def get_quant_func(
         data_types = [rtn_data_type, pad_bits(rtn_data_type), pad_sym(rtn_data_type), pad_sym(pad_bits(rtn_data_type))]
         if asym_search != "neuqi" and not sym:
             data_types = [dt for dt in data_types if not dt.endswith("_asym") and not dt.endswith(f"_asym{bits}")]
+        if sym and asym_search == "neuqi":
+            # two-stage symmetric scale search (NeUQI grid machinery, zero point
+            # fixed at 0) -- preferred over the uniform search_scales grid
+            data_types = [f"{rtn_data_type}_sym_neuqi", f"{rtn_data_type}{bits}_sym_neuqi"] + data_types
         for data_type in data_types:
             from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
 

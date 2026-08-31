@@ -292,7 +292,7 @@ export AR_DISK_STREAM_MODEL=1
 ```
 
 ### AR_POST_SCALE_REFIT
-- **描述**: 调优结束后按组做最小二乘 scale 重拟合，整数网格与零点冻结。单步闭式解（冻结整数约束下的精确最优解）；存在 imatrix 时按 imatrix 加权；按构造保证加权 MSE 单调不增。可与任意 `AR_TUNE_RECIPE`（以及普通 minmax 初始化运行）组合；仅作用于标准 group size 的非对称 int 层（对称层保持原网格，记录一次日志）。
+- **描述**: NeUQI 搜索（非对称联合扫描与对称两阶段变体）中每个粗候选的精细（加法）scale 细化候选数量。
 - **默认值**: `0`（关闭）
 - **有效值**: `0`、`1`（也接受 `true`/`yes`）
 

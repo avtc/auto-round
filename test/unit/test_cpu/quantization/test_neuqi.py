@@ -615,8 +615,8 @@ class TestAsymSearchAPI:
     def test_non_auto_with_sym_raises(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
-        with pytest.raises(ValueError, match="asymmetric path only"):
-            RTNConfig(bits=4, group_size=32, sym=True, disable_opt_rtn=False, asym_search="neuqi")
+        # neuqi + sym engages the two-stage symmetric scale search (opt_rtn_int_sym_neuqi)
+        RTNConfig(bits=4, group_size=32, sym=True, disable_opt_rtn=False, asym_search="neuqi")
         with pytest.raises(ValueError, match="asymmetric path only"):
             RTNConfig(bits=4, group_size=32, sym=True, disable_opt_rtn=False, asym_search="minmax")
 
@@ -688,3 +688,124 @@ class TestNeuqiItersGuard:
 
         fn, name = get_quant_func("int", 4, False, disable_opt_rtn=False, group_size=128, iters=0, asym_search="neuqi")
         assert name.startswith("opt_rtn_int_asym")
+
+
+class TestNeuqiSymSearch:
+    """Two-stage symmetric scale search (zero point fixed at 0)."""
+
+    def _skewed_data(self, n_groups=512, group_size=128, seed=0):
+        gen = torch.Generator().manual_seed(seed)
+        data = torch.randn(n_groups, group_size, generator=gen)
+        data[:, :6] *= 60.0  # outliers make the clip search matter
+        # half the groups skew negative so the mirrored clamp family is in play
+        data[::2] *= -1.0
+        return data
+
+    def _sym_loss(self, data, qw, scale):
+        """Literal loss of the shipped symmetric formula (signed scales allowed)."""
+        iq = (data / scale).round().clamp(-8, 7)
+        err = (scale * iq - data) ** 2
+        if qw is not None:
+            err = err * qw
+        return err.sum(-1)
+
+    def test_returns_signed_scales_with_magnitude_floor(self):
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+        data = self._skewed_data()
+        qw = torch.rand(*data.shape) + 0.05
+        scale = neuqi_search_scale_sym(data, bits=4, qw=qw, coarse_n=32, fine_n=16)
+        assert scale.shape == (data.shape[0], 1)
+        assert (scale.abs() >= 1e-5).all()
+        # both clamp conventions must actually win somewhere on skewed data
+        assert (scale < 0).any() and (scale > 0).any()
+
+    def test_mirrored_family_matches_literal_negative_scale(self):
+        """The mirrored-clamp loss used inside the search must equal the literal
+        negative-scale evaluation of the shipped formula (guards the sign of the
+        mirrored error term)."""
+        from auto_round.data_type.neuqi import _sym_loss_chunk
+
+        torch.manual_seed(3)
+        data = torch.randn(64, 96)
+        qw = torch.rand(64, 96) + 0.1
+        scales = torch.rand(64, 8) * 0.05 + 0.005  # [C, K] positive candidates
+        loss, idx, mirror = _sym_loss_chunk(data, qw, scales, nmax=8)
+        for c in range(data.shape[0]):
+            k = idx[c].item()
+            s = scales[c, k]
+            signed = -s if mirror[c] else s
+            ref = self._sym_loss(data[c : c + 1], qw[c : c + 1], torch.tensor([[signed]]))[0]
+            assert torch.allclose(loss[c], ref, rtol=1e-4, atol=1e-3)
+
+    def test_signed_search_beats_positive_only_bruteforce_on_skewed_groups(self):
+        """Skewed groups: allowing the mirrored family must reach (near-)the signed
+        brute-force optimum, strictly below the positive-only optimum."""
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+        data = self._skewed_data(128, 96, seed=7)
+        qw = torch.rand(*data.shape) + 0.05
+        scale = neuqi_search_scale_sym(data, bits=4, qw=qw, coarse_n=64, fine_n=32)
+        got = self._sym_loss(data, qw, scale)
+        # dense positive-only reference over the same anchor
+        s0 = data.abs().amax(dim=-1, keepdim=True) / 8
+        fracs = torch.logspace(-0.9, 0.3, 2000)
+        ref = torch.full_like(got, float("inf"))
+        for f in fracs:
+            l = self._sym_loss(data, qw, s0 * f)
+            ref = torch.minimum(ref, l)
+        # aggregate must win: the mirrored family is reachable, and the few
+        # two-stage basin misses (coarse grid skips a narrow basin) stay small
+        assert got.sum() <= ref.sum() * 1.001
+        # and on genuinely skewed groups it must beat the positive-only optimum
+        assert (got < ref - 1e-3).float().mean() > 0.25
+
+    def test_covers_incumbent_uniform_grid(self):
+        """Total weighted loss must not exceed search_scales (both searches see the
+        same data, weights and signed-scale families)."""
+        from auto_round.data_type.int import search_scales
+        from auto_round.data_type.neuqi import neuqi_search_scale_sym
+
+        data = self._skewed_data(512, 128, seed=11)
+        qw = torch.rand(*data.shape) + 0.05
+        s_neuqi = neuqi_search_scale_sym(data.clone(), bits=4, qw=qw.clone(), coarse_n=64, fine_n=32)
+        s_old = search_scales(data.clone(), bits=4, qw=qw.clone())
+        l_neuqi = self._sym_loss(data, qw, s_neuqi).sum().item()
+        l_old = self._sym_loss(data, qw, s_old).sum().item()
+        assert l_neuqi <= l_old * 1.001
+
+
+class TestNeuqiSymIntegration:
+    def test_sym_neuqi_dispatch(self):
+        fn, name = get_quant_func(
+            "int", 4, True, disable_opt_rtn=False, group_size=32, iters=0, asym_search="neuqi", weight_path=False
+        )
+        assert name == "opt_rtn_int_sym_neuqi"
+        assert "opt_rtn_int_sym_neuqi" in QUANT_FUNC_WITH_DTYPE
+
+    def test_sym_auto_still_uses_incumbent(self):
+        fn, name = get_quant_func(
+            "int", 4, True, disable_opt_rtn=False, group_size=32, iters=0, asym_search="auto", weight_path=False
+        )
+        assert name == "opt_rtn_int_sym"
+
+    def test_wrapper_qdq_matches_returned_signed_scale(self):
+        from auto_round.data_type.neuqi import quant_tensor_opt_rtn_sym_neuqi
+
+        torch.manual_seed(13)
+        w = torch.randn(32, 256)
+        w[:, :20] *= -40.0  # negative-heavy columns exercise the mirrored family
+        qdq, scale, zp = quant_tensor_opt_rtn_sym_neuqi(w, bits=4, group_size=32)
+        assert zp == 8
+        assert scale.shape == (32 * 256 // 32, 1)
+        s2d = torch.repeat_interleave(scale.reshape(32, 8), 32, dim=1)
+        manual = (w / s2d).round().clamp(-8, 7) * s2d
+        assert torch.allclose(qdq, manual, rtol=1e-3, atol=1e-4)
+        assert (scale < 0).any()  # mirrored family won somewhere
+
+    def test_config_allows_neuqi_sym_rejects_minmax_sym(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        RTNConfig(bits=4, group_size=32, sym=True, asym_search="neuqi")  # must not raise
+        with pytest.raises(ValueError, match="minmax"):
+            RTNConfig(bits=4, group_size=32, sym=True, asym_search="minmax")

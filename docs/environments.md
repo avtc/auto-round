@@ -202,7 +202,7 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 ```
 
 ### AR_NEUQI_COARSE
-- **Description**: Number of coarse (log-spaced) scale candidates explored by the NeUQI search before the fine additive refinement.
+- **Description**: Number of coarse (log-spaced) scale candidates explored by the NeUQI searches (the asymmetric joint scale/zero-point sweep and the symmetric two-stage scale search engaged via `asym_search=neuqi` with `sym=True`) before the fine additive refinement.
 - **Default**: `"64"`
 - **Valid Values**: any positive integer
 - **Usage**: Lower for faster searches, raise for exhaustive scale sweeps
@@ -212,7 +212,7 @@ export AR_NEUQI_COARSE=64
 ```
 
 ### AR_NEUQI_FINE
-- **Description**: Number of fine (additive) scale refinement candidates per coarse candidate in the NeUQI search.
+- **Description**: Number of fine (additive) scale refinement candidates per coarse candidate in the NeUQI searches (asymmetric joint sweep and symmetric two-stage variant).
 - **Default**: `"32"`
 - **Valid Values**: any positive integer
 - **Usage**: Lower for faster searches, raise for finer scale resolution

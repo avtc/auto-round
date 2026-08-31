@@ -95,10 +95,10 @@ class RTNConfig(QuantizationConfig):
         valid_asym_search = ("auto", "neuqi", "minmax")
         if asym_search not in valid_asym_search:
             raise ValueError(f"asym_search={asym_search!r} is not one of {valid_asym_search}.")
-        if asym_search != "auto" and self.sym:
+        if asym_search == "minmax" and self.sym:
             raise ValueError(
-                f"asym_search={asym_search!r} applies to the asymmetric path only (sym=False); the "
-                "symmetric path uses its own scale grid search."
+                'asym_search="minmax" applies to the asymmetric path only (sym=False); the symmetric '
+                "path already initializes from min/max."
             )
         if asym_search == "neuqi" and disable_opt_rtn:
             raise ValueError(

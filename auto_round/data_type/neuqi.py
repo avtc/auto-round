@@ -37,7 +37,12 @@ The search replaces the plain min/max initialization of the asymmetric optimized
 path and is a strict generalization of the symmetric ``search_scales`` grid (which
 fixes ``z = 0``).
 
-Performance: the per-candidate zero-point sweep is a pure elementwise + reduction
+The symmetric counterpart (:func:`neuqi_search_scale_sym`) fixes the zero point at
+0 and searches only the scale on the same two-stage grid; it replaces the uniform
+``search_scales`` grid of ``opt_rtn_int_sym`` when engaged via
+``asym_search="neuqi"`` with ``sym=True``.
+
+Performance: the per-candidate zero-point sweep is a pure elementwise + reduction chain,
 chain, so on CUDA it is fused into a single generated kernel via ``torch.compile``
 (``AR_NEUQI_BACKEND=auto``, the default), and all coarse/fine candidates of a pass
 are additionally folded into one such kernel per group chunk (``AR_NEUQI_BATCH``)
@@ -83,7 +88,7 @@ def _log_search_engaged(coarse_n: int, fine_n: int) -> None:
 
 
 @torch.compiler.disable
-def _coarse_grid(lo: float, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _coarse_grid(lo: float, n: int, device: torch.device, dtype: torch.dtype, hi: float = 1.0) -> torch.Tensor:
     """Log-spaced coarse scale fractions, always built eagerly.
 
     torch.logspace lowers to an fp64 ``libdevice.pow`` inside compiled
@@ -101,7 +106,7 @@ def _coarse_grid(lo: float, n: int, device: torch.device, dtype: torch.dtype) ->
     CUDA_LAUNCH_BLOCKING=1). Recreating 64 floats per call is free and
     keeps creation on the calling thread's own stream.
     """
-    return torch.logspace(math.log10(lo), 0.0, n, device=device, dtype=dtype)
+    return torch.logspace(math.log10(lo), math.log10(hi), n, device=device, dtype=dtype)
 
 
 def _zp_expr_last(data, qw, scale, zp_grid, maxq):
@@ -626,6 +631,222 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     return scale, best_zp.unsqueeze(-1)
 
 
+@lru_cache(maxsize=1)
+def _log_sym_search_engaged(coarse_n: int, fine_n: int) -> None:
+    logger.info("[NeUQI] two-stage symmetric scale search active (coarse=%d, fine=%d)", coarse_n, fine_n)
+
+
+def _sym_loss_chunk(data, qw, scales, nmax):
+    """Batched symmetric-candidate weighted qdq losses for one chunk of groups.
+
+    Evaluates every per-group scale candidate in one vectorized call under BOTH
+    symmetric clamp conventions and keeps the better one per (group, candidate):
+
+    * standard:  ``q = clamp(round(w / s), -nmax, nmax - 1)``, dequant ``s * q``
+    * mirrored:  ``q = clamp(round(w / s), -(nmax - 1), nmax)``, dequant ``-s * q``
+
+    The mirrored family is the exact arithmetic of a NEGATIVE scale through the
+    standard formula (``round(w / -s)`` flips the rounding sign, ``clamp`` bounds
+    swap roles, ``-s * q`` restores magnitude). The incumbent
+    ``search_scales`` reaches it implicitly by anchoring on the signed max-abs
+    value, so groups whose largest-magnitude element is negative get a negative
+    scale -- for skewed groups the one-level clamp asymmetry makes the mirrored
+    grid notably cheaper (measured: the worst synthetic groups lose ~2x total
+    weighted loss when the family is unreachable). Searching ``|s|`` plus a sign
+    per group covers both families explicitly.
+
+    Plain eager math: with a single zero-point-free axis there is no
+    (candidate, zero-point) expansion, so the whole chunk is a handful of
+    elementwise kernels and no fused sweep is needed.
+
+    Args:
+        data: [chunk, g] float32 group data.
+        qw: [chunk, g] float32 per-element weights or ``None``.
+        scales: [chunk, K] float32 POSITIVE per-group scale candidates.
+        nmax: symmetric integer bound (``2 ** (bits - 1)``).
+
+    Returns:
+        (best_loss [chunk], best_idx [chunk], best_mirror [chunk] bool) with the
+        first-minimum tie rule of ``Tensor.min`` over candidates (matching the
+        asymmetric sweep's tie semantics); ``best_mirror`` marks whether the
+        winning candidate used the mirrored convention (negative scale).
+    """
+    d = data.unsqueeze(1)  # [C, 1, g]
+    sc = scales.unsqueeze(-1)  # [C, K, 1]
+    r = torch.round(d / sc)
+    q_std = r.clamp(min=-nmax, max=nmax - 1)
+    e_std = sc * q_std - d
+    l_std = e_std * e_std
+    q_mir = r.clamp(min=-(nmax - 1), max=nmax)
+    e_mir = sc * q_mir - d  # dequant of the mirrored family is sc * q_mir (neg scale flipped inside q_mir)
+    l_mir = e_mir * e_mir
+    if qw is not None:
+        w = qw.unsqueeze(1)
+        l_std = l_std * w
+        l_mir = l_mir * w
+    l_std = l_std.sum(dim=-1)  # [C, K]
+    l_mir = l_mir.sum(dim=-1)  # [C, K]
+    mirror = l_mir < l_std
+    loss = torch.where(mirror, l_mir, l_std)
+    best_loss, best_idx = loss.min(dim=-1)
+    best_mirror = mirror.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+    return best_loss, best_idx, best_mirror
+
+
+# Fraction of the no-clip max-abs scale above which coarser grids are never
+# competitive: beyond the no-clip scale the step only coarsens with no clipping
+# benefit, and the slack region far above it is dominated.
+_SYM_UPPER_SCALE_RATIO = 2.0
+
+
+def neuqi_search_scale_sym(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=None, fine_n=None):
+    """Two-stage (coarse log-spaced + fine additive) scale search, symmetric.
+
+    Symmetric counterpart of :func:`neuqi_search_scale_zero`: the zero point is
+    fixed at 0 and the integer range is clamped to
+    ``[-2**(bits-1), 2**(bits-1) - 1]``. The grid is anchored at the per-group
+    no-clip scale ``s0 = max|w| / nmax`` and searches log-spaced fractions in
+    ``[_lower_scale_ratio(bits), 2.0]`` followed by an additive refinement
+    between the coarse neighbors bracketing each winner -- the same two-stage
+    scheme as the asymmetric search, applied to the zero-point-free slice.
+    Both clamp conventions of the asymmetric-bounds symmetric grid are searched
+    per group (negative scales, the family the incumbent reaches implicitly via
+    its signed anchor; see ``_sym_loss_chunk``), and the returned scale carries
+    the winning sign. Compared with the incumbent uniform ``search_scales``
+    grid this adds coverage in the deep-clip region (below its ~0.57x floor at
+    4-bit) at the price of first-stage basin selection; which grid wins is an
+    empirical question per landscape, which is why the variant is opt-in via
+    ``asym_search="neuqi"`` with ``sym=True``.
+
+    Args:
+        data: [N, g] float32 tensor of already-grouped weights.
+        bits: quantization bit width.
+        qw: optional [N, g] float32 per-element loss weights (e.g. imatrix).
+        q_scale_thresh: minimum scale magnitude.
+        coarse_n: number of coarse log-spaced candidates (env ``AR_NEUQI_COARSE``).
+        fine_n: number of fine additive candidates (env ``AR_NEUQI_FINE``).
+
+    Returns:
+        scale: [N, 1] float32 per-group signed scales (negative = mirrored clamp
+        convention won for that group).
+    """
+    if coarse_n is None:
+        coarse_n = envs.AR_NEUQI_COARSE if envs.AR_NEUQI_COARSE else 64
+    if fine_n is None:
+        fine_n = envs.AR_NEUQI_FINE if envs.AR_NEUQI_FINE else 32
+    _log_sym_search_engaged(coarse_n, fine_n)
+
+    nmax = int(2 ** (bits - 1))
+    data = data.to(torch.float32)
+    if qw is not None:
+        qw = qw.to(torch.float32)
+
+    g = data.shape[1]
+    n_groups = data.shape[0]
+    s0 = (torch.abs(data).amax(dim=-1, keepdim=True) / nmax).clamp_(min=q_scale_thresh)  # [N, 1]
+
+    lo = _lower_scale_ratio(bits)
+    coarse = _coarse_grid(lo, coarse_n, data.device, torch.float32, hi=_SYM_UPPER_SCALE_RATIO)
+
+    best_loss = torch.full((n_groups,), float("inf"), device=data.device, dtype=torch.float32)
+    best_frac = torch.ones(n_groups, device=data.device, dtype=torch.float32)
+    best_mirror = torch.zeros(n_groups, device=data.device, dtype=torch.bool)
+
+    # Coarse pass: shared log-spaced fractions of the per-group no-clip scale.
+    chunk = max(1, _MAX_TMP_ELEMS // (2 * coarse_n * g))
+    for start in range(0, n_groups, chunk):
+        stop = min(start + chunk, n_groups)
+        scales = s0[start:stop] * coarse.view(1, -1)  # [C, K]
+        loss, idx, mirror = _sym_loss_chunk(data[start:stop], qw[start:stop] if qw is not None else None, scales, nmax)
+        best_loss[start:stop] = loss
+        best_frac[start:stop] = coarse.index_select(0, idx)
+        best_mirror[start:stop] = mirror
+
+    # Fine pass: additive grid between the coarse neighbors bracketing each winner.
+    best_idx = torch.argmin(torch.abs(coarse.unsqueeze(0) - best_frac.unsqueeze(1)), dim=1)
+    frac_lo = coarse[(best_idx - 1).clamp_(min=0)]
+    frac_hi = coarse[(best_idx + 1).clamp_(max=coarse_n - 1)]
+    if fine_n:
+        steps = torch.arange(1, fine_n + 1, device=data.device, dtype=torch.float32) / (fine_n + 1)
+        one_m_steps = 1.0 - steps
+        chunk = max(1, _MAX_TMP_ELEMS // (2 * fine_n * g))
+        for start in range(0, n_groups, chunk):
+            stop = min(start + chunk, n_groups)
+            fracs = frac_lo[start:stop].unsqueeze(1) * one_m_steps + frac_hi[start:stop].unsqueeze(1) * steps
+            scales = s0[start:stop] * fracs  # [C, F]
+            loss, k, mirror = _sym_loss_chunk(
+                data[start:stop], qw[start:stop] if qw is not None else None, scales, nmax
+            )
+            frac = fracs.gather(1, k.unsqueeze(1)).squeeze(1)
+            improved = loss < best_loss[start:stop]
+            best_loss[start:stop] = torch.where(improved, loss, best_loss[start:stop])
+            best_frac[start:stop] = torch.where(improved, frac, best_frac[start:stop])
+            best_mirror[start:stop] = torch.where(improved, mirror, best_mirror[start:stop])
+
+    scale = best_frac.unsqueeze(-1) * s0
+    scale = torch.where(best_mirror.unsqueeze(-1), -scale, scale)
+    # magnitude floor on both signs (the incumbent keeps the sign and clamps
+    # the magnitude), so a near-zero winner never produces a degenerate scale
+    scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
+    return scale
+
+
+@register_dtype("opt_rtn_int_sym_neuqi")
+def quant_tensor_opt_rtn_sym_neuqi(
+    tensor, bits=4, group_size=-1, v=0, q_scale_thresh=1e-5, imatrix=None, scale_dtype=torch.float16, **kwargs
+):
+    """Quantize/dequantize with the two-stage symmetric scale search (NeUQI grid).
+
+    Symmetric sibling of ``opt_rtn_int_asym``: the zero point is fixed at 0 and
+    the joint search collapses to the scale axis, searched on the NeUQI
+    coarse+fine grid instead of ``opt_rtn_int_sym``'s uniform grid. Returns
+    follow the ``quant_tensor_opt_rtn_sym`` conventions (zero point = ``nmax``).
+    ``v`` is accepted and ignored, matching the incumbent symmetric path.
+
+    Args:
+        tensor: Tensor to quantize.
+        bits: Number of bits for the quantization (e.g., 2, 3, 4, 8).
+        group_size: Number of elements sharing a scale.
+        v: Rounding value perturbation (ignored, matching ``opt_rtn_int_sym``).
+        q_scale_thresh: Minimum scale magnitude for numerical stability.
+        imatrix: Optional per-column (1-D) or per-row (2-D, stacked modules)
+            importance weights (activation imatrix).
+        scale_dtype: dtype of the returned scale (kernels support fp16/fp32).
+
+    Returns:
+        (qdq_result, scale, zero_point) matching ``quant_tensor_opt_rtn_sym`` conventions.
+    """
+    from auto_round.data_type.gguf import _imatrix_handle_zero
+
+    tensor, orig_shape, pad_len = reshape_pad_tensor_by_group_size(tensor, group_size)
+    nmax = int(2 ** (bits - 1))
+
+    qw = None
+    if imatrix is not None:
+        if imatrix.dim() == 1:
+            qw = imatrix.reshape(1, -1)
+            qw = reshape_pad_tensor_by_group_size(qw, group_size, val=1e-5)[0].view(1, -1)
+            qw = qw.expand(tensor.numel() // qw.numel(), -1)
+            qw = qw.reshape(tensor.shape)
+        else:
+            qw = reshape_pad_tensor_by_group_size(imatrix, group_size, val=1e-5)[0]
+            if qw.shape != tensor.shape:
+                raise ValueError(
+                    f"per-row imatrix shape {tuple(imatrix.shape)} incompatible with tensor {tuple(tensor.shape)}"
+                )
+        qw = _imatrix_handle_zero(qw, tensor, bits, group_size)
+
+    scale = neuqi_search_scale_sym(tensor.to(torch.float32), bits, qw=qw, q_scale_thresh=q_scale_thresh)
+    scale = scale.to(scale_dtype)
+    # sign-preserving magnitude floor, mirroring quant_tensor_opt_rtn_sym
+    scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
+
+    int_w = tensor.div(scale).round_().clamp_(-nmax, nmax - 1)
+    qdq_result = (int_w.mul_(scale)).to(tensor.dtype)
+    qdq_result = revert_tensor_by_pad(qdq_result, orig_shape=orig_shape, pad_len=pad_len)
+    return qdq_result, scale, nmax
+
+
 @register_dtype("opt_rtn_int_asym")
 def quant_tensor_opt_rtn_asym(
     tensor, bits=4, group_size=-1, v=0, q_scale_thresh=1e-5, imatrix=None, scale_dtype=torch.float16, **kwargs
@@ -682,3 +903,4 @@ def quant_tensor_opt_rtn_asym(
 
 
 logger.info("[NeUQI] opt_rtn_int_asym registered (clean-room, arXiv 2505.17595)")
+logger.info("[NeUQI] opt_rtn_int_sym_neuqi registered (two-stage sym scale search)")
