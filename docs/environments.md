@@ -131,6 +131,22 @@ export AR_DYNAMO_CACHE_SIZE_LIMIT=32
 export AR_MODEL_FREE_SHARD_PARALLELISM=4
 ```
 
+### AR_AUTO_SCHEME_SCORE
+- **Description**: Controls the loss AutoScheme scoring attributes to each layer.
+  `cross-entropy` (default) uses the model's own CE loss on the calibration text.
+  `kld` replaces it with the KL divergence between the bf16 teacher's full output
+  distribution and the quantized model's distribution — the same quantity the final
+  KL measurement reports. `kld` builds (once, then reuses) a teacher-logit shard cache
+  beside the per-scheme caches under `AR_AUTO_SCHEME_CACHE`; kld-scored schemes land in
+  separate cache files and never collide with cross-entropy caches.
+- **Default**: unset → `cross-entropy` (legacy behavior; existing caches stay valid)
+- **Valid Values**: `cross-entropy`, `kld` (case-insensitive; anything else fails loud)
+- **Usage**: Optimize bit allocation for the KL-to-base objective:
+
+```bash
+export AR_AUTO_SCHEME_SCORE=kld
+```
+
 ### AR_AUTO_SCHEME_NSAMPLES
 - **Description**: Controls the default number of calibration samples used by AutoScheme scoring when `AutoScheme.nsamples` is not explicitly set.
 - **Default**: unset → 16

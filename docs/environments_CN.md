@@ -131,6 +131,16 @@ export AR_DYNAMO_CACHE_SIZE_LIMIT=32
 export AR_MODEL_FREE_SHARD_PARALLELISM=4
 ```
 
+### AR_AUTO_SCHEME_SCORE
+- **描述**：控制 AutoScheme 打分时归因到每层的损失函数。`cross-entropy`（默认）使用模型在校准文本上的自身交叉熵损失。`kld` 将其替换为 bf16 教师模型完整输出分布与量化模型分布之间的 KL 散度——与最终 KL 测量所报告的量相同。`kld` 会在 `AR_AUTO_SCHEME_CACHE` 下的逐 scheme 缓存旁构建（一次构建，之后复用）教师 logits 分片缓存；kld 打分的 scheme 写入独立缓存文件，不会与 cross-entropy 缓存冲突。
+- **默认值**：未设置 → `cross-entropy`（兼容旧行为；已有缓存仍然有效）
+- **合法取值**：`cross-entropy`、`kld`（大小写不敏感；其他取值直接报错）
+- **用法**：面向 KL-to-base 目标优化比特分配：
+
+```bash
+export AR_AUTO_SCHEME_SCORE=kld
+```
+
 ### AR_AUTO_SCHEME_NSAMPLES
 - **描述**：控制 AutoScheme 评分时使用的校准样本数默认值，仅在 `AutoScheme.nsamples` 未显式设置时生效。
 - **默认值**：未设置 → 16

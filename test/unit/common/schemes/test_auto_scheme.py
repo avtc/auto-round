@@ -574,6 +574,118 @@ class TestAutoScheme:
             )
 
 
+class TestAutoSchemeKldScoring:
+    """AR_AUTO_SCHEME_SCORE=kld: teacher-logit shards + KL loss substitution."""
+
+    def test_kld_loss_matches_fp32_reference(self):
+        import torch
+        from auto_round.auto_scheme.delta_loss import _kld_loss
+
+        torch.manual_seed(0)
+        z_fp = torch.randn(3, 7, 50)
+        z_q = (torch.randn(3, 7, 50) * 0.1 + z_fp).requires_grad_(True)
+        got = _kld_loss(z_q, z_fp)
+        # fp32 reference: KL(softmax(fp) || softmax(q)) summed over all positions
+        lp_t = torch.log_softmax(z_fp.float(), dim=-1)
+        lq = torch.log_softmax(z_q.float(), dim=-1)
+        ref = (lp_t.exp() * (lp_t - lq)).sum()
+        assert torch.allclose(got, ref, rtol=1e-5, atol=1e-4), (got.item(), ref.item())
+
+        # gradient flows through student logits only
+        got.backward()
+        assert z_q.grad is not None and torch.isfinite(z_q.grad).all()
+
+    def test_teacher_shards_build_load_and_verify(self, tiny_opt_model_path, tmp_path, monkeypatch):
+        import torch
+        from auto_round.auto_scheme.delta_loss import (
+            _build_teacher_logit_shards,
+            _load_teacher_shard,
+            _teacher_shard_identity,
+        )
+        from auto_round.utils.model import llm_load_model
+
+        monkeypatch.chdir(tmp_path)  # relative dataset path: avoid the drive-colon split bug on Windows
+        dataset_path = _make_local_calibration_dataset(tmp_path)
+        model, tokenizer = llm_load_model(tiny_opt_model_path, torch_dtype=torch.float32)
+        ident_dir, _meta = _teacher_shard_identity(
+            tiny_opt_model_path, "calibration.json", nsamples=2, seqlen=8, batch_size=1
+        )
+        shard_dir = _build_teacher_logit_shards(
+            model,
+            tokenizer,
+            dataset="calibration.json",
+            nsamples=2,
+            seqlen=8,
+            batch_size=1,
+            model_name=tiny_opt_model_path,
+            cache_root=str(tmp_path / "cache"),
+        )
+        assert os.path.isdir(shard_dir)
+        assert os.path.isfile(os.path.join(shard_dir, "manifest.json"))
+        assert ident_dir in shard_dir or os.path.basename(shard_dir) == ident_dir
+
+        # reload the model's own first batch to verify checksums line up
+        from auto_round.calib_dataset import get_dataloader
+
+        loader = get_dataloader(tokenizer, 8, dataset_name="calibration.json", seed=42, bs=1, nsamples=2)
+        first = next(iter(loader))
+        ids = first["input_ids"] if isinstance(first, dict) else first
+        z_fp = _load_teacher_shard(shard_dir, 1, ids)
+        assert z_fp.shape[:2] == ids.shape[:2]
+        assert z_fp.dtype == torch.bfloat16
+
+        # tampered input must fail loud
+        bad = ids.flip(-1)
+        with pytest.raises(RuntimeError, match="teacher"):
+            _load_teacher_shard(shard_dir, 1, bad)
+
+        # idempotent second build skips work and returns the same dir
+        again = _build_teacher_logit_shards(
+            model,
+            tokenizer,
+            dataset="calibration.json",
+            nsamples=2,
+            seqlen=8,
+            batch_size=1,
+            model_name=tiny_opt_model_path,
+            cache_root=str(tmp_path / "cache"),
+        )
+        assert again == shard_dir
+
+    def test_kld_scoring_end_to_end_separate_cache(self, tiny_opt_model_path, tmp_path, monkeypatch):
+        import glob
+        import json
+
+        from auto_round.auto_scheme.delta_loss import _load_autoscheme_scores
+
+        monkeypatch.chdir(tmp_path)  # relative dataset path: avoid the drive-colon split bug on Windows
+        _make_local_calibration_dataset(tmp_path)
+        cache_dir = str(tmp_path / "as_cache")
+        monkeypatch.setenv("AR_AUTO_SCHEME_CACHE", cache_dir)
+
+        scheme = AutoScheme(avg_bits=3, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
+        ar = AutoRound(
+            model=tiny_opt_model_path,
+            scheme=scheme,
+            iters=0,
+            nsamples=1,
+            seqlen=8,
+            dataset="calibration.json",  # relative: avoid Windows drive-colon dataset bug
+        )
+        monkeypatch.setenv("AR_AUTO_SCHEME_SCORE", "kld")  # noqa: E501
+        _, layer_config = ar.quantize()
+        assert layer_config, "kld scoring must produce a layer_config"
+
+        kld_files = glob.glob(os.path.join(cache_dir, "scheme_*.json"))
+        assert kld_files, "per-scheme cache files must be written under kld mode"
+        for path in kld_files:
+            data = _load_autoscheme_scores(path)
+            assert data is not None
+            assert data["cache_config"].get("score_fn") == "kld"
+            scores = [v[1] for v in data["layer_scores"].values()]
+            assert any(s > 0 for s in scores), "kld layer scores must be non-zero"
+
+
 def test_autoscheme_cache_key_default_score_fn_matches_legacy_ce_key():
     """Default score_fn must NOT change the cache key: existing cross-entropy caches stay valid."""
     from auto_round.auto_scheme.delta_loss import _autoscheme_cache_config

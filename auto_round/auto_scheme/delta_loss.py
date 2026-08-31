@@ -1010,6 +1010,8 @@ def model_forward_low_gpu(
     disk_index=None,
     skip_batches=0,
     batch_checkpoint=None,
+    score_fn="cross-entropy",
+    teacher_shard_dir=None,
 ):
     """Run one full scoring pass (all calibration batches) in low-GPU-memory mode.
 
@@ -1089,7 +1091,11 @@ def model_forward_low_gpu(
             memory_monitor.log_summary()
 
             try:
-                output.loss.to(torch.float32).backward()
+                if score_fn == "kld":
+                    z_fp = _load_teacher_shard(teacher_shard_dir, batch_idx, _teacher_input_ids(data))
+                    _kld_loss(output.logits, z_fp).backward()
+                else:
+                    output.loss.to(torch.float32).backward()
             except MyCustomError:
                 interrupted = True
             if not interrupted or captured_grad is None:
@@ -1206,11 +1212,26 @@ def get_score_for_scheme(
     model_name: Optional[str] = None,
     scheme_tag: Optional[str] = None,
     disk_index=None,
+    score_fn=None,
+    teacher_shard_dir=None,
 ):
     """Wrap every quantizable layer in ``quant_layer_names`` with a scoring wrapper, run
     forward(+backward, unless RTN-only) calibration over ``nsamples`` examples from
     ``dataset``/``dataloader``, then unwrap and return each layer's ``[bits, loss]``.
+
+    ``score_fn`` defaults to ``AR_AUTO_SCHEME_SCORE`` (cross-entropy). ``kld`` swaps the
+    backward loss from the model's own CE to KL(teacher || student) using teacher-logit
+    shards from ``teacher_shard_dir`` (derived from the scoring identity when omitted).
     """
+    score_fn = score_fn or _autoscheme_score_fn()
+    if score_fn == "kld":
+        if force_mllm:
+            raise NotImplementedError("AR_AUTO_SCHEME_SCORE=kld does not support VLM (force_mllm) scoring yet")
+        if teacher_shard_dir is None:
+            shard_name, _meta = _teacher_shard_identity(model_name or "", dataset, nsamples, seqlen, batch_size)
+            teacher_shard_dir = os.path.join(_teacher_shards_root(), shard_name)
+        logger.info("AutoScheme(kld): scoring %s against teacher shards %s", scheme_tag or "", teacher_shard_dir)
+
     scores_dict = {}  # Key=name,Val=[quant_total_bits, loss]
     # Include the visual block(s) when scoring VLMs with ``--quant_nontext_module``
     # (``force_mllm=True``) so vision-tower layer losses match a block below instead
@@ -1450,6 +1471,8 @@ def get_score_for_scheme(
                     disk_index=disk_index,
                     skip_batches=skip_batches,
                     batch_checkpoint=batch_checkpoint,
+                    score_fn=score_fn,
+                    teacher_shard_dir=teacher_shard_dir,
                 )
             except Exception as exc:  # noqa: BLE001
                 if not is_vlm:
@@ -1510,7 +1533,11 @@ def get_score_for_scheme(
                 # model.dtype, handles dict-with-text/str/tuple paths the same
                 # way the multimodal compressor calibration does).
                 output, _prepared = model_forward(model, data_for_forward, labels=labels, use_cache=False)
-                output.loss.backward()
+                if score_fn == "kld":
+                    z_fp = _load_teacher_shard(teacher_shard_dir, batch_idx, _teacher_input_ids(data))
+                    _kld_loss(output.logits, z_fp).backward()
+                else:
+                    output.loss.backward()
 
                 # One-shot sanity check: when scoring vision layers, the batch
                 # MUST carry image data, otherwise the vision tower is bypassed
@@ -1872,6 +1899,173 @@ def _stable_model_id(model_name):
         return model_name
     normalized = model_name.rstrip("/\\")
     return os.path.basename(normalized) or normalized
+
+
+def _kld_loss(z_q, z_fp, chunk_tokens=4096):
+    """Full-vocabulary KL(teacher || student) summed over all positions, fp32 chunked.
+
+    ``z_fp`` is a detached teacher-logits tensor (any float dtype); gradients flow
+    through ``z_q`` only.
+    """
+    z_q2 = z_q.reshape(-1, z_q.shape[-1])
+    z_fp2 = z_fp.reshape(-1, z_fp.shape[-1]).to(device=z_q2.device, dtype=z_q2.dtype)
+    if z_fp2.shape != z_q2.shape:
+        raise RuntimeError(
+            f"teacher logits shape {tuple(z_fp2.shape)} does not match student {tuple(z_q2.shape)}; "
+            "teacher shards were probably built against a different model/tokenizer"
+        )
+    total = z_q2.new_zeros((), dtype=torch.float32)
+    for start in range(0, z_q2.shape[0], chunk_tokens):
+        sl = slice(start, start + chunk_tokens)
+        log_q = torch.log_softmax(z_q2[sl].float(), dim=-1)
+        with torch.no_grad():
+            log_t = torch.log_softmax(z_fp2[sl].float(), dim=-1)
+        total = total + (log_t.exp() * (log_t - log_q)).sum()
+    return total
+
+
+def _teacher_shard_identity(model_name, dataset, nsamples, seqlen, batch_size):
+    """Stable directory name + identity meta for a teacher-logit shard set."""
+    meta = {
+        "model_id": _stable_model_id(model_name),
+        "dataset": str(dataset),
+        "nsamples": int(nsamples),
+        "seqlen": int(seqlen),
+        "batch_size": int(batch_size),
+        "seed": 42,
+    }
+    digest = hashlib.sha256(json.dumps(meta, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return f"teacher_{digest}", meta
+
+
+def _teacher_shards_root(cache_root=None):
+    """Directory holding all teacher-logit shard sets (beside the per-scheme caches)."""
+    if cache_root is None:
+        from auto_round import envs as _envs
+
+        cache_root = _envs.AR_AUTO_SCHEME_CACHE or "~/.cache/auto_round"
+    return os.path.join(os.path.expanduser(str(cache_root)), "teacher_logits")
+
+
+def _teacher_input_ids(input_ids):
+    ids = input_ids["input_ids"] if isinstance(input_ids, dict) and "input_ids" in input_ids else input_ids
+    return ids
+
+
+def _teacher_ids_checksum(ids):
+    return hashlib.sha256(ids.detach().to(torch.int64).cpu().contiguous().numpy().tobytes()).hexdigest()
+
+
+def _build_teacher_logit_shards(
+    model,
+    tokenizer,
+    dataset,
+    nsamples,
+    seqlen,
+    batch_size,
+    model_name,
+    cache_root=None,
+    force_mllm=False,
+):
+    """Build (or reuse) the per-batch bf16 teacher-logit shard cache for kld scoring.
+
+    One wrapper-free forward over the SAME deterministic dataloader scoring uses
+    (seed=42); each batch's logits land in ``batch_XXXX.pt`` beside a ``manifest.json``.
+    Idempotent: an existing compatible manifest short-circuits the pass.
+    """
+    if force_mllm:
+        raise NotImplementedError(
+            "AR_AUTO_SCHEME_SCORE=kld does not support VLM (force_mllm) scoring yet; "
+            "use the default cross-entropy scoring for multimodal models."
+        )
+    shard_name, meta = _teacher_shard_identity(model_name, dataset, nsamples, seqlen, batch_size)
+    shard_dir = os.path.join(_teacher_shards_root(cache_root), shard_name)
+    manifest_path = os.path.join(shard_dir, "manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                existing = json.load(f)
+            if existing.get("identity") == meta:
+                logger.info("AutoScheme(kld): reusing teacher shards at %s", shard_dir)
+                return shard_dir
+        except (OSError, ValueError):
+            pass  # fall through and rebuild
+
+    from auto_round.calib_dataset import get_dataloader
+
+    loader = get_dataloader(tokenizer, seqlen, dataset_name=str(dataset), seed=42, bs=batch_size, nsamples=nsamples)
+    tmp_dir = shard_dir + ".tmp"
+    os.makedirs(tmp_dir, exist_ok=True)
+    num_batches = 0
+    vocab_size = None
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for batch_idx, data in enumerate(loader, start=1):
+                src = data if isinstance(data, dict) else None
+                labels = (
+                    src["labels"]
+                    if src is not None and "labels" in src
+                    else (src["input_ids"] if src is not None else data)
+                )
+                data_for_forward = {k: v for k, v in data.items() if k != "labels"} if src is not None else data
+                output, _ = model_forward(model, data_for_forward, labels=labels, use_cache=False)
+                logits = output.logits
+                if logits is None or not logits.is_floating_point():
+                    raise RuntimeError("AR_AUTO_SCHEME_SCORE=kld requires float model logits; forward returned none")
+                vocab_size = int(logits.shape[-1])
+                torch.save(
+                    {
+                        "input_ids_sha": _teacher_ids_checksum(_teacher_input_ids(data)),
+                        "logits": logits.detach().to(torch.bfloat16).cpu(),
+                    },
+                    os.path.join(tmp_dir, f"batch_{batch_idx:04d}.pt"),
+                )
+                num_batches = batch_idx
+        if num_batches == 0:
+            raise RuntimeError("teacher shard build produced zero batches; check dataset/nsamples")
+        manifest = {
+            "identity": meta,
+            "num_batches": num_batches,
+            "vocab_size": vocab_size,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "format": "bf16",
+        }
+        with open(os.path.join(tmp_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        if os.path.isdir(shard_dir):
+            import shutil
+
+            shutil.rmtree(shard_dir, ignore_errors=True)
+        os.rename(tmp_dir, shard_dir)
+        logger.info(
+            "AutoScheme(kld): teacher shards built at %s (%d batches, vocab=%s)", shard_dir, num_batches, vocab_size
+        )
+    finally:
+        if was_training:
+            model.train()
+    return shard_dir
+
+
+def _load_teacher_shard(shard_dir, batch_idx, input_ids):
+    """Load the teacher logits for ``batch_idx`` and fail loud on any mismatch."""
+    path = os.path.join(shard_dir, f"batch_{batch_idx:04d}.pt")
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            f"teacher shard {path} not found under AR_AUTO_SCHEME_SCORE=kld; "
+            "shards are built by the parent run before scoring -- rerun from the "
+            "AutoScheme entry point (or clear AR_AUTO_SCHEME_SCORE to fall back to cross-entropy)"
+        )
+    shard = torch.load(path, map_location="cpu", weights_only=True)
+    expected = _teacher_ids_checksum(_teacher_input_ids(input_ids))
+    if shard["input_ids_sha"] != expected:
+        raise RuntimeError(
+            f"teacher shard batch {batch_idx} input_ids checksum mismatch: the scoring "
+            "dataloader does not match the one the teacher shards were built with "
+            "(same dataset/nsamples/seqlen/batch_size required)"
+        )
+    return shard["logits"]
 
 
 _AUTOSCHEME_SCORE_FNS = ("cross-entropy", "kld")
@@ -2985,6 +3179,19 @@ def _gen_layer_config(
             for index, (_, _, cached) in enumerate(scheme_cache_meta)
             if not check_bf16_scheme(schemes[index]) and cached is None
         ]
+        # kld scoring needs teacher-logit shards before any scheme is applied.
+        # Build them once here (wrapper-free bf16 model); parallel workers and all
+        # per-scheme scoring passes only READ the shards afterwards.
+        if score_fn == "kld" and uncached_indices:
+            _build_teacher_logit_shards(
+                model,
+                tokenizer,
+                dataset=dataset,
+                nsamples=nsamples,
+                seqlen=seqlen,
+                batch_size=batch_size,
+                model_name=model_name or "",
+            )
         worker_device_pool = [device for device in device_list if str(device).startswith("cuda:")]
         num_gpus = len(worker_device_pool)
         parallel_enabled = _envs.AR_ENABLE_AUTO_SCHEME_PARALLEL
