@@ -184,6 +184,24 @@ class TestNeuqiLogging:
         assert any("[NeUQI]" in m and "search active" in m for m in cap.records)
 
 
+class TestNeuqiSymLogging:
+    def test_sym_engaged_logs_once_per_unique_grid(self, caplog):
+        """Grid sweeps cycle configs in one process; the engaged line must fire
+        once per unique (coarse, fine), not once per call."""
+        import logging
+
+        from auto_round.data_type.neuqi import _log_sym_search_engaged
+
+        with caplog.at_level(logging.INFO, logger="auto_round"):
+            _log_sym_search_engaged.cache_clear()
+            _log_sym_search_engaged(64, 32)
+            _log_sym_search_engaged(64, 32)
+            _log_sym_search_engaged(128, 64)
+            _log_sym_search_engaged(64, 32)
+        msgs = [r.message for r in caplog.records if "two-stage symmetric" in r.message]
+        assert len(msgs) == 2  # (64,32) once + (128,64) once
+
+
 class TestNeuqiIntegration:
     def test_registration_and_dispatch(self):
         assert "opt_rtn_int_asym" in QUANT_FUNC_WITH_DTYPE
@@ -774,7 +792,6 @@ class TestNeuqiSymSearch:
         l_old = self._sym_loss(data, qw, s_old).sum().item()
         assert l_neuqi <= l_old * 1.001
 
-
     def test_union_variant_dominates_both_parents_per_group(self, monkeypatch):
         """AR_NEUQI_SYM_UNION=1: per-group loss must be <= BOTH the incumbent
         search_scales result and the plain two-stage result (candidate superset)."""
@@ -807,6 +824,7 @@ class TestNeuqiSymSearch:
         monkeypatch.delenv("AR_NEUQI_SYM_UNION")
         b = neuqi_search_scale_sym(data.clone(), bits=4, qw=qw.clone(), coarse_n=32, fine_n=16)
         assert torch.equal(a, b)
+
 
 class TestNeuqiSymIntegration:
     def test_sym_neuqi_dispatch(self):

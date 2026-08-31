@@ -631,7 +631,7 @@ def neuqi_search_scale_zero(data, bits, qw=None, q_scale_thresh=1e-5, coarse_n=N
     return scale, best_zp.unsqueeze(-1)
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=None)  # once per unique grid: grid sweeps cycle configs in one process
 def _log_sym_search_engaged(coarse_n: int, fine_n: int) -> None:
     logger.info("[NeUQI] two-stage symmetric scale search active (coarse=%d, fine=%d)", coarse_n, fine_n)
 
