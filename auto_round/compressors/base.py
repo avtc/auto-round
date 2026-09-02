@@ -277,6 +277,12 @@ class BaseOrchestrator(object):
                 self.rotation_configs.append(_cfg)
         assert self.quantize_config is not None, "QuantizationConfig is required for Compressor"
 
+        # Layer-wise (block-wise) rotation: when True, rotation transforms that
+        # support it prepare their matrices up-front and rotate each block inside
+        # the block loop instead of a full-model pass (required for streamed
+        # models whose weights are never all resident).
+        self.layerwise_rotation = kwargs.pop("layerwise_rotation", False)
+
         # Compressor-level layer params (do not live in QuantizationConfig).
         # Calibration params (nsamples/seqlen/batch_size) are owned by
         # ``self.calibration_context`` (seeded above) and exposed via
@@ -1385,7 +1391,6 @@ class BaseOrchestrator(object):
         self._resolve_formats()
         self._patch_model()
         self._build_layer_config()
-        self._apply_rotations()
 
         # Reclaim temporaries from Phases 1-4 (scheme resolution, format
         # parsing, model patching, layer-config walk) before Phase 5
@@ -1399,6 +1404,13 @@ class BaseOrchestrator(object):
         # BlockForwardRunner is now created inside AlgorithmComposer.__init__,
         # so _build_composer must run first.
         self._build_composer()
+
+        # Model-level pre-quantisation transforms (rotation). The composer
+        # owns the full rotation lifecycle: full-model rotation happens here,
+        # while layer-wise rotation only prepares matrices and defers the
+        # per-block work to ``compress_block`` (required for streamed models
+        # whose weights are never all resident).
+        self._apply_rotations()
 
         # Set block_forward torch compile for block forward
         # Final trim after all init phases.
@@ -1634,13 +1646,11 @@ class BaseOrchestrator(object):
         """
         if not self.rotation_configs:
             return
-        logger.info("Applying Hadamard transform to the model.")
-        for rotation_cfg in self.rotation_configs:
-            self.model_context.model = apply_rotation(
-                self.model_context.model,
-                rotation_cfg,
-                data_type=self.quantize_config.data_type,
-            )
+        # The composer owns the full rotation lifecycle: full-model rotation
+        # happens here, while layer-wise rotation only prepares matrices and
+        # defers the per-block work to ``compress_block`` (required when the
+        # model is streamed and never fully resident).
+        self.model_context.model = self.alg_composer.apply_model_transforms(self.model_context.model)
 
     def _patch_model(self) -> None:
         """Phase 3 – Model structure patching.

@@ -328,6 +328,7 @@ _ENTRY_KWARG_OWNERS = {
     "ignore_layers": "compressor",
     "quant_lm_head": "compressor",
     "to_quant_block_names": "compressor",
+    "layerwise_rotation": "compressor",
     "stream_checkpoint": "compressor",
     "stream_prefetch": "compressor",
     "stream_prefetch_gpus": "compressor",
