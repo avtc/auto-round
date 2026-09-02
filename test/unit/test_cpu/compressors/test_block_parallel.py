@@ -749,8 +749,14 @@ class TestStreamMemInventory:
     """AR_STREAM_MEM_INVENTORY: bucket names + graceful no-CUDA behavior."""
 
     def test_mem_bucket_names(self):
+        from types import SimpleNamespace
+
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
+        # instance access must not bind self (regression: a stray decorator
+        # once turned this staticmethod into a bound method)
+        orch = SimpleNamespace(_mem_bucket=CompressionOrchestrator._mem_bucket)
+        orch._mem_bucket("model.language_model.layers.12.self_attn.q_proj.weight")
         b = CompressionOrchestrator._mem_bucket
         assert b("model.language_model.layers.12.self_attn.q_proj.weight") == "block:12"
         assert b("model.embed_tokens.weight") == "embeddings"

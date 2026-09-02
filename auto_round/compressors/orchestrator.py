@@ -401,7 +401,136 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         return self._quantize_data_driven()
 
-    @torch.no_grad()
+    def _stream_resume_jump_chain(self, calib_state, resume_states) -> None:
+        """Jump the streaming calibration chain to the deepest saved frontier entry.
+
+        The per-group manifests hold the successor chain entry (FP hidden
+        states) exactly as the serial and BPT paths persist it, so a run
+        interrupted in ANY mode can hand its frontier to the streaming loop:
+        the deepest group with progress provides the entry its next pending
+        block would consume. ``input_others``/``token_ids`` are static per row
+        and rebuilt deterministically by ``prepare_streaming_calibration``.
+        """
+        if calib_state is None:
+            return
+        jumped = False
+        for rs in resume_states:
+            if rs is None or rs.resume_index <= 0:
+                continue
+            entry = rs.load_input_ids()
+            if entry is None:
+                continue
+            calib_state["fp_inputs"] = entry
+            q_input = rs.load_q_input()
+            if q_input is not None and self.alg_composer.need_quanted_input():
+                calib_state["q_inputs"] = q_input
+            jumped = True
+        if jumped:
+            logger.info("[stream] resume: calibration chain jumped to the saved frontier entry")
+
+    @staticmethod
+    def _stream_resume_pending_offset(all_blocks, resume_states):
+        """Flat index of the first block not yet done in the resume manifests.
+
+        Returns None when every block is already done. Groups are visited in
+        order; a fully-done group's frontier equals its length, so the offset
+        lands on the next group's first pending block.
+        """
+        seen = 0
+        for gi, blocks in enumerate(all_blocks):
+            rs = resume_states[gi] if resume_states is not None and gi < len(resume_states) else None
+            frontier = rs.resume_index if rs is not None else 0
+            if frontier < len(blocks):
+                return seen + frontier
+            seen += len(blocks)
+        return None
+
+    def _stream_resume_done_block(
+        self,
+        block_name,
+        *,
+        results_dir,
+        streamer,
+        stage_devices,
+        stream_block_idx,
+        pbar,
+        tied_weights_layers,
+    ) -> bool:
+        """Handle a block already marked done in the resume manifest.
+
+        If the interrupted run was block-parallel, the block was tuned but
+        never packed: its worker result (scale/zp per layer) is applied and
+        packed here -- preserving the BPT calibration shaping instead of
+        re-searching under streaming-chain entries. If it was a streaming or
+        serial run, the block's tensors are already in an adopted shard and
+        there is nothing to do. Returns True when block weights were loaded
+        (i.e. a staging slot was consumed).
+        """
+        from auto_round.compressors.utils import immediate_pack as _immediate_pack
+
+        result = None
+        if results_dir is not None:
+            from auto_round.compressors import block_parallel as _bp
+
+            path = _bp.block_result_path(results_dir, block_name)
+            if os.path.exists(path):
+                try:
+                    result = torch.load(path, map_location="cpu")
+                except Exception as e:
+                    raise RuntimeError(
+                        f"resume: block {block_name} is marked done but its BPT result file {path} "
+                        f"is unreadable ({e}). Its tensors are neither packed nor recoverable -- remove "
+                        "the stale group manifest under AR_RESUME_DIR to re-do this block."
+                    ) from e
+        if result is None:
+            if pbar is not None:
+                pbar.set_description(f"Skipping {block_name} (done)")
+            return False
+
+        if pbar is not None:
+            pbar.set_description(f"Applying {block_name} (BPT result)")
+        block = get_module(self.model, block_name)
+        if streamer is not None:
+            load_device = stage_devices[stream_block_idx % len(stage_devices)] if stage_devices else str(self.device)
+            streamer.load_module_(block, block_name, device=load_device)
+        elif self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+            self._offloader.reload(self.model, block_name)
+        materialize_model_(block)
+        applied = 0
+        for sub_name, sub in block.named_modules():
+            entry = result.get(_tuned_layer_key(block_name, sub_name, sub))
+            if entry is None or not hasattr(sub, "weight"):
+                continue
+            sub.scale = entry["scale"].to(sub.weight.device)
+            zp = entry["zp"]
+            # symmetric layers keep zp as a plain int -- only tensors move devices
+            sub.zp = zp.to(sub.weight.device) if isinstance(zp, torch.Tensor) else zp
+            applied += 1
+        if applied == 0:
+            raise RuntimeError(f"resume: BPT result for {block_name} matched no layers (key mismatch)")
+        if self.compress_context.is_immediate_packing:
+            from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
+
+            _immediate_pack_block(block, block_name, self.layer_config, nblocks=self.nblocks)
+        if self.compress_context.is_immediate_saving:
+            for _n, m in block.named_modules():
+                if (
+                    not any(m.children())
+                    and len(m.state_dict()) > 0
+                    and hasattr(m, "global_name")
+                    and m.global_name not in tied_weights_layers
+                    and not check_to_quantized(m)
+                ):
+                    set_module(self.model, m.global_name, copy.deepcopy(m))
+                    self.shard_writer.write(name=m.global_name)
+                    get_module(self.model, m.global_name).to("meta")
+                    m.to("meta")
+            self.shard_writer.write(name=block_name)
+            self.shard_writer._flush_shard()
+        block.to("meta")
+        clear_memory()
+        return True
+
     @staticmethod
     def _mem_bucket(name: str) -> str:
         """Bucket a module-path name for the device-memory inventory."""
@@ -502,6 +631,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 other,
             )
 
+    @torch.no_grad()
     def _resolve_stream_stage_devices(self):
         """Resolve ``stream_prefetch_devices`` into a list of staging devices.
 
