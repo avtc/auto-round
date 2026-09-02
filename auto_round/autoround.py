@@ -304,12 +304,6 @@ def _select_rtn_compressor_base_cls(quant_config: "RTNConfig", scheme, format, b
         static_attention_dtype=base_kwargs.get("static_attention_dtype"),
     )
 
-    # --imatrix_enabled true/false overrides the scheme-driven rules (e.g.
-    # forces the imatrix on for asymmetric schemes, off for symmetric int).
-    forced_imatrix = getattr(quant_config, "forced_imatrix", None)
-    if forced_imatrix is not None:
-        enable_imatrix = forced_imatrix
-
     # AutoScheme always requires calibration data for delta-loss based scheme
     # selection, regardless of whether imatrix is needed.
     quant_config.enable_imatrix = enable_imatrix
@@ -678,25 +672,6 @@ class _CompressorBuilder(object):
             alg_configs = normalize_algorithm_config(alg_configs)
         configs_for_routing = alg_configs if isinstance(alg_configs, list) else [alg_configs]
         preprocessor_configs, _, quant_config = _resolve_quant_config_for_routing(configs_for_routing)
-        if getattr(quant_config, "forced_imatrix", None) is True:
-            if getattr(quant_config, "disable_opt_rtn", False):
-                raise ValueError(
-                    "--imatrix_enabled true requires the optimized-RTN search (the "
-                    "imatrix only weights that search): unset --disable_opt_rtn or "
-                    "use --imatrix_enabled auto/false."
-                )
-            # Without the NeUQI joint search, asym resolves to the plain min/max
-            # rtn_*_asym function (get_quant_func drops every opt_rtn_*_asym
-            # candidate for asym_search != 'neuqi'), which never consumes the
-            # imatrix: collecting statistics nothing reads must stop here.
-            _resolved_sym = _preview_resolved_attrs(quant_config, scheme).get("sym")
-            if _resolved_sym is False and getattr(quant_config, "asym_search", "auto") != "neuqi":
-                raise ValueError(
-                    "--imatrix_enabled true with an asymmetric scheme requires the "
-                    "NeUQI joint (scale, zero-point) search: add --enable_neuqi "
-                    "(asym_search='neuqi'); the plain min/max asym path never consumes "
-                    "activation statistics. Or switch to a symmetric scheme."
-                )
         is_svdquant = any(type(config).__name__ == "SVDQuantConfig" for config in preprocessor_configs)
         if is_svdquant:
             format = "svdquant_nunchaku"

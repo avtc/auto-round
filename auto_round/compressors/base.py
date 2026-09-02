@@ -565,7 +565,7 @@ class BaseOrchestrator(object):
            present. An explicit True/False from the caller wins.
         2. The activation chain engages automatically when the streaming loop
            needs activations -- iters > 0 tuning (SignRound) or an enabled
-           imatrix (scheme rules or --imatrix_enabled true). Weight-only runs
+           imatrix (scheme rules). Weight-only runs
            (imatrix off / forced false, iters=0) never consume activations and
            stay chain-free.
         """
@@ -587,10 +587,8 @@ class BaseOrchestrator(object):
         if self.stream_quantization and not self.stream_calibration:
             from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
-            needs_chain = (
-                any(isinstance(c, SignRoundConfig) for c in self._alg_configs)
-                or any(getattr(c, "forced_imatrix", None) is True for c in self._alg_configs)
-                or any(getattr(c, "enable_imatrix", False) for c in self._alg_configs)
+            needs_chain = any(
+                isinstance(c, SignRoundConfig) or getattr(c, "enable_imatrix", False) for c in self._alg_configs
             )
             if needs_chain:
                 self.stream_calibration = True
@@ -631,9 +629,7 @@ class BaseOrchestrator(object):
                 # If configs demanding activations slipped in afterwards, take
                 # the ordinary data-driven path rather than silently tuning
                 # weight-only under streaming.
-                if any(isinstance(c, _SignRound) for c in demanding) or any(
-                    getattr(c, "forced_imatrix", None) is True for c in demanding
-                ):
+                if any(isinstance(c, _SignRound) for c in demanding):
                     return True
             logger.info(
                 "[stream_quantization] streaming zero-shot loop covers the calibration "
