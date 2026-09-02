@@ -215,6 +215,12 @@ class ModelContext(BaseContext):
             )
         elif is_mllm_model(self.model, platform=self.platform):
             self.is_mllm = True
+            if self.stream_quantization:
+                raise ValueError(
+                    "--stream_quantization does not support multimodal models yet "
+                    "(the meta-skeleton loader is text-LLM only); disable it or use "
+                    "AR_DISK_STREAM_MODEL for the multimodal disk-stream path."
+                )
             if isinstance(self.model, str):
                 # Multimodal checkpoints used to
                 # bypass disk streaming entirely -- mllm_load_model fully
@@ -253,6 +259,13 @@ class ModelContext(BaseContext):
                         self.model, platform=self.platform, device="cpu", model_dtype=self.model_dtype
                     )
         elif isinstance(self.model, str) and self.stream_quantization:
+            if envs.AR_DISK_STREAM_MODEL:
+                raise ValueError(
+                    "AR_DISK_STREAM_MODEL and --stream_quantization are mutually "
+                    "exclusive: the env var selects the offloader (data-driven) disk "
+                    "stream, the flag selects the never-materialize streaming loop. "
+                    "Unset AR_DISK_STREAM_MODEL to use --stream_quantization."
+                )
             self._load_model_on_meta()
         elif isinstance(self.model, str):
             config = self.config
