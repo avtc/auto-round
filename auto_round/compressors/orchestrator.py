@@ -1028,6 +1028,30 @@ class CompressionOrchestrator(BaseOrchestrator):
         self.model_context.quantized = True
         return self.model, self.layer_config
 
+    def _assert_no_cpu_offload(self) -> None:
+        """Fail fast when accelerate had to CPU-offload part of the model.
+
+        The data-driven loop stages each block on the tuning device and feeds
+        it the cached block inputs; that invariant assumes every block weight
+        is GPU-resident under a contiguous accelerate split. When the visible
+        VRAM pool is smaller than the model (observed: 27B bf16 on 2x24GB),
+        accelerate silently offloads weights to CPU, block/input device
+        co-residency breaks, and the run dies mid-loop with a confusing
+        device-mismatch inside a block forward. Streaming mode
+        (--stream_quantization) is the sanctioned path for tight VRAM.
+        """
+        hf_map = getattr(self.model_context.model, "hf_device_map", None)
+        if not hf_map:
+            return
+        offloaded = [name for name, dev in hf_map.items() if str(dev) in ("cpu", "disk")]
+        if offloaded:
+            raise RuntimeError(
+                f"data-driven quantization requires full GPU residency, but accelerate offloaded "
+                f"{len(offloaded)} module(s) to CPU/disk (first: {offloaded[0]}). The visible VRAM "
+                "pool is smaller than the model -- use more GPUs (no CUDA_VISIBLE_DEVICES "
+                "restriction) or --stream_quantization."
+            )
+
     def _quantize_data_driven(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Data-driven quantization path — uses calibration data for optimization."""
 
@@ -1036,6 +1060,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         _force_trim_malloc()
 
         self._check_compatibility()
+        self._assert_no_cpu_offload()
 
         if bool(self.quant_block_list):
             all_blocks = self.quant_block_list
