@@ -164,6 +164,16 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         return res
 
+    @staticmethod
+    def _should_offload_after_pack(compress_context) -> bool:
+        """Whether a just-processed block still needs an offloader state write.
+
+        With immediate saving the block is already flushed to the output
+        shards; writing its state_dict afterwards would leave a ~block-sized
+        dead file per block until process exit.
+        """
+        return compress_context.low_cpu_mem_usage and not compress_context.is_immediate_saving
+
     def _preprocess_block_inputs(self, inputs, first_input_name="input_ids"):
         # Thin wrapper around auto_round.calibration.inputs.preprocess_block_inputs.
         from auto_round.calibration.inputs import preprocess_block_inputs
@@ -255,7 +265,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # matching post-tune offload runs when `low_cpu_mem_usage` is False --
             # see the `is_immediate_saving`-adjacent offload call further down),
             # matching upstream's own choice not to cycle blocks for these formats.
-            if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+            if self._should_offload_after_pack(self.compress_context) or envs.AR_DISK_STREAM_MODEL:
                 if nblocks == 1:
                     self._offloader.reload(model, n)
                 else:
@@ -493,7 +503,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         if streamer is not None:
             load_device = stage_devices[stream_block_idx % len(stage_devices)] if stage_devices else str(self.device)
             streamer.load_module_(block, block_name, device=load_device)
-        elif self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+        elif self._should_offload_after_pack(self.compress_context) or envs.AR_DISK_STREAM_MODEL:
             self._offloader.reload(self.model, block_name)
         materialize_model_(block)
         applied = 0
