@@ -811,7 +811,7 @@ class TestStreamQuantizeEquivalence:
             model_path,
             scheme="W4A16",
             alg_configs=[
-                RotationConfig(group_size=16),
+                RotationConfig(block_size=16),
                 RTNConfig(group_size=16, disable_opt_rtn=False),
             ],
             layerwise_rotation=True,
