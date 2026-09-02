@@ -402,6 +402,106 @@ class CompressionOrchestrator(BaseOrchestrator):
         return self._quantize_data_driven()
 
     @torch.no_grad()
+    @staticmethod
+    def _mem_bucket(name: str) -> str:
+        """Bucket a module-path name for the device-memory inventory."""
+        if ".layers." in name:
+            return "block:" + name.split(".layers.")[1].split(".")[0]
+        if "embed" in name.lower():
+            return "embeddings"
+        return "nonblock:" + name.split(".")[0]
+
+    def _largest_block_bytes(self) -> float:
+        """Largest block's checkpoint-tensor footprint from the meta skeleton (bytes)."""
+        try:
+            block_names = [n for sub in get_block_names(self.model, quant_vision=True) for n in sub]
+        except Exception:  # noqa: BLE001  sizing must never break staging
+            return float("inf")
+        per_block: dict = {}
+        for name, t in self.model.named_parameters():
+            for b in block_names:
+                if name == b or name.startswith(b + "."):
+                    per_block[b] = per_block.get(b, 0) + t.numel() * t.element_size()
+                    break
+        if not per_block:
+            return float("inf")
+        return float(max(per_block.values()))
+
+    def _primary_fits_largest_block(self, quant_dev: torch.device):
+        """Whether the primary GPU can join the auto rotation, else None.
+
+        Fit rule: free VRAM (queried live) - 3 GiB headroom >= largest block.
+        The headroom covers tuning transients on top of the block (batch
+        slices, in-place qdq, pack buffers). Conservative on purpose: the
+        largest block gates EVERY block's home, and sizes vary by layer type.
+        """
+        if quant_dev.type != "cuda" or quant_dev.index is None:
+            return None
+        try:
+            free_b, _total_b = torch.cuda.mem_get_info(quant_dev.index)
+        except Exception:  # noqa: BLE001
+            return None
+        largest = self._largest_block_bytes()
+        free_gb = free_b / 2**30
+        if largest is float("inf") or free_gb - 3.0 < largest / 2**30:
+            return None
+        return largest / 2**30, free_gb
+
+    def _log_device_inventory(self, calib_state: dict, tag: str) -> None:
+        """AR_STREAM_MEM_INVENTORY=1: per-GPU breakdown of the streaming parent's memory.
+
+        Walks model tensors (meta skipped, deduped), the calibration chain
+        state, and compares against the allocator's view; the residual
+        ("other") captures temporaries, packing buffers and optimizer state.
+        """
+        import collections
+
+        seen: set = set()
+        per_dev: dict = collections.defaultdict(lambda: collections.defaultdict(int))
+
+        def _add(dev: str, bucket: str, t) -> None:
+            per_dev[dev][bucket] += t.numel() * t.element_size()
+
+        for name, t in list(self.model.named_parameters()) + list(self.model.named_buffers()):
+            if t.device.type != "cuda" or id(t) in seen:
+                continue
+            seen.add(id(t))
+            _add(str(t.device), self._mem_bucket(name), t)
+
+        def _walk(v, dev_hint=None):
+            if isinstance(v, torch.Tensor):
+                if v.device.type == "cuda" and id(v) not in seen:
+                    seen.add(id(v))
+                    _add(str(v.device), "chain", v)
+            elif isinstance(v, dict):
+                for x in v.values():
+                    _walk(x)
+            elif isinstance(v, (list, tuple)):
+                for x in v:
+                    _walk(x)
+
+        if calib_state is not None:
+            for key in ("fp_inputs", "q_inputs", "input_others"):
+                _walk(calib_state.get(key))
+
+        for idx in range(torch.cuda.device_count()):
+            dev = f"cuda:{idx}"
+            alloc = torch.cuda.memory_allocated(idx) / 2**30
+            reserved = torch.cuda.memory_reserved(idx) / 2**30
+            buckets = sorted(per_dev.get(dev, {}).items(), key=lambda kv: -kv[1])
+            parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in buckets if v > 0)
+            tracked = sum(v for _, v in buckets)
+            other = max(0.0, alloc - tracked / 2**30)
+            logger.info(
+                "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG",
+                tag,
+                dev,
+                alloc,
+                reserved,
+                parts or "no tracked tensors",
+                other,
+            )
+
     def _resolve_stream_stage_devices(self):
         """Resolve ``stream_prefetch_devices`` into a list of staging devices.
 
@@ -426,6 +526,21 @@ class CompressionOrchestrator(BaseOrchestrator):
                 logger.warning("[stream] stream_prefetch_devices='auto' ignored: no CUDA devices visible")
                 return None
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
+            # The primary joins the rotation when its free VRAM comfortably
+            # holds the LARGEST block (block sizes vary by layer type - GDN vs
+            # full-attention vs first/last): parent working set + block + tuning
+            # transients must coexist there for one block at a time.
+            primary_fit = self._primary_fits_largest_block(quant_dev)
+            if primary_fit is not None:
+                largest_gb, free_gb = primary_fit
+                devices = [torch.device("cuda", i) for i in range(n_gpu)]
+                logger.info(
+                    "[stream] auto staging includes the primary %s: largest block %.2fG fits free %.2fG "
+                    "(headroom 3.0G for tuning transients)",
+                    quant_dev,
+                    largest_gb,
+                    free_gb,
+                )
         else:
             devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
             if any(d.type == "cuda" for d in devices) and any(d.type == "cpu" for d in devices):
@@ -592,12 +707,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                         if hasattr(_mod, "bits") and check_to_quantized(_mod):
                             from auto_round.compressors.utils import immediate_pack as _immediate_pack
 
-                            module_name = getattr(_mod, "global_name", None)
-                            if module_name is None and self.nblocks == 1 and _n:
-                                module_name = f"{block.global_name}.{_n}"
-                            if module_name is None:
-                                continue
-                            _immediate_pack(module_name, self.layer_config)
+                    _immediate_pack_block(
+                        block, block_name, self.layer_config, nblocks=self.nblocks, device=load_device
+                    )
+                    _t_pack = _time.perf_counter() - _t_pack
+                else:
+                    _t_pack = 0.0
 
                 # ── Infrastructure: shard write / device cleanup ──────────
                 if self.compress_context.is_immediate_saving:

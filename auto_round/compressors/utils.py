@@ -600,6 +600,93 @@ def _get_save_folder_name(format, *args, **kwargs) -> str:
     return compress_context.output_dir
 
 
+_PACK_DEVICE_LOGGED = False
+
+
+def _format_supports_batched_pack(fmt) -> bool:
+    """True when the format's pack chain terminates in the autoround packer.
+
+    Only a PURE, unrouted ``auto_round`` format qualifies: ``AutoRoundFormat``
+    wraps other format families (``auto_round:llm_compressor`` -> CT packer,
+    sym ``auto_round`` -> gptq packer, 4-bit asym ``auto_round`` -> awq packer)
+    while its own ``output_format`` attribute stays the plain "auto_round" --
+    so the check must look at the ROUTING (``backend is None``), never at the
+    wrapper's identity attributes. Batched-packing a routed format writes
+    qweight/qzeros/scales modules into an otherwise differently-packed
+    checkpoint that no single consumer can load.
+    """
+    if getattr(fmt, "format_name", None) != "auto_round":
+        return False
+    if getattr(fmt, "backend", None) is not None:
+        return False  # routed to another format family: per-module pack differs
+    out = str(getattr(fmt, "output_format", "") or "")
+    if not out.startswith("auto_round"):
+        return False
+    return not any(tok in out for tok in ("nv_fp", "mx_fp", "nvfp", "mxfp", "fp8", "fake", "llm_compressor"))
+
+
+def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: int = 1, device=None):
+    """Immediate-pack every quantizable module of one block.
+
+    Same-shape Linear modules (MoE experts -- 576 per hy3 block) go through a
+    single batched pack pass (bitwise-identical to per-module packing, but one
+    Python/alloc/transfer round trip per shape group instead of per module);
+    everything else falls back to the per-module :func:`immediate_pack`.
+    Non-batchable formats use the per-module path throughout.
+    """
+    names = []
+    for _n, _mod in block.named_modules():
+        if hasattr(_mod, "bits") and check_to_quantized(_mod):
+            module_name = getattr(_mod, "global_name", None)
+            if module_name is None and nblocks == 1 and _n:
+                module_name = f"{block.global_name}.{_n}"
+            if module_name is None:
+                continue
+            names.append(module_name)
+    if not names:
+        return  # nothing to pack: do not even touch the context singletons
+
+    from auto_round.context.compress import CompressContext
+    from auto_round.context.model import ModelContext
+    from auto_round.utils.device_manager import device_manager
+
+    compress_context = CompressContext.get_context()
+    if not compress_context.is_immediate_packing:
+        return
+    model = ModelContext.get_context().model
+
+    fmt = compress_context.formats[0] if compress_context.formats else None
+    from auto_round.utils.device_manager import get_packing_device
+
+    # default to the caller's block home: weights/scales/zp already sit there,
+    # so packing in place avoids a per-module round trip to the primary
+    pack_device = get_packing_device(device if device is not None else device_manager.device)
+    if pack_device.type == "cpu":
+        # CPU packing is elementwise-compute-bound: batching trades small
+        # per-module allocations for one huge intermediate and measures ~30%
+        # SLOWER. Keep the per-module path (the win lives on accelerators,
+        # where per-module launch/transfer overhead dominates instead).
+        logger.debug("immediate_pack_block: pack device is CPU; using per-module pack")
+    else:
+        global _PACK_DEVICE_LOGGED
+        # once per run: a per-block line collides with the tqdm redraws and
+        # garbles the log ("...(batched...):33, 16.50s/it]")
+        if not _PACK_DEVICE_LOGGED:
+            _PACK_DEVICE_LOGGED = True
+            logger.info("immediate_pack_block: packing on %s (batched for same-shape Linear groups)", pack_device)
+    if fmt is not None and pack_device.type != "cpu" and _format_supports_batched_pack(fmt):
+        from auto_round.export.export_to_autoround.export import pack_layers_batched
+
+        _packed, names = pack_layers_batched(
+            names,
+            model,
+            backend=getattr(fmt, "output_format", "auto_round"),
+            device=str(pack_device),
+        )
+    for module_name in names:
+        immediate_pack(module_name, layer_config)
+
+
 def immediate_pack(name: str, layer_config: dict):
     from auto_round.context.compress import CompressContext
     from auto_round.context.model import ModelContext
