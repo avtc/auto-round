@@ -22,6 +22,7 @@ is one decoder block plus the streamed pass-through tensors.
 
 import json
 import os
+import threading
 from typing import Optional
 
 import torch
@@ -55,7 +56,6 @@ class CheckpointStreamer:
         self._prefetch_remaining: list[str] = []  # prefixes not yet consumed
         self._prefetch_staged: list[str] = []  # staged, awaiting consumption
         self._prefetch_depth = 0
-        self._prefetch_stage_devices: Optional[list] = None
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_stop = False
         self._prefetch_err: Optional[BaseException] = None
@@ -97,58 +97,46 @@ class CheckpointStreamer:
         return os.path.join(self.model_path, shard_name)
 
     def _get_safe_open(self, shard_name: str):
-        """Bounded-cache ``safe_open`` handle per shard (shards are visited in
-        mostly-sequential order during block streaming)."""
-        if shard_name in self._open_handles:
-            return self._open_handles[shard_name]
+        """Bounded-cache ``safe_open`` handle per shard on the consumer pool
+        (shards are visited in mostly-sequential order during block streaming)."""
+        return self._get_safe_open_pooled(shard_name, self._open_handles, self._open_order)
+
+    def _get_safe_open_pooled(self, shard_name: str, handles: dict, order: list):
+        """Bounded-cache ``safe_open`` handle per shard on a caller-owned pool."""
+        if shard_name in handles:
+            return handles[shard_name]
         from safetensors import safe_open
 
         handle = safe_open(self._shard_path(shard_name), framework="pt", device="cpu")
-        self._open_handles[shard_name] = handle
-        self._open_order.append(shard_name)
-        while len(self._open_order) > self._max_open:
-            old = self._open_order.pop(0)
-            h = self._open_handles.pop(old, None)
+        handles[shard_name] = handle
+        order.append(shard_name)
+        while len(order) > self._max_open:
+            old = order.pop(0)
+            h = handles.pop(old, None)
             if h is not None:
                 h.__exit__(None, None, None)
         return handle
 
     # ── Prefetch ─────────────────────────────────────────────────────────────
 
-    def start_prefetch(
-        self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None
-    ) -> None:
-        """Stream whole module prefixes ahead of the consumer on a background
-        thread.
+    def start_prefetch(self, module_prefixes: list, depth: int = 1) -> None:
+        """Stream whole module prefixes into host RAM on a background thread.
 
         The reader stages prefixes in visit order and keeps at most ``depth``
-        staged-but-unconsumed prefixes; the consumer releases a prefix with
-        :meth:`prefetch_consumed`. With ``stage_devices`` (e.g. CUDA devices)
-        each prefix is staged directly onto its device, round-robin by prefix
-        index, overlapping the checkpoint read with block compute; without it
-        prefixes land in host RAM. Memory use is bounded at roughly ``depth``
-        prefixes worth of tensors.
+        staged-but-unconsumed prefixes beyond the current one; the consumer
+        releases a prefix with :meth:`prefetch_consumed`. Host RAM use is
+        bounded at roughly (depth + 1) prefixes worth of tensors.
         """
         if self._prefetch_thread is not None:
             raise RuntimeError("prefetch already running; call stop_prefetch() first")
-        if stage_devices:
-            for d in stage_devices:
-                if torch.device(d).type == "meta":
-                    raise ValueError(
-                        f"invalid staging device {d!r}: meta tensors hold no data; "
-                        "use a real device (e.g. 'cpu' or 'cuda:k')"
-                    )
         self._prefetch_remaining = list(module_prefixes)
         self._prefetch_depth = max(1, int(depth))
         self._prefetch_stop = False
         self._prefetch_err = None
-        self._prefetch_stage_devices = (
-            [torch.device(d) for d in stage_devices] if stage_devices else None
-        )
 
         def _reader():
             try:
-                for idx, prefix in enumerate(module_prefixes):
+                for prefix in module_prefixes:
                     with self._prefetch_cond:
                         while len(self._prefetch_staged) >= self._prefetch_depth and not self._prefetch_stop:
                             self._prefetch_cond.wait()
@@ -157,17 +145,10 @@ class CheckpointStreamer:
                     names = self.names_under(prefix)
                     if not names:
                         raise KeyError(f"no checkpoint tensors under prefix {prefix!r}")
-                    stage_dev = (
-                        self._prefetch_stage_devices[idx % len(self._prefetch_stage_devices)]
-                        if self._prefetch_stage_devices
-                        else None
-                    )
                     for name in names:
                         if self._prefetch_stop:
                             return
                         tensor = self._read_tensor(name, self._prefetch_handles, self._prefetch_handle_order)
-                        if stage_dev is not None:
-                            tensor = tensor.to(stage_dev)
                         with self._prefetch_cond:
                             self._prefetch_cache[name] = tensor
                     with self._prefetch_cond:
@@ -230,30 +211,38 @@ class CheckpointStreamer:
         self._prefetch_handle_order.clear()
 
     def fetch(self, name: str, device: Optional[str] = None) -> torch.Tensor:
-        """Read one tensor from the checkpoint (CPU unless ``device`` given)."""
+        """Read one tensor (CPU unless ``device`` given); prefetched tensors
+        are served from the host-RAM cache."""
+        tensor = self._prefetch_pop(name)
+        if tensor is None:
+            tensor = self._read_tensor(name, self._open_handles, self._open_order)
+        if device is not None:
+            tensor = tensor.to(device)
+        return tensor
+
+    def _read_tensor(self, name: str, handles: dict, order: list) -> torch.Tensor:
+        """Read one tensor through a caller-owned handle pool."""
         if name not in self.weight_map:
             raise KeyError(f"Tensor {name!r} not present in the checkpoint index.")
         shard = self.weight_map[name]
         if self._format == "safetensors":
-            tensor = self._get_safe_open(shard).get_tensor(name)
+            tensor = self._get_safe_open_pooled(shard, handles, order).get_tensor(name)
         else:
             # .bin shards: load (mmap-free) and keep a one-shard cache — shard
             # granularity is coarse for pickle checkpoints, but such shards are
             # also typically written sequentially.
             cache_key = f"__bin__{shard}"
-            if cache_key not in self._open_handles:
+            if cache_key not in handles:
                 try:
                     data = torch.load(self._shard_path(shard), map_location="cpu", weights_only=True)
                 except TypeError:  # older torch
                     data = torch.load(self._shard_path(shard), map_location="cpu")  # nosec
-                self._open_handles[cache_key] = data
-                self._open_order.append(cache_key)
-                while len(self._open_order) > self._max_open:
-                    old = self._open_order.pop(0)
-                    self._open_handles.pop(old, None)
-            tensor = self._open_handles[cache_key][name]
-        if device is not None:
-            tensor = tensor.to(device)
+                handles[cache_key] = data
+                order.append(cache_key)
+                while len(order) > self._max_open:
+                    old = order.pop(0)
+                    handles.pop(old, None)
+            tensor = handles[cache_key][name]
         return tensor
 
     def names_under(self, prefix: str) -> list[str]:
@@ -312,9 +301,12 @@ class CheckpointStreamer:
             loaded.append(name)
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
+        if self._prefetch_thread is not None:
+            self.prefetch_consumed(prefix)
         return loaded
 
     def close(self) -> None:
+        self.stop_prefetch()
         for handle in self._open_handles.values():
             if hasattr(handle, "__exit__"):
                 try:

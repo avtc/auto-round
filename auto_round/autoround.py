@@ -330,7 +330,6 @@ _ENTRY_KWARG_OWNERS = {
     "to_quant_block_names": "compressor",
     "stream_checkpoint": "compressor",
     "stream_prefetch": "compressor",
-    "stream_prefetch_gpus": "compressor",
     "format": "base",
     "dataset": "base",
     "batch_size": "base",

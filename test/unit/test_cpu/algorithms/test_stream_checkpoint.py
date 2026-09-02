@@ -16,6 +16,8 @@
 import json
 import os
 
+import time
+
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -176,47 +178,6 @@ class TestCheckpointStreamer:
         finally:
             streamer.stop_prefetch()
 
-    def test_prefetch_stages_to_devices(self, tmp_path):
-        """With stage_devices the reader lands each prefix on its assigned
-        device (round-robin by prefix index) and fetch() moves tensors back to
-        whatever device the consumer asks for."""
-        torch.manual_seed(4)
-        tensors = {f"b{i}.w.weight": torch.randn(3, 3) for i in range(4)}
-        shards = {f"model-{i:05d}.safetensors": {f"b{i}.w.weight": tensors[f"b{i}.w.weight"]} for i in range(4)}
-        path = _make_sharded_checkpoint(tmp_path, shards)
-        stage = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-        streamer = CheckpointStreamer(path)
-        streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=4, stage_devices=[stage])
-        try:
-            deadline = time.monotonic() + 10.0
-            while len(streamer._prefetch_staged) < 4 and streamer.prefetch_error() is None \
-                    and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert len(streamer._prefetch_staged) == 4, streamer._prefetch_staged
-            for name in list(streamer._prefetch_cache):
-                assert streamer._prefetch_cache[name].device == stage
-            # consumer on a different device gets a move, not an error
-            target = torch.device("cpu") if stage.type == "cuda" else None
-            for name, ref in tensors.items():
-                got = streamer.fetch(name, device=target)
-                assert got.device == (target or stage)
-                assert torch.equal(got.to("cpu"), ref)
-        finally:
-            streamer.stop_prefetch()
-
-
-    def test_prefetch_invalid_stage_device_raises(self, tmp_path):
-        """Meta staging devices are rejected eagerly: staging to meta would
-        silently produce empty tensors instead of an error."""
-        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
-        streamer = CheckpointStreamer(path)
-        with pytest.raises(ValueError, match="meta"):
-            streamer.start_prefetch(["m"], depth=1, stage_devices=[torch.device("meta")])
-        # no reader thread left behind
-        assert streamer._prefetch_thread is None
-
-
-
 
 
 
@@ -257,7 +218,7 @@ class TestStreamQuantizeEquivalence:
         return str(d)
 
     @staticmethod
-    def _quantize(model_path, out_dir, stream, stream_prefetch=0, stream_prefetch_gpus=None):
+    def _quantize(model_path, out_dir, stream, stream_prefetch=0):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.algorithms.transforms.presinq import PreSINQConfig
         from auto_round.autoround import AutoRound
@@ -269,7 +230,6 @@ class TestStreamQuantizeEquivalence:
             layerwise_rotation=True,
             stream_checkpoint=stream,
             stream_prefetch=stream_prefetch,
-            stream_prefetch_gpus=stream_prefetch_gpus,
             format="auto_round",
             disable_model_free=True,
             device_map="cpu",
@@ -414,41 +374,4 @@ class TestStreamQuantizeEquivalence:
         assert set(t_plain) == set(t_prefetched)
         for k in t_plain:
             assert torch.equal(t_plain[k], t_prefetched[k]), f"tensor {k} differs under prefetch"
-
-    def test_staged_export_matches_streamed(self, tiny_checkpoint, tmp_path):
-        """Device staging (round-robin block homes + tensors preloaded onto the
-        staging devices) must not change any exported bit: the quantization
-        math is device-independent, staging only changes where tensors wait.
-        Exercises the full home-rotation plumbing via CPU staging devices; the
-        multi-GPU variant runs on CUDA hosts."""
-        import shutil
-
-        ck_a = str(tmp_path / "ck_a")
-        ck_b = str(tmp_path / "ck_b")
-        shutil.copytree(tiny_checkpoint, ck_a)
-        shutil.copytree(tiny_checkpoint, ck_b)
-        stage_devs = ["cpu"] if torch.cuda.device_count() < 2 else ["cuda:1"]
-        plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
-        staged = self._quantize(
-            ck_b, str(tmp_path / "staged"), stream=True, stream_prefetch=2, stream_prefetch_gpus=stage_devs
-        )
-
-        def load_all(d):
-            from safetensors import safe_open
-
-            out = {}
-            for fn in sorted(os.listdir(d)):
-                if not fn.endswith(".safetensors"):
-                    continue
-                with safe_open(os.path.join(d, fn), framework="pt") as f:
-                    for k in f.keys():
-                        out[k] = f.get_tensor(k)
-            return out
-
-        t_plain, t_staged = load_all(plain), load_all(staged)
-        assert set(t_plain) == set(t_staged)
-        for k in t_plain:
-            assert torch.equal(t_plain[k], t_staged[k]), f"tensor {k} differs under device staging"
-
-
 
