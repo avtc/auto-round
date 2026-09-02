@@ -100,30 +100,53 @@ class TestStreamingCliFlags(unittest.TestCase):
         kwargs = self._compressor_kwargs(
             [
                 "--layerwise_rotation",
-                "--stream_checkpoint",
+                "--stream_quantization",
                 "--stream_calibration",
-                "--stream_prefetch",
-                "3",
-                "--stream_prefetch_devices",
-                "auto",
+                "--stream_calibration_rows",
+                "16",
                 "--iters",
                 "0",
             ]
         )
         self.assertIs(kwargs["layerwise_rotation"], True)
-        self.assertIs(kwargs["stream_checkpoint"], True)
+        self.assertIs(kwargs["stream_quantization"], True)
         self.assertIs(kwargs["stream_calibration"], True)
-        self.assertEqual(kwargs["stream_calibration_rows"], 0)
-        self.assertEqual(kwargs["stream_prefetch"], 3)
+        self.assertEqual(kwargs["stream_calibration_rows"], 16)
+        # unset prefetch -> off
+        self.assertEqual(kwargs["stream_prefetch"], 0)
+        self.assertIsNone(kwargs["stream_prefetch_devices"])
+
+    def test_prefetch_auto(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch", "auto"])
+        self.assertIsNone(kwargs["stream_prefetch"], "auto derives depth at loop start")
         self.assertEqual(kwargs["stream_prefetch_devices"], "auto")
 
-    def test_prefetch_devices_list_parsed(self):
-        kwargs = self._compressor_kwargs(["--stream_prefetch_devices", "cuda:0,cpu"])
-        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:0", "cpu"])
+    def test_prefetch_cpu(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch", "cpu"])
+        self.assertIsNone(kwargs["stream_prefetch"])
+        self.assertEqual(kwargs["stream_prefetch_devices"], ["cpu"])
 
-    def test_prefetch_devices_whitespace_tolerant(self):
-        kwargs = self._compressor_kwargs(["--stream_prefetch_devices", " cuda:1 , cpu ,"])
-        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:1", "cpu"])
+    def test_prefetch_gpu_list_ints(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch", "1,2"])
+        self.assertIsNone(kwargs["stream_prefetch"])
+        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:1", "cuda:2"])
+
+    def test_prefetch_gpu_list_names(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch", " cuda:3 , cuda:5 "])
+        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:3", "cuda:5"])
+
+    def test_prefetch_off_synonyms(self):
+        for value in ("off", "", "0"):
+            kwargs = self._compressor_kwargs(["--stream_prefetch", value] if value else [])
+            self.assertEqual(kwargs["stream_prefetch"], 0)
+            self.assertIsNone(kwargs["stream_prefetch_devices"])
+
+    def test_prefetch_empty_list_rejected(self):
+        from auto_round.cli.main import _build_entry_compressor_kwargs
+
+        args = _parse(["--stream_prefetch", " , "])
+        with self.assertRaises(ValueError):
+            _build_entry_compressor_kwargs(args)
 
     def test_calibration_rows_flag(self):
         kwargs = self._compressor_kwargs(["--stream_calibration_rows", "16"])
@@ -131,8 +154,8 @@ class TestStreamingCliFlags(unittest.TestCase):
 
     def test_defaults_are_api_neutral(self):
         kwargs = self._compressor_kwargs([])
-        self.assertIs(kwargs["layerwise_rotation"], False)
-        self.assertIs(kwargs["stream_checkpoint"], False)
+        self.assertIsNone(kwargs["layerwise_rotation"], "unset must auto-resolve, not force off")
+        self.assertIs(kwargs["stream_quantization"], False)
         self.assertIs(kwargs["stream_calibration"], False)
         self.assertEqual(kwargs["stream_calibration_rows"], 0)
         self.assertEqual(kwargs["stream_prefetch"], 0)

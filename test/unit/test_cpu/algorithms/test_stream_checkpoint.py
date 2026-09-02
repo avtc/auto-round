@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for stream_checkpoint: meta-device model + per-block tensor streaming."""
+"""Tests for stream_quantization: meta-device model + per-block tensor streaming."""
 
 import json
 import os
@@ -372,11 +372,14 @@ class TestStageDeviceResolution:
     def test_none_means_host_ram(self):
         assert self._resolve(stream_prefetch_devices=None) is None
 
-    def test_cpu_list_resolves(self):
-        # explicit list accepts device strings incl. cpu (CPU quant device)
-        devices = self._resolve(stream_prefetch_devices=["cuda:0", "cpu"])
-        # cpu quant device + cuda entry -> falls back to host RAM by design
+    def test_cuda_list_with_cpu_quant_falls_back_to_ram(self):
+        # all-GPU staging list with a CPU quant device -> host RAM by design
+        devices = self._resolve(stream_prefetch_devices=["cuda:0", "cuda:1"])
         assert devices is None
+
+    def test_mixed_list_raises_even_with_cpu_quant(self):
+        with pytest.raises(ValueError, match="mixed GPU/CPU staging"):
+            self._resolve(stream_prefetch_devices=["cuda:0", "cpu"])
 
     def test_cpu_only_list_resolves_to_cpu(self):
         devices = self._resolve(stream_prefetch_devices=["cpu"])
@@ -390,9 +393,19 @@ class TestStageDeviceResolution:
         with pytest.raises(ValueError, match="meta tensors hold no data"):
             self._resolve(stream_prefetch_devices=["cpu", "meta"])
 
+    def test_mixed_gpu_cpu_list_rejected_with_cuda_quant(self):
+        # in-place round-robin quantization: all-GPU or CPU-only, never mixed
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        stub = SimpleNamespace(stream_prefetch=None, device="cuda:0", stream_prefetch_devices=["cuda:1", "cpu"])
+        with pytest.raises(ValueError, match="mixed GPU/CPU staging"):
+            CompressionOrchestrator._resolve_stream_stage_devices(stub)
+
 
 class TestStreamingRoutingWaiver:
-    """Calibration-demand resolution under stream_checkpoint: RTN stays waived
+    """Calibration-demand resolution under stream_quantization: RTN stays waived
     (weight-only); SignRound (iters>0) is admitted only with the chained
     calibration (stream_calibration) and hard-errors without it."""
 
@@ -404,7 +417,7 @@ class TestStreamingRoutingWaiver:
         fields = dict(
             quantize_config=object(),
             _alg_configs=configs,
-            stream_checkpoint=False,
+            stream_quantization=False,
             stream_calibration=False,
             scheme="W4A16",
             static_kv_dtype=None,
@@ -418,26 +431,28 @@ class TestStreamingRoutingWaiver:
     def test_optimized_rtn_streamed_waived_without_calibration(self):
         from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
 
-        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_checkpoint=True) is False
+        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_quantization=True) is False
 
     def test_signround_streamed_with_calibration_waived(self):
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
         stub = SignRoundConfig(group_size=16, iters=1)
-        assert self._needs([stub], stream_checkpoint=True, stream_calibration=True) is False
+        assert self._needs([stub], stream_quantization=True, stream_calibration=True) is False
 
     def test_mixed_rtn_signround_streamed_with_calibration_waived(self):
         from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
         configs = [OptimizedRTNConfig(group_size=16), SignRoundConfig(group_size=16, iters=1)]
-        assert self._needs(configs, stream_checkpoint=True, stream_calibration=True) is False
+        assert self._needs(configs, stream_quantization=True, stream_calibration=True) is False
 
-    def test_signround_streamed_without_calibration_raises(self):
+    def test_signround_streamed_without_chain_falls_back_to_data_driven(self):
+        """Auto-engage normally handles this in __init__; if a SignRound config
+        slips in later without the chain, the safe route is the data-driven
+        path -- never silent weight-only tuning under streaming."""
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
-        with pytest.raises(ValueError, match="--stream_calibration"):
-            self._needs([SignRoundConfig(group_size=16, iters=1)], stream_checkpoint=True)
+        assert self._needs([SignRoundConfig(group_size=16, iters=1)], stream_quantization=True) is True
 
     def test_signround_unstreamed_stays_data_driven(self):
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
@@ -447,34 +462,117 @@ class TestStreamingRoutingWaiver:
     def test_unsupported_quantizer_streamed_stays_data_driven(self):
         from auto_round.algorithms.transforms.awq.config import AWQConfig
 
-        assert self._needs([AWQConfig(group_size=16)], stream_checkpoint=True, stream_calibration=True) is True
+        assert self._needs([AWQConfig(group_size=16)], stream_quantization=True, stream_calibration=True) is True
 
-    def test_forced_imatrix_streamed_without_calibration_raises(self):
+    def test_forced_imatrix_streamed_without_chain_falls_back_to_data_driven(self):
         from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
 
         cfg = OptimizedRTNConfig(group_size=16)
         cfg.forced_imatrix = True
-        with pytest.raises(ValueError, match="--stream_calibration"):
-            self._needs([cfg], stream_checkpoint=True)
+        assert self._needs([cfg], stream_quantization=True) is True
 
     def test_forced_imatrix_streamed_with_calibration_waived(self):
         from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
 
         cfg = OptimizedRTNConfig(group_size=16)
         cfg.forced_imatrix = True
-        assert self._needs([cfg], stream_checkpoint=True, stream_calibration=True) is False
+        assert self._needs([cfg], stream_quantization=True, stream_calibration=True) is False
 
     def test_rule_enabled_imatrix_streamed_stays_waived_silently(self):
         """imatrix on by scheme rules (no flag): the pre-existing weight-only
         waiver applies -- no error, imatrix simply not collected."""
         from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
 
-        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_checkpoint=True) is False
+        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_quantization=True) is False
+
+
+class TestStreamFeatureAutoEngage:
+    """_auto_engage_stream_features: layerwise rotation + calibration chain
+    engage by themselves under stream_quantization when the run needs them."""
+
+    @staticmethod
+    def _engage(configs, **attrs):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.base import BaseCompressor
+
+        fields = dict(
+            layerwise_rotation=None,
+            stream_quantization=False,
+            stream_calibration=False,
+            _alg_configs=configs,
+        )
+        fields.update(attrs)
+        stub = SimpleNamespace(**fields)
+        BaseCompressor._auto_engage_stream_features(stub)
+        return stub
+
+    def test_layerwise_auto_enables_with_rotations_under_streaming(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.transforms.presinq import PreSINQConfig
+
+        stub = self._engage([PreSINQConfig(group_size=16), RTNConfig(group_size=16)], stream_quantization=True)
+        assert stub.layerwise_rotation is True
+
+    def test_layerwise_stays_off_without_rotations(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        stub = self._engage([RTNConfig(group_size=16)], stream_quantization=True)
+        assert stub.layerwise_rotation is False
+
+    def test_layerwise_stays_off_without_streaming(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.transforms.presinq import PreSINQConfig
+
+        stub = self._engage([PreSINQConfig(group_size=16), RTNConfig(group_size=16)])
+        assert stub.layerwise_rotation is False
+
+    def test_explicit_layerwise_wins(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.transforms.presinq import PreSINQConfig
+
+        stub = self._engage(
+            [PreSINQConfig(group_size=16), RTNConfig(group_size=16)], stream_quantization=True, layerwise_rotation=False
+        )
+        assert stub.layerwise_rotation is False
+
+    def test_calibration_auto_engages_for_signround(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        stub = self._engage([SignRoundConfig(group_size=16, iters=1)], stream_quantization=True)
+        assert stub.stream_calibration is True
+
+    def test_calibration_auto_engages_for_forced_imatrix(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        cfg = RTNConfig(group_size=16)
+        cfg.forced_imatrix = True
+        stub = self._engage([cfg], stream_quantization=True)
+        assert stub.stream_calibration is True
+
+    def test_calibration_not_engaged_for_weight_only(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        stub = self._engage([RTNConfig(group_size=16)], stream_quantization=True)
+        assert stub.stream_calibration is False
+
+    def test_calibration_not_engaged_without_streaming(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        stub = self._engage([SignRoundConfig(group_size=16, iters=1)])
+        assert stub.stream_calibration is False
+
+    def test_explicit_calibration_kept(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        stub = self._engage([RTNConfig(group_size=16)], stream_calibration=True)
+        assert stub.stream_calibration is True
 
 
 @pytest.mark.slow
 class TestStreamQuantizeEquivalence:
-    """stream_checkpoint=True must produce the same export as the normal flow."""
+    """stream_quantization=True must produce the same export as the normal flow."""
 
     @pytest.fixture(scope="class")
     def tiny_checkpoint(self, tmp_path_factory):
@@ -539,7 +637,7 @@ class TestStreamQuantizeEquivalence:
                 RTNConfig(group_size=16, disable_opt_rtn=False),
             ],
             layerwise_rotation=True,
-            stream_checkpoint=stream,
+            stream_quantization=stream,
             stream_prefetch=stream_prefetch,
             stream_prefetch_devices=stream_prefetch_devices,
             stream_calibration=stream_calibration,
@@ -629,7 +727,7 @@ class TestStreamQuantizeEquivalence:
                 RTNConfig(group_size=16, disable_opt_rtn=True),
             ],
             layerwise_rotation=True,
-            stream_checkpoint=True,
+            stream_quantization=True,
             format="auto_round",
             disable_model_free=True,
             device_map="cpu",
@@ -654,7 +752,7 @@ class TestStreamQuantizeEquivalence:
         so, sp = get_scales(d_opt), get_scales(d_plain)
         assert so and set(so) == set(sp)
         differing = [k for k in so if not torch.equal(so[k], sp[k])]
-        assert differing, "opt-RTN clip search did not change any scales under stream_checkpoint"
+        assert differing, "opt-RTN clip search did not change any scales under stream_quantization"
 
     def test_stream_calibration_matches_data_driven(self, tiny_checkpoint, tmp_path):
         """stream_calibration=True must reproduce the data-driven run exactly:
@@ -698,7 +796,7 @@ class TestStreamQuantizeEquivalence:
         assert n_exact + n_close == len(t_a)
 
     def test_streamed_signround_qon_chains_quantized_inputs(self, tiny_checkpoint, tmp_path, monkeypatch):
-        """iters>0 under stream_checkpoint routes into the streaming loop
+        """iters>0 under stream_quantization routes into the streaming loop
         (routing waiver) and chains each block's quantized outputs as the next
         block's q_inputs (qon), mirroring the data-driven loop."""
         import shutil
@@ -728,7 +826,7 @@ class TestStreamQuantizeEquivalence:
             scheme="W4A16",
             alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
             layerwise_rotation=False,
-            stream_checkpoint=True,
+            stream_quantization=True,
             stream_calibration=True,
             dataset=rows,
             seqlen=32,
@@ -779,7 +877,7 @@ class TestStreamQuantizeEquivalence:
             scheme="W4A16",
             alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
             layerwise_rotation=False,
-            stream_checkpoint=True,
+            stream_quantization=True,
             stream_calibration=True,
             enable_quanted_input=False,
             dataset=rows,
@@ -796,31 +894,49 @@ class TestStreamQuantizeEquivalence:
         assert len(block_calls) >= 2
         assert all(q is None for q in block_calls), "qoff must not chain quantized inputs"
 
-    def test_streamed_signround_without_calibration_raises(self, tiny_checkpoint, tmp_path):
-        """stream_checkpoint + iters>0 + stream_calibration=False must fail
-        with the actionable fix instead of silently skipping the tuning data."""
+    def test_streamed_signround_auto_engages_calibration(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """stream_quantization + iters>0 with stream_calibration unset: the
+        activation chain auto-engages -- the run completes with real chained
+        tuning inputs instead of silently skipping the tuning data."""
         import shutil
 
+        from auto_round.algorithms.composer import AlgorithmComposer
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
         from auto_round.autoround import AutoRound
 
+        torch.manual_seed(11)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
         ck = str(tmp_path / "ck_nocal")
         shutil.copytree(tiny_checkpoint, ck)
-        # need_calib resolves during __init__, so the guard fires at construction
-        with pytest.raises(ValueError, match="--stream_calibration"):
-            AutoRound(
-                ck,
-                scheme="W4A16",
-                alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
-                layerwise_rotation=False,
-                stream_checkpoint=True,
-                stream_calibration=False,
-                format="auto_round",
-                disable_model_free=True,
-                device_map="cpu",
-                low_gpu_mem_usage=True,
-                low_cpu_mem_usage=True,
-            )
+
+        chained = {"calls": 0}
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            if fp_inputs is not None:
+                chained["calls"] += 1
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
+            stream_quantization=True,
+            stream_calibration=False,  # must auto-engage
+            dataset=rows,
+            seqlen=32,
+            nsamples=4,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        assert ar.stream_calibration is True, "chain must auto-engage for iters>0 under streaming"
+        out_dir = ar.quantize_and_save(str(tmp_path / "nocal"), format="auto_round")
+        assert out_dir
+        assert chained["calls"] >= 2, "auto-engaged chain must feed every block"
 
     def test_partial_layer_config_resolves_format(self, tiny_checkpoint, tmp_path):
         """layer_config entries are partial overrides: unset keys fall back to
@@ -845,7 +961,7 @@ class TestStreamQuantizeEquivalence:
                 ".*experts": {"group_size": 8},
             },
             layerwise_rotation=True,
-            stream_checkpoint=True,
+            stream_quantization=True,
             format="auto_round",
             disable_model_free=True,
             device_map="cpu",

@@ -81,20 +81,48 @@ def _build_entry_route_kwargs(args) -> dict:
     }
 
 
+def _parse_stream_prefetch(value):
+    """Parse the combined --stream_prefetch flag into (depth, devices).
+
+    'off' (default) -> (0, None); 'auto' -> (None, 'auto') with the depth
+    derived at loop start (one block per staging GPU); 'cpu' -> (None,
+    ['cpu']) host-RAM staging at depth 1; a comma list of GPUs ('1,2' or
+    'cuda:1,cuda:2') -> (None, devices), one block each, quantized in place.
+    """
+    text = (value or "off").strip()
+    lowered = text.lower()
+    if lowered in ("", "off", "0", "false"):
+        return 0, None
+    if lowered == "auto":
+        return None, "auto"
+    if lowered == "cpu":
+        return None, ["cpu"]
+    devices = []
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        devices.append(f"cuda:{item}" if item.isdigit() else item)
+    if not devices:
+        raise ValueError(f"--stream_prefetch: cannot parse staging spec {value!r}")
+    return None, devices
+
+
 def _build_entry_compressor_kwargs(args) -> dict:
-    devices = getattr(args, "stream_prefetch_devices", None)
-    if devices is not None and devices.strip() and devices.strip().lower() != "auto":
-        devices = [d.strip() for d in devices.split(",") if d.strip()]
+    depth, devices = _parse_stream_prefetch(getattr(args, "stream_prefetch", "off"))
+    layerwise = getattr(args, "layerwise_rotation", False)
     return {
         "scale_dtype": args.scale_dtype,
         "ignore_layers": args.ignore_layers,
         "quant_lm_head": args.quant_lm_head,
         "to_quant_block_names": args.to_quant_block_names,
-        "layerwise_rotation": getattr(args, "layerwise_rotation", False),
-        "stream_checkpoint": getattr(args, "stream_checkpoint", False),
+        # None (unset) lets stream_quantization auto-enable layer-wise rotation
+        # when rotation transforms are present; True/False are explicit.
+        "layerwise_rotation": True if layerwise else None,
+        "stream_quantization": getattr(args, "stream_quantization", False),
         "stream_calibration": getattr(args, "stream_calibration", False),
         "stream_calibration_rows": getattr(args, "stream_calibration_rows", 0),
-        "stream_prefetch": getattr(args, "stream_prefetch", 0),
+        "stream_prefetch": depth,
         "stream_prefetch_devices": devices,
     }
 

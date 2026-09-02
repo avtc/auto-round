@@ -68,7 +68,7 @@ class ModelContext(BaseContext):
         need_calib: bool = True,
         is_act_quantize: bool = False,
         quant_nontext_module: bool = False,
-        stream_checkpoint: bool = False,
+        stream_quantization: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -84,7 +84,7 @@ class ModelContext(BaseContext):
         assert model is not None, "model must be provided for ModelContext"
         self.model = model
         self.tokenizer = tokenizer
-        self.stream_checkpoint = stream_checkpoint
+        self.stream_quantization = stream_quantization
         self.model_path = model if isinstance(model, str) else None
         self.checkpoint_streamer = None
 
@@ -121,7 +121,7 @@ class ModelContext(BaseContext):
         # by the time BaseCompressor.post_init() runs.
         self._load_model()
 
-        if unsupported_meta_device(self.model) and not self.stream_checkpoint:
+        if unsupported_meta_device(self.model) and not self.stream_quantization:
             raise RuntimeError(
                 "AutoRound does not support parameters on meta device. "
                 "Please use more GPUs by setting `--device 0,1,2,3` or just place the model on CPU."
@@ -161,7 +161,7 @@ class ModelContext(BaseContext):
     def _load_model_on_meta(self):
         """Load the model structure on the meta device + build a tensor streamer.
 
-        ``stream_checkpoint`` mode for models far larger than host RAM: weights
+        ``stream_quantization`` mode for models far larger than host RAM: weights
         are never materialized as a whole; the zero-shot block loop streams each
         block from the checkpoint shards right before quantizing it and the
         ShardWriter releases it right after (requires immediate saving).
@@ -190,11 +190,11 @@ class ModelContext(BaseContext):
         except Exception as e:
             # Zero-shot streaming never consumes calibration data; a tokenizer
             # is only needed for the export copy-through.
-            logger.warning(f"[stream_checkpoint] tokenizer unavailable ({e}); continuing without it.")
+            logger.warning(f"[stream_quantization] tokenizer unavailable ({e}); continuing without it.")
             self.tokenizer = None
         self.checkpoint_streamer = CheckpointStreamer(self.model_path)
         logger.info(
-            f"[stream_checkpoint] model structure loaded on meta device; "
+            f"[stream_quantization] model structure loaded on meta device; "
             f"{len(self.checkpoint_streamer.tensor_names)} tensors will be streamed from "
             f"{self.model_path} per block (model never fully materialized)."
         )
@@ -252,7 +252,7 @@ class ModelContext(BaseContext):
                     self.model, self.processor, self.tokenizer, self.image_processor = mllm_load_model(
                         self.model, platform=self.platform, device="cpu", model_dtype=self.model_dtype
                     )
-        elif isinstance(self.model, str) and self.stream_checkpoint:
+        elif isinstance(self.model, str) and self.stream_quantization:
             self._load_model_on_meta()
         elif isinstance(self.model, str):
             config = self.config
