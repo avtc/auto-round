@@ -143,7 +143,7 @@ class AlgorithmComposer:
         """
         from auto_round.algorithms.quantization.base import BaseQuantizer
         from auto_round.algorithms.quantization.config import QuantizationConfig
-        from auto_round.algorithms.transforms.base import BasePreprocessor
+        from auto_round.algorithms.transforms.base import BasePreprocessor, BaseRotationConfig
 
         configs = list(configs)
 

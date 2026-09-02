@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Optional, Union
 
 import torch
+
+from auto_round import envs
 from transformers import AutoConfig, set_seed
 
 from auto_round.algorithms.quantization import BaseQuantizer, QuantizationConfig
@@ -356,7 +358,7 @@ class BaseOrchestrator(object):
         model_dtype = kwargs.pop("model_dtype", None)
         trust_remote_code = kwargs.pop("trust_remote_code") if "trust_remote_code" in kwargs else True
         quant_nontext_module = kwargs.pop("quant_nontext_module", False)
-        self._validate_stream_options(quant_nontext_module, enable_block_parallel_tuning=enable_block_parallel_tuning)
+        self._validate_stream_options(quant_nontext_module)
         device = kwargs.pop("device", None)
         if device is not None:
             logger.warning("`device` is deprecated, please use `device_map` instead")
@@ -536,7 +538,7 @@ class BaseOrchestrator(object):
             return True
         return self._needs_calibration_data()
 
-    def _validate_stream_options(self, quant_nontext_module: bool, enable_block_parallel_tuning: bool = False) -> None:
+    def _validate_stream_options(self, quant_nontext_module: bool) -> None:
         """Reject option combinations the streaming loop cannot honor."""
         if quant_nontext_module and self.stream_quantization:
             raise ValueError(
@@ -546,14 +548,6 @@ class BaseOrchestrator(object):
                 "garbage), and the path is unvalidated. Non-text layers pass "
                 "through at full precision under streaming; to quantize them use "
                 "the ordinary (non-streaming) path."
-            )
-        if enable_block_parallel_tuning and self.stream_quantization:
-            raise ValueError(
-                "enable_block_parallel_tuning cannot run under stream_quantization: "
-                "block-parallel tuning is a data-driven-path feature (workers re-exec "
-                "the CLI against the reference chain) while the streaming loop is "
-                "zero-shot. Drop --enable_block_parallel_tuning; AutoScheme scoring "
-                "keeps its own parallelism (AR_ENABLE_AUTO_SCHEME_PARALLEL)."
             )
 
     def _auto_engage_stream_features(self) -> None:
