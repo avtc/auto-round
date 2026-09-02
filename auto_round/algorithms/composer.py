@@ -79,6 +79,7 @@ def _as_hidden_tensor(out):
 
 
 
+@dataclass
 class BlockContext:
     """Per-block context threaded through the lifecycle hooks.
 

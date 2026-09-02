@@ -15,6 +15,7 @@ import copy
 import gc
 import os
 import time
+import time as _time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
 
