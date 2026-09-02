@@ -356,6 +356,7 @@ class BaseOrchestrator(object):
         model_dtype = kwargs.pop("model_dtype", None)
         trust_remote_code = kwargs.pop("trust_remote_code") if "trust_remote_code" in kwargs else True
         quant_nontext_module = kwargs.pop("quant_nontext_module", False)
+        self._validate_stream_options(quant_nontext_module)
         device = kwargs.pop("device", None)
         if device is not None:
             logger.warning("`device` is deprecated, please use `device_map` instead")
@@ -534,6 +535,18 @@ class BaseOrchestrator(object):
         if not hasattr(self, "quantize_config") or self.quantize_config is None:
             return True
         return self._needs_calibration_data()
+
+    def _validate_stream_options(self, quant_nontext_module: bool) -> None:
+        """Reject option combinations the streaming loop cannot honor."""
+        if quant_nontext_module and self.stream_quantization:
+            raise ValueError(
+                "quant_nontext_module=True is not supported under stream_quantization: "
+                "the streaming loop feeds text hidden states block-to-block, which "
+                "cannot drive vision/non-text blocks (their statistics would be "
+                "garbage), and the path is unvalidated. Non-text layers pass "
+                "through at full precision under streaming; to quantize them use "
+                "the ordinary (non-streaming) path."
+            )
 
     def _auto_engage_stream_features(self) -> None:
         """Resolve streaming-mode conveniences right after kwargs are popped.
