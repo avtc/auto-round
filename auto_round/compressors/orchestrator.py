@@ -482,13 +482,34 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
 
         all_blocks = self.quant_block_list or get_block_names(self.model)
+        flat_block_names = [name for group in all_blocks for name in group]
+
+        # Optional streaming calibration: the rows are embedded once and each
+        # block's compress_block reference output (replay through the
+        # transformed block, activation hooks firing) feeds the next block —
+        # the data-driven chain semantics without a full model load.
+        calib_state = None
+        if streamer is not None and getattr(self, "stream_calibration", False):
+            from auto_round.utils.streaming_calibration import prepare_streaming_calibration
+
+            fp_inputs, input_others, summary = prepare_streaming_calibration(
+                self.model,
+                streamer,
+                dataset=self.dataset,
+                device=str(self.device),
+                seqlen=self.calibration_context.seqlen,
+                tokenizer=self.tokenizer,
+                max_rows=int(getattr(self, "stream_calibration_rows", 0) or 0),
+                first_block=get_module(self.model, flat_block_names[0]) if flat_block_names else None,
+            )
+            calib_state = {"fp_inputs": fp_inputs, "input_others": input_others}
+            logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])
 
         # Prefetch pipeline: a background reader stages upcoming blocks into
         # host RAM while the current one quantizes, hiding the disk read.
         prefetch_depth = int(getattr(self, "stream_prefetch", 0) or 0)
         if streamer is not None and prefetch_depth > 0:
-            flat_prefixes = [name for group in all_blocks for name in group]
-            streamer.start_prefetch(flat_prefixes, depth=prefetch_depth)
+            streamer.start_prefetch(flat_block_names, depth=prefetch_depth, stage_devices=stage_devices)
 
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         for block_names in all_blocks:
@@ -518,7 +539,16 @@ class CompressionOrchestrator(BaseOrchestrator):
                     set_amax_for_all_moe_layers(block, attr_name="act_max")
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
-                self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
+                if calib_state is not None and calib_state["fp_inputs"] is not None:
+                    _, reference_output = self.alg_composer.compress_block(
+                        block,
+                        calib_state["fp_inputs"],
+                        calib_state["input_others"],
+                        block_ctx=ctx,
+                    )
+                    calib_state["fp_inputs"] = reference_output
+                else:
+                    self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
                 if self.compress_context.is_immediate_packing:
                     for _n, _mod in block.named_modules():
                         if hasattr(_mod, "bits") and check_to_quantized(_mod):
@@ -595,9 +625,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             from auto_round.compressors.utils import check_to_quantized as _ctq
 
             saved = set(self.shard_writer._all_saved)
-            quantized_prefixes = tuple(
-                n for n, m in self.model.named_modules() if _ctq(m) and not any(m.children())
-            )
+            quantized_prefixes = tuple(n for n, m in self.model.named_modules() if _ctq(m) and not any(m.children()))
             targets = dict(self.model.named_parameters())
             targets.update(dict(self.model.named_buffers()))
             for pname, tensor in self.model.state_dict().items():
