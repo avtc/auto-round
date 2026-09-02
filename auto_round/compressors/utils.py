@@ -16,6 +16,8 @@ import random
 from typing import Union
 
 import torch
+
+from auto_round.logger import logger
 from torch.amp import autocast
 
 from auto_round.compressors.config_resolution import LayerConfigResolutionError
