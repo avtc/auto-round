@@ -283,19 +283,24 @@ class CheckpointStreamer:
         """
         if self._prefetch_thread is not None:
             raise RuntimeError("prefetch already running; call stop_prefetch() first")
+        if stage_devices:
+            for d in stage_devices:
+                if torch.device(d).type == "meta":
+                    raise ValueError(
+                        f"invalid staging device {d!r}: meta tensors hold no data; "
+                        "use a real device (e.g. 'cpu' or 'cuda:k')"
+                    )
         self._prefetch_remaining = list(module_prefixes)
         self._prefetch_depth = max(1, int(depth))
         self._prefetch_stop = False
         self._prefetch_err = None
-        self._prefetch_stage_devices = (
-            [torch.device(d) for d in stage_devices] if stage_devices else None
-        )
+        self._prefetch_stage_devices = [torch.device(d) for d in stage_devices] if stage_devices else None
         self._prefetch_stage_dev = {}  # prefix -> device it was staged on
         self._prefetch_cpu_staged = 0  # outstanding rescue-buffered prefixes
 
         def _reader():
             try:
-                for prefix in module_prefixes:
+                for idx, prefix in enumerate(module_prefixes):
                     with self._prefetch_cond:
                         while len(self._prefetch_staged) >= self._prefetch_depth and not self._prefetch_stop:
                             self._prefetch_cond.wait()
@@ -313,6 +318,8 @@ class CheckpointStreamer:
                         if self._prefetch_stop:
                             return
                         tensor = self._read_tensor(name, self._prefetch_handles, self._prefetch_handle_order)
+                        if stage_dev is not None:
+                            tensor = tensor.to(stage_dev)
                         with self._prefetch_cond:
                             self._prefetch_cache[name] = tensor
                     with self._prefetch_cond:
