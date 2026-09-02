@@ -143,15 +143,21 @@ def _find_model_rotary(model, cfg, device):
     return _ensure_real_rotary(rotary, cfg, device)
 
 
-def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0):
+def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0, seed=42, nsamples=128, bs=1):
     """Flatten the calibration dataset into a list of input_ids batches
     (tensors), applying the data-driven skip rule (shorter than seqlen) and an
-    optional row cap."""
+    optional row cap.
+
+    A string dataset follows the data-driven protocol (pile-10k, shuffle
+    seed 42) tokenized with the MODEL's tokenizer, so ids are in-vocab by
+    construction."""
     rows = []
     if isinstance(dataset, str):
         from auto_round.calib_dataset import get_dataloader
 
-        dataset = get_dataloader(tokenizer, seqlen, dataset.replace(" ", ""), 1234, 1, len(dataset))
+        dataset = get_dataloader(
+            tokenizer, seqlen, dataset.replace(" ", ""), seed=seed, bs=bs, nsamples=nsamples
+        )
     for data in dataset:
         if data.__class__.__name__ == "BatchEncoding":
             data = data.data
@@ -176,8 +182,20 @@ def _normalize_rows(dataset, tokenizer, seqlen, max_rows=0):
     return rows
 
 
+def _check_ids_in_vocab(rows, vocab):
+    """Fail with an actionable message before a CUDA gather assert poisons the
+    process (rows tokenized with a different model's tokenizer)."""
+    top = max(int(max(int(r.max()), 0)) for r in rows) if rows else 0
+    if top >= vocab:
+        raise ValueError(
+            f"stream_calibration: calibration token id {top} exceeds the embedding vocab ({vocab}) - "
+            "the rows were tokenized with a different model's tokenizer; rebuild them "
+            "with this model's tokenizer"
+        )
+
+
 def prepare_streaming_calibration(
-    model, streamer, dataset, device, seqlen, tokenizer=None, max_rows=0, first_block=None
+    model, streamer, dataset, device, seqlen, tokenizer=None, max_rows=0, first_block=None, nsamples=128
 ):
     """Initialize the streaming calibration chain.
 
@@ -192,7 +210,7 @@ def prepare_streaming_calibration(
     Returns ``(fp_inputs, input_others, summary)``: the initial per-row hidden
     states, the shared kwargs cache, and a small summary dict.
     """
-    rows = _normalize_rows(dataset, tokenizer, seqlen, max_rows)
+    rows = _normalize_rows(dataset, tokenizer, seqlen, max_rows, nsamples=nsamples)
     if not rows:
         raise ValueError("stream_calibration: no usable calibration rows (all shorter than seqlen?)")
 
@@ -200,6 +218,8 @@ def prepare_streaming_calibration(
     if embed_mod is None:
         raise RuntimeError("stream_calibration: no checkpoint-backed embedding module found")
     streamer.load_module_(embed_mod, embed_name, device=device)
+    vocab = embed_mod.num_embeddings if hasattr(embed_mod, "num_embeddings") else embed_mod.weight.shape[0]
+    _check_ids_in_vocab(rows, vocab)
     with torch.no_grad():
         fp_inputs = [embed_mod(ids.to(device)).cpu() for ids in rows]
     embed_mod.to("meta")

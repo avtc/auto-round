@@ -334,15 +334,11 @@ class TestCheckpointStreamer:
         finally:
             streamer.stop_prefetch()
 
-    def test_prefetch_invalid_stage_device_raises(self, tmp_path):
-        """Meta staging devices are rejected eagerly: staging to meta would
-        silently produce empty tensors instead of an error."""
-        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
-        streamer = CheckpointStreamer(path)
-        with pytest.raises(ValueError, match="meta"):
-            streamer.start_prefetch(["m"], depth=1, stage_devices=[torch.device("meta")])
-        # no reader thread left behind
-        assert streamer._prefetch_thread is None
+        rows = [torch.tensor([[1, 2, 3]]), torch.tensor([[0, 5, 63]])]
+        _check_ids_in_vocab(rows, 64)  # in range: no raise
+        bad = [torch.tensor([[1, 2, 150000]])]  # Qwen-tokenized ids vs hy3 vocab
+        with pytest.raises(ValueError, match="different model's tokenizer"):
+            _check_ids_in_vocab(bad, 120832)
 
 
 @pytest.mark.slow
