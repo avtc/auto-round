@@ -700,67 +700,12 @@ class Hadamard(AlgorithmHandler):
         )
 
 
-class PreSINQ(AlgorithmHandler):
-    name = "presinq"
-    aliases = ("presinq", "pre_sinq")
-    summary = (
-        "Calibration-free function-preserving Sinkhorn column-scale fold applied "
-        "before quantization (composable: --algorithm 'presinq,auto_round')."
-    )
-    config_factory = None
-
-    def register(self, group) -> None:
-        group.add_argument(
-            "--presinq_group_size",
-            dest="presinq_group_size",
-            default=None,
-            type=int,
-            help="PreSINQ tile width in input channels (locked default 64 when unset).",
-        )
-        group.add_argument(
-            "--presinq_n_iter",
-            dest="presinq_n_iter",
-            default=None,
-            type=int,
-            help="Sinkhorn iterations per tile (locked default 4 when unset).",
-        )
-        group.add_argument(
-            "--presinq_n_repeat",
-            dest="presinq_n_repeat",
-            default=None,
-            type=int,
-            help="Whole-model folding passes (locked default 3 when unset).",
-        )
-        group.add_argument(
-            "--presinq_parallel_folds",
-            dest="presinq_parallel_folds",
-            default=None,
-            action=argparse.BooleanOptionalAction,
-            help="Fan per-expert folds out over all visible GPUs (MoE).",
-        )
-
-    def build(self, args, common_kwargs: dict[str, Any]):
-        from auto_round.algorithms.transforms.presinq.config import PreSINQConfig
-
-        kwargs = {
-            key: value
-            for key, value in {
-                "group_size": getattr(args, "presinq_group_size", None),
-                "n_iter": getattr(args, "presinq_n_iter", None),
-                "n_repeat": getattr(args, "presinq_n_repeat", None),
-                "parallel_folds": getattr(args, "presinq_parallel_folds", None),
-            }.items()
-            if value is not None
-        }
-        return PreSINQConfig(**kwargs)
-
 
 def _register_builtin_algorithm_factories() -> None:
     from auto_round.algorithms.quantization.rtn.config import RTNConfig
     from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
     from auto_round.algorithms.transforms.awq.config import AWQConfig
     from auto_round.algorithms.transforms.hadamard.config import RotationConfig
-    from auto_round.algorithms.transforms.presinq.config import PreSINQConfig
     from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
 
     register_algorithm("rtn", aliases=("rtn",), config_factory=RTNConfig, cli_handler=RTN, summary=RTN.summary)
@@ -790,13 +735,7 @@ def _register_builtin_algorithm_factories() -> None:
             "quarot_hadamard": lambda: RotationConfig(hadamard_type="quarot_hadamard"),
         },
     )
-    register_algorithm(
-        "presinq",
-        aliases=("presinq", "pre_sinq"),
-        config_factory=PreSINQConfig,
-        cli_handler=PreSINQ,
-        summary=PreSINQ.summary,
-    )
+
 
 
 _register_builtin_algorithm_factories()
