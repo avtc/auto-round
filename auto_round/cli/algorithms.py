@@ -25,6 +25,7 @@ from auto_round.algorithms.config import AlgorithmConfig, AlgorithmParameterRegi
 from auto_round.algorithms.registry import (
     get_algorithm_entry,
     iter_algorithm_entries,
+    register_algorithm,
     resolve_algorithm_alias,
     resolve_algorithm_names,
 )
