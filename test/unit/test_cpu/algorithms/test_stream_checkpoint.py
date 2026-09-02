@@ -724,12 +724,41 @@ class TestStreamQuantizeEquivalence:
         for k in t_plain:
             assert torch.equal(t_plain[k], t_staged[k]), f"tensor {k} differs under device staging"
 
-    def test_unclaimed_block_passthrough(self, tiny_checkpoint, tmp_path):
-        """Checkpoint block groups with no module counterpart (e.g. the hy_v3 MTP
-        layer, which transformers does not model) must be written verbatim."""
-        import json
-        import os
+    def test_partial_layer_config_resolves_format(self, tiny_checkpoint, tmp_path):
+        """layer_config entries are partial overrides: unset keys fall back to
+        the global scheme. Format resolution must not assume every entry
+        carries the full key set — asym scheme (RTNConfig sym=False, the NeUQI
+        path) hits the AutoAWQ enablement check in formats.py, which raised
+        KeyError('bits') on partial entries (hy3 NeUQI-asym server run)."""
         import shutil
+
+        ck = str(tmp_path / "ck_partial")
+        shutil.copytree(tiny_checkpoint, ck)
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.autoround import AutoRound
+
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[RTNConfig(group_size=8, sym=False)],  # asym global scheme (NeUQI path)
+            layer_config={
+                ".*model.layers.0.": {"bits": 16, "data_type": "float"},
+                ".*shared_mlp": {"group_size": 8},  # partial: no bits key
+                ".*experts": {"group_size": 8},
+            },
+            layerwise_rotation=True,
+            stream_checkpoint=True,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.post_init()  # resolves formats; raised KeyError('bits') before the fix
+        assert ar.formats is not None
+
+
+
 
         ck = str(tmp_path / "ck_partial")
         shutil.copytree(tiny_checkpoint, ck)
