@@ -79,6 +79,23 @@ class SignRoundQuantizer(BaseQuantizer):
             logger.info("using higher lr (2.0/iters) for <=3 bit layers to improve accuracy")
             self._logged_low_bit_lr = True
 
+    @staticmethod
+    def _pin_stream_home(block, home):
+        """Pin every leaf with parameters to the streamed home device.
+
+        Sets ``tuning_device`` (the designed per-layer override that wrappers
+        and outside-block quantization honor) so SignRound tuning, the loss,
+        and packing all stay on the block's home instead of being re-sharded
+        across the full device_map or dragged to the global primary.
+        """
+        home = torch.device(home)
+        for _n, _mod in block.named_modules():
+            if list(_mod.children()):
+                continue
+            if any(True for _ in _mod.parameters(recurse=False)):
+                _mod.tuning_device = home
+        return block
+
     def dispatch_block(self, block, input_ids, input_others):
         """Multi-GPU aware block dispatch for SignRound tuning.
 
@@ -87,6 +104,11 @@ class SignRoundQuantizer(BaseQuantizer):
         """
         from auto_round.utils import is_auto_device_mapping
 
+        stream_home = getattr(block, "_stream_home_device", None)
+        if stream_home is not None:
+            # streaming loop: the block was streamed onto this device and
+            # rehomed there - it is the single tuning device, never sharded
+            return self._pin_stream_home(block, stream_home)
         if (
             is_auto_device_mapping(device_manager.device_map)
             and len(device_manager.device_list) > 1
