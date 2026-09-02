@@ -633,8 +633,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         if getattr(self.compress_context.cache_device, "type", "") == "cuda" and _home.type == "cuda"
                         else self.compress_context.cache_device
                     )
-                    with tune_stage(tune_prof, "snapshot"):
-                        best_params = collect_best_params(block, _snap_dev)
+                    best_params = collect_best_params(block, _snap_dev)
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
                 best_params = collect_best_params(block, self.compress_context.cache_device)
