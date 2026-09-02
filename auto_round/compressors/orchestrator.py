@@ -509,9 +509,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         if applied == 0:
             raise RuntimeError(f"resume: BPT result for {block_name} matched no layers (key mismatch)")
         if self.compress_context.is_immediate_packing:
-            from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
-
-            _immediate_pack_block(block, block_name, self.layer_config, nblocks=self.nblocks)
+            for _n, _mod in block.named_modules():
+                if hasattr(_mod, "bits") and check_to_quantized(_mod):
+                    module_name = getattr(_mod, "global_name", None)
+                    if module_name is None and self.nblocks == 1 and _n:
+                        module_name = f"{block.global_name}.{_n}"
+                    if module_name is None:
+                        continue
+                    _immediate_pack(module_name, self.layer_config)
         if self.compress_context.is_immediate_saving:
             for _n, m in block.named_modules():
                 if (
@@ -530,284 +535,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         block.to("meta")
         clear_memory()
         return True
-
-    @staticmethod
-    def _prefetch_replica_eligible(ddp_world: int, stage_devices, composer) -> bool:
-        """Whether the prefetch replica fan-out is worthwhile.
-
-        Staged raw copies only pay off when mirrors can ADOPT them as weights.
-        The pristine gate disables adoption for every block whenever weight
-        transforms are active (layer-wise rotation) or preprocessors will
-        mutate weights in-loop (AWQ clip/scale) -- in that regime the fan-out
-        is pure staging traffic + VRAM: skip it and let mirrors deepcopy the
-        (transformed) home instead.
-        """
-        if not stage_devices or int(ddp_world) <= 1:
-            return False
-        if bool(getattr(composer, "has_layerwise_rotation", False)):
-            return False
-        return not list(getattr(composer, "preprocessors", []) or [])
-
-    def _start_bg_ready_transform(self, block_name: str, home_device, streamer):
-        """Early-load + ready-transform the NEXT block on its idle-group home.
-
-        Spawns a daemon worker that (after a free-VRAM guard on the target
-        home and waiting for the prefetcher to stage the block): streams the
-        block in, re-homes and pins it exactly like the main loop's load
-        stage, then applies the weight-only layer-wise transforms off the
-        critical path while the current block tunes. On success the block is
-        marked ``_bg_ready_done`` (the main loop skips its load stage and
-        compress_block skips the ready stage); on any failure the block is
-        marked ``_bg_ready_failed`` and the main loop reloads it from the
-        checkpoint, resetting any partially applied transform.
-
-        Staged replica copies are released eagerly: the in-place transform
-        invalidates them for mirror adoption (the pristine gate), so keeping
-        them would waste a block of VRAM per replica device.
-        """
-        home = torch.device(home_device)
-
-        def _worker():
-            from auto_round.algorithms.composer import BlockContext
-
-            block = get_module(self.model, block_name)
-            try:
-                if home.type == "cuda":
-                    needed = streamer.prefix_bytes(block_name) + 2 * 1024**3
-                    free, _total = torch.cuda.mem_get_info(home)
-                    if free < needed:
-                        raise MemoryError(f"only {free / 2**30:.1f} GiB free on {home}, need {needed / 2**30:.1f} GiB")
-                if not streamer.wait_until_staged(block_name, timeout=900):
-                    raise TimeoutError("prefetcher did not stage the block within 900s")
-                streamer.load_module_(block, block_name, device=str(home))
-                materialize_model_(block)
-                strip_stale_device_hooks_(block)
-                rehome_block_(block, home)
-                block._stream_home_device = home
-                from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
-
-                SignRoundQuantizer._pin_stream_home(block, home)
-                ctx = BlockContext(
-                    model=self.model,
-                    block_names=[block_name],
-                    block_name=block_name,
-                    block_index=0,
-                )
-                self.alg_composer.run_ready_transforms(block, ctx)
-                streamer.release_replicas(block_name)
-                block._bg_ready_done = True
-                logger.info("[stream] background ready-transform armed %s on %s", block_name, home)
-            except Exception as e:  # noqa: BLE001 - recorded, main path recovers
-                block._bg_ready_failed = repr(e)
-                logger.warning(
-                    "[stream] background ready-transform for %s aborted (%r); the main path will reload it",
-                    block_name,
-                    e,
-                )
-
-        import threading as _threading
-
-        t = _threading.Thread(target=_worker, daemon=True, name="bg-ready-transform")
-        t.start()
-        return t
-
-    def _start_bg_pack_block(
-        self,
-        block,
-        block_name: str,
-        load_device,
-        layer_config: dict,
-        nblocks: int,
-        tied_weights_layers,
-        rs,
-        q_snap,
-        fp_snap,
-        is_model_last: bool,
-    ):
-        """Pack + shard-write the FINISHED block in a background thread.
-
-        Runs while the main loop advances to the next block (which tunes on
-        the other ping-pong group): :func:`immediate_pack_block` on the
-        block's home device, then the leaf saves, block-scope write, flush,
-        resume-manifest update and meta-release -- exactly the serial tail,
-        on the now-idle group. ``q_snap``/``fp_snap`` are CAPTURED references
-        to the next block's inputs (the main loop mutates ``calib_state``
-        the moment it advances); ``mark_block_done`` must receive those, not
-        a live dict read. Exactly one pipeline thread runs at a time (the
-        loop joins the previous one first): shard writes stay ordered and
-        the lock-free ShardWriter has a single writer. A worker failure is
-        re-raised at join time -- a silently skipped pack would corrupt the
-        checkpoint.
-        """
-        import threading as _threading
-
-        holder = {"exc": None, "pack": 0.0, "write": 0.0}
-
-        def _worker():
-            import time as _wtime
-
-            try:
-                _t0 = _wtime.perf_counter()
-                from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
-
-                _immediate_pack_block(block, block_name, layer_config, nblocks=nblocks, device=load_device)
-                holder["pack"] = _wtime.perf_counter() - _t0
-                if self.compress_context.is_immediate_saving:
-                    _t0 = _wtime.perf_counter()
-                    # Save non-quantized leaf modules (e.g. norms, embeddings in block).
-                    for _n, m in block.named_modules():
-                        if (
-                            not any(m.children())
-                            and len(m.state_dict()) > 0
-                            and hasattr(m, "global_name")
-                            and m.global_name not in tied_weights_layers
-                            and not check_to_quantized(m)
-                        ):
-                            set_module(self.model, m.global_name, copy.deepcopy(m))
-                            self.shard_writer.write(name=m.global_name)
-                            get_module(self.model, m.global_name).to("meta")
-                            m.to("meta")
-                    # Write at block scope for any remaining params/buffers.
-                    self.shard_writer.write(name=block_name)
-                    block.to("meta")
-                    holder["write"] = _wtime.perf_counter() - _t0
-                    if rs is not None:
-                        # crash-durability contract, same as the serial path:
-                        # the manifest may claim this block done only after
-                        # its tensors are durably flushed to a shard file
-                        self.shard_writer._flush_shard()
-                        rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
-                    logger.info(
-                        "[stream] bg pack+write %s: pack %.1fs write %.1fs",
-                        block_name,
-                        holder["pack"],
-                        holder["write"],
-                    )
-                else:
-                    mv_module_from_gpu(block)
-                    logger.info("[stream] bg pack %s: pack %.1fs", block_name, holder["pack"])
-            except BaseException as e:  # noqa: BLE001 - re-raised at join
-                holder["exc"] = e
-            finally:
-                clear_memory()
-
-        t = _threading.Thread(target=_worker, daemon=True, name=f"bg-pack-{block_name}")
-        t.autoround_state = holder
-        t.start()
-        return t
-
-    @staticmethod
-    def _join_bg_pack(thread) -> None:
-        """Join a background pack pipeline, surfacing any worker failure."""
-        thread.join()
-        holder = getattr(thread, "autoround_state", None) or {}
-        exc = holder.get("exc")
-        if exc is not None:
-            raise RuntimeError(
-                f"background pack pipeline for a block failed ({exc!r}); refusing to continue -- "
-                "the checkpoint would silently miss packed tensors. Fix the underlying failure "
-                "or set AR_DISABLE_BG_PACK=1."
-            ) from exc
-
-    @staticmethod
-    def _mem_bucket(name: str) -> str:
-        """Bucket a module-path name for the device-memory inventory."""
-        if ".layers." in name:
-            return "block:" + name.split(".layers.")[1].split(".")[0]
-        if "embed" in name.lower():
-            return "embeddings"
-        return "nonblock:" + name.split(".")[0]
-
-    def _largest_block_bytes(self) -> float:
-        """Largest block's checkpoint-tensor footprint from the meta skeleton (bytes)."""
-        try:
-            block_names = [n for sub in get_block_names(self.model, quant_vision=True) for n in sub]
-        except Exception:  # noqa: BLE001  sizing must never break staging
-            return float("inf")
-        per_block: dict = {}
-        for name, t in self.model.named_parameters():
-            for b in block_names:
-                if name == b or name.startswith(b + "."):
-                    per_block[b] = per_block.get(b, 0) + t.numel() * t.element_size()
-                    break
-        if not per_block:
-            return float("inf")
-        return float(max(per_block.values()))
-
-    def _primary_fits_largest_block(self, quant_dev: torch.device):
-        """Whether the primary GPU can join the auto rotation, else None.
-
-        Fit rule: free VRAM (queried live) - 3 GiB headroom >= largest block.
-        The headroom covers tuning transients on top of the block (batch
-        slices, in-place qdq, pack buffers). Conservative on purpose: the
-        largest block gates EVERY block's home, and sizes vary by layer type.
-        """
-        if quant_dev.type != "cuda" or quant_dev.index is None:
-            return None
-        try:
-            free_b, _total_b = torch.cuda.mem_get_info(quant_dev.index)
-        except Exception:  # noqa: BLE001
-            return None
-        largest = self._largest_block_bytes()
-        free_gb = free_b / 2**30
-        if largest is float("inf") or free_gb - 3.0 < largest / 2**30:
-            return None
-        return largest / 2**30, free_gb
-
-    def _log_device_inventory(self, calib_state: dict, tag: str) -> None:
-        """AR_STREAM_MEM_INVENTORY=1: per-GPU breakdown of the streaming parent's memory.
-
-        Walks model tensors (meta skipped, deduped), the calibration chain
-        state, and compares against the allocator's view; the residual
-        ("other") captures temporaries, packing buffers and optimizer state.
-        """
-        import collections
-
-        seen: set = set()
-        per_dev: dict = collections.defaultdict(lambda: collections.defaultdict(int))
-
-        def _add(dev: str, bucket: str, t) -> None:
-            per_dev[dev][bucket] += t.numel() * t.element_size()
-
-        for name, t in list(self.model.named_parameters()) + list(self.model.named_buffers()):
-            if t.device.type != "cuda" or id(t) in seen:
-                continue
-            seen.add(id(t))
-            _add(str(t.device), self._mem_bucket(name), t)
-
-        def _walk(v, dev_hint=None):
-            if isinstance(v, torch.Tensor):
-                if v.device.type == "cuda" and id(v) not in seen:
-                    seen.add(id(v))
-                    _add(str(v.device), "chain", v)
-            elif isinstance(v, dict):
-                for x in v.values():
-                    _walk(x)
-            elif isinstance(v, (list, tuple)):
-                for x in v:
-                    _walk(x)
-
-        if calib_state is not None:
-            for key in ("fp_inputs", "q_inputs", "input_others"):
-                _walk(calib_state.get(key))
-
-        for idx in range(torch.cuda.device_count()):
-            dev = f"cuda:{idx}"
-            alloc = torch.cuda.memory_allocated(idx) / 2**30
-            reserved = torch.cuda.memory_reserved(idx) / 2**30
-            buckets = sorted(per_dev.get(dev, {}).items(), key=lambda kv: -kv[1])
-            parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in buckets if v > 0)
-            tracked = sum(v for _, v in buckets)
-            other = max(0.0, alloc - tracked / 2**30)
-            logger.info(
-                "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG",
-                tag,
-                dev,
-                alloc,
-                reserved,
-                parts or "no tracked tensors",
-                other,
-            )
 
     @torch.no_grad()
     @staticmethod
@@ -1003,6 +730,28 @@ class CompressionOrchestrator(BaseOrchestrator):
             calib_state = {"fp_inputs": fp_inputs, "input_others": input_others, "token_ids": summary.get("token_ids")}
             logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])
 
+        # ── AR_RESUME_DIR: resume support (byte-compatible manifests with the
+        # serial and BPT paths -- any execution mode continues where another
+        # stopped). Requires immediate saving: "done" in the manifest is the
+        # contract that the block's tensors are durably in a shard file. ──
+        resume_states = None
+        bp_apply_results = None
+        if envs.AR_RESUME_DIR and self.compress_context.is_immediate_saving:
+            resume_states = self._build_resume_states(all_blocks)
+            if any(rs is not None and rs.resume_index > 0 for rs in resume_states):
+                self._stream_resume_jump_chain(calib_state, resume_states)
+                from auto_round.compressors import block_parallel as _bp
+
+                _results_dir = _bp.parallel_results_dir()
+                if _results_dir is not None and _bp.signature_matches(
+                    _results_dir, self._parallel_run_signature(all_blocks)
+                ):
+                    # blocks tuned by a crashed BPT run but never packed: their
+                    # worker results get applied instead of re-searched
+                    bp_apply_results = _results_dir
+                if self.shard_writer is not None:
+                    self.shard_writer.adopt_existing_shards()  # never overwrite the crashed run's shards
+
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
         # of the quantize loop. With staging devices the blocks land directly
         # on those devices (round-robin by block index) and are quantized in
@@ -1015,8 +764,20 @@ class CompressionOrchestrator(BaseOrchestrator):
             prefetch_depth = 0 if raw_depth == 0 else (len(stage_devices) if stage_devices else 1)
         else:
             prefetch_depth = int(raw_depth)
-        if streamer is not None and prefetch_depth > 0:
-            streamer.start_prefetch(flat_block_names, depth=prefetch_depth, stage_devices=stage_devices)
+        prefetch_names = flat_block_names
+        if resume_states is not None:
+            _pending_offset = self._stream_resume_pending_offset(all_blocks, resume_states)
+            if _pending_offset is None:
+                prefetch_names = []
+            elif _pending_offset > 0:
+                logger.info(
+                    "[stream] resume: %d block(s) already done; continuing from %s",
+                    _pending_offset,
+                    flat_block_names[_pending_offset],
+                )
+                prefetch_names = flat_block_names[_pending_offset:]
+        if streamer is not None and prefetch_depth > 0 and prefetch_names:
+            streamer.start_prefetch(prefetch_names, depth=prefetch_depth, stage_devices=stage_devices)
 
         # ── Background pack pipeline (default ON; AR_DISABLE_BG_PACK opts out)
         # The finished block's immediate-pack + shard-write tail runs in a
@@ -1037,16 +798,12 @@ class CompressionOrchestrator(BaseOrchestrator):
         _bg_pack = None
 
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
-        for block_names in all_blocks:
-            for block_name in block_names:
+        stream_block_idx = 0
+        for g_idx, block_names in enumerate(all_blocks):
+            rs = resume_states[g_idx] if resume_states is not None and g_idx < len(resume_states) else None
+            for k_idx, block_name in enumerate(block_names):
                 pbar.set_description(f"Quantizing {block_name}")
                 if rs is not None and k_idx < rs.resume_index:
-                    if _bg_pack is not None:
-                        # the BPT resume-apply path packs + writes on THIS
-                        # thread; the background pipeline must be quiesced
-                        # first (single ShardWriter writer at a time)
-                        self._join_bg_pack(_bg_pack)
-                        _bg_pack = None
                     # already durably done in a previous (possibly BPT) run
                     if self._stream_resume_done_block(
                         block_name,
@@ -1202,7 +959,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                             calib_state.get("q_inputs") if calib_state is not None else None,
                             (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None,
                         )
-                elif not _bg_pack_eligible:
+                else:
                     mv_module_from_gpu(block)
                     if self.compress_context.low_cpu_mem_usage and streamer is None:
                         self._offloader(self.model, block_name)

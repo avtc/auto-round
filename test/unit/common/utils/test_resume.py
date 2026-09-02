@@ -164,3 +164,72 @@ class TestLayerConfigFingerprint:
         cfg_with_tensor = {"layer.0": {"bits": 4, "weight": torch.ones(2, 2)}}
         cfg_without_tensor = {"layer.0": {"bits": 4}}
         assert layer_config_fingerprint(cfg_with_tensor) == layer_config_fingerprint(cfg_without_tensor)
+<<<<<<< HEAD:test/unit/common/utils/test_resume.py
+=======
+
+
+class TestMarkBlockDoneFromFile:
+    def _rs(self, d, names=("b0", "b1")):
+        return ResumeState(d, "sig", list(names))
+
+    def test_handoff_writes_same_bytes_and_manifest(self, tmp_path):
+        import json
+
+        from auto_round.compressors import block_parallel
+
+        src_dir = str(tmp_path / "parallel")
+        entry = [{"h": torch.arange(4, dtype=torch.float32)}]
+        block_parallel.save_chain_state(src_dir, 0, 1, entry)
+        rs = self._rs(str(tmp_path))
+        rs.mark_block_done_from_file("b0", block_parallel.chain_state_path(src_dir, 0, 1))
+        assert rs.completed_blocks == ["b0"]
+        restored = torch.load(rs.input_ids_path, map_location="cpu", weights_only=True)
+        # the checkpoint payload wrapper is preserved verbatim
+        assert restored["hidden"][0]["h"].tolist() == [0.0, 1.0, 2.0, 3.0]
+        with open(rs.manifest_path) as f:
+            assert json.load(f)["completed_blocks"] == ["b0"]
+
+    def test_out_of_order_handoff_is_rejected(self, tmp_path):
+        from auto_round.compressors import block_parallel
+
+        src_dir = str(tmp_path / "parallel")
+        block_parallel.save_chain_state(src_dir, 0, 0, [{"h": torch.zeros(1)}])
+        rs = self._rs(str(tmp_path))
+        with pytest.raises(AssertionError):
+            rs.mark_block_done_from_file("b1", block_parallel.chain_state_path(src_dir, 0, 0))
+
+
+class TestMarkBlockDoneFromFileLastBlock:
+    """The final block commits without a successor entry.
+
+    Workers never publish a chain entry past the last block (there is no
+    next assignee), so the BPT commit loop passes entry_src=None for it --
+    observed as FileNotFoundError on hy3 (MTP tail) at 79/80.
+    """
+
+    def test_last_block_none_entry_commits(self, tmp_path):
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        entry = str(tmp_path / "chain_b1.pt")
+        torch.save({"ids": torch.zeros(2, 3, dtype=torch.long)}, entry)
+        state.mark_block_done_from_file("b0", entry)
+        state.mark_block_done_from_file("b1", None)  # <- crashed here before
+        manifest = json.loads((tmp_path / "resume_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["completed_blocks"] == ["b0", "b1"]
+        assert state.resume_index == 2
+
+    def test_non_last_block_missing_entry_still_raises(self, tmp_path):
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        with pytest.raises(FileNotFoundError):
+            state.mark_block_done_from_file("b0", str(tmp_path / "nope.pt"))
+
+
+class TestMarkBlockDoneInMemoryLastBlock:
+    """mark_block_done(None input_ids) marks the final block without a successor entry."""
+
+    def test_last_block_none_input_ids(self, tmp_path):
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        state.mark_block_done("b0", None, torch.zeros(2, 3, dtype=torch.long))
+        state.mark_block_done("b1", None, None)  # final block: no successor entry
+        assert state.resume_index == 2
+        assert not (tmp_path / "resume_input_ids.pt").exists() or state.completed_blocks == ["b0", "b1"]
+>>>>>>> 7f4d8e69 (feat(streaming): AR_RESUME_DIR support for --stream_quantization):test/unit/test_cpu/utils/test_resume.py

@@ -148,10 +148,11 @@ class ResumeState:
             torch.save(_to_cpu_recursive(q_input), self.q_input_path)
         elif self.q_input_path.exists():
             self.q_input_path.unlink()
-        # input_ids is required (unlike q_input, which is legitimately None
-        # when enable_quanted_input=False) -- the FP reference chain always
-        # exists.
-        torch.save(_to_cpu_recursive(input_ids), self.input_ids_path)
+        # input_ids is the successor chain entry. It is only skippable for the
+        # FINAL block of the run: no next block consumes it, and the streaming
+        # path deliberately does not materialize a past-the-end chain state.
+        if input_ids is not None:
+            torch.save(_to_cpu_recursive(input_ids), self.input_ids_path)
         self.completed_blocks.append(block_name)
         _atomic_write_json(
             self.manifest_path,
