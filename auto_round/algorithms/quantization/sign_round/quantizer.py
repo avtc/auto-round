@@ -368,7 +368,7 @@ class SignRoundQuantizer(BaseQuantizer):
             dict: Best quantization parameters found during optimization, or an
                 empty dict if no trainable parameters were found.
         """
-        device = device_manager.device
+        device = getattr(block, "_stream_home_device", None) or device_manager.device
         loss_device = getattr(self, "_loss_device", device)
         card_0_in_high_risk = getattr(self, "_card_0_in_high_risk", False)
         mid_iter_mem_check = self.compress_context.low_gpu_mem_usage and card_0_in_high_risk

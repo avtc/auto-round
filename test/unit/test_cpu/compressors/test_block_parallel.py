@@ -817,3 +817,15 @@ class TestPinStreamHome:
         assert block[0].tuning_device == torch.device("meta")
         assert block[1].tuning_device == torch.device("meta")
         assert not hasattr(block, "tuning_device")  # parents untouched
+
+
+class TestStreamingLoopPinsTuningDevice:
+    """The streaming loop must pin leaf tuning_device (wrapper prefers it over the primary)."""
+
+    def test_streaming_loop_calls_pin(self):
+        import inspect
+
+        from auto_round.compressors import orchestrator as orch_mod
+
+        src = inspect.getsource(orch_mod.CompressionOrchestrator._quantize_zero_shot)
+        assert "_pin_stream_home" in src, "streaming loop lost the tuning_device pin"
