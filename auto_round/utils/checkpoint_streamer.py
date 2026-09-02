@@ -56,6 +56,74 @@ def to_checkpoint_name(name: str) -> str:
     return name
 
 
+_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
+
+
+def device_free_bytes(device: torch.device) -> Optional[int]:
+    """Free bytes on *device*; ``None`` when unknown (non-CUDA devices)."""
+    if device.type != "cuda":
+        return None
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+        return int(free)
+    except Exception:  # pragma: no cover - platform without a CUDA runtime
+        return None
+
+
+def pick_stage_device(devices: list, index: int, needed_bytes: int, headroom: int) -> Optional[torch.device]:
+    """Choose a staging device for prefix *index*, or ``None`` when no CUDA
+    device can hold ``needed_bytes`` while keeping ``headroom`` free for the
+    tuning fan-out's search batches.
+
+    Walks the round-robin rotation first; callers decide how to react to
+    ``None`` (wait for VRAM, or stage on host RAM when explicitly requested).
+    """
+    for k in range(len(devices)):
+        d = torch.device(devices[(index + k) % len(devices)])
+        free = device_free_bytes(d)
+        if free is None or free >= needed_bytes + headroom:
+            return d
+    return None
+
+
+@torch.no_grad()
+def _park_cpu_buffers_(module: torch.nn.Module, device) -> None:
+    """Move non-checkpoint CPU buffers (e.g. rotary inv_freq tables) to ``device``.
+
+    ``load_module_`` only replaces tensors present in the checkpoint; buffers a
+    module computes at init (rotary frequency tables, non-persistent caches) keep
+    whatever device the skeleton gave them -- typically CPU. A block forward then
+    mixes CUDA weights with CPU cos/sin and dies with a device mismatch at the
+    first rope-using (full-attention) block. Already-on-device tensors are left
+    untouched (identity mapping, no copies); meta buffers are left for
+    materialize_model_ to report.
+    """
+    target = torch.device(device)
+    if target.type == "cpu":
+        return
+
+    def _fn(t: torch.Tensor) -> torch.Tensor:
+        return t.to(target) if t.device.type == "cpu" else t
+
+    module._apply(_fn)
+
+
 class CheckpointStreamer:
     """Streams tensors from a HuggingFace checkpoint on demand.
 
@@ -416,6 +484,8 @@ class CheckpointStreamer:
             logger.info(f"[stream] {rewrites_hit} checkpoint tensor(s) matched via name rewrite")
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
+        if device is not None:
+            _park_cpu_buffers_(module, device)
         if self._prefetch_thread is not None:
             self.prefetch_consumed(prefix)
         return loaded

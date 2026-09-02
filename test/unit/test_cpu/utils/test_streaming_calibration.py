@@ -170,3 +170,27 @@ def test_find_model_rotary_callable_position_embeddings():
     pos = torch.arange(4, device="cpu").unsqueeze(0)
     cos, sin = rotary(torch.zeros(1, 4), pos)
     assert cos.shape[-1] == 8 and sin.shape[-1] == 8
+
+
+class TestParkCpuBuffers:
+    """Non-checkpoint CPU buffers (rotary tables) move to the load device."""
+
+    def test_cpu_target_is_noop(self):
+        import torch
+
+        from auto_round.utils.checkpoint_streamer import _park_cpu_buffers_
+
+        m = torch.nn.Linear(4, 4)
+        m.register_buffer("tbl", torch.ones(4))
+        _park_cpu_buffers_(m, "cpu")
+        assert m.tbl.device.type == "cpu"
+
+    def test_meta_buffers_left_alone(self):
+        import torch
+
+        from auto_round.utils.checkpoint_streamer import _park_cpu_buffers_
+
+        m = torch.nn.Linear(4, 4, device="meta")
+        m.register_buffer("tbl", torch.ones(4, device="meta"))
+        _park_cpu_buffers_(m, "cuda:0") if torch.cuda.is_available() else _park_cpu_buffers_(m, "cpu")
+        assert m.tbl.device.type == "meta"
