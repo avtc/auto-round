@@ -610,7 +610,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     block_index=0,
                 )
                 self.alg_composer.run_ready_transforms(block, ctx)
-                streamer.release_replicas(block_name)
                 block._bg_ready_done = True
                 logger.info("[stream] background ready-transform armed %s on %s", block_name, home)
             except Exception as e:  # noqa: BLE001 - recorded, main path recovers
@@ -1074,8 +1073,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                         calib_state.pop("q_inputs", None)
                 else:
                     self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
-                if streamer is not None:
-                    streamer.release_replicas(block_name)
                 if _bg_pack is not None:
                     # the previous block's pipeline must finish before this
                     # block's spawn: shard-write order follows quantization
