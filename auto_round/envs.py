@@ -78,104 +78,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_SEARCH_SCALE_RATIO": lambda: (
         float(os.getenv("AR_SEARCH_SCALE_RATIO")) if os.getenv("AR_SEARCH_SCALE_RATIO") is not None else None
     ),
-    # Number of coarse (log-spaced) and fine (additive) scale candidates for the
-    # NeUQI search in ``auto_round.data_type.neuqi``.
-    "AR_NEUQI_COARSE": lambda: int(os.getenv("AR_NEUQI_COARSE", "64")),
-    "AR_NEUQI_FINE": lambda: int(os.getenv("AR_NEUQI_FINE", "32")),
-    # Zero-point sweep backend for the NeUQI search: "auto" serves the batched
-    # sweep with the extension Triton kernel on CUDA and falls back to the
-    # torch.compile-fused sweep (reference eager sweep elsewhere); "triton"
-    # forces the Triton kernel, "compile" forces the torch.compile sweeps on any
-    # device, "eager" always uses the reference chunked sweep.
-    "AR_NEUQI_BACKEND": lambda: os.getenv("AR_NEUQI_BACKEND", "auto").lower(),
-    # Experimental init-search recipes for the SignRound tuning path (iters>0):
-    # "" (default) = status-quo min/max init; see docs/environments.md for the
-    # recipe table, composability rules, and the BPT arms.
-    "AR_TUNE_RECIPE": lambda: os.getenv("AR_TUNE_RECIPE", "").strip().lower(),
-    # Post-tuning per-group least-squares scale refit with the integer grid
-    # and zero points frozen (composable with any AR_TUNE_RECIPE; also
-    # applies to plain minmax-init runs).
-    "AR_POST_SCALE_REFIT": lambda: os.getenv("AR_POST_SCALE_REFIT", "0").lower() in ("1", "true", "yes"),
-    # Post-quantization per-Linear bias correction: one extra no-grad pass of
-    # the calibration rows per block, b = mean(y_fp - y_q) absorbed into bias.
-    "AR_BIAS_CORRECT": lambda: os.getenv("AR_BIAS_CORRECT", "0").lower() in ("1", "true", "yes"),
-    # When set, the block tuning loop logs a per-block per-stage timing
-    # table (staging / forward / loss / sync / backward / snapshot / step,
-    # plus CUDA-event GPU times and the host-sync bubble). Diagnostic only;
-    # adds no per-iteration sync points.
-    "AR_TUNE_PROFILE": lambda: os.getenv("AR_TUNE_PROFILE", "0").lower() in ("1", "true", "yes", "on"),
-    # Single-process data parallelism for the block tuning loop: the global
-    # calibration batch is sharded across AR_TUNE_DDP_WORLD GPUs (the block's
-    # home + mirrors), gradients exchanged with a halving-doubling all-reduce
-    # so every replica applies the identical SignSGD step. 1 (default) keeps
-    # the exact serial path; must divide the calibration batch size and be a
-    # power of two (2/4/8 at batch 8).
-    "AR_TUNE_DDP_WORLD": lambda: int(os.getenv("AR_TUNE_DDP_WORLD", "1") or 1),
-    # Optional explicit mirror devices for AR_TUNE_DDP_WORLD, comma-separated
-    # ("cuda:1,cuda:2"; the block home is always rank 0). Default: home + next
-    # GPUs in ascending order, per-mirror VRAM-guarded.
-    "AR_TUNE_DDP_DEVICES": lambda: os.getenv("AR_TUNE_DDP_DEVICES", ""),
-    # Ping-pong device groups for AR_TUNE_DDP_WORLD, syntax "0,1,2,3;4,5,6,7":
-    # streaming homes alternate between group leaders, each block's mirrors
-    # are its own group, and the idle group prefetches the next block.
-    "AR_TUNE_DDP_GROUPS": lambda: os.getenv("AR_TUNE_DDP_GROUPS", ""),
-    # Exchange DDP gradients in bfloat16 (halves PCIe payload; sign-SGD robust
-    # to the reduced precision, but the trajectory changes within fp noise).
     "AR_TUNE_DDP_BF16_GRAD": lambda: os.getenv("AR_TUNE_DDP_BF16_GRAD", "0").lower() in ("1", "true", "yes"),
-    "AR_TUNE_DDP_MERGE_STATS": lambda: os.getenv("AR_TUNE_DDP_MERGE_STATS", "0").lower() in ("1", "true", "yes"),
-    # Background ready-transforms (default ON when eligible): while block N
-    # tunes on its ping-pong group, early-load block N+1 on the idle group's
-    # home device and apply the weight-only layer-wise transforms (e.g. PreSINQ
-    # folds) there, taking the transform off the critical path. Eligibility
-    # still requires >=2 ping-pong staging groups + an active layer-wise
-    # transform + streaming prefetch; activation-dependent preprocessors (AWQ
-    # scale/clip) stay in-loop either way. Set to 1 to opt out.
-    "AR_DISABLE_BG_READY_TRANSFORMS": lambda: os.getenv("AR_DISABLE_BG_READY_TRANSFORMS", "0").lower()
-    in ("1", "true", "yes"),
-    # Background pack pipeline (default ON when eligible): the finished
-    # block's immediate-pack + shard-write tail runs in a background thread
-    # on its (now idle) ping-pong home while the loop advances to the next
-    # block's tune on the other group. Eligibility still requires >=2 staging
-    # groups + streaming + immediate packing; exactly one pipeline thread
-    # runs at a time. Set to 1 to opt out.
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
     # alt2 (alternating re-grid): iterations of the SECOND tuning round after
     # the mid-tune re-grid; 0 = half of --iters.
     "AR_ALT2_ITERS2": lambda: int(os.getenv("AR_ALT2_ITERS2", "0") or 0),
-    # qoff (FP-reference-chain) tuning unblocker: inject per-channel
-    # quantization noise into the FP block inputs during SignRound tuning.
-    "AR_QOFF_NOISE": lambda: os.getenv("AR_QOFF_NOISE", "0").lower() in ("1", "true", "yes"),
-    # Directory for those noise stats: when set, every quantized block also
-    # writes block_<idx>.pt (per-channel mean/var of y_fp - y_q); the tuning
-    # run reads them back for injection.
-    "AR_QOFF_NOISE_STATS": lambda: os.getenv("AR_QOFF_NOISE_STATS", "").strip(),
-    # Post-BPT serial qon touch-up: re-tune this many iterations per block on
-    # the real quantized chain, starting each wrapper from the tuned grid.
-    "AR_TOUCHUP_ITERS": lambda: int(os.getenv("AR_TOUCHUP_ITERS", "0") or 0),
-    # Memory layout of the fused zero-point sweep expression: "auto" picks by
-    # device (group-axis-last reduction on CUDA, zero-point-axis-last elsewhere),
-    # "last"/"mid" force one layout for A/B measurements.
-    "AR_NEUQI_LAYOUT": lambda: os.getenv("AR_NEUQI_LAYOUT", "auto").lower(),
-    # All-candidates batched zero-point sweep for the NeUQI search: "auto" batches
-    # every coarse/fine scale candidate into one fused kernel per group chunk on
-    # CUDA, "on" forces it on any fused-capable device, "off" keeps the
-    # per-candidate loop.
-    "AR_NEUQI_BATCH": lambda: os.getenv("AR_NEUQI_BATCH", "auto").lower(),
     "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower()
     in ("1", "true", "yes"),
-    "AR_DISABLE_TUNING_FANOUT": lambda: os.getenv("AR_DISABLE_TUNING_FANOUT", "0").lower() in ("1", "true", "yes"),
-    # Sinkhorn loop backend for the Pre-SINQ transform: "auto" serves the loop
-    # with the extension Triton kernels on CUDA (2.1-2.8x over the eager loop,
-    # fp64-ulp parity) and the eager reference loop elsewhere; "triton" forces
-    # the kernels, "compile" the torch.compile fused graph (opt-in), "eager"
-    # the reference loop. Any failure permanently reverts to the torch loops.
-    "AR_PRESINQ_BACKEND": lambda: os.getenv("AR_PRESINQ_BACKEND", "auto").lower(),
-    # Minimum value to which torch._dynamo cache_size_limit /
-    # accumulated_cache_size_limit / recompile_limit are bumped when
-    # ``enable_torch_compile`` is used. The default of 16 is enough to cover
-    # all distinct linear-weight shapes inside one transformer block (q/k/v/
-    # o_proj, gate/up/down_proj, ...) so that per-layer static recompiles do
-    # not exceed dynamo's default limit (8) and fall back to eager.
     "AR_DYNAMO_CACHE_SIZE_LIMIT": lambda: int(os.getenv("AR_DYNAMO_CACHE_SIZE_LIMIT", "16")),
     "AR_MODEL_FREE_SHARD_PARALLELISM": lambda: _get_optional_positive_int_env("AR_MODEL_FREE_SHARD_PARALLELISM"),
     "AUTO_ROUND_CACHE": lambda: os.getenv("AUTO_ROUND_CACHE", None),

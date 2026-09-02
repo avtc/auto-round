@@ -77,77 +77,8 @@ def _as_hidden_tensor(out):
     return out
 
 
-def _apply_block_bias_correction(block, y_fp, y_q) -> bool:
-    """Absorb b = mean(y_fp - y_q) into the block's residual-feeding projection.
-
-    The correction restores the block's output mean exactly at its boundary
-    (the residual stream), where downstream layers and the export stack read
-    it. The sink is the LAST Linear/Conv1D whose output width matches the
-    hidden size (typically ``mlp.down_proj`` / shared-expert down projection);
-    modules on routed-expert paths are deprioritized since they execute on a
-    token subset only. Bias is created as zeros when absent (native in all
-    export formats).
-    """
-    import torch.nn as nn
-
-    y_fp = _as_hidden_tensor(y_fp).detach()
-    y_q = _as_hidden_tensor(y_q).detach()
-    b = (y_fp.to(torch.float32) - y_q.to(torch.float32)).mean(dim=tuple(range(y_q.dim() - 1)))
-
-    def _out_features(mod):
-        # nn.Linear weight is [out, in]; Conv1D weight is [in, out]
-        return mod.weight.shape[1] if isinstance(mod, transformers.pytorch_utils.Conv1D) else mod.weight.shape[0]
-
-    targets = [
-        (name, mod)
-        for name, mod in block.named_modules()
-        if isinstance(mod, (nn.Linear, transformers.pytorch_utils.Conv1D)) and _out_features(mod) == b.numel()
-    ]
-    non_expert = [(n, m) for n, m in targets if ".experts." not in n and "experts." not in n]
-    pool = non_expert or targets
-    if not pool:
-        logger.warning("[bias_correct] no projection with out_features==hidden found; correction skipped")
-        return False
-    name, mod = pool[-1]
-    dtype = mod.weight.dtype
-    if getattr(mod, "bias", None) is not None:
-        mod.bias = nn.Parameter((mod.bias.data.to(torch.float32) + b).to(dtype))
-    else:
-        mod.bias = nn.Parameter(b.to(dtype))
-    logger.info("[bias_correct] absorbed block output drift (mean |b| %.3e) into %s", b.abs().mean().item(), name)
-    return True
 
 
-def _collect_qoff_noise_stats_from_outputs(y_fp, y_q, path):
-    """Per-channel stats of the quantization noise (y_fp - y_q) for one block.
-
-    Consumes block outputs the pipeline already computed (no extra forward).
-    Writes ``{mean, var}`` CPU tensors [hidden] to ``path`` (created with
-    parents). Returns (mean, var).
-    """
-    import os as _os
-
-    y_fp_t = _as_hidden_tensor(y_fp).detach().to(torch.float32)
-    y_q_t = _as_hidden_tensor(y_q).detach().to(torch.float32)
-    noise = (y_fp_t - y_q_t).reshape(-1, y_fp_t.shape[-1])
-    mean = noise.mean(dim=0).cpu()
-    var = noise.var(dim=0, unbiased=False).cpu()
-    _os.makedirs(_os.path.dirname(path), exist_ok=True)
-    torch.save({"mean": mean, "var": var}, path)
-    return mean, var
-
-
-if TYPE_CHECKING:  # avoid circular imports at runtime
-    from auto_round.algorithms.quantization.base import BaseQuantizer
-    from auto_round.algorithms.quantization.config import QuantizationConfig
-    from auto_round.algorithms.transforms.base import BasePreprocessor
-    from auto_round.compressors import BaseOrchestrator
-
-
-# ---------------------------------------------------------------------------
-# Context dataclasses
-# ---------------------------------------------------------------------------
-@dataclass
 class BlockContext:
     """Per-block context threaded through the lifecycle hooks.
 
@@ -600,19 +531,6 @@ class AlgorithmComposer:
                 new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
         else:
             new_q_input = None
-            _stats_y_q = None
-            if reference_next_input is not None:
-                if _envs.AR_QOFF_NOISE_STATS or _envs.AR_BIAS_CORRECT:
-                    with torch.no_grad():
-                        _stats_y_q = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
-                if _envs.AR_QOFF_NOISE_STATS:
-                    _collect_qoff_noise_stats_from_outputs(
-                        reference_next_input,
-                        _stats_y_q,
-                        f"{_envs.AR_QOFF_NOISE_STATS}/block_{block_ctx.block_index:04d}.pt",
-                    )
-                if _envs.AR_BIAS_CORRECT:
-                    _apply_block_bias_correction(block, reference_next_input, _stats_y_q)
 
         return new_q_input, reference_next_input
 
