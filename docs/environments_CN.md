@@ -198,7 +198,67 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 - **用法**：排查 AutoScheme 打分期间显存增长问题时启用
 
 ```bash
-export AR_SCHEME_MEM_INVENTORY=1
+export AR_NEUQI_COARSE=64
+```
+
+### AR_NEUQI_FINE
+- **描述**：NeUQI 搜索中每个粗粒度候选对应的精细（加性）scale 细化候选数量。
+- **默认值**：`"32"`
+- **有效值**：任意正整数
+- **用法**：调低可加速搜索，调高可提升 scale 分辨率
+
+```bash
+export AR_NEUQI_FINE=32
+```
+
+### AR_NEUQI_BACKEND
+- **描述**：NeUQI 零点扫描的后端链。`"auto"`（默认）在 CPU 上保持参考的分块 eager 扫描，在 CUDA 上优先用 `auto_round_extension.triton.neuqi_sweep` 中的手写 Triton 内核服务批量扫描（寄存器驻留：每个权重元素只加载一次，所有（候选，零点）损失都在寄存器中计算），Triton 不可用时回退到 `torch.compile` 融合扫描；`"triton"` 强制使用 Triton 内核；`"compile"` 在任意设备上强制使用 `torch.compile` 融合扫描；`"eager"` 始终使用参考扫描。所有后端在完全相同的候选网格上计算完全相同的损失（选择仅在近似并列时不同：少于约 0.1% 的组会翻转，RTX 3090 上实测最坏相对损失差约 5e-5，Triton 内核的并列特征与其完全一致），并消除大规模批量专家搜索中暴力网格的显存带宽瓶颈（200 万组的 RTX 3090 扫描实测：eager 12.3 秒 → 单候选融合 0.59 秒 → 编译批量 0.49 秒 → Triton 0.22 秒，约 57 倍）。每一级失败都会永久逐级回退：Triton → 编译批量 → 编译逐候选 → eager。Triton/编译批量阶段需要启用 `AR_NEUQI_BATCH`（默认启用）。
+- **默认值**：`"auto"`
+- **有效值**：`"auto"`、`"triton"`、`"compile"`、`"eager"`（无法识别的值按 `"eager"` 处理）
+- **用法**：固定某一阶段做 A/B 对比，或彻底禁用编译
+
+```bash
+export AR_NEUQI_BACKEND=eager
+```
+
+### AR_NEUQI_LAYOUT
+- **描述**：融合零点扫描表达式的内存布局。扫描需要对每个整数零点沿组轴归约平方误差，两个轴可互换布置：`"last"` 布置为 `[组数, 零点数, 组大小]`，在连续的末维上归约（Triton/CUDA 的经典融合形态；中间维归约在 RTX 3090 上实测不快于 eager）；`"mid"` 布置为 `[组数, 组大小, 零点数]`（在 eager TensorIterator 路径与编译后的 CPU 后端上更快）。`"auto"`（默认）按设备选择：CUDA 用 `"last"`，其余设备用 `"mid"`。两种布局计算的损失在 fp32 组内求和顺序之外完全一致（仅末位 ulp 并列）。
+- **默认值**：`"auto"`
+- **有效值**：`"auto"`、`"last"`、`"mid"`（无法识别的值按设备的 `"auto"` 规则处理）
+- **用法**：在特定设备上对两种布局做 A/B 对比
+
+```bash
+export AR_NEUQI_LAYOUT=mid
+```
+
+### AR_PRESINQ_BACKEND
+- **描述**：Pre-SINQ 变换的 Sinkhorn 循环后端。`"auto"`（默认）在 CUDA 上使用 `auto_round_extension.triton.presinq_sinkhorn` 中的手写 Triton 内核（每次迭代三个 fp64 内核 —— 权重分块只读取一次、两个 std 都在寄存器中计算，确定性的两阶段列归约，以及带容差的失衡追踪器），其他设备使用参考 eager 循环。RTX 3090 实测：比 std 复用后的 eager 循环快 2.1–2.8 倍（约为原始实现的 4.3 倍），fp64 ulp 级一致性（约 1e-15），并且 MoE 池化范数折叠（巨大的拼接消费者矩阵，如 Hunyuan-A13B 类层）可在 24 GiB 内运行而 eager 循环会 OOM。`"triton"` 强制使用 Triton 内核（任何失败都会永久回退到 torch 循环 —— 包括无 CUDA 时的强制尝试）；`"eager"` 始终使用 eager 循环；`"compile"` 强制 `torch.compile` 融合图（可选：RTX 3090 实测最好情况仅持平、大矩阵慢达 20%）。eager 循环本身与上一版本位级一致且快约 1.8 倍（每次迭代的 std 只计算一次并复用，跳过不需要的缩放后矩阵物化）。
+- **默认值**：`"auto"`
+- **有效值**：`"auto"`、`"triton"`、`"eager"`、`"compile"`（无法识别的值按 `"eager"` 处理）
+- **用法**：固定后端做 A/B 对比，或在测量结果不同的架构上切换
+
+```bash
+export AR_PRESINQ_BACKEND=eager
+```
+
+### AR_STREAM_MEM_INVENTORY
+
+- **类型**：布尔值（`1`/`true`/`yes` 启用；默认关闭）
+- **描述**：流式量化诊断开关。启用后，zero-shot 循环每 16 个 block 输出一次按 GPU 的显存分解（`[stream-mem] ...`）：分配器视角（alloc/reserved）、按类别统计的张量（`block:<k>` 暂存 block 权重、`embeddings`、`nonblock:<...>` 初始化阶段创建的模块、`chain` 校准 fp/q 隐状态及 kwargs），以及 `other = alloc - tracked`（临时对象、打包缓冲、优化器状态）。用于查看主 GPU 上到底驻留了什么、为何占用如此之大。与 `AR_SCHEME_MEM_INVENTORY`（AutoScheme 评分池）互补。
+
+### AR_DISABLE_TUNING_FANOUT
+
+- **类型**：布尔值（`1`/`true`/`yes` 启用；默认关闭）
+- **描述**：关闭 RTN/NeUQI zero-shot 路径中的多 GPU 逐模块调优扇出（即 `[OptRTN] tuning fan-out: ... across N GPUs` 轮询分发，它会把模块权重搬到各工作设备）。设置该环境变量后，所有 scale/zp 搜索都在主设备上串行执行。两种方式下逐模块结果完全一致；这是一个隔离/取证开关（单流 Triton 启动、无扇出线程），不是提速开关。显式传入 `parallel_tuning=True` 配置项时仍以配置为准。不影响 block-parallel tuning（BPT）或数据驱动 SignRound 调优，它们有各自的开关。
+
+### AR_NEUQI_BATCH
+- **描述**：全候选批量零点扫描。`"auto"`（默认）在 CUDA 上把每轮的全部粗/精 scale 候选折叠为每个组块一次融合内核调用（单候选融合后，剩余墙钟时间主要消耗在逐候选的调度与簿记启动上）；`"on"` 在任意可融合设备上强制批量扫描（用于 A/B 或测试）；`"off"` 保持逐候选循环。批量内核在内核内完成零点最小化，每次启动只输出 `[组数, 候选数]` 的最优损失与获胜零点。选择遵循与顺序扫描相同的首个最小值并列规则；在单候选融合（RTX 3090 实测 21 倍）之上，这是同一候选网格上的第二级加速。批量调用一旦失败（例如更大的符号中间量导致显存不足），进程将永久回退到逐候选融合扫描处理其余候选。
+- **默认值**：`"auto"`
+- **有效值**：`"auto"`、`"on"`、`"off"`（无法识别的值按 `"auto"` 规则处理）
+- **用法**：固定为逐候选循环以对批量阶段做 A/B 对比
+
+```bash
+export AR_NEUQI_BATCH=off
 ```
 
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT

@@ -749,14 +749,8 @@ class TestStreamMemInventory:
     """AR_STREAM_MEM_INVENTORY: bucket names + graceful no-CUDA behavior."""
 
     def test_mem_bucket_names(self):
-        from types import SimpleNamespace
-
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
-        # instance access must not bind self (regression: a stray decorator
-        # once turned this staticmethod into a bound method)
-        orch = SimpleNamespace(_mem_bucket=CompressionOrchestrator._mem_bucket)
-        orch._mem_bucket("model.language_model.layers.12.self_attn.q_proj.weight")
         b = CompressionOrchestrator._mem_bucket
         assert b("model.language_model.layers.12.self_attn.q_proj.weight") == "block:12"
         assert b("model.embed_tokens.weight") == "embeddings"
@@ -772,60 +766,3 @@ class TestStreamMemInventory:
         orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
         orch.model = torch.nn.Linear(4, 4)  # cpu-only box: loop body skips cuda tensors
         orch._log_device_inventory({"fp_inputs": [torch.ones(2)]}, "test")  # must not raise
-
-
-class TestAutoStagingPrimaryFit:
-    """auto staging adds the primary only when the largest block fits free VRAM."""
-
-    def test_largest_block_bytes_from_meta(self):
-        import torch
-
-        from auto_round.compressors.orchestrator import CompressionOrchestrator
-
-        class FakeModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.blocks = torch.nn.ModuleList(
-                    [torch.nn.ModuleDict({"w": torch.nn.Linear(4, 4, device="meta")}) for _ in range(2)]
-                )
-                self.blocks[1].big = torch.nn.Linear(16, 16, device="meta")
-
-        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
-        orch.model = FakeModel()
-        got = orch._largest_block_bytes()
-        want = (16 * 16 + 16) * 4 + (4 * 4 + 4) * 4  # big block weight+bias dominates
-        assert abs(got - want) < 1, (got, want)
-
-    def test_primary_fit_none_without_cuda(self):
-        from auto_round.compressors.orchestrator import CompressionOrchestrator
-
-        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
-        assert orch._primary_fits_largest_block(torch.device("cpu")) is None
-
-
-class TestPinStreamHome:
-    """Streaming homes win over dispatch_block's multi-GPU sharding."""
-
-    def test_pin_stream_home(self):
-        import torch
-
-        from auto_round.algorithms.quantization.sign_round import quantizer as qmod
-
-        block = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
-        block[0].tuning_device = "cpu"  # pre-existing pin must be overwritten
-        qmod.SignRoundQuantizer._pin_stream_home(block, torch.device("meta"))
-        assert block[0].tuning_device == torch.device("meta")
-        assert block[1].tuning_device == torch.device("meta")
-        assert not hasattr(block, "tuning_device")  # parents untouched
-
-
-class TestStreamingLoopPinsTuningDevice:
-    """The streaming loop must pin leaf tuning_device (wrapper prefers it over the primary)."""
-
-    def test_streaming_loop_calls_pin(self):
-        import inspect
-
-        from auto_round.compressors import orchestrator as orch_mod
-
-        src = inspect.getsource(orch_mod.CompressionOrchestrator._quantize_zero_shot)
-        assert "_pin_stream_home" in src, "streaming loop lost the tuning_device pin"

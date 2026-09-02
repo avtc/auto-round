@@ -198,7 +198,67 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 - **Usage**: Enable when investigating VRAM growth during AutoScheme scoring
 
 ```bash
-export AR_SCHEME_MEM_INVENTORY=1
+export AR_NEUQI_COARSE=64
+```
+
+### AR_NEUQI_FINE
+- **Description**: Number of fine (additive) scale refinement candidates per coarse candidate in the NeUQI search.
+- **Default**: `"32"`
+- **Valid Values**: any positive integer
+- **Usage**: Lower for faster searches, raise for finer scale resolution
+
+```bash
+export AR_NEUQI_FINE=32
+```
+
+### AR_NEUQI_BACKEND
+- **Description**: Backend chain for the NeUQI zero-point sweep. `"auto"` (default) keeps the reference chunked eager sweep on CPU and, on CUDA, serves the batched sweep with the hand-written Triton kernel from `auto_round_extension.triton.neuqi_sweep` (registers-resident: each weight element is loaded once and every (candidate, zero-point) loss is computed from registers), falling back to the `torch.compile`-fused sweep when Triton is unavailable. `"triton"` forces the Triton kernel, `"compile"` forces the `torch.compile` sweeps on any device, and `"eager"` always uses the reference sweep. All backends evaluate the exact same losses over the exact same candidate grid (selections identical up to near-ties: <~0.1% of groups flip, worst observed relative loss difference ~5e-5 on an RTX 3090, with the Triton kernel matching that tie profile exactly) and remove the HBM-traffic bottleneck of the brute-force grid on large batched expert searches (measured on a 2M-group RTX 3090 sweep: 12.3 s eager -> 0.59 s fused per-candidate -> 0.49 s compiled-batched -> 0.22 s Triton, ~57x). Every stage latches down permanently on failure: Triton -> compiled batched -> compiled per-candidate -> eager. Requires `AR_NEUQI_BATCH` to be enabled for the Triton/compiled-batched stages (it is by default).
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"triton"`, `"compile"`, `"eager"` (unrecognized values are treated as `"eager"`)
+- **Usage**: Pin a specific stage for A/B comparisons, or disable compilation entirely
+
+```bash
+export AR_NEUQI_BACKEND=eager
+```
+
+### AR_NEUQI_LAYOUT
+- **Description**: Memory layout of the fused zero-point sweep expression. The sweep reduces squared errors over the group axis for every integer zero point, and the two axes can be arranged either way: `"last"` lays the tensor out as `[groups, zero_points, group_size]` with the reduction over the contiguous last dimension (the canonical Triton/CUDA fusion shape; a middle-dimension reduction measured no faster than eager on an RTX 3090), while `"mid"` lays it out as `[groups, group_size, zero_points]` (faster under the eager TensorIterator path and the compiled CPU backend). `"auto"` (default) selects by device: `"last"` on CUDA, `"mid"` elsewhere. Both layouts compute identical losses up to the fp32 summation order over the group (last-ulp ties).
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"last"`, `"mid"` (unrecognized values follow the device-based `"auto"` rule)
+- **Usage**: A/B the two layouts on a given device
+
+```bash
+export AR_NEUQI_LAYOUT=mid
+```
+
+### AR_PRESINQ_BACKEND
+- **Description**: Sinkhorn loop backend for the Pre-SINQ transform. `"auto"` (default) serves the loop with the hand-written Triton kernels from `auto_round_extension.triton.presinq_sinkhorn` on CUDA (three fp64 kernels per iteration — one read of the weight tile with both stds computed from registers, a deterministic two-phase column reduction, and the slack-hardened imbalance tracker) and uses the eager reference loop elsewhere. Measured on an RTX 3090: 2.1–2.8x faster than the eager std-once loop across dense/concat/expert/pooled shapes (~4.3x vs the original port), fp64-ulp parity (~1e-15), and the pooled MoE norm fold (huge concatenated consumer matrices, e.g. Hunyuan-A13B-class layers) runs within 24 GiB where the eager loop OOMs. `"triton"` forces the Triton kernels (falls back permanently to the torch loops on any failure — including a forced attempt without CUDA); `"eager"` always uses the eager loop; `"compile"` forces the `torch.compile` fused graph (opt-in: measured at best on par and up to 20% slower than eager on an RTX 3090). The eager loop itself is bit-exact with the previous release and ~1.8x faster (per-iteration stds computed once and reused, unused scaled-matrix materialization skipped).
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"triton"`, `"eager"`, `"compile"` (unrecognized values are treated as `"eager"`)
+- **Usage**: Pin a backend for A/B comparisons or on architectures where the measurements differ
+
+```bash
+export AR_PRESINQ_BACKEND=eager
+```
+
+### AR_STREAM_MEM_INVENTORY
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Streaming-quantization diagnostic. When set, the zero-shot loop logs a per-GPU memory breakdown every 16 blocks (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
+
+### AR_DISABLE_TUNING_FANOUT
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Disables the multi-GPU per-module tuning fan-out in the RTN/NeUQI zero-shot path (the `[OptRTN] tuning fan-out: ... across N GPUs` round-robin that hops module weights to worker devices). With the env set, all scale/zp searches run serially on the primary device. Per-module results are identical either way; this is an isolation/forensics knob (single-stream Triton launches, no fan-out threads), not a speed knob. An explicit `parallel_tuning=True` config kwarg still wins over the env. Does not affect block-parallel tuning (BPT) or data-driven SignRound tuning, which have their own switches.
+
+### AR_NEUQI_BATCH
+- **Description**: All-candidates batched zero-point sweep. `"auto"` (default) folds every coarse and fine scale candidate of a pass into a single fused kernel per group chunk on CUDA (the per-candidate fused sweep spends most of its remaining wall time in per-candidate dispatch and bookkeeping launches); `"on"` forces the batched sweep on any fused-capable device (e.g. for A/B or tests); `"off"` keeps the per-candidate loop. The batched kernel computes the min over zero points in-kernel and emits only `[groups, candidates]` best losses and winning zero points per launch. Selections follow the same first-minimum tie rule as the sequential sweep; after the single-candidate fusion this is the second speedup stage on top of the same candidate grid (21x measured for the first stage on an RTX 3090). Any failure of a batched call (e.g. out of memory from the larger symbolic intermediate) permanently latches the process back to the per-candidate fused sweep for the remaining candidates.
+- **Default**: `"auto"`
+- **Valid Values**: `"auto"`, `"on"`, `"off"` (unrecognized values follow the `"auto"` rule)
+- **Usage**: Pin the per-candidate loop for A/B comparisons of the batching stage
+
+```bash
+export AR_NEUQI_BATCH=off
 ```
 
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT

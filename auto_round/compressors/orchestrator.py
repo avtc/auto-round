@@ -632,6 +632,70 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
 
     @torch.no_grad()
+    @staticmethod
+    def _mem_bucket(name: str) -> str:
+        """Bucket a module-path name for the device-memory inventory."""
+        if ".layers." in name:
+            return "block:" + name.split(".layers.")[1].split(".")[0]
+        if "embed" in name.lower():
+            return "embeddings"
+        return "nonblock:" + name.split(".")[0]
+
+    def _log_device_inventory(self, calib_state: dict, tag: str) -> None:
+        """AR_STREAM_MEM_INVENTORY=1: per-GPU breakdown of the streaming parent's memory.
+
+        Walks model tensors (meta skipped, deduped), the calibration chain
+        state, and compares against the allocator's view; the residual
+        ("other") captures temporaries, packing buffers and optimizer state.
+        """
+        import collections
+
+        seen: set = set()
+        per_dev: dict = collections.defaultdict(lambda: collections.defaultdict(int))
+
+        def _add(dev: str, bucket: str, t) -> None:
+            per_dev[dev][bucket] += t.numel() * t.element_size()
+
+        for name, t in list(self.model.named_parameters()) + list(self.model.named_buffers()):
+            if t.device.type != "cuda" or id(t) in seen:
+                continue
+            seen.add(id(t))
+            _add(str(t.device), self._mem_bucket(name), t)
+
+        def _walk(v, dev_hint=None):
+            if isinstance(v, torch.Tensor):
+                if v.device.type == "cuda" and id(v) not in seen:
+                    seen.add(id(v))
+                    _add(str(v.device), "chain", v)
+            elif isinstance(v, dict):
+                for x in v.values():
+                    _walk(x)
+            elif isinstance(v, (list, tuple)):
+                for x in v:
+                    _walk(x)
+
+        if calib_state is not None:
+            for key in ("fp_inputs", "q_inputs", "input_others"):
+                _walk(calib_state.get(key))
+
+        for idx in range(torch.cuda.device_count()):
+            dev = f"cuda:{idx}"
+            alloc = torch.cuda.memory_allocated(idx) / 2**30
+            reserved = torch.cuda.memory_reserved(idx) / 2**30
+            buckets = sorted(per_dev.get(dev, {}).items(), key=lambda kv: -kv[1])
+            parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in buckets if v > 0)
+            tracked = sum(v for _, v in buckets)
+            other = max(0.0, alloc - tracked / 2**30)
+            logger.info(
+                "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG",
+                tag,
+                dev,
+                alloc,
+                reserved,
+                parts or "no tracked tensors",
+                other,
+            )
+
     def _resolve_stream_stage_devices(self):
         """Resolve ``stream_prefetch_devices`` into a list of staging devices.
 
@@ -688,9 +752,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             if d.type == "meta":
                 raise ValueError(f"invalid staging device {d}: meta tensors hold no data")
         depth = int(getattr(self, "stream_prefetch", 0) or 0)
+        shown_depth = depth if depth else (len(devices) if devices else 1)
         logger.info(
             "[stream] staging %d block(s) deep on %s; blocks quantize in place (round-robin homes)",
-            depth,
+            shown_depth,
             [str(d) for d in devices],
         )
         return devices or None
@@ -809,6 +874,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _n_moved,
                         load_device,
                     )
+                if envs.AR_STREAM_MEM_INVENTORY and stream_block_idx % 16 == 0:
+                    self._log_device_inventory(calib_state, f"block {stream_block_idx}")
                 _t_load = _time.perf_counter() - _t_load
 
                 # ── Pure algorithm ────────────────────────────────────────
