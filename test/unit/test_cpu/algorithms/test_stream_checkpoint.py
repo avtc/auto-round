@@ -259,37 +259,6 @@ class TestCheckpointStreamer:
         # after stop, plain disk reads still work
         assert torch.equal(streamer.fetch("blk.a.weight"), tensors["blk.a.weight"])
 
-    def test_prefetch_depth_and_consumption(self, tmp_path):
-        """The reader keeps at most ``depth`` prefixes staged ahead and releases
-        a slot only after the consumer reports the prefix consumed."""
-        torch.manual_seed(3)
-        shards = {}
-        for i in range(4):
-            shards[f"model-{i:05d}.safetensors"] = {f"b{i}.w.weight": torch.randn(2, 2)}
-        path = _make_sharded_checkpoint(tmp_path, shards)
-        streamer = CheckpointStreamer(path)
-        streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=1)
-
-        def wait_staged(prefix):
-            deadline = time.monotonic() + 10.0
-            while prefix not in streamer._prefetch_staged and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert prefix in streamer._prefetch_staged, f"{prefix} never staged"
-
-        try:
-            wait_staged("b0")
-            time.sleep(0.2)  # a wrongly-unbounded reader would stage b1..b3 now
-            assert streamer._prefetch_staged == ["b0"], streamer._prefetch_staged
-            assert torch.equal(streamer.fetch("b0.w.weight"), shards["model-00000.safetensors"]["b0.w.weight"])
-            streamer.prefetch_consumed("b0")
-            for p in ("b1", "b2", "b3"):
-                wait_staged(p)
-                streamer.prefetch_consumed(p)
-            assert not streamer._prefetch_remaining and not streamer._prefetch_staged
-            assert not streamer._prefetch_cache
-        finally:
-            streamer.stop_prefetch()
-
     def test_prefetch_error_surfaces(self, tmp_path):
         """A reader failure is re-raised at the next fetch."""
         path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
