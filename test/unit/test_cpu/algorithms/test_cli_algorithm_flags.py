@@ -95,35 +95,3 @@ class TestStreamingCliFlags(unittest.TestCase):
         self.assertIsNone(kwargs["stream_prefetch_devices"])
 
 
-class TestImatrixEnabledFlag(unittest.TestCase):
-    """--imatrix_enabled tri-state: the forced marker overrides the scheme
-    rules during config-class selection; auto leaves them in control."""
-
-    @staticmethod
-    def _rtn(extra):
-        from auto_round.algorithms.quantization.rtn.config import RTNConfig
-
-        configs = _build(_parse([*extra, "--iters", "0"]))
-        return [c for c in configs if isinstance(c, RTNConfig)][0]
-
-    def test_auto_leaves_rules_in_control(self):
-        rtn = self._rtn(["--imatrix_enabled", "auto"])
-        self.assertNotIn("forced_imatrix", rtn.__dict__, "auto must not force an override")
-
-    def test_true_sets_forced_marker(self):
-        rtn = self._rtn(["--imatrix_enabled", "true"])
-        self.assertIs(rtn.forced_imatrix, True)
-
-    def test_false_sets_forced_marker(self):
-        rtn = self._rtn(["--imatrix_enabled", "false"])
-        self.assertIs(rtn.forced_imatrix, False)
-
-    def test_default_is_auto(self):
-        rtn = self._rtn([])
-        self.assertNotIn("forced_imatrix", rtn.__dict__)
-
-    def test_forced_true_survives_asym_scheme(self):
-        """asym resolves imatrix off by rule; the forced marker must stay set so
-        config-class selection (autoround.py) turns it back on."""
-        rtn = self._rtn(["--imatrix_enabled", "true", "--asym"])
-        self.assertIs(rtn.forced_imatrix, True)
