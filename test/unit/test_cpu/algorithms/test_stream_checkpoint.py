@@ -181,6 +181,111 @@ class TestCheckpointStreamer:
 
 
 
+    def test_pick_stage_device_headroom(self, tmp_path, monkeypatch):
+        """Staging picks the first round-robin GPU above the headroom; when all
+        are below it returns None (caller waits for VRAM) instead of OOM-ing."""
+        import auto_round.utils.checkpoint_streamer as cs
+
+        gpu0, gpu1 = torch.device("cuda:0"), torch.device("cuda:1")
+        fake_free = {gpu0: 4 << 30, gpu1: 20 << 30}  # 4 GiB vs 20 GiB free
+        monkeypatch.setattr(cs, "device_free_bytes", lambda d: fake_free.get(torch.device(d)))
+
+        headroom = 8 << 30
+        # index 0 rotates to gpu0 first, skips it (4 < 8), picks gpu1
+        assert cs.pick_stage_device([gpu0, gpu1], 0, headroom) == gpu1
+        # index 1 rotates to gpu1 directly
+        assert cs.pick_stage_device([gpu0, gpu1], 1, headroom) == gpu1
+        # non-CUDA devices report unknown free and are always eligible
+        cpu = torch.device("cpu")
+        assert cs.pick_stage_device([cpu], 0, headroom) == cpu
+        # all GPUs below headroom -> None (no CPU fallback here)
+        fake_free[gpu1] = 1 << 30
+        assert cs.pick_stage_device([gpu0, gpu1], 0, headroom) is None
+
+    def test_prefetch_rescue_buffer_capped_at_one(self, tmp_path, monkeypatch):
+        """With every GPU below the headroom the reader stages exactly ONE
+        block into host RAM (rescue buffer) and waits for VRAM for the rest;
+        no OOM, no unbounded RAM staging."""
+        import time
+
+        import auto_round.utils.checkpoint_streamer as cs
+
+        torch.manual_seed(3)
+        tensors = {"blk.a.weight": torch.randn(4, 4), "blk.b.weight": torch.randn(4, 4)}
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": tensors})
+        streamer = CheckpointStreamer(path)
+
+        gpu = torch.device("cuda:0")
+        state = {"free": 1 << 30}
+        monkeypatch.setattr(cs, "device_free_bytes", lambda d: state["free"])
+        monkeypatch.setattr(cs.CheckpointStreamer, "_staging_headroom_bytes", 8 << 30)
+        # no CUDA locally: the device CHOICE is what matters, not the transfer
+        monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: self)
+
+        streamer.start_prefetch(["blk.a", "blk.b"], depth=2, stage_devices=[gpu])
+        try:
+            deadline = time.monotonic() + 5
+            while streamer._prefetch_staged != ["blk.a"] and time.monotonic() < deadline:
+                time.sleep(0.05)
+            # blk.a took the rescue slot (host RAM); blk.b must wait for VRAM
+            time.sleep(1.0)
+            assert streamer._prefetch_staged == ["blk.a"]
+            assert streamer.prefetch_error() is None
+
+            state["free"] = 20 << 30  # VRAM frees up
+            deadline = time.monotonic() + 5
+            while streamer._prefetch_staged != ["blk.a", "blk.b"] and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert streamer.prefetch_error() is None
+        finally:
+            streamer.stop_prefetch()
+
+    def test_prefetch_depth_and_consumption(self, tmp_path):
+        """The reader keeps at most ``depth`` prefixes staged ahead and releases
+        a slot only after the consumer reports the prefix consumed."""
+        torch.manual_seed(3)
+        shards = {}
+        for i in range(4):
+            shards[f"model-{i:05d}.safetensors"] = {f"b{i}.w.weight": torch.randn(2, 2)}
+        path = _make_sharded_checkpoint(tmp_path, shards)
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=1)
+
+        def wait_staged(prefix):
+            deadline = time.monotonic() + 10.0
+            while prefix not in streamer._prefetch_staged and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert prefix in streamer._prefetch_staged, f"{prefix} never staged"
+
+        try:
+            wait_staged("b0")
+            time.sleep(0.2)  # a wrongly-unbounded reader would stage b1..b3 now
+            assert streamer._prefetch_staged == ["b0"], streamer._prefetch_staged
+            assert torch.equal(streamer.fetch("b0.w.weight"), shards["model-00000.safetensors"]["b0.w.weight"])
+            streamer.prefetch_consumed("b0")
+            for p in ("b1", "b2", "b3"):
+                wait_staged(p)
+                streamer.prefetch_consumed(p)
+            assert not streamer._prefetch_remaining and not streamer._prefetch_staged
+            assert not streamer._prefetch_cache
+        finally:
+            streamer.stop_prefetch()
+
+    def test_prefetch_error_surfaces(self, tmp_path):
+        """A reader failure is re-raised at the next fetch."""
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["missing"], depth=1)
+        try:
+            deadline = time.monotonic() + 10.0
+            while streamer.prefetch_error() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert streamer.prefetch_error() is not None, "reader failure not recorded"
+            with pytest.raises(RuntimeError, match="prefetch"):
+                streamer.fetch("m.w.weight")
+        finally:
+            streamer.stop_prefetch()
+
 
 @pytest.mark.slow
 class TestStreamQuantizeEquivalence:

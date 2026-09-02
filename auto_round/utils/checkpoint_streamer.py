@@ -23,11 +23,65 @@ is one decoder block plus the streamed pass-through tensors.
 import json
 import os
 import threading
+import time
 from typing import Optional
 
 import torch
 
 from auto_round.logger import logger
+
+
+# Checkpoint-name fragment -> module-name fragment, applied only when the
+# direct spelling misses (never shadows an exact match). Covers checkpoints
+# whose block spellings differ from the modeling code: hyv3 stores
+# ``mlp.shared_mlp`` / ``mlp.router.gate`` / ``mlp.expert_bias`` while the
+# runtime module exposes ``mlp.shared_experts`` / ``mlp.gate`` /
+# ``mlp.e_score_correction_bias``.
+_CKPT_NAME_REWRITES = (
+    (".mlp.shared_mlp.", ".mlp.shared_experts."),
+    (".mlp.router.gate.", ".mlp.gate."),
+    (".mlp.expert_bias", ".mlp.e_score_correction_bias"),
+)
+
+
+def to_checkpoint_name(name: str) -> str:
+    """Map a runtime module-name onto its checkpoint spelling.
+
+    Inverse of the rewrite table above: applies the first matching module-name
+    fragment substitution and returns *name* unchanged when nothing matches.
+    """
+    for ckpt_frag, mod_frag in _CKPT_NAME_REWRITES:
+        if mod_frag in name:
+            return name.replace(mod_frag, ckpt_frag)
+    return name
+
+
+def device_free_bytes(device: torch.device) -> Optional[int]:
+    """Free bytes on *device*; ``None`` when unknown (non-CUDA devices)."""
+    if device.type != "cuda":
+        return None
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+        return int(free)
+    except Exception:  # pragma: no cover - platform without a CUDA runtime
+        return None
+
+
+def pick_stage_device(devices: list, index: int, headroom: int) -> Optional[torch.device]:
+    """Choose a staging device for prefix *index*, or ``None`` when no CUDA
+    device currently keeps ``headroom`` bytes free for the quantization
+    workspace (the tuning fan-out allocates multi-GB search batches beside
+    staged blocks).
+
+    Walks the round-robin rotation first; callers decide how to react to
+    ``None`` (wait for VRAM, or stage on host RAM when explicitly requested).
+    """
+    for k in range(len(devices)):
+        d = torch.device(devices[(index + k) % len(devices)])
+        free = device_free_bytes(d)
+        if free is None or free >= headroom:
+            return d
+    return None
 
 
 class CheckpointStreamer:
@@ -119,8 +173,50 @@ class CheckpointStreamer:
 
     # ── Prefetch ─────────────────────────────────────────────────────────────
 
-    def start_prefetch(self, module_prefixes: list, depth: int = 1) -> None:
-        """Stream whole module prefixes into host RAM on a background thread.
+    # Bytes kept free on each staging GPU for the quantization workspace
+    # (tuning fan-out allocates multi-GB search batches beside staged blocks).
+    _staging_headroom_bytes = 8 * 1024**3
+
+    def _wait_for_stage_device(self, index: int) -> Optional[torch.device]:
+        """Pick a staging device for prefix *index*, waiting for VRAM.
+
+        VRAM-first: returns the first round-robin GPU keeping the staging
+        headroom free. When no GPU has room, exactly ONE block may wait in
+        host RAM (rescue buffer, keeping some I/O overlap alive); further
+        blocks wait until VRAM frees or the rescue block is consumed.
+        """
+        devices = self._prefetch_stage_devices
+        headroom = int(getattr(self, "_staging_headroom_bytes", 0) or 0)
+        rescue_allowed = any(d.type == "cuda" for d in devices)
+        rescue_logged = False
+        while not self._prefetch_stop:
+            dev = pick_stage_device(devices, index, headroom)
+            if dev is not None:
+                return dev
+            if rescue_allowed:
+                with self._prefetch_cond:
+                    if self._prefetch_cpu_staged < 1:
+                        self._prefetch_cpu_staged += 1
+                        if not rescue_logged:
+                            logger.info(
+                                "[stream] staging GPU(s) below %d GiB headroom; holding one block in host RAM",
+                                headroom // (1024**3),
+                            )
+                            rescue_logged = True
+                        return torch.device("cpu")
+            if not rescue_logged and rescue_allowed:
+                logger.info(
+                    "[stream] staging GPU(s) below %d GiB headroom; waiting for VRAM", headroom // (1024**3)
+                )
+                rescue_logged = True
+            time.sleep(0.5)
+        return None
+
+    def start_prefetch(
+        self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None
+    ) -> None:
+        """Stream whole module prefixes ahead of the consumer on a background
+        thread.
 
         The reader stages prefixes in visit order and keeps at most ``depth``
         staged-but-unconsumed prefixes beyond the current one; the consumer
@@ -133,6 +229,11 @@ class CheckpointStreamer:
         self._prefetch_depth = max(1, int(depth))
         self._prefetch_stop = False
         self._prefetch_err = None
+        self._prefetch_stage_devices = (
+            [torch.device(d) for d in stage_devices] if stage_devices else None
+        )
+        self._prefetch_stage_dev = {}  # prefix -> device it was staged on
+        self._prefetch_cpu_staged = 0  # outstanding rescue-buffered prefixes
 
         def _reader():
             try:
@@ -145,6 +246,11 @@ class CheckpointStreamer:
                     names = self.names_under(prefix)
                     if not names:
                         raise KeyError(f"no checkpoint tensors under prefix {prefix!r}")
+                    stage_dev = None
+                    if self._prefetch_stage_devices:
+                        stage_dev = self._wait_for_stage_device(idx)
+                    if self._prefetch_stop:
+                        return
                     for name in names:
                         if self._prefetch_stop:
                             return
@@ -153,6 +259,8 @@ class CheckpointStreamer:
                             self._prefetch_cache[name] = tensor
                     with self._prefetch_cond:
                         self._prefetch_staged.append(prefix)
+                        if stage_dev is not None:
+                            self._prefetch_stage_dev[prefix] = stage_dev
             except BaseException as e:  # surfaced at the next fetch
                 self._prefetch_err = e
             finally:
@@ -171,13 +279,17 @@ class CheckpointStreamer:
 
     def prefetch_consumed(self, prefix: str) -> None:
         """Mark a prefix consumed: drop any unconsumed leftovers and release
-        the staging slot so the reader can proceed."""
+        the staging slot (and the host-RAM rescue slot if it held *prefix*).
+        """
         with self._prefetch_cond:
             for name in [n for n in self._prefetch_cache if n == prefix or n.startswith(prefix + ".")]:
                 del self._prefetch_cache[name]
             for lst in (self._prefetch_remaining, self._prefetch_staged):
                 if prefix in lst:
                     lst.remove(prefix)
+            dev = self._prefetch_stage_dev.pop(prefix, None)
+            if dev is not None and dev.type != "cuda":
+                self._prefetch_cpu_staged = max(0, self._prefetch_cpu_staged - 1)
             self._prefetch_cond.notify_all()
 
     def stop_prefetch(self) -> None:
