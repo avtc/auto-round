@@ -350,6 +350,48 @@ class CheckpointStreamer:
                 self._prefetch_cpu_staged = max(0, self._prefetch_cpu_staged - 1)
             self._prefetch_cond.notify_all()
 
+    def staged_replica_status(self, prefix: str) -> list:
+        """Devices holding a COMPLETE staged replica of ``prefix`` (debug aid)."""
+        with self._prefetch_cond:
+            return [str(d) for (p, d) in self._prefetch_replica_ready if p == prefix]
+
+    def release_replicas(self, prefix: str) -> None:
+        """Free the staged replica copies of ``prefix`` on all devices.
+
+        Called by the consumer after mirror creation (or when a block skips
+        DDP); replica tensors must outlive the primary ``prefetch_consumed``
+        so :meth:`staged_replica_tensors` can serve them for adoption.
+        """
+        with self._prefetch_cond:
+            for dev in list(self._prefetch_replica_cache):
+                cache = self._prefetch_replica_cache[dev]
+                for name in [n for n in cache if n == prefix or n.startswith(prefix + ".")]:
+                    del cache[name]
+            self._prefetch_replica_ready = {(p, d) for (p, d) in self._prefetch_replica_ready if p != prefix}
+
+    def wait_until_staged(self, prefix: str, timeout: Optional[float] = None) -> bool:
+        """Wait until the prefetch reader has fully staged ``prefix``.
+
+        Returns False when the prefix cannot arrive (reader stopped or failed,
+        or ``timeout`` seconds elapsed). With no prefetch thread running there
+        is nothing to wait for -- :meth:`load_module_` will read from disk.
+        """
+        if self._prefetch_thread is None:
+            return True
+        deadline = None if timeout is None else time.time() + timeout
+        with self._prefetch_cond:
+            while prefix not in self._prefetch_staged:
+                if self._prefetch_stop or self._prefetch_err is not None:
+                    return False
+                if deadline is not None and time.time() >= deadline:
+                    return False
+                self._prefetch_cond.wait(0.5)
+        return True
+
+    def prefix_bytes(self, prefix: str) -> int:
+        """Exact staged size (bytes) of the tensors under ``prefix``."""
+        return self._prefix_bytes_estimate(prefix)
+
     def stop_prefetch(self) -> None:
         """Signal the reader to stop, join it, and clear the staging cache."""
         if self._prefetch_thread is None:
