@@ -613,6 +613,28 @@ class CompressionOrchestrator(BaseOrchestrator):
                     logger.warning(f"[stream] root tensor {pname} missing from checkpoint; skipped")
                     continue
                 streamer.fetch_into_(self.model, pname)
+
+            # Block groups that exist only in the checkpoint (e.g. the hy_v3 MTP
+            # layer, which the modeling code does not instantiate) have no module
+            # to quantize or write; pass their tensors through verbatim so the
+            # export stays complete.
+            claimed_blocks = {b for block in all_blocks for b in block}
+            ckpt_layer_ids = {
+                n.split(".")[2] for n in streamer.tensor_names if n.startswith("model.layers.")
+            }
+            for layer_id in sorted(ckpt_layer_ids):
+                blk = f"model.layers.{layer_id}"
+                if blk in claimed_blocks:
+                    continue
+                names = streamer.names_under(blk)
+                if not names:
+                    continue
+                logger.info(
+                    f"[stream] {blk} has no module counterpart; "
+                    f"writing {len(names)} checkpoint tensors verbatim"
+                )
+                for n in names:
+                    self.shard_writer.save_tensor(n, streamer.fetch(n))
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
