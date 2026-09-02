@@ -401,7 +401,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
     @torch.no_grad()
     def _resolve_stream_stage_devices(self):
-        """Resolve ``stream_prefetch_gpus`` into a list of staging devices.
+        """Resolve ``stream_prefetch_devices`` into a list of staging devices.
 
         Returns None for host-RAM staging (the default). "auto" uses every CUDA
         device except the quant device (all of them when only one exists);
@@ -409,17 +409,19 @@ class CompressionOrchestrator(BaseOrchestrator):
         GPU staging with a CPU quant device falls back to host RAM: blocks
         would quantize on CPU, so VRAM staging buys nothing there.
         """
-        value = getattr(self, "stream_prefetch_gpus", None)
+        value = getattr(self, "stream_prefetch_devices", None)
         if not value:
             return None
         quant_dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
         if isinstance(value, str) and value.strip().lower() == "auto":
             if quant_dev.type != "cuda":
-                logger.warning("[stream] stream_prefetch_gpus='auto' ignored: quant device is %s, not CUDA", quant_dev)
+                logger.warning(
+                    "[stream] stream_prefetch_devices='auto' ignored: quant device is %s, not CUDA", quant_dev
+                )
                 return None
             n_gpu = torch.cuda.device_count()
             if n_gpu == 0:
-                logger.warning("[stream] stream_prefetch_gpus='auto' ignored: no CUDA devices visible")
+                logger.warning("[stream] stream_prefetch_devices='auto' ignored: no CUDA devices visible")
                 return None
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
         else:
@@ -503,7 +505,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 first_block=get_module(self.model, flat_block_names[0]) if flat_block_names else None,
                 nsamples=int(getattr(self.calibration_context, "nsamples", 128) or 128),
             )
-            calib_state = {"fp_inputs": fp_inputs, "input_others": input_others}
+            calib_state = {"fp_inputs": fp_inputs, "input_others": input_others, "token_ids": summary.get("token_ids")}
             logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])
 
         # Prefetch pipeline: a background reader stages upcoming blocks into
@@ -541,13 +543,21 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
-                    _, reference_output = self.alg_composer.compress_block(
+                    new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
                         calib_state["fp_inputs"],
                         calib_state["input_others"],
                         block_ctx=ctx,
+                        q_inputs=calib_state.get("q_inputs"),
+                        input_ids=calib_state.get("token_ids"),
                     )
                     calib_state["fp_inputs"] = reference_output
+                    if self.alg_composer.need_quanted_input():
+                        # qon: the next block tunes against this block's
+                        # quantized outputs, mirroring the data-driven loop.
+                        calib_state["q_inputs"] = new_q_input
+                    else:
+                        calib_state.pop("q_inputs", None)
                 else:
                     self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
                 if self.compress_context.is_immediate_packing:

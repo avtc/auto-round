@@ -304,6 +304,12 @@ def _select_rtn_compressor_base_cls(quant_config: "RTNConfig", scheme, format, b
         static_attention_dtype=base_kwargs.get("static_attention_dtype"),
     )
 
+    # --imatrix_enabled true/false overrides the scheme-driven rules (e.g.
+    # forces the imatrix on for asymmetric schemes, off for symmetric int).
+    forced_imatrix = getattr(quant_config, "forced_imatrix", None)
+    if forced_imatrix is not None:
+        enable_imatrix = forced_imatrix
+
     # AutoScheme always requires calibration data for delta-loss based scheme
     # selection, regardless of whether imatrix is needed.
     quant_config.enable_imatrix = enable_imatrix
@@ -331,7 +337,7 @@ _ENTRY_KWARG_OWNERS = {
     "layerwise_rotation": "compressor",
     "stream_checkpoint": "compressor",
     "stream_prefetch": "compressor",
-    "stream_prefetch_gpus": "compressor",
+    "stream_prefetch_devices": "compressor",
     "stream_calibration": "compressor",
     "stream_calibration_rows": "compressor",
     "format": "base",

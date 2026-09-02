@@ -305,3 +305,498 @@ class AlgorithmHandler:
             default = f" (default: {action.default})" if action.default is not None else ""
             lines.append(f"  {flags}: {action.help or ''}{default}")
         return "\n".join(lines)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+
+def _parse_bool_or_mode(value: str) -> bool | str:
+    """Parse AWQ duo_scaling's tri-state: true / false / both."""
+    lowered = value.strip().lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "both":
+        return "both"
+    raise argparse.ArgumentTypeError("Expected one of: true, false, both")
+
+
+# ============================================================================
+# Algorithm implementations  (auto-registered via __init_subclass__)
+# ============================================================================
+
+
+class AWQ(AlgorithmHandler):
+    name = "awq"
+    aliases = ("awq",)
+    summary = "Activation-Aware Weight Quantization (pre-processing)."
+    config_factory = None
+
+    def register(self, group) -> None:
+        group.add_argument(
+            "--awq_duo_scaling",
+            dest="duo_scaling",
+            default=True,
+            type=_parse_bool_or_mode,
+            metavar="{true,false,both}",
+            help="Use activation+weight duo scaling (true/false/both).",
+        )
+        group.add_argument(
+            "--awq_n_grid",
+            dest="n_grid",
+            default=20,
+            type=int,
+            help="Number of grid-search points for AWQ scaling ratio.",
+        )
+        group.add_argument(
+            "--awq_seqlen",
+            dest="awq_seqlen",
+            default=None,
+            type=int,
+            help=(
+                "Maximum sequence length used by AWQ calibration. "
+                "This is distinct from the global calibration --seqlen."
+            ),
+        )
+        group.add_argument(
+            "--awq_smooth_batch_size",
+            dest="awq_smooth_batch_size",
+            default=None,
+            type=int,
+            help="Microbatch size for AWQ parent replay during scale search; <=0 disables microbatching.",
+        )
+        group.add_argument(
+            "--awq_apply_clip",
+            dest="awq_apply_clip",
+            action="store_true",
+            help="Search and hard-clamp per-group AWQ weight clipping after smoothing.",
+        )
+        group.add_argument(
+            "--awq_clip_as_init",
+            dest="awq_clip_as_init",
+            action="store_true",
+            help=(
+                "Use the searched AWQ clip to initialize the block quantizer's "
+                "weight range instead of hard-clamping (requires --awq_apply_clip)."
+            ),
+        )
+
+    def build(self, args, common_kwargs: dict[str, Any]):
+        from auto_round.algorithms.transforms.awq.config import AWQConfig
+
+        awq_seqlen = getattr(args, "awq_seqlen", None)
+        return AWQConfig(
+            duo_scaling=getattr(args, "duo_scaling", True),
+            n_grid=getattr(args, "n_grid", 20),
+            apply_clip=getattr(args, "awq_apply_clip", False),
+            clip_as_init=getattr(args, "awq_clip_as_init", False),
+            awq_seqlen=512 if awq_seqlen is None else awq_seqlen,
+            smooth_batch_size=getattr(args, "awq_smooth_batch_size", None),
+            **common_kwargs,
+        )
+
+
+class SVDQuant(AlgorithmHandler):
+    name = "svdquant"
+    aliases = ("svdquant",)
+    summary = "SVD low-rank decomposition before residual quantization."
+    config_factory = None
+
+    def register(self, group) -> None:
+        group.add_argument("--svdquant-rank", default=32, type=int, help="SVDQuant low-rank size.")
+        group.add_argument(
+            "--enable-svdquant-smooth",
+            dest="svdquant_smooth_enabled",
+            default=False,
+            action="store_true",
+            help="Enable SVDQuant activation-aware smoothing.",
+        )
+        group.add_argument(
+            "--svdquant-smooth-num-grids",
+            default=20,
+            type=int,
+            help="Number of candidates per SVDQuant smooth search grid family.",
+        )
+        group.add_argument(
+            "--svdquant-smooth-max-calibration-calls",
+            default=128,
+            type=int,
+            help="Maximum calibration calls retained per SVDQuant smooth group.",
+        )
+        group.add_argument(
+            "--svdquant-residual-iters",
+            default=1,
+            type=int,
+            help="Number of alternating low-rank and residual quantization iterations.",
+        )
+        group.add_argument(
+            "--enable-svdquant-residual-early-stop",
+            dest="svdquant_residual_early_stop",
+            default=False,
+            action="store_true",
+            help="Stop residual iteration when reconstruction error no longer improves.",
+        )
+        group.add_argument(
+            "--svdquant-low-rank-dtype",
+            default="bf16",
+            choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"],
+            help="Data type for the SVDQuant low-rank branch.",
+        )
+        group.add_argument(
+            "--svdquant-target-modules",
+            default=None,
+            type=str,
+            help="Comma-separated module-name substrings to transform.",
+        )
+        group.add_argument(
+            "--svdquant-exclude-modules",
+            default=None,
+            type=str,
+            help="Comma-separated module-name substrings to exclude.",
+        )
+        group.add_argument(
+            "--svdquant-model-adapter",
+            default="auto",
+            choices=["auto", "identity", "flux"],
+            help="Architecture adapter used by SVDQuant export.",
+        )
+
+    def build(self, args, common_kwargs: dict[str, Any]):
+        from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+        return SVDQuantConfig(
+            rank=getattr(args, "svdquant_rank", 32),
+            smooth_enabled=getattr(args, "svdquant_smooth_enabled", False),
+            smooth_num_grids=getattr(args, "svdquant_smooth_num_grids", 20),
+            smooth_max_calibration_calls=getattr(args, "svdquant_smooth_max_calibration_calls", 128),
+            residual_iters=getattr(args, "svdquant_residual_iters", 1),
+            residual_early_stop=getattr(args, "svdquant_residual_early_stop", False),
+            low_rank_dtype=getattr(args, "svdquant_low_rank_dtype", "bf16"),
+            target_modules=getattr(args, "svdquant_target_modules", None),
+            exclude_modules=getattr(args, "svdquant_exclude_modules", None),
+            model_adapter=getattr(args, "svdquant_model_adapter", "auto"),
+            **common_kwargs,
+        )
+
+
+class RTN(AlgorithmHandler):
+    name = "rtn"
+    aliases = ("rtn",)
+    summary = "Round-To-Nearest quantization."
+    config_factory = None
+
+    def register(self, group) -> None:
+        mutex = group.add_mutually_exclusive_group()
+        mutex.add_argument(
+            "--disable_opt_rtn",
+            dest="disable_opt_rtn",
+            default=None,
+            action="store_const",
+            const=True,
+            help="Force plain RTN (disable optimized path).",
+        )
+        mutex.add_argument(
+            "--enable_opt_rtn",
+            dest="disable_opt_rtn",
+            action="store_const",
+            const=False,
+            help="Force optimized RTN path.",
+        )
+        group.add_argument(
+            "--enable_neuqi",
+            dest="enable_neuqi",
+            default=False,
+            action="store_true",
+            help=(
+                "Opt into the NeUQI joint (scale, zero-point) search for asymmetric "
+                "optimized-RTN (asym_search='neuqi'). Without it, asymmetric layers "
+                "use the plain min/max initializer. Ignored for symmetric quantization."
+            ),
+        )
+        group.add_argument(
+            "--imatrix_enabled",
+            dest="imatrix_enabled",
+            default="auto",
+            choices=["auto", "true", "false"],
+            help=(
+                "Force the activation-imatrix weighting for the optimized-RTN search "
+                "on/off, overriding the scheme rules (sym int<8 -> on, asym -> off). "
+                "'auto' keeps the rules. Forcing it on under --stream_checkpoint also "
+                "requires --stream_calibration."
+            ),
+        )
+
+    def build(self, args, common_kwargs: dict[str, Any]):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        asym_search = "neuqi" if getattr(args, "enable_neuqi", False) else "auto"
+        cfg = RTNConfig(
+            disable_opt_rtn=getattr(args, "disable_opt_rtn", None),
+            asym_search=asym_search,
+            **common_kwargs,
+        )
+        imatrix = getattr(args, "imatrix_enabled", "auto")
+        if imatrix == "true":
+            cfg.forced_imatrix = True
+        elif imatrix == "false":
+            cfg.forced_imatrix = False
+        return cfg
+
+
+class AutoRound(AlgorithmHandler):
+    name = "auto_round"
+    aliases = ("auto_round", "autoround", "sign_round", "signround")
+    summary = "SignRound-style iterative block quantization."
+    config_factory = None
+
+    def register(self, group) -> None:
+        group.add_argument(
+            "--iters", "--iter", default=None, type=int, help="Number of optimization iterations per block."
+        )
+        group.add_argument("--lr", default=None, type=float, help="Learning rate for rounding optimization.")
+        group.add_argument("--minmax_lr", default=None, type=float, help="Learning rate for min-max tuning.")
+        group.add_argument("--momentum", default=0.0, type=float, help="Momentum factor for the optimizer.")
+        group.add_argument("--nblocks", default=1, type=int, help="Number of blocks to optimize together.")
+        minmax_mutex = group.add_mutually_exclusive_group()
+        minmax_mutex.add_argument(
+            "--enable_minmax_tuning",
+            default=True,
+            dest="enable_minmax_tuning",
+            action="store_true",
+            help="Tune weight min/max ranges.",
+        )
+        minmax_mutex.add_argument(
+            "--no-enable_minmax_tuning",
+            "--disable_minmax_tuning",
+            dest="enable_minmax_tuning",
+            action="store_false",
+            help="Disable weight min/max tuning.",
+        )
+        group.add_argument(
+            "--enable_norm_bias_tuning",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+            help="Tune normalization and bias terms.",
+        )
+        group.add_argument(
+            "--gradient_accumulate_steps", default=1, type=int, help="Gradient accumulation steps per update."
+        )
+        group.add_argument(
+            "--enable_alg_ext",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+            help="Enable experimental SignRound extension.",
+        )
+        group.add_argument(
+            "--not_use_best_mse",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+            help="Skip restoring best-MSE checkpoint.",
+        )
+        quanted_input_mutex = group.add_mutually_exclusive_group()
+        quanted_input_mutex.add_argument(
+            "--enable_quanted_input",
+            default=True,
+            dest="enable_quanted_input",
+            action="store_true",
+            help="Consume quantized output of previous blocks.",
+        )
+        quanted_input_mutex.add_argument(
+            "--no-enable_quanted_input",
+            "--disable_quanted_input",
+            dest="enable_quanted_input",
+            action="store_false",
+            help="Disable quantized-input propagation across blocks.",
+        )
+        group.add_argument(
+            "--enable_adam",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+            help="Use the Adam-based SignRound variant.",
+        )
+        group.add_argument(
+            "--enable_lfq",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+            help="Enable last-block LM cross-entropy (LFQ) loss for the final transformer block (experimental).",
+        )
+
+    def build(self, args, common_kwargs: dict[str, Any]):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        return SignRoundConfig(
+            iters=getattr(args, "iters", 200),
+            lr=getattr(args, "lr", None),
+            minmax_lr=getattr(args, "minmax_lr", None),
+            momentum=getattr(args, "momentum", 0.0),
+            nblocks=getattr(args, "nblocks", 1),
+            enable_minmax_tuning=getattr(args, "enable_minmax_tuning", True),
+            enable_norm_bias_tuning=getattr(args, "enable_norm_bias_tuning", False),
+            gradient_accumulate_steps=getattr(args, "gradient_accumulate_steps", 1),
+            enable_alg_ext=getattr(args, "enable_alg_ext", False),
+            not_use_best_mse=getattr(args, "not_use_best_mse", False),
+            enable_quanted_input=getattr(args, "enable_quanted_input", True),
+            enable_adam=getattr(args, "enable_adam", False),
+            enable_lfq=getattr(args, "enable_lfq", False),
+            **common_kwargs,
+        )
+
+
+class Hadamard(AlgorithmHandler):
+    name = "hadamard"
+    aliases = ("hadamard", "random_hadamard", "quarot_hadamard")
+    summary = "Hadamard rotation/transform applied before quantization."
+    config_factory = None
+
+    def register(self, group) -> None:
+        group.add_argument(
+            "--rotation_type",
+            "--rotation-hadamard-type",
+            dest="rotation_hadamard_type",
+            default=None,
+            choices=["hadamard", "random_hadamard", "quarot_hadamard"],
+            help="Hadamard transform variant.",
+        )
+        group.add_argument(
+            "--rotation_backend",
+            dest="rotation_backend",
+            default="auto",
+            choices=["auto", "inplace", "transform"],
+            help="Rotation backend to use.",
+        )
+        group.add_argument(
+            "--rotation_block_size",
+            dest="rotation_block_size",
+            default=None,
+            type=int,
+            help="Grouped Hadamard block size.",
+        )
+        group.add_argument(
+            "--fuse_online_to_weight",
+            default=None,
+            action=argparse.BooleanOptionalAction,
+            help="Fuse online Hadamard rotation into weights.",
+        )
+        group.add_argument(
+            "--allow_online_rotation",
+            default=True,
+            action=argparse.BooleanOptionalAction,
+            help="Allow online activation rotation.",
+        )
+
+    def build(self, args, common_kwargs: dict[str, Any]):
+        from auto_round.algorithms.transforms.hadamard.config import RotationConfig
+
+        hadamard_type = getattr(args, "rotation_hadamard_type", None) or "hadamard"
+        return RotationConfig(
+            hadamard_type=hadamard_type,
+            backend=getattr(args, "rotation_backend", "auto"),
+            block_size=getattr(args, "rotation_block_size", None),
+            fuse_online_to_weight=getattr(args, "fuse_online_to_weight", None),
+            allow_online_rotation=getattr(args, "allow_online_rotation", True),
+        )
+
+
+class PreSINQ(AlgorithmHandler):
+    name = "presinq"
+    aliases = ("presinq", "pre_sinq")
+    summary = (
+        "Calibration-free function-preserving Sinkhorn column-scale fold applied "
+        "before quantization (composable: --algorithm 'presinq,auto_round')."
+    )
+    config_factory = None
+
+    def register(self, group) -> None:
+        group.add_argument(
+            "--presinq_group_size",
+            dest="presinq_group_size",
+            default=None,
+            type=int,
+            help="PreSINQ tile width in input channels (locked default 64 when unset).",
+        )
+        group.add_argument(
+            "--presinq_n_iter",
+            dest="presinq_n_iter",
+            default=None,
+            type=int,
+            help="Sinkhorn iterations per tile (locked default 4 when unset).",
+        )
+        group.add_argument(
+            "--presinq_n_repeat",
+            dest="presinq_n_repeat",
+            default=None,
+            type=int,
+            help="Whole-model folding passes (locked default 3 when unset).",
+        )
+        group.add_argument(
+            "--presinq_parallel_folds",
+            dest="presinq_parallel_folds",
+            default=None,
+            action=argparse.BooleanOptionalAction,
+            help="Fan per-expert folds out over all visible GPUs (MoE).",
+        )
+
+    def build(self, args, common_kwargs: dict[str, Any]):
+        from auto_round.algorithms.transforms.presinq.config import PreSINQConfig
+
+        kwargs = {
+            key: value
+            for key, value in {
+                "group_size": getattr(args, "presinq_group_size", None),
+                "n_iter": getattr(args, "presinq_n_iter", None),
+                "n_repeat": getattr(args, "presinq_n_repeat", None),
+                "parallel_folds": getattr(args, "presinq_parallel_folds", None),
+            }.items()
+            if value is not None
+        }
+        return PreSINQConfig(**kwargs)
+
+
+def _register_builtin_algorithm_factories() -> None:
+    from auto_round.algorithms.quantization.rtn.config import RTNConfig
+    from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+    from auto_round.algorithms.transforms.awq.config import AWQConfig
+    from auto_round.algorithms.transforms.hadamard.config import RotationConfig
+    from auto_round.algorithms.transforms.presinq.config import PreSINQConfig
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    register_algorithm("rtn", aliases=("rtn",), config_factory=RTNConfig, cli_handler=RTN, summary=RTN.summary)
+    register_algorithm(
+        "auto_round",
+        aliases=("auto_round", "autoround", "sign_round", "signround"),
+        config_factory=SignRoundConfig,
+        cli_handler=AutoRound,
+        summary=AutoRound.summary,
+    )
+    register_algorithm("awq", aliases=("awq",), config_factory=AWQConfig, cli_handler=AWQ, summary=AWQ.summary)
+    register_algorithm(
+        "svdquant",
+        aliases=("svdquant",),
+        config_factory=SVDQuantConfig,
+        cli_handler=SVDQuant,
+        summary=SVDQuant.summary,
+    )
+    register_algorithm(
+        "hadamard",
+        aliases=("hadamard", "random_hadamard", "quarot_hadamard"),
+        config_factory=RotationConfig,
+        cli_handler=Hadamard,
+        summary=Hadamard.summary,
+        alias_factories={
+            "random_hadamard": lambda: RotationConfig(hadamard_type="random_hadamard"),
+            "quarot_hadamard": lambda: RotationConfig(hadamard_type="quarot_hadamard"),
+        },
+    )
+    register_algorithm(
+        "presinq",
+        aliases=("presinq", "pre_sinq"),
+        config_factory=PreSINQConfig,
+        cli_handler=PreSINQ,
+        summary=PreSINQ.summary,
+    )
+
+
+_register_builtin_algorithm_factories()

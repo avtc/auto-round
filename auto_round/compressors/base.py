@@ -330,7 +330,7 @@ class BaseOrchestrator(object):
         # these devices and quantized in place (round-robin block homes), so
         # no cross-device copy is needed when the loop reaches them.
         # Requires stream_prefetch > 0.
-        self.stream_prefetch_gpus = kwargs.pop("stream_prefetch_gpus", None)
+        self.stream_prefetch_devices = kwargs.pop("stream_prefetch_devices", None)
         # Collect imatrix activation statistics with a streaming forward pass
         # before the zero-shot loop (stream_checkpoint only): one block at a
         # time is materialized, all calibration rows are pushed through, and
@@ -550,14 +550,35 @@ class BaseOrchestrator(object):
             # stream_checkpoint cannot provide cached block inputs (no full-model
             # forward exists). The RTN family (incl. optimized RTN) is weight-only:
             # its clip search never consumes activations, so the demand is waived
-            # and the zero-shot block loop runs instead.
+            # and the zero-shot block loop runs instead. SignRound (iters > 0)
+            # tuning can also run in the streaming loop, but only when
+            # stream_calibration chains real activations block-to-block.
             from auto_round.algorithms.quantization.rtn.config import RTNConfig as _RTN
+            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig as _SignRound
 
-            if not (getattr(self, "stream_checkpoint", False) and all(isinstance(c, _RTN) for c in demanding)):
+            if not getattr(self, "stream_checkpoint", False):
                 return True
+            if not all(isinstance(c, (_RTN, _SignRound)) for c in demanding):
+                return True
+            if any(isinstance(c, _SignRound) for c in demanding) and not getattr(self, "stream_calibration", False):
+                raise ValueError(
+                    "iters > 0 tuning under stream_checkpoint needs the calibration "
+                    "chain: pass --stream_calibration (stream_calibration=True) so "
+                    "the streaming loop chains real activations block-to-block, or "
+                    "disable stream_checkpoint for the ordinary data-driven path."
+                )
+            if any(getattr(c, "forced_imatrix", None) is True for c in demanding) and not getattr(
+                self, "stream_calibration", False
+            ):
+                raise ValueError(
+                    "--imatrix_enabled true under stream_checkpoint needs the "
+                    "calibration chain: pass --stream_calibration (stream_calibration=True) "
+                    "so the streaming loop can collect the activation statistics, or "
+                    "disable stream_checkpoint."
+                )
             logger.info(
-                "[stream_checkpoint] RTN-family quantizer: proceeding zero-shot "
-                "(weight-only clip search; calibration data would be unused)."
+                "[stream_checkpoint] streaming zero-shot loop covers the calibration "
+                "demand (weight-only search and/or stream_calibration chained rows)."
             )
 
         # AutoScheme needs data for delta-loss scheme selection
