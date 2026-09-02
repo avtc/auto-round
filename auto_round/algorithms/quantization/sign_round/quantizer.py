@@ -35,6 +35,147 @@ from auto_round.utils import (
 )
 from auto_round.utils.device import clear_memory_if_reached_threshold
 from auto_round.utils.device_manager import device_manager
+
+
+def _rehome_calibration_state(
+    active_inputs,
+    fp_outputs,
+    device,
+    margin_bytes: int = 2 * 1024**3,
+) -> int:
+    """Move a block's calibration tensors to its tuning device, once per block.
+
+    Under streaming with round-robin homes, collected rows are parked on the
+    GPU that PRODUCED them (previous block's home / the primary); a block
+    tuning on a different device would then pay a cross-device toll on every
+    iteration (batch staging inside forward, the reference cat+to, snapshot
+    copies). One guarded bulk move replaces those per-iteration tolls.
+
+    Lists are mutated in place. VRAM-guarded: skips (returns 0) when the
+    target device cannot hold the off-device bytes with margin. Only CUDA
+    devices are considered; CPU targets and CPU-resident inputs are no-ops.
+    """
+    if device is None or getattr(device, "type", "") != "cuda":
+        return 0
+    lists = [lst for lst in (active_inputs, fp_outputs) if isinstance(lst, list)]
+    off_device = [t for lst in lists for t in lst if torch.is_tensor(t) and t.device != device]
+    needed = sum(t.nbytes for t in off_device)
+    if needed == 0:
+        return 0
+    free, _total = torch.cuda.mem_get_info(device)
+    if needed + margin_bytes > free:
+        logger.info(
+            "[tune-locality] keeping calibration state off %s: need %.1fGiB + margin, free %.1fGiB",
+            device,
+            needed / 2**30,
+            free / 2**30,
+        )
+        return 0
+    t0 = time.perf_counter()
+    moved = 0
+    for lst in lists:
+        for i, t in enumerate(lst):
+            if torch.is_tensor(t) and t.device != device:
+                lst[i] = t.to(device)
+                moved += 1
+    logger.info(
+        "[tune-locality] re-homed %d calibration tensors (%.1fGiB) to %s in %.1fs",
+        moved,
+        needed / 2**30,
+        device,
+        time.perf_counter() - t0,
+    )
+    return moved
+
+
+def alt2_switch_iter(iters: int, recipe: str, iters2_env: int):
+    """Iteration index (exclusive) at which the alt2 re-grid fires, or None.
+
+    Round 1 tunes on the init-search grid for ``iters - iters2`` iterations;
+    the re-grid then re-anchors every alt2 layer to a fresh search over the
+    perturbed effective weights and resets the rounding params; round 2 tunes
+    for ``iters2`` more. ``iters2_env=0`` means "half of iters".
+    """
+    if recipe != "alt2" or iters < 2:
+        return None
+    if iters2_env < 0:
+        raise ValueError(f"AR_ALT2_ITERS2={iters2_env} must be >= 0 (0 = half of iters).")
+    iters2 = iters2_env if iters2_env > 0 else iters // 2
+    if not 1 <= iters2 < iters:
+        raise ValueError(f"AR_ALT2_ITERS2={iters2} must be in [1, {iters - 1}] (iters={iters}).")
+    return iters - iters2
+
+
+def _maybe_qoff_noise(active_inputs, block_index: int, enable_quanted_input: bool):
+    """Inject per-channel quantization noise into FP chain inputs (AR_QOFF_NOISE).
+
+    The qoff tuning path optimizes against FP-reference inputs that the
+    deployed quantized chain never produces; injecting the measured noise
+    statistics of the previous quantized block closes that gap. Deterministic:
+    the noise draw is seeded by the block index. Returns a NEW list; the
+    cached FP inputs are never modified in place.
+    """
+    import os
+
+    from auto_round import envs
+
+    if not envs.AR_QOFF_NOISE:
+        return active_inputs
+    if enable_quanted_input:
+        raise ValueError(
+            "AR_QOFF_NOISE=1 is a qoff-path aid; with quantized-input chaining (qon) the tuning "
+            "already sees real quantized inputs. Unset AR_QOFF_NOISE."
+        )
+    if not isinstance(active_inputs, list):
+        raise ValueError("AR_QOFF_NOISE=1 supports list-of-tensor calibration inputs only.")
+    stats_dir = envs.AR_QOFF_NOISE_STATS
+    if not stats_dir:
+        raise ValueError(
+            "AR_QOFF_NOISE=1 requires AR_QOFF_NOISE_STATS=<dir> with the collected per-block noise "
+            "stats. Generate them first with a zero-shot pass (e.g. --iters 0) using the SAME "
+            "AR_QOFF_NOISE_STATS directory, then run the tuning pass."
+        )
+    if block_index == 0:
+        logger.info("[qoff_noise] block 0 inputs are embeddings; no previous-block stats to inject")
+        return active_inputs
+    path = os.path.join(stats_dir, f"block_{block_index - 1:04d}.pt")
+    if not os.path.exists(path):
+        raise ValueError(
+            f"AR_QOFF_NOISE stats file {path} is missing. Run a zero-shot collection pass "
+            "(--iters 0) with AR_QOFF_NOISE_STATS={stats_dir!r} first."
+        )
+    stats = torch.load(path, map_location="cpu", weights_only=True)
+    mean = stats["mean"].to(torch.float32)
+    std = stats["var"].to(torch.float32).clamp_min(0).sqrt()
+    gen = torch.Generator(device="cpu").manual_seed(10_000 + block_index)
+    out = []
+    for t in active_inputs:
+        if t.shape[-1] != mean.numel():
+            raise ValueError(
+                f"AR_QOFF_NOISE stats width ({mean.numel()}) does not match block inputs "
+                f"({t.shape[-1]}); the stats dir likely belongs to another model."
+            )
+        shift = mean + std * torch.randn(t.shape, generator=gen, dtype=torch.float32)
+        out.append(t + shift.to(dtype=t.dtype, device=t.device))
+    return out
+
+
+def _alt2_regrid_block(block) -> float:
+    """Re-grid every participating wrapper in the block; returns mean |delta scale|."""
+    deltas = []
+    for _, m in block.named_modules():
+        if getattr(m, "_tune_recipe", "") != "alt2":
+            continue
+        ds = m.alt2_regrid()
+        if ds is not None:
+            deltas.append(ds)
+    if not deltas:
+        return 0.0
+    mean_ds = sum(deltas) / len(deltas)
+    logger.info("[alt2] re-grid %d layers, mean |delta scale| %.3e", len(deltas), mean_ds)
+    return mean_ds
+
+
 from auto_round.utils.distributed import setup_ddp_if_needed_
 from auto_round.wrapper import WrapperLinear, unwrapper_block, unwrapper_layer, wrapper_block
 
@@ -383,6 +524,9 @@ class SignRoundQuantizer(BaseQuantizer):
 
         # Use quantized inputs if available and enabled
         active_inputs = q_inputs if (q_inputs is not None and self.enable_quanted_input) else fp_inputs
+        active_inputs = _maybe_qoff_noise(active_inputs, block_ctx.block_index, self.enable_quanted_input)
+        _home = torch.device(device) if not isinstance(device, torch.device) else device
+        _rehome_calibration_state(active_inputs, fp_outputs, _home)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
@@ -535,7 +679,16 @@ class SignRoundQuantizer(BaseQuantizer):
             if total_loss < best_loss:
                 best_loss = total_loss
                 if not self.not_use_best_mse:
-                    best_params = collect_best_params(block, self.compress_context.cache_device)
+                    # park the snapshot where it was produced when the pipeline
+                    # already caches on GPU: cross-device D2D snapshots cost
+                    # ~0.1s/iter on non-primary homes
+                    _snap_dev = (
+                        _home
+                        if getattr(self.compress_context.cache_device, "type", "") == "cuda" and _home.type == "cuda"
+                        else self.compress_context.cache_device
+                    )
+                    with tune_stage(tune_prof, "snapshot"):
+                        best_params = collect_best_params(block, _snap_dev)
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
                 best_params = collect_best_params(block, self.compress_context.cache_device)
