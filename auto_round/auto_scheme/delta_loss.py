@@ -2278,6 +2278,14 @@ def _serial_scoring_device_safe(model, visible_cuda_devices=None) -> bool:
     if visible_cuda_devices is not None and len(visible_cuda_devices) > 1:
         if getattr(model, "_disk_stream_index", None) is not None:
             return False
+    if getattr(model, "_disk_stream_index", None) is None and any(
+        parameter.device.type == "meta" for parameter in model.parameters()
+    ):
+        # stream_quantization (never-materialize) skeleton: unlike the
+        # AR_DISK_STREAM_MODEL offloader there is no in-process hook to
+        # materialize blocks, so a serial full-model forward is impossible;
+        # scoring must go through the disk-stream workers.
+        return False
     return True
 
 
@@ -2633,8 +2641,6 @@ def _gen_layer_config(
         if len(list(m.children())) == 0:
             if not hasattr(m, "in_block"):
                 m.in_block = False
-            if not m.in_block and auto_scheme.low_gpu_mem_usage:
-                m.to(major_device)
 
     total_scores = {}
     schemes = auto_scheme.options
@@ -2824,25 +2830,6 @@ def _gen_layer_config(
     # We always prepare the common resources (imatrix, pbar, etc.) since they're
     # reusable across schemes and their setup cost is negligible compared to scoring.
     if True:
-        if need_imatrix:
-            dataloader = get_dataloader(
-                tokenizer,
-                seqlen=max(seqlen * 2, 2048),
-                dataset_name=dataset,
-                seed=42,
-                bs=batch_size,
-                nsamples=min(nsamples, 128),
-            )
-            logger.info("start to compute imatrix in AutoScheme")
-            cal_imatrix(model, dataloader, major_device, low_gpu_mem_usage=auto_scheme.low_gpu_mem_usage)
-            memory_monitor.update()
-            memory_monitor.log_summary()
-            logger.info("finish calculating imatrix")
-
-        # Register hooks and clear all block weights before the scheme loop.
-        # Hooks will transparently reload weights on demand during forward passes.
-        if offload_context is not None:
-            offload_context.add_offload_hooks(model, block_name)
 
         pbar = tqdm(total=pbar_cnt, desc="Generating AutoScheme")
         scored_layer_names = set(quant_layer_names + embedding_layers_names)
@@ -2952,6 +2939,39 @@ def _gen_layer_config(
             for index, (_, _, cached) in enumerate(scheme_cache_meta)
             if not check_bf16_scheme(schemes[index]) and cached is None
         ]
+        # Scoring-only setup: skipped entirely when every scheme resolved from
+        # the cache -- on a stream_quantization meta skeleton this is what keeps
+        # the parent free of weight materialization (no imatrix forwards, no
+        # offload hooks, no non-block staging onto the scoring device).
+        if uncached_indices:
+            if need_imatrix:
+                dataloader = get_dataloader(
+                    tokenizer,
+                    seqlen=max(seqlen * 2, 2048),
+                    dataset_name=dataset,
+                    seed=42,
+                    bs=batch_size,
+                    nsamples=min(nsamples, 128),
+                )
+                logger.info("start to compute imatrix in AutoScheme")
+                cal_imatrix(model, dataloader, major_device, low_gpu_mem_usage=auto_scheme.low_gpu_mem_usage)
+                memory_monitor.update()
+                memory_monitor.log_summary()
+                logger.info("finish calculating imatrix")
+
+            # Register hooks and clear all block weights before the scheme loop.
+            # Hooks will transparently reload weights on demand during forward passes.
+            if offload_context is not None:
+                offload_context.add_offload_hooks(model, block_name)
+
+            # Non-block modules stage onto the scoring device only now: with a
+            # fully-cached resolution this .to() would copy meta tensors.
+            if auto_scheme.low_gpu_mem_usage:
+                for n, m in model.named_modules():
+                    if len(list(m.children())) == 0 and not getattr(m, "in_block", False):
+                        m.to(major_device)
+        else:
+            pbar.update(pbar_cnt)  # everything cached: complete the bar
         worker_device_pool = [device for device in device_list if str(device).startswith("cuda:")]
         num_gpus = len(worker_device_pool)
         parallel_enabled = _envs.AR_ENABLE_AUTO_SCHEME_PARALLEL
@@ -3236,6 +3256,15 @@ def _gen_layer_config(
                 pbar.reset(total=pbar_cnt)
 
         if not parallel_done:
+            if uncached_indices and not serial_device_safe:
+                raise RuntimeError(
+                    "AutoScheme scoring cannot run in-process on this model (meta "
+                    "skeleton without an in-process materialization hook, e.g. "
+                    "stream_quantization, or weights spanning multiple GPUs) and no "
+                    "parallel scoring worker was started. Score once without "
+                    "--stream_quantization (this fills AR_AUTO_SCHEME_CACHE), or "
+                    "keep AR_ENABLE_AUTO_SCHEME_PARALLEL enabled with CUDA devices."
+                )
             if uncached_indices and disk_index is None:
                 # Skipped in streaming mode: materialize_model_ only acts on
                 # ReplacementModuleBase (fused-MoE) instances -- a no-op for

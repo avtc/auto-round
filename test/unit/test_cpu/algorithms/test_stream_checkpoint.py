@@ -428,6 +428,21 @@ class TestStreamingRoutingWaiver:
         fields.update(attrs)
         return BaseCompressor._needs_calibration_data(SimpleNamespace(**fields))
 
+    def test_auto_scheme_streamed_does_not_force_calib(self):
+        """AutoScheme scoring runs in workers / from cache -- the streaming
+        parent never forwards, so under stream_quantization the scheme itself
+        must not force the data-driven path (streaming governs quantization)."""
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+
+        scheme = AutoScheme(avg_bits=3.5, options="W3A16,W4A16")
+        assert self._needs([], scheme=scheme, stream_quantization=True) is False
+
+    def test_auto_scheme_non_streamed_still_forces_calib(self):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+
+        scheme = AutoScheme(avg_bits=3.5, options="W3A16,W4A16")
+        assert self._needs([], scheme=scheme, stream_quantization=False) is True
+
     def test_optimized_rtn_streamed_waived_without_calibration(self):
         from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
 
@@ -540,6 +555,40 @@ class TestStreamModeExclusivity:
         assert called["meta"] == 1, "mllm + stream_quantization must use the streaming loader"
         assert ctx.is_mllm is True
 
+    def test_block_parallel_tuning_under_streaming_raises(self, monkeypatch):
+        """BPT is a data-driven-path feature; under streaming it would be
+        silently ignored -- fail fast instead."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from auto_round.compressors.base import BaseCompressor
+
+        stub = SimpleNamespace(stream_quantization=True)
+        with pytest.raises(ValueError, match="enable_block_parallel_tuning cannot run under stream_quantization"):
+            BaseCompressor._validate_stream_options(stub, quant_nontext_module=False, enable_block_parallel_tuning=True)
+        # allowed: no streaming, or no BPT
+        BaseCompressor._validate_stream_options(
+            SimpleNamespace(stream_quantization=False), quant_nontext_module=False, enable_block_parallel_tuning=True
+        )
+        BaseCompressor._validate_stream_options(stub, quant_nontext_module=False, enable_block_parallel_tuning=False)
+
+    def test_quant_nontext_module_under_streaming_raises(self, monkeypatch):
+        """quant_nontext_module + streaming must fail fast: the streaming chain
+        feeds text hidden states block-to-block and cannot drive vision blocks
+        (silently including them would quantize on garbage statistics)."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from auto_round.compressors.base import BaseCompressor
+
+        stub = SimpleNamespace(stream_quantization=True)
+        with pytest.raises(ValueError, match="quant_nontext_module=True is not supported under stream_quantization"):
+            BaseCompressor._validate_stream_options(stub, quant_nontext_module=True)
+        # sanity: allowed combination passes
+        BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
+
     def test_stream_quantization_with_mllm_and_env_var_still_raises(self, monkeypatch):
         import pytest
 
@@ -585,6 +634,59 @@ class TestStreamRowsCap:
         assert len(out) == 1
 
 
+class TestDiskStreamEnvRotationGuard:
+    """_assert_model_foldable_in_place must also refuse whole-model rotation
+    under AR_DISK_STREAM_MODEL (env-var offloader path builds the same meta
+    skeleton; the guard used to key on the --stream_quantization flag only)."""
+
+    def _composer(self, monkeypatch, env_value):
+        from types import SimpleNamespace
+
+        from auto_round import envs
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        monkeypatch.setattr(envs, "AR_DISK_STREAM_MODEL", env_value)
+        orch = SimpleNamespace(
+            layerwise_rotation=False, stream_quantization=False, model_context=None, compress_context=None
+        )
+        return AlgorithmComposer([RTNConfig(group_size=16)], orchestrator=orch)
+
+    def test_env_var_eager_rotation_raises(self, monkeypatch):
+        import torch.nn as nn
+
+        import pytest
+
+        composer = self._composer(monkeypatch, True)
+        with pytest.raises(ValueError, match="can only run layer-wise"):
+            composer._assert_model_foldable_in_place(nn.Linear(4, 4))
+
+    def test_flag_path_still_raises(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        import pytest
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        composer = AlgorithmComposer(
+            [RTNConfig(group_size=16)],
+            orchestrator=SimpleNamespace(
+                layerwise_rotation=False, stream_quantization=True, model_context=None, compress_context=None
+            ),
+        )
+        with pytest.raises(ValueError, match="can only run layer-wise"):
+            composer._assert_model_foldable_in_place(nn.Linear(4, 4))
+
+    def test_no_streaming_no_meta_raises_nothing(self, monkeypatch):
+        import torch.nn as nn
+
+        composer = self._composer(monkeypatch, False)
+        composer._assert_model_foldable_in_place(nn.Linear(4, 4))  # must not raise
+
+
 class TestStreamFeatureAutoEngage:
     """_auto_engage_stream_features: layerwise rotation + calibration chain
     engage by themselves under stream_quantization when the run needs them."""
@@ -623,6 +725,26 @@ class TestStreamFeatureAutoEngage:
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.algorithms.transforms.presinq import PreSINQConfig
 
+        stub = self._engage([PreSINQConfig(group_size=16), RTNConfig(group_size=16)])
+        assert stub.layerwise_rotation is False
+
+    def test_layerwise_auto_enables_under_disk_stream_env(self, monkeypatch):
+        """AR_DISK_STREAM_MODEL (env-var offloader path) builds the same meta
+        skeleton, so rotation transforms must defer layer-wise there too."""
+        from auto_round import envs
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.transforms.presinq import PreSINQConfig
+
+        monkeypatch.setattr(envs, "AR_DISK_STREAM_MODEL", True)
+        stub = self._engage([PreSINQConfig(group_size=16), RTNConfig(group_size=16)])
+        assert stub.layerwise_rotation is True
+
+    def test_layerwise_stays_off_when_env_unset_even_with_flag_off(self, monkeypatch):
+        from auto_round import envs
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.transforms.presinq import PreSINQConfig
+
+        monkeypatch.setattr(envs, "AR_DISK_STREAM_MODEL", False)
         stub = self._engage([PreSINQConfig(group_size=16), RTNConfig(group_size=16)])
         assert stub.layerwise_rotation is False
 
@@ -755,6 +877,48 @@ class TestStreamQuantizeEquivalence:
         )
         ar.quantize_and_save(out_dir, format="auto_round")
         return ar.output_dir  # resolved export dir (may add a name/scheme suffix)
+
+    def test_auto_scheme_with_streaming(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """AutoScheme + stream_quantization: scoring never needs the streaming
+        parent (pass 1 fills the AR_AUTO_SCHEME_CACHE without streaming; pass 2
+        resolves from cache) and the quantization itself runs in the zero-shot
+        streaming loop -- streaming governs quantization, not the scheme."""
+        import shutil
+
+        from auto_round import envs
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.autoround import AutoRound
+
+        cache_dir = str(tmp_path / "as_cache")
+        monkeypatch.setattr(envs, "AR_AUTO_SCHEME_CACHE", cache_dir)
+        # fp16 embed/lm_head inflate the achievable floor; W2+W4 span it
+        scheme = AutoScheme(avg_bits=5.0, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
+
+        def _run(ckpt, out_dir, stream):
+            return AutoRound(
+                ckpt,
+                scheme=scheme,
+                iters=0,
+                nsamples=1,
+                seqlen=32,
+                stream_quantization=stream,
+                format="auto_round",
+                disable_model_free=True,
+                device_map="cpu",
+                low_gpu_mem_usage=True,
+                low_cpu_mem_usage=True,
+            ).quantize_and_save(out_dir, format="auto_round")
+
+        # same model path both passes: the scheme cache is keyed on it (quantization
+        # happens in memory; the on-disk checkpoint stays pristine)
+        _run(tiny_checkpoint, str(tmp_path / "pass1"), stream=False)
+        assert any(
+            p.name.endswith(".json") for p in __import__("pathlib").Path(cache_dir).glob("*")
+        ), "pass 1 must fill the AutoScheme cache"
+        _, out_dir = _run(tiny_checkpoint, str(tmp_path / "pass2"), stream=True)
+        with open(os.path.join(out_dir, "config.json")) as f:
+            qconf = json.load(f)["quantization_config"]
+        assert qconf["quant_method"] == "auto-round"
 
     def test_streamed_export_matches_normal(self, tiny_checkpoint, tmp_path):
         """Streamed zero-shot export must match the normal (data-driven) run on
