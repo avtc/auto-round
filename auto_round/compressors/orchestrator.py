@@ -400,6 +400,46 @@ class CompressionOrchestrator(BaseOrchestrator):
         return self._quantize_data_driven()
 
     @torch.no_grad()
+    def _resolve_stream_stage_devices(self):
+        """Resolve ``stream_prefetch_gpus`` into a list of staging devices.
+
+        Returns None for host-RAM staging (the default). "auto" uses every CUDA
+        device except the quant device (all of them when only one exists);
+        explicit lists accept ints (``cuda:k``), device strings, or torch.device.
+        GPU staging with a CPU quant device falls back to host RAM: blocks
+        would quantize on CPU, so VRAM staging buys nothing there.
+        """
+        value = getattr(self, "stream_prefetch_gpus", None)
+        if not value:
+            return None
+        quant_dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            if quant_dev.type != "cuda":
+                logger.warning("[stream] stream_prefetch_gpus='auto' ignored: quant device is %s, not CUDA", quant_dev)
+                return None
+            n_gpu = torch.cuda.device_count()
+            if n_gpu == 0:
+                logger.warning("[stream] stream_prefetch_gpus='auto' ignored: no CUDA devices visible")
+                return None
+            devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
+        else:
+            devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
+            if quant_dev.type != "cuda" and any(d.type == "cuda" for d in devices):
+                logger.warning(
+                    "[stream] GPU staging devices ignored with CPU quant device %s; using host RAM", quant_dev
+                )
+                return None
+        for d in devices:
+            if d.type == "meta":
+                raise ValueError(f"invalid staging device {d}: meta tensors hold no data")
+        depth = int(getattr(self, "stream_prefetch", 0) or 0)
+        logger.info(
+            "[stream] staging %d block(s) deep on %s; blocks quantize in place (round-robin homes)",
+            depth,
+            [str(d) for d in devices],
+        )
+        return devices or None
+
     def _quantize_zero_shot(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Zero-shot (RTN) quantization path — no calibration data needed.
 
@@ -433,7 +473,26 @@ class CompressionOrchestrator(BaseOrchestrator):
             if lm_head_name is not None:
                 tied_weights_layers.append(lm_head_name)
 
+        # ── stream_checkpoint: per-block tensor streaming from the checkpoint ──
+        streamer = getattr(self.model_context, "checkpoint_streamer", None)
+        if streamer is not None and not self.compress_context.is_immediate_saving:
+            raise ValueError(
+                "stream_checkpoint=True requires immediate saving "
+                "(enable low_cpu_mem_usage=True and keep inplace packing; int data types only)."
+            )
+
         all_blocks = self.quant_block_list or get_block_names(self.model)
+
+        # Prefetch pipeline: a background reader stages upcoming blocks ahead
+        # of the quantize loop. With staging devices the blocks land directly
+        # on those devices (round-robin by block index) and are quantized in
+        # place there; otherwise they wait in host RAM.
+        prefetch_depth = int(getattr(self, "stream_prefetch", 0) or 0)
+        stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and prefetch_depth > 0) else None
+        if streamer is not None and prefetch_depth > 0:
+            flat_prefixes = [name for group in all_blocks for name in group]
+            streamer.start_prefetch(flat_prefixes, depth=prefetch_depth, stage_devices=stage_devices)
+
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         for block_names in all_blocks:
             for block_name in block_names:
@@ -441,6 +500,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block = get_module(self.model, block_name)
 
                 # ── Infrastructure: materialize ───────────────────────────
+                if streamer is not None:
+                    if stage_devices:
+                        # round-robin home: the block was staged here, quantize in place
+                        load_device = stage_devices[_zs_block_idx % len(stage_devices)]
+                    else:
+                        load_device = str(self.device)
+                    streamer.load_module_(block, block_name, device=load_device)
                 materialize_model_(block)
 
                 # ── Pure algorithm ────────────────────────────────────────
@@ -488,7 +554,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     block.to("meta")
                 else:
                     mv_module_from_gpu(block)
-                    if self.compress_context.low_cpu_mem_usage:
+                    if self.compress_context.low_cpu_mem_usage and streamer is None:
                         self._offloader(self.model, block_name)
 
                 clear_memory()
@@ -506,6 +572,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             remain_layer_names.append(n)
         for name in remain_layer_names:
             logger.info(f"Quantizing remaining layer {name} on CPU.")
+            if streamer is not None:
+                parent = name.rsplit(".", 1)[0]
+                streamer.load_module_(get_module(self.model, parent), parent, device="cpu")
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.
@@ -514,8 +583,33 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         # Convert remaining fp8
         convert_module_to_hp_if_necessary(self.model, self.amp_dtype, self.device)
-        if self.compress_context.low_cpu_mem_usage:
+        if self.compress_context.low_cpu_mem_usage and streamer is None:
             self._offloader.reload(self.model)
+        if streamer is not None and self.compress_context.is_immediate_saving:
+            # Root pass-through tensors (embeddings, final norm, lm_head, ...) are
+            # still meta; stream them in so ShardWriter.finalize() sees real data
+            # (finalize silently skips meta tensors).
+            from auto_round.compressors.utils import check_to_quantized as _ctq
+
+            saved = set(self.shard_writer._all_saved)
+            quantized_prefixes = tuple(
+                n for n, m in self.model.named_modules() if _ctq(m) and not any(m.children())
+            )
+            targets = dict(self.model.named_parameters())
+            targets.update(dict(self.model.named_buffers()))
+            for pname, tensor in self.model.state_dict().items():
+                if pname in saved or tensor.device.type != "meta":
+                    continue
+                if any(pname == q or pname.startswith(q + ".") for q in quantized_prefixes):
+                    continue  # quantized layer's original weight — packed name was written
+                tgt = targets.get(pname, None)
+                if tgt is None:
+                    logger.debug(f"[stream] root tensor {pname} has no live parameter/buffer; skipped")
+                    continue
+                if pname not in streamer.weight_map:
+                    logger.warning(f"[stream] root tensor {pname} missing from checkpoint; skipped")
+                    continue
+                streamer.fetch_into_(self.model, pname)
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
