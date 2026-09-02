@@ -157,19 +157,7 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
             "from the source checkpoint on demand (meta skeleton, one resident "
             "block at a time) and pack/save progressively; for models larger than "
             "host RAM. The activation chain and layerwise rotation auto-engage "
-            "when the run needs them (iters>0, imatrix, rotations)."
-        ),
-    )
-    rt.add_argument(
-        "--stream_calibration",
-        dest="stream_calibration",
-        default=False,
-        action="store_true",
-        help=(
-            "Chain calibration sequences block-to-block under stream_quantization "
-            "so imatrix / tuning (iters>0) see real activations without a full "
-            "model load. Auto-engages when needed; pass explicitly to force the "
-            "imatrix chain on for a weight-only (iters=0) run."
+            "when the run needs them (iters>0, imatrix on, rotations)."
         ),
     )
     rt.add_argument(

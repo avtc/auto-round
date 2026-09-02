@@ -406,8 +406,8 @@ class TestStageDeviceResolution:
 
 class TestStreamingRoutingWaiver:
     """Calibration-demand resolution under stream_quantization: RTN stays waived
-    (weight-only); SignRound (iters>0) is admitted only with the chained
-    calibration (stream_calibration) and hard-errors without it."""
+    (weight-only); SignRound (iters>0) is admitted when the chained calibration
+    is active (auto-engaged) and falls back to the data-driven path without it."""
 
     def _needs(self, configs, **attrs):
         from types import SimpleNamespace
@@ -557,17 +557,25 @@ class TestStreamFeatureAutoEngage:
         stub = self._engage([RTNConfig(group_size=16)], stream_quantization=True)
         assert stub.stream_calibration is False
 
+    def test_calibration_auto_engages_for_rule_enabled_imatrix(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        cfg = OptimizedRTNConfig(group_size=16)  # sym int4: imatrix on by scheme rules
+        cfg.enable_imatrix = True
+        stub = self._engage([cfg], stream_quantization=True)
+        assert stub.stream_calibration is True
+
+    def test_calibration_not_engaged_for_imatrix_off(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        stub = self._engage([RTNConfig(group_size=16)], stream_quantization=True)
+        assert stub.stream_calibration is False
+
     def test_calibration_not_engaged_without_streaming(self):
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
         stub = self._engage([SignRoundConfig(group_size=16, iters=1)])
         assert stub.stream_calibration is False
-
-    def test_explicit_calibration_kept(self):
-        from auto_round.algorithms.quantization.rtn.config import RTNConfig
-
-        stub = self._engage([RTNConfig(group_size=16)], stream_calibration=True)
-        assert stub.stream_calibration is True
 
 
 @pytest.mark.slow
@@ -617,7 +625,6 @@ class TestStreamQuantizeEquivalence:
         stream,
         stream_prefetch=0,
         stream_prefetch_devices=None,
-        stream_calibration=False,
         dataset=None,
     ):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
@@ -640,7 +647,6 @@ class TestStreamQuantizeEquivalence:
             stream_quantization=stream,
             stream_prefetch=stream_prefetch,
             stream_prefetch_devices=stream_prefetch_devices,
-            stream_calibration=stream_calibration,
             **kwargs,
             format="auto_round",
             disable_model_free=True,
@@ -768,7 +774,7 @@ class TestStreamQuantizeEquivalence:
         shutil.copytree(tiny_checkpoint, ck_a)
         shutil.copytree(tiny_checkpoint, ck_b)
         data_driven = self._quantize(ck_a, str(tmp_path / "a"), stream=False, dataset=rows)
-        streamed_calib = self._quantize(ck_b, str(tmp_path / "b"), stream=True, stream_calibration=True, dataset=rows)
+        streamed_calib = self._quantize(ck_b, str(tmp_path / "b"), stream=True, dataset=rows)
 
         def load_all(d):
             from safetensors import safe_open
@@ -827,7 +833,6 @@ class TestStreamQuantizeEquivalence:
             alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
             layerwise_rotation=False,
             stream_quantization=True,
-            stream_calibration=True,
             dataset=rows,
             seqlen=32,
             nsamples=4,
@@ -878,7 +883,6 @@ class TestStreamQuantizeEquivalence:
             alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
             layerwise_rotation=False,
             stream_quantization=True,
-            stream_calibration=True,
             enable_quanted_input=False,
             dataset=rows,
             seqlen=32,
@@ -923,7 +927,6 @@ class TestStreamQuantizeEquivalence:
             scheme="W4A16",
             alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
             stream_quantization=True,
-            stream_calibration=False,  # must auto-engage
             dataset=rows,
             seqlen=32,
             nsamples=4,

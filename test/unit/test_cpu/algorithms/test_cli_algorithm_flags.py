@@ -101,7 +101,6 @@ class TestStreamingCliFlags(unittest.TestCase):
             [
                 "--layerwise_rotation",
                 "--stream_quantization",
-                "--stream_calibration",
                 "--stream_calibration_rows",
                 "16",
                 "--iters",
@@ -110,7 +109,6 @@ class TestStreamingCliFlags(unittest.TestCase):
         )
         self.assertIs(kwargs["layerwise_rotation"], True)
         self.assertIs(kwargs["stream_quantization"], True)
-        self.assertIs(kwargs["stream_calibration"], True)
         self.assertEqual(kwargs["stream_calibration_rows"], 16)
         # unset prefetch -> off
         self.assertEqual(kwargs["stream_prefetch"], 0)
@@ -156,7 +154,6 @@ class TestStreamingCliFlags(unittest.TestCase):
         kwargs = self._compressor_kwargs([])
         self.assertIsNone(kwargs["layerwise_rotation"], "unset must auto-resolve, not force off")
         self.assertIs(kwargs["stream_quantization"], False)
-        self.assertIs(kwargs["stream_calibration"], False)
         self.assertEqual(kwargs["stream_calibration_rows"], 0)
         self.assertEqual(kwargs["stream_prefetch"], 0)
         self.assertIsNone(kwargs["stream_prefetch_devices"])

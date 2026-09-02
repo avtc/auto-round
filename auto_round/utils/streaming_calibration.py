@@ -16,7 +16,7 @@
 
 """Streaming calibration cache: per-block FP inputs without a full model load.
 
-Runs before the zero-shot quantization loop when ``stream_calibration=True``:
+Runs before the zero-shot quantization loop when the activation chain engages:
 calibration rows are pushed through the model one block at a time (blocks
 streamed onto the compute device, hidden states chained block-to-block), and
 each block's FP input tensors plus the forward kwargs are cached on the host —

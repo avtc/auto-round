@@ -338,7 +338,6 @@ _ENTRY_KWARG_OWNERS = {
     "stream_quantization": "compressor",
     "stream_prefetch": "compressor",
     "stream_prefetch_devices": "compressor",
-    "stream_calibration": "compressor",
     "stream_calibration_rows": "compressor",
     "format": "base",
     "dataset": "base",
