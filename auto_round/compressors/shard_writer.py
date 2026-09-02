@@ -29,8 +29,7 @@ from auto_round.utils import (
     get_reverse_checkpoint_conversion_mapping,
     revert_checkpoint_conversion_mapping,
 )
-
-DEFAULT_MAX_SHARD_SIZE = "5GB"
+from auto_round.utils.checkpoint_streamer import to_checkpoint_name
 
 
 class ShardWriter:
@@ -61,7 +60,21 @@ class ShardWriter:
             return
         self.model = model
         self.lm_head_name = get_lm_head_name(self.model)
-        self.max_shard_size = self._parse_size(max_shard_size or DEFAULT_MAX_SHARD_SIZE)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        # Heuristic estimate of model size in GB used to choose a default max_shard_size:
+        # - total_params * rounder.bits       -> total number of bits in all parameters
+        # - // 8                              -> convert bits to bytes
+        # - // 1e9                            -> approx convert bytes to GB (1e9 bytes ~= 1 GB)
+        # - final // 10                       -> apply a safety margin so default shards are
+        #                                         smaller than the full model; this intentionally
+        #                                         underestimates size before clamping below.
+        max_split_num = 10
+        model_size = int(total_params * bits // 1e9 // 8 + max_split_num - 1) / max_split_num
+        model_size = max(1, min(int(model_size), 5))
+
+        # Configuration
+        max_shard_size = max_shard_size or f"{model_size}GB"
+        self.max_shard_size = self._parse_size(max_shard_size)
         self.safe_serialization = safe_serialization
 
         # Internal State
@@ -204,15 +217,20 @@ class ShardWriter:
         # transformers will handle _checkpoint_conversion_mapping automatically if is_immediate_saving=False
         name = revert_checkpoint_conversion_mapping(name, self.reverse_checkpoint_conversion_mapping)
 
+        # hy_v3: write checkpoint spellings (shared_mlp / router.gate /
+        # expert_bias) so stock vLLM loads the export without renames
+        if getattr(getattr(self.model, "config", None), "model_type", None) == "hy_v3":
+            name = to_checkpoint_name(name)
+
         t_size = tensor.nbytes
         self.total_param_elems += tensor.numel()
         self.total_param_size_bytes += t_size
         tensor = tensor.detach().cpu()
-        # Keep an oversized tensor with any buffered tensors so it does not
-        # leave a tiny shard immediately before its own shard.
+        # If single tensor exceeds limit, flush current, save it solo, then continue
         if t_size > self.max_shard_size:
+            self._flush_shard()
             self.current_shard_tensors[name] = tensor
-            self.current_shard_size += t_size
+            self.current_shard_size = t_size
             self._flush_shard()
         # If adding exceeds limit, flush first
         elif self.current_shard_size + t_size > self.max_shard_size and self.current_shard_size > 0:

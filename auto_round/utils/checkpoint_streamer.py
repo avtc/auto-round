@@ -56,41 +56,6 @@ def to_checkpoint_name(name: str) -> str:
     return name
 
 
-_DTYPE_BYTES = {
-    "BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
-    "I16": 2, "U16": 2, "F16": 2, "BF16": 2,
-    "I32": 4, "U32": 4, "F32": 4,
-    "I64": 8, "U64": 8, "F64": 8,
-}
-
-
-def device_free_bytes(device: torch.device) -> Optional[int]:
-    """Free bytes on *device*; ``None`` when unknown (non-CUDA devices)."""
-    if device.type != "cuda":
-        return None
-    try:
-        free, _total = torch.cuda.mem_get_info(device)
-        return int(free)
-    except Exception:  # pragma: no cover - platform without a CUDA runtime
-        return None
-
-
-def pick_stage_device(devices: list, index: int, needed_bytes: int, headroom: int) -> Optional[torch.device]:
-    """Choose a staging device for prefix *index*, or ``None`` when no CUDA
-    device can hold ``needed_bytes`` while keeping ``headroom`` free for the
-    tuning fan-out's search batches.
-
-    Walks the round-robin rotation first; callers decide how to react to
-    ``None`` (wait for VRAM, or stage on host RAM when explicitly requested).
-    """
-    for k in range(len(devices)):
-        d = torch.device(devices[(index + k) % len(devices)])
-        free = device_free_bytes(d)
-        if free is None or free >= needed_bytes + headroom:
-            return d
-    return None
-
-
 class CheckpointStreamer:
     """Streams tensors from a HuggingFace checkpoint on demand.
 
@@ -423,8 +388,18 @@ class CheckpointStreamer:
         targets.update(dict(module.named_buffers(recurse=True)))
         by_short = {prefix + ("." if prefix else "") + k: v for k, v in targets.items()}
         loaded = []
+        rewrites_hit = 0
         for name in self.names_under(prefix):
-            tgt = by_short.get(name, None)
+            tgt, mod_name = by_short.get(name), name
+            if tgt is None:
+                for ckpt_frag, mod_frag in _CKPT_NAME_REWRITES:
+                    if ckpt_frag in name:
+                        cand = name.replace(ckpt_frag, mod_frag)
+                        tgt = by_short.get(cand)
+                        if tgt is not None:
+                            mod_name = cand
+                            rewrites_hit += 1
+                            break
             if tgt is None:
                 logger.debug(f"[stream] {name} has no matching parameter/buffer in the module; skipped")
                 continue
@@ -433,9 +408,12 @@ class CheckpointStreamer:
                 raise ValueError(
                     f"[stream] shape mismatch for {name}: checkpoint {tuple(tensor.shape)} vs module {tuple(tgt.shape)}"
                 )
-            if not self._assign_leaf_(module, name[len(prefix) + 1:] if prefix else name, tensor):
+            rel = mod_name[len(prefix) + 1 :] if prefix else mod_name
+            if not self._assign_leaf_(module, rel, tensor):
                 raise RuntimeError(f"[stream] failed to assign {name!r} into module")
             loaded.append(name)
+        if rewrites_hit:
+            logger.info(f"[stream] {rewrites_hit} checkpoint tensor(s) matched via name rewrite")
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
         if self._prefetch_thread is not None:
