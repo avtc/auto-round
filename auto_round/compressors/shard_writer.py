@@ -121,6 +121,115 @@ class ShardWriter:
         cls._initialized = False
         cls._instance = None
 
+    @staticmethod
+    def _read_safetensors_header(path: str) -> Optional[dict]:
+        """Parse a safetensors header (tensor_name -> dtype/shape) without loading data."""
+        import json
+        import struct
+
+        try:
+            with open(path, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(n))
+            header.pop("__metadata__", None)
+            return header
+        except (OSError, ValueError, struct.error, OverflowError):
+            return None
+
+    def adopt_existing_shards(self) -> int:
+        """Adopt shard files a previous (crashed) run already wrote to the output dir.
+
+        Resume support: the manifest marks a block done only after its tensors are
+        durably flushed, so a resumed process must not re-write those tensors -- but
+        a fresh ShardWriter starts at ``shard_counter = 0`` and would silently
+        OVERWRITE ``model-shard-00001`` on its first flush, destroying the crashed
+        run's data and dropping its tensors from the final index. Adoption
+        reconstructs the writer's bookkeeping (shard_meta / _all_saved / counters /
+        size stats) from the safetensors headers on disk.
+
+        Rules:
+        - only the highest-numbered shard may be unparseable (a crash mid-flush):
+          it is deleted, its tensors belong to the un-marked in-flight block and
+          will be re-written by the resumed run;
+        - an unparseable non-tail shard is corruption: hard error (never silent
+          data loss);
+        - ``.bin`` shards cannot be adopted (no cheap header): hard error telling
+          the user resume requires safe_serialization.
+
+        Returns the number of adopted shards.
+        """
+        import glob
+        import re
+
+        output_dir = self.output_dir
+        if not os.path.isdir(output_dir):
+            return 0
+
+        pattern = re.compile(r"^model-shard-(\d+)\.safetensors$")
+        found = {}
+        for fname in os.listdir(output_dir):
+            mobj = pattern.match(fname)
+            if mobj:
+                found[int(mobj.group(1))] = fname
+        if not found:
+            bin_shards = [f for f in os.listdir(output_dir) if re.match(r"^model-shard-\d+\.bin$", f)]
+            if bin_shards:
+                raise RuntimeError(
+                    f"ShardWriter resume: found torch .bin shards in {output_dir} but adoption requires "
+                    "safetensors headers (safe_serialization). Use a fresh --output_dir or enable safetensors."
+                )
+            return 0
+
+        dtype_sizes = {
+            "F64": 8,
+            "F32": 4,
+            "F16": 2,
+            "BF16": 2,
+            "I64": 8,
+            "I32": 4,
+            "I16": 2,
+            "I8": 1,
+            "U8": 1,
+            "BOOL": 1,
+        }
+        numbers = sorted(found)
+        for num in numbers:
+            path = os.path.join(output_dir, found[num])
+            header = self._read_safetensors_header(path)
+            if header is None:
+                if num == numbers[-1]:
+                    logger.warning(
+                        "ShardWriter resume: tail shard %s is incomplete (crash mid-flush); deleting it -- "
+                        "its block was not marked done and will be re-done",
+                        found[num],
+                    )
+                    os.remove(path)
+                    continue
+                raise RuntimeError(
+                    f"ShardWriter resume: shard {found[num]} in {output_dir} is corrupt (only the tail "
+                    "shard of a crashed run may be incomplete). Use a fresh --output_dir."
+                )
+            params = list(header.keys())
+            self.shard_meta.append({"tmp_file": found[num], "params": params, "dir": output_dir})
+            self._all_saved.update(params)
+            for name, meta in header.items():
+                numel = 1
+                for dim in meta.get("shape", []):
+                    numel *= dim
+                self.total_param_elems += numel
+                self.total_param_size_bytes += numel * dtype_sizes.get(meta.get("dtype", "F32"), 4)
+            self.shard_counter = max(self.shard_counter, num)
+
+        if self.shard_meta:
+            logger.info(
+                "ShardWriter resume: adopted %d existing shard(s) from %s (%d tensors); new shards continue at %05d",
+                len(self.shard_meta),
+                output_dir,
+                len(self._all_saved),
+                self.shard_counter + 1,
+            )
+        return len(self.shard_meta)
+
     @classmethod
     def get_shard_writer(cls, *args, **kwargs) -> Optional["ShardWriter"]:
         """Return the current singleton instance, or None if not yet initialized.

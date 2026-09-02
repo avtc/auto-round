@@ -15,6 +15,8 @@
 import os
 from types import SimpleNamespace
 
+import pytest
+
 import torch
 
 from auto_round.compressors.shard_writer import ShardWriter
@@ -203,6 +205,7 @@ def test_finalize_offloads_module_with_tensor_in_parameters(tmp_path, monkeypatc
     assert offloaded_weight.device.type == "meta"
 
 
+<<<<<<< HEAD:test/unit/common/utils/test_shard_writer.py
 def test_default_max_shard_size_is_fixed(tmp_path, monkeypatch):
     writer = _make_writer(_DiffusionStyleModel(), str(tmp_path), monkeypatch)
     assert writer.max_shard_size == 1 * 1024**2
@@ -226,3 +229,91 @@ def test_oversized_tensor_does_not_leave_tiny_preceding_shard(tmp_path, monkeypa
 
     assert writer.shard_counter == 1
     assert set(writer.current_shard_tensors) == set()
+=======
+class TestAdoptExistingShards:
+    """Resume support: a fresh writer must adopt shards a crashed run already wrote.
+
+    Without adoption the resumed writer starts at shard_counter=0 and its first
+    flush silently overwrites model-shard-00001.safetensors, destroying the
+    crashed run's tensors and dropping them from the final index.
+    """
+
+    def _writer(self, output_dir, monkeypatch):
+        ShardWriter.reset()
+        compress_context = SimpleNamespace(formats=[_FormatStub()], output_dir=output_dir)
+        model_context = SimpleNamespace(is_diffusion=False)
+        monkeypatch.setattr(CompressContext, "get_context", classmethod(lambda cls: compress_context))
+        monkeypatch.setattr(ModelContext, "get_context", classmethod(lambda cls: model_context))
+        return ShardWriter(torch.nn.Module(), bits=4, max_shard_size="1MB", safe_serialization=True)
+
+    def test_adopt_continues_numbering_and_index_covers_all(self, tmp_path, monkeypatch):
+        from safetensors.torch import load_file
+
+        out = str(tmp_path)
+        t0 = torch.randn(4, 4)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", t0)
+        w1._flush_shard()
+        # crash: no finalize, singleton reset
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 1
+        assert "blk.0.w" in w2._all_saved
+        assert w2.shard_counter == 1
+        t1 = torch.randn(4, 4)
+        w2.save_tensor("blk.1.w", t1)
+        w2.finalize()
+
+        import json
+
+        index = json.loads(open(os.path.join(out, "model.safetensors.index.json"), encoding="utf-8").read())
+        assert index["metadata"]["total_shards"] == 2
+        assert "blk.0.w" in index["weight_map"]
+        assert "blk.1.w" in index["weight_map"]
+        # the crashed run's shard must survive byte-identical (no overwrite)
+        shard0 = os.path.join(out, "model-00001-of-00002.safetensors")
+        assert torch.equal(load_file(shard0)["blk.0.w"], t0)
+        shard1 = os.path.join(out, "model-00002-of-00002.safetensors")
+        assert torch.equal(load_file(shard1)["blk.1.w"], t1)
+
+    def test_adopt_deletes_incomplete_tail_shard(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", torch.randn(4, 4))
+        w1._flush_shard()
+        w1.save_tensor("blk.1.w", torch.randn(4, 4))
+        w1._flush_shard()
+        # crash mid-flush of a third shard: truncated file on disk
+        tail = os.path.join(out, "model-shard-00003.safetensors")
+        with open(tail, "wb") as f:
+            f.write(b"\x00" * 17)  # header length + partial json
+
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 2
+        assert not os.path.exists(tail), "incomplete tail shard must be deleted"
+        assert w2.shard_counter == 2
+
+    def test_adopt_raises_on_corrupt_non_tail_shard(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", torch.randn(4, 4))
+        w1._flush_shard()
+        w1.save_tensor("blk.1.w", torch.randn(4, 4))
+        w1._flush_shard()
+        # corrupt the FIRST shard (not the tail): real corruption
+        with open(os.path.join(out, "model-shard-00001.safetensors"), "r+b") as f:
+            f.write(b"\xff\xff\xff\xff\xff\xff\xff\xff")
+
+        w2 = self._writer(out, monkeypatch)
+        with pytest.raises(RuntimeError, match="corrupt"):
+            w2.adopt_existing_shards()
+
+    def test_adopt_refuses_bin_shards(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        with open(os.path.join(out, "model-shard-00001.bin"), "wb") as f:
+            f.write(b"junk")
+        w = self._writer(out, monkeypatch)
+        with pytest.raises(RuntimeError, match="safetensors"):
+            w.adopt_existing_shards()
+>>>>>>> 6c01b543 (feat(shard_writer): adopt shards from a crashed run for resume support):test/unit/test_cpu/utils/test_shard_writer.py
