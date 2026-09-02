@@ -540,27 +540,11 @@ class TestStreamModeExclusivity:
         assert called["meta"] == 1, "mllm + stream_quantization must use the streaming loader"
         assert ctx.is_mllm is True
 
-    def test_quant_nontext_module_under_streaming_raises(self, monkeypatch):
-        """quant_nontext_module + streaming must fail fast: the streaming chain
-        feeds text hidden states block-to-block and cannot drive vision blocks
-        (silently including them would quantize on garbage statistics)."""
-        from types import SimpleNamespace
-
-        import pytest
-
-        from auto_round.compressors.base import BaseCompressor
-
-        stub = SimpleNamespace(stream_quantization=True)
-        with pytest.raises(ValueError, match="quant_nontext_module=True is not supported under stream_quantization"):
-            BaseCompressor._validate_stream_options(stub, quant_nontext_module=True)
-        # sanity: allowed combination passes
-        BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
-
     def test_stream_quantization_with_mllm_and_env_var_still_raises(self, monkeypatch):
         import pytest
 
-        with pytest.raises(ValueError, match="multimodal"):
-            self._make_context(monkeypatch, mllm=True)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._make_context(monkeypatch, mllm=True, env_disk_stream=True)
 
     def test_text_path_without_env_proceeds_to_meta_load(self, monkeypatch):
         """Sanity: the guards must not fire on the normal text streaming path

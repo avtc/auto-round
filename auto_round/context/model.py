@@ -180,18 +180,46 @@ class ModelContext(BaseContext):
         from auto_round.utils.common import monkey_patch_model
         from auto_round.utils.model import handle_generation_config
 
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=self.trust_remote_code)
-        monkey_patch_model(model)
-        handle_generation_config(model)
-        self.model = model.eval()
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=self.trust_remote_code)
-        except Exception as e:
-            # Zero-shot streaming never consumes calibration data; a tokenizer
-            # is only needed for the export copy-through.
-            logger.warning(f"[stream_quantization] tokenizer unavailable ({e}); continuing without it.")
-            self.tokenizer = None
+        if self.is_mllm:
+            # Multimodal: AutoModelForCausalLM cannot resolve VL architectures;
+            # build_meta_model resolves the exact class from config.architectures
+            # (same strategy as the AR_DISK_STREAM_MODEL loader). The vision
+            # tower stays meta -- zero-shot never forwards it and the streaming
+            # export passes its tensors through verbatim -- and only the
+            # processor stack loads eagerly for the export copy-through.
+            from auto_round.utils.disk_stream_util import build_meta_model
+
+            model, tokenizer, _index = build_meta_model(self.model, trust_remote_code=self.trust_remote_code)
+            model.path = self.model
+            monkey_patch_model(model)
+            handle_generation_config(model)
+            self.model = model.eval()
+            self.tokenizer = tokenizer
+            try:
+                from transformers import AutoProcessor
+
+                self.processor = AutoProcessor.from_pretrained(
+                    self.model_path, trust_remote_code=self.trust_remote_code
+                )
+                self.image_processor = getattr(self.processor, "image_processor", None)
+                self.tokenizer = getattr(self.processor, "tokenizer", None) or tokenizer
+            except Exception as e:
+                logger.warning(f"[stream_quantization] processor unavailable ({e}); continuing without it.")
+        else:
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=self.trust_remote_code)
+            monkey_patch_model(model)
+            handle_generation_config(model)
+            self.model = model.eval()
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path, trust_remote_code=self.trust_remote_code
+                )
+            except Exception as e:
+                # Zero-shot streaming never consumes calibration data; a tokenizer
+                # is only needed for the export copy-through.
+                logger.warning(f"[stream_quantization] tokenizer unavailable ({e}); continuing without it.")
+                self.tokenizer = None
         self.checkpoint_streamer = CheckpointStreamer(self.model_path)
         logger.info(
             f"[stream_quantization] model structure loaded on meta device; "
@@ -200,6 +228,13 @@ class ModelContext(BaseContext):
         )
 
     def _load_model(self):
+        if self.stream_quantization and envs.AR_DISK_STREAM_MODEL:
+            raise ValueError(
+                "AR_DISK_STREAM_MODEL and --stream_quantization are mutually "
+                "exclusive: the env var selects the offloader (data-driven) disk "
+                "stream, the flag selects the never-materialize streaming loop. "
+                "Unset AR_DISK_STREAM_MODEL to use --stream_quantization."
+            )
         if is_diffusion_model(self.model):
             self.is_diffusion = True
             self.preloaded_diffusion_pipeline = not isinstance(self.model, str)
@@ -216,12 +251,13 @@ class ModelContext(BaseContext):
         elif is_mllm_model(self.model, platform=self.platform):
             self.is_mllm = True
             if self.stream_quantization:
-                raise ValueError(
-                    "--stream_quantization does not support multimodal models yet "
-                    "(the meta-skeleton loader is text-LLM only); disable it or use "
-                    "AR_DISK_STREAM_MODEL for the multimodal disk-stream path."
-                )
-            if isinstance(self.model, str):
+                # Same never-materialize contract as the text path: the meta
+                # skeleton resolves the multimodal class from architectures,
+                # the vision tower stays meta (zero-shot never forwards it;
+                # export passes its tensors through verbatim), and only the
+                # processor stack loads eagerly.
+                self._load_model_on_meta()
+            elif isinstance(self.model, str):
                 # Multimodal checkpoints used to
                 # bypass disk streaming entirely -- mllm_load_model fully
                 # materializes the checkpoint on CPU, infeasible for a 100B+
@@ -259,13 +295,6 @@ class ModelContext(BaseContext):
                         self.model, platform=self.platform, device="cpu", model_dtype=self.model_dtype
                     )
         elif isinstance(self.model, str) and self.stream_quantization:
-            if envs.AR_DISK_STREAM_MODEL:
-                raise ValueError(
-                    "AR_DISK_STREAM_MODEL and --stream_quantization are mutually "
-                    "exclusive: the env var selects the offloader (data-driven) disk "
-                    "stream, the flag selects the never-materialize streaming loop. "
-                    "Unset AR_DISK_STREAM_MODEL to use --stream_quantization."
-                )
             self._load_model_on_meta()
         elif isinstance(self.model, str):
             config = self.config
