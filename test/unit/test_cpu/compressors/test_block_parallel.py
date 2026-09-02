@@ -718,3 +718,28 @@ class TestInputOthersAlwaysMoved:
         moved = to_device(others, torch.device("cpu"))
         # identity for on-device tensors - masters untouched, structure intact
         assert moved["position_embeddings"][0][0] is cos
+
+
+class TestRehomeBlock:
+    """Shared/setup modules reachable from a streamed block move onto its home."""
+
+    def test_moves_foreign_tensor_leaves_meta(self):
+        import torch
+
+        from auto_round.compressors.utils import rehome_block_
+
+        block = torch.nn.Linear(4, 4)  # cpu params
+        block.register_buffer("meta_tbl", torch.ones(4, device="meta"))
+        moved = rehome_block_(block, torch.device("meta"))
+        assert moved == 2  # weight + bias moved cpu -> meta
+        assert block.weight.device.type == "meta"
+        assert block.meta_tbl.device.type == "meta"  # was already there, untouched
+
+    def test_noop_when_placed(self):
+        import torch
+
+        from auto_round.compressors.utils import rehome_block_
+
+        block = torch.nn.Linear(4, 4)
+        assert rehome_block_(block, torch.device("cpu")) == 0
+        assert block.weight.device.type == "cpu"

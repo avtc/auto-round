@@ -33,6 +33,7 @@ from auto_round.compressors.utils import (
     _get_quantized_layer_names_outside_blocks,
     immediate_pack,
     is_nv_fp,
+    rehome_block_,
     strip_stale_device_hooks_,
 )
 from auto_round.data_type.utils import update_block_global_scale_if_needed
@@ -544,6 +545,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
                 materialize_model_(block)
+                strip_stale_device_hooks_(block)
+                _n_moved = rehome_block_(block, load_device)
+                if stream_block_idx == 0:
+                    logger.info(
+                        "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
+                        "re-homed to %s (shared/setup modules start on the primary)",
+                        block_name,
+                        _n_moved,
+                        load_device,
+                    )
+                _t_load = _time.perf_counter() - _t_load
 
                 # ── Pure algorithm ────────────────────────────────────────
                 ctx = BlockContext(
