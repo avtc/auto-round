@@ -214,7 +214,7 @@ class CheckpointStreamer:
     # ── Prefetch ─────────────────────────────────────────────────────────────
 
     # Bytes reserved per staging GPU for the tuning fan-out's share of the
-    # active block's search batches (chunked NeUQI stacks + intermediates).
+    # active block's search batches (chunked stacks + intermediates).
     _staging_search_headroom = 4 * 1024**3
 
     def _prefix_bytes_estimate(self, prefix: str) -> int:

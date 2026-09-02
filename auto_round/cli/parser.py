@@ -141,7 +141,7 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         default=False,
         action="store_true",
         help=(
-            "Apply rotation transforms (e.g. PreSINQ) per block inside the streaming "
+            "Apply rotation transforms (e.g. Hadamard rotations) per block inside the streaming "
             "block loop instead of one whole-model pass. Auto-enables under "
             "--stream_quantization when rotation transforms are present; the flag "
             "remains for explicit control on non-streamed models."
