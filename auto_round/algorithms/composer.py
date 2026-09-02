@@ -614,11 +614,11 @@ class AlgorithmComposer:
     # entry point :meth:`apply_model_transforms`.
 
     _STREAMED_ROTATION_MSG = (
-        "Rotation transforms on a streamed model (stream_quantization / meta "
-        "skeleton) can only run layer-wise: leave layerwise_rotation unset (it "
-        "auto-enables under stream_quantization) or pass --layerwise_rotation, "
-        "so each block is folded inside the streaming block loop instead of "
-        "materializing the whole model."
+        "Rotation transforms on a streamed model (stream_quantization / "
+        "AR_DISK_STREAM_MODEL meta skeleton) can only run layer-wise: leave "
+        "layerwise_rotation unset (it auto-enables under both streaming modes) "
+        "or pass --layerwise_rotation, so each block is folded inside the "
+        "block loop instead of materializing the whole model."
     )
 
     def _model_has_meta(self, model) -> bool:
@@ -636,7 +636,9 @@ class AlgorithmComposer:
         REMAINING afterwards belong to a streamed skeleton (no original to
         materialize from) and must not be folded.
         """
-        if getattr(self._orchestrator_ref, "stream_quantization", False):
+        from auto_round import envs
+
+        if getattr(self._orchestrator_ref, "stream_quantization", False) or bool(envs.AR_DISK_STREAM_MODEL):
             raise ValueError(self._STREAMED_ROTATION_MSG)
         from auto_round.modeling.fused_moe.replace_modules import ReplacementModuleBase, materialize_model_
 
