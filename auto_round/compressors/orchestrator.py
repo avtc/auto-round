@@ -33,6 +33,7 @@ from auto_round.compressors.utils import (
     _get_quantized_layer_names_outside_blocks,
     immediate_pack,
     is_nv_fp,
+    strip_stale_device_hooks_,
 )
 from auto_round.data_type.utils import update_block_global_scale_if_needed
 from auto_round.logger import logger
