@@ -45,6 +45,8 @@ from auto_round.utils import (
 )
 from auto_round.utils.device_manager import device_manager
 
+from auto_round.logger import logger
+
 
 def _as_scheme(ar_or_scheme) -> "QuantizationScheme":
     """Resolve a compressor-like object or QuantizationScheme to a QuantizationScheme.
@@ -525,6 +527,118 @@ def _get_save_folder_name(format, *args, **kwargs) -> str:
         return os.path.join(compress_context.output_dir, sanitized_format)
 
     return compress_context.output_dir
+
+
+_PACK_DEVICE_LOGGED = False
+
+
+def _format_supports_batched_pack(fmt) -> bool:
+    """True when the format's pack chain terminates in a qlinear-family packer.
+
+    ``AutoRoundFormat`` wraps other format families while its own identity
+    attributes stay plain (``output_format`` / ``format_name`` remain
+    "auto_round" even for routed formats), so the check must look at the
+    ROUTING, never at the wrapper's identity attributes. Eligible pack chains:
+    plain unrouted ``auto_round`` (qlinear_torch), the routed gptq packer
+    (qlinear_torch_zp), and the routed awq packer (WQLinear_GEMM) -- all three
+    share the column-sliceable packed layout. Routed llm_compressor / nvfp /
+    mxfp / fp8 wrappers pack through their own paths and keep the per-module
+    immediate_pack loop; batched-packing those would write qweight/qzeros/
+    scales modules into an otherwise differently-packed checkpoint that no
+    single consumer can load.
+    """
+    if getattr(fmt, "format_name", None) != "auto_round":
+        return False
+    out = str(getattr(fmt, "output_format", "") or "")
+    if not out.startswith("auto_round"):
+        return False
+    if any(tok in out for tok in ("nv_fp", "mx_fp", "nvfp", "mxfp", "fp8", "fake", "llm_compressor")):
+        return False
+    backend = getattr(fmt, "backend", None)
+    if backend is None:
+        return True  # plain, unrouted
+    # routed: only the gptq / awq packers share the batchable layout
+    return str(getattr(backend, "format_name", "") or "") in ("auto_gptq", "auto_awq")
+
+
+def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: int = 1):
+    """Immediate-pack every quantizable module of one block.
+
+    Same-shape Linear modules (routed MoE experts are the extreme case:
+    every expert projection in a block shares one shape) go through a
+    single batched pack pass (bitwise-identical to per-module packing, but one
+    Python/alloc/transfer round trip per shape group instead of per module);
+    everything else falls back to the per-module :func:`immediate_pack`.
+    Non-batchable formats use the per-module path throughout.
+    """
+    names = []
+    for _n, _mod in block.named_modules():
+        if hasattr(_mod, "bits") and check_to_quantized(_mod):
+            module_name = getattr(_mod, "global_name", None)
+            if module_name is None and nblocks == 1 and _n:
+                module_name = f"{block.global_name}.{_n}"
+            if module_name is None:
+                continue
+            names.append(module_name)
+    if not names:
+        return  # nothing to pack: do not even touch the context singletons
+
+    from auto_round.context.compress import CompressContext
+    from auto_round.context.model import ModelContext
+    from auto_round.utils.device_manager import device_manager
+
+    compress_context = CompressContext.get_context()
+    if not compress_context.is_immediate_packing:
+        return
+    model = ModelContext.get_context().model
+
+    fmt = compress_context.formats[0] if compress_context.formats else None
+    from auto_round.utils.device_manager import get_packing_device
+
+    pack_device = get_packing_device(device_manager.device)
+    from auto_round import envs
+    from auto_round.utils.perf import perf
+
+    # AR_BATCHED_PACKING: None ("auto") batches on accelerators only -- CPU
+    # packing is elementwise-compute-bound and batching trades small per-module
+    # allocations for one huge intermediate, measuring ~30% slower there.
+    # 1 forces batching everywhere (benching), 0 disables it outright.
+    batched = envs.AR_BATCHED_PACKING
+    if batched is None:
+        batched = pack_device.type != "cpu"
+    elif batched and pack_device.type == "cpu":
+        logger.info("immediate_pack_block: AR_BATCHED_PACKING=1 forces batched packing on CPU")
+    use_batched = fmt is not None and batched and _format_supports_batched_pack(fmt)
+    if not use_batched and fmt is not None and batched:
+        logger.debug("immediate_pack_block: format not batchable; using per-module pack")
+    if use_batched:
+        global _PACK_DEVICE_LOGGED
+        # once per run: a per-block line collides with the tqdm redraws and
+        # garbles the log ("...(batched...):33, 16.50s/it]")
+        if not _PACK_DEVICE_LOGGED:
+            _PACK_DEVICE_LOGGED = True
+            logger.info("immediate_pack_block: packing on %s (batched for same-shape Linear groups)", pack_device)
+    with perf.phase("pack"):
+        if use_batched:
+            from auto_round.export.export_to_autoround.export import pack_layers_batched
+
+            # routed formats (gptq / awq packers) must pack through the ROUTED
+            # backend's own format string -- the wrapper's output_format stays
+            # "auto_round", which would resolve the wrong packer class.
+            backend_fmt = getattr(fmt, "backend", None)
+            backend_str = (
+                getattr(backend_fmt, "output_format", None)
+                if backend_fmt is not None
+                else getattr(fmt, "output_format", "auto_round")
+            )
+            _packed, names = pack_layers_batched(
+                names,
+                model,
+                backend=backend_str or "auto_round",
+                device=str(pack_device),
+            )
+        for module_name in names:
+            immediate_pack(module_name, layer_config)
 
 
 def immediate_pack(name: str, layer_config: dict):

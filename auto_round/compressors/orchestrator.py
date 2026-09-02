@@ -253,19 +253,23 @@ class CompressionOrchestrator(BaseOrchestrator):
             # matching post-tune offload runs when `low_cpu_mem_usage` is False --
             # see the `is_immediate_saving`-adjacent offload call further down),
             # matching upstream's own choice not to cycle blocks for these formats.
-            if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
-                if nblocks == 1:
-                    self._offloader.reload(model, n)
-                else:
-                    self._offloader.reload(model, names)
+            from auto_round.utils.perf import perf
 
-            block_name_or_names = n if nblocks == 1 else names
+            perf.start_block(n if nblocks == 1 else str(names))
+            with perf.phase("read"):
+                if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL:
+                    if nblocks == 1:
+                        self._offloader.reload(model, n)
+                    else:
+                        self._offloader.reload(model, names)
 
-            # ── Infrastructure: materialize, dtype convert, device placement ──
-            materialize_model_(m)
-            convert_module_to_hp_if_necessary(m, self.model_context.amp_dtype, device_manager.device)
+                block_name_or_names = n if nblocks == 1 else names
 
-            m = self.alg_composer.dispatch_block(m, input_ids, input_others)
+                # ── Infrastructure: materialize, dtype convert, device placement ──
+                materialize_model_(m)
+                convert_module_to_hp_if_necessary(m, self.model_context.amp_dtype, device_manager.device)
+
+                m = self.alg_composer.dispatch_block(m, input_ids, input_others)
 
             # ── Pipeline lifecycle: per-block setup ───────────────────────────
             from auto_round.algorithms.composer import BlockContext
@@ -290,14 +294,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
 
             # ── Run block pipeline (calibration → quantization → collection) ──
-            new_q_input, reference_output = self.alg_composer.compress_block(
-                m,
-                input_ids,
-                input_others,
-                block_ctx=ctx,
-                q_inputs=q_input,
-                input_ids=token_ids,
-            )
+            with perf.phase("tune"):
+                new_q_input, reference_output = self.alg_composer.compress_block(
+                    m,
+                    input_ids,
+                    input_others,
+                    block_ctx=ctx,
+                    q_inputs=q_input,
+                    input_ids=token_ids,
+                )
 
             # ── Infrastructure: memory management ─────────────────────────────
             # Mirrors the original q_input-swap + end-of-loop clear_memory semantics:
@@ -325,32 +330,26 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             # ── Infrastructure: immediate_pack / shard write ──────────────────
             if self.compress_context.is_immediate_packing:
-                for _n, _mod in m.named_modules():
-                    if hasattr(_mod, "bits") and check_to_quantized(_mod):
-                        from auto_round.compressors.utils import immediate_pack as _immediate_pack
+                from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
-                        module_name = getattr(_mod, "global_name", None)
-                        if module_name is None and nblocks == 1 and _n:
-                            module_name = f"{n}.{_n}"
-                        if module_name is None:
-                            continue
-                        _immediate_pack(module_name, self.layer_config)
+                _immediate_pack_block(m, n, self.layer_config, nblocks=nblocks)
 
             input_ids = next_input_ids
 
-            if self.compress_context.is_immediate_saving:
-                self.shard_writer.write(m, is_finalize=False)
-                # ShardWriter only actually flushes to disk once its
-                # shard-size budget is reached (`_flush_shard`, private but
-                # there's no public equivalent) -- `write()` above may just
-                # buffer this block's tensors in memory. Force a flush here
-                # whenever resumability is active, since marking a block
-                # "done" in the resume manifest is a lie if a crash before
-                # the next natural flush would lose its tensors entirely.
-                # Only pay this extra small-shard-fragmentation cost when
-                # AR_RESUME_DIR is actually set.
-                if resume_state is not None:
-                    self.shard_writer._flush_shard()
+            with perf.phase("write"):
+                if self.compress_context.is_immediate_saving:
+                    self.shard_writer.write(m, is_finalize=False)
+                    # ShardWriter only actually flushes to disk once its
+                    # shard-size budget is reached (`_flush_shard`, private but
+                    # there's no public equivalent) -- `write()` above may just
+                    # buffer this block's tensors in memory. Force a flush here
+                    # whenever resumability is active, since marking a block
+                    # "done" in the resume manifest is a lie if a crash before
+                    # the next natural flush would lose its tensors entirely.
+                    # Only pay this extra small-shard-fragmentation cost when
+                    # AR_RESUME_DIR is actually set.
+                    if resume_state is not None:
+                        self.shard_writer._flush_shard()
 
             if self.compress_context.low_cpu_mem_usage and not self.compress_context.is_immediate_saving:
                 if nblocks == 1:
@@ -371,6 +370,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # as its chained hidden-state input, which is exactly what
                 # needs to be persisted here.
                 resume_state.mark_block_done(n, q_input, input_ids)
+            perf.finish_block()
         if pbar is not None:
             pbar.update(1)
 
@@ -440,8 +440,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 pbar.set_description(f"Quantizing {block_name}")
                 block = get_module(self.model, block_name)
 
+                from auto_round.utils.perf import perf
+
+                perf.start_block(block_name)
                 # ── Infrastructure: materialize ───────────────────────────
-                materialize_model_(block)
+                with perf.phase("read"):
+                    materialize_model_(block)
 
                 # ── Pure algorithm ────────────────────────────────────────
                 ctx = BlockContext(
@@ -455,45 +459,41 @@ class CompressionOrchestrator(BaseOrchestrator):
                     set_amax_for_all_moe_layers(block, attr_name="act_max")
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
-                self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
+                with perf.phase("tune"):
+                    self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
                 if self.compress_context.is_immediate_packing:
-                    for _n, _mod in block.named_modules():
-                        if hasattr(_mod, "bits") and check_to_quantized(_mod):
-                            from auto_round.compressors.utils import immediate_pack as _immediate_pack
+                    from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
-                            module_name = getattr(_mod, "global_name", None)
-                            if module_name is None and self.nblocks == 1 and _n:
-                                module_name = f"{block.global_name}.{_n}"
-                            if module_name is None:
-                                continue
-                            _immediate_pack(module_name, self.layer_config)
+                    _immediate_pack_block(block, block_name, self.layer_config, nblocks=self.nblocks)
 
                 # ── Infrastructure: shard write / device cleanup ──────────
-                if self.compress_context.is_immediate_saving:
-                    # Save non-quantized leaf modules (e.g. norms, embeddings in block).
-                    for _n, m in block.named_modules():
-                        if (
-                            not any(m.children())
-                            and len(m.state_dict()) > 0
-                            and hasattr(m, "global_name")
-                            and m.global_name not in tied_weights_layers
-                            and not check_to_quantized(m)
-                        ):
-                            set_module(self.model, m.global_name, copy.deepcopy(m))
-                            self.shard_writer.write(name=m.global_name)
-                            get_module(self.model, m.global_name).to("meta")
-                            m.to("meta")
-                    # Write at block scope for any remaining params/buffers.
-                    self.shard_writer.write(name=block_name)
-                    block.to("meta")
-                else:
-                    mv_module_from_gpu(block)
-                    if self.compress_context.low_cpu_mem_usage:
-                        self._offloader(self.model, block_name)
+                with perf.phase("write"):
+                    if self.compress_context.is_immediate_saving:
+                        # Save non-quantized leaf modules (e.g. norms, embeddings in block).
+                        for _n, m in block.named_modules():
+                            if (
+                                not any(m.children())
+                                and len(m.state_dict()) > 0
+                                and hasattr(m, "global_name")
+                                and m.global_name not in tied_weights_layers
+                                and not check_to_quantized(m)
+                            ):
+                                set_module(self.model, m.global_name, copy.deepcopy(m))
+                                self.shard_writer.write(name=m.global_name)
+                                get_module(self.model, m.global_name).to("meta")
+                                m.to("meta")
+                        # Write at block scope for any remaining params/buffers.
+                        self.shard_writer.write(name=block_name)
+                        block.to("meta")
+                    else:
+                        mv_module_from_gpu(block)
+                        if self.compress_context.low_cpu_mem_usage:
+                            self._offloader(self.model, block_name)
 
                 clear_memory()
                 memory_monitor.log_summary()
                 pbar.update(1)
+                perf.finish_block()
 
         remain_layer_names = []
         block_name_set = set(name for block in all_blocks for name in block)

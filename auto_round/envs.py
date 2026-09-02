@@ -30,10 +30,25 @@ if TYPE_CHECKING:
     AR_AUTO_SCHEME_NO_SERIAL_FALLBACK: bool = False
     AR_ENABLE_AUTO_SCHEME_PARALLEL: bool = True
     AR_NVFP4_E5M3_CACHE_HP_WEIGHT: bool = False
+    AR_BATCHED_PACKING: Optional[bool] = None
+    AR_PERF_COUNTERS: bool = False
     AR_DISK_STREAM_MODEL: bool = False
     AR_RESUME_DIR: Optional[str] = None
     AR_FORCE_MOE_ROUTING_ALL_EXPERTS: bool = False
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
+
+
+def _get_tristate_env(name: str) -> Optional[bool]:
+    """Read an auto/0/1 env var; None means "auto" (decide by device type)."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip().lower() in ("", "auto"):
+        return None
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be 'auto', '0' or '1', got {raw!r}")
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -54,6 +69,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this is used for configuring the default logging level
     "AR_LOG_LEVEL": lambda: os.getenv("AR_LOG_LEVEL", "INFO").upper(),
     "AR_ENABLE_COMPILE_PACKING": lambda: os.getenv("AR_ENABLE_COMPILE_PACKING", "0").lower() in ("1", "true", "yes"),
+    "AR_BATCHED_PACKING": lambda: _get_tristate_env("AR_BATCHED_PACKING"),
+    "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "0").lower() in ("1", "true", "yes"),
     "AR_USE_MODELSCOPE": lambda: os.getenv("AR_USE_MODELSCOPE", "False").lower() in ["1", "true"],
     "AR_WORK_SPACE": lambda: os.getenv("AR_WORK_SPACE", "ar_work_space").lower(),
     "AR_ENABLE_UNIFY_MOE_INPUT_SCALE": lambda: os.getenv("AR_ENABLE_UNIFY_MOE_INPUT_SCALE", "False").lower()

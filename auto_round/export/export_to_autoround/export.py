@@ -19,6 +19,7 @@ import json
 import os
 from dataclasses import fields
 from enum import Enum
+from types import SimpleNamespace
 from typing import Callable, Union
 
 import torch
@@ -237,6 +238,224 @@ def pack_layer(layer_name, model, backend, device=None):
 
     # Note: release weight and bias explicitly, in case they are referenced elsewhere
     release_layer_safely(layer)
+
+
+def pack_layers_batched(names, model, backend, device=None, max_batch_bytes=256 * 1024 * 1024):
+    """Pack same-shape Linear layers (MoE experts) with one pack pass per group.
+
+    Per-module ``pack_layer`` spends its wall time on Python overhead, tensor
+    allocations, and host<->device round trips (~50 ms/module); a large MoE
+    block pays that hundreds of times (once per expert projection). This
+    batches every group of modules
+    sharing (QuantLinear class, bits, group_size, sym, act_bits, shape, bias)
+    into one ``QuantLinear`` whose out_features is the stacked total, packs
+    the row-stacked weight once, then column-slices the packed artifacts back
+    into per-module ``QuantLinear`` shells -- bitwise-identical results
+    (qweight/qzeros/scales are all column-aligned by out_features).
+
+    Modules that cannot be batched (non-Linear, meta/packed, act_bits <= 8,
+    3-bit, non qlinear_torch backends) are returned unpacked for the caller
+    to route through the legacy per-module path.
+
+    Returns (packed_names, leftover_names).
+    """
+    import torch as _torch
+
+    from auto_round.utils.model import get_module as _get_module
+
+    if "llm_compressor" in backend:
+        raise ValueError(
+            f"pack_layers_batched packs the AutoRound qweight/qzeros/scales format and must not be "
+            f"used for backend '{backend}': compressed-tensors exports pack through their own "
+            f"pack_layer, and mixing the two produces a checkpoint no single consumer can load."
+        )
+
+    leftover = []
+    groups = {}
+    for name in names:
+        layer = _get_module(model, name)
+        if hasattr(layer, "orig_layer"):
+            layer = layer.orig_layer
+        if type(layer) not in SUPPORTED_LAYER_TYPES:
+            continue  # already packed or not quantizable
+        if layer.weight.device.type == "meta":
+            continue
+        if int(getattr(layer, "act_bits", 16)) <= 8:
+            leftover.append(name)  # qact path: per-module only
+            continue
+        if int(layer.bits) not in (2, 4, 8):
+            leftover.append(name)  # 3-bit pack path: per-module only
+            continue
+        if type(layer) is not nn.Linear:
+            leftover.append(name)
+            continue
+        if layer.in_features % 32 != 0 or layer.out_features % 32 != 0:
+            # The qweight/qzeros lane math (in // 32 * bits rows, out // 32 * bits
+            # columns) is exact only for multiples of 32; other shapes keep the
+            # per-module path, which preserves its existing behavior for them.
+            leftover.append(name)
+            continue
+        QuantLinear = dynamic_import_quant_linear_for_packing(
+            backend, layer.bits, layer.group_size, layer.sym, int(getattr(layer, "act_bits", 16))
+        )
+        if QuantLinear not in _batched_packer_classes():
+            leftover.append(name)  # unfamiliar pack implementation: per-module
+            continue
+        if QuantLinear is _wqlinear_gemm_cls() and int(layer.bits) != 4:
+            leftover.append(name)  # the awq packer is 4-bit only: per-module
+            continue
+        key = (
+            layer.bits,
+            layer.group_size,
+            bool(layer.sym),
+            layer.in_features,
+            layer.out_features,
+            layer.bias is not None,
+            layer.weight.dtype,
+        )
+        groups.setdefault(key, []).append(name)
+
+    packed = []
+    for (bits, group_size, sym, in_f, out_f, bias, w_dtype), group_names in groups.items():
+        if len(group_names) < 2:
+            leftover.extend(group_names)
+            continue
+        members = []
+        for n in group_names:
+            layer = _get_module(model, n)
+            if hasattr(layer, "orig_layer"):
+                layer = layer.orig_layer
+            members.append((n, layer))
+        zp_list = [layer.zp for _, layer in members]
+        zp_all_int = all(not isinstance(z, _torch.Tensor) for z in zp_list)
+        zp_all_tensor = all(isinstance(z, _torch.Tensor) for z in zp_list)
+        if not sym and zp_all_int and len({int(z) for z in zp_list}) != 1:
+            logger.warning(
+                "batched pack: per-module integer zero points differ within a same-shape "
+                "group; falling back to per-module pack for %d module(s)",
+                len(group_names),
+            )
+            leftover.extend(group_names)
+            continue
+        if sym and zp_all_tensor and any(z.numel() > 1 for z in zp_list):
+            # per-module pack_layer only collapses sym tensor zero points to a
+            # scalar for the plain packer; the gptq packer's tensor path applies
+            # its zp - 1 convention per element -- keep such groups per-module.
+            leftover.extend(group_names)
+            continue
+        if not sym and not zp_all_int and not zp_all_tensor:
+            logger.warning(
+                "batched pack: mixed tensor and integer zero points within a same-shape "
+                "group; falling back to per-module pack for %d module(s)",
+                len(group_names),
+            )
+            leftover.extend(group_names)
+            continue
+        QuantLinear = dynamic_import_quant_linear_for_packing(backend, bits, group_size, sym, 16)
+
+        # chunk the stack so the int32 intermediate stays bounded
+        per_module_elems = out_f * in_f
+        per_chunk = max(1, max_batch_bytes // (per_module_elems * 4))
+        for start in range(0, len(members), per_chunk):
+            layers = members[start : start + per_chunk]
+            n_out = out_f * len(layers)
+
+            stacked_w = _torch.cat([layer.weight.data for _, layer in layers], dim=0)
+            stacked_scale = _torch.cat(
+                [layer.scale.data if isinstance(layer.scale, nn.Parameter) else layer.scale for _, layer in layers],
+                dim=0,
+            )
+            stacked_bias = None
+            if bias:
+                stacked_bias = _torch.cat([layer.bias.data for _, layer in layers], dim=0)
+
+            is_awq = QuantLinear is _wqlinear_gemm_cls()
+            shim = SimpleNamespace(weight=stacked_w, bias=stacked_bias)
+            if sym:
+                zp0 = zp_list[0]
+                zp_arg = int(zp0.flatten()[0]) if isinstance(zp0, _torch.Tensor) else zp0
+            elif zp_all_int:
+                zp_arg = int(zp_list[0])
+            else:
+                zp_arg = _torch.cat(zp_list, dim=0)
+            if is_awq:
+                # the awq packer has no .pack(): from_linear packs directly and
+                # packs qweight along out ([in, out // pack_num] layout). It
+                # expects scales/zeros in [groups, out] orientation (the
+                # per-module awq path transposes them the same way).
+                shim.in_features, shim.out_features = in_f, n_out
+                awq_scale = stacked_scale.t().contiguous()
+                if isinstance(zp_arg, _torch.Tensor):
+                    awq_zp = zp_arg.t().contiguous().to(_torch.float32)
+                else:
+                    awq_zp = zp_arg
+                big = QuantLinear.from_linear(shim, bits, group_size, scales=awq_scale, zeros=awq_zp, device=device)
+                del awq_scale
+            else:
+                big = QuantLinear(bits, group_size, in_f, n_out, bias=bias, weight_dtype=w_dtype)
+                big.device = stacked_w.device
+                big.to("cpu")
+                big.pack(shim, stacked_scale, zp_arg, None, device=device)
+            del stacked_w, stacked_scale
+
+            oq = out_f // 32 * bits  # qzeros columns per module (both families)
+            pack_num = 32 // bits  # awq packs qweight along out with this factor
+            for i, (n, layer) in enumerate(layers):
+                lo, hi = i * out_f, (i + 1) * out_f
+                if is_awq:
+                    q = QuantLinear(bits, group_size, in_f, out_f, bias, str(layer.weight.device))
+                    qw = big.qweight[:, lo // pack_num : hi // pack_num]
+                else:
+                    q = QuantLinear(bits, group_size, in_f, out_f, bias=bias, weight_dtype=w_dtype)
+                    q.device = layer.weight.device
+                    qw = big.qweight[:, lo:hi]
+                q.qweight = qw.contiguous()
+                q.qzeros = big.qzeros[:, i * oq : (i + 1) * oq].contiguous()
+                q.scales = big.scales[:, lo:hi].contiguous()
+                if bias:
+                    q.bias = big.bias[lo:hi].contiguous()
+                if hasattr(model, "_rotation_config"):
+                    from auto_round.algorithms.transforms import inject_rotation_buffers_on_layer
+
+                    inject_rotation_buffers_on_layer(n, q, model)
+                set_module(model, n, q)
+                release_layer_safely(layer)
+                packed.append(n)
+            del big
+    return packed, leftover
+
+
+def _qlinear_torch_cls():
+    import auto_round_extension.torch.qlinear_torch
+
+    return auto_round_extension.torch.qlinear_torch.QuantLinear
+
+
+def _batched_packer_classes():
+    """Packer classes whose packed layout can be column-sliced by out_features.
+
+    - qlinear_torch (plain auto_round): qweight [in // 32 * bits, out],
+      zero points stored directly.
+    - qlinear_torch_zp (auto_round:auto_gptq): identical layout, zero points
+      stored as zp - 1 and unpacked with +1 (handled inside the packer).
+    - WQLinear_GEMM (auto_round:auto_awq): qweight packs along out instead
+      ([in, out // pack_num]); handled by the awq-specific slice below.
+    """
+    import auto_round_extension.torch.qlinear_torch
+    import auto_round_extension.torch.qlinear_torch_zp
+    from auto_round.export.export_to_awq.utils import WQLinear_GEMM
+
+    return (
+        auto_round_extension.torch.qlinear_torch.QuantLinear,
+        auto_round_extension.torch.qlinear_torch_zp.QuantLinear,
+        WQLinear_GEMM,
+    )
+
+
+def _wqlinear_gemm_cls():
+    from auto_round.export.export_to_awq.utils import WQLinear_GEMM
+
+    return WQLinear_GEMM
 
 
 def save_quantized_as_autoround(

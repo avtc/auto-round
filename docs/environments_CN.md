@@ -20,6 +20,26 @@ AutoRound 通过 `envs.py` 模块提供统一的环境变量管理系统，支�
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_BATCHED_PACKING
+- **描述**: 控制同形状模块的批量打包优化。`"0"` 使所有层均使用逐模块打包路径（可作为显存紧张时的逃生开关，也可用于排查打包问题：两种路径产出的结果逐位一致）；`"1"` 强制在包括 CPU 在内的所有设备上批量打包；`"auto"` 仅在加速器设备上批量打包。
+- **默认值**: `"auto"`（GPU/XPU/HPU 打包设备批量打包，CPU 逐模块打包）
+- **有效值**: `"auto"`、`"0"`/`"false"`、`"1"`/`"true"`（不区分大小写；其他值视为错误）
+- **用法**: 批量打包将同形状的 Linear 模块（常见于 MoE 专家）合并为一次打包，适用于原生、gptq 打包与 awq 打包的 `auto_round` 格式。CPU 打包受逐元素计算限制，批量后测得更慢，因此默认值为 `"auto"`。
+
+```bash
+export AR_BATCHED_PACKING=0
+```
+
+### AR_PERF_COUNTERS
+- **描述**: 量化过程中为每个 block 输出一行阶段耗时摘要，例如 `[perf] block=model.layers.10 total: 88s, pack: 10s, tune: 70s, read: 500ms, write: 2.5s, other: 5.0s`。输出打印在进度条上方，不会打乱进度条重绘。数值在 10 以下保留一位小数、10 以上不保留小数，单位为 `ms`/`s`/`m`。
+- **默认值**: `False`（等价于 `"0"`）
+- **有效值**: `"1"`、`"true"`、`"yes"`（不区分大小写）表示启用；其他值表示禁用
+- **用法**: 阶段采集点位于编排器的 block 循环（`read` = block 重载/物化/设备放置，`tune` = block 流水线，`write` = 立即分片写出）以及 `immediate_pack_block`（`pack`）；`other` 为 block 总耗时的剩余部分。现有的 `peak_ram`/`peak_vram` 摘要行不受影响，始终保持开启。
+
+```bash
+export AR_PERF_COUNTERS=1
+```
+
 ### AR_ENABLE_COMPILE_PACKING
 - **描述**：启用编译打包优化
 - **默认值**：`False`（等价于 `"0"`）

@@ -20,6 +20,26 @@ AutoRound uses a centralized environment variable management system through the 
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_BATCHED_PACKING
+- **Description**: Controls the batched same-shape packing optimization. `"0"` keeps the per-module pack path for every layer (escape hatch when GPU memory is tight, and a bisect tool: the two paths produce bitwise-identical artifacts); `"1"` forces batched packing everywhere, including CPU; `"auto"` batches on accelerator devices only.
+- **Default**: `"auto"` (batch on GPU/XPU/HPU pack devices, per-module on CPU)
+- **Valid Values**: `"auto"`, `"0"`/`"false"`, `"1"`/`"true"` (case-insensitive; anything else is an error)
+- **Usage**: Batched packing stacks same-shape Linear modules (MoE experts are the common case) into one pack pass for the plain, gptq-packed and awq-packed `auto_round` formats. CPU packing is elementwise-compute-bound and measures slower when batched, hence the `"auto"` default.
+
+```bash
+export AR_BATCHED_PACKING=0
+```
+
+### AR_PERF_COUNTERS
+- **Description**: Emits one per-block phase summary line during quantization, e.g. `[perf] block=model.layers.10 total: 88s, pack: 10s, tune: 70s, read: 500ms, write: 2.5s, other: 5.0s`. Lines are printed above any active progress bar and never garble it. Durations use one decimal digit below 10 and none above, with `ms`/`s`/`m` units.
+- **Default**: `False` (equivalent to `"0"`)
+- **Valid Values**: `"1"`, `"true"`, `"yes"` (case-insensitive) for enabling; any other value for disabling
+- **Usage**: Phase collection points live in the orchestrator block loops (`read` = block reload/materialize/device placement, `tune` = block pipeline, `write` = immediate shard write) and in `immediate_pack_block` (`pack`); `other` is the residual of the block wall time. The existing `peak_ram`/`peak_vram` summary lines are unaffected and stay always-on.
+
+```bash
+export AR_PERF_COUNTERS=1
+```
+
 ### AR_ENABLE_COMPILE_PACKING
 - **Description**: Enables compile packing optimization
 - **Default**: `False` (equivalent to `"0"`)
