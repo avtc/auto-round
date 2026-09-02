@@ -486,6 +486,33 @@ class TestStreamingRoutingWaiver:
         assert self._needs([OptimizedRTNConfig(group_size=16)], stream_quantization=True) is False
 
 
+class TestStreamRowsCap:
+    """nsamples caps chained rows for every dataset type (list datasets were
+    previously forwarded in full -- inconsistent with the data-driven
+    calibrator, which stops at nsamples for any dataset)."""
+
+    def test_list_dataset_capped_at_nsamples(self):
+        from auto_round.utils.streaming_calibration import _normalize_rows
+
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]
+        out = _normalize_rows(rows, tokenizer=None, seqlen=32, nsamples=3)
+        assert len(out) == 3
+
+    def test_list_dataset_shorter_than_nsamples_untouched(self):
+        from auto_round.utils.streaming_calibration import _normalize_rows
+
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(2)]
+        out = _normalize_rows(rows, tokenizer=None, seqlen=32, nsamples=8)
+        assert len(out) == 2
+
+    def test_short_rows_dropped_by_skip_rule(self):
+        from auto_round.utils.streaming_calibration import _normalize_rows
+
+        rows = [torch.randint(0, 64, (1, 8)), torch.randint(0, 64, (1, 32))]  # first < seqlen
+        out = _normalize_rows(rows, tokenizer=None, seqlen=32, nsamples=8)
+        assert len(out) == 1
+
+
 class TestStreamFeatureAutoEngage:
     """_auto_engage_stream_features: layerwise rotation + calibration chain
     engage by themselves under stream_quantization when the run needs them."""

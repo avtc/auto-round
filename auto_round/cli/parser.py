@@ -161,19 +161,6 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         ),
     )
     rt.add_argument(
-        "--stream_calibration_rows",
-        dest="stream_calibration_rows",
-        default=0,
-        type=int,
-        help=(
-            "Cap on the number of calibration sequences chained through the "
-            "streaming block loop (0 = chain all nsamples sequences). Not a batch "
-            "size: each chained sequence costs one block forward per block; a "
-            "modest cap is statistically fine for the imatrix but iters>0 tuning "
-            "wants the full count."
-        ),
-    )
-    rt.add_argument(
         "--stream_prefetch",
         dest="stream_prefetch",
         default="off",

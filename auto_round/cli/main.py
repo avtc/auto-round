@@ -120,7 +120,6 @@ def _build_entry_compressor_kwargs(args) -> dict:
         # when rotation transforms are present; True/False are explicit.
         "layerwise_rotation": True if layerwise else None,
         "stream_quantization": getattr(args, "stream_quantization", False),
-        "stream_calibration_rows": getattr(args, "stream_calibration_rows", 0),
         "stream_prefetch": depth,
         "stream_prefetch_devices": devices,
     }

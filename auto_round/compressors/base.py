@@ -341,9 +341,6 @@ class BaseOrchestrator(object):
         # activations (iters > 0 tuning or an enabled imatrix) -- see
         # _auto_engage_stream_features.
         self.stream_calibration = False
-        # Cap on chained calibration sequences for the streaming FP-input
-        # cache; 0 = no cap (follow nsamples).
-        self.stream_calibration_rows = kwargs.pop("stream_calibration_rows", 0)
         self._auto_engage_stream_features()
 
         # ``stream_quantization`` handles its own block lifecycle (meta -> stream
