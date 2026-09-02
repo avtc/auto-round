@@ -1012,6 +1012,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block = get_module(self.model, block_name)
 
                 # ── Infrastructure: materialize ───────────────────────────
+                _t_load = _time.perf_counter()
                 if streamer is not None:
                     if stage_devices:
                         # round-robin home: the block was staged here, quantize in place
