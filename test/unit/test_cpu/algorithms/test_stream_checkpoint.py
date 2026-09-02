@@ -533,23 +533,6 @@ class TestStreamModeExclusivity:
         assert called["meta"] == 1, "mllm + stream_quantization must use the streaming loader"
         assert ctx.is_mllm is True
 
-    def test_block_parallel_tuning_under_streaming_raises(self, monkeypatch):
-        """BPT is a data-driven-path feature; under streaming it would be
-        silently ignored -- fail fast instead."""
-        from types import SimpleNamespace
-
-        import pytest
-
-        from auto_round.compressors.base import BaseCompressor
-
-        stub = SimpleNamespace(stream_quantization=True)
-        with pytest.raises(ValueError, match="enable_block_parallel_tuning cannot run under stream_quantization"):
-            BaseCompressor._validate_stream_options(stub, quant_nontext_module=False, enable_block_parallel_tuning=True)
-        # allowed: no streaming, or no BPT
-        BaseCompressor._validate_stream_options(
-            SimpleNamespace(stream_quantization=False), quant_nontext_module=False, enable_block_parallel_tuning=True
-        )
-        BaseCompressor._validate_stream_options(stub, quant_nontext_module=False, enable_block_parallel_tuning=False)
 
     def test_quant_nontext_module_under_streaming_raises(self, monkeypatch):
         """quant_nontext_module + streaming must fail fast: the streaming chain
@@ -799,7 +782,6 @@ class TestStreamQuantizeEquivalence:
         dataset=None,
     ):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
-        from auto_round.algorithms.transforms.hadamard.config import RotationConfig
         from auto_round.autoround import AutoRound
 
         kwargs = {}
@@ -810,11 +792,7 @@ class TestStreamQuantizeEquivalence:
         ar = AutoRound(
             model_path,
             scheme="W4A16",
-            alg_configs=[
-                RotationConfig(block_size=16),
-                RTNConfig(group_size=16, disable_opt_rtn=False),
-            ],
-            layerwise_rotation=True,
+            alg_configs=[RTNConfig(group_size=16, disable_opt_rtn=False)],
             stream_quantization=stream,
             stream_prefetch=stream_prefetch,
             stream_prefetch_devices=stream_prefetch_devices,

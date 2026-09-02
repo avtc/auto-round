@@ -737,14 +737,23 @@ class AlgorithmComposer:
                     rotation.prepare_layerwise(model, data_type=data_type)
                     self._rotation_transforms.append(rotation)
                     continue
+                from auto_round import envs as _envs
+
+                streaming = bool(
+                    getattr(self._orchestrator_ref, "stream_quantization", False)
+                ) or bool(_envs.AR_DISK_STREAM_MODEL)
+                if streaming:
+                    raise ValueError(
+                        f"{rotation.__class__.__name__} does not support layer-wise "
+                        "rotation, which is required under stream_quantization / "
+                        "AR_DISK_STREAM_MODEL (whole-model folding would materialize "
+                        "the model). Remove the rotation config or use an algorithm "
+                        "that implements the layer-wise protocol."
+                    )
                 logger.warning(
                     f"[Rotation] {rotation.__class__.__name__} does not support "
                     f"layer-wise mode. Falling back to full-model rotation."
                 )
-                # The fallback is whole-model rotation: the streamed-model guard
-                # skipped earlier because layerwise mode was requested, but this
-                # transform cannot honor it -- re-check before folding.
-                self._assert_model_foldable_in_place(model)
             model = apply_rotation(model, rotation_cfg, data_type=data_type)
 
         self._rotation_prepared = True
