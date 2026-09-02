@@ -291,6 +291,8 @@ export AR_DISK_STREAM_MODEL=1
 export AR_RESUME_DIR=/path/to/resume/state
 ```
 
+Cross-mode resume: the serial (`AR_DISK_STREAM_MODEL`), streaming (`--stream_quantization`), and block-parallel (BPT) execution paths share the same per-block manifests. A run interrupted in any mode can be continued in the same or any other mode: shards already written for completed blocks are adopted as-is (never overwritten or re-quantized), and blocks a crashed BPT run tuned but never packed get their worker results (scale/zp) applied and packed instead of re-searched.
+
 ## Usage Examples
 
 ### Setting Environment Variables
