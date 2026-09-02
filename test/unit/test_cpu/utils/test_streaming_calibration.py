@@ -77,3 +77,96 @@ def test_guard_passes_with_correct_vocab():
         raise SystemError("should have raised")
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Text-rotary selection (VL towers carry an incompatible vision rotary first)
+# ---------------------------------------------------------------------------
+
+
+class _VisionRotary(nn.Module):
+    def forward(self, x, dim):  # vision convention: (x, dim) -- incompatible
+        del x
+        return dim, dim
+
+
+class _TextRotary(nn.Module):
+    def __init__(self):
+        super().__init__()
+        head_dim = 8
+        self.inv_freq = None  # filled below on a real device
+
+    def forward(self, x, position_ids):  # text convention
+        d = self.inv_freq.numel() * 2
+        freqs = torch.einsum("i,j->ij", position_ids.float().reshape(-1), self.inv_freq.float())
+        cos = freqs.cos().unsqueeze(0)[..., : d // 2]
+        sin = freqs.sin().unsqueeze(0)[..., : d // 2]
+        return cos, sin
+
+
+def _make_text_rotary():
+    r = _TextRotary()
+    d = 16
+    r.inv_freq = 1.0 / (10000.0 ** (torch.arange(0, d, 2, dtype=torch.float32) / d))
+    return r
+
+
+class _VLTinyRotary(nn.Module):
+    """Vision rotary BEFORE the text rotary in named_modules (qwen3_5 shape)."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = SimpleNamespace()  # replaced below; keeps attr-chain honest
+        self.visual = SimpleNamespace(rotary_emb=_VisionRotary())
+        self.language_model = nn.Module()
+        self.language_model.model = nn.Module()
+        self.language_model.model.rotary_emb = _make_text_rotary()
+
+
+def test_find_model_rotary_prefers_language_model_attr():
+    import torch.nn as nn
+
+    from auto_round.utils.streaming_calibration import _find_model_rotary
+
+    m = _VLTinyRotary()
+    # plain-object 'model' attr breaks nn traversal; rebuild cleanly
+    m = nn.Module()
+    m.visual = nn.Module()
+    m.visual.rotary_emb = _VisionRotary()
+    m.language_model = nn.Module()
+    m.language_model.model = nn.Module()
+    m.language_model.model.rotary_emb = _make_text_rotary()
+    cfg = SimpleNamespace(text_config=SimpleNamespace(rope_theta=10000.0))
+    rotary = _find_model_rotary(m, cfg, torch.device("cpu"))
+    assert isinstance(rotary, _TextRotary), "must resolve the text rotary via .language_model.model"
+
+
+def test_find_model_rotary_scan_skips_vision_and_requires_position_ids():
+    from auto_round.utils.streaming_calibration import _find_model_rotary
+
+    m = torch.nn.Module()
+    m.visual = torch.nn.Module()
+    m.visual.deep = torch.nn.Module()
+    m.visual.deep.rotary_emb = _VisionRotary()  # first in named_modules
+    m.text_side = torch.nn.Module()
+    m.text_side.rotary_emb = _make_text_rotary()
+    cfg = SimpleNamespace()
+    rotary = _find_model_rotary(m, cfg, torch.device("cpu"))
+    assert isinstance(rotary, _TextRotary), "scan must deprioritize vision + prefer position_ids signature"
+
+
+def test_find_model_rotary_callable_position_embeddings():
+    """The selected rotary must satisfy the text-block call shape (x, pos)."""
+    from auto_round.utils.streaming_calibration import _find_model_rotary
+
+    m = torch.nn.Module()
+    m.visual = torch.nn.Module()
+    m.visual.rotary_emb = _VisionRotary()
+    m.language_model = torch.nn.Module()
+    m.language_model.model = torch.nn.Module()
+    m.language_model.model.rotary_emb = _make_text_rotary()
+    cfg = SimpleNamespace(text_config=SimpleNamespace(rope_theta=10000.0))
+    rotary = _find_model_rotary(m, cfg, torch.device("cpu"))
+    pos = torch.arange(4, device="cpu").unsqueeze(0)
+    cos, sin = rotary(torch.zeros(1, 4), pos)
+    assert cos.shape[-1] == 8 and sin.shape[-1] == 8

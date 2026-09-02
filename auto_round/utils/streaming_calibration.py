@@ -146,16 +146,40 @@ def _ensure_real_rotary(rotary, cfg, device):
 
 
 def _find_model_rotary(model, cfg, device):
-    """Locate the model-level rotary module (outside the blocks) and ensure it
-    holds real tensors; returns the module or None."""
+    """Locate the TEXT model's rotary module (outside the blocks) and ensure it
+    holds real tensors; returns the module or None.
+
+    VL-capable checkpoints carry a vision rotary whose ``forward(x, dim)``
+    signature differs from the text rotary's ``forward(x, position_ids)``; it
+    iterates first in ``named_modules`` and must not be picked (same trap as
+    ``_find_embedding`` and the vision position table)."""
     base = getattr(model, "model", model)
-    rotary = getattr(base, "rotary_emb", None)
+    # VL composites keep the text backbone under .language_model (sometimes
+    # nested one .model deeper); resolve it before touching any fallback scan
+    for attr in ("language_model",):
+        nxt = getattr(base, attr, None)
+        if nxt is not None:
+            base = nxt
+    rotary = getattr(base, "rotary_emb", None) or getattr(getattr(base, "model", None), "rotary_emb", None)
     if rotary is None:
+        best, best_score = None, -1
         for name, mod in model.named_modules():
             leaf = not list(mod.children())
-            if leaf and "rotary" in type(mod).__name__.lower():
-                rotary = mod
-                break
+            if not leaf or "rotary" not in type(mod).__name__.lower():
+                continue
+            score = 0
+            lname = name.lower()
+            if "visio" in lname or "visual" in lname:
+                score -= 4
+            try:
+                params = list(inspect.signature(mod.forward).parameters)[1:]
+            except (TypeError, ValueError):
+                params = []
+            if "position_ids" in params:
+                score += 2  # text rotary convention: forward(x, position_ids)
+            if score > best_score:
+                best, best_score = mod, score
+        rotary = best
     if rotary is None:
         return None
     return _ensure_real_rotary(rotary, cfg, device)
