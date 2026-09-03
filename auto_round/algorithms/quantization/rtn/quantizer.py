@@ -49,7 +49,7 @@ def register_imatrix_hooks(model, *, with_count: bool = False):
 
     handles = []
     for _, module in model.named_modules():
-        if check_to_quantized(module):
+        if isinstance(module, SUPPORTED_LAYER_TYPES) and check_to_quantized(module):
             handles.append(module.register_forward_hook(collect_imatrix))
     return handles
 
