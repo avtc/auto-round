@@ -66,6 +66,62 @@ def build_causal_attention_mask(input_ids):
     return causal[None, None] & (mask_2d != 0)[:, None, None, :]
 
 
+def mask_form_candidates(key_mask_2d):
+    """The three mask forms decoder layers accept, most-native first.
+
+    1. 4D bool (True = allowed), causal + key mask: what llama-style models
+       pass into their decoder layers after model-level preparation.
+    2. 2D float padding mask: what GDN/hybrid models pass down (their layers
+       build causal structure internally; the linear-attention path
+       multiplies the 2D mask against the hidden states directly).
+    3. 4D float additive (allowed = 0.0, masked = -inf): the sdpa convention,
+       accepted by layers that feed the mask straight into scaled_dot_product_attention.
+    """
+    seq_len = key_mask_2d.shape[-1]
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+    allowed = causal[None, None] & (key_mask_2d != 0.0)[:, None, None, :]
+    additive = torch.zeros(allowed.shape, dtype=torch.float32)
+    additive.masked_fill_(~allowed, torch.finfo(torch.float32).min)
+    return [("4d_bool", allowed), ("2d_float", key_mask_2d), ("4d_additive", additive)]
+
+
+def resolve_chain_mask_form(block, fp_row, input_others):
+    """Probe which attention-mask form this model's decoder layers accept.
+
+    Runs one tiny no-grad forward of the first block per candidate form
+    (most model-native first) and returns the winning form name. Every block
+    of a model shares the same layer calling convention, so probing once is
+    enough.
+    """
+    row_others = {k: (v[0] if isinstance(v, list) else v) for k, v in input_others.items()}
+    row_others["use_cache"] = False
+    row_others["past_key_values"] = None
+    last_err = None
+    with torch.no_grad():
+        for name, mask in mask_form_candidates(input_others["attention_mask"][0]):
+            probe_others = dict(row_others)
+            probe_others["attention_mask"] = mask.to(fp_row.device)
+            try:
+                block(fp_row[:1].to(fp_row.device), **probe_others)
+                return name
+            except Exception as e:  # noqa: BLE001  shape/dtype/type errors are the signal
+                last_err = e
+                continue
+    raise ValueError(
+        "streaming calibration could not determine this model's attention-mask "
+        "convention: the first decoder block rejected every candidate form "
+        f"(last error: {last_err})."
+    )
+
+
+def materialize_mask_form(key_mask_2d, form):
+    """The per-row mask tensor for the resolved form."""
+    for name, mask in mask_form_candidates(key_mask_2d):
+        if name == form:
+            return mask
+    raise ValueError(f"unknown mask form {form!r}")
+
+
 def _find_embedding(model, streamer):
     """The token-embedding module: checkpoint-backed, preferring the config's
     vocab size, else the largest candidate.
@@ -273,20 +329,31 @@ def prepare_streaming_calibration(
     # the data-driven pipeline replays a float32 0/1 mask (bool captured, cast
     # during preprocessing); sdpa treats it additively. Match the dtype for
     # statistics parity with the data-driven path.
-    # Additive float mask in the convention sdpa expects: allowed = 0.0,
-    # masked = -inf. A bool->float cast of the allowed-mask (True=1.0) adds
-    # +1 to ALLOWED scores and 0 to masked ones - a weak, inverted soft mask
-    # instead of a hard one; the data-driven replay builds the true additive
-    # mask through the modeling code, so the cast broke statistics parity.
-    neg_inf = torch.finfo(torch.float32).min
-    float_masks = []
+    # Canonical per-row 2D key mask (1.0 = keep, 0.0 = masked), the same form
+    # the ordinary calibration path feeds model.forward: all ones, trailing
+    # repeated tokens masked, last position always masked (see
+    # calibration/llm.py). The form each decoder layer actually consumes is
+    # model-dependent (llama-style layers receive a prepared 4D bool mask;
+    # GDN linear-attention layers consume the 2D padding mask directly), so
+    # the loop resolves it once by probing the first block (see
+    # resolve_chain_mask_form) and materializes the winning form.
+    masks = []
     for ids in rows:
-        allowed = build_causal_attention_mask(ids)
-        fm = torch.zeros(allowed.shape, dtype=torch.float32)
-        fm.masked_fill_(~allowed, neg_inf)
-        float_masks.append(fm.cpu())
+        m = torch.ones(ids.shape, dtype=torch.float32, device=ids.device)
+        last_token = ids[:, -1]
+        j = ids.shape[-1] - 2
+        for b in range(ids.shape[0]):
+            repeated = False
+            while j >= 0 and ids[b, j] == last_token[b]:
+                repeated = True
+                m[b, j] = 0.0
+                j -= 1
+            if repeated:
+                m[b, -1] = 0.0
+        m[:, -1] = 0.0
+        masks.append(m.cpu())
     input_others = {
-        "attention_mask": float_masks,
+        "attention_mask": masks,
         "use_cache": False,
         "past_key_values": None,
     }

@@ -965,6 +965,26 @@ class CompressionOrchestrator(BaseOrchestrator):
                     set_amax_for_all_moe_layers(block, attr_name="act_max")
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
+                if (
+                    streamer is not None
+                    and calib_state is not None
+                    and calib_state.get("input_others")
+                    and not calib_state.get("_mask_form")
+                ):
+                    # resolve the model's attention-mask convention once (the
+                    # canonical per-row 2D key mask is stored at prepare time;
+                    # the winning form is materialized for every row here)
+                    from auto_round.utils.streaming_calibration import (
+                        materialize_mask_form,
+                        resolve_chain_mask_form,
+                    )
+
+                    form = resolve_chain_mask_form(block, calib_state["fp_inputs"][0], calib_state["input_others"])
+                    calib_state["input_others"]["attention_mask"] = [
+                        materialize_mask_form(m, form) for m in calib_state["input_others"]["attention_mask"]
+                    ]
+                    calib_state["_mask_form"] = form
+                    logger.info("[stream_calibration] attention-mask form resolved by probe: %s", form)
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
