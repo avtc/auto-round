@@ -282,7 +282,7 @@ class BaseOrchestrator(object):
         # support it prepare their matrices up-front and rotate each block inside
         # the block loop instead of a full-model pass (required for streamed
         # models whose weights are never all resident).
-        self.layerwise_rotation = kwargs.pop("layerwise_rotation", False)
+        self.layerwise_rotation = kwargs.pop("layerwise_rotation", None)
 
         # Compressor-level layer params (do not live in QuantizationConfig).
         # Calibration params (nsamples/seqlen/batch_size) are owned by
@@ -608,6 +608,10 @@ class BaseOrchestrator(object):
                     "[stream_calibration] auto-engaged (streaming loop needs activations: "
                     "iters > 0 tuning or imatrix enabled)"
                 )
+        # API parity with the CLI: unset (None) enables the auto-engage above;
+        # coerce the final value to bool either way
+        if self.layerwise_rotation is None:
+            self.layerwise_rotation = False
 
     def _needs_calibration_data(self) -> bool:
         """Determine whether calibration data is truly required.

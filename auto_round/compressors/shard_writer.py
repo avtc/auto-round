@@ -14,6 +14,7 @@
 
 import json
 import os
+import struct
 from collections import OrderedDict
 from typing import Optional, Union
 
@@ -186,6 +187,33 @@ class ShardWriter:
                     continue
                 raise RuntimeError(
                     f"ShardWriter resume: shard {found[num]} in {output_dir} is corrupt (only the tail "
+                    "shard of a crashed run may be incomplete). Use a fresh --output_dir."
+                )
+            # a crash DURING the data write (after the header flushed) leaves
+            # a header-valid but truncated file: verify the declared data end
+            # fits inside the actual file size before adopting
+            with open(path, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                f.seek(0, 2)
+                file_size = f.tell()
+            max_end = 0
+            for spec in header.values():
+                try:
+                    max_end = max(max_end, int(spec["data_offsets"][1]))
+                except (KeyError, TypeError, ValueError, IndexError):
+                    max_end = file_size  # unexpected spec: fall through to the size check
+                    break
+            if 8 + header_len + max_end > file_size:
+                if num == numbers[-1]:
+                    logger.warning(
+                        "ShardWriter resume: tail shard %s is truncated (crash mid-data-write); deleting it -- "
+                        "its block was not marked done and will be re-done",
+                        found[num],
+                    )
+                    os.remove(path)
+                    continue
+                raise RuntimeError(
+                    f"ShardWriter resume: shard {found[num]} in {output_dir} is truncated (only the tail "
                     "shard of a crashed run may be incomplete). Use a fresh --output_dir."
                 )
             params = list(header.keys())

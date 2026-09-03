@@ -64,6 +64,9 @@ class TestImmediateSavingRules:
         fake = _fake_self(stream=False, quant_cfg=SignRoundConfig(iters=200))
         BaseCompressor._adjust_immediate_packing_and_saving(fake)
         assert fake.compress_context.low_cpu_mem_usage is False, "legacy downgrade preserved"
+        # behavior change vs upstream: per-block immediate packing is NOT
+        # disabled anymore (outside-block layers pack at export)
+        assert fake.compress_context.is_immediate_packing is True
 
     def test_rtn_outside_block_keeps_enabled(self):
         fake = _fake_self(stream=False, quant_cfg=RTNConfig())

@@ -844,9 +844,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             and not envs.AR_DISABLE_BG_PACK
         )
         _bg_pack = None
-        _bg_thread = None
 
-        pbar = tqdm(range(sum(len(block) for block in all_blocks)))
+        total_block_cnt = sum(len(block) for block in all_blocks)
+        pbar = tqdm(range(total_block_cnt))
         stream_block_idx = 0
         for g_idx, block_names in enumerate(all_blocks):
             rs = resume_states[g_idx] if resume_states is not None and g_idx < len(resume_states) else None
@@ -896,11 +896,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _t_load = _time.perf_counter() - _t_load
 
                 # ── Pure algorithm ────────────────────────────────────────
+                # global block index/count so consumers keyed on "last block
+                # of the run" (SignRound's LFQ loss gate, layerwise rotation
+                # indices) behave exactly as on the data-driven path
                 ctx = BlockContext(
                     model=self.model,
                     block_names=[block_name],
                     block_name=block_name,
-                    block_index=0,
+                    block_index=stream_block_idx,
+                    block_cnt=total_block_cnt,
                 )
                 # ── MoE scale alignment for FP8 dispatch efficiency ────────────────
                 if is_nv_fp(self.act_data_type) or not self.act_dynamic:
@@ -1016,9 +1020,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 pbar.update(1)
 
         # Pipeline lifecycle: model-level teardown (also finalizes rotation)
-        if _bg_thread is not None:
-            _bg_thread.join()
-            _bg_thread = None
         if _bg_pack is not None:
             # final save/index write below reads the ShardWriter state; the
             # last block's pack pipeline must be complete first
