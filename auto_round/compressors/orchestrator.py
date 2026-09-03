@@ -1151,7 +1151,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             streamer.close()
         self.alg_composer.finalize_run()
 
-        cnt = 1
         remain_layer_names = []
         block_name_set = set(name for block in all_blocks for name in block)
         for n, m in self.model.named_modules():
