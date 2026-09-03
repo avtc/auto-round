@@ -85,13 +85,15 @@ def mask_form_candidates(key_mask_2d):
     return [("4d_bool", allowed), ("2d_float", key_mask_2d), ("4d_additive", additive)]
 
 
-def resolve_chain_mask_form(block, fp_row, input_others):
+def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=None):
     """Probe which attention-mask form this model's decoder layers accept.
 
-    Runs one tiny no-grad forward of the first block per candidate form
-    (most model-native first) and returns the winning form name. Every block
-    of a model shares the same layer calling convention, so probing once is
-    enough.
+    Runs one tiny no-grad forward of the block per candidate form and
+    returns the winning form name. Models can MIX conventions per block
+    (e.g. GDN linear-attention blocks take the 2D padding mask while
+    full-attention blocks of the same model take the 4D form), so each block
+    is probed; ``preferred`` tries the previous block's form first (block
+    types come in runs, so most probes hit immediately).
     """
 
     def _to_dev(v, dev):
@@ -108,9 +110,14 @@ def resolve_chain_mask_form(block, fp_row, input_others):
     dev = next((p.device for p in block.parameters() if p.device.type != "meta"), torch.device("cpu"))
     row_others = {k: _to_dev(v, dev) for k, v in row_others.items()}
     fp_row = fp_row[:1].to(dev)
+    candidates = mask_form_candidates(key_mask_2d)
+    if preferred is not None:
+        order = [c for c in candidates if c[0] == preferred] + [c for c in candidates if c[0] != preferred]
+    else:
+        order = candidates
     last_err = None
     with torch.no_grad():
-        for name, mask in mask_form_candidates(input_others["attention_mask"][0]):
+        for name, mask in order:
             probe_others = dict(row_others)
             probe_others["attention_mask"] = mask.to(dev)
             try:
@@ -384,5 +391,5 @@ def prepare_streaming_calibration(
         input_others["position_embeddings"] = pe_list
 
     # keep the raw token ids: SignRound's loss mask consumes them per block
-    summary = {"rows": len(rows), "token_ids": rows}
+    summary = {"rows": len(rows), "token_ids": rows, "keymask_2d": masks}
     return fp_inputs, input_others, summary

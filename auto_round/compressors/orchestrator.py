@@ -825,7 +825,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 first_block=get_module(self.model, flat_block_names[0]) if flat_block_names else None,
                 nsamples=int(getattr(self.calibration_context, "nsamples", 128) or 128),
             )
-            calib_state = {"fp_inputs": fp_inputs, "input_others": input_others, "token_ids": summary.get("token_ids")}
+            calib_state = {
+                "fp_inputs": fp_inputs,
+                "input_others": input_others,
+                "token_ids": summary.get("token_ids"),
+                "keymask_2d": summary.get("keymask_2d"),
+            }
             logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])
 
         # -- AR_RESUME_DIR: resume support (byte-compatible manifests with the
@@ -965,26 +970,29 @@ class CompressionOrchestrator(BaseOrchestrator):
                     set_amax_for_all_moe_layers(block, attr_name="act_max")
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
-                if (
-                    streamer is not None
-                    and calib_state is not None
-                    and calib_state.get("input_others")
-                    and not calib_state.get("_mask_form")
-                ):
-                    # resolve the model's attention-mask convention once (the
-                    # canonical per-row 2D key mask is stored at prepare time;
-                    # the winning form is materialized for every row here)
+                if streamer is not None and calib_state is not None and calib_state.get("keymask_2d"):
+                    # resolve this block's attention-mask convention by probe
+                    # (models can mix forms per block: GDN linear-attention
+                    # blocks take the 2D padding mask, full-attention blocks
+                    # the 4D form); the previous block's form is tried first
                     from auto_round.utils.streaming_calibration import (
                         materialize_mask_form,
                         resolve_chain_mask_form,
                     )
 
-                    form = resolve_chain_mask_form(block, calib_state["fp_inputs"][0], calib_state["input_others"])
+                    form = resolve_chain_mask_form(
+                        block,
+                        calib_state["fp_inputs"][0],
+                        calib_state["keymask_2d"][0],
+                        calib_state["input_others"],
+                        preferred=calib_state.get("_mask_form"),
+                    )
+                    if form != calib_state.get("_mask_form"):
+                        logger.info("[stream_calibration] attention-mask form for %s: %s (probed)", block_name, form)
                     calib_state["input_others"]["attention_mask"] = [
-                        materialize_mask_form(m, form) for m in calib_state["input_others"]["attention_mask"]
+                        materialize_mask_form(m, form) for m in calib_state["keymask_2d"]
                     ]
                     calib_state["_mask_form"] = form
-                    logger.info("[stream_calibration] attention-mask form resolved by probe: %s", form)
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
