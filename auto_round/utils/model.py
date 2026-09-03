@@ -1797,7 +1797,10 @@ def unsupported_meta_device(model):
     bool: True if the model is valid, False otherwise.
     """
     target_device = None
-    for param in model.parameters():
+    # buffers too: Module.to() converts them alongside parameters, so a meta
+    # buffer that parameters-only checks miss still detonates in .to()
+    tensors = list(model.parameters()) + [b for b in model.buffers() if isinstance(b, torch.Tensor)]
+    for param in tensors:
         if target_device is None:
             target_device = param.device
         if param.device != target_device:

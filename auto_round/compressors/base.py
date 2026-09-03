@@ -2336,6 +2336,7 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
     import json
     import os
 
+    from auto_round.utils.model import check_to_quantized
     from safetensors.torch import safe_open
 
     sd = model.state_dict()
@@ -2363,6 +2364,14 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
         for leaf in mod._buffers:
             owners[f"{mod_name}.{leaf}" if mod_name else leaf] = (mod, "buffer", leaf)
 
+    # never hydrate a quantized module's weight: its packed state already
+    # lives in the output shards and format packers skip meta modules for
+    # exactly this reason - making the weight real would re-enter the pack
+    # path without scale/zero-point
+    quantized_prefixes = tuple(
+        f"{mod_name}." for mod_name, mod in model.named_modules() if check_to_quantized(mod) and not any(mod.children())
+    )
+
     missing, replaced = [], 0
     for n in meta_names:
         shard = weight_map.get(n)
@@ -2370,6 +2379,8 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
         if shard is None or owner is None:
             missing.append(n)
             continue
+        if quantized_prefixes and n.startswith(quantized_prefixes):
+            continue  # packed in shards already; packers must see it meta
         mod, kind, leaf = owner
         with safe_open(os.path.join(ckpt_dir, shard), framework="pt") as f:
             t = f.get_tensor(n)
