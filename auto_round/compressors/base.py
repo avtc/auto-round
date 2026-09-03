@@ -2326,13 +2326,13 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
     """Load still-meta tensors straight from the model checkpoint files.
 
     Export reads the in-memory model. Some tensors (e.g. a vision tower in a
-    multimodal wrapper) may never be materialized by the quantization paths
-    - the streaming skeleton leaves them meta and no pass-through covers
-    them. Copy their values from the checkpoint shards so the exported
-    artifacts are complete; returns the names that could not be hydrated
-    (absent from the checkpoint, e.g. computed buffers).
+    multimodal wrapper) are never materialized by the quantization paths -
+    the streaming skeleton leaves them meta and no pass-through covers them.
+    meta parameters cannot absorb ``copy_`` (it silently no-ops), so the
+    objects themselves are replaced on their parent modules. Returns the
+    names that could not be hydrated (absent from the checkpoint or unowned,
+    e.g. computed buffers).
     """
-    import glob
     import json
     import os
 
@@ -2344,32 +2344,43 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
         return meta_names
 
     index = os.path.join(ckpt_dir, "model.safetensors.index.json")
-    if not os.path.exists(index):
-        weight_map = {}  # single-file checkpoints
-        single = os.path.join(ckpt_dir, "model.safetensors")
-        if os.path.exists(single):
-            with safe_open(single, framework="pt") as f:
-                weight_map = {k: "model.safetensors" for k in f.keys()}
-    else:
+    if os.path.exists(index):
         with open(index, encoding="utf-8") as f:
             weight_map = json.load(f)["weight_map"]
+    else:
+        single = os.path.join(ckpt_dir, "model.safetensors")
+        if not os.path.exists(single):
+            return meta_names
+        with safe_open(single, framework="pt") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
 
-    targets = dict(model.named_parameters())
-    targets.update(dict(model.named_buffers()))
-    missing = []
+    # map every leaf tensor name to (parent module, kind, attribute name);
+    # state_dict aliases (tied weights) resolve to the same owner
+    owners: dict[str, tuple[torch.nn.Module, str, str]] = {}
+    for mod_name, mod in model.named_modules():
+        for leaf in mod._parameters:
+            owners[f"{mod_name}.{leaf}" if mod_name else leaf] = (mod, "param", leaf)
+        for leaf in mod._buffers:
+            owners[f"{mod_name}.{leaf}" if mod_name else leaf] = (mod, "buffer", leaf)
+
+    missing, replaced = [], 0
     for n in meta_names:
         shard = weight_map.get(n)
-        obj = targets.get(n)
-        if shard is None or obj is None:
+        owner = owners.get(n)
+        if shard is None or owner is None:
             missing.append(n)
             continue
+        mod, kind, leaf = owner
         with safe_open(os.path.join(ckpt_dir, shard), framework="pt") as f:
             t = f.get_tensor(n)
-        with torch.no_grad():
-            obj.data.copy_(t.to(obj.dtype))
-    hydrated = [n for n in meta_names if n not in missing]
-    if hydrated:
-        logger.info("hydrated %d meta tensor(s) from checkpoint for export", len(hydrated))
+        old = mod._parameters[leaf] if kind == "param" else mod._buffers[leaf]
+        if kind == "param":
+            mod._parameters[leaf] = torch.nn.Parameter(t, requires_grad=bool(old.requires_grad))
+        else:
+            mod._buffers[leaf] = t
+        replaced += 1
+    if replaced:
+        logger.info("hydrated %d meta tensor(s) from checkpoint for export", replaced)
     return missing
 
 
