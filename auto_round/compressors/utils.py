@@ -639,10 +639,13 @@ def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: in
         _PACK_DEVICE_LOGGED = True
         logger.info("immediate_pack_block: packing on %s", pack_device)
     for module_name in names:
-        immediate_pack(module_name, layer_config)
+        immediate_pack(module_name, layer_config, device=pack_device)
 
 
-def immediate_pack(name: str, layer_config: dict):
+def immediate_pack(name: str, layer_config: dict, device=None):
+    """Pack one module immediately. ``device`` overrides the pack target (the
+    streaming loop passes the block's home device so packed modules do not
+    round-trip to the primary GPU); None keeps the global default."""
     from auto_round.context.compress import CompressContext
     from auto_round.context.model import ModelContext
 
@@ -654,7 +657,7 @@ def immediate_pack(name: str, layer_config: dict):
     compress_context.formats[0].immediate_pack(
         name=name,
         model=model_context.model,
-        device=device_manager.device,
+        device=device if device is not None else device_manager.device,
         output_dir=_get_save_folder_name(compress_context.formats[0]),
         layer_config=layer_config,
         tokenizer=model_context.tokenizer,

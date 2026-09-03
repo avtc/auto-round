@@ -264,6 +264,30 @@ class TestAdoptExistingShards:
         assert not os.path.exists(tail), "incomplete tail shard must be deleted"
         assert w2.shard_counter == 2
 
+    def test_adopt_deletes_truncated_data_tail_shard(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", torch.randn(4, 4))
+        w1._flush_shard()
+        # crash AFTER the header flushed but DURING the data write: the tail
+        # shard parses as valid safetensors but its declared data is truncated
+        import struct as _struct
+
+        from safetensors.torch import save_file
+
+        full = os.path.join(out, "model-shard-00002.safetensors")
+        save_file({"blk.1.w": torch.randn(8, 8)}, full)
+        with open(full, "r+b") as f:
+            header_len = _struct.unpack("<Q", f.read(8))[0]
+            f.truncate(8 + header_len + 16)  # cut inside the tensor data
+
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 1
+        assert not os.path.exists(full), "header-valid but truncated tail shard must be deleted"
+        # counter = max adopted index; the next flush continues after it
+        assert w2.shard_counter == 1
+
     def test_adopt_raises_on_corrupt_non_tail_shard(self, tmp_path, monkeypatch):
         out = str(tmp_path)
         w1 = self._writer(out, monkeypatch)

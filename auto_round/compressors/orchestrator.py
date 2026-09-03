@@ -795,6 +795,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         resume_states = None
         if envs.AR_RESUME_DIR and self.compress_context.is_immediate_saving:
             resume_states = self._build_resume_states(all_blocks)
+            # quantize_and_save clears these after a successful export; without
+            # the assignment a rerun of the same command would skip every block
+            # and export nothing
+            self._resume_states = resume_states
             if any(rs is not None and rs.resume_index > 0 for rs in resume_states):
                 self._stream_resume_jump_chain(calib_state, resume_states)
                 if self.shard_writer is not None:
@@ -848,6 +852,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         total_block_cnt = sum(len(block) for block in all_blocks)
         pbar = tqdm(range(total_block_cnt))
         stream_block_idx = 0
+        blocks_before = 0
         for g_idx, block_names in enumerate(all_blocks):
             rs = resume_states[g_idx] if resume_states is not None and g_idx < len(resume_states) else None
             for k_idx, block_name in enumerate(block_names):
@@ -898,12 +903,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # ── Pure algorithm ────────────────────────────────────────
                 # global block index/count so consumers keyed on "last block
                 # of the run" (SignRound's LFQ loss gate, layerwise rotation
-                # indices) behave exactly as on the data-driven path
+                # indices) behave exactly as on the data-driven path. This is
+                # the position in the FULL block list -- resumed-done blocks
+                # that were skipped above still count (unlike the staging
+                # rotation index).
                 ctx = BlockContext(
                     model=self.model,
                     block_names=[block_name],
                     block_name=block_name,
-                    block_index=stream_block_idx,
+                    block_index=blocks_before + k_idx,
                     block_cnt=total_block_cnt,
                 )
                 # ── MoE scale alignment for FP8 dispatch efficiency ────────────────
@@ -1018,6 +1026,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
+            blocks_before += len(block_names)
 
         # Pipeline lifecycle: model-level teardown (also finalizes rotation)
         if _bg_pack is not None:

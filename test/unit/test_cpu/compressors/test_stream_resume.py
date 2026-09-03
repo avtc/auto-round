@@ -13,9 +13,10 @@
 # limitations under the License.
 """AR_RESUME_DIR support for the --stream_quantization (zero-shot) loop.
 
-The per-group manifests are the shared currency: any execution mode (serial,
-the three streaming-side pieces: the chain jump to the saved frontier entry,
-the pending-offset arithmetic, and the done-block handler (pure skip vs
+The per-group manifests are the shared currency across execution modes
+(serial, streaming). This file covers the streaming-side pieces: the chain
+jump to the saved frontier entry, the pending-offset arithmetic, and the
+done-block skip.
 """
 
 import os

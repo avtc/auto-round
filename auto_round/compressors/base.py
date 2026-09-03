@@ -549,6 +549,14 @@ class BaseOrchestrator(object):
                 "the ordinary (non-streaming) path."
             )
         if self.stream_quantization:
+            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig as _SR
+
+            if any(getattr(c, "enable_lfq", False) for c in getattr(self, "_alg_configs", None) or []):
+                raise ValueError(
+                    "enable_lfq=True is not supported under stream_quantization: the LFQ loss "
+                    "forwards the still-meta lm_head on the final block. Leave enable_lfq off "
+                    "for streaming runs."
+                )
             from auto_round.algorithms.quantization.config import QuantizationConfig
             from auto_round.algorithms.quantization.rtn.config import RTNConfig
             from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
@@ -675,12 +683,25 @@ class BaseOrchestrator(object):
             static_kv_dtype=self.static_kv_dtype,
             static_attention_dtype=self.static_attention_dtype,
         ):
+            if getattr(self, "stream_quantization", False):
+                raise ValueError(
+                    "Static activation quantization is not supported under stream_quantization: "
+                    "collecting activation statistics requires full-model forward passes, which "
+                    "the streaming loop (meta skeleton, block-at-a-time) cannot provide. Use a "
+                    "weight-only scheme (e.g. W4A16) or the ordinary (non-streaming) path."
+                )
             return True
 
         # Layer-level scheme overrides can request static-activation paths
         # (e.g., global MXFP8 + local NVFP4 experts). Those still need
         # calibration data even when top-level scheme looks dynamic.
         if self._layer_config_needs_calibration(check_need_act_calibration):
+            if getattr(self, "stream_quantization", False):
+                raise ValueError(
+                    "Layer-level static activation quantization is not supported under "
+                    "stream_quantization (full-model forward passes are unavailable). Use "
+                    "weight-only layer schemes or the ordinary (non-streaming) path."
+                )
             return True
 
         return False

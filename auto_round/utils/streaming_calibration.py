@@ -22,7 +22,7 @@ streamed onto the compute device, hidden states chained block-to-block), and
 each block's FP input tensors plus the forward kwargs are cached on the host -
 the same structure the data-driven calibrator produces. The quantization loop
 then replays the cached inputs through each block via the standard
-``compress_block`` path: transforms (rotation, PreSINQ) run first and the
+``compress_block`` path: transforms (rotation, smoothing) run first and the
 imatrix hooks fire on the replayed inputs, exactly matching the data-driven
 semantics for identical rows.
 

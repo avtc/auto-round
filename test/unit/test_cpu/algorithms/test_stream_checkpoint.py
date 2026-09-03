@@ -424,8 +424,8 @@ class TestStreamingRoutingWaiver:
 
 
 class TestStreamModeExclusivity:
-    """stream_quantization is mutually exclusive with AR_DISK_STREAM_MODEL and
-    unsupported for multimodal models -- both must fail fast with the fix."""
+    """stream_quantization is mutually exclusive with AR_DISK_STREAM_MODEL
+    (hard error), and quant_nontext_module is rejected under streaming."""
 
     def _make_context(self, monkeypatch, *, env_disk_stream=False, mllm=False):
         from auto_round import envs

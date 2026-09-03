@@ -63,23 +63,6 @@ def _stream_out_device(block):
     return torch.device(home) if home is not None else None
 
 
-def _as_hidden_tensor(out):
-    """Normalize a block output (tensor | dict | tuple) to its hidden-states tensor."""
-    import torch as _torch
-
-    if isinstance(out, dict):
-        for key in ("hidden_states", "last_hidden_state"):
-            if key in out:
-                return out[key]
-        for v in out.values():
-            if isinstance(v, _torch.Tensor):
-                return v
-        raise ValueError("bias correction: block output dict has no tensor")
-    if isinstance(out, (tuple, list)):
-        out = out[0]
-    return out
-
-
 @dataclass
 class BlockContext:
     """Per-block context threaded through the lifecycle hooks.

@@ -113,9 +113,6 @@ class ShardWriter:
     @staticmethod
     def _read_safetensors_header(path: str) -> Optional[dict]:
         """Parse a safetensors header (tensor_name -> dtype/shape) without loading data."""
-        import json
-        import struct
-
         try:
             with open(path, "rb") as f:
                 n = struct.unpack("<Q", f.read(8))[0]
@@ -147,7 +144,6 @@ class ShardWriter:
 
         Returns the number of adopted shards.
         """
-        import glob
         import re
 
         output_dir = self.output_dir
