@@ -252,6 +252,63 @@ def pack_layer(name, model, device=None):
 
 
 @torch.no_grad()
+def _restore_packed_modules_from_shards(model, output_dir: str) -> int:
+    """Rebuild packed-module state from already-written output shards.
+
+    A resumed streaming session skips blocks that a previous run already
+    packed and wrote: their modules stay fresh (bits set, but no scale or
+    compressed state) because the packed tensors live in the output shards,
+    not in memory. Re-attach the packed attributes and mark the modules
+    compressed so packing is a no-op and the quantization config derives
+    exactly as it would in the session that did the work.
+    """
+    import json
+    import os
+
+    from compressed_tensors.quantization import QuantizationStatus  # pylint: disable=E0401
+    from safetensors import safe_open
+
+    shards = {}
+    for fn in os.listdir(output_dir or ""):
+        if not fn.endswith(".safetensors"):
+            continue
+        path = os.path.join(output_dir, fn)
+        with safe_open(path, framework="pt") as h:
+            for k in h.keys():
+                shards.setdefault(k, path)
+    if not shards:
+        return 0
+
+    restored = 0
+    for name, layer in model.named_modules():
+        if not check_to_quantized(layer):
+            continue
+        if getattr(layer, "quantization_status", None) is not None or hasattr(layer, "scale"):
+            continue
+        if f"{name}.weight_packed" not in shards:
+            continue
+        attrs = {}
+        for suffix in ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point"):
+            path = shards.get(f"{name}.{suffix}")
+            if path is None:
+                continue
+            with safe_open(path, framework="pt") as h:
+                attrs[suffix] = h.get_tensor(f"{name}.{suffix}")
+        if "weight_scale" not in attrs:
+            continue
+        layer.quantization_scheme = construct_ct_scheme(layer)
+        layer.quantization_status = QuantizationStatus.COMPRESSED
+        for suffix, tensor in attrs.items():
+            if suffix == "weight_scale":
+                layer.weight_scale = torch.nn.Parameter(tensor, requires_grad=False)
+            else:
+                setattr(layer, suffix, tensor)
+        restored += 1
+    if restored:
+        logger.info("restored packed state for %d module(s) from existing output shards (resumed blocks)", restored)
+    return restored
+
+
 def save_quantized_as_llmcompressor(
     output_dir: str,
     model: torch.nn.Module = None,
@@ -299,6 +356,10 @@ def save_quantized_as_llmcompressor(
     save_pretrained_artifact(tokenizer, output_dir, artifact_name="tokenizer")
     if output_dir is not None and processor is not None:
         processor.save_pretrained(output_dir)
+
+    # a resumed streaming session skipped blocks already packed and written
+    # by an earlier run; rebuild their packed-module state from the shards
+    _restore_packed_modules_from_shards(model, output_dir)
 
     # generate q_weight
     device = get_major_device(device)
