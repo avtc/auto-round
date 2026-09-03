@@ -459,7 +459,13 @@ def prepare_streaming_calibration(
         input_others["position_ids"] = [torch.arange(ids.shape[-1]).unsqueeze(0) for ids in rows]
     if "position_embeddings" in params and rotary is not None:
         pe_list = []
-        rotary_dtype = _block_dtype(first_block) or torch.float32
+        # probe the rotary exactly as the model's own forward does: dummy in
+        # the model dtype the normal path would run (the streamer's resolved
+        # amp policy; the meta skeleton itself is never dtype-converted),
+        # cos/sin kept in whatever dtype the module returns. A fixed fp32
+        # dummy upcasts q/k at full-attention blocks while v stays in the
+        # block dtype - a mix the attention kernel rejects.
+        rotary_dtype = getattr(streamer, "load_dtype", None) or next(model.parameters()).dtype
         for ids in rows:
             pos = torch.arange(ids.shape[-1], device=device).unsqueeze(0)
             cos, sin = rotary(torch.zeros(1, ids.shape[-1], device=device, dtype=rotary_dtype), pos)

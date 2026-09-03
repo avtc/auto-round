@@ -408,6 +408,15 @@ class CompressionOrchestrator(BaseOrchestrator):
         """
         self.post_init()
 
+        # mirror the normal path's model.to(amp_dtype): every tensor the
+        # streamer materializes must follow the same dtype policy or the
+        # streamed run quantizes raw checkpoint precision while a fully
+        # loaded run quantizes the converted dtype (amp state resolves here,
+        # after the context finished loading)
+        streamer = getattr(self.model_context, "checkpoint_streamer", None)
+        if streamer is not None and getattr(self, "amp", False):
+            streamer.load_dtype = self.amp_dtype
+
         if not self.need_calib:
             return self._quantize_zero_shot()
 
@@ -1225,7 +1234,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     f"[stream] {blk} has no module counterpart; " f"writing {len(names)} checkpoint tensors verbatim"
                 )
                 for n in names:
-                    self.shard_writer.save_tensor(n, streamer.fetch(n))
+                    self.shard_writer.save_tensor(n, streamer.fetch(n, raw=True))
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 

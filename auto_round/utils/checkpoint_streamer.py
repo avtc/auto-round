@@ -107,10 +107,16 @@ class CheckpointStreamer:
 
     Args:
         model_path: Local directory containing the checkpoint.
+        load_dtype: Optional target dtype for floating tensors. A fully loaded
+            model is converted via ``model.to(amp_dtype)`` during context
+            setup; streaming must apply the same policy to every tensor it
+            materializes or the streamed run would quantize raw checkpoint
+            precision while the normal run quantizes the converted dtype.
     """
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, load_dtype: Optional[torch.dtype] = None):
         self.model_path = model_path
+        self.load_dtype = load_dtype
         self.weight_map: dict[str, str] = {}
         self._format: Optional[str] = None  # "safetensors" | "bin"
         self._open_handles: dict[str, object] = {}  # shard path -> safe_open handle
@@ -357,12 +363,17 @@ class CheckpointStreamer:
         self._prefetch_handles.clear()
         self._prefetch_handle_order.clear()
 
-    def fetch(self, name: str, device: Optional[str] = None) -> torch.Tensor:
+    def fetch(self, name: str, device: Optional[str] = None, raw: bool = False) -> torch.Tensor:
         """Read one tensor (CPU unless ``device`` given); prefetched tensors
-        are served from the host-RAM cache."""
+        are served from the host-RAM cache. ``raw=True`` skips the resolved
+        load-dtype policy (checkpoint-only tensors are passed through
+        verbatim, mirroring the normal path where they never become part of
+        the model and so are never dtype-converted)."""
         tensor = self._prefetch_pop(name)
         if tensor is None:
             tensor = self._read_tensor(name, self._open_handles, self._open_order)
+        if self.load_dtype is not None and not raw and tensor.is_floating_point():
+            tensor = tensor.to(self.load_dtype)
         if device is not None:
             tensor = tensor.to(device)
         return tensor
