@@ -20,6 +20,15 @@ AutoRound uses a centralized environment variable management system through the 
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_PERF_COUNTERS
+- **Description**: Emit per-block `[perf]` timing lines in the streaming loop (load / tune / pack / write / resume snapshot). Informational only.
+- **Default**: `false`
+- **Usage**: Set this to observe where streaming wall time goes
+
+```bash
+export AR_PERF_COUNTERS=1
+```
+
 ### AR_ENABLE_COMPILE_PACKING
 - **Description**: Enables compile packing optimization
 - **Default**: `False` (equivalent to `"0"`)

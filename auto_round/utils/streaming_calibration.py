@@ -213,7 +213,14 @@ def materialize_residual_meta(model, cfg, device):
     """
     rebuilt, stubborn = [], []
     for name, mod in model.named_modules():
-        tensors = list(mod.parameters()) + list(mod.buffers(recurse=False))
+        # leaf-level params only: parameters() recurses, so containers would
+        # inherit their children's meta state and flood the list; modules
+        # marked for quantization are expected to sit on meta once their
+        # packed tensors are written to shards
+        if check_to_quantized(mod) and not any(mod.children()):
+            continue
+        tensors = list(mod.named_parameters(recurse=False)) + list(mod.named_buffers(recurse=False))
+        tensors = [t for _, t in tensors]
         if not any(t.device.type == "meta" for t in tensors):
             continue
         base = name.rsplit(".", 1)[-1]
@@ -239,7 +246,7 @@ def materialize_residual_meta(model, cfg, device):
     return stubborn
 
 
-from auto_round.utils.model import set_module
+from auto_round.utils.model import check_to_quantized, set_module
 
 
 def _ensure_real_rotary(rotary, cfg, device):

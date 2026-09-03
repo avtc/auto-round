@@ -65,7 +65,7 @@ def _rehome_calibration_state(
         return 0
     free, _total = torch.cuda.mem_get_info(device)
     if needed + margin_bytes > free:
-        logger.info(
+        logger.debug(
             "[tune-locality] keeping calibration state off %s: need %.1fGiB + margin, free %.1fGiB",
             device,
             needed / 2**30,
@@ -79,7 +79,7 @@ def _rehome_calibration_state(
             if torch.is_tensor(t) and t.device != device:
                 lst[i] = t.to(device)
                 moved += 1
-    logger.info(
+    logger.debug(
         "[tune-locality] re-homed %d calibration tensors (%.1fGiB) to %s in %.1fs",
         moved,
         needed / 2**30,
@@ -628,7 +628,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
         self.compress_context.clear_memory()  # clear cached memory during training
         if len(unquantized_layer_names) != 0:
-            logger.info(f"Unquantized layers: {unquantized_layer_names}")
+            logger.debug(f"Unquantized layers: {unquantized_layer_names}")
         with torch.no_grad():
             unwrapper_block(block, best_params)
 

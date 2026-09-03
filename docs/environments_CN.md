@@ -20,6 +20,15 @@ AutoRound 通过 `envs.py` 模块提供统一的环境变量管理系统，支�
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_PERF_COUNTERS
+- **描述**：在流式循环中输出逐块 `[perf]` 计时（load / tune / pack / write / resume 快照）。仅用于观察。
+- **默认值**：`false`
+- **用法**：设置该项以观察流式耗时分布
+
+```bash
+export AR_PERF_COUNTERS=1
+```
+
 ### AR_ENABLE_COMPILE_PACKING
 - **描述**：启用编译打包优化
 - **默认值**：`False`（等价于 `"0"`）

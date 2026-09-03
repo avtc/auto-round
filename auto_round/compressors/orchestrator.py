@@ -1014,12 +1014,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                         preferred=calib_state.get("_mask_form"),
                     )
                     if form != calib_state.get("_mask_form"):
-                        logger.info("[stream_calibration] attention-mask form for %s: %s (probed)", block_name, form)
+                        # block types come in runs; the transition is the signal
+                        logger.info("[stream_calibration] attention-mask form change at %s: %s", block_name, form)
                     calib_state["input_others"]["attention_mask"] = [
                         materialize_mask_form(m, form) for m in calib_state["keymask_2d"]
                     ]
                     calib_state["_mask_form"] = form
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
+                    _t_tune = _time.perf_counter()
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
                         calib_state["fp_inputs"],
@@ -1035,6 +1037,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         calib_state["q_inputs"] = new_q_input
                     else:
                         calib_state.pop("q_inputs", None)
+                    block._stream_tune_seconds = _time.perf_counter() - _t_tune
                 else:
                     self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
                 if _bg_pack is not None:
@@ -1100,23 +1103,31 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self.shard_writer.write(name=block_name)
                     block.to("meta")
                     _t_write = _time.perf_counter() - _t_write
-                    logger.info(
-                        "[stream] block timings: load %.1fs pack %.1fs write %.1fs",
-                        _t_load,
-                        _t_pack,
-                        _t_write,
-                    )
+                    if envs.AR_PERF_COUNTERS:
+                        logger.info(
+                            "[perf] block %s: load %.1fs tune %.1fs pack %.1fs write %.1fs",
+                            block_name,
+                            _t_load,
+                            getattr(block, "_stream_tune_seconds", 0.0),
+                            _t_pack,
+                            _t_write,
+                        )
                     if rs is not None:
                         # crash-durability contract, same as the serial path:
                         # the manifest may claim this block done only after its
                         # tensors are durably flushed to a shard file
                         self.shard_writer._flush_shard()
+                        _t_snap = _time.perf_counter()
                         is_model_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
                         rs.mark_block_done(
                             block_name,
                             calib_state.get("q_inputs") if calib_state is not None else None,
                             (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None,
                         )
+                        if envs.AR_PERF_COUNTERS:
+                            logger.info(
+                                "[perf] block %s: resume snapshot %.1fs", block_name, _time.perf_counter() - _t_snap
+                            )
                 else:
                     mv_module_from_gpu(block)
                     if self.compress_context.low_cpu_mem_usage and streamer is None:

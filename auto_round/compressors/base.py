@@ -2374,13 +2374,16 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
 
     missing, replaced = [], 0
     for n in meta_names:
+        if quantized_prefixes and n.startswith(quantized_prefixes):
+            # packed in shards already; packers must see it meta. These are
+            # also no "missing" tensors: their meta placeholders (packed
+            # attrs included) are the designed post-pack state.
+            continue
         shard = weight_map.get(n)
         owner = owners.get(n)
         if shard is None or owner is None:
             missing.append(n)
             continue
-        if quantized_prefixes and n.startswith(quantized_prefixes):
-            continue  # packed in shards already; packers must see it meta
         mod, kind, leaf = owner
         with safe_open(os.path.join(ckpt_dir, shard), framework="pt") as f:
             t = f.get_tensor(n)
