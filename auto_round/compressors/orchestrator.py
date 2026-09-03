@@ -920,6 +920,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         )
         _bg_pack = None
 
+        # Model-level algorithm lifecycle before the block loop, mirroring the
+        # data-driven path: SignRoundV2Quantizer.prepare_run binds the optimized
+        # wrapper (imatrix-weighted init); skipping it left V2 tuning silently
+        # on the plain min/max wrapper. Inert for iters=0 RTN runs (no member
+        # overrides prepare_run there).
+        self.alg_composer.prepare_run()
+
         total_block_cnt = sum(len(block) for block in all_blocks)
         pbar = tqdm(range(total_block_cnt))
         stream_block_idx = 0

@@ -1070,6 +1070,69 @@ class TestStreamQuantizeEquivalence:
         assert out_dir
         assert chained["calls"] >= 2, "auto-engaged chain must feed every block"
 
+    def test_streamed_signround_runs_prepare_run_and_alg_ext_wrapper(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """The streaming zero-shot loop must run the model-level lifecycle
+        before its block loop: SignRoundV2Quantizer.prepare_run binds the
+        optimized wrapper (SignRoundOptimizedWrapperLinear). Skipping it left
+        V2 tuning silently on the plain min/max wrapper (worse init, worse KL).
+        """
+        import shutil
+        from functools import partial
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.algorithms.quantization.sign_roundv2.quantizer import SignRoundOptimizedWrapperLinear
+        from auto_round.autoround import AutoRound
+        from auto_round.wrapper import wrapper_block
+
+        torch.manual_seed(11)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
+        ck = str(tmp_path / "ck_ext")
+        shutil.copytree(tiny_checkpoint, ck)
+
+        prepared = {"calls": 0}
+        orig_prepare = AlgorithmComposer.prepare_run
+
+        def prepare_spy(self, composer=None):
+            prepared["calls"] += 1
+            return orig_prepare(self, composer=composer)
+
+        wrapper_at_compress = []
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            wrapper_at_compress.append(self.block_quantizer.wrapper_block)
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "prepare_run", prepare_spy)
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4, enable_alg_ext=True)],
+            layerwise_rotation=False,
+            stream_quantization=True,
+            dataset=rows,
+            seqlen=32,
+            nsamples=4,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        out_dir = ar.quantize_and_save(str(tmp_path / "ext"), format="auto_round")
+        assert out_dir, "streamed SignRound alg-ext run must produce an export"
+        assert prepared["calls"] >= 1, "streaming zero-shot loop never called alg_composer.prepare_run"
+        assert wrapper_at_compress, "no compress_block calls observed"
+        expected = partial(wrapper_block, wrapper_cls=SignRoundOptimizedWrapperLinear)
+        for w in wrapper_at_compress:
+            assert w.func is wrapper_block, "wrapper_block must stay the shared wrapper function"
+            assert w.keywords.get("wrapper_cls") is SignRoundOptimizedWrapperLinear, (
+                "alg-ext tuning under streaming must use the optimized wrapper; "
+                "the plain min/max WrapperLinear means prepare_run was skipped"
+            )
+
     def test_prefetched_export_matches_streamed(self, tiny_checkpoint, tmp_path):
         """stream_prefetch only changes WHERE the tensors come from (host-RAM
         cache instead of a synchronous disk read); the exported checkpoint must
