@@ -2128,6 +2128,15 @@ class BaseOrchestrator(object):
                 kwargs.setdefault("processor", self.model_context.processor)
             if getattr(self.model_context, "image_processor", None) is not None:
                 kwargs.setdefault("image_processor", self.model_context.image_processor)
+            missing = _hydrate_meta_from_checkpoint(
+                self.model_context.model, getattr(self.model_context, "model_path", None)
+            )
+            if missing:
+                logger.warning(
+                    "%d tensor(s) remained meta at export (not in the checkpoint): %s",
+                    len(missing),
+                    missing[:10],
+                )
             compressed_model = format.save_quantized(
                 save_folder,
                 model=self.model_context.model,
@@ -2311,6 +2320,57 @@ class BaseOrchestrator(object):
             self._resume_states = None
 
         return model, folders
+
+
+def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
+    """Load still-meta tensors straight from the model checkpoint files.
+
+    Export reads the in-memory model. Some tensors (e.g. a vision tower in a
+    multimodal wrapper) may never be materialized by the quantization paths
+    - the streaming skeleton leaves them meta and no pass-through covers
+    them. Copy their values from the checkpoint shards so the exported
+    artifacts are complete; returns the names that could not be hydrated
+    (absent from the checkpoint, e.g. computed buffers).
+    """
+    import glob
+    import json
+    import os
+
+    from safetensors.torch import safe_open
+
+    sd = model.state_dict()
+    meta_names = [n for n, t in sd.items() if t.device.type == "meta"]
+    if not meta_names or not ckpt_dir or not os.path.isdir(ckpt_dir):
+        return meta_names
+
+    index = os.path.join(ckpt_dir, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        weight_map = {}  # single-file checkpoints
+        single = os.path.join(ckpt_dir, "model.safetensors")
+        if os.path.exists(single):
+            with safe_open(single, framework="pt") as f:
+                weight_map = {k: "model.safetensors" for k in f.keys()}
+    else:
+        with open(index, encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+
+    targets = dict(model.named_parameters())
+    targets.update(dict(model.named_buffers()))
+    missing = []
+    for n in meta_names:
+        shard = weight_map.get(n)
+        obj = targets.get(n)
+        if shard is None or obj is None:
+            missing.append(n)
+            continue
+        with safe_open(os.path.join(ckpt_dir, shard), framework="pt") as f:
+            t = f.get_tensor(n)
+        with torch.no_grad():
+            obj.data.copy_(t.to(obj.dtype))
+    hydrated = [n for n in meta_names if n not in missing]
+    if hydrated:
+        logger.info("hydrated %d meta tensor(s) from checkpoint for export", len(hydrated))
+    return missing
 
 
 #: Backward-compatible alias — prefer ``BaseOrchestrator`` in new code.
