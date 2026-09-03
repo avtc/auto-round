@@ -93,16 +93,28 @@ def resolve_chain_mask_form(block, fp_row, input_others):
     of a model shares the same layer calling convention, so probing once is
     enough.
     """
+
+    def _to_dev(v, dev):
+        if isinstance(v, torch.Tensor):
+            return v.to(dev)
+        if isinstance(v, (list, tuple)):
+            packed = type(v)
+            return packed(_to_dev(x, dev) for x in v)
+        return v
+
     row_others = {k: (v[0] if isinstance(v, list) else v) for k, v in input_others.items()}
     row_others["use_cache"] = False
     row_others["past_key_values"] = None
+    dev = next((p.device for p in block.parameters() if p.device.type != "meta"), torch.device("cpu"))
+    row_others = {k: _to_dev(v, dev) for k, v in row_others.items()}
+    fp_row = fp_row[:1].to(dev)
     last_err = None
     with torch.no_grad():
         for name, mask in mask_form_candidates(input_others["attention_mask"][0]):
             probe_others = dict(row_others)
-            probe_others["attention_mask"] = mask.to(fp_row.device)
+            probe_others["attention_mask"] = mask.to(dev)
             try:
-                block(fp_row[:1].to(fp_row.device), **probe_others)
+                block(fp_row, **probe_others)
                 return name
             except Exception as e:  # noqa: BLE001  shape/dtype/type errors are the signal
                 last_err = e
