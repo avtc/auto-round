@@ -228,6 +228,13 @@ class ModelContext(BaseContext):
         )
 
     def _load_model(self):
+        if self.stream_quantization and not isinstance(self.model, (str, os.PathLike)):
+            raise ValueError(
+                "stream_quantization requires a model path (str): the streaming loop "
+                "reads decoder blocks straight from the on-disk checkpoint and never "
+                "materializes the full model. A preloaded model object cannot be "
+                "streamed; pass the checkpoint path instead."
+            )
         if self.stream_quantization and envs.AR_DISK_STREAM_MODEL:
             raise ValueError(
                 "AR_DISK_STREAM_MODEL and --stream_quantization are mutually "

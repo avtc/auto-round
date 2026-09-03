@@ -760,8 +760,3 @@ class AlgorithmComposer:
         """Finalize layer-wise rotation after all blocks are processed (no-op when inactive)."""
         for t in self._rotation_transforms:
             t.finalize_layerwise(model)
-
-    @property
-    def has_layerwise_rotation(self) -> bool:
-        """Whether layer-wise rotation transforms are active."""
-        return bool(self._rotation_transforms)

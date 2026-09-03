@@ -568,6 +568,45 @@ class CompressionOrchestrator(BaseOrchestrator):
             return "embeddings"
         return "nonblock:" + name.split(".")[0]
 
+    def _build_resume_states(self, all_blocks: list) -> list:
+        """Build one ResumeState per block group under AR_RESUME_DIR.
+
+        Shared by the serial tuning path and the streaming zero-shot loop so
+        the per-group manifests (signature strings, group_{idx} layout) are
+        byte-compatible: a manifest advanced by one execution mode is
+        consumed by the other and vice versa.
+        """
+        from auto_round.utils.resume import ResumeState, compute_run_signature, layer_config_fingerprint
+
+        model_dir = getattr(self.model_context, "disk_stream_model_dir", None) or getattr(
+            getattr(self.model_context.model, "config", None), "_name_or_path", None
+        )
+        dataset_desc = str(getattr(self, "dataset", None))
+        # str(self.scheme) alone is bits-blind for AutoScheme runs: two runs
+        # with different avg_bits share it, so include the resolved
+        # per-layer allocation (see layer_config_fingerprint docstring). The
+        # qi= component keeps enable_quanted_input (chain semantics) from
+        # silently sharing manifests across different modes.
+        scheme_desc = (
+            str(self.scheme)
+            + "|"
+            + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
+            + "|qi="
+            + str(bool(self.alg_composer.need_quanted_input()))
+        )
+        states = []
+        for group_idx, block_names in enumerate(all_blocks):
+            sig = compute_run_signature(
+                model_dir,
+                scheme_desc,
+                dataset_desc,
+                self.calibration_context.nsamples,
+                self.calibration_context.seqlen,
+                block_names,
+            )
+            states.append(ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names))
+        return states
+
     def _largest_block_bytes(self) -> float:
         """Largest block's checkpoint-tensor footprint from the meta skeleton (bytes)."""
         try:
@@ -585,7 +624,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         return float(max(per_block.values()))
 
     def _primary_fits_largest_block(self, quant_dev: torch.device):
-        """Whether the primary GPU can join the auto rotation, else None.
+        """(largest_block_GiB, free_GiB) when the primary GPU can join the auto
+        rotation, else None.
 
         Fit rule: free VRAM (queried live) - 3 GiB headroom >= largest block.
         The headroom covers tuning transients on top of the block (batch
@@ -600,7 +640,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             return None
         largest = self._largest_block_bytes()
         free_gb = free_b / 2**30
-        if largest is float("inf") or free_gb - 3.0 < largest / 2**30:
+        if not largest < float("inf") or free_gb - 3.0 < largest / 2**30:
             return None
         return largest / 2**30, free_gb
 
@@ -870,8 +910,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _t_load = _time.perf_counter()
                 if streamer is not None:
                     if stage_devices:
-                        # round-robin home: the block was staged here, quantize in place
-                        load_device = stage_devices[stream_block_idx % len(stage_devices)]
+                        # the reader records where each block was ACTUALLY staged
+                        # (first-fit under asymmetric pressure may diverge from
+                        # the rotation); quantize in place on that home
+                        load_device = str(
+                            streamer._prefetch_stage_dev.get(
+                                block_name, stage_devices[stream_block_idx % len(stage_devices)]
+                            )
+                        )
                     else:
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
@@ -1267,33 +1313,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "low_cpu_mem_usage=True (or a format= to quantize_and_save) "
                     "for resumability to be meaningful here."
                 )
-            from auto_round.utils.resume import ResumeState, compute_run_signature, layer_config_fingerprint
-
-            model_dir = getattr(self.model_context, "disk_stream_model_dir", None) or getattr(
-                getattr(self.model_context.model, "config", None), "_name_or_path", None
-            )
-            dataset_desc = str(getattr(self, "dataset", None))
-            # str(self.scheme) alone is bits-blind for AutoScheme runs: two runs
-            # with different avg_bits share it, so include the resolved
-            # per-layer allocation (see layer_config_fingerprint docstring).
-            scheme_desc = (
-                str(self.scheme)
-                + "|"
-                + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
-            )
-            resume_states = []
-            for group_idx, block_names in enumerate(all_blocks):
-                sig = compute_run_signature(
-                    model_dir,
-                    scheme_desc,
-                    dataset_desc,
-                    self.calibration_context.nsamples,
-                    self.calibration_context.seqlen,
-                    block_names,
-                )
-                resume_states.append(
-                    ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names)
-                )
+            resume_states = self._build_resume_states(all_blocks)
             # a resumed run must never overwrite shards the crashed run wrote:
             # adopt them so the writer continues at the next shard index
             if any(rs is not None and rs.resume_index > 0 for rs in resume_states) and self.shard_writer is not None:

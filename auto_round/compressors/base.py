@@ -549,8 +549,6 @@ class BaseOrchestrator(object):
                 "the ordinary (non-streaming) path."
             )
         if self.stream_quantization:
-            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig as _SR
-
             if any(getattr(c, "enable_lfq", False) for c in getattr(self, "_alg_configs", None) or []):
                 raise ValueError(
                     "enable_lfq=True is not supported under stream_quantization: the LFQ loss "

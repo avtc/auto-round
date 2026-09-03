@@ -81,6 +81,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
     # Streaming loop: log a per-GPU memory inventory every 16 blocks.
     "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower() in ("1", "true", "yes"),
+    # torch.compile cache size cap (recompile_limit); streaming block shapes
+    # vary, a higher cap avoids spurious eager fallbacks.
     "AR_DYNAMO_CACHE_SIZE_LIMIT": lambda: int(os.getenv("AR_DYNAMO_CACHE_SIZE_LIMIT", "16")),
     "AR_MODEL_FREE_SHARD_PARALLELISM": lambda: _get_optional_positive_int_env("AR_MODEL_FREE_SHARD_PARALLELISM"),
     "AUTO_ROUND_CACHE": lambda: os.getenv("AUTO_ROUND_CACHE", None),
