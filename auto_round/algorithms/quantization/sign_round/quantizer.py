@@ -108,7 +108,6 @@ def alt2_switch_iter(iters: int, recipe: str, iters2_env: int):
     return iters - iters2
 
 
-
 def _alt2_regrid_block(block) -> float:
     """Re-grid every participating wrapper in the block; returns mean |delta scale|."""
     deltas = []

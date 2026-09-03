@@ -533,7 +533,6 @@ class TestStreamModeExclusivity:
         assert called["meta"] == 1, "mllm + stream_quantization must use the streaming loader"
         assert ctx.is_mllm is True
 
-
     def test_quant_nontext_module_under_streaming_raises(self, monkeypatch):
         """quant_nontext_module + streaming must fail fast: the streaming chain
         feeds text hidden states block-to-block and cannot drive vision blocks

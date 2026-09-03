@@ -33,6 +33,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from auto_round.compressors import BaseOrchestrator
+
 import torch
 
 from auto_round.algorithms.block_runner import BlockForwardRunner
@@ -75,8 +78,6 @@ def _as_hidden_tensor(out):
     if isinstance(out, (tuple, list)):
         out = out[0]
     return out
-
-
 
 
 @dataclass
@@ -740,9 +741,9 @@ class AlgorithmComposer:
                     continue
                 from auto_round import envs as _envs
 
-                streaming = bool(
-                    getattr(self._orchestrator_ref, "stream_quantization", False)
-                ) or bool(_envs.AR_DISK_STREAM_MODEL)
+                streaming = bool(getattr(self._orchestrator_ref, "stream_quantization", False)) or bool(
+                    _envs.AR_DISK_STREAM_MODEL
+                )
                 if streaming:
                     raise ValueError(
                         f"{rotation.__class__.__name__} does not support layer-wise "
@@ -790,4 +791,3 @@ class AlgorithmComposer:
     def has_layerwise_rotation(self) -> bool:
         """Whether layer-wise rotation transforms are active."""
         return bool(self._rotation_transforms)
-

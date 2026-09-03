@@ -166,8 +166,6 @@ class TestLayerConfigFingerprint:
         assert layer_config_fingerprint(cfg_with_tensor) == layer_config_fingerprint(cfg_without_tensor)
 
 
-
-
 class TestMarkBlockDoneInMemoryLastBlock:
     """mark_block_done(None input_ids) marks the final block without a successor entry."""
 

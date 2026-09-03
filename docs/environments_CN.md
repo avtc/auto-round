@@ -236,7 +236,7 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 export AR_DISK_STREAM_MODEL=1
 ```
 
-注意：`AR_DISK_STREAM_MODEL` 与 `--stream_quantization` 互斥——同时设置会在启动时报错。文本 LLM 请优先使用 `--stream_quantization`；env 路径保留给 block-parallel 调优工作进程以及需要量化视觉塔的多模态运行。
+注意：`AR_DISK_STREAM_MODEL` 与 `--stream_quantization` 互斥——同时设置会在启动时报错。文本 LLM 请优先使用 `--stream_quantization`；env 路径保留给需要量化视觉塔的多模态运行。
 
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
@@ -248,7 +248,7 @@ export AR_DISK_STREAM_MODEL=1
 export AR_RESUME_DIR=/path/to/resume/state
 ```
 
-跨模式断点续跑：串行（`AR_DISK_STREAM_MODEL`）、流式（`--stream_quantization`）与块并行（BPT）三种执行路径共用同一组逐块清单（manifest）。任意一种模式中断后，可以用相同或不同的模式从断点继续：已完成块的权重分片会被直接采用（不会被覆盖，也不会重新量化）；若中断的是 BPT 运行（已完成调优但尚未打包的块），流式路径会直接套用其调优结果（scale/zp）并打包，而不是重新搜索。
+跨模式断点续跑：串行（`AR_DISK_STREAM_MODEL`）与流式（`--stream_quantization`）两种执行路径共用同一组逐块清单（manifest）。任意一种模式中断后，可以用相同或另一种模式从断点继续；已完成块的权重分片会被直接采用（不会被覆盖，也不会重新量化）。
 
 ## 使用示例
 

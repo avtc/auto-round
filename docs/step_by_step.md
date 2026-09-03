@@ -35,6 +35,7 @@ This document presents step-by-step instructions for auto-round llm quantization
   + [Device/Multi-GPU setting in Quantization](#devicemulti-gpu-setting-in-quantization)
     - [Enable multiple gpus calibration in lm_head quantization](#enable-multiple-gpus-calibration-in-lm_head-quantization)
   + [Adjust Hyperparameters](#adjust-hyperparameters)
+  + [Streaming Quantization (large models)](#streaming-quantization-large-models)
   + [Rotation (Research)](#rotation-research)
 * [4 Inference](#4-inference)
   + [CPU](#cpu)
@@ -951,6 +952,33 @@ autoround.save_quantized(format="auto_awq", output_dir="tmp_autoround")
 
   Include the flag `--adam`. Note that AdamW is less effective than sign gradient descent in many scenarios we tested.
 
+
+### Streaming Quantization (large models)
+
+For models that do not fit in GPU/CPU memory, `--stream_quantization` quantizes one decoder block at a time
+directly from the on-disk checkpoint: the model is loaded as a meta skeleton and each block's weights are
+materialized, quantized, packed, and written to its output shard before moving on. Peak memory is roughly one
+block plus calibration state, and total disk usage is about one copy of the quantized model instead of several
+intermediate copies. All blockwise algorithms (RTN-family, SignRound with `iters > 0`) are supported.
+
+```bash
+auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --stream_prefetch auto
+```
+
+- `--stream_quantization`: enable the streaming path. Mutually exclusive with `AR_DISK_STREAM_MODEL` (an error
+  is raised when both are set). Text LLMs should prefer this flag; the env path remains for multimodal runs
+  that quantize the vision tower. For multimodal models the vision tower stays unquantized
+  (`quant_nontext_module` is rejected under streaming).
+- `--stream_prefetch off|auto|<devices>`: stage the next block's weights while the current block is quantized.
+  `auto` uses every GPU except the primary, one block each; an explicit list (e.g. `cuda:1,cuda:2`) round-robins
+  across the listed devices.
+- `--layerwise_rotation`: apply rotation transforms per block instead of up front, so the full model never has
+  to be materialized. Engaged automatically when `--stream_quantization` is used with rotation algorithms.
+- Resume: `AR_RESUME_DIR` works with streaming runs; completed blocks are skipped and their output shards are
+  adopted as-is.
+
+The calibration data flows through a bf16 reference chain, so the statistics match the data-driven path
+bit-exactly.
 
 ### Rotation (Research)
 

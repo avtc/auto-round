@@ -30,7 +30,6 @@ import torch
 
 from auto_round.logger import logger
 
-
 # Checkpoint-name fragment -> module-name fragment, applied only when the
 # direct spelling misses (never shadows an exact match). Covers checkpoints
 # whose block spellings differ from the modeling code: hyv3 stores
@@ -263,16 +262,12 @@ class CheckpointStreamer:
                             rescue_logged = True
                         return torch.device("cpu")
             if not rescue_logged and rescue_allowed:
-                logger.info(
-                    "[stream] staging GPUs below block+headroom watermarks; waiting for VRAM"
-                )
+                logger.info("[stream] staging GPUs below block+headroom watermarks; waiting for VRAM")
                 rescue_logged = True
             time.sleep(0.5)
         return None
 
-    def start_prefetch(
-        self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None
-    ) -> None:
+    def start_prefetch(self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None) -> None:
         """Stream whole module prefixes ahead of the consumer on a background
         thread.
 
@@ -356,8 +351,6 @@ class CheckpointStreamer:
             if dev is not None and dev.type != "cuda":
                 self._prefetch_cpu_staged = max(0, self._prefetch_cpu_staged - 1)
             self._prefetch_cond.notify_all()
-
-
 
     def wait_until_staged(self, prefix: str, timeout: Optional[float] = None) -> bool:
         """Wait until the prefetch reader has fully staged ``prefix``.

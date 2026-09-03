@@ -207,9 +207,7 @@ def block_forward(
     # streaming) must receive its inputs there; moving the weights instead
     # would defeat in-place quantization.
     block_param = next(block.parameters(), None)
-    device = resolve_block_replay_device(
-        block_param.device if block_param is not None else None, device
-    )
+    device = resolve_block_replay_device(block_param.device if block_param is not None else None, device)
     if input_ids.device != device:
         input_ids = to_device(input_ids, device)
     # input_others move is NOT gated on input_ids: the streaming chain parks

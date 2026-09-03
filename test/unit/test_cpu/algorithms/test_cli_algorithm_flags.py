@@ -29,8 +29,6 @@ def _build(args):
     return AlgorithmHandler.build_configs(args, common_kwargs={})
 
 
-
-
 class TestStreamingCliFlags(unittest.TestCase):
     """Streaming/layerwise CLI flags must reach the AutoRound compressor kwargs."""
 
@@ -93,5 +91,3 @@ class TestStreamingCliFlags(unittest.TestCase):
         self.assertIs(kwargs["stream_quantization"], False)
         self.assertEqual(kwargs["stream_prefetch"], 0)
         self.assertIsNone(kwargs["stream_prefetch_devices"])
-
-

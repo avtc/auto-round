@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Fail-fast guard tests for CPU-offloaded data-driven runs."""
+
 import unittest
 from unittest import mock
+
 
 class TestAssertNoCpuOffload:
     """Data-driven runs fail fast when accelerate CPU-offloaded part of the model."""

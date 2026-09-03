@@ -1013,7 +1013,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if streamer is not None:
                     if stage_devices:
                         # round-robin home: the block was staged here, quantize in place
-                        load_device = stage_devices[_zs_block_idx % len(stage_devices)]
+                        load_device = stage_devices[stream_block_idx % len(stage_devices)]
                     else:
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
@@ -1223,9 +1223,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # to quantize or write; pass their tensors through verbatim so the
             # export stays complete.
             claimed_blocks = {b for block in all_blocks for b in block}
-            ckpt_layer_ids = {
-                n.split(".")[2] for n in streamer.tensor_names if n.startswith("model.layers.")
-            }
+            ckpt_layer_ids = {n.split(".")[2] for n in streamer.tensor_names if n.startswith("model.layers.")}
             for layer_id in sorted(ckpt_layer_ids):
                 blk = f"model.layers.{layer_id}"
                 if blk in claimed_blocks:
@@ -1234,8 +1232,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if not names:
                     continue
                 logger.info(
-                    f"[stream] {blk} has no module counterpart; "
-                    f"writing {len(names)} checkpoint tensors verbatim"
+                    f"[stream] {blk} has no module counterpart; " f"writing {len(names)} checkpoint tensors verbatim"
                 )
                 for n in names:
                     self.shard_writer.save_tensor(n, streamer.fetch(n))

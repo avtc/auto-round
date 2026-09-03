@@ -236,7 +236,7 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 export AR_DISK_STREAM_MODEL=1
 ```
 
-Note: `AR_DISK_STREAM_MODEL` and `--stream_quantization` are mutually exclusive -- setting both raises an error at startup. For text LLMs prefer `--stream_quantization`; the env path remains for block-parallel tuning workers and multimodal runs that quantize the vision tower.
+Note: `AR_DISK_STREAM_MODEL` and `--stream_quantization` are mutually exclusive -- setting both raises an error at startup. For text LLMs prefer `--stream_quantization`; the env path remains for multimodal runs that quantize the vision tower.
 
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
@@ -248,7 +248,7 @@ Note: `AR_DISK_STREAM_MODEL` and `--stream_quantization` are mutually exclusive 
 export AR_RESUME_DIR=/path/to/resume/state
 ```
 
-Cross-mode resume: the serial (`AR_DISK_STREAM_MODEL`), streaming (`--stream_quantization`), and block-parallel (BPT) execution paths share the same per-block manifests. A run interrupted in any mode can be continued in the same or any other mode: shards already written for completed blocks are adopted as-is (never overwritten or re-quantized), and blocks a crashed BPT run tuned but never packed get their worker results (scale/zp) applied and packed instead of re-searched.
+Cross-mode resume: the serial (`AR_DISK_STREAM_MODEL`) and streaming (`--stream_quantization`) execution paths share the same per-block manifests. A run interrupted in either mode can be continued in the same or the other mode; shards already written for completed blocks are adopted as-is (never overwritten or re-quantized).
 
 ## Usage Examples
 

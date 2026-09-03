@@ -36,6 +36,7 @@
     - [lm_head 量化中开启多 GPU 标定](#lm_head-量化中开启多-gpu-标定)
     - [手动配置设备映射](#手动配置设备映射)
   + [超参数调整](#超参数调整)
+  + [流式量化（大模型）](#流式量化大模型)
   + [旋转（Rotation）（研究性）](#旋转rotation研究性)
 * [4 推理部署](#4-推理部署)
   + [CPU](#cpu)
@@ -914,6 +915,27 @@ auto-round --model_name Qwen/Qwen3-0.6B  --scheme "W4A16" --quant_lm_head --form
 
 #### 使用 AdamW 优化器
 添加 `--adam` 参数即可启用；**注意**：在我们的多项测试场景中，AdamW 优化器的效果均不如符号梯度下降（sign gradient descent）。
+
+### 流式量化（大模型）
+
+对于无法放入显存/内存的模型，`--stream_quantization` 每次只从磁盘上的 checkpoint 中读取一个解码器块：
+模型以 meta 骨架方式加载，每个块的权重按需加载、量化、打包并写入输出分片。峰值内存约为一个块加上
+校准状态，磁盘总占用约为量化后模型的一份拷贝。所有块级算法（RTN 系列、`iters > 0` 的 SignRound）均受支持。
+
+```bash
+auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --stream_prefetch auto
+```
+
+- `--stream_quantization`：启用流式路径。与 `AR_DISK_STREAM_MODEL` 互斥（同时设置会报错）。文本 LLM
+  建议优先使用该 flag；env 路径保留给需要量化视觉塔的多模态运行。多模态模型的视觉塔保持不量化
+  （流式模式下会拒绝 `quant_nontext_module`）。
+- `--stream_prefetch off|auto|<设备列表>`：在量化当前块的同时预取下一块。`auto` 使用除主 GPU 外的全部
+  GPU，每卡一块；显式列表（如 `cuda:1,cuda:2`）在所列设备间轮转。
+- `--layerwise_rotation`：逐块应用旋转类变换，而不是一次性前处理，从而无需物化完整模型。当
+  `--stream_quantization` 与旋转类算法同时使用时会自动启用。
+- 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。
+
+校准数据经由 bf16 参考链传递，因此统计量与数据驱动路径按位一致。
 
 ### 旋转（Rotation）（研究性）
 
