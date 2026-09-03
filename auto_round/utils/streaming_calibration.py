@@ -202,6 +202,46 @@ def _find_embedding(model, streamer):
     return best_name, best_mod
 
 
+def materialize_residual_meta(model, cfg, device):
+    """Rebuild computed buffers (rotary inv_freq & friends) that never appear
+    in a checkpoint and therefore stay meta after the root pass-through.
+
+    A leftover meta buffer makes the model mixed meta/real, which export paths
+    treat as "unsupported" and silently skip packing for. Buffers inside
+    rotary modules are rebuilt from the config; anything else still meta is
+    logged loudly so it cannot pass silently.
+    """
+    rebuilt, stubborn = [], []
+    for name, mod in model.named_modules():
+        tensors = list(mod.parameters()) + list(mod.buffers(recurse=False))
+        if not any(t.device.type == "meta" for t in tensors):
+            continue
+        base = name.rsplit(".", 1)[-1]
+        if "rotary" in base.lower() or hasattr(mod, "inv_freq"):
+            try:
+                fresh = _ensure_real_rotary(mod, cfg, device)
+                fresh_tensors = list(fresh.parameters()) + list(fresh.buffers())
+                if not any(t.device.type == "meta" for t in fresh_tensors):
+                    set_module(model, name, fresh)
+                    rebuilt.append(name)
+                    continue
+            except Exception:  # fall through to the stubborn list
+                pass
+        stubborn.append(name)
+    if rebuilt:
+        logger.info("[stream] rebuilt %d computed rotary buffer module(s) for export: %s", len(rebuilt), rebuilt[:6])
+    if stubborn:
+        logger.warning(
+            "[stream] %d module(s) still hold meta tensors at export time (no checkpoint source, " "not rotary): %s",
+            len(stubborn),
+            stubborn[:10],
+        )
+    return stubborn
+
+
+from auto_round.utils.model import set_module
+
+
 def _ensure_real_rotary(rotary, cfg, device):
     """Return a rotary module with real tensors on *device*.
 

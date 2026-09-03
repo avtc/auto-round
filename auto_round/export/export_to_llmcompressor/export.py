@@ -308,6 +308,13 @@ def save_quantized_as_llmcompressor(
 
     quant_format = _get_quant_format(model)
     quantization_config = QuantizationConfig.from_pretrained(model, format=quant_format)
+    if quantization_config is None:
+        meta_names = [n for n, p in model.state_dict().items() if p.device.type == "meta"]
+        raise RuntimeError(
+            "no quantization config could be derived from the model after packing: no layer ended up "
+            "compressed. Remaining meta tensors: "
+            f"{meta_names[:10] if meta_names else 'none'}"
+        )
     quantization_config_dict = quantization_config.to_dict()
     # from_pretrained groups layers by scheme correctly, but every group inherits
     # the placeholder targets=["Linear"] from construct_ct_scheme. For mixed

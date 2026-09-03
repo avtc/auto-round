@@ -1195,6 +1195,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                 ", ".join(non_meta_unsaved[:6]) + ("..." if len(non_meta_unsaved) > 6 else ""),
             )
 
+            # computed buffers (rotary inv_freq & friends) never appear in a
+            # checkpoint; rebuild them so the model is not mixed meta/real at
+            # export time (mixed meta makes packing silently skip everything)
+            from auto_round.utils.streaming_calibration import materialize_residual_meta
+
+            materialize_residual_meta(self.model, self.model_context.model.config, torch.device("cpu"))
+
             # Block groups that exist only in the checkpoint (e.g. an MTP
             # layer, which the modeling code does not instantiate) have no module
             # to quantize or write; pass their tensors through verbatim so the
