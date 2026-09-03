@@ -976,16 +976,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # blocks take the 2D padding mask, full-attention blocks
                     # the 4D form); the previous block's form is tried first
                     from auto_round.utils.streaming_calibration import (
-                        cast_position_embeddings_to_block,
                         materialize_mask_form,
                         resolve_chain_mask_form,
                     )
 
-                    # rope position embeddings captured with an fp32 dummy
-                    # upcast q/k at full-attention blocks while v stays in the
-                    # block dtype - feed them in the block's own dtype, exactly
-                    # what the non-streaming forward computes
-                    cast_position_embeddings_to_block(calib_state["input_others"], block)
                     form = resolve_chain_mask_form(
                         block,
                         calib_state["fp_inputs"][0],
