@@ -275,7 +275,20 @@ def prepare_streaming_calibration(
     # the data-driven pipeline replays a float32 0/1 mask (bool captured, cast
     # during preprocessing); sdpa treats it additively. Match the dtype for
     # statistics parity with the data-driven path.
+    # Additive float mask in the convention sdpa expects: allowed = 0.0,
+    # masked = -inf. A bool->float cast of the allowed-mask (True=1.0) adds
+    # +1 to ALLOWED scores and 0 to masked ones - a weak, inverted soft mask
+    # instead of a hard one; the data-driven replay builds the true additive
+    # mask through the modeling code, so the cast broke statistics parity.
+    neg_inf = torch.finfo(torch.float32).min
+    float_masks = []
+    for ids in rows:
+        allowed = build_causal_attention_mask(ids)
+        fm = torch.zeros(allowed.shape, dtype=torch.float32)
+        fm.masked_fill_(~allowed, neg_inf)
+        float_masks.append(fm.cpu())
     input_others = {
+        "attention_mask": float_masks,
         "use_cache": False,
         "past_key_values": None,
     }
