@@ -637,7 +637,7 @@ def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: in
     # garbles the log
     if not _PACK_DEVICE_LOGGED:
         _PACK_DEVICE_LOGGED = True
-        logger.info("immediate_pack_block: packing on %s", pack_device)
+        logger.debug("immediate_pack_block: packing on %s", pack_device)
     for module_name in names:
         immediate_pack(module_name, layer_config, device=pack_device)
 

@@ -966,7 +966,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                     SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
                     if stream_block_idx == 0:
-                        logger.info(
+                        logger.debug(
                             "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
                             "re-homed to %s (shared/setup modules start on the primary)",
                             block_name,
@@ -1015,7 +1015,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     )
                     if form != calib_state.get("_mask_form"):
                         # block types come in runs; the transition is the signal
-                        logger.info("[stream_calibration] attention-mask form change at %s: %s", block_name, form)
+                        logger.debug("[stream_calibration] attention-mask form change at %s: %s", block_name, form)
                     calib_state["input_others"]["attention_mask"] = [
                         materialize_mask_form(m, form) for m in calib_state["keymask_2d"]
                     ]
