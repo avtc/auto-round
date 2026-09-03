@@ -976,10 +976,16 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # blocks take the 2D padding mask, full-attention blocks
                     # the 4D form); the previous block's form is tried first
                     from auto_round.utils.streaming_calibration import (
+                        cast_position_embeddings_to_block,
                         materialize_mask_form,
                         resolve_chain_mask_form,
                     )
 
+                    # rope position embeddings captured with an fp32 dummy
+                    # upcast q/k at full-attention blocks while v stays in the
+                    # block dtype - feed them in the block's own dtype, exactly
+                    # what the non-streaming forward computes
+                    cast_position_embeddings_to_block(calib_state["input_others"], block)
                     form = resolve_chain_mask_form(
                         block,
                         calib_state["fp_inputs"][0],
@@ -1169,6 +1175,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                     logger.warning(f"[stream] root tensor {pname} missing from checkpoint; skipped")
                     continue
                 streamer.fetch_into_(self.model, pname)
+                # match the non-streaming path's dtype policy: a fully loaded
+                # model is converted via model.to(amp_dtype) during context
+                # setup, but that cast never touches meta tensors - without
+                # this, the streamed export would keep raw checkpoint fp32
+                # while the normal export carries the converted dtype
+                fetched = dict(self.model.named_parameters())
+                fetched.update(dict(self.model.named_buffers()))
+                t = fetched.get(pname, None)
+                if t is not None and t.is_floating_point() and t.dtype != self.amp_dtype:
+                    with torch.no_grad():
+                        t.data = t.data.to(self.amp_dtype)
                 n_streamed += 1
             logger.info(
                 "[stream] root pass-through: %d tensor(s) streamed from checkpoint, %d already materialized "

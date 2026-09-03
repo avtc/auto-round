@@ -85,6 +85,35 @@ def mask_form_candidates(key_mask_2d):
     return [("4d_bool", allowed), ("2d_float", key_mask_2d), ("4d_additive", additive)]
 
 
+def _block_dtype(block):
+    live = [p for p in block.parameters() if p.device.type != "meta"]
+    return live[0].dtype if live else None
+
+
+def cast_position_embeddings_to_block(input_others, block):
+    """Cast rope cos/sin rows to the block's dtype in place.
+
+    The chain captures position embeddings with an fp32 dummy (tuning math
+    prefers fp32), but full-attention blocks feed them straight into rope:
+    fp32 cos/sin upcast q/k while v stays in the block dtype, a mix the
+    attention kernel rejects. The non-streaming forward computes cos/sin in
+    the model dtype, so casting here matches it.
+    """
+    dtype = _block_dtype(block)
+    pe = input_others.get("position_embeddings") if isinstance(input_others, dict) else None
+    if dtype is None or pe is None:
+        return
+    cast = []
+    for item in pe:
+        if isinstance(item, (list, tuple)):
+            cast.append(
+                tuple(t.to(dtype) if isinstance(t, torch.Tensor) and t.is_floating_point() else t for t in item)
+            )
+        else:
+            cast.append(item)
+    input_others["position_embeddings"] = cast
+
+
 def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=None):
     """Probe which attention-mask form this model's decoder layers accept.
 
@@ -114,6 +143,7 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
     # Casting the row to the block dtype makes rope upcast q/k to fp32 while
     # v stays bf16 - a dtype mix the kernel rejects.
     row_others = {k: _to_dev(v, dev) for k, v in row_others.items()}
+    cast_position_embeddings_to_block(row_others, block)
     fp_row = fp_row[:1].to(dev)
     candidates = mask_form_candidates(key_mask_2d)
     if preferred is not None:
@@ -389,9 +419,10 @@ def prepare_streaming_calibration(
         input_others["position_ids"] = [torch.arange(ids.shape[-1]).unsqueeze(0) for ids in rows]
     if "position_embeddings" in params and rotary is not None:
         pe_list = []
+        rotary_dtype = _block_dtype(first_block) or torch.float32
         for ids in rows:
             pos = torch.arange(ids.shape[-1], device=device).unsqueeze(0)
-            cos, sin = rotary(torch.zeros(1, ids.shape[-1], device=device, dtype=torch.float32), pos)
+            cos, sin = rotary(torch.zeros(1, ids.shape[-1], device=device, dtype=rotary_dtype), pos)
             pe_list.append((cos.cpu(), sin.cpu()))
         input_others["position_embeddings"] = pe_list
 
