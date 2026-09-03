@@ -1189,6 +1189,18 @@ class CompressionOrchestrator(BaseOrchestrator):
                 ", ".join(non_meta_unsaved[:6]) + ("..." if len(non_meta_unsaved) > 6 else ""),
             )
 
+            # export reads the in-memory model. Tensors already written to
+            # adopted shards (e.g. by an earlier crashed run) are "saved" and
+            # therefore skipped above, which would leave them meta in memory;
+            # materialize everything the checkpoint can still supply so the
+            # model is not mixed meta/real at export time
+            for pname, tensor in self.model.state_dict().items():
+                if tensor.device.type != "meta" or pname not in streamer.weight_map:
+                    continue
+                if any(pname == q or pname.startswith(q + ".") for q in quantized_prefixes):
+                    continue
+                streamer.fetch_into_(self.model, pname)
+
             # computed buffers (rotary inv_freq & friends) never appear in a
             # checkpoint; rebuild them so the model is not mixed meta/real at
             # export time (mixed meta makes packing silently skip everything)
