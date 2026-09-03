@@ -272,12 +272,10 @@ def prepare_streaming_calibration(
     cfg = getattr(model, "config", None)
     rotary = _find_model_rotary(model, cfg, device)
 
-    masks = [build_causal_attention_mask(ids) for ids in rows]
     # the data-driven pipeline replays a float32 0/1 mask (bool captured, cast
     # during preprocessing); sdpa treats it additively. Match the dtype for
     # statistics parity with the data-driven path.
     input_others = {
-        "attention_mask": [m.cpu().to(torch.float32) for m in masks],
         "use_cache": False,
         "past_key_values": None,
     }
