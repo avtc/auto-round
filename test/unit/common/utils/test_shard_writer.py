@@ -205,7 +205,6 @@ def test_finalize_offloads_module_with_tensor_in_parameters(tmp_path, monkeypatc
     assert offloaded_weight.device.type == "meta"
 
 
-<<<<<<< HEAD:test/unit/common/utils/test_shard_writer.py
 def test_default_max_shard_size_is_fixed(tmp_path, monkeypatch):
     writer = _make_writer(_DiffusionStyleModel(), str(tmp_path), monkeypatch)
     assert writer.max_shard_size == 1 * 1024**2
@@ -229,7 +228,8 @@ def test_oversized_tensor_does_not_leave_tiny_preceding_shard(tmp_path, monkeypa
 
     assert writer.shard_counter == 1
     assert set(writer.current_shard_tensors) == set()
-=======
+
+
 class TestAdoptExistingShards:
     """Resume support: a fresh writer must adopt shards a crashed run already wrote.
 
@@ -316,4 +316,3 @@ class TestAdoptExistingShards:
         w = self._writer(out, monkeypatch)
         with pytest.raises(RuntimeError, match="safetensors"):
             w.adopt_existing_shards()
->>>>>>> 6c01b543 (feat(shard_writer): adopt shards from a crashed run for resume support):test/unit/test_cpu/utils/test_shard_writer.py
