@@ -150,13 +150,32 @@ class ShardWriter:
         if not os.path.isdir(output_dir):
             return 0
 
-        pattern = re.compile(r"^model-shard-(\d+)\.safetensors$")
-        found = {}
+        # shard sources, keyed by their ordinal position in the sequence:
+        # - temp files (``model-shard-NNN``): a crash during the block loop
+        # - finalized files (``model-000NN-of-000MM`` / single ``model.safetensors``):
+        #   a crash AFTER the writer finalized (e.g. in the export stage that
+        #   follows) - without adopting these, a fresh writer restarts at
+        #   counter 0, rewrites tensors and its finalize clobbers the index,
+        #   orphaning every previously written shard
+        temp_pattern = re.compile(r"^model-shard-(\d+)\.safetensors$")
+        final_pattern = re.compile(r"^model-(\d{5})-of-\d{5}\.safetensors$")
+        seq = {}  # ordinal -> (fname, is_final)
+        single_file = None
         for fname in os.listdir(output_dir):
-            mobj = pattern.match(fname)
+            mobj = temp_pattern.match(fname)
             if mobj:
-                found[int(mobj.group(1))] = fname
-        if not found:
+                seq[int(mobj.group(1))] = (fname, False)
+                continue
+            mobj = final_pattern.match(fname)
+            if mobj:
+                seq[int(mobj.group(1))] = (fname, True)
+                continue
+            if fname == "model.safetensors":
+                single_file = fname
+        found = {num: fname for num, (fname, _is_final) in seq.items() if not _is_final}
+        if not seq and single_file is not None:
+            seq[1] = (single_file, True)
+        if not seq:
             bin_shards = [f for f in os.listdir(output_dir) if re.match(r"^model-shard-\d+\.bin$", f)]
             if bin_shards:
                 raise RuntimeError(
@@ -168,10 +187,12 @@ class ShardWriter:
         from auto_round.utils.checkpoint_streamer import _DTYPE_BYTES
 
         dtype_sizes = _DTYPE_BYTES
-        numbers = sorted(found)
+        numbers = sorted(seq)
         for num in numbers:
-            path = os.path.join(output_dir, found[num])
+            path = os.path.join(output_dir, seq[num][0])
             header = self._read_safetensors_header(path)
+            if header is None and seq[num][1]:
+                continue  # finalized files are complete by construction
             if header is None:
                 if num == numbers[-1]:
                     logger.warning(
@@ -213,7 +234,8 @@ class ShardWriter:
                     "shard of a crashed run may be incomplete). Use a fresh --output_dir."
                 )
             params = list(header.keys())
-            self.shard_meta.append({"tmp_file": found[num], "params": params, "dir": output_dir})
+            fname, _is_final = seq[num]
+            self.shard_meta.append({"tmp_file": fname, "params": params, "dir": output_dir})
             self._all_saved.update(params)
             for name, meta in header.items():
                 numel = 1
