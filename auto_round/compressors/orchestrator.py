@@ -1167,7 +1167,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "in memory (%s)",
                 n_streamed,
                 len(non_meta_unsaved),
-                ", ".join(non_meta_unsaved[:6]) + ("..." if n_in_memory > 6 else ""),
+                ", ".join(non_meta_unsaved[:6]) + ("..." if len(non_meta_unsaved) > 6 else ""),
             )
 
             # Block groups that exist only in the checkpoint (e.g. an MTP
