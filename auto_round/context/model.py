@@ -121,7 +121,11 @@ class ModelContext(BaseContext):
         # by the time BaseCompressor.post_init() runs.
         self._load_model()
 
-        if unsupported_meta_device(self.model) and not self.stream_quantization:
+        # meta parameters are legal in the two streaming modes: the
+        # --stream_quantization flag (never-materialize loop) and the env-var
+        # disk-stream route, which builds the same skeleton but drives the
+        # offloader data-driven path (_disk_stream_index marks it was built)
+        if unsupported_meta_device(self.model) and not self.stream_quantization and self._disk_stream_index is None:
             raise RuntimeError(
                 "AutoRound does not support parameters on meta device. "
                 "Please use more GPUs by setting `--device 0,1,2,3` or just place the model on CPU."
