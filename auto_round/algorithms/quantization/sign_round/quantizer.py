@@ -15,6 +15,8 @@ import copy
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
+import time
+
 import torch
 from torch import autocast
 

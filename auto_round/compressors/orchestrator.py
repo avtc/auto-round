@@ -68,6 +68,13 @@ if TYPE_CHECKING:
 
 
 # TODO wenhuach align all the API args
+def _tuned_layer_key(block_name: str, sub_name: str, sub) -> str:
+    """Key of a tuned layer in the block-results files: the layer's
+    ``global_name`` when set, else its path below the block (the bare block
+    name for the root submodule)."""
+    return getattr(sub, "global_name", None) or (f"{block_name}.{sub_name}" if sub_name else block_name)
+
+
 class CompressionOrchestrator(BaseOrchestrator):
 
     def __init__(
@@ -481,9 +488,9 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         result = None
         if results_dir is not None:
-            from auto_round.compressors import block_parallel as _bp
-
-            path = _bp.block_result_path(results_dir, block_name)
+            # shared block-result path convention (also produced by the
+            # block-parallel worker path when present)
+            path = os.path.join(results_dir, f"block_{block_name.replace('.', '_').replace('/', '-')}.pt")
             if os.path.exists(path):
                 try:
                     result = torch.load(path, map_location="cpu")
@@ -926,20 +933,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         # stopped). Requires immediate saving: "done" in the manifest is the
         # contract that the block's tensors are durably in a shard file. ──
         resume_states = None
-        bp_apply_results = None
         if envs.AR_RESUME_DIR and self.compress_context.is_immediate_saving:
             resume_states = self._build_resume_states(all_blocks)
             if any(rs is not None and rs.resume_index > 0 for rs in resume_states):
                 self._stream_resume_jump_chain(calib_state, resume_states)
-                from auto_round.compressors import block_parallel as _bp
-
-                _results_dir = _bp.parallel_results_dir()
-                if _results_dir is not None and _bp.signature_matches(
-                    _results_dir, self._parallel_run_signature(all_blocks)
-                ):
-                    # blocks tuned by a crashed BPT run but never packed: their
-                    # worker results get applied instead of re-searched
-                    bp_apply_results = _results_dir
                 if self.shard_writer is not None:
                     self.shard_writer.adopt_existing_shards()  # never overwrite the crashed run's shards
 
@@ -999,7 +996,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # already durably done in a previous (possibly BPT) run
                     if self._stream_resume_done_block(
                         block_name,
-                        results_dir=bp_apply_results,
+                        results_dir=None,
                         streamer=streamer,
                         stage_devices=stage_devices,
                         stream_block_idx=stream_block_idx,

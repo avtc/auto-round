@@ -20,6 +20,8 @@ the pending-offset arithmetic, and the done-block handler (pure skip vs
 applying a BPT worker result).
 """
 
+import os
+
 import torch
 
 from auto_round.compressors.orchestrator import CompressionOrchestrator
@@ -124,14 +126,10 @@ class TestStreamResumeDoneBlock:
         assert used is False
 
     def test_applies_bpt_result(self, tmp_path):
-        from auto_round.compressors import block_parallel as bp
-
         model = _ToyModel()
         orch = self._orch(model)
         scale = torch.full((4, 1), 0.5)
-        result_path = bp.block_result_path(str(tmp_path), "dec0")
-        import os
-
+        result_path = os.path.join(str(tmp_path), "block_dec0.pt")
         os.makedirs(os.path.dirname(result_path), exist_ok=True)
         torch.save({"dec0.linear": {"scale": scale, "zp": 0}}, result_path)
 
@@ -149,13 +147,9 @@ class TestStreamResumeDoneBlock:
         assert model.dec0.linear.zp == 0
 
     def test_corrupt_result_fails_fast(self, tmp_path):
-        from auto_round.compressors import block_parallel as bp
-
-        import os
-
         model = _ToyModel()
         orch = self._orch(model)
-        result_path = bp.block_result_path(str(tmp_path), "dec0")
+        result_path = os.path.join(str(tmp_path), "block_dec0.pt")
         os.makedirs(os.path.dirname(result_path), exist_ok=True)
         with open(result_path, "wb") as f:
             f.write(b"not a torch file")
@@ -174,13 +168,9 @@ class TestStreamResumeDoneBlock:
             )
 
     def test_key_mismatch_fails_fast(self, tmp_path):
-        from auto_round.compressors import block_parallel as bp
-
-        import os
-
         model = _ToyModel()
         orch = self._orch(model)
-        result_path = bp.block_result_path(str(tmp_path), "dec0")
+        result_path = os.path.join(str(tmp_path), "block_dec0.pt")
         os.makedirs(os.path.dirname(result_path), exist_ok=True)
         torch.save({"totally.unrelated": {"scale": torch.ones(1), "zp": 0}}, result_path)
 

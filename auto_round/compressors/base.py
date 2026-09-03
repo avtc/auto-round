@@ -1800,15 +1800,13 @@ class BaseOrchestrator(object):
 
         # Disable inplace when quantized layers live outside transformer blocks.
         # gguf lm-head used rtn in version>=0.13
-        if (
-            self.has_qlayer_outside_block
-            and self.need_calib
-            and (
-                self.compress_context.formats is None
-                or "gguf" not in self.compress_context.formats[0].__class__.__name__.lower()
-            )
-        ):
-            self.inplace = False
+        # NOTE: a legacy rule used to disable ``self.inplace`` here when
+        # quantized layers lived outside the decoder blocks (e.g. a pinned
+        # lm_head) on the data-driven path. ``inplace`` has a single consumer
+        # -- the ``packing = True`` gate in :meth:`_adjust_immediate_packing_and_saving`
+        # -- so the rule only ever starved immediate packing/saving for exactly
+        # the configuration the streaming flow already supports (outside-block
+        # layers quantize after the block loop and pack/save at export).
 
         if not hasattr(self, "formats"):
             logger.warning("this API is deprecated, please use `quantize_and_save` instead")
@@ -1912,8 +1910,6 @@ class BaseOrchestrator(object):
         ):
             self.compress_context.is_immediate_packing = True
 
-        if self.has_qlayer_outside_block and self.need_calib and not has_single_gguf_format:
-            self.compress_context.is_immediate_packing = False
         if not ("causallm" in self.model_context.model.__class__.__name__.lower() and not self.model_context.is_mllm):
             # TODO For tied keys, there may some issues, we haven't not verified this
             tied_weight_keys = getattr(self.model_context.model, "_tied_weight_keys", {})
