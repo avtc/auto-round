@@ -20,6 +20,7 @@ take the first checkpoint-backed Embedding it sees.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -72,11 +73,8 @@ def test_largest_embedding_when_config_silent():
 def test_guard_passes_with_correct_vocab():
     rows = [torch.tensor([499, 0, 17])]
     _check_ids_in_vocab(rows, 500)  # must not raise
-    try:
+    with pytest.raises(ValueError, match="different model's tokenizer"):
         _check_ids_in_vocab(rows, 64)
-        raise SystemError("should have raised")
-    except ValueError:
-        pass
 
 
 # ---------------------------------------------------------------------------

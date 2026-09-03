@@ -22,6 +22,7 @@ import torch
 from auto_round.compressors.utils import _get_save_folder_name
 from auto_round.context.compress import CompressContext
 from auto_round.context.model import ModelContext
+from auto_round.experimental.attention import is_attention_calibration_tensor_name
 from auto_round.logger import logger
 from auto_round.utils import (
     get_lm_head_name,
@@ -29,7 +30,6 @@ from auto_round.utils import (
     get_reverse_checkpoint_conversion_mapping,
     revert_checkpoint_conversion_mapping,
 )
-from auto_round.utils.checkpoint_streamer import to_checkpoint_name
 
 DEFAULT_MAX_SHARD_SIZE = "5GB"
 
@@ -168,18 +168,9 @@ class ShardWriter:
                 )
             return 0
 
-        dtype_sizes = {
-            "F64": 8,
-            "F32": 4,
-            "F16": 2,
-            "BF16": 2,
-            "I64": 8,
-            "I32": 4,
-            "I16": 2,
-            "I8": 1,
-            "U8": 1,
-            "BOOL": 1,
-        }
+        from auto_round.utils.checkpoint_streamer import _DTYPE_BYTES
+
+        dtype_sizes = _DTYPE_BYTES
         numbers = sorted(found)
         for num in numbers:
             path = os.path.join(output_dir, found[num])
@@ -255,6 +246,8 @@ class ShardWriter:
         for k, v in sd.items():
             if not isinstance(v, torch.Tensor):
                 continue
+            if is_attention_calibration_tensor_name(k):
+                continue
             param_name = f"{prefix}.{k}"
             self._add_tensor(param_name, v)
 
@@ -298,6 +291,8 @@ class ShardWriter:
         return list(expanded.items())
 
     def _add_tensor(self, name: str, tensor: torch.Tensor):
+        if is_attention_calibration_tensor_name(name):
+            return
         if isinstance(tensor, torch.Tensor) and tensor.device.type == "meta":
             self.skipped_meta_tensors.append(name)
             return
@@ -317,11 +312,6 @@ class ShardWriter:
 
         # transformers will handle _checkpoint_conversion_mapping automatically if is_immediate_saving=False
         name = revert_checkpoint_conversion_mapping(name, self.reverse_checkpoint_conversion_mapping)
-
-        # hy_v3: write checkpoint spellings (shared_mlp / router.gate /
-        # expert_bias) so stock vLLM loads the export without renames
-        if getattr(getattr(self.model, "config", None), "model_type", None) == "hy_v3":
-            name = to_checkpoint_name(name)
 
         t_size = tensor.nbytes
         self.total_param_elems += tensor.numel()

@@ -16,7 +16,6 @@ import os
 from types import SimpleNamespace
 
 import pytest
-
 import torch
 
 from auto_round.compressors.shard_writer import ShardWriter
@@ -146,35 +145,6 @@ def test_expand_fused_experts_for_skipped_talker_prefix(tmp_path, monkeypatch):
     assert "talker.experts.0.up_proj.weight" in saved_tensors
     assert torch.equal(saved_tensors["talker.experts.0.gate_proj.weight"], fused_gate_up[0, :3, :])
     assert torch.equal(saved_tensors["talker.experts.0.up_proj.weight"], fused_gate_up[0, 3:, :])
-
-
-def test_hy3_module_names_export_with_checkpoint_spellings(tmp_path, monkeypatch):
-    """hy_v3 runtime names (shared_experts / gate / e_score_correction_bias)
-    must be written with their checkpoint spellings (shared_mlp / router.gate /
-    expert_bias) so stock vLLM loads the export without renames."""
-
-    class _Hy3Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.proj_out = torch.nn.Linear(4, 2)
-            self.config = SimpleNamespace(model_type="hy_v3")
-
-    model = _Hy3Model()
-    writer = _make_writer(model, str(tmp_path), monkeypatch)
-
-    writer._add_tensor("model.layers.1.mlp.shared_experts.gate_proj.weight", torch.zeros(2, 2))
-    writer._add_tensor("model.layers.1.mlp.gate.weight", torch.zeros(2, 2))
-    writer._add_tensor("model.layers.1.mlp.e_score_correction_bias", torch.zeros(2))
-    writer._add_tensor("model.layers.1.mlp.experts.0.gate_proj.weight", torch.zeros(2, 2))
-    writer.finalize()
-
-    saved_tensors = torch.load(os.path.join(tmp_path, "model.bin"), map_location="cpu")
-    assert "model.layers.1.mlp.shared_mlp.gate_proj.weight" in saved_tensors
-    assert "model.layers.1.mlp.router.gate.weight" in saved_tensors
-    assert "model.layers.1.mlp.expert_bias" in saved_tensors
-    # spellings that already match the checkpoint are untouched
-    assert "model.layers.1.mlp.experts.0.gate_proj.weight" in saved_tensors
-    assert not any("shared_experts" in k or "e_score_correction" in k for k in saved_tensors)
 
 
 def test_do_not_expand_fused_experts_outside_skipped_prefixes(tmp_path, monkeypatch):

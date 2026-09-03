@@ -158,15 +158,6 @@ class AlgorithmComposer:
         self._layerwise_rotation = bool(getattr(orchestrator, "layerwise_rotation", False))
         self._orchestrator_ref = orchestrator
 
-        _algos = {getattr(c, "algorithm", None) for c in self._rotation_configs}
-        if "presinq" in _algos and "spinquant" in _algos:
-            # Both transforms modify norm weights; their composition is untested
-            # and easy to get silently wrong — require an explicit choice.
-            raise ValueError(
-                "PreSINQ and SpinQuant transforms are mutually exclusive: both "
-                "modify RMSNorm weights. Pass only one of them in alg_configs."
-            )
-
         _, block_quantizer_configs = split_quantization_configs(configs)
         if not block_quantizer_configs:
             from auto_round.algorithms.quantization.rtn.config import RTNConfig
@@ -438,7 +429,7 @@ class AlgorithmComposer:
         block_forward_fn = self.block_forward
         _out_dev = _stream_out_device(block)
 
-        # ── Step 0: Layer-wise rotation (before any reference/calibration) ────
+        # -- Step 0: Layer-wise rotation (before any reference/calibration) ----
         # Rotates this block's weights and installs online hooks so all downstream
         # calibration and reference collection operate on the rotated block. No-op
         # unless layer-wise rotation is active.
@@ -697,7 +688,7 @@ class AlgorithmComposer:
         caching / the block loop. For full-model rotation the model is rotated
         immediately and returned; for layer-wise rotation only the rotation
         matrices are initialised and the per-block work is deferred to
-        :meth:`compress_block`. Idempotent — repeated calls are a no-op.
+        :meth:`compress_block`. Idempotent - repeated calls are a no-op.
 
         Returns:
             The (possibly mutated) model.

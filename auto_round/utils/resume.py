@@ -153,6 +153,10 @@ class ResumeState:
         # path deliberately does not materialize a past-the-end chain state.
         if input_ids is not None:
             torch.save(_to_cpu_recursive(input_ids), self.input_ids_path)
+        elif self.input_ids_path.exists():
+            # mirror the q_input cleanup: a stale successor entry (e.g. left
+            # by the previous block before this final one) must not survive
+            self.input_ids_path.unlink()
         self.completed_blocks.append(block_name)
         _atomic_write_json(
             self.manifest_path,

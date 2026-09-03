@@ -115,7 +115,6 @@ class TestBgPackWorker:
         assert rs.calls[0][2] is snaps[0] and rs.calls[0][3] is snaps[1]
         # block released to meta
         assert all(p.device.type == "meta" for p in blk.parameters())
-        assert t_or_none(model)
 
     def test_model_last_drops_fp_snapshot(self):
         _, _, rs, *_ = self._run(_Ctx(), is_last=True)
@@ -133,8 +132,3 @@ class TestBgPackWorker:
 
         with pytest.raises(RuntimeError, match="pack exploded"):
             self._run(_Ctx(), pack_impl=_boom)
-
-
-def t_or_none(model):
-    """Model-level sentinel (kept trivial; the block-level meta check above is the real assertion)."""
-    return True

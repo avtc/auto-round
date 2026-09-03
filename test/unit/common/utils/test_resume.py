@@ -174,4 +174,5 @@ class TestMarkBlockDoneInMemoryLastBlock:
         state.mark_block_done("b0", None, torch.zeros(2, 3, dtype=torch.long))
         state.mark_block_done("b1", None, None)  # final block: no successor entry
         assert state.resume_index == 2
-        assert not (tmp_path / "resume_input_ids.pt").exists() or state.completed_blocks == ["b0", "b1"]
+        # no successor entry for the final block: nothing to resume from
+        assert not (tmp_path / "resume_input_ids.pt").exists()

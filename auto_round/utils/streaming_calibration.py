@@ -19,7 +19,7 @@
 Runs before the zero-shot quantization loop when the activation chain engages:
 calibration rows are pushed through the model one block at a time (blocks
 streamed onto the compute device, hidden states chained block-to-block), and
-each block's FP input tensors plus the forward kwargs are cached on the host —
+each block's FP input tensors plus the forward kwargs are cached on the host -
 the same structure the data-driven calibrator produces. The quantization loop
 then replays the cached inputs through each block via the standard
 ``compress_block`` path: transforms (rotation, PreSINQ) run first and the
@@ -31,7 +31,7 @@ lm_head) receive no cached inputs; the quantizer falls back to unweighted
 search there.
 
 Memory: the cache holds one tensor per row per block on the host
-(rows x blocks x seqlen x hidden). ``nsamples`` bounds it —
+(rows x blocks x seqlen x hidden). ``nsamples`` bounds it -
 the imatrix is a column statistic, so a modest row count is statistically
 sufficient.
 """

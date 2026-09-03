@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
-
-import time
 
 import torch
 from torch import autocast
@@ -88,40 +87,6 @@ def _rehome_calibration_state(
         time.perf_counter() - t0,
     )
     return moved
-
-
-def alt2_switch_iter(iters: int, recipe: str, iters2_env: int):
-    """Iteration index (exclusive) at which the alt2 re-grid fires, or None.
-
-    Round 1 tunes on the init-search grid for ``iters - iters2`` iterations;
-    the re-grid then re-anchors every alt2 layer to a fresh search over the
-    perturbed effective weights and resets the rounding params; round 2 tunes
-    for ``iters2`` more. ``iters2_env=0`` means "half of iters".
-    """
-    if recipe != "alt2" or iters < 2:
-        return None
-    if iters2_env < 0:
-        raise ValueError(f"AR_ALT2_ITERS2={iters2_env} must be >= 0 (0 = half of iters).")
-    iters2 = iters2_env if iters2_env > 0 else iters // 2
-    if not 1 <= iters2 < iters:
-        raise ValueError(f"AR_ALT2_ITERS2={iters2} must be in [1, {iters - 1}] (iters={iters}).")
-    return iters - iters2
-
-
-def _alt2_regrid_block(block) -> float:
-    """Re-grid every participating wrapper in the block; returns mean |delta scale|."""
-    deltas = []
-    for _, m in block.named_modules():
-        if getattr(m, "_tune_recipe", "") != "alt2":
-            continue
-        ds = m.alt2_regrid()
-        if ds is not None:
-            deltas.append(ds)
-    if not deltas:
-        return 0.0
-    mean_ds = sum(deltas) / len(deltas)
-    logger.info("[alt2] re-grid %d layers, mean |delta scale| %.3e", len(deltas), mean_ds)
-    return mean_ds
 
 
 from auto_round.utils.distributed import setup_ddp_if_needed_

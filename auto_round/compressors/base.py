@@ -19,10 +19,9 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Optional, Union
 
 import torch
-
-from auto_round import envs
 from transformers import AutoConfig, set_seed
 
+from auto_round import envs
 from auto_round.algorithms.quantization import BaseQuantizer, QuantizationConfig
 from auto_round.algorithms.transforms import (
     BaseRotationConfig,
@@ -549,6 +548,25 @@ class BaseOrchestrator(object):
                 "through at full precision under streaming; to quantize them use "
                 "the ordinary (non-streaming) path."
             )
+        if self.stream_quantization:
+            from auto_round.algorithms.quantization.config import QuantizationConfig
+            from auto_round.algorithms.quantization.rtn.config import RTNConfig
+            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+            unsupported = [
+                type(c).__name__
+                for c in getattr(self, "_alg_configs", None) or []
+                if isinstance(c, QuantizationConfig)
+                and getattr(c, "need_calib", True)
+                and not isinstance(c, (RTNConfig, SignRoundConfig))
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"stream_quantization supports the RTN and SignRound quantizers, got "
+                    f"{unsupported}. Other quantizers need calibration-data forward passes "
+                    "on the full model, which the streaming loop (meta skeleton, "
+                    "block-at-a-time) cannot provide."
+                )
 
     def _auto_engage_stream_features(self) -> None:
         """Resolve streaming-mode conveniences right after kwargs are popped.
@@ -1800,13 +1818,14 @@ class BaseOrchestrator(object):
 
         # Disable inplace when quantized layers live outside transformer blocks.
         # gguf lm-head used rtn in version>=0.13
-        # NOTE: a legacy rule used to disable ``self.inplace`` here when
-        # quantized layers lived outside the decoder blocks (e.g. a pinned
-        # lm_head) on the data-driven path. ``inplace`` has a single consumer
-        # -- the ``packing = True`` gate in :meth:`_adjust_immediate_packing_and_saving`
-        # -- so the rule only ever starved immediate packing/saving for exactly
-        # the configuration the streaming flow already supports (outside-block
-        # layers quantize after the block loop and pack/save at export).
+        # NOTE: upstream used to disable ``self.inplace`` here when quantized
+        # layers lived outside the decoder blocks (e.g. a pinned lm_head) on
+        # the data-driven path. ``inplace``'s only consumer is the packing
+        # gate in :meth:`_adjust_immediate_packing_and_saving`; with the
+        # blockwise pack path those layers quantize after the block loop and
+        # pack at export, so the rule is obsolete and removed for streaming
+        # and non-streaming runs alike (behavior change, covered by
+        # test_immediate_saving_rules.py).
 
         if not hasattr(self, "formats"):
             logger.warning("this API is deprecated, please use `quantize_and_save` instead")

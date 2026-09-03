@@ -929,13 +929,15 @@ auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --str
 - `--stream_quantization`：启用流式路径。与 `AR_DISK_STREAM_MODEL` 互斥（同时设置会报错）。文本 LLM
   建议优先使用该 flag；env 路径保留给需要量化视觉塔的多模态运行。多模态模型的视觉塔保持不量化
   （流式模式下会拒绝 `quant_nontext_module`）。
-- `--stream_prefetch off|auto|<设备列表>`：在量化当前块的同时预取下一块。`auto` 使用除主 GPU 外的全部
-  GPU，每卡一块；显式列表（如 `cuda:1,cuda:2`）在所列设备间轮转。
+- `--stream_prefetch off|auto|cpu|<设备列表>`：在量化当前块的同时，在其他设备上预取下一块的权重。
+  `auto` 在除主 GPU 外的全部 GPU 间逐块轮转（当主 GPU 的空闲显存足以容纳最大块时也会加入轮转）；
+  `cpu` 在主机内存上预取（最慢、容量最大）；显式列表（如 `cuda:1,cuda:2`）在所列设备间轮转。
 - `--layerwise_rotation`：逐块应用旋转类变换，而不是一次性前处理，从而无需物化完整模型。当
   `--stream_quantization` 与旋转类算法同时使用时会自动启用。
-- 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。
+- 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。Python API
+  用户可通过 `stream_prefetch_devices` 显式控制预取设备。
 
-校准数据经由 bf16 参考链传递，因此统计量与数据驱动路径按位一致。
+校准数据经由 bf16 参考链传递，因此收集到的统计量与普通数据驱动校准在浮点容差内一致（等价性有回归测试覆盖）。
 
 ### 旋转（Rotation）（研究性）
 

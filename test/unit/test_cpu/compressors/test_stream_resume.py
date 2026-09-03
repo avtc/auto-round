@@ -14,10 +14,8 @@
 """AR_RESUME_DIR support for the --stream_quantization (zero-shot) loop.
 
 The per-group manifests are the shared currency: any execution mode (serial,
-block-parallel, streaming) continues where another stopped. These tests pin
 the three streaming-side pieces: the chain jump to the saved frontier entry,
 the pending-offset arithmetic, and the done-block handler (pure skip vs
-applying a BPT worker result).
 """
 
 import os
@@ -95,94 +93,3 @@ class TestStreamResumeJumpChain:
         rs0 = ResumeState(str(tmp_path / "g0"), "sig", ["b0", "b1"])
         rs0.mark_block_done("b0", None, torch.ones(2, 2))
         orch._stream_resume_jump_chain(None, [rs0])  # weight-only streaming: no crash
-
-
-class TestStreamResumeDoneBlock:
-    def _orch(self, model):
-        from types import SimpleNamespace
-
-        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
-        orch.model = model
-        orch.device = "cpu"
-        orch.shard_writer = None
-        orch.nblocks = 1
-        orch.compress_context = SimpleNamespace(
-            is_immediate_packing=False, is_immediate_saving=False, low_cpu_mem_usage=False
-        )
-        return orch
-
-    def test_pure_skip_when_no_result(self):
-        model = _ToyModel()
-        orch = self._orch(model)
-        used = orch._stream_resume_done_block(
-            "dec0",
-            results_dir=None,
-            streamer=None,
-            stage_devices=None,
-            stream_block_idx=0,
-            pbar=None,
-            tied_weights_layers=[],
-        )
-        assert used is False
-
-    def test_applies_bpt_result(self, tmp_path):
-        model = _ToyModel()
-        orch = self._orch(model)
-        scale = torch.full((4, 1), 0.5)
-        result_path = os.path.join(str(tmp_path), "block_dec0.pt")
-        os.makedirs(os.path.dirname(result_path), exist_ok=True)
-        torch.save({"dec0.linear": {"scale": scale, "zp": 0}}, result_path)
-
-        used = orch._stream_resume_done_block(
-            "dec0",
-            results_dir=str(tmp_path),
-            streamer=None,
-            stage_devices=None,
-            stream_block_idx=0,
-            pbar=None,
-            tied_weights_layers=[],
-        )
-        assert used is True
-        assert torch.equal(model.dec0.linear.scale, scale)
-        assert model.dec0.linear.zp == 0
-
-    def test_corrupt_result_fails_fast(self, tmp_path):
-        model = _ToyModel()
-        orch = self._orch(model)
-        result_path = os.path.join(str(tmp_path), "block_dec0.pt")
-        os.makedirs(os.path.dirname(result_path), exist_ok=True)
-        with open(result_path, "wb") as f:
-            f.write(b"not a torch file")
-
-        import pytest
-
-        with pytest.raises(RuntimeError, match="unreadable"):
-            orch._stream_resume_done_block(
-                "dec0",
-                results_dir=str(tmp_path),
-                streamer=None,
-                stage_devices=None,
-                stream_block_idx=0,
-                pbar=None,
-                tied_weights_layers=[],
-            )
-
-    def test_key_mismatch_fails_fast(self, tmp_path):
-        model = _ToyModel()
-        orch = self._orch(model)
-        result_path = os.path.join(str(tmp_path), "block_dec0.pt")
-        os.makedirs(os.path.dirname(result_path), exist_ok=True)
-        torch.save({"totally.unrelated": {"scale": torch.ones(1), "zp": 0}}, result_path)
-
-        import pytest
-
-        with pytest.raises(RuntimeError, match="matched no layers"):
-            orch._stream_resume_done_block(
-                "dec0",
-                results_dir=str(tmp_path),
-                streamer=None,
-                stage_devices=None,
-                stream_block_idx=0,
-                pbar=None,
-                tied_weights_layers=[],
-            )

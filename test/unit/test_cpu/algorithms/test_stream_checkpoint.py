@@ -15,8 +15,8 @@
 
 import json
 import os
-
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -115,62 +115,6 @@ class TestCheckpointStreamer:
             streamer.start_prefetch(["m"], depth=1, stage_devices=[torch.device("meta")])
         # no reader thread left behind
         assert streamer._prefetch_thread is None
-
-    def test_load_module_name_rewrites(self, tmp_path):
-        """hyv3-style checkpoints (shared_mlp / router.gate / expert_bias) map onto
-        modules spelled shared_experts / gate / e_score_correction_bias; direct
-        spellings are never shadowed by a rewrite."""
-        import torch.nn as nn
-
-        torch.manual_seed(2)
-        tensors = {
-            "model.layers.1.mlp.shared_mlp.gate_proj.weight": torch.randn(4, 8),
-            "model.layers.1.mlp.router.gate.weight": torch.randn(4, 8),
-            "model.layers.1.mlp.expert_bias": torch.arange(4, dtype=torch.float32),
-            "model.layers.1.mlp.experts.0.gate_proj.weight": torch.randn(4, 8),
-        }
-        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": tensors})
-        streamer = CheckpointStreamer(path)
-
-        class Shared(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.gate_proj = nn.Linear(8, 4, bias=False)
-
-        class Expert(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.gate_proj = nn.Linear(8, 4, bias=False)
-
-        class MLP(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.shared_experts = Shared()
-                self.gate = nn.Linear(8, 4, bias=False)
-                self.experts = nn.ModuleList([Expert()])
-                self.register_buffer("e_score_correction_bias", torch.zeros(4))
-
-        class L1(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.mlp = MLP()
-
-        with torch.device("meta"):
-            l1 = L1()
-        loaded = streamer.load_module_(l1, "model.layers.1")
-        assert set(loaded) == set(tensors)
-        assert torch.equal(
-            l1.mlp.shared_experts.gate_proj.weight.data, tensors["model.layers.1.mlp.shared_mlp.gate_proj.weight"]
-        )
-        assert torch.equal(l1.mlp.gate.weight.data, tensors["model.layers.1.mlp.router.gate.weight"])
-        assert torch.equal(l1.mlp.e_score_correction_bias, tensors["model.layers.1.mlp.expert_bias"])
-        assert torch.equal(
-            l1.mlp.experts[0].gate_proj.weight.data, tensors["model.layers.1.mlp.experts.0.gate_proj.weight"]
-        )
-        for _, p in l1.named_parameters():
-            assert p.device.type != "meta"
-        for _, b in l1.named_buffers():
-            assert b.device.type != "meta"
 
     def test_load_module_device_and_errors(self, tmp_path):
         torch.manual_seed(1)
@@ -345,7 +289,7 @@ class TestCheckpointStreamer:
 
         rows = [torch.tensor([[1, 2, 3]]), torch.tensor([[0, 5, 63]])]
         _check_ids_in_vocab(rows, 64)  # in range: no raise
-        bad = [torch.tensor([[1, 2, 150000]])]  # Qwen-tokenized ids vs hy3 vocab
+        bad = [torch.tensor([[1, 2, 150000]])]  # ids from a different model's tokenizer
         with pytest.raises(ValueError, match="different model's tokenizer"):
             _check_ids_in_vocab(bad, 120832)
 
@@ -487,7 +431,10 @@ class TestStreamModeExclusivity:
         from auto_round import envs
         from auto_round.context.model import ModelContext
 
-        monkeypatch.setattr(envs, "AR_DISK_STREAM_MODEL", env_disk_stream)
+        if env_disk_stream:
+            monkeypatch.setenv("AR_DISK_STREAM_MODEL", "1")
+        else:
+            monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
         monkeypatch.setattr("auto_round.context.model.is_mllm_model", lambda *a, **k: mllm)
         monkeypatch.setattr("auto_round.context.model.is_diffusion_model", lambda *a, **k: False)
         # BaseContext memoizes instances and skips __init__ on re-construction:
@@ -597,7 +544,7 @@ class TestStreamRowsCap:
 class TestOffloadAfterPackDecision:
     """Per-block offload writes must be skipped once the block is already
     flushed to output shards (is_immediate_saving): the file would be dead
-    weight until process exit (hy3: ~6.8GB x 80 blocks = ~545GB)."""
+    weight until process exit (a large MoE easily writes hundreds of GB)."""
 
     def _should_offload(self, low_cpu_mem_usage, is_immediate_saving):
         from types import SimpleNamespace
@@ -629,16 +576,18 @@ class TestDiskStreamEnvRotationGuard:
         from auto_round.algorithms.composer import AlgorithmComposer
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
 
-        monkeypatch.setattr(envs, "AR_DISK_STREAM_MODEL", env_value)
+        if env_value:
+            monkeypatch.setenv("AR_DISK_STREAM_MODEL", "1")
+        else:
+            monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
         orch = SimpleNamespace(
             layerwise_rotation=False, stream_quantization=False, model_context=None, compress_context=None
         )
         return AlgorithmComposer([RTNConfig(group_size=16)], orchestrator=orch)
 
     def test_env_var_eager_rotation_raises(self, monkeypatch):
-        import torch.nn as nn
-
         import pytest
+        import torch.nn as nn
 
         composer = self._composer(monkeypatch, True)
         with pytest.raises(ValueError, match="can only run layer-wise"):
@@ -647,9 +596,8 @@ class TestDiskStreamEnvRotationGuard:
     def test_flag_path_still_raises(self, monkeypatch):
         from types import SimpleNamespace
 
-        import torch.nn as nn
-
         import pytest
+        import torch.nn as nn
 
         from auto_round.algorithms.composer import AlgorithmComposer
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
@@ -760,7 +708,9 @@ class TestStreamQuantizeEquivalence:
                     p.mul_(0.1).add_(outlier_mask.float() * torch.randn_like(p))
         d = tmp_path_factory.mktemp("tiny_ckpt")
         # minimal fast tokenizer (no sentencepiece dependency)
-        from tokenizers import Tokenizer, models as tk_models, pre_tokenizers
+        from tokenizers import Tokenizer
+        from tokenizers import models as tk_models
+        from tokenizers import pre_tokenizers
         from transformers import PreTrainedTokenizerFast
 
         tk = Tokenizer(tk_models.WordLevel(vocab={"[UNK]": 0, "a": 1, "b": 2}, unk_token="[UNK]"))
@@ -817,7 +767,7 @@ class TestStreamQuantizeEquivalence:
         from auto_round.autoround import AutoRound
 
         cache_dir = str(tmp_path / "as_cache")
-        monkeypatch.setattr(envs, "AR_AUTO_SCHEME_CACHE", cache_dir)
+        monkeypatch.setenv("AR_AUTO_SCHEME_CACHE", str(cache_dir))
         # fp16 embed/lm_head inflate the achievable floor; W2+W4 span it
         scheme = AutoScheme(avg_bits=5.0, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
 
@@ -839,9 +789,7 @@ class TestStreamQuantizeEquivalence:
         # same model path both passes: the scheme cache is keyed on it (quantization
         # happens in memory; the on-disk checkpoint stays pristine)
         _run(tiny_checkpoint, str(tmp_path / "pass1"), stream=False)
-        assert any(
-            p.name.endswith(".json") for p in __import__("pathlib").Path(cache_dir).glob("*")
-        ), "pass 1 must fill the AutoScheme cache"
+        assert any(p.name.endswith(".json") for p in Path(cache_dir).glob("*")), "pass 1 must fill the AutoScheme cache"
         _, out_dir = _run(tiny_checkpoint, str(tmp_path / "pass2"), stream=True)
         with open(os.path.join(out_dir, "config.json")) as f:
             qconf = json.load(f)["quantization_config"]
@@ -855,7 +803,7 @@ class TestStreamQuantizeEquivalence:
         from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
         from auto_round.autoround import AutoRound
 
-        monkeypatch.setattr(envs, "AR_AUTO_SCHEME_CACHE", str(tmp_path / "empty_cache"))
+        monkeypatch.setenv("AR_AUTO_SCHEME_CACHE", str(tmp_path / "empty_cache"))
         scheme = AutoScheme(avg_bits=5.0, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
 
         with pytest.raises(RuntimeError, match="AutoScheme scoring cannot run in-process"):
@@ -929,8 +877,8 @@ class TestStreamQuantizeEquivalence:
     def test_stream_calibration_matches_data_driven(self, tiny_checkpoint, tmp_path):
         """stream_calibration=True must reproduce the data-driven run exactly:
         the streaming pass forwards the same rows through the same block chain
-        (same attention-mask rule, row-by-row) so the imatrix statistics — and
-        therefore the searched quantized weights — are identical."""
+        (same attention-mask rule, row-by-row) so the imatrix statistics - and
+        therefore the searched quantized weights - are identical."""
         import shutil
 
         torch.manual_seed(7)
@@ -1173,8 +1121,8 @@ class TestStreamQuantizeEquivalence:
             assert torch.equal(t_plain[k], t_staged[k]), f"tensor {k} differs under device staging"
 
     def test_unclaimed_block_passthrough(self, tiny_checkpoint, tmp_path):
-        """Checkpoint block groups with no module counterpart (e.g. the hy_v3 MTP
-        layer, which transformers does not model) must be written verbatim."""
+        """Checkpoint block groups with no module counterpart (e.g. an MTP layer
+        transformers does not model) must be written verbatim."""
         import json
         import os
         import shutil

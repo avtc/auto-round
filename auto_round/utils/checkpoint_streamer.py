@@ -30,31 +30,6 @@ import torch
 
 from auto_round.logger import logger
 
-# Checkpoint-name fragment -> module-name fragment, applied only when the
-# direct spelling misses (never shadows an exact match). Covers checkpoints
-# whose block spellings differ from the modeling code: hyv3 stores
-# ``mlp.shared_mlp`` / ``mlp.router.gate`` / ``mlp.expert_bias`` while the
-# runtime module exposes ``mlp.shared_experts`` / ``mlp.gate`` /
-# ``mlp.e_score_correction_bias``.
-_CKPT_NAME_REWRITES = (
-    (".mlp.shared_mlp.", ".mlp.shared_experts."),
-    (".mlp.router.gate.", ".mlp.gate."),
-    (".mlp.expert_bias", ".mlp.e_score_correction_bias"),
-)
-
-
-def to_checkpoint_name(name: str) -> str:
-    """Map a runtime module-name onto its checkpoint spelling.
-
-    Inverse of the rewrite table above: applies the first matching module-name
-    fragment substitution and returns *name* unchanged when nothing matches.
-    """
-    for ckpt_frag, mod_frag in _CKPT_NAME_REWRITES:
-        if mod_frag in name:
-            return name.replace(mod_frag, ckpt_frag)
-    return name
-
-
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -210,7 +185,7 @@ class CheckpointStreamer:
                 h.__exit__(None, None, None)
         return handle
 
-    # ── Prefetch ─────────────────────────────────────────────────────────────
+    # -- Prefetch -------------------------------------------------------------
 
     # Bytes reserved per staging GPU for the tuning fan-out's share of the
     # active block's search batches (chunked stacks + intermediates).
@@ -423,7 +398,7 @@ class CheckpointStreamer:
         if self._format == "safetensors":
             tensor = self._get_safe_open_pooled(shard, handles, order).get_tensor(name)
         else:
-            # .bin shards: load (mmap-free) and keep a one-shard cache — shard
+            # .bin shards: load (mmap-free) and keep a one-shard cache - shard
             # granularity is coarse for pickle checkpoints, but such shards are
             # also typically written sequentially.
             cache_key = f"__bin__{shard}"
@@ -481,18 +456,8 @@ class CheckpointStreamer:
         targets.update(dict(module.named_buffers(recurse=True)))
         by_short = {prefix + ("." if prefix else "") + k: v for k, v in targets.items()}
         loaded = []
-        rewrites_hit = 0
         for name in self.names_under(prefix):
             tgt, mod_name = by_short.get(name), name
-            if tgt is None:
-                for ckpt_frag, mod_frag in _CKPT_NAME_REWRITES:
-                    if ckpt_frag in name:
-                        cand = name.replace(ckpt_frag, mod_frag)
-                        tgt = by_short.get(cand)
-                        if tgt is not None:
-                            mod_name = cand
-                            rewrites_hit += 1
-                            break
             if tgt is None:
                 logger.debug(f"[stream] {name} has no matching parameter/buffer in the module; skipped")
                 continue
@@ -505,8 +470,6 @@ class CheckpointStreamer:
             if not self._assign_leaf_(module, rel, tensor):
                 raise RuntimeError(f"[stream] failed to assign {name!r} into module")
             loaded.append(name)
-        if rewrites_hit:
-            logger.info(f"[stream] {rewrites_hit} checkpoint tensor(s) matched via name rewrite")
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
         if device is not None:

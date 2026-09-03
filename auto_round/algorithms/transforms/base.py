@@ -127,7 +127,7 @@ class BaseRotation(ABC):
 
         When ``True``, the compressor can call :meth:`prepare_layerwise`
         during ``post_init`` and then :meth:`rotate_layer` per-block inside
-        the ``_quantize_blocks`` loop — avoiding the need to load the
+        the ``_quantize_blocks`` loop - avoiding the need to load the
         entire model onto GPU at once.
         """
         return False
@@ -176,7 +176,7 @@ class BaseRotation(ABC):
         Implementations should:
         - Rotate weights of target modules inside *layer*.
         - Register any online hooks (R1/R3/R4) needed at inference time.
-        - Be idempotent — calling twice on the same layer should be safe.
+        - Be idempotent - calling twice on the same layer should be safe.
 
         Args:
             layer: A single decoder layer, already on the target device.

@@ -459,7 +459,7 @@ class TestAutoScheme:
         )
         _, layer_config = ar.quantize()
 
-        # Cache files must exist — one per scheme (2 schemes here)
+        # Cache files must exist - one per scheme (2 schemes here)
         cache_files = glob.glob(f"{cache_dir}/scheme_*.json")
         assert (
             len(cache_files) == 2
@@ -485,7 +485,7 @@ class TestAutoScheme:
             # All non-fixed linear layers in layer_config should appear individually in cache
             for layer_name in layer_config:
                 assert layer_name in data["layer_scores"], (
-                    f"Layer {layer_name!r} missing from cache {path} — "
+                    f"Layer {layer_name!r} missing from cache {path} - "
                     f"cache may have stored merged group scores instead of individual scores"
                 )
 

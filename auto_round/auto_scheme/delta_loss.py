@@ -1711,7 +1711,7 @@ def move_module_to_tuning_device(module, major_device="cpu"):
         ``.grad``) to ``device``.
         """
         # Cover non-leaf modules that directly hold nn.Parameter / buffers
-        # (e.g. Mamba/GDN linear_attn with A_log & dt_bias). Also relocate
+        # (e.g. linear-attention layers with A_log & dt_bias). Also relocate
         # p.grad together with p.data — otherwise the next backward's grad
         # accumulation hits a cuda/cpu device mismatch.
         target = _normalize(device)

@@ -14,7 +14,6 @@
 import copy
 import gc
 import os
-import time
 import time as _time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -68,11 +67,6 @@ if TYPE_CHECKING:
 
 
 # TODO wenhuach align all the API args
-def _tuned_layer_key(block_name: str, sub_name: str, sub) -> str:
-    """Key of a tuned layer in the block-results files: the layer's
-    ``global_name`` when set, else its path below the block (the bare block
-    name for the root submodule)."""
-    return getattr(sub, "global_name", None) or (f"{block_name}.{sub_name}" if sub_name else block_name)
 
 
 class CompressionOrchestrator(BaseOrchestrator):
@@ -423,7 +417,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         """Jump the streaming calibration chain to the deepest saved frontier entry.
 
         The per-group manifests hold the successor chain entry (FP hidden
-        states) exactly as the serial and BPT paths persist it, so a run
+        states) exactly as the serial path persists it, so a run
         interrupted in ANY mode can hand its frontier to the streaming loop:
         the deepest group with progress provides the entry its next pending
         block would consume. ``input_others``/``token_ids`` are static per row
@@ -463,176 +457,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             seen += len(blocks)
         return None
 
-    def _stream_resume_done_block(
-        self,
-        block_name,
-        *,
-        results_dir,
-        streamer,
-        stage_devices,
-        stream_block_idx,
-        pbar,
-        tied_weights_layers,
-    ) -> bool:
-        """Handle a block already marked done in the resume manifest.
-
-        If the interrupted run was block-parallel, the block was tuned but
-        never packed: its worker result (scale/zp per layer) is applied and
-        packed here -- preserving the BPT calibration shaping instead of
-        re-searching under streaming-chain entries. If it was a streaming or
-        serial run, the block's tensors are already in an adopted shard and
-        there is nothing to do. Returns True when block weights were loaded
-        (i.e. a staging slot was consumed).
-        """
-        from auto_round.compressors.utils import immediate_pack as _immediate_pack
-
-        result = None
-        if results_dir is not None:
-            # shared block-result path convention (also produced by the
-            # block-parallel worker path when present)
-            path = os.path.join(results_dir, f"block_{block_name.replace('.', '_').replace('/', '-')}.pt")
-            if os.path.exists(path):
-                try:
-                    result = torch.load(path, map_location="cpu")
-                except Exception as e:
-                    raise RuntimeError(
-                        f"resume: block {block_name} is marked done but its BPT result file {path} "
-                        f"is unreadable ({e}). Its tensors are neither packed nor recoverable -- remove "
-                        "the stale group manifest under AR_RESUME_DIR to re-do this block."
-                    ) from e
-        if result is None:
-            if pbar is not None:
-                pbar.set_description(f"Skipping {block_name} (done)")
-            return False
-
-        if pbar is not None:
-            pbar.set_description(f"Applying {block_name} (BPT result)")
-        block = get_module(self.model, block_name)
-        if streamer is not None:
-            load_device = stage_devices[stream_block_idx % len(stage_devices)] if stage_devices else str(self.device)
-            streamer.load_module_(block, block_name, device=load_device)
-        elif self._should_offload_after_pack(self.compress_context) or envs.AR_DISK_STREAM_MODEL:
-            self._offloader.reload(self.model, block_name)
-        materialize_model_(block)
-        applied = 0
-        for sub_name, sub in block.named_modules():
-            entry = result.get(_tuned_layer_key(block_name, sub_name, sub))
-            if entry is None or not hasattr(sub, "weight"):
-                continue
-            sub.scale = entry["scale"].to(sub.weight.device)
-            zp = entry["zp"]
-            # symmetric layers keep zp as a plain int -- only tensors move devices
-            sub.zp = zp.to(sub.weight.device) if isinstance(zp, torch.Tensor) else zp
-            applied += 1
-        if applied == 0:
-            raise RuntimeError(f"resume: BPT result for {block_name} matched no layers (key mismatch)")
-        if self.compress_context.is_immediate_packing:
-            for _n, _mod in block.named_modules():
-                if hasattr(_mod, "bits") and check_to_quantized(_mod):
-                    module_name = getattr(_mod, "global_name", None)
-                    if module_name is None and self.nblocks == 1 and _n:
-                        module_name = f"{block.global_name}.{_n}"
-                    if module_name is None:
-                        continue
-                    _immediate_pack(module_name, self.layer_config)
-        if self.compress_context.is_immediate_saving:
-            for _n, m in block.named_modules():
-                if (
-                    not any(m.children())
-                    and len(m.state_dict()) > 0
-                    and hasattr(m, "global_name")
-                    and m.global_name not in tied_weights_layers
-                    and not check_to_quantized(m)
-                ):
-                    set_module(self.model, m.global_name, copy.deepcopy(m))
-                    self.shard_writer.write(name=m.global_name)
-                    get_module(self.model, m.global_name).to("meta")
-                    m.to("meta")
-            self.shard_writer.write(name=block_name)
-            self.shard_writer._flush_shard()
-        block.to("meta")
-        clear_memory()
-        return True
-
-    @staticmethod
-    def _prefetch_replica_eligible(ddp_world: int, stage_devices, composer) -> bool:
-        """Whether the prefetch replica fan-out is worthwhile.
-
-        Staged raw copies only pay off when mirrors can ADOPT them as weights.
-        The pristine gate disables adoption for every block whenever weight
-        transforms are active (layer-wise rotation) or preprocessors will
-        mutate weights in-loop (AWQ clip/scale) -- in that regime the fan-out
-        is pure staging traffic + VRAM: skip it and let mirrors deepcopy the
-        (transformed) home instead.
-        """
-        if not stage_devices or int(ddp_world) <= 1:
-            return False
-        if bool(getattr(composer, "has_layerwise_rotation", False)):
-            return False
-        return not list(getattr(composer, "preprocessors", []) or [])
-
-    def _start_bg_ready_transform(self, block_name: str, home_device, streamer):
-        """Early-load + ready-transform the NEXT block on its idle-group home.
-
-        Spawns a daemon worker that (after a free-VRAM guard on the target
-        home and waiting for the prefetcher to stage the block): streams the
-        block in, re-homes and pins it exactly like the main loop's load
-        stage, then applies the weight-only layer-wise transforms off the
-        critical path while the current block tunes. On success the block is
-        marked ``_bg_ready_done`` (the main loop skips its load stage and
-        compress_block skips the ready stage); on any failure the block is
-        marked ``_bg_ready_failed`` and the main loop reloads it from the
-        checkpoint, resetting any partially applied transform.
-
-        Staged replica copies are released eagerly: the in-place transform
-        invalidates them for mirror adoption (the pristine gate), so keeping
-        them would waste a block of VRAM per replica device.
-        """
-        home = torch.device(home_device)
-
-        def _worker():
-            from auto_round.algorithms.composer import BlockContext
-
-            block = get_module(self.model, block_name)
-            try:
-                if home.type == "cuda":
-                    needed = streamer.prefix_bytes(block_name) + 2 * 1024**3
-                    free, _total = torch.cuda.mem_get_info(home)
-                    if free < needed:
-                        raise MemoryError(f"only {free / 2**30:.1f} GiB free on {home}, need {needed / 2**30:.1f} GiB")
-                if not streamer.wait_until_staged(block_name, timeout=900):
-                    raise TimeoutError("prefetcher did not stage the block within 900s")
-                streamer.load_module_(block, block_name, device=str(home))
-                materialize_model_(block)
-                strip_stale_device_hooks_(block)
-                rehome_block_(block, home)
-                block._stream_home_device = home
-                from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
-
-                SignRoundQuantizer._pin_stream_home(block, home)
-                ctx = BlockContext(
-                    model=self.model,
-                    block_names=[block_name],
-                    block_name=block_name,
-                    block_index=0,
-                )
-                self.alg_composer.run_ready_transforms(block, ctx)
-                block._bg_ready_done = True
-                logger.info("[stream] background ready-transform armed %s on %s", block_name, home)
-            except Exception as e:  # noqa: BLE001 - recorded, main path recovers
-                block._bg_ready_failed = repr(e)
-                logger.warning(
-                    "[stream] background ready-transform for %s aborted (%r); the main path will reload it",
-                    block_name,
-                    e,
-                )
-
-        import threading as _threading
-
-        t = _threading.Thread(target=_worker, daemon=True, name="bg-ready-transform")
-        t.start()
-        return t
-
     def _start_bg_pack_block(
         self,
         block,
@@ -669,13 +493,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             import time as _wtime
 
             try:
-                _t0 = _wtime.perf_counter()
+                _t0 = _time.perf_counter()
                 from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
                 _immediate_pack_block(block, block_name, layer_config, nblocks=nblocks, device=load_device)
-                holder["pack"] = _wtime.perf_counter() - _t0
+                holder["pack"] = _time.perf_counter() - _t0
                 if self.compress_context.is_immediate_saving:
-                    _t0 = _wtime.perf_counter()
+                    _t0 = _time.perf_counter()
                     # Save non-quantized leaf modules (e.g. norms, embeddings in block).
                     for _n, m in block.named_modules():
                         if (
@@ -692,7 +516,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # Write at block scope for any remaining params/buffers.
                     self.shard_writer.write(name=block_name)
                     block.to("meta")
-                    holder["write"] = _wtime.perf_counter() - _t0
+                    holder["write"] = _time.perf_counter() - _t0
                     if rs is not None:
                         # crash-durability contract, same as the serial path:
                         # the manifest may claim this block done only after
@@ -743,6 +567,42 @@ class CompressionOrchestrator(BaseOrchestrator):
         if "embed" in name.lower():
             return "embeddings"
         return "nonblock:" + name.split(".")[0]
+
+    def _largest_block_bytes(self) -> float:
+        """Largest block's checkpoint-tensor footprint from the meta skeleton (bytes)."""
+        try:
+            block_names = [n for sub in get_block_names(self.model, quant_vision=True) for n in sub]
+        except Exception:  # noqa: BLE001  sizing must never break staging
+            return float("inf")
+        per_block: dict = {}
+        for name, t in self.model.named_parameters():
+            for b in block_names:
+                if name == b or name.startswith(b + "."):
+                    per_block[b] = per_block.get(b, 0) + t.numel() * t.element_size()
+                    break
+        if not per_block:
+            return float("inf")
+        return float(max(per_block.values()))
+
+    def _primary_fits_largest_block(self, quant_dev: torch.device):
+        """Whether the primary GPU can join the auto rotation, else None.
+
+        Fit rule: free VRAM (queried live) - 3 GiB headroom >= largest block.
+        The headroom covers tuning transients on top of the block (batch
+        slices, in-place qdq, pack buffers). Conservative on purpose: the
+        largest block gates EVERY block's home, and sizes vary by layer type.
+        """
+        if quant_dev.type != "cuda" or quant_dev.index is None:
+            return None
+        try:
+            free_b, _total_b = torch.cuda.mem_get_info(quant_dev.index)
+        except Exception:  # noqa: BLE001
+            return None
+        largest = self._largest_block_bytes()
+        free_gb = free_b / 2**30
+        if largest is float("inf") or free_gb - 3.0 < largest / 2**30:
+            return None
+        return largest / 2**30, free_gb
 
     def _log_device_inventory(self, calib_state: dict, tag: str) -> None:
         """AR_STREAM_MEM_INVENTORY=1: per-GPU breakdown of the streaming parent's memory.
@@ -824,7 +684,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 return None
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
             # The primary joins the rotation when its free VRAM comfortably
-            # holds the LARGEST block (block sizes vary by layer type - GDN vs
+            # holds the LARGEST block (block sizes vary by layer type - linear-attention vs
             # full-attention vs first/last): parent working set + block + tuning
             # transients must coexist there for one block at a time.
             primary_fit = self._primary_fits_largest_block(quant_dev)
@@ -896,7 +756,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if lm_head_name is not None:
                 tied_weights_layers.append(lm_head_name)
 
-        # ── stream_quantization: per-block tensor streaming from the checkpoint ──
+        # -- stream_quantization: per-block tensor streaming from the checkpoint --
         streamer = getattr(self.model_context, "checkpoint_streamer", None)
         if streamer is not None and not self.compress_context.is_immediate_saving:
             raise ValueError(
@@ -909,7 +769,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         # Optional streaming calibration: the rows are embedded once and each
         # block's compress_block reference output (replay through the
-        # transformed block, activation hooks firing) feeds the next block —
+        # transformed block, activation hooks firing) feeds the next block -
         # the data-driven chain semantics without a full model load.
         calib_state = None
         if streamer is not None and getattr(self, "stream_calibration", False):
@@ -928,10 +788,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             calib_state = {"fp_inputs": fp_inputs, "input_others": input_others, "token_ids": summary.get("token_ids")}
             logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])
 
-        # ── AR_RESUME_DIR: resume support (byte-compatible manifests with the
-        # serial and BPT paths -- any execution mode continues where another
+        # -- AR_RESUME_DIR: resume support (byte-compatible manifests with the
+        # serial and streaming paths -- either execution mode continues where the
         # stopped). Requires immediate saving: "done" in the manifest is the
-        # contract that the block's tensors are durably in a shard file. ──
+        # contract that the block's tensors are durably in a shard file. --
         resume_states = None
         if envs.AR_RESUME_DIR and self.compress_context.is_immediate_saving:
             resume_states = self._build_resume_states(all_blocks)
@@ -967,7 +827,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         if streamer is not None and prefetch_depth > 0 and prefetch_names:
             streamer.start_prefetch(prefetch_names, depth=prefetch_depth, stage_devices=stage_devices)
 
-        # ── Background pack pipeline (default ON; AR_DISABLE_BG_PACK opts out)
+        # -- Background pack pipeline (default ON; AR_DISABLE_BG_PACK opts out)
         # The finished block's immediate-pack + shard-write tail runs in a
         # background thread on its (now idle) ping-pong home while the loop
         # advances to the next block's tune on the other group. Eligible only
@@ -993,17 +853,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             for k_idx, block_name in enumerate(block_names):
                 pbar.set_description(f"Quantizing {block_name}")
                 if rs is not None and k_idx < rs.resume_index:
-                    # already durably done in a previous (possibly BPT) run
-                    if self._stream_resume_done_block(
-                        block_name,
-                        results_dir=None,
-                        streamer=streamer,
-                        stage_devices=stage_devices,
-                        stream_block_idx=stream_block_idx,
-                        pbar=pbar,
-                        tied_weights_layers=tied_weights_layers,
-                    ):
-                        stream_block_idx += 1  # applied blocks consume a staging slot
+                    # durably done in a previous run: its tensors are already
+                    # in an adopted output shard -- just skip (no staging slot
+                    # is consumed, the block is never materialized)
+                    pbar.set_description(f"Skipping {block_name} (done)")
                     pbar.update(1)
                     continue
                 block = get_module(self.model, block_name)
@@ -1018,27 +871,28 @@ class CompressionOrchestrator(BaseOrchestrator):
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
                 materialize_model_(block)
-                strip_stale_device_hooks_(block)
-                _n_moved = rehome_block_(block, load_device)
-                block._stream_home_device = torch.device(load_device)
-                # pin leaf tuning_device to the home: WrapperLinear prefers it
-                # (wrapper.py self.device = orig_layer.tuning_device or device),
-                # and quantize_block's local device otherwise defaults to the
-                # global primary - the wrapper would drag the wrapped layers
-                # back to cuda:0 while unwrapped siblings (conv1d) stay home.
-                from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+                if streamer is not None:
+                    strip_stale_device_hooks_(block)
+                    _n_moved = rehome_block_(block, load_device)
+                    block._stream_home_device = torch.device(load_device)
+                    # pin leaf tuning_device to the home: WrapperLinear prefers it
+                    # (wrapper.py self.device = orig_layer.tuning_device or device),
+                    # and quantize_block's local device otherwise defaults to the
+                    # global primary - the wrapper would drag the wrapped layers
+                    # back to cuda:0 while unwrapped siblings (conv1d) stay home.
+                    from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
 
-                SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
-                if stream_block_idx == 0:
-                    logger.info(
-                        "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
-                        "re-homed to %s (shared/setup modules start on the primary)",
-                        block_name,
-                        _n_moved,
-                        load_device,
-                    )
-                if envs.AR_STREAM_MEM_INVENTORY and stream_block_idx % 16 == 0:
-                    self._log_device_inventory(calib_state, f"block {stream_block_idx}")
+                    SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
+                    if stream_block_idx == 0:
+                        logger.info(
+                            "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
+                            "re-homed to %s (shared/setup modules start on the primary)",
+                            block_name,
+                            _n_moved,
+                            load_device,
+                        )
+                    if envs.AR_STREAM_MEM_INVENTORY and stream_block_idx % 16 == 0:
+                        self._log_device_inventory(calib_state, f"block {stream_block_idx}")
                 _t_load = _time.perf_counter() - _t_load
 
                 # ── Pure algorithm ────────────────────────────────────────
@@ -1104,7 +958,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
 
                     _immediate_pack_block(
-                        block, block_name, self.layer_config, nblocks=self.nblocks, device=load_device
+                        block,
+                        block_name,
+                        self.layer_config,
+                        nblocks=self.nblocks,
+                        device=load_device if streamer is not None else None,
                     )
                     _t_pack = _time.perf_counter() - _t_pack
                 else:
@@ -1154,9 +1012,10 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                 clear_memory()
                 memory_monitor.log_summary()
+                stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
 
-        # ── Pipeline lifecycle: model-level teardown (also finalizes rotation) ─
+        # Pipeline lifecycle: model-level teardown (also finalizes rotation)
         if _bg_thread is not None:
             _bg_thread.join()
             _bg_thread = None
@@ -1167,6 +1026,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             _bg_pack = None
         if streamer is not None and prefetch_depth > 0:
             streamer.stop_prefetch()
+        if streamer is not None:
+            streamer.close()
         self.alg_composer.finalize_run()
 
         cnt = 1
@@ -1182,8 +1043,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         for name in remain_layer_names:
             logger.info(f"Quantizing remaining layer {name} on CPU.")
             if streamer is not None:
-                parent = name.rsplit(".", 1)[0]
-                streamer.load_module_(get_module(self.model, parent), parent, device="cpu")
+                # load the layer itself; streaming its parent prefix would
+                # materialize the parent's whole subtree (every block weight)
+                streamer.load_module_(get_module(self.model, name), name, device="cpu")
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.
@@ -1208,7 +1070,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if pname in saved or tensor.device.type != "meta":
                     continue
                 if any(pname == q or pname.startswith(q + ".") for q in quantized_prefixes):
-                    continue  # quantized layer's original weight — packed name was written
+                    continue  # quantized layer's original weight - packed name was written
                 tgt = targets.get(pname, None)
                 if tgt is None:
                     logger.debug(f"[stream] root tensor {pname} has no live parameter/buffer; skipped")
@@ -1218,7 +1080,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     continue
                 streamer.fetch_into_(self.model, pname)
 
-            # Block groups that exist only in the checkpoint (e.g. the hy_v3 MTP
+            # Block groups that exist only in the checkpoint (e.g. an MTP
             # layer, which the modeling code does not instantiate) have no module
             # to quantize or write; pass their tensors through verbatim so the
             # export stays complete.
@@ -1373,7 +1235,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         else:
             pbar = tqdm(range(0, len(all_blocks[0]), self.nblocks))  # move the alg warning outside pbar
 
-        start_time = time.time()
+        start_time = _time.time()
 
         self.alg_composer.prepare_run()
 
@@ -1422,6 +1284,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 resume_states.append(
                     ResumeState(os.path.join(envs.AR_RESUME_DIR, f"group_{group_idx}"), sig, block_names)
                 )
+            # a resumed run must never overwrite shards the crashed run wrote:
+            # adopt them so the writer continues at the next shard index
+            if any(rs is not None and rs.resume_index > 0 for rs in resume_states) and self.shard_writer is not None:
+                self.shard_writer.adopt_existing_shards()
 
         for group_idx, block_names in enumerate(all_blocks):
             inputs = all_inputs[block_names[0]]
@@ -1531,7 +1397,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
-        end_time = time.time()
+        end_time = _time.time()
         cost_time = end_time - start_time
         logger.info(f"quantization tuning time {cost_time}")
 
