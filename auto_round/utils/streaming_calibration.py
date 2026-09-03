@@ -107,9 +107,13 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
     row_others = {k: (v[0] if isinstance(v, list) else v) for k, v in input_others.items()}
     row_others["use_cache"] = False
     row_others["past_key_values"] = None
-    dev = next((p.device for p in block.parameters() if p.device.type != "meta"), torch.device("cpu"))
+    live = [p for p in block.parameters() if p.device.type != "meta"]
+    dev = live[0].device if live else torch.device("cpu")
+    # the real replay casts inputs to the block's dtype (block_runner does the
+    # same); the raw probe row may be fp32 chain state against a bf16 block
+    dtype = live[0].dtype if live else None
     row_others = {k: _to_dev(v, dev) for k, v in row_others.items()}
-    fp_row = fp_row[:1].to(dev)
+    fp_row = fp_row[:1].to(dev) if dtype is None else fp_row[:1].to(device=dev, dtype=dtype)
     candidates = mask_form_candidates(key_mask_2d)
     if preferred is not None:
         order = [c for c in candidates if c[0] == preferred] + [c for c in candidates if c[0] != preferred]
