@@ -20,6 +20,16 @@ AutoRound 通过 `envs.py` 模块提供统一的环境变量管理系统，支�
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_CALIB_DEBUG_DUMP
+
+- **描述**: 设置为一个目录后, 各条校准通道(数据驱动文本、数据驱动多模态模板、流式链路)都会把进入模型的校准数据指纹写入该目录: 每个被接受的校准行的 token id 的 sha256, 以及首个 block 输入隐状态的统计信息。对比不同执行路径产生的 JSON 文件即可定位两条运行从何处开始分叉(例如流式与数据驱动路径 block-0 损失不一致的问题)。
+- **默认值**: `None`(禁用)
+- **用法**: 设置为可写目录
+
+```bash
+export AR_CALIB_DEBUG_DUMP=/tmp/calib_debug
+```
+
 ### AR_PERF_COUNTERS
 - **描述**：在流式循环中输出逐块 `[perf]` 计时（load / tune / pack / write / resume 快照）。仅用于观察。
 - **默认值**：`false`

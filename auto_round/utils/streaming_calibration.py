@@ -414,6 +414,10 @@ def prepare_streaming_calibration(
         raise ValueError("stream_calibration: no usable calibration rows (all shorter than seqlen?)")
     logger.info("[stream_calibration] chaining %d calibration rows (nsamples=%d)", len(rows), nsamples)
 
+    from auto_round.utils.calib_debug import dump_calib_rows, dump_calib_tensor
+
+    dump_calib_rows("stream", rows)
+
     embed_name, embed_mod = _find_embedding(model, streamer)
     if embed_mod is None:
         raise RuntimeError("stream_calibration: no checkpoint-backed embedding module found")
@@ -422,6 +426,8 @@ def prepare_streaming_calibration(
     _check_ids_in_vocab(rows, vocab)
     with torch.no_grad():
         fp_inputs = [embed_mod(ids.to(device)).cpu() for ids in rows]
+    if fp_inputs:
+        dump_calib_tensor("stream", "block0_fp0", fp_inputs[0])
     embed_mod.to("meta")
 
     cfg = getattr(model, "config", None)

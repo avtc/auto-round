@@ -337,6 +337,12 @@ class LLMCalibrator(Calibrator):
                 input_ids = data_new["input_ids"]
             if input_ids.shape[-1] < self.seqlen:
                 continue
+            from auto_round.utils import calib_debug
+
+            if not hasattr(self, "_calib_dbg_rows"):
+                self._calib_dbg_rows = []
+            if len(self._calib_dbg_rows) < 128:
+                self._calib_dbg_rows.extend(list(torch.split(input_ids.detach().cpu(), 1, dim=0)))
             # Cache raw token IDs for quantize_block.  Positions that should be
             # excluded from the loss are marked with -100 (PyTorch's standard
             # ignore index):
@@ -435,6 +441,15 @@ class LLMCalibrator(Calibrator):
             total_cnt += input_ids.shape[0] if len(input_ids.shape) > 1 else 1
             if total_cnt >= nsamples:
                 break
+        dbg_rows = getattr(self, "_calib_dbg_rows", None)
+        if dbg_rows:
+            calib_debug.dump_calib_rows("disk_text", dbg_rows)
+            first_block = self.blocks_requiring_input_ids[0] if self.blocks_requiring_input_ids else None
+            block_cache = self.inputs.get(first_block, None) if first_block else None
+            if isinstance(block_cache, dict):
+                hs = block_cache.get("hidden_states", None)
+                if isinstance(hs, (list, tuple)) and hs:
+                    calib_debug.dump_calib_tensor("disk_text", "block0_fp0", hs[0].detach().cpu())
         if total_cnt == 0:
             logger.error(
                 f"no data has been cached, please provide more data with sequence length "

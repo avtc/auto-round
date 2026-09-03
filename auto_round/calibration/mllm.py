@@ -170,6 +170,14 @@ class MLLMCalibrator(LLMCalibrator):
                     data_new = data
 
                 if isinstance(data_new, dict):
+                    _dbg_ids = data_new.get("input_ids", None)
+                    if isinstance(_dbg_ids, torch.Tensor) and not hasattr(self, "_calib_dbg_rows"):
+                        from auto_round.utils import calib_debug
+
+                        self._calib_dbg_rows = [
+                            r.detach().cpu() for r in torch.split(_dbg_ids.detach().cpu(), 1, dim=0)
+                        ][:128]
+                        calib_debug.dump_calib_rows("disk_mllm", self._calib_dbg_rows)
                     self.model(**data_new)
                 else:
                     self.model(data_new)

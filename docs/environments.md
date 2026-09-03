@@ -20,6 +20,16 @@ AutoRound uses a centralized environment variable management system through the 
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_CALIB_DEBUG_DUMP
+
+- **Description**: Set to a directory to make every calibration funnel (data-driven text, data-driven multimodal-template, and the streaming chain) write deterministic fingerprints of what reaches the model: per-row sha256 of the accepted token ids plus stats of the first block's input hidden states. Diff the JSON files across execution paths to localize where two runs diverge (e.g. a streamed block-0 loss differing from the data-driven one).
+- **Default**: `None` (disabled)
+- **Usage**: Set to a writable directory
+
+```bash
+export AR_CALIB_DEBUG_DUMP=/tmp/calib_debug
+```
+
 ### AR_PERF_COUNTERS
 - **Description**: Emit per-block `[perf]` timing lines in the streaming loop (load / tune / pack / write / resume snapshot). Informational only.
 - **Default**: `false`
