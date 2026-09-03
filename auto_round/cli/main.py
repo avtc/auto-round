@@ -84,10 +84,13 @@ def _build_entry_route_kwargs(args) -> dict:
 def _parse_stream_prefetch(value):
     """Parse the combined --stream_prefetch flag into (depth, devices).
 
-    'off' (default) -> (0, None); 'auto' -> (None, 'auto') with the depth
-    derived at loop start (one block per staging GPU); 'cpu' -> (None,
-    ['cpu']) host-RAM staging at depth 1; a comma list of GPUs ('1,2' or
-    'cuda:1,cuda:2') -> (None, devices), one block each, quantized in place.
+    'off' (default) -> (0, None); 'auto' -> (None, 'auto'): stage on the
+    other GPUs, or on the quant device itself when it is the only GPU and
+    the next block fits its free VRAM, or in host RAM as a last resort;
+    'on' -> same resolution chain but guaranteed enabled (host RAM at
+    minimum); 'cpu' -> (None, ['cpu']) host-RAM staging at depth 1; a comma
+    list of GPUs ('1,2' or 'cuda:1,cuda:2') -> (None, devices), one block
+    each, quantized in place.
     """
     text = (value or "off").strip()
     lowered = text.lower()
@@ -95,6 +98,8 @@ def _parse_stream_prefetch(value):
         return 0, None
     if lowered == "auto":
         return None, "auto"
+    if lowered == "on":
+        return None, "on"
     if lowered == "cpu":
         return None, ["cpu"]
     devices = []

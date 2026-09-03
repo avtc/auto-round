@@ -167,11 +167,13 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         type=str,
         help=(
             "Background block staging for the streaming loop: 'off' (default), "
-            "'auto' (every GPU except the primary, one staged block each -- e.g. "
-            "depth 3 on 4x3090), 'cpu' (host RAM, depth 1), or a comma list of "
-            "staging GPUs ('1,2' or 'cuda:1,cuda:2', one block each). Staged "
-            "blocks are quantized in place, round-robin across the devices, so "
-            "mixed GPU/CPU lists are not supported."
+            "'auto' (stage on the other GPUs; on the quant device itself when it "
+            "is the only GPU and the next block fits its free VRAM; in host RAM "
+            "as a last resort), 'on' (same chain, guaranteed enabled - host RAM "
+            "at minimum), 'cpu' (host RAM), or a comma list of staging GPUs "
+            "('1,2' or 'cuda:1,cuda:2'). Each staging GPU holds one in-flight "
+            "block and quantizes it in place (round-robin homes), so mixed "
+            "GPU/CPU lists are not supported."
         ),
     )
     rt.add_argument("--output_dir", default="./tmp_autoround", type=str, help="Directory to save quantized artifacts.")

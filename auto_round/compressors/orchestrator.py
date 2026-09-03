@@ -721,15 +721,24 @@ class CompressionOrchestrator(BaseOrchestrator):
         if not value:
             return None
         quant_dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
-        if isinstance(value, str) and value.strip().lower() == "auto":
+        forced = isinstance(value, str) and value.strip().lower() == "on"
+        if isinstance(value, str) and value.strip().lower() in ("auto", "on"):
+            ram_last_resort = (
+                "[stream] prefetch fallback: staging in host RAM (RAM->GPU hop still beats an on-demand "
+                "NVMe re-read)"
+            )
             if quant_dev.type != "cuda":
-                logger.warning(
-                    "[stream] stream_prefetch_devices='auto' ignored: quant device is %s, not CUDA", quant_dev
-                )
+                if forced:
+                    logger.info("%s: quant device is %s, not CUDA", ram_last_resort, quant_dev)
+                    return None  # host-RAM staging (devices None)
+                logger.warning("[stream] stream_prefetch='auto' ignored: quant device is %s, not CUDA", quant_dev)
                 return None
             n_gpu = torch.cuda.device_count()
             if n_gpu == 0:
-                logger.warning("[stream] stream_prefetch_devices='auto' ignored: no CUDA devices visible")
+                if forced:
+                    logger.info("%s: no CUDA devices visible", ram_last_resort)
+                    return None
+                logger.warning("[stream] stream_prefetch='auto' ignored: no CUDA devices visible")
                 return None
             devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
             # The primary joins the rotation when its free VRAM comfortably
@@ -747,6 +756,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                     largest_gb,
                     free_gb,
                 )
+            elif n_gpu == 1 and not devices:
+                # sole GPU and the largest block does not fit with headroom:
+                # do not stage on it, host RAM takes the lookahead
+                logger.info("%s: largest block does not fit free VRAM on the sole GPU", ram_last_resort)
+                return None
+            if forced and not devices:
+                logger.info("%s: no usable staging GPU", ram_last_resort)
+                return None
         else:
             devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
             if any(d.type == "cuda" for d in devices) and any(d.type == "cpu" for d in devices):

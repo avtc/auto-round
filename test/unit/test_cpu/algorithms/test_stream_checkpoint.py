@@ -329,6 +329,21 @@ class TestStageDeviceResolution:
         with pytest.raises(ValueError, match="meta tensors hold no data"):
             self._resolve(stream_prefetch_devices=["cpu", "meta"])
 
+    def test_on_value_parses(self):
+        from auto_round.cli.main import _parse_stream_prefetch
+
+        assert _parse_stream_prefetch("on") == (None, "on")
+        assert _parse_stream_prefetch("off") == (0, None)
+        assert _parse_stream_prefetch("auto") == (None, "auto")
+
+    def test_on_with_cpu_quant_stays_enabled_as_ram(self):
+        # 'on' never silently disables: with a CPU quant device the chain
+        # lands on host-RAM staging (devices None) without a warning-only bail
+        assert self._resolve(stream_prefetch_devices="on") is None
+
+    def test_auto_with_cpu_quant_is_none(self):
+        assert self._resolve(stream_prefetch_devices="auto") is None
+
     def test_mixed_gpu_cpu_list_rejected_with_cuda_quant(self):
         # in-place round-robin quantization: all-GPU or CPU-only, never mixed
         from types import SimpleNamespace
