@@ -227,6 +227,13 @@ def pack_layer(name, model, device=None):
     # explicitly obtain the underlying device to prevent RuntimeError mismatched tensors
     weight_device = layer.weight.device
 
+    if not hasattr(layer, "scale"):
+        raise AttributeError(
+            f"layer '{name}' is marked for quantization (bits={getattr(layer, 'bits', None)}) but carries no "
+            "scale/zero-point: its quantization never ran. This usually means the module was never visited "
+            "by the block loop or the outside-block quantization pass (e.g. it sits in a subtree the "
+            "streaming setup left untouched)."
+        )
     scheme = construct_ct_scheme(layer)
     setattr(layer, "quantization_scheme", scheme)
     setattr(layer, "weight_scale", torch.nn.Parameter(layer.scale.to(weight_device)))
