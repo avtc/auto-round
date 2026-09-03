@@ -1142,6 +1142,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             quantized_prefixes = tuple(n for n, m in self.model.named_modules() if _ctq(m) and not any(m.children()))
             targets = dict(self.model.named_parameters())
             targets.update(dict(self.model.named_buffers()))
+            non_meta_unsaved = [
+                pname
+                for pname, tensor in self.model.state_dict().items()
+                if pname not in saved and tensor.device.type != "meta"
+            ]
+            n_streamed = 0
             for pname, tensor in self.model.state_dict().items():
                 if pname in saved or tensor.device.type != "meta":
                     continue
@@ -1155,6 +1161,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                     logger.warning(f"[stream] root tensor {pname} missing from checkpoint; skipped")
                     continue
                 streamer.fetch_into_(self.model, pname)
+                n_streamed += 1
+            logger.info(
+                "[stream] root pass-through: %d tensor(s) streamed from checkpoint, %d already materialized "
+                "in memory (%s)",
+                n_streamed,
+                len(non_meta_unsaved),
+                ", ".join(non_meta_unsaved[:6]) + ("..." if n_in_memory > 6 else ""),
+            )
 
             # Block groups that exist only in the checkpoint (e.g. an MTP
             # layer, which the modeling code does not instantiate) have no module
