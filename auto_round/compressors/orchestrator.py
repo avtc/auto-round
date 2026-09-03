@@ -987,6 +987,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             and not envs.AR_DISABLE_BG_PACK
         )
         _bg_pack = None
+        _bg_thread = None
 
         pbar = tqdm(range(sum(len(block) for block in all_blocks)))
         stream_block_idx = 0
