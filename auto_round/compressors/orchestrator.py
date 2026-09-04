@@ -1000,6 +1000,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "keymask_2d": summary.get("keymask_2d"),
             }
             logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])
+            # drop the local aliases: the block loop replaces
+            # calib_state["fp_inputs"] with each new generation, but a live
+            # local reference would pin the FIRST generation (a generation-
+            # sized region) for the whole run
+            fp_inputs = None
+            input_others = None
 
         # -- AR_RESUME_DIR: resume support (byte-compatible manifests with the
         # serial and streaming paths -- either execution mode continues where the
