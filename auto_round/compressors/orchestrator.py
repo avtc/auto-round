@@ -653,7 +653,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             return None
         return largest / 2**30, free_gb
 
-    def _log_device_inventory(self, calib_state: dict, tag: str) -> None:
+    def _log_device_inventory(self, calib_state: dict, tag: str, extra_buckets: dict = None) -> None:
         """AR_STREAM_MEM_INVENTORY=1: per-GPU breakdown of the streaming parent's memory.
 
         Walks model tensors (meta skipped, deduped), the calibration chain
@@ -691,6 +691,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _walk(calib_state.get(key))
             # masks / position ids / rope tables: persistent small residents
             _walk(calib_state.get("input_others"), bucket="chain-kwargs")
+        for bucket_name, payload in (extra_buckets or {}).items():
+            _walk(payload, bucket=bucket_name)
         if self.shard_writer is not None:
             pending = getattr(self.shard_writer, "current_shard_tensors", None) or {}
             for _t in pending.values():
@@ -1464,9 +1466,20 @@ class CompressionOrchestrator(BaseOrchestrator):
             if any(rs is not None and rs.resume_index > 0 for rs in resume_states) and self.shard_writer is not None:
                 self.shard_writer.adopt_existing_shards()
 
+        _mem_inv = bool(envs.AR_STREAM_MEM_INVENTORY)
+        if _mem_inv:
+            self._log_device_inventory(
+                None, "cache-built", extra_buckets={"cache-remaining": all_inputs, "cache-q": all_q_inputs or {}}
+            )
         for group_idx, block_names in enumerate(all_blocks):
             inputs = all_inputs[block_names[0]]
             all_inputs.pop(block_names[0])
+            if _mem_inv:
+                self._log_device_inventory(
+                    None,
+                    f"block {group_idx}",
+                    extra_buckets={"cache-block": inputs, "cache-remaining": all_inputs},
+                )
             q_inputs = None
             if all_q_inputs is not None:
                 q_inputs = all_q_inputs[block_names[0]]
