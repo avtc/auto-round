@@ -50,7 +50,7 @@ class Qwen2VLVisionModel(MmprojModel):
         # rename config.json values
         self.hparams_vision["num_attention_heads"] = self.hparams_vision.get("num_heads")
         self.hparams_vision["num_hidden_layers"] = self.hparams_vision.get("depth")
-        if "embed_dim" in self.hparams_vision: # qwen2vl
+        if "embed_dim" in self.hparams_vision:  # qwen2vl
             self.hparams_vision["intermediate_size"] = self.hparams_vision.get("hidden_size")
             self.hparams_vision["hidden_size"] = self.hparams_vision.get("embed_dim")
 
@@ -58,11 +58,11 @@ class Qwen2VLVisionModel(MmprojModel):
         super().set_gguf_parameters()
         assert self.hparams_vision is not None
         hparams = self.hparams_vision
-        model_type = self.global_config['model_type']
-        if model_type == 'qwen2_vl':
+        model_type = self.global_config["model_type"]
+        if model_type == "qwen2_vl":
             self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN2VL)
-        elif model_type == 'qwen2_5_vl' or model_type == 'qwen2_5_omni':
-            if model_type == 'qwen2_5_omni':
+        elif model_type == "qwen2_5_vl" or model_type == "qwen2_5_omni":
+            if model_type == "qwen2_5_omni":
                 self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN25O)
             else:
                 self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN25VL)
@@ -98,24 +98,24 @@ class Qwen2VLVisionModel(MmprojModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # split QKV tensors if needed
         if ".qkv." in name:
-            if data_torch.ndim == 2: # weight
+            if data_torch.ndim == 2:  # weight
                 c3, _ = data_torch.shape
-            else: # bias
+            else:  # bias
                 c3 = data_torch.shape[0]
             assert c3 % 3 == 0
             c = c3 // 3
             wq = data_torch[:c]
-            wk = data_torch[c: c * 2]
-            wv = data_torch[c * 2:]
+            wk = data_torch[c : c * 2]
+            wv = data_torch[c * 2 :]
             yield from super().modify_tensors(wq, name.replace("qkv", "q"), bid)
             yield from super().modify_tensors(wk, name.replace("qkv", "k"), bid)
             yield from super().modify_tensors(wv, name.replace("qkv", "v"), bid)
-        elif 'patch_embed.proj.weight' in name:
+        elif "patch_embed.proj.weight" in name:
             # split Conv3D into Conv2Ds
             c1, c2, kt, kh, kw = data_torch.shape
             del c1, c2, kh, kw  # unused
             assert kt == 2, "Current implementation only support temporal_patch_size of 2"
-            yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight"  , data_torch[:, :, 0, ...])
+            yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight", data_torch[:, :, 0, ...])
             yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight.1", data_torch[:, :, 1, ...])
         else:
             yield from super().modify_tensors(data_torch, name, bid)

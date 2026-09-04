@@ -33,17 +33,23 @@ class MiniCPMModel(TextModel):
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         rope_dims = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
 
-        long_factors = self.rope_parameters.get('long_factor')
-        short_factors = self.rope_parameters.get('short_factor')
+        long_factors = self.rope_parameters.get("long_factor")
+        short_factors = self.rope_parameters.get("short_factor")
         if long_factors or short_factors:
             if long_factors is None or short_factors is None:
-                raise KeyError('Missing the required key rope_scaling.long_factor or rope_scaling_short_factor')
+                raise KeyError("Missing the required key rope_scaling.long_factor or rope_scaling_short_factor")
 
             if len(long_factors) != len(short_factors) or len(long_factors) != rope_dims / 2:
-                raise ValueError(f'The length of rope long and short factors must be {rope_dims / 2}')
+                raise ValueError(f"The length of rope long and short factors must be {rope_dims / 2}")
 
-            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG), torch.tensor(long_factors, dtype=torch.float32))
-            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT), torch.tensor(short_factors, dtype=torch.float32))
+            yield (
+                self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG),
+                torch.tensor(long_factors, dtype=torch.float32),
+            )
+            yield (
+                self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT),
+                torch.tensor(short_factors, dtype=torch.float32),
+            )
 
     def set_vocab(self):
         self._set_vocab_sentencepiece()
@@ -85,19 +91,25 @@ class MiniCPM3Model(TextModel):
         self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
-        long_factors = self.rope_parameters.get('long_factor')
-        short_factors = self.rope_parameters.get('short_factor')
+        long_factors = self.rope_parameters.get("long_factor")
+        short_factors = self.rope_parameters.get("short_factor")
         if long_factors or short_factors:
             rope_dims = self.hparams["qk_rope_head_dim"]
 
             if long_factors is None or short_factors is None:
-                raise KeyError('Missing the required key rope_scaling.long_factor or rope_scaling_short_factor')
+                raise KeyError("Missing the required key rope_scaling.long_factor or rope_scaling_short_factor")
 
             if len(long_factors) != len(short_factors) or len(long_factors) != rope_dims / 2:
-                raise ValueError(f'The length of rope long and short factors must be {rope_dims / 2}')
+                raise ValueError(f"The length of rope long and short factors must be {rope_dims / 2}")
 
-            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG), torch.tensor(long_factors, dtype=torch.float32))
-            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT), torch.tensor(short_factors, dtype=torch.float32))
+            yield (
+                self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG),
+                torch.tensor(long_factors, dtype=torch.float32),
+            )
+            yield (
+                self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT),
+                torch.tensor(short_factors, dtype=torch.float32),
+            )
 
     def set_vocab(self):
         self._set_vocab_sentencepiece()
@@ -117,6 +129,7 @@ class MiniCPM3Model(TextModel):
 # `model.language_model.*`; vision tower is SigLIP + a window-attention ViT merger
 # + a final DownsampleMLP merger. The same HF arch is registered twice below: once as
 # the LM (text mode) and once as the mmproj (vision mode), mirroring the Qwen3-VL setup.
+
 
 @ModelBase.register("MiniCPMV4_6ForConditionalGeneration")
 @ModelBase.example("openbmb/MiniCPM-V-4_6")
@@ -146,8 +159,7 @@ class MiniCPMV4_6VisionModel(MmprojModel):
             raise ValueError(f"Unsupported downsample mode: {self.downsample_mode}")
         if self.downsample_mode == "4x":
             self.model_tensors = {
-                name: tensor for name, tensor in self.model_tensors.items()
-                if ".vit_merger." not in name
+                name: tensor for name, tensor in self.model_tensors.items() if ".vit_merger." not in name
             }
 
         if self.hparams_vision is not None:
@@ -169,18 +181,15 @@ class MiniCPMV4_6VisionModel(MmprojModel):
         # (mapped to PROJECTOR_TYPE_MINICPMV4_6).
         self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MINICPMV4_6)
 
-        self.gguf_writer.add_vision_projector_scale_factor(
-            2 if self.downsample_mode == "4x" else 4)
+        self.gguf_writer.add_vision_projector_scale_factor(2 if self.downsample_mode == "4x" else 4)
 
         # borrow wa_layer_indexes for vit_merger insertion point
-        insert_layer_id = int(self.global_config.get(
-            "insert_layer_id", self.hparams_vision.get("insert_layer_id", 6)))
+        insert_layer_id = int(self.global_config.get("insert_layer_id", self.hparams_vision.get("insert_layer_id", 6)))
         self.gguf_writer.add_vision_wa_layer_indexes([insert_layer_id])
 
         # SigLIP vision body uses gelu_pytorch_tanh, which matches ggml_gelu (tanh approx).
         self.gguf_writer.add_vision_use_gelu(True)
-        self.gguf_writer.add_vision_attention_layernorm_eps(
-            self.hparams_vision.get("layer_norm_eps", 1e-6))
+        self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams_vision.get("layer_norm_eps", 1e-6))
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

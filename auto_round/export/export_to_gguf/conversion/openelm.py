@@ -31,8 +31,7 @@ class OpenELMModel(TextModel):
         self._num_kv_heads: list[int] = self.hparams["num_kv_heads"]
         self._num_query_heads: list[int] = self.hparams["num_query_heads"]
         self._ffn_dims: list[int] = [
-            OpenELMModel._make_divisible(multiplier * self._n_embd, ffn_dim_divisor)
-            for multiplier in ffn_multipliers
+            OpenELMModel._make_divisible(multiplier * self._n_embd, ffn_dim_divisor) for multiplier in ffn_multipliers
         ]
         assert isinstance(self._num_kv_heads, list) and isinstance(self._num_kv_heads[0], int)
         assert isinstance(self._num_query_heads, list) and isinstance(self._num_query_heads[0], int)

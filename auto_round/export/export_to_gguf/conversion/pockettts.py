@@ -28,10 +28,10 @@ from .base import ModelBase, MmprojModel, SentencePieceTokenTypes, TextModel, gg
 #   mimi decoder                --> MTMD_GEN_PROCESS_TYPE_GEN_WAV
 
 # indices into mimi.encoder.model / mimi.decoder.model for stage i, see SEANetEncoder/SEANetDecoder
-_ENC_RES_IDX   = lambda i: 1 + 3 * i  # noqa: E731
+_ENC_RES_IDX = lambda i: 1 + 3 * i  # noqa: E731
 _ENC_SCALE_IDX = lambda i: 3 + 3 * i  # noqa: E731
 _DEC_SCALE_IDX = lambda i: 2 + 3 * i  # noqa: E731
-_DEC_RES_IDX   = lambda i: 3 + 3 * i  # noqa: E731
+_DEC_RES_IDX = lambda i: 3 + 3 * i  # noqa: E731
 
 _N_SEANET_STAGES = 3
 _SAMPLE_RATE = 24000
@@ -51,7 +51,11 @@ def _load_hparams(dir_model: Path) -> dict[str, Any]:
     shapes = _tensor_shapes(dir_model)
     n_vocab, n_embd = shapes["flow_lm.conditioner.embed.weight"]
     n_layer = sum(1 for name in shapes if re.fullmatch(r"flow_lm\.transformer\.layers\.\d+\.norm1\.weight", name))
-    n_layer_a = sum(1 for name in shapes if re.fullmatch(r"mimi\.encoder_transformer\.transformer\.layers\.\d+\.norm1\.weight", name))
+    n_layer_a = sum(
+        1
+        for name in shapes
+        if re.fullmatch(r"mimi\.encoder_transformer\.transformer\.layers\.\d+\.norm1\.weight", name)
+    )
     n_embd_a = shapes["mimi.encoder_transformer.transformer.layers.0.norm1.weight"][0]
     return {
         "architectures": ["PocketTTSModel"],
@@ -82,11 +86,11 @@ class PocketTTSModel(TextModel):
     model_arch = gguf.MODEL_ARCH.POCKETTTS
 
     _LAYER_TENSOR_MAP = {
-        "norm1":               gguf.MODEL_TENSOR.ATTN_NORM,
-        "norm2":               gguf.MODEL_TENSOR.FFN_NORM,
-        "self_attn.out_proj":  gguf.MODEL_TENSOR.ATTN_OUT,
-        "linear1":             gguf.MODEL_TENSOR.FFN_UP,
-        "linear2":             gguf.MODEL_TENSOR.FFN_DOWN,
+        "norm1": gguf.MODEL_TENSOR.ATTN_NORM,
+        "norm2": gguf.MODEL_TENSOR.FFN_NORM,
+        "self_attn.out_proj": gguf.MODEL_TENSOR.ATTN_OUT,
+        "linear1": gguf.MODEL_TENSOR.FFN_UP,
+        "linear2": gguf.MODEL_TENSOR.FFN_DOWN,
     }
 
     def set_vocab(self):
@@ -181,17 +185,21 @@ class PocketTTSMmprojModel(MmprojModel):
     has_vision_encoder = False
 
     _MIMI_TFM_MAP = {
-        "norm1":              (gguf.MODEL_TENSOR.A_ENC_INPUT_NORM,  gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_NORM),
-        "norm2":              (gguf.MODEL_TENSOR.A_ENC_OUTPUT_NORM, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_FFN_NORM),
-        "self_attn.out_proj": (gguf.MODEL_TENSOR.A_ENC_OUTPUT,      gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_OUT),
-        "linear1":            (gguf.MODEL_TENSOR.A_ENC_FFN_UP,      gguf.MODEL_TENSOR.A_GEN_WAV_TFM_FFN_UP),
-        "linear2":            (gguf.MODEL_TENSOR.A_ENC_FFN_DOWN,    gguf.MODEL_TENSOR.A_GEN_WAV_TFM_FFN_DOWN),
+        "norm1": (gguf.MODEL_TENSOR.A_ENC_INPUT_NORM, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_NORM),
+        "norm2": (gguf.MODEL_TENSOR.A_ENC_OUTPUT_NORM, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_FFN_NORM),
+        "self_attn.out_proj": (gguf.MODEL_TENSOR.A_ENC_OUTPUT, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_OUT),
+        "linear1": (gguf.MODEL_TENSOR.A_ENC_FFN_UP, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_FFN_UP),
+        "linear2": (gguf.MODEL_TENSOR.A_ENC_FFN_DOWN, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_FFN_DOWN),
         "layer_scale_1.scale": (gguf.MODEL_TENSOR.A_ENC_ATTN_SCALE, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_SCALE),
         "layer_scale_2.scale": (gguf.MODEL_TENSOR.A_ENC_FFN_SCALE_LS, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_FFN_SCALE),
     }
     _MIMI_TFM_QKV = (
         (gguf.MODEL_TENSOR.A_ENC_ATTN_Q, gguf.MODEL_TENSOR.A_ENC_ATTN_K, gguf.MODEL_TENSOR.A_ENC_ATTN_V),
-        (gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_Q, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_K, gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_V),
+        (
+            gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_Q,
+            gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_K,
+            gguf.MODEL_TENSOR.A_GEN_WAV_TFM_ATTN_V,
+        ),
     )
 
     def set_gguf_parameters(self):
@@ -287,9 +295,9 @@ class PocketTTSMmprojModel(MmprojModel):
         suffix = "." + key.rsplit(".", 1)[1]
 
         simple = {
-            "input_proj":                 T.A_GEN_FLOW_INPUT_PROJ,
-            "cond_embed":                 T.A_GEN_FLOW_COND_EMBD,
-            "final_layer.linear":         T.A_GEN_FLOW_FINAL_PROJ,
+            "input_proj": T.A_GEN_FLOW_INPUT_PROJ,
+            "cond_embed": T.A_GEN_FLOW_COND_EMBD,
+            "final_layer.linear": T.A_GEN_FLOW_FINAL_PROJ,
             "final_layer.adaLN_modulation.1": T.A_GEN_FLOW_FINAL_ADA,
         }
         tensor = simple.get(key.rsplit(".", 1)[0])
@@ -301,10 +309,10 @@ class PocketTTSMmprojModel(MmprojModel):
             bid = int(key.split(".")[1])
             rest = key.split(f"time_embed.{bid}.", 1)[1]
             time_map = {
-                "freqs":       (T.A_GEN_FLOW_TIME_FREQS, ""),
-                "mlp.0":       (T.A_GEN_FLOW_TIME_UP,    suffix),
-                "mlp.2":       (T.A_GEN_FLOW_TIME_DOWN,  suffix),
-                "mlp.3.alpha": (T.A_GEN_FLOW_TIME_NORM,  ""),
+                "freqs": (T.A_GEN_FLOW_TIME_FREQS, ""),
+                "mlp.0": (T.A_GEN_FLOW_TIME_UP, suffix),
+                "mlp.2": (T.A_GEN_FLOW_TIME_DOWN, suffix),
+                "mlp.3.alpha": (T.A_GEN_FLOW_TIME_NORM, ""),
             }
             entry = time_map.get(rest) or time_map.get(rest.rsplit(".", 1)[0])
             if entry is not None:
@@ -315,10 +323,10 @@ class PocketTTSMmprojModel(MmprojModel):
             bid = int(key.split(".")[1])
             rest = key.split(f"res_blocks.{bid}.", 1)[1].rsplit(".", 1)[0]
             blk_map = {
-                "in_ln":                T.A_GEN_FLOW_BLK_NORM,
-                "mlp.0":                T.A_GEN_FLOW_BLK_UP,
-                "mlp.2":                T.A_GEN_FLOW_BLK_DOWN,
-                "adaLN_modulation.1":   T.A_GEN_FLOW_BLK_ADA,
+                "in_ln": T.A_GEN_FLOW_BLK_NORM,
+                "mlp.0": T.A_GEN_FLOW_BLK_UP,
+                "mlp.2": T.A_GEN_FLOW_BLK_DOWN,
+                "adaLN_modulation.1": T.A_GEN_FLOW_BLK_ADA,
             }
             tensor = blk_map.get(rest)
             if tensor is not None:
@@ -352,11 +360,21 @@ class PocketTTSMmprojModel(MmprojModel):
         suffix = "." + name.rsplit(".", 1)[1]
 
         conv_in, conv_out, res1, res2, scale = (
-            (T.A_GEN_WAV_SEANET_CONV_IN, T.A_GEN_WAV_SEANET_CONV_OUT, T.A_GEN_WAV_SEANET_RES_CONV1,
-             T.A_GEN_WAV_SEANET_RES_CONV2, T.A_GEN_WAV_SEANET_SCALE_CONV)
-            if is_decoder else
-            (T.A_ENC_SEANET_CONV_IN, T.A_ENC_SEANET_CONV_OUT, T.A_ENC_SEANET_RES_CONV1,
-             T.A_ENC_SEANET_RES_CONV2, T.A_ENC_SEANET_SCALE_CONV)
+            (
+                T.A_GEN_WAV_SEANET_CONV_IN,
+                T.A_GEN_WAV_SEANET_CONV_OUT,
+                T.A_GEN_WAV_SEANET_RES_CONV1,
+                T.A_GEN_WAV_SEANET_RES_CONV2,
+                T.A_GEN_WAV_SEANET_SCALE_CONV,
+            )
+            if is_decoder
+            else (
+                T.A_ENC_SEANET_CONV_IN,
+                T.A_ENC_SEANET_CONV_OUT,
+                T.A_ENC_SEANET_RES_CONV1,
+                T.A_ENC_SEANET_RES_CONV2,
+                T.A_ENC_SEANET_SCALE_CONV,
+            )
         )
 
         if idx == 0:

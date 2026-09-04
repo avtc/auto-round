@@ -82,7 +82,7 @@ class Plamo2Model(TextModel):
             for i in range(self.block_count):
                 if self.block_count <= (mamba_step // 2):
                     # use attention in last layer
-                    is_mamba = (i != self.block_count - 1)
+                    is_mamba = i != self.block_count - 1
                 else:
                     is_mamba = (i % mamba_step) != (mamba_step // 2)
                 if is_mamba:

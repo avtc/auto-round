@@ -21,12 +21,12 @@ class JanusProModel(LlamaModel):
 
         # Skip vision, aligner, and generation tensors
         skip_prefixes = (
-            'model.vision_model.',
-            'model.aligner.',
-            'model.vqmodel.',
-            'model.generation_embeddings.',
-            'model.generation_aligner.',
-            'model.generation_head.',
+            "model.vision_model.",
+            "model.aligner.",
+            "model.vqmodel.",
+            "model.generation_embeddings.",
+            "model.generation_aligner.",
+            "model.generation_head.",
         )
         if name.startswith(skip_prefixes):
             return None
@@ -65,9 +65,9 @@ class JanusProVisionModel(MmprojModel):
         suffix = ".bias" if name.endswith(".bias") else ".weight"
 
         if name.startswith("model.aligner."):
-            local_name = name[len("model.aligner."):]
+            local_name = name[len("model.aligner.") :]
         elif name.startswith("aligner."):
-            local_name = name[len("aligner."):]
+            local_name = name[len("aligner.") :]
         else:
             raise ValueError(f"Unsupported Janus aligner prefix: {name}")
 
@@ -90,14 +90,14 @@ class JanusProVisionModel(MmprojModel):
 
         # Skip generation-related components
         skip_generation_prefixes = (
-            'model.vqmodel.',
-            'vqmodel.',
-            'model.generation_embeddings.',
-            'generation_embeddings.',
-            'model.generation_aligner.',
-            'generation_aligner.',
-            'model.generation_head.',
-            'generation_head.',
+            "model.vqmodel.",
+            "vqmodel.",
+            "model.generation_embeddings.",
+            "generation_embeddings.",
+            "model.generation_aligner.",
+            "generation_aligner.",
+            "model.generation_head.",
+            "generation_head.",
         )
         if name.startswith(skip_generation_prefixes):
             return None
@@ -106,12 +106,12 @@ class JanusProVisionModel(MmprojModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Handle aligner tensors
-        if name.startswith(('model.aligner.', 'aligner.')):
+        if name.startswith(("model.aligner.", "aligner.")):
             yield from self._map_aligner_tensor(data_torch, name)
             return
 
         # Handle vision tensors
-        if name.startswith(('model.vision_model.', 'vision_model.')):
+        if name.startswith(("model.vision_model.", "vision_model.")):
             yield from super().modify_tensors(data_torch, name, bid)
             return
 

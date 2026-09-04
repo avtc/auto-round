@@ -101,6 +101,26 @@ def _park_cpu_buffers_(module: torch.nn.Module, device) -> None:
     module._apply(_fn)
 
 
+def reverse_name_map(model_type, names) -> dict:
+    """Build a module-name -> checkpoint-name map for conversion aliases.
+
+    Applies the per-family checkpoint->module rewrites to every concrete
+    checkpoint name and keeps the inversion; export-side lookups that arrive
+    with transformers module names can then find their checkpoint source.
+    """
+    renames = _name_rewrites_for(model_type)
+    rev = {}
+    if not renames:
+        return rev
+    for ckpt_name in names:
+        for pattern, replacement in renames:
+            candidate = pattern.sub(lambda _m, r=replacement: r, ckpt_name)
+            if candidate != ckpt_name:
+                rev.setdefault(candidate, ckpt_name)
+                break
+    return rev
+
+
 @lru_cache(maxsize=None)
 def _name_rewrites_for(model_type):
     """Compiled (checkpoint-pattern -> module-replacement) pairs for a family.
@@ -641,6 +661,23 @@ class CheckpointStreamer:
         """Stream a single tensor by full name straight into ``model``."""
         tensor = self.fetch(name)
         return self._assign_leaf_(model, name, tensor)
+
+    def resolve_checkpoint_name(self, module_name: str) -> Optional[str]:
+        """Resolve a module-side tensor name to its checkpoint-side counterpart.
+
+        Inverse of the conversion-registry rewrites: export-side lookups
+        (root pass-through, residual hydration) arrive with transformers
+        module names while the checkpoint index holds the original names
+        (e.g. a MoE router weight stored under a legacy prefix). Exact
+        checkpoint hits pass through unchanged.
+        """
+        if module_name in self.weight_map:
+            return module_name
+        rev = self.__dict__.get("_module_to_ckpt")
+        if rev is None:
+            rev = reverse_name_map(self._model_type, self.weight_map)
+            self._module_to_ckpt = rev
+        return rev.get(module_name)
 
     @torch.no_grad()
     def load_module_(self, module: torch.nn.Module, prefix: str, device: Optional[str] = None) -> list[str]:

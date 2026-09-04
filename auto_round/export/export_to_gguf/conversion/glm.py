@@ -30,6 +30,7 @@ class Glm4Model(TextModel):
 
     def set_vocab(self):
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
         tokens, toktypes, tokpre = self.get_vocab_base()
@@ -38,10 +39,18 @@ class Glm4Model(TextModel):
         self.gguf_writer.add_token_list(tokens)
         self.gguf_writer.add_token_types(toktypes)
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        special_vocab._set_special_token("eos", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
-        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])  # ty: ignore[unresolved-attribute]
-        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
-        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "eos", tokenizer.get_added_vocab()["<|endoftext|>"]
+        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "eot", tokenizer.get_added_vocab()["<|user|>"]
+        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "unk", tokenizer.get_added_vocab()["<|endoftext|>"]
+        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "bos", tokenizer.get_added_vocab()["<|endoftext|>"]
+        )  # ty: ignore[unresolved-attribute]
         special_vocab.add_to_gguf(self.gguf_writer)
 
     def set_gguf_parameters(self):
@@ -51,7 +60,9 @@ class Glm4Model(TextModel):
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.partial_rotary_factor))
 
     @staticmethod
-    def normal_to_neox(weights: Tensor, n_head: int, n_head_kv: int, head_dim: int, partial_rotary_factor: float) -> Tensor:
+    def normal_to_neox(
+        weights: Tensor, n_head: int, n_head_kv: int, head_dim: int, partial_rotary_factor: float
+    ) -> Tensor:
         orig_shape = weights.shape
         if len(orig_shape) == 1:
             weights = weights.unsqueeze(1)  # [out_dim, 1]
@@ -60,7 +71,9 @@ class Glm4Model(TextModel):
         n_effective_heads = weights.shape[0] // head_dim
         if n_head_kv is not None and n_effective_heads != n_head:
             if n_effective_heads != n_head_kv:
-                raise AssertionError(f"Mismatch in effective heads: computed {n_effective_heads}, expected {n_head} or {n_head_kv}")
+                raise AssertionError(
+                    f"Mismatch in effective heads: computed {n_effective_heads}, expected {n_head} or {n_head_kv}"
+                )
         rotary_dim = int(head_dim * partial_rotary_factor)
         if rotary_dim % 2 != 0:
             raise ValueError("rotary_dim must be even.")
@@ -82,7 +95,9 @@ class Glm4Model(TextModel):
             if name.endswith(("q_proj.weight", "q_proj.bias")):
                 data_torch = Glm4Model.normal_to_neox(data_torch, n_head, n_head, head_dim, self.partial_rotary_factor)
             if name.endswith(("k_proj.weight", "k_proj.bias")):
-                data_torch = Glm4Model.normal_to_neox(data_torch, n_head, n_kv_head, head_dim, self.partial_rotary_factor)
+                data_torch = Glm4Model.normal_to_neox(
+                    data_torch, n_head, n_kv_head, head_dim, self.partial_rotary_factor
+                )
         yield from super().modify_tensors(data_torch, name, bid)
 
 
@@ -125,9 +140,7 @@ class Glm4MoeModel(TextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         if (rope_dim := self.hparams.get("head_dim")) is None:
-            rope_dim = (
-                self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
-            )
+            rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
         self.gguf_writer.add_rope_dimension_count(
             int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.5))
         )
@@ -254,8 +267,15 @@ class Glm4MoeLiteModel(DeepseekV2Model):
             is_mtp = match is not None and int(match.group(1)) >= cls._n_main_layers
             if is_mtp and cls.no_mtp:
                 return None
-            if cls.mtp_only and not is_mtp and name not in (
-                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+            if (
+                cls.mtp_only
+                and not is_mtp
+                and name
+                not in (
+                    "model.embed_tokens.weight",
+                    "model.norm.weight",
+                    "lm_head.weight",
+                )
             ):
                 return None
 
@@ -270,8 +290,14 @@ class Glm4MoeLiteModel(DeepseekV2Model):
 
         output_type: str = self.ftype.name.partition("_")[2]
         fname_default: str = gguf.naming_convention(
-            self.metadata.name, self.metadata.basename, self.metadata.finetune,
-            self.metadata.version, size_label=None, output_type=output_type, model_type=None)
+            self.metadata.name,
+            self.metadata.basename,
+            self.metadata.finetune,
+            self.metadata.version,
+            size_label=None,
+            output_type=output_type,
+            model_type=None,
+        )
         self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
 
@@ -314,8 +340,15 @@ class GlmMoeDsaModel(DeepseekV2Model):
             return None
         # --mtp: keep ONLY NextN-block tensors plus the shared embeddings/
         # norm/lm_head (so the resulting GGUF carries just the draft head).
-        if cls.mtp_only and not is_mtp and name not in (
-            "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+        if (
+            cls.mtp_only
+            and not is_mtp
+            and name
+            not in (
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+            )
         ):
             return None
 
@@ -351,6 +384,7 @@ class SolarOpenModel(Glm4MoeModel):
 
     def set_vocab(self):
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
         tokens, toktypes, tokpre = self.get_vocab_base()
@@ -358,8 +392,16 @@ class SolarOpenModel(Glm4MoeModel):
         self.gguf_writer.add_tokenizer_pre(tokpre)
         self.gguf_writer.add_token_list(tokens)
         self.gguf_writer.add_token_types(toktypes)
-        special_vocab._set_special_token("eos", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
-        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
-        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<unk>"])  # ty: ignore[unresolved-attribute]
-        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["<|startoftext|>"])  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "eos", tokenizer.get_added_vocab()["<|endoftext|>"]
+        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "eot", tokenizer.get_added_vocab()["<|endoftext|>"]
+        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "unk", tokenizer.get_added_vocab()["<unk>"]
+        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token(
+            "bos", tokenizer.get_added_vocab()["<|startoftext|>"]
+        )  # ty: ignore[unresolved-attribute]
         special_vocab.add_to_gguf(self.gguf_writer)

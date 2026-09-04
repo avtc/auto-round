@@ -23,15 +23,17 @@ class ExaoneModel(TextModel):
         super().set_gguf_parameters()
         hparams = self.hparams
 
-        assert (hparams["activation_function"] == "silu")
+        assert hparams["activation_function"] == "silu"
 
         rotary_factor = self.rope_parameters.get("partial_rotary_factor")
         rotary_factor = rotary_factor if rotary_factor is not None else 1.0
-        self.gguf_writer.add_rope_dimension_count(int(rotary_factor * (hparams["hidden_size"] // hparams["num_attention_heads"])))
+        self.gguf_writer.add_rope_dimension_count(
+            int(rotary_factor * (hparams["hidden_size"] // hparams["num_attention_heads"]))
+        )
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if rope_params := self.rope_parameters.get("full_attention", self.rope_parameters):
-            if rope_params.get("rope_type", '').lower() == "llama3":
+            if rope_params.get("rope_type", "").lower() == "llama3":
                 base = self.rope_parameters.get("rope_theta", 10000.0)
                 if (dim := self.hparams.get("head_dim")) is None:
                     dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
@@ -57,7 +59,10 @@ class ExaoneModel(TextModel):
                         smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
                         rope_factors.append(1 / ((1 - smooth) / factor + smooth))
 
-                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), torch.tensor(rope_factors, dtype=torch.float32))
+                yield (
+                    self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS),
+                    torch.tensor(rope_factors, dtype=torch.float32),
+                )
 
 
 @ModelBase.register("Exaone4ForCausalLM")
@@ -88,7 +93,9 @@ class Exaone4Model(TextModel):
                 sliding_window_pattern = []
                 if isinstance(hparams["sliding_window_pattern"], str):  # e.g. LLLG
                     for i in range(hparams["num_hidden_layers"]):
-                        sliding_window_pattern.append(hparams["sliding_window_pattern"][i % len(hparams["sliding_window_pattern"])] == "L")
+                        sliding_window_pattern.append(
+                            hparams["sliding_window_pattern"][i % len(hparams["sliding_window_pattern"])] == "L"
+                        )
                 if isinstance(hparams["sliding_window_pattern"], int):  # e.g. 4
                     for i in range(hparams["num_hidden_layers"]):
                         sliding_window_pattern.append((i + 1) % hparams["sliding_window_pattern"] != 0)
@@ -97,7 +104,7 @@ class Exaone4Model(TextModel):
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if rope_params := self.rope_parameters.get("full_attention", self.rope_parameters):
-            if rope_params.get("rope_type", '').lower() == "llama3":
+            if rope_params.get("rope_type", "").lower() == "llama3":
                 base = rope_params.get("rope_theta", 10_000.0)
                 if (dim := self.hparams.get("head_dim")) is None:
                     dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
@@ -122,7 +129,10 @@ class Exaone4Model(TextModel):
                         smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
                         rope_factors.append(1 / ((1 - smooth) / factor + smooth))
 
-                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), torch.tensor(rope_factors, dtype=torch.float32))
+                yield (
+                    self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS),
+                    torch.tensor(rope_factors, dtype=torch.float32),
+                )
 
 
 # note: transformers >= 5.1 renamed the class to "ExaoneMoeForCausalLM" (lowercase 'e'),
@@ -171,7 +181,7 @@ class ExaoneMoEModel(Exaone4Model):
                 new_name = remapper[_n.stem] + _n.suffix
 
                 # set shared weights for all NextN/MTP layers
-                for bid in range(self.hparams['num_hidden_layers'], self.block_count):
+                for bid in range(self.hparams["num_hidden_layers"], self.block_count):
                     yield from super().modify_tensors(data_torch, new_name.format(bid=bid), bid)
                 return
 

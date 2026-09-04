@@ -1550,10 +1550,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if tgt is None:
                     logger.debug(f"[stream] root tensor {pname} has no live parameter/buffer; skipped")
                     continue
-                if pname not in streamer.weight_map:
+                # transformers module names may differ from the checkpoint's
+                # (conversion-registry aliases, e.g. MoE router weights)
+                ckpt_name = streamer.resolve_checkpoint_name(pname)
+                if ckpt_name is None:
                     logger.warning(f"[stream] root tensor {pname} missing from checkpoint; skipped")
                     continue
-                streamer.fetch_into_(self.model, pname)
+                streamer._assign_leaf_(self.model, pname, streamer.fetch(ckpt_name))
                 # match the non-streaming path's dtype policy: a fully loaded
                 # model is converted via model.to(amp_dtype) during context
                 # setup, but that cast never touches meta tensors - without
@@ -1580,11 +1583,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             # materialize everything the checkpoint can still supply so the
             # model is not mixed meta/real at export time
             for pname, tensor in self.model.state_dict().items():
-                if tensor.device.type != "meta" or pname not in streamer.weight_map:
+                if tensor.device.type != "meta":
                     continue
                 if any(pname == q or pname.startswith(q + ".") for q in quantized_prefixes):
                     continue
-                streamer.fetch_into_(self.model, pname)
+                ckpt_name = streamer.resolve_checkpoint_name(pname)
+                if ckpt_name is not None:
+                    streamer._assign_leaf_(self.model, pname, streamer.fetch(ckpt_name))
 
             # computed buffers (rotary inv_freq & friends) never appear in a
             # checkpoint; rebuild them so the model is not mixed meta/real at

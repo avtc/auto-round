@@ -38,13 +38,16 @@ class Step3VLVisionModel(MmprojModel):
         projector_stride = int(self.global_config.get("understand_projector_stride", -1))
         hidden_size = int(self.hparams_vision.get("hidden_size", self.hparams_vision.get("width", -1)))
         num_layers = int(self.hparams_vision.get("num_hidden_layers", self.hparams_vision.get("layers", -1)))
-        assert (projector_stride, int(self.hparams_vision.get("image_size", -1)), hidden_size, num_layers) == (2, 728, 1536, 47), (
-            "current Step3-VL conversion path is only validated for Step3-VL-10B"
-        )
+        assert (projector_stride, int(self.hparams_vision.get("image_size", -1)), hidden_size, num_layers) == (
+            2,
+            728,
+            1536,
+            47,
+        ), "current Step3-VL conversion path is only validated for Step3-VL-10B"
 
         self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.STEP3VL)
         self.gguf_writer.add_vision_attention_layernorm_eps(float(self.hparams_vision.get("layer_norm_eps", 1e-5)))
-        self.gguf_writer.add_vision_projector_scale_factor(projector_stride ** 2)
+        self.gguf_writer.add_vision_projector_scale_factor(projector_stride**2)
         # 3024 max resize comes from step3-vl-10b processing_step3.py.
         self.gguf_writer.add_vision_preproc_image_size(3024)
 
@@ -52,7 +55,11 @@ class Step3VLVisionModel(MmprojModel):
         if ".position_embd." in new_name:
             return gguf.GGMLQuantizationType.F32
         if ("mm.0." in new_name or "mm.1." in new_name) and new_name.endswith(".weight"):
-            return gguf.GGMLQuantizationType.F16 if self.ftype == gguf.LlamaFileType.MOSTLY_F16 else gguf.GGMLQuantizationType.F32
+            return (
+                gguf.GGMLQuantizationType.F16
+                if self.ftype == gguf.LlamaFileType.MOSTLY_F16
+                else gguf.GGMLQuantizationType.F32
+            )
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     @classmethod
@@ -244,8 +251,15 @@ class Step35Model(TextModel):
             return None
         # --mtp: keep ONLY MTP-block tensors plus the shared embeddings/norm/
         # lm_head (so the resulting GGUF carries just the draft head).
-        if cls.mtp_only and not is_mtp and name not in (
-            "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+        if (
+            cls.mtp_only
+            and not is_mtp
+            and name
+            not in (
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+            )
         ):
             return None
 
@@ -264,7 +278,15 @@ class Step35Model(TextModel):
         if name.endswith("norm.weight"):
             data_torch += 1.0
 
-        if name.endswith((".self_attn.g_proj.weight", ".moe.gate.weight", ".moe.up_proj.weight", ".moe.gate_proj.weight", ".moe.down_proj.weight")):
+        if name.endswith(
+            (
+                ".self_attn.g_proj.weight",
+                ".moe.gate.weight",
+                ".moe.up_proj.weight",
+                ".moe.gate_proj.weight",
+                ".moe.down_proj.weight",
+            )
+        ):
             data_torch = data_torch.squeeze().contiguous()
 
         yield from super().modify_tensors(data_torch, name, bid)
@@ -280,8 +302,14 @@ class Step35Model(TextModel):
 
         output_type: str = self.ftype.name.partition("_")[2]
         fname_default: str = gguf.naming_convention(
-            self.metadata.name, self.metadata.basename, self.metadata.finetune,
-            self.metadata.version, size_label=None, output_type=output_type, model_type=None)
+            self.metadata.name,
+            self.metadata.basename,
+            self.metadata.finetune,
+            self.metadata.version,
+            size_label=None,
+            output_type=output_type,
+            model_type=None,
+        )
         self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:

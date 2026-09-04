@@ -44,14 +44,14 @@ class MambaModel(TextModel):
             self._set_vocab_builtin("gpt-neox", vocab_size)
 
     def set_gguf_parameters(self):
-        d_model = self.find_hparam(["hidden_size",       "d_model"])
-        d_conv  = self.find_hparam(["conv_kernel",       "d_conv"],  optional=True) or 4
+        d_model = self.find_hparam(["hidden_size", "d_model"])
+        d_conv = self.find_hparam(["conv_kernel", "d_conv"], optional=True) or 4
         d_inner = self.find_hparam(["intermediate_size", "d_inner"], optional=True) or 2 * d_model
-        d_state = self.find_hparam(["state_size",        "d_state"], optional=True) or 16
+        d_state = self.find_hparam(["state_size", "d_state"], optional=True) or 16
         # ceiling division
         # ref: https://stackoverflow.com/a/17511341/22827863
         # ref: https://github.com/state-spaces/mamba/blob/ce59daea3a090d011d6476c6e5b97f6d58ddad8b/mamba_ssm/modules/mamba_simple.py#L58
-        dt_rank      = self.find_hparam(["time_step_rank",     "dt_rank"],      optional=True) or -(d_model // -16)
+        dt_rank = self.find_hparam(["time_step_rank", "dt_rank"], optional=True) or -(d_model // -16)
         rms_norm_eps = self.find_hparam(["layer_norm_epsilon", "rms_norm_eps"], optional=True) or 1e-5
         use_dt_b_c_norm = False
         # For falconmamba we do apply RMS norm on B / DT and C layers
@@ -60,17 +60,19 @@ class MambaModel(TextModel):
         # Fail early for models which don't have a block expansion factor of 2
         assert d_inner == 2 * d_model
 
-        self.gguf_writer.add_context_length(2**20) # arbitrary value; for those who use the default
+        self.gguf_writer.add_context_length(2**20)  # arbitrary value; for those who use the default
         self.gguf_writer.add_embedding_length(d_model)
-        self.gguf_writer.add_feed_forward_length(0) # unused, but seemingly required when loading
-        self.gguf_writer.add_head_count(0) # unused, but seemingly required when loading
+        self.gguf_writer.add_feed_forward_length(0)  # unused, but seemingly required when loading
+        self.gguf_writer.add_head_count(0)  # unused, but seemingly required when loading
         self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_ssm_conv_kernel(d_conv)
         self.gguf_writer.add_ssm_inner_size(d_inner)
         self.gguf_writer.add_ssm_state_size(d_state)
         self.gguf_writer.add_ssm_time_step_rank(dt_rank)
         self.gguf_writer.add_layer_norm_rms_eps(rms_norm_eps)
-        self.gguf_writer.add_ssm_dt_b_c_rms(use_dt_b_c_norm) # For classic Mamba we don't apply rms norm on B / DT layers
+        self.gguf_writer.add_ssm_dt_b_c_rms(
+            use_dt_b_c_norm
+        )  # For classic Mamba we don't apply rms norm on B / DT layers
         self.gguf_writer.add_file_type(self.ftype)
 
     _tok_embd = None
@@ -117,7 +119,10 @@ class Mamba2Model(TextModel):
         super().__init__(dir_model, *args, hparams=hparams, **kwargs)
         self.d_model = self.find_hparam(["hidden_size", "d_model", "dim"])
         self.expand = self.find_hparam(["mamba_expand", "expand"], optional=True) or 2
-        self.d_inner = self.find_hparam(["mamba_d_ssm", "intermediate_size", "d_inner"], optional=True) or self.expand * self.d_model
+        self.d_inner = (
+            self.find_hparam(["mamba_d_ssm", "intermediate_size", "d_inner"], optional=True)
+            or self.expand * self.d_model
+        )
         self.n_group = self.find_hparam(["n_groups"], optional=True) or 1
 
     def set_vocab(self):
@@ -133,7 +138,9 @@ class Mamba2Model(TextModel):
             self._set_vocab_sentencepiece()
         elif (self.dir_model / "tokenizer.model.v3").is_file():
             # mamba-codestral
-            raise NotImplementedError(f"Please rename {self.dir_model / 'tokenizer.model.v3'} to {self.dir_model / 'tokenizer.model'}")
+            raise NotImplementedError(
+                f"Please rename {self.dir_model / 'tokenizer.model.v3'} to {self.dir_model / 'tokenizer.model'}"
+            )
         elif (self.dir_model / "tokenizer.json").is_file():
             self._set_vocab_gpt2()
         else:
@@ -141,8 +148,8 @@ class Mamba2Model(TextModel):
             self._set_vocab_builtin("gpt-neox", vocab_size)
 
     def set_gguf_parameters(self):
-        d_conv  = self.find_hparam(["conv_kernel", "d_conv"],     optional=True) or 4
-        d_state = self.find_hparam(["state_size",  "d_state"],    optional=True) or 128
+        d_conv = self.find_hparam(["conv_kernel", "d_conv"], optional=True) or 4
+        d_state = self.find_hparam(["state_size", "d_state"], optional=True) or 128
         head_dim = self.find_hparam(["mamba_d_head", "head_dim"], optional=True) or 64
 
         rms_norm_eps = self.find_hparam(["layer_norm_epsilon", "rms_norm_eps"], optional=True) or 1e-5
@@ -183,10 +190,13 @@ class Mamba2Model(TextModel):
 
         if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.SSM_CONV1D, bid):
             data_torch = data_torch.squeeze()
-        elif any(self.match_model_tensor_name(new_name, t, bid, suffix="") for t in [
-            gguf.MODEL_TENSOR.SSM_A,
-            gguf.MODEL_TENSOR.SSM_D,
-        ]):
+        elif any(
+            self.match_model_tensor_name(new_name, t, bid, suffix="")
+            for t in [
+                gguf.MODEL_TENSOR.SSM_A,
+                gguf.MODEL_TENSOR.SSM_D,
+            ]
+        ):
             # unsqueeze A to use similar shape semantics as Mamba-1
             # (D is also unsqueezed, but for more straightforward broadcast internally)
             data_torch = data_torch.reshape((*data_torch.shape, 1))

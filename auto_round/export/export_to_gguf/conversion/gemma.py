@@ -23,13 +23,14 @@ class GemmaModel(TextModel):
         self._set_vocab_sentencepiece()
 
         # TODO: these special tokens should be exported only for the CodeGemma family
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False,
-                                          special_token_types = ['prefix', 'suffix', 'middle', 'fsep', 'eot'])
+        special_vocab = gguf.SpecialVocab(
+            self.dir_model, load_merges=False, special_token_types=["prefix", "suffix", "middle", "fsep", "eot"]
+        )
         special_vocab._set_special_token("prefix", 67)
         special_vocab._set_special_token("suffix", 69)
         special_vocab._set_special_token("middle", 68)
-        special_vocab._set_special_token("fsep",   70)
-        special_vocab._set_special_token("eot",    107)
+        special_vocab._set_special_token("fsep", 70)
+        special_vocab._set_special_token("eot", 107)
         special_vocab.chat_template = None  # do not add it twice
         special_vocab.add_to_gguf(self.gguf_writer)
 
@@ -43,7 +44,9 @@ class GemmaModel(TextModel):
         self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_feed_forward_length(hparams["intermediate_size"])
         self.gguf_writer.add_head_count(hparams["num_attention_heads"])
-        self.gguf_writer.add_head_count_kv(self.hparams["num_key_value_heads"] if "num_key_value_heads" in hparams else hparams["num_attention_heads"])
+        self.gguf_writer.add_head_count_kv(
+            self.hparams["num_key_value_heads"] if "num_key_value_heads" in hparams else hparams["num_attention_heads"]
+        )
         self.gguf_writer.add_layer_norm_rms_eps(self.hparams["rms_norm_eps"])
         self.gguf_writer.add_key_length(hparams["head_dim"])
         self.gguf_writer.add_value_length(hparams["head_dim"])
@@ -88,17 +91,15 @@ class Gemma2Model(TextModel):
         self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_feed_forward_length(hparams["intermediate_size"])
         self.gguf_writer.add_head_count(hparams["num_attention_heads"])
-        self.gguf_writer.add_head_count_kv(self.hparams["num_key_value_heads"] if "num_key_value_heads" in hparams else hparams["num_attention_heads"])
+        self.gguf_writer.add_head_count_kv(
+            self.hparams["num_key_value_heads"] if "num_key_value_heads" in hparams else hparams["num_attention_heads"]
+        )
         self.gguf_writer.add_layer_norm_rms_eps(self.hparams["rms_norm_eps"])
         self.gguf_writer.add_key_length(hparams["head_dim"])
         self.gguf_writer.add_value_length(hparams["head_dim"])
         self.gguf_writer.add_file_type(self.ftype)
-        self.gguf_writer.add_attn_logit_softcapping(
-            self.hparams["attn_logit_softcapping"]
-        )
-        self.gguf_writer.add_final_logit_softcapping(
-            self.hparams["final_logit_softcapping"]
-        )
+        self.gguf_writer.add_attn_logit_softcapping(self.hparams["attn_logit_softcapping"])
+        self.gguf_writer.add_final_logit_softcapping(self.hparams["final_logit_softcapping"])
         self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])
 
     @classmethod
@@ -123,7 +124,9 @@ class Gemma2Model(TextModel):
 
 @ModelBase.register("Gemma3ForCausalLM", "Gemma3ForConditionalGeneration")
 # [TAG_HF_EXAMPLE_GATED] google/gemma-3-4b-it is gated
-@ModelBase.example("trl-internal-testing/tiny-Gemma3ForConditionalGeneration", "hf-tiny-v2/tiny-random-Gemma3ForCausalLM")
+@ModelBase.example(
+    "trl-internal-testing/tiny-Gemma3ForConditionalGeneration", "hf-tiny-v2/tiny-random-Gemma3ForCausalLM"
+)
 class Gemma3Model(TextModel):
     model_arch = gguf.MODEL_ARCH.GEMMA3
 
@@ -147,10 +150,12 @@ class Gemma3Model(TextModel):
         self.gguf_writer.add_layer_norm_rms_eps(self.hparams.get("rms_norm_eps", 1e-6))
         self.gguf_writer.add_key_length(hparams.get("head_dim", 256))
         self.gguf_writer.add_value_length(hparams.get("head_dim", 256))
-        self.gguf_writer.add_rope_freq_base(self.rope_parameters.get("full_attention", self.rope_parameters).get("rope_theta", 1_000_000.0)) # for global layers
+        self.gguf_writer.add_rope_freq_base(
+            self.rope_parameters.get("full_attention", self.rope_parameters).get("rope_theta", 1_000_000.0)
+        )  # for global layers
         # attn_logit_softcapping is removed in Gemma3
         assert hparams.get("attn_logit_softcapping") is None
-        if (final_logit_softcap := hparams.get("final_logit_softcapping")):
+        if final_logit_softcap := hparams.get("final_logit_softcapping"):
             self.gguf_writer.add_final_logit_softcapping(final_logit_softcap)
         if hparams.get("sliding_window_pattern") != 1:
             self.gguf_writer.add_sliding_window(hparams["sliding_window"])
@@ -210,10 +215,14 @@ class EmbeddingGemma(Gemma3Model):
                                     # hparams dense_2_feat_out and dense_3_feat_in are required when loading model's dense weights
                                     prefix = self._get_dense_prefix(mod_path)
                                     if mod_conf["in_features"] is not None and mod_conf["out_features"] is not None:
-                                        self.dense_features_dims[prefix] = (mod_conf["in_features"], mod_conf["out_features"])
+                                        self.dense_features_dims[prefix] = (
+                                            mod_conf["in_features"],
+                                            mod_conf["out_features"],
+                                        )
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         from safetensors.torch import load_file
+
         module_paths = list(self.module_paths)
         for i, module_path in enumerate(module_paths):
             tensors_file = self.dir_model / module_path / "model.safetensors"
@@ -244,8 +253,10 @@ class EmbeddingGemma(Gemma3Model):
             if orig_sliding_window is None:
                 raise ValueError("sliding_window not found in model config - this is required for the model")
 
-            logger.info(f"Using original sliding_window from config: {orig_sliding_window} "
-                        f"instead of {self.hparams['sliding_window']}")
+            logger.info(
+                f"Using original sliding_window from config: {orig_sliding_window} "
+                f"instead of {self.hparams['sliding_window']}"
+            )
             self.gguf_writer.add_sliding_window(orig_sliding_window)
         if self.sentence_transformers_dense_modules:
             for dense, dims in self.dense_features_dims.items():
@@ -268,7 +279,7 @@ class Gemma3VisionModel(MmprojModel):
         self.gguf_writer.add_vision_use_gelu(True)
         # calculate proj_scale_factor (used by tinygemma3 test model)
         image_seq_length = self.preprocessor_config.get("image_seq_length", 256)
-        n_per_side = int(image_seq_length ** 0.5)
+        n_per_side = int(image_seq_length**0.5)
         image_size = self.hparams["image_size"]
         patch_size = self.hparams["patch_size"]
         proj_scale_factor = (image_size // patch_size) // n_per_side
@@ -316,7 +327,9 @@ class ConformerAudioModel(MmprojModel):
 
     @staticmethod
     def is_audio_tensor(name: str):
-        return any(p in name for p in ["audio", "codebook", "conformer", "depth_embedding", "depthformer", "depth_linear"])
+        return any(
+            p in name for p in ["audio", "codebook", "conformer", "depth_embedding", "depthformer", "depth_linear"]
+        )
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         if ConformerAudioModel.is_audio_tensor(name):
@@ -339,7 +352,7 @@ class ConformerAudioModel(MmprojModel):
             bias = self._batch_norm_tensors[bid][f"conformer.layers.{bid}.conv.batch_norm.bias"]
             running_mean = self._batch_norm_tensors[bid][f"conformer.layers.{bid}.conv.batch_norm.running_mean"]
             running_var = self._batch_norm_tensors[bid][f"conformer.layers.{bid}.conv.batch_norm.running_var"]
-            eps = 1e-5 # default value
+            eps = 1e-5  # default value
 
             a = weight / torch.sqrt(running_var + eps)
             b = bias - running_mean * a
@@ -357,7 +370,9 @@ class ConformerAudioModel(MmprojModel):
             assert data_torch.shape[2] == 1
             data_torch = data_torch.reshape(data_torch.shape[0], data_torch.shape[1])
 
-        mapped_name = self.map_tensor_name(name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min"))
+        mapped_name = self.map_tensor_name(
+            name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min")
+        )
         yield (mapped_name, data_torch)
 
 
@@ -371,44 +386,44 @@ class Gemma3nVisionAudioModel(ConformerAudioModel):
     # Double indexed mapping for MobileNetV5 blocks (not supported by tensor_mapping.py)
     # This is the only known model having this, so we prefer implementing it outside of tensor_mapping.py
     block_tensor_mapping = {
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.conv_exp.weight":             "v.blk.{bid}.{sid}.conv_exp.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.bn1.weight":                  "v.blk.{bid}.{sid}.bn1.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.conv_pwl.weight":             "v.blk.{bid}.{sid}.conv_pwl.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.bn2.weight":                  "v.blk.{bid}.{sid}.bn2.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_start.conv.weight":        "v.blk.{bid}.{sid}.dw_start.conv.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_start.bn.weight":          "v.blk.{bid}.{sid}.dw_start.bn.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_mid.conv.weight":          "v.blk.{bid}.{sid}.dw_mid.conv.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_mid.bn.weight":            "v.blk.{bid}.{sid}.dw_mid.bn.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_exp.conv.weight":          "v.blk.{bid}.{sid}.pw_exp.conv.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_exp.bn.weight":            "v.blk.{bid}.{sid}.pw_exp.bn.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_proj.conv.weight":         "v.blk.{bid}.{sid}.pw_proj.conv.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_proj.bn.weight":           "v.blk.{bid}.{sid}.pw_proj.bn.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.layer_scale.gamma":           "v.blk.{bid}.{sid}.layer_scale.gamma",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.query.proj.weight":      "v.blk.{bid}.{sid}.attn.query.proj.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.key.proj.weight":        "v.blk.{bid}.{sid}.attn.key.proj.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.value.proj.weight":      "v.blk.{bid}.{sid}.attn.value.proj.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.output.proj.weight":     "v.blk.{bid}.{sid}.attn.output.proj.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.key.down_conv.weight":   "v.blk.{bid}.{sid}.attn.key.down_conv.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.key.norm.weight":        "v.blk.{bid}.{sid}.attn.key.norm.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.conv_exp.weight": "v.blk.{bid}.{sid}.conv_exp.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.bn1.weight": "v.blk.{bid}.{sid}.bn1.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.conv_pwl.weight": "v.blk.{bid}.{sid}.conv_pwl.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.bn2.weight": "v.blk.{bid}.{sid}.bn2.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_start.conv.weight": "v.blk.{bid}.{sid}.dw_start.conv.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_start.bn.weight": "v.blk.{bid}.{sid}.dw_start.bn.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_mid.conv.weight": "v.blk.{bid}.{sid}.dw_mid.conv.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.dw_mid.bn.weight": "v.blk.{bid}.{sid}.dw_mid.bn.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_exp.conv.weight": "v.blk.{bid}.{sid}.pw_exp.conv.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_exp.bn.weight": "v.blk.{bid}.{sid}.pw_exp.bn.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_proj.conv.weight": "v.blk.{bid}.{sid}.pw_proj.conv.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.pw_proj.bn.weight": "v.blk.{bid}.{sid}.pw_proj.bn.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.layer_scale.gamma": "v.blk.{bid}.{sid}.layer_scale.gamma",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.query.proj.weight": "v.blk.{bid}.{sid}.attn.query.proj.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.key.proj.weight": "v.blk.{bid}.{sid}.attn.key.proj.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.value.proj.weight": "v.blk.{bid}.{sid}.attn.value.proj.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.output.proj.weight": "v.blk.{bid}.{sid}.attn.output.proj.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.key.down_conv.weight": "v.blk.{bid}.{sid}.attn.key.down_conv.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.key.norm.weight": "v.blk.{bid}.{sid}.attn.key.norm.weight",
         "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.value.down_conv.weight": "v.blk.{bid}.{sid}.attn.value.down_conv.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.value.norm.weight":      "v.blk.{bid}.{sid}.attn.value.norm.weight",
-        "model.vision_tower.timm_model.blocks.{bid}.{sid}.norm.weight":                 "v.blk.{bid}.{sid}.norm.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.attn.value.norm.weight": "v.blk.{bid}.{sid}.attn.value.norm.weight",
+        "model.vision_tower.timm_model.blocks.{bid}.{sid}.norm.weight": "v.blk.{bid}.{sid}.norm.weight",
     }
 
     def __init__(self, *args, **kwargs):
         # Parent init will call find_hparam which now returns 0 for empty keys
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
-        self.hparams_vision["n_layers"] = 128 # fake value for audio encoder, vision encoder doesn't use it
+        self.hparams_vision["n_layers"] = 128  # fake value for audio encoder, vision encoder doesn't use it
         self.hparams_vision["intermediate_size"] = self.hparams_vision.get("intermediate_size", 2048) * 4
         self.hparams_vision["num_attention_heads"] = self.hparams_vision.get("num_attention_heads", 8)
 
         # MobileNetV5 does not use image_mean/std
-        self.preprocessor_config["image_mean"] = [0.0 ,0.0 , 0.0]
-        self.preprocessor_config["image_std"] = [1.0 ,1.0 ,1.0]
-        self.hparams_vision["image_size"] = self.preprocessor_config.get(
-            "size", {"height": 768, "width": 768}
-        )["height"]
+        self.preprocessor_config["image_mean"] = [0.0, 0.0, 0.0]
+        self.preprocessor_config["image_std"] = [1.0, 1.0, 1.0]
+        self.hparams_vision["image_size"] = self.preprocessor_config.get("size", {"height": 768, "width": 768})[
+            "height"
+        ]
 
         # Image sequence length (256 tokens = 16x16 for Gemma3n)
         image_seq_length = self.preprocessor_config.get("image_seq_length", 256)
@@ -457,7 +472,7 @@ class Gemma3nVisionAudioModel(ConformerAudioModel):
         raise ValueError(f"Unknown name: {name}")
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if (ConformerAudioModel.is_audio_tensor(name)):
+        if ConformerAudioModel.is_audio_tensor(name):
             name = name.replace("model.audio_tower.conformer.", "conformer.layers.")
             yield from super().modify_tensors(data_torch, name, bid)
 
@@ -477,7 +492,7 @@ class Gemma3nVisionAudioModel(ConformerAudioModel):
             new_name = self.map_tensor_name(name)
 
         if new_name.endswith("conv_stem.conv.bias") or new_name.endswith("layer_scale.gamma"):
-            data_torch = data_torch.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [1, C, 1, 1]
+            data_torch = data_torch.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  # [1, C, 1, 1]
 
         yield from ModelBase.modify_tensors(self, data_torch, new_name, bid)
 
@@ -495,19 +510,19 @@ class Gemma3NModel(Gemma3Model):
         super().__init__(*args, **kwargs)
         assert self.hparams["altup_num_inputs"] == 4, "Current conversion only supports 4 altup inputs"
         self._altup_proj = [
-            torch.Tensor(), # to be replaced
-            torch.Tensor(), # to be replaced
-            torch.Tensor(), # to be replaced
+            torch.Tensor(),  # to be replaced
+            torch.Tensor(),  # to be replaced
+            torch.Tensor(),  # to be replaced
         ]
         self._altup_unembd = [
-            torch.Tensor(), # to be replaced
-            torch.Tensor(), # to be replaced
-            torch.Tensor(), # to be replaced
+            torch.Tensor(),  # to be replaced
+            torch.Tensor(),  # to be replaced
+            torch.Tensor(),  # to be replaced
         ]
 
     def norm_shift(self, name: str) -> float:
         del name
-        return 0.0 # same value with Gemma3p5RMSNorm scale_shift on python code
+        return 0.0  # same value with Gemma3p5RMSNorm scale_shift on python code
 
     def set_vocab(self):
         # For Gemma3n multimodal models, we need the FULL vocab_size (262400)
@@ -579,10 +594,14 @@ class Gemma3NModel(Gemma3Model):
                 # Pad with zeros for vision/audio tokens (they get embeddings from vision tower)
                 padding_size = vocab_size - current_size
                 tensor_type = "per-layer embeddings" if "per_layer" in name else "token embeddings"
-                logger.info(f"Padding {tensor_type} shape {list(data_torch.shape)} from {current_size} to {vocab_size} (adding {padding_size} vision/audio token slots)")
+                logger.info(
+                    f"Padding {tensor_type} shape {list(data_torch.shape)} from {current_size} to {vocab_size} (adding {padding_size} vision/audio token slots)"
+                )
 
                 # Create padding with zeros (vision tokens won't use these embeddings)
-                padding = torch.zeros((padding_size, data_torch.shape[1]), dtype=data_torch.dtype, device=data_torch.device)
+                padding = torch.zeros(
+                    (padding_size, data_torch.shape[1]), dtype=data_torch.dtype, device=data_torch.device
+                )
                 data_torch = torch.cat([data_torch, padding], dim=0)
 
             # Continue with normal processing
@@ -634,7 +653,7 @@ class Gemma4Model(Gemma3Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4
 
     def norm_shift(self, name: str) -> float:
-        del name # unused
+        del name  # unused
         return 0.0
 
     def set_vocab(self):
@@ -642,7 +661,15 @@ class Gemma4Model(Gemma3Model):
         tokens = []
         scores = []
         toktypes = []
-        visible_tokens = {"<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>", "<|\"|>"}
+        visible_tokens = {
+            "<|channel>",
+            "<channel|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            '<|"|>',
+        }
 
         for text, score, toktype in vocab.all_tokens():
             tokens.append(text)
@@ -711,7 +738,9 @@ class Gemma4Model(Gemma3Model):
             n_ff_arr = [n_ff if il < first_kv_shared_layer_idx else n_ff * 2 for il in range(self.block_count)]
             self.gguf_writer.add_feed_forward_length(n_ff_arr)
 
-        if (num_key_value_heads_full := self.hparams.get("num_global_key_value_heads")) is None and per_layer_config is not None:
+        if (
+            num_key_value_heads_full := self.hparams.get("num_global_key_value_heads")
+        ) is None and per_layer_config is not None:
             for layer_idx, layer_config in per_layer_config.items():
                 layer_idx = int(layer_idx)
                 if layer_idx < len(layer_types):
@@ -726,7 +755,7 @@ class Gemma4Model(Gemma3Model):
 
         # handle n_rot differently for global vs swa layers
         partial_rotary_factor_swa = self.rope_parameters.get("partial_rotary_factor", 1.0)
-        n_rot_full = int(head_dim_full) # "proportional" is used, see generate_extra_tensors
+        n_rot_full = int(head_dim_full)  # "proportional" is used, see generate_extra_tensors
         n_rot_swa = int(head_dim_swa * partial_rotary_factor_swa)
         self.gguf_writer.add_rope_dimension_count(n_rot_full)
         self.gguf_writer.add_rope_dimension_count_swa(n_rot_swa)
@@ -831,7 +860,9 @@ class Gemma4UnifiedModel(Gemma4Model):
 
 
 @ModelBase.register("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
-@ModelBase.example("google/gemma-4-31B-it-assistant", "google/gemma-4-26B-A4B-it-assistant", "google/gemma-4-E2B-it-assistant")
+@ModelBase.example(
+    "google/gemma-4-31B-it-assistant", "google/gemma-4-26B-A4B-it-assistant", "google/gemma-4-E2B-it-assistant"
+)
 class Gemma4AssistantModel(Gemma4Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
 
@@ -860,7 +891,7 @@ class Gemma4VisionAudioModel(MmprojModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
-        self.hparams_vision["image_size"] = 224 # unused, but set to avoid error
+        self.hparams_vision["image_size"] = 224  # unused, but set to avoid error
 
         # remap audio hparams
         if self.hparams_audio:
@@ -897,7 +928,7 @@ class Gemma4VisionAudioModel(MmprojModel):
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        del bid # unused
+        del bid  # unused
 
         if len(data_torch.shape) == 0:
             # convert scalar tensors (input/output_mix/max) to 1D tensors
@@ -913,7 +944,9 @@ class Gemma4VisionAudioModel(MmprojModel):
             if "lconv1d.depthwise_conv1d" in name and name.endswith(".weight"):
                 assert data_torch.shape[1] == 1
                 data_torch = data_torch.reshape(data_torch.shape[0], data_torch.shape[2])
-            mapped_name = self.map_tensor_name(name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min"))
+            mapped_name = self.map_tensor_name(
+                name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min")
+            )
             yield (mapped_name, data_torch)
 
         else:
@@ -926,7 +959,9 @@ class Gemma4VisionAudioModel(MmprojModel):
                 patch_size = int((ksize_sq_c // 3) ** 0.5)
                 data_torch = data_torch.reshape(n_embd, patch_size, patch_size, 3)
                 data_torch = data_torch.permute(0, 3, 1, 2).contiguous()
-            mapped_name = self.map_tensor_name(name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min"))
+            mapped_name = self.map_tensor_name(
+                name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min")
+            )
             yield (mapped_name, data_torch)
 
 
@@ -972,7 +1007,7 @@ class Gemma4UnifiedVisionAudioModel(Gemma4VisionAudioModel):
             else:
                 p = self.hparams_vision["patch_size"] * self.hparams_vision["pooling_kernel_size"]
             i = torch.arange(p * p * 3)
-            ch  = i // (p * p)
+            ch = i // (p * p)
             row = (i % (p * p)) // p
             col = i % p
             # perm[i] = HWC column index for CHW position i
@@ -986,7 +1021,7 @@ class Gemma4UnifiedVisionAudioModel(Gemma4VisionAudioModel):
             else:
                 p = self.hparams_vision["patch_size"] * self.hparams_vision["pooling_kernel_size"]
             i = torch.arange(p * p * 3)
-            ch  = i // (p * p)
+            ch = i // (p * p)
             row = (i % (p * p)) // p
             col = i % p
             # perm[i] = HWC index for CHW position i

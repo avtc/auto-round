@@ -31,4 +31,4 @@ class Sarashina2VLTextModel(LlamaModel):
 class Sarashina2VLVisionModel(Qwen2VLVisionModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.global_config['model_type'] = "qwen2_vl"
+        self.global_config["model_type"] = "qwen2_vl"

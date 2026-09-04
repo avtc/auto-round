@@ -22,7 +22,7 @@ class Ernie4_5Model(TextModel):
     def set_vocab(self):
         self._set_vocab_sentencepiece()
 
-        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
         if tokenizer_config_file.is_file():
             with open(tokenizer_config_file, "r", encoding="utf-8") as f:
                 tokenizer_config_json = json.load(f)
@@ -56,7 +56,9 @@ class Ernie4_5Model(TextModel):
             total_q_dim = num_heads * head_dim
             total_k_dim = num_kv_heads * head_dim
             total_v_dim = num_kv_heads * head_dim
-            q_proj_weight, k_proj_weight, v_proj_weight = data_torch.split([total_q_dim, total_k_dim, total_v_dim], dim=0)
+            q_proj_weight, k_proj_weight, v_proj_weight = data_torch.split(
+                [total_q_dim, total_k_dim, total_v_dim], dim=0
+            )
             yield from super().modify_tensors(q_proj_weight, name_q, bid)
             yield from super().modify_tensors(k_proj_weight, name_k, bid)
             yield from super().modify_tensors(v_proj_weight, name_v, bid)
@@ -91,10 +93,16 @@ class Ernie4_5MoeModel(Ernie4_5Model):
         self.gguf_writer.add_leading_dense_block_count(self.hparams["moe_layer_start_index"])
         if (moe_intermediate_size := self.hparams.get("moe_intermediate_size")) is not None:
             self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
-        if (shared_expert_count := self.hparams.get('moe_num_shared_experts')) is not None:
+        if (shared_expert_count := self.hparams.get("moe_num_shared_experts")) is not None:
             self.gguf_writer.add_expert_shared_count(shared_expert_count)
-            if shared_expert_count > 0 and (shared_expert_intermediate_size := self.hparams.get('intermediate_size')) is not None and (num_key_value_heads := self.hparams.get('num_key_value_heads')) is not None:
-                self.gguf_writer.add_expert_shared_feed_forward_length(shared_expert_intermediate_size // num_key_value_heads)
+            if (
+                shared_expert_count > 0
+                and (shared_expert_intermediate_size := self.hparams.get("intermediate_size")) is not None
+                and (num_key_value_heads := self.hparams.get("num_key_value_heads")) is not None
+            ):
+                self.gguf_writer.add_expert_shared_feed_forward_length(
+                    shared_expert_intermediate_size // num_key_value_heads
+                )
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

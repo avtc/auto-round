@@ -252,15 +252,20 @@ def pack_layer(name, model, device=None):
 
 
 @torch.no_grad()
-def _restore_packed_modules_from_shards(model, output_dir: str) -> int:
+def _restore_packed_modules_from_shards(model, output_dir: str, metadata_only: bool = False) -> int:
     """Rebuild packed-module state from already-written output shards.
 
-    A resumed streaming session skips blocks that a previous run already
-    packed and wrote: their modules stay fresh (bits set, but no scale or
-    compressed state) because the packed tensors live in the output shards,
-    not in memory. Re-attach the packed attributes and mark the modules
-    compressed so packing is a no-op and the quantization config derives
-    exactly as it would in the session that did the work.
+    A resumed streaming session skips blocks a previous run already packed
+    and wrote: their modules stay fresh (bits set, but no scale or compressed
+    state) because the packed tensors live in the output shards, not in
+    memory. Re-attach the packed attributes and mark the modules compressed
+    so packing is a no-op and the quantization config derives exactly as it
+    would in the session that did the work.
+
+    ``metadata_only`` (immediate-saving runs, whose weights stay in the
+    shards) restores just the scheme and status: the packed tensors
+    themselves would never be consumed downstream - loading them would
+    materialize the whole model's packed weights in host RAM for nothing.
     """
     import json
     import os
@@ -268,14 +273,22 @@ def _restore_packed_modules_from_shards(model, output_dir: str) -> int:
     from compressed_tensors.quantization import QuantizationStatus  # pylint: disable=E0401
     from safetensors import safe_open
 
+    # Prefer the shard index (pure JSON): scanning headers mmaps every shard
+    # transiently, which on memory-tight hosts can fail outright.
     shards = {}
-    for fn in os.listdir(output_dir or ""):
-        if not fn.endswith(".safetensors"):
-            continue
-        path = os.path.join(output_dir, fn)
-        with safe_open(path, framework="pt") as h:
-            for k in h.keys():
-                shards.setdefault(k, path)
+    index_path = os.path.join(output_dir or "", "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = (json.load(f) or {}).get("weight_map", {})
+        shards = {k: os.path.join(output_dir, v) for k, v in weight_map.items()}
+    if not shards:
+        for fn in os.listdir(output_dir or ""):
+            if not fn.endswith(".safetensors"):
+                continue
+            path = os.path.join(output_dir, fn)
+            with safe_open(path, framework="pt") as h:
+                for k in h.keys():
+                    shards.setdefault(k, path)
     if not shards:
         return 0
 
@@ -286,6 +299,11 @@ def _restore_packed_modules_from_shards(model, output_dir: str) -> int:
         if getattr(layer, "quantization_status", None) is not None or hasattr(layer, "scale"):
             continue
         if f"{name}.weight_packed" not in shards:
+            continue
+        if metadata_only:
+            layer.quantization_scheme = construct_ct_scheme(layer)
+            layer.quantization_status = QuantizationStatus.COMPRESSED
+            restored += 1
             continue
         attrs = {}
         for suffix in ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point"):
@@ -305,7 +323,11 @@ def _restore_packed_modules_from_shards(model, output_dir: str) -> int:
                 setattr(layer, suffix, tensor)
         restored += 1
     if restored:
-        logger.info("restored packed state for %d module(s) from existing output shards (resumed blocks)", restored)
+        logger.info(
+            "restored packed state for %d module(s) from existing output shards%s",
+            restored,
+            " (metadata only)" if metadata_only else " (resumed blocks)",
+        )
     return restored
 
 
@@ -359,7 +381,9 @@ def save_quantized_as_llmcompressor(
 
     # a resumed streaming session skipped blocks already packed and written
     # by an earlier run; rebuild their packed-module state from the shards
-    _restore_packed_modules_from_shards(model, output_dir)
+    # (metadata only: the weights stay durably in the shards under immediate
+    # saving and would never be consumed from memory)
+    _restore_packed_modules_from_shards(model, output_dir, metadata_only=immediate_saving)
 
     # generate q_weight
     device = get_major_device(device)

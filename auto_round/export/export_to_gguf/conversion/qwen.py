@@ -21,8 +21,9 @@ class QwenModel(TextModel):
     @staticmethod
     def token_bytes_to_string(b):
         from transformers.convert_slow_tokenizer import bytes_to_unicode
+
         byte_encoder = bytes_to_unicode()
-        return ''.join([byte_encoder[ord(char)] for char in b.decode('latin-1')])
+        return "".join([byte_encoder[ord(char)] for char in b.decode("latin-1")])
 
     @staticmethod
     def bpe(mergeable_ranks: dict[bytes, int], token: bytes, max_rank: int | None = None) -> list[bytes]:
@@ -38,7 +39,7 @@ class QwenModel(TextModel):
             if min_rank is None or (max_rank is not None and min_rank >= max_rank):
                 break
             assert min_idx is not None
-            parts = parts[:min_idx] + [parts[min_idx] + parts[min_idx + 1]] + parts[min_idx + 2:]
+            parts = parts[:min_idx] + [parts[min_idx] + parts[min_idx + 1]] + parts[min_idx + 2 :]
         return parts
 
     def set_vocab(self):
@@ -83,7 +84,7 @@ class Qwen2MoeModel(TextModel):
         if (moe_intermediate_size := self.hparams.get("moe_intermediate_size")) is not None:
             self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
             logger.info(f"gguf: expert feed forward length = {moe_intermediate_size}")
-        if (shared_expert_intermediate_size := self.hparams.get('shared_expert_intermediate_size')) is not None:
+        if (shared_expert_intermediate_size := self.hparams.get("shared_expert_intermediate_size")) is not None:
             self.gguf_writer.add_expert_shared_feed_forward_length(shared_expert_intermediate_size)
             logger.info(f"gguf: expert shared feed forward length = {shared_expert_intermediate_size}")
 
@@ -172,7 +173,7 @@ class Qwen3Model(Qwen2Model):
 
         # track for intern-s1-mini
         hparams = ModelBase.load_hparams(self.dir_model, is_mistral_format=False)
-        self.origin_hf_arch = hparams.get('architectures', [None])[0]
+        self.origin_hf_arch = hparams.get("architectures", [None])[0]
 
         if self._is_qwen3_reranker():
             self._find_rerank_config()
@@ -202,7 +203,7 @@ class Qwen3Model(Qwen2Model):
 
     def set_vocab(self):
         # deal with intern-s1-mini
-        if self.origin_hf_arch == 'InternS1ForConditionalGeneration':
+        if self.origin_hf_arch == "InternS1ForConditionalGeneration":
             self._set_vocab_interns1()
             return
 
@@ -210,12 +211,17 @@ class Qwen3Model(Qwen2Model):
 
     def _find_rerank_config(self):
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
 
         self.is_rerank = True
         self.is_tied_embeddings = self.hparams.get("tie_word_embeddings", False)
-        self.token_false_id = tokenizer.convert_tokens_to_ids("no")  # ty: ignore[unresolved-attribute, invalid-assignment]
-        self.token_true_id = tokenizer.convert_tokens_to_ids("yes")  # ty: ignore[unresolved-attribute, invalid-assignment]
+        self.token_false_id = tokenizer.convert_tokens_to_ids(
+            "no"
+        )  # ty: ignore[unresolved-attribute, invalid-assignment]
+        self.token_true_id = tokenizer.convert_tokens_to_ids(
+            "yes"
+        )  # ty: ignore[unresolved-attribute, invalid-assignment]
         self.sep_token_id = tokenizer.convert_tokens_to_ids("|")  # ty: ignore[unresolved-attribute]
 
         assert self.token_false_id is not None and self.token_true_id is not None
@@ -225,12 +231,16 @@ class Qwen3Model(Qwen2Model):
         if self.is_rerank:
             self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
             self.gguf_writer.add_classifier_output_labels(["yes", "no"])
-            self.gguf_writer.add_chat_template([{
-                "name": "rerank",
-                "template": "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n"
-                            "<|im_start|>user\n<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n<Query>: {query}\n<Document>: {document}<|im_end|>\n"
-                            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-            }])
+            self.gguf_writer.add_chat_template(
+                [
+                    {
+                        "name": "rerank",
+                        "template": '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n'
+                        "<|im_start|>user\n<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n<Query>: {query}\n<Document>: {document}<|im_end|>\n"
+                        "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    }
+                ]
+            )
 
     def _get_cls_out_tensor(self, data_torch: Tensor) -> Tensor:
         # extract "yes" and "no" tokens from the output lm_head tensor
@@ -263,11 +273,11 @@ class Qwen3MoeModel(Qwen2MoeModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         hparams = ModelBase.load_hparams(self.dir_model, False)
-        self.origin_hf_arch = hparams.get('architectures', [None])[0]
+        self.origin_hf_arch = hparams.get("architectures", [None])[0]
 
     def set_vocab(self):
         # deal with intern-s1
-        if self.origin_hf_arch == 'InternS1ForConditionalGeneration':
+        if self.origin_hf_arch == "InternS1ForConditionalGeneration":
             self._set_vocab_interns1()
             return
 
@@ -325,10 +335,10 @@ class _QwenMtpMixin:
             if cls.no_mtp:
                 return None
             remapper = {
-                "fc":                    "eh_proj",
+                "fc": "eh_proj",
                 "pre_fc_norm_embedding": "enorm",
-                "pre_fc_norm_hidden":    "hnorm",
-                "norm":                  "shared_head.norm",
+                "pre_fc_norm_hidden": "hnorm",
+                "norm": "shared_head.norm",
             }
             parts = name.split(".", 3)
             if len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
@@ -339,8 +349,11 @@ class _QwenMtpMixin:
                 name = f"model.layers.{cls._original_block_count}.{remapper[parts[1]]}.{parts[2]}"
         elif cls.mtp_only:
             keep = name in (
-                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-                "embed_tokens.weight", "norm.weight",
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+                "embed_tokens.weight",
+                "norm.weight",
             )
             if not keep:
                 return None
@@ -360,10 +373,18 @@ class _QwenMtpMixin:
         if not self.mtp_only or not from_dir:
             return
 
-        output_type: str = self.ftype.name.partition("_")[2]  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        output_type: str = self.ftype.name.partition("_")[
+            2
+        ]  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
         fname_default: str = gguf.naming_convention(
-            self.metadata.name, self.metadata.basename, self.metadata.finetune,                  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
-            self.metadata.version, size_label=None, output_type=output_type, model_type=None)    # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+            self.metadata.name,
+            self.metadata.basename,
+            self.metadata.finetune,  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+            self.metadata.version,
+            size_label=None,
+            output_type=output_type,
+            model_type=None,
+        )  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
         self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
 
@@ -378,11 +399,15 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
         self.gguf_writer.add_ssm_state_size(self.hparams["linear_key_head_dim"])
         self.gguf_writer.add_ssm_group_count(self.hparams["linear_num_key_heads"])
         self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
-        self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
+        self.gguf_writer.add_ssm_inner_size(
+            self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"]
+        )
         self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
         if (rope_dim := self.hparams.get("head_dim")) is None:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
-        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.25)))
+        self.gguf_writer.add_rope_dimension_count(
+            int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.25))
+        )
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.endswith(".A_log"):
@@ -403,10 +428,10 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
             num_k_heads = self.hparams["linear_num_key_heads"]
             hidden_size = self.hparams["hidden_size"]
             split_arg_list_qkvz = [
-                head_k_dim, # q partition
-                head_k_dim, # k partition
-                (num_v_heads // num_k_heads * head_v_dim), # v partition
-                (num_v_heads // num_k_heads * head_v_dim), # z partition
+                head_k_dim,  # q partition
+                head_k_dim,  # k partition
+                (num_v_heads // num_k_heads * head_v_dim),  # v partition
+                (num_v_heads // num_k_heads * head_v_dim),  # z partition
             ]
             # view as (n_embd, head_count, [q+k+v+z])
             data_torch = data_torch.permute(1, 0).contiguous()
@@ -421,7 +446,7 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
             # stack back
             qkv = torch.cat([q, k, v], dim=-1).permute(1, 0).contiguous()
             z = z.permute(1, 0).contiguous()
-            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV,  bid, ".weight"), qkv)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV, bid, ".weight"), qkv)
             yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_GATE, bid, ".weight"), z)
         else:
             yield from super().modify_tensors(data_torch, name, bid)
@@ -462,20 +487,22 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         shape = list(tensor.shape)
         if dim < 0:
             dim += len(shape)
-        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
+        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1 :]
         tensor = tensor.reshape(*new_shape)
         perm = list(range(len(new_shape)))
         perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
         return tensor.permute(*perm).contiguous().reshape(*shape)
 
     def _transform_nvfp4_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
-        if not name.endswith((
-            ".linear_attn.in_proj_qkv.weight",
-            ".linear_attn.in_proj_z.weight",
-            ".linear_attn.in_proj_a.weight",
-            ".linear_attn.in_proj_b.weight",
-            ".linear_attn.out_proj.weight",
-        )):
+        if not name.endswith(
+            (
+                ".linear_attn.in_proj_qkv.weight",
+                ".linear_attn.in_proj_z.weight",
+                ".linear_attn.in_proj_a.weight",
+                ".linear_attn.in_proj_b.weight",
+                ".linear_attn.out_proj.weight",
+            )
+        ):
             return weight, scale
 
         num_k_heads = self.hparams["linear_num_key_heads"]
@@ -523,7 +550,10 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         def reorder_rows(qs: Tensor, scales: Tensor, head_dim: int) -> tuple[Tensor, Tensor]:
             row_perm = self._reorder_v_heads(
                 torch.arange(num_v_heads * head_dim, dtype=torch.long).unsqueeze(-1),
-                0, num_k_heads, num_v_per_k, head_dim,
+                0,
+                num_k_heads,
+                num_v_per_k,
+                head_dim,
             ).squeeze(-1)
             return (
                 qs.index_select(0, row_perm.to(device=qs.device)),
@@ -534,11 +564,11 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
             q_dim = head_k_dim * num_k_heads
             k_dim = head_k_dim * num_k_heads
             q = weight[:q_dim]
-            k = weight[q_dim:q_dim + k_dim]
-            v = weight[q_dim + k_dim:]
+            k = weight[q_dim : q_dim + k_dim]
+            v = weight[q_dim + k_dim :]
             q_scale = scale[:q_dim]
-            k_scale = scale[q_dim:q_dim + k_dim]
-            v_scale = scale[q_dim + k_dim:]
+            k_scale = scale[q_dim : q_dim + k_dim]
+            v_scale = scale[q_dim + k_dim :]
             v, v_scale = reorder_rows(v, v_scale, head_v_dim)
             return torch.cat([q, k, v], dim=0), torch.cat([q_scale, k_scale, v_scale], dim=0)
 
@@ -549,7 +579,10 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         elif name.endswith(".linear_attn.out_proj.weight"):
             col_perm = self._reorder_v_heads(
                 torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
-                1, num_k_heads, num_v_per_k, head_v_dim,
+                1,
+                num_k_heads,
+                num_v_per_k,
+                head_v_dim,
             ).squeeze(0)
             weight, scale = apply_col_perm(weight, scale, col_perm)
 
@@ -573,8 +606,8 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 q_dim = head_k_dim * num_k_heads
                 k_dim = head_k_dim * num_k_heads
                 q = data_torch[:q_dim]
-                k = data_torch[q_dim:q_dim + k_dim]
-                v = data_torch[q_dim + k_dim:]
+                k = data_torch[q_dim : q_dim + k_dim]
+                v = data_torch[q_dim + k_dim :]
                 v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
                 data_torch = torch.cat([q, k, v], dim=0)
 
@@ -657,6 +690,7 @@ class DFlashModel(Qwen3Model):
         # Reuse the target model's own vocab handler (e.g. Gemma-4 needs its
         # own tokenizer logic, not the Qwen default).
         from . import get_model_class
+
         with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
             target_hparams = json.load(f)
             target_arch = target_hparams["architectures"][0]
@@ -723,7 +757,8 @@ class DSparkModel(DFlashModel):
         # EAGLE3-style exports use the 1+N bonus-anchor block, DFlash-lineage exports sample from the anchor
         self._sample_from_anchor = hparams.get(
             "sample_from_anchor",
-            "transformer_layer_config" not in hparams and "aux_hidden_state_layer_ids" not in hparams)
+            "transformer_layer_config" not in hparams and "aux_hidden_state_layer_ids" not in hparams,
+        )
         if "transformer_layer_config" in hparams:
             hparams = {**hparams, **hparams["transformer_layer_config"]}
 
@@ -731,14 +766,18 @@ class DSparkModel(DFlashModel):
 
         # normalize both schemas to DFlash's nested dflash_config
         if "aux_hidden_state_layer_ids" in self.hparams:
-            self.hparams.setdefault("dflash_config", {
-                "mask_token_id": self.hparams.get("mask_token_id"),
-                "target_layer_ids": [i - 1 for i in self.hparams["aux_hidden_state_layer_ids"]],
-            })
+            self.hparams.setdefault(
+                "dflash_config",
+                {
+                    "mask_token_id": self.hparams.get("mask_token_id"),
+                    "target_layer_ids": [i - 1 for i in self.hparams["aux_hidden_state_layer_ids"]],
+                },
+            )
         else:
-            self.hparams.setdefault("dflash_config", {
-                k: self.hparams[k] for k in ("target_layer_ids", "mask_token_id") if k in self.hparams
-            })
+            self.hparams.setdefault(
+                "dflash_config",
+                {k: self.hparams[k] for k in ("target_layer_ids", "mask_token_id") if k in self.hparams},
+            )
 
         if (markov_head_type := self.hparams.get("markov_head_type", "vanilla")) != "vanilla":
             raise ValueError(f"unsupported markov_head_type {markov_head_type!r} (only 'vanilla' is supported)")
@@ -764,7 +803,9 @@ class DSparkModel(DFlashModel):
             self._d2t = data_torch
             return
 
-        if self._n_vocab_draft == self.hparams["vocab_size"] and name.endswith(("embed_tokens.weight", "lm_head.weight")):
+        if self._n_vocab_draft == self.hparams["vocab_size"] and name.endswith(
+            ("embed_tokens.weight", "lm_head.weight")
+        ):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)

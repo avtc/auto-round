@@ -2365,20 +2365,27 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
     )
 
     missing, replaced = [], 0
+    renames_rev = {}
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type:
+        from auto_round.utils.checkpoint_streamer import reverse_name_map
+
+        renames_rev = reverse_name_map(model_type, weight_map)
     for n in meta_names:
         if quantized_prefixes and n.startswith(quantized_prefixes):
             # packed in shards already; packers must see it meta. These are
             # also no "missing" tensors: their meta placeholders (packed
             # attrs included) are the designed post-pack state.
             continue
-        shard = weight_map.get(n)
+        key = n if n in weight_map else renames_rev.get(n)
         owner = owners.get(n)
-        if shard is None or owner is None:
+        if key is None or owner is None:
             missing.append(n)
             continue
+        shard = weight_map[key]
         mod, kind, leaf = owner
         with safe_open(os.path.join(ckpt_dir, shard), framework="pt") as f:
-            t = f.get_tensor(n)
+            t = f.get_tensor(key)
         old = mod._parameters[leaf] if kind == "param" else mod._buffers[leaf]
         if kind == "param":
             mod._parameters[leaf] = torch.nn.Parameter(t, requires_grad=bool(old.requires_grad))

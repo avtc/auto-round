@@ -13,8 +13,8 @@ from .llama import LlamaModel
 
 
 @ModelBase.register(
-    "LlavaForConditionalGeneration", # pixtral
-    "Mistral3ForConditionalGeneration", # mistral small 3.1
+    "LlavaForConditionalGeneration",  # pixtral
+    "Mistral3ForConditionalGeneration",  # mistral small 3.1
 )
 @ModelBase.example("mistral-community/pixtral-12b", "mistralai/Mistral-Small-3.1-24B-Instruct-2503")
 class LlavaVisionModel(MmprojModel):
@@ -44,9 +44,9 @@ class LlavaVisionModel(MmprojModel):
         logger.info(f"Image break token id: {self.img_break_tok_id}")
 
     def get_token_id(self, token: str) -> int:
-        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
         with open(tokenizer_config_file, "r", encoding="utf-8") as f:
-            added_tokens_decoder = json.load(f).get('added_tokens_decoder') or {}
+            added_tokens_decoder = json.load(f).get("added_tokens_decoder") or {}
             for id_, token_data in added_tokens_decoder.items():
                 if token_data.get("content") == token:
                     return int(id_)
@@ -97,7 +97,9 @@ class LlavaVisionModel(MmprojModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         n_head = (
-            self.hparams["num_attention_heads"] if not self.is_mistral_format else self.find_vparam(["num_attention_heads"])
+            self.hparams["num_attention_heads"]
+            if not self.is_mistral_format
+            else self.find_vparam(["num_attention_heads"])
         )
         n_kv_head = n_head
 
@@ -127,4 +129,4 @@ class LlavaVisionModel(MmprojModel):
             name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_TOK_EMBD_IMG_BREAK]
             yield from super().modify_tensors(img_break_embd, name, bid)
 
-        return # skip other tensors
+        return  # skip other tensors

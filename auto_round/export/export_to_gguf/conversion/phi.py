@@ -43,25 +43,25 @@ class Phi3MiniModel(TextModel):
 
     def set_vocab(self):
         # Phi-4 model uses GPT2Tokenizer
-        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
         if tokenizer_config_file.is_file():
             with open(tokenizer_config_file, "r", encoding="utf-8") as f:
                 tokenizer_config_json = json.load(f)
-                tokenizer_class = tokenizer_config_json['tokenizer_class']
-                if tokenizer_class == 'GPT2Tokenizer':
+                tokenizer_class = tokenizer_config_json["tokenizer_class"]
+                if tokenizer_class == "GPT2Tokenizer":
                     return self._set_vocab_gpt2()
 
         from sentencepiece import SentencePieceProcessor
 
-        tokenizer_path = self.dir_model / 'tokenizer.model'
+        tokenizer_path = self.dir_model / "tokenizer.model"
 
         if not tokenizer_path.is_file():
-            raise ValueError(f'Error: Missing {tokenizer_path}')
+            raise ValueError(f"Error: Missing {tokenizer_path}")
 
         tokenizer = SentencePieceProcessor()
         tokenizer.LoadFromFile(str(tokenizer_path))
 
-        vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
+        vocab_size = self.hparams.get("vocab_size", tokenizer.vocab_size())
 
         tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
         scores: list[float] = [-10000.0] * vocab_size
@@ -87,7 +87,7 @@ class Phi3MiniModel(TextModel):
             scores[token_id] = score
             toktypes[token_id] = toktype
 
-        added_tokens_file = self.dir_model / 'added_tokens.json'
+        added_tokens_file = self.dir_model / "added_tokens.json"
         if added_tokens_file.is_file():
             with open(added_tokens_file, "r", encoding="utf-8") as f:
                 added_tokens_json = json.load(f)
@@ -95,14 +95,14 @@ class Phi3MiniModel(TextModel):
                 for key in added_tokens_json:
                     token_id = added_tokens_json[key]
                     if token_id >= vocab_size:
-                        logger.debug(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
+                        logger.debug(f"ignore token {token_id}: id is out of range, max={vocab_size - 1}")
                         continue
 
                     tokens[token_id] = key.encode("utf-8")
                     scores[token_id] = -1000.0
                     toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
 
-        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
         if tokenizer_config_file.is_file():
             with open(tokenizer_config_file, "r", encoding="utf-8") as f:
                 tokenizer_config_json = json.load(f)
@@ -112,14 +112,16 @@ class Phi3MiniModel(TextModel):
                     token = foken_data["content"].encode("utf-8")
                     if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
                         if tokens[token_id] != token:
-                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}')
+                            logger.warning(
+                                f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}'
+                            )
                     tokens[token_id] = token
                     scores[token_id] = -1000.0
                     toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
                     if foken_data.get("special"):
                         toktypes[token_id] = SentencePieceTokenTypes.CONTROL
 
-        tokenizer_file = self.dir_model / 'tokenizer.json'
+        tokenizer_file = self.dir_model / "tokenizer.json"
         if tokenizer_file.is_file():
             with open(tokenizer_file, "r", encoding="utf-8") as f:
                 tokenizer_json = json.load(f)
@@ -129,7 +131,9 @@ class Phi3MiniModel(TextModel):
                     token = foken_data["content"].encode("utf-8")
                     if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
                         if tokens[token_id] != token:
-                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}')
+                            logger.warning(
+                                f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}'
+                            )
                     tokens[token_id] = token
                     scores[token_id] = -1000.0
                     toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
@@ -164,7 +168,9 @@ class Phi3MiniModel(TextModel):
         self.gguf_writer.add_head_count_kv(n_head_kv)
         self.gguf_writer.add_layer_norm_rms_eps(rms_eps)
         self.gguf_writer.add_rope_dimension_count(rope_dims)
-        self.gguf_writer.add_rope_freq_base(self.rope_parameters.get("full_attention", self.rope_parameters)["rope_theta"])
+        self.gguf_writer.add_rope_freq_base(
+            self.rope_parameters.get("full_attention", self.rope_parameters)["rope_theta"]
+        )
         self.gguf_writer.add_file_type(self.ftype)
         sliding_window = self.hparams.get("sliding_window")
         # use zero value of sliding_window to distinguish Phi-4 from other PHI3 models
@@ -181,34 +187,42 @@ class Phi3MiniModel(TextModel):
         rope_dims = int(rot_pct * n_embd) // n_head
 
         # write rope scaling for long context (128k) model
-        long_factors = self.rope_parameters.get('long_factor')
-        short_factors = self.rope_parameters.get('short_factor')
+        long_factors = self.rope_parameters.get("long_factor")
+        short_factors = self.rope_parameters.get("short_factor")
         if not long_factors:
             return
 
         scale = max_pos_embds / orig_max_pos_embds
 
-        rope_scaling_type = self.rope_parameters.get('rope_type', '').lower()
+        rope_scaling_type = self.rope_parameters.get("rope_type", "").lower()
         if len(rope_scaling_type) == 0:
-            raise KeyError('Missing the required key rope_scaling.type')
+            raise KeyError("Missing the required key rope_scaling.type")
 
-        if rope_scaling_type == 'su' or rope_scaling_type == 'longrope':
+        if rope_scaling_type == "su" or rope_scaling_type == "longrope":
             attn_factor = math.sqrt(1 + math.log(scale) / math.log(orig_max_pos_embds)) if scale > 1.0 else 1.0
-        elif rope_scaling_type == 'yarn':
+        elif rope_scaling_type == "yarn":
             attn_factor = 0.1 * math.log(scale) + 1.0 if scale > 1.0 else 1.0
         else:
-            raise NotImplementedError(f'The rope scaling type {rope_scaling_type} is not supported yet')
+            raise NotImplementedError(f"The rope scaling type {rope_scaling_type} is not supported yet")
 
         self.gguf_writer.add_rope_scaling_attn_factors(attn_factor)
 
         if long_factors is None or short_factors is None:
-            raise KeyError('Missing the required key rope_scaling.long_factor or rope_scaling_short_factor')
+            raise KeyError("Missing the required key rope_scaling.long_factor or rope_scaling_short_factor")
 
         if len(long_factors) != len(short_factors) or len(long_factors) != rope_dims / 2:
-            raise ValueError(f'The length of rope long and short factors must be {rope_dims / 2}. long_factors = {len(long_factors)}, short_factors = {len(short_factors)}.')
+            raise ValueError(
+                f"The length of rope long and short factors must be {rope_dims / 2}. long_factors = {len(long_factors)}, short_factors = {len(short_factors)}."
+            )
 
-        yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG), torch.tensor(long_factors, dtype=torch.float32))
-        yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT), torch.tensor(short_factors, dtype=torch.float32))
+        yield (
+            self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG),
+            torch.tensor(long_factors, dtype=torch.float32),
+        )
+        yield (
+            self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT),
+            torch.tensor(short_factors, dtype=torch.float32),
+        )
 
 
 @ModelBase.register("Phi4ForCausalLMV")
@@ -245,10 +259,7 @@ class Phi4VisionMmprojModel(MmprojModel):
         self.hparams_vision["patch_size"] = patch_size
 
         pos_emb_name = next(
-            (
-                name for name in self.model_tensors
-                if name.endswith("vision_model.embeddings.position_embedding.weight")
-            ),
+            (name for name in self.model_tensors if name.endswith("vision_model.embeddings.position_embedding.weight")),
             None,
         )
         if pos_emb_name is None:

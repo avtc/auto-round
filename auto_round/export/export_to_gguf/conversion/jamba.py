@@ -24,13 +24,13 @@ class JambaModel(TextModel):
 
     def set_gguf_parameters(self):
         d_model = self.find_hparam(["hidden_size", "mamba_d_model"])
-        d_conv  = self.find_hparam(["mamba_d_conv"],  optional=True) or 4
+        d_conv = self.find_hparam(["mamba_d_conv"], optional=True) or 4
         d_inner = self.hparams["mamba_expand"] * d_model
         d_state = self.find_hparam(["mamba_d_state"], optional=True) or 16
         # ceiling division
         # ref: https://stackoverflow.com/a/17511341/22827863
         # ref: https://github.com/state-spaces/mamba/blob/ce59daea3a090d011d6476c6e5b97f6d58ddad8b/mamba_ssm/modules/mamba_simple.py#L58
-        dt_rank      = self.find_hparam(["mamba_dt_rank"], optional=True) or -(d_model // -16)
+        dt_rank = self.find_hparam(["mamba_dt_rank"], optional=True) or -(d_model // -16)
         rms_norm_eps = self.find_hparam(["layer_norm_epsilon", "rms_norm_eps"], optional=True) or 1e-6
         n_kv_head = self.hparams["num_key_value_heads"]
         attn_offset = self.hparams["attn_layer_offset"]

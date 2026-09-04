@@ -38,19 +38,19 @@ class JaisModel(TextModel):
 
         # Embeddings scale
         self.embeddings_scale = 1.0
-        if 'mup_embeddings_scale' in self.hparams:
-            self.embeddings_scale = self.hparams['mup_embeddings_scale']
-        elif 'embeddings_scale' in self.hparams:
-            self.embeddings_scale = self.hparams['embeddings_scale']
+        if "mup_embeddings_scale" in self.hparams:
+            self.embeddings_scale = self.hparams["mup_embeddings_scale"]
+        elif "embeddings_scale" in self.hparams:
+            self.embeddings_scale = self.hparams["embeddings_scale"]
         else:
             assert False
 
         self.width_scale = 1.0
-        if 'mup_output_alpha' in self.hparams:
-            assert 'mup_width_scale' in self.hparams
-            self.width_scale = self.hparams['mup_output_alpha'] * self.hparams['mup_width_scale']
-        elif 'width_scale' in self.hparams:
-            self.width_scale = self.hparams['width_scale']
+        if "mup_output_alpha" in self.hparams:
+            assert "mup_width_scale" in self.hparams
+            self.width_scale = self.hparams["mup_output_alpha"] * self.hparams["mup_width_scale"]
+        elif "width_scale" in self.hparams:
+            self.width_scale = self.hparams["width_scale"]
         else:
             assert False
 

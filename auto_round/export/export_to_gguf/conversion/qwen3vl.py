@@ -13,8 +13,15 @@ from .qwen import Qwen3Model, Qwen3MoeModel
 from .qwenvl import Qwen25AudioModel
 
 
-@ModelBase.register("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration")
-@ModelBase.example("Qwen/Qwen3-VL-4B-Instruct", "Qwen/Qwen3-VL-30B-A3B-Instruct", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-35B-A3B")
+@ModelBase.register(
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+)
+@ModelBase.example(
+    "Qwen/Qwen3-VL-4B-Instruct", "Qwen/Qwen3-VL-30B-A3B-Instruct", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-35B-A3B"
+)
 class Qwen3VLVisionModel(MmprojModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -225,11 +232,13 @@ class Qwen3ASRMmprojModel(Qwen3OmniMmprojModel):
     has_vision_encoder = False
 
 
-@ModelBase.register("Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration", "GlmOcrForConditionalGeneration")
+@ModelBase.register(
+    "Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration", "GlmOcrForConditionalGeneration"
+)
 @ModelBase.example("zai-org/GLM-4.1V-9B-Thinking", "zai-org/GLM-4.5V")
 class Glm4VVisionModel(Qwen3VLVisionModel):
     def set_gguf_parameters(self):
-        MmprojModel.set_gguf_parameters(self) # skip Qwen3VLVisionModel parameters
+        MmprojModel.set_gguf_parameters(self)  # skip Qwen3VLVisionModel parameters
         assert self.hparams_vision is not None
         self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.GLM4V)
 
@@ -310,7 +319,7 @@ class Qwen3VLMoeTextModel(Qwen3MoeModel):
             # Need PyTorch: (128, 768, 2048) [reversed of GGML]
             # So: permute(0, 2, 1): (128, 2048, 768) -> (128, 768, 2048)
             base_name = name.removesuffix(".weight")
-            base = base_name.rsplit('.', 1)[0]
+            base = base_name.rsplit(".", 1)[0]
             mapped_gate = f"{base}.gate_proj.weight"
             mapped_up = f"{base}.up_proj.weight"
             perm_gate = gate.permute(0, 2, 1).contiguous()
@@ -356,7 +365,9 @@ class Qwen3ASRTextModel(Qwen3VLTextModel):
     def set_vocab(self):
         super().set_vocab()
         # fix chat template, use correct chatml format
-        self.gguf_writer.add_chat_template("{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}")
+        self.gguf_writer.add_chat_template(
+            "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+        )
         # correct BOS/EOS tokens
         with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
             tokenizer_config = json.load(f)

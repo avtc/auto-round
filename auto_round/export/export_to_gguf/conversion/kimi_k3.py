@@ -40,16 +40,15 @@ class KimiK3Model(TextModel):
     # HF suffix -> (gguf tensor, per-layer?)
     _RES_FUSIONS = {
         "self_attention_res": (gguf.MODEL_TENSOR.ATTN_RES_SCORE, True),
-        "mlp_res":            (gguf.MODEL_TENSOR.FFN_RES_SCORE,   True),
-        "output_attn_res":    (gguf.MODEL_TENSOR.OUTPUT_RES_SCORE, False),
+        "mlp_res": (gguf.MODEL_TENSOR.FFN_RES_SCORE, True),
+        "output_attn_res": (gguf.MODEL_TENSOR.OUTPUT_RES_SCORE, False),
     }
 
     # compressed-tensors MXFP4. the `language_model.` prefix is still there, as
     # self.model_tensors is keyed by the raw checkpoint names
     _MXFP4_FORMAT = "mxfp4-pack-quantized"
     _MXFP4_EXPERT_RE = re.compile(
-        r"^(?:language_model\.)?model\.layers\.(\d+)"
-        r"\.block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight_packed$"
+        r"^(?:language_model\.)?model\.layers\.(\d+)" r"\.block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight_packed$"
     )
     _MXFP4_PROJ = {
         "w1": gguf.MODEL_TENSOR.FFN_GATE_EXP,
@@ -87,8 +86,10 @@ class KimiK3Model(TextModel):
 
     def _is_mxfp4_packed(self) -> bool:
         quant_config = self.hparams.get("quantization_config") or {}
-        return (quant_config.get("quant_method") == "compressed-tensors"
-                and quant_config.get("format") == self._MXFP4_FORMAT)
+        return (
+            quant_config.get("quant_method") == "compressed-tensors"
+            and quant_config.get("format") == self._MXFP4_FORMAT
+        )
 
     def dequant_model(self):
         if not self._is_mxfp4_packed():
@@ -96,8 +97,7 @@ class KimiK3Model(TextModel):
 
         # skipping base.py's dequant is only safe if the experts are the only
         # quantized tensors, so check it
-        stray = [n for n in self.model_tensors
-                 if n.endswith(".weight_packed") and not self._MXFP4_EXPERT_RE.match(n)]
+        stray = [n for n in self.model_tensors if n.endswith(".weight_packed") and not self._MXFP4_EXPERT_RE.match(n)]
         if stray:
             raise NotImplementedError(
                 f"{len(stray)} MXFP4 tensor(s) outside the routed experts, e.g. {stray[0]!r}; "
@@ -154,8 +154,7 @@ class KimiK3Model(TextModel):
             missing = [e for e in range(n_experts) if e not in experts]
             if missing:
                 raise KeyError(
-                    f"layer {bid} {wid}: {len(missing)} of {n_experts} experts missing, "
-                    f"first is {missing[0]}"
+                    f"layer {bid} {wid}: {len(missing)} of {n_experts} experts missing, " f"first is {missing[0]}"
                 )
             if len(experts) != n_experts:
                 raise KeyError(f"layer {bid} {wid}: {len(experts)} experts, expected {n_experts}")
@@ -190,7 +189,7 @@ class KimiK3Model(TextModel):
             if name.startswith(("vision_tower.", "mm_projector.")):
                 continue  # text only
             if name.startswith("language_model."):
-                name = name[len("language_model."):]
+                name = name[len("language_model.") :]
             yield name, data
 
     def set_gguf_parameters(self):
@@ -249,8 +248,7 @@ class KimiK3Model(TextModel):
             self.gguf_writer.add_expert_latent_length(latent)
 
         # --- situ activation ---
-        assert self.hparams["hidden_act"] == "situ", \
-            f"unexpected hidden_act {self.hparams['hidden_act']!r}"
+        assert self.hparams["hidden_act"] == "situ", f"unexpected hidden_act {self.hparams['hidden_act']!r}"
         self.gguf_writer.add_activation_situ_beta(self.hparams["activation_situ_beta"])
         self.gguf_writer.add_activation_situ_linear_beta(self.hparams["activation_situ_linear_beta"])
 
@@ -291,8 +289,9 @@ class KimiK3Model(TextModel):
                 proj = data_torch if kind == "proj" else other_data
                 fused = norm.float().flatten() * proj.float().flatten()
                 # ".weight" suffix matches the convention map_tensor_name applies
-                new_name = (self.format_tensor_name(tensor_id, bid) if per_layer
-                            else gguf.TENSOR_NAMES[tensor_id] + ".weight")
+                new_name = (
+                    self.format_tensor_name(tensor_id, bid) if per_layer else gguf.TENSOR_NAMES[tensor_id] + ".weight"
+                )
                 logger.info(f"fused {prefix}_norm * {prefix}_proj -> {new_name}")
                 return [(new_name, fused)]
         return None
@@ -308,9 +307,9 @@ class KimiK3Model(TextModel):
         # GGUF reverses the numpy shape on write, so target numpy (1, d_inner, 1, d_conv).
         # conv_step varies fastest in both layouts, so this is a pure reshape.
         if name.endswith((".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")):
-            if data_torch.ndim == 3:      # [d_inner, 1, d_conv]
+            if data_torch.ndim == 3:  # [d_inner, 1, d_conv]
                 d_inner, _, d_conv = data_torch.shape
-            elif data_torch.ndim == 2:    # [d_inner, d_conv]
+            elif data_torch.ndim == 2:  # [d_inner, d_conv]
                 d_inner, d_conv = data_torch.shape
             else:
                 raise ValueError(f"unexpected conv1d rank {data_torch.ndim} for {name}")
@@ -349,9 +348,11 @@ class KimiK3Model(TextModel):
                 return
 
             # w1: gate, w2: down, w3: up
-            for wid, tensor_id in (("w1", gguf.MODEL_TENSOR.FFN_GATE_EXP),
-                                   ("w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP),
-                                   ("w3", gguf.MODEL_TENSOR.FFN_UP_EXP)):
+            for wid, tensor_id in (
+                ("w1", gguf.MODEL_TENSOR.FFN_GATE_EXP),
+                ("w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP),
+                ("w3", gguf.MODEL_TENSOR.FFN_UP_EXP),
+            ):
                 datas = []
                 for xid in range(n_experts):
                     ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{wid}.weight"

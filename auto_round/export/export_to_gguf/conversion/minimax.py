@@ -36,12 +36,16 @@ class MiniMaxText01Model(TextModel):
             embeddings_data = model_shard[embeddings_tensor_name]
 
         embeddings_weights_dtype = LazyTorchTensor._dtype_str_map[embeddings_data.dtype]
-        embeddings_weights = torch.from_numpy(embeddings_data.mmap_bytes()).view(embeddings_weights_dtype).reshape(embeddings_data.shape)
+        embeddings_weights = (
+            torch.from_numpy(embeddings_data.mmap_bytes()).view(embeddings_weights_dtype).reshape(embeddings_data.shape)
+        )
         embeddings_vocab_size = embeddings_weights.shape[0]
 
         embeddings_added_tokens = embeddings_weights[tokenizer_vocab_size:embeddings_vocab_size]
         embeddings_zero_rows = torch.all(embeddings_added_tokens == 0, dim=1)
-        tokens_zero_embeddings_ids = (torch.nonzero(embeddings_zero_rows, as_tuple=False).flatten() + tokenizer_vocab_size).tolist()
+        tokens_zero_embeddings_ids = (
+            torch.nonzero(embeddings_zero_rows, as_tuple=False).flatten() + tokenizer_vocab_size
+        ).tolist()
 
         return tokens_zero_embeddings_ids
 
@@ -52,7 +56,7 @@ class MiniMaxText01Model(TextModel):
 
         for tmpl_file in [
             self.dir_model / "chat_template.jinja",
-            Path(__file__).parent.parent / "models" / "templates" / "MiniMax-M1.jinja"
+            Path(__file__).parent.parent / "models" / "templates" / "MiniMax-M1.jinja",
         ]:
             if tmpl_file.is_file():
                 self.gguf_writer.add_chat_template(tmpl_file.read_text(encoding="utf-8"))
@@ -224,9 +228,7 @@ class MiniMaxM3VisionModel(MmprojModel):
         self.gguf_writer.add_vision_use_gelu(True)
 
         # the ViT carries its own LayerNorm eps (text tower uses a different one)
-        self.gguf_writer.add_vision_attention_layernorm_eps(
-            self.hparams_vision.get("layer_norm_eps", 1e-5)
-        )
+        self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams_vision.get("layer_norm_eps", 1e-5))
 
         comp = self.hparams_vision.get("img_token_compression_config", {})
         merge_size = comp.get("spatial_merge_size", 2)
