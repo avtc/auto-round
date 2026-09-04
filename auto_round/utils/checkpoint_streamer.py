@@ -122,7 +122,10 @@ class CheckpointStreamer:
         self._format: Optional[str] = None  # "safetensors" | "bin"
         self._open_handles: dict[str, object] = {}  # shard path -> safe_open handle
         self._open_order: list[str] = []
-        self._max_open = 4
+        # Sequential consume-once reads only need the current shard plus the
+        # prefetcher's next one; deeper pools keep already-read pages mapped
+        # (munmap on eviction is what releases them from RSS).
+        self._max_open = int(envs.AR_STREAM_SHARD_POOL)
 
         # Prefetch state: a background reader stages whole module prefixes into
         # host RAM ahead of the consumer; fetch() serves from that cache first.

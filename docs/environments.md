@@ -234,6 +234,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
+### AR_STREAM_SHARD_POOL
+
+- **Type**: int (default `2`)
+- **Description**: Maximum simultaneously open checkpoint shards in the streaming reader's LRU handle pool. The access pattern is sequential consume-once: the current shard plus the prefetcher's next one is all that is needed. Each open shard keeps its touched pages mapped in RSS until eviction (munmap), so a deeper pool - or an early-touched shard lingering in it - holds multi-GB residency for no reuse benefit.
+
+```bash
+export AR_STREAM_SHARD_POOL=2
+```
+
 ### AR_STREAM_DROP_FILE_CACHE
 
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)

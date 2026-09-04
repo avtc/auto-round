@@ -77,3 +77,19 @@ class TestDropFileCache:
         from auto_round.utils.checkpoint_streamer import CheckpointStreamer
 
         CheckpointStreamer._drop_file_cache(str(tmp_path / "missing.safetensors"))
+
+
+class TestShardPool:
+    def test_env_default_and_bounds(self, monkeypatch):
+        import auto_round.envs as envs
+
+        assert envs.AR_STREAM_SHARD_POOL == 2
+        monkeypatch.setenv("AR_STREAM_SHARD_POOL", "4")
+        assert envs.AR_STREAM_SHARD_POOL == 4
+        monkeypatch.setenv("AR_STREAM_SHARD_POOL", "0")
+        assert envs.AR_STREAM_SHARD_POOL == 1  # clamped
+        monkeypatch.setenv("AR_STREAM_SHARD_POOL", "bogus")
+        import pytest
+
+        with pytest.raises(ValueError):
+            _ = envs.AR_STREAM_SHARD_POOL  # noqa: B018
