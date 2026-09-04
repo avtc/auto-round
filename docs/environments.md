@@ -234,6 +234,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
+### AR_STREAM_DROP_FILE_CACHE
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: The streaming reader memory-maps checkpoint shards (`safe_open`); pages touched by reads stay resident in RSS for the lifetime of the mapping even though they are clean, reclaimable and (for an evicted shard) never read again - the footprint grows by roughly one shard per newly touched file. When set, evicted and closed shards get `posix_fadvise(DONTNEED)`, dropping their residency from RSS. Best effort: non-POSIX hosts silently no-op. Effect is visible in the `AR_STREAM_MEM_TOP` regions lines (file-backed `*.safetensors` entries stop accumulating).
+
+```bash
+export AR_STREAM_DROP_FILE_CACHE=1
+```
+
 ### AR_STREAM_MALLOC_TRIM
 
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)

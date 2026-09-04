@@ -234,6 +234,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
+### AR_STREAM_DROP_FILE_CACHE
+
+- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
+- **描述**: 流式读取器对 checkpoint 分片做内存映射（`safe_open`）；读取触碰过的页在映射存活期间会一直计入 RSS，尽管它们是干净、可回收且（对已被淘汰的分片）不会再被读取的 —— 足迹随新触碰文件大约每个分片增长一份。启用后，被淘汰和关闭的分片会执行 `posix_fadvise(DONTNEED)`，将其驻留页从 RSS 释放。尽力而为：非 POSIX 平台静默跳过。效果可在 `AR_STREAM_MEM_TOP` 的 regions 行中看到（文件映射的 `*.safetensors` 条目不再累积）。
+
+```bash
+export AR_STREAM_DROP_FILE_CACHE=1
+```
+
 ### AR_STREAM_MALLOC_TRIM
 
 - **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）

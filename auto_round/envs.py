@@ -94,6 +94,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Streaming loop: list individual tensors larger than this many GiB
     # (plus the top host memory regions) in the memory inventory. 0 = off.
     "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),
+    # Streaming reader: drop evicted checkpoint shards' page-cache residency
+    # (posix_fadvise DONTNEED) so mmap'd clean pages stop counting in RSS.
+    "AR_STREAM_DROP_FILE_CACHE": lambda: os.getenv("AR_STREAM_DROP_FILE_CACHE", "0").lower() in ("1", "true", "yes"),
     # Streaming loop: return freed host-heap pages to the OS after the chain
     # rebuild and after every block (glibc malloc_trim). The streaming
     # reader's many small per-tensor allocations fragment the allocator and

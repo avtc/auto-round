@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 
+import auto_round.envs as envs
 from auto_round.logger import logger
 
 _DTYPE_BYTES = {
@@ -189,6 +190,10 @@ class CheckpointStreamer:
             h = handles.pop(old, None)
             if h is not None:
                 h.__exit__(None, None, None)
+                if envs.AR_STREAM_DROP_FILE_CACHE:
+                    # the evicted shard is consumed for good; release its
+                    # still-mapped page-cache residency from RSS
+                    self._drop_file_cache(self._shard_path(old))
         return handle
 
     # -- Prefetch -------------------------------------------------------------
@@ -403,6 +408,26 @@ class CheckpointStreamer:
             tensor = handles[cache_key][name]
         return tensor
 
+    @staticmethod
+    def _drop_file_cache(path: str) -> None:
+        """Drop a checkpoint shard's page-cache residency (posix_fadvise).
+
+        ``safe_open`` memory-maps each shard; pages touched by reads stay
+        resident in RSS for the lifetime of the mapping even though they are
+        clean, reclaimable and (for an evicted shard) never read again. The
+        accumulated residency inflates the process footprint (and the VmHWM
+        peak) by one shard per newly touched file. Best effort: silently
+        no-ops on non-POSIX hosts.
+        """
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except (AttributeError, OSError):
+            pass
+
     def names_under(self, prefix: str) -> list[str]:
         """Checkpoint tensor names belonging to a module prefix."""
         return [n for n in self.weight_map if n == prefix or n.startswith(prefix + ".")]
@@ -468,11 +493,13 @@ class CheckpointStreamer:
 
     def close(self) -> None:
         self.stop_prefetch()
-        for handle in self._open_handles.values():
+        for shard_name, handle in self._open_handles.items():
             if hasattr(handle, "__exit__"):
                 try:
                     handle.__exit__(None, None, None)
                 except Exception:  # pragma: no cover - best effort
                     pass
+            if envs.AR_STREAM_DROP_FILE_CACHE:
+                self._drop_file_cache(self._shard_path(shard_name))
         self._open_handles.clear()
         self._open_order.clear()

@@ -62,3 +62,18 @@ class TestStreamMemTop:
         assert abs(envs.AR_STREAM_MEM_TOP - 0.25) < 1e-9
         monkeypatch.setenv("AR_STREAM_MEM_TOP", "not-a-float")
         assert envs.AR_STREAM_MEM_TOP == 0.0
+
+
+class TestDropFileCache:
+    def test_env_parse(self, monkeypatch):
+        import auto_round.envs as envs
+
+        assert envs.AR_STREAM_DROP_FILE_CACHE is False
+        monkeypatch.setenv("AR_STREAM_DROP_FILE_CACHE", "1")
+        assert envs.AR_STREAM_DROP_FILE_CACHE is True
+
+    def test_drop_file_cache_never_raises(self, tmp_path):
+        # non-POSIX hosts must silently no-op; a bogus path must not raise
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        CheckpointStreamer._drop_file_cache(str(tmp_path / "missing.safetensors"))
