@@ -1160,7 +1160,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self._stream_resume_jump_chain(calib_state, resume_states)
                 if self.shard_writer is not None:
                     self.shard_writer.adopt_existing_shards()  # never overwrite the crashed run's shards
-                if envs.AR_STREAM_MALLOC_TRIM and self._trim_host_heap():
+                if self._trim_host_heap():
                     # the replay leaves granular-read debris that would raise
                     # every later block's peak (VmHWM keeps the high-water mark)
                     logger.info("[stream] host heap trimmed after chain rebuild")
@@ -1267,8 +1267,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     streamer.load_module_(block, block_name, device=load_device)
                     _t_seg = _mark_load_seg(_load_sub, "io", _t_seg)
                     streamer.close_shards_not_serving_(flat_block_names[flat_block_names.index(block_name) + 1 :])
-                    if envs.AR_STREAM_CLOSE_PER_BLOCK:
-                        streamer.close_main_pool_()
+                    streamer.close_main_pool_()
                     _t_seg = _mark_load_seg(_load_sub, "close", _t_seg)
                 materialize_model_(block)
                 _t_seg = _mark_load_seg(_load_sub, "mat", _t_seg)
@@ -1473,8 +1472,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _peak_watch.log(f"block {stream_block_idx}")
                     _peak_watch.reset_run_max()
                 clear_memory()
-                if envs.AR_STREAM_MALLOC_TRIM:
-                    self._trim_host_heap()
+                self._trim_host_heap()
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)

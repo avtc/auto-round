@@ -237,28 +237,10 @@ export AR_STREAM_PEAK_WATCH=1
 ### AR_STREAM_MEM_TOP
 
 - **类型**: 浮点数，GiB 阈值（默认 `0` = 关闭）
-- **描述**: `AR_STREAM_MEM_INVENTORY` 的配套项。设置为如 `0.2` 时，每条 inventory 行后会列出达到阈值的最大单个张量（含完整命名，host 与每个 GPU），并在 Linux 上额外输出 `/proc/self/smaps` 中按 RSS 排序的宿主内存区域。张量用于归类*存活*集合；内存区域用于归类 *residual*（已释放的内存不再持有张量对象）：`[heap]` 增长表示分配器碎片化（见 `AR_STREAM_MALLOC_TRIM`）；匿名映射表示 CUDA pinned 池或 torch 宿主缓存（无法 trim）；文件映射表示 checkpoint 的 mmap。
+- **描述**: `AR_STREAM_MEM_INVENTORY` 的配套项。设置为如 `0.2` 时，每条 inventory 行后会列出达到阈值的最大单个张量（含完整命名，host 与每个 GPU），并在 Linux 上额外输出 `/proc/self/smaps` 中按 RSS 排序的宿主内存区域。张量用于归类*存活*集合；内存区域用于归类 *residual*（已释放的内存不再持有张量对象）：`[heap]` 增长表示分配器碎片化（流式循环会在每个块后自动 trim 堆）；匿名映射表示 CUDA pinned 池或 torch 宿主缓存（无法 trim）；文件映射表示 checkpoint 的 mmap。
 
 ```bash
 export AR_STREAM_MEM_TOP=0.2
-```
-
-### AR_STREAM_CLOSE_PER_BLOCK
-
-- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
-- **描述**: 每个块读取完成后立即关闭消费池中的分片句柄。被触碰的页在解除映射前一直驻留，因此跨块持有分片会累积这些页直到分片结束；逐块关闭把驻留限制在当前块，重开开销仅为一次头解析（毫秒级）。预取读取器保有自己独立的句柄池，不受影响。
-
-```bash
-export AR_STREAM_CLOSE_PER_BLOCK=1
-```
-
-### AR_STREAM_GROUPED_READ
-
-- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
-- **描述**: 按分片文件分组读取模块的 checkpoint 张量（逐文件：打开一个文件、读取该文件中属于此模块的全部张量、再进入下一个），而不是按模块树顺序。配合按消费关闭分片，即使 checkpoint 的张量在多个文件间交错分布，驻留也被限制在每模块单个打开的分片内。
-
-```bash
-export AR_STREAM_GROUPED_READ=1
 ```
 
 ### AR_STREAM_SHARD_POOL
@@ -277,15 +259,6 @@ export AR_STREAM_SHARD_POOL=2
 
 ```bash
 export AR_STREAM_DROP_FILE_CACHE=1
-```
-
-### AR_STREAM_MALLOC_TRIM
-
-- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
-- **描述**: 流式量化内存优化。流式读取器的大量小尺寸逐张量分配会造成宿主内存分配器碎片化，已释放的页仍被映射，即使没有任何对象引用它们，RSS（以及进程峰值 `VmHWM`）也会逐块单调增长。启用后，会在断点续跑的链重建之后以及每个量化块结束时执行 `malloc_trim(0)`，把已释放的堆页交还操作系统。尽力而为：非 glibc 平台（Windows/macOS）静默跳过。效果可直接在 `AR_STREAM_MEM_INVENTORY` 的 host 行中看到（residual 不再增长）。
-
-```bash
-export AR_STREAM_MALLOC_TRIM=1
 ```
 
 ### AR_DISABLE_BG_PACK

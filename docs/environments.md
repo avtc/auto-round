@@ -237,28 +237,10 @@ export AR_STREAM_PEAK_WATCH=1
 ### AR_STREAM_MEM_TOP
 
 - **Type**: float, GiB threshold (default `0` = off)
-- **Description**: Companion to `AR_STREAM_MEM_INVENTORY`. When set to e.g. `0.2`, each inventory line is followed by the top individual tensors at or above the threshold (with qualified names, host and per-GPU) and — on Linux — the top host memory regions by RSS from `/proc/self/smaps`. Tensors classify the *live* set; regions classify the *residual* (dead memory holds no tensor objects): `[heap]` growth means allocator fragmentation (see `AR_STREAM_MALLOC_TRIM`), anonymous mappings mean CUDA pinned pools or torch host caches (not trimmable), and file-backed mappings mean checkpoint mmaps.
+- **Description**: Companion to `AR_STREAM_MEM_INVENTORY`. When set to e.g. `0.2`, each inventory line is followed by the top individual tensors at or above the threshold (with qualified names, host and per-GPU) and — on Linux — the top host memory regions by RSS from `/proc/self/smaps`. Tensors classify the *live* set; regions classify the *residual* (dead memory holds no tensor objects): `[heap]` growth means allocator fragmentation (the streaming loop trims the heap after every block), anonymous mappings mean CUDA pinned pools or torch host caches (not trimmable), and file-backed mappings mean checkpoint mmaps.
 
 ```bash
 export AR_STREAM_MEM_TOP=0.2
-```
-
-### AR_STREAM_CLOSE_PER_BLOCK
-
-- **Type**: bool (`1`/`true`/`yes` to enable; default off)
-- **Description**: Close the consumer pool's shard handles right after each block's read. Touched pages stay resident until unmap, so holding a shard across the blocks it serves accumulates their pages until shard end; per-block closing bounds residency to the current block, at a ~ms reopen cost (one header parse). The prefetch reader keeps its own handle pool and is unaffected.
-
-```bash
-export AR_STREAM_CLOSE_PER_BLOCK=1
-```
-
-### AR_STREAM_GROUPED_READ
-
-- **Type**: bool (`1`/`true`/`yes` to enable; default off)
-- **Description**: Read each module's checkpoint tensors grouped by shard file (file-by-file: open one file, read all its tensors for the module, then move on) instead of module-tree order. With the consumed-shard close this bounds residency to a single open shard per module even for checkpoints whose tensors are adversarially interleaved across files.
-
-```bash
-export AR_STREAM_GROUPED_READ=1
 ```
 
 ### AR_STREAM_SHARD_POOL
@@ -277,15 +259,6 @@ export AR_STREAM_SHARD_POOL=2
 
 ```bash
 export AR_STREAM_DROP_FILE_CACHE=1
-```
-
-### AR_STREAM_MALLOC_TRIM
-
-- **Type**: bool (`1`/`true`/`yes` to enable; default off)
-- **Description**: Streaming-quantization memory mitigation. The streaming reader's many small per-tensor allocations fragment the host allocator, so freed pages stay mapped and RSS (and the process peak, `VmHWM`) grows monotonically block over block even though nothing references them. When set, `malloc_trim(0)` runs after the resume chain rebuild and after every quantized block, handing freed heap pages back to the OS. Best effort: non-glibc hosts (Windows/macOS) silently no-op. Effect is visible directly in the `AR_STREAM_MEM_INVENTORY` host lines (residual stops growing).
-
-```bash
-export AR_STREAM_MALLOC_TRIM=1
 ```
 
 ### AR_DISABLE_BG_PACK

@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     AR_NVFP4_E5M3_CACHE_HP_WEIGHT: bool = False
     AR_DISK_STREAM_MODEL: bool = False
     AR_RESUME_DIR: Optional[str] = None
-    AR_STREAM_MALLOC_TRIM: bool = False
     AR_FORCE_MOE_ROUTING_ALL_EXPERTS: bool = False
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
 
@@ -98,13 +97,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Streaming loop: list individual tensors larger than this many GiB
     # (plus the top host memory regions) in the memory inventory. 0 = off.
     "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),
-    # Streaming reader: close the consumer pool's shard handles after every
-    # block's read (bounds mmap residency to the current block; ~ms reopen).
-    "AR_STREAM_CLOSE_PER_BLOCK": lambda: os.getenv("AR_STREAM_CLOSE_PER_BLOCK", "0").lower() in ("1", "true", "yes"),
-    # Streaming reader: read a module's tensors grouped by checkpoint shard
-    # (file-by-file) instead of module-tree order. Bounds residency to one
-    # open shard per module even for adversarially interleaved checkpoints.
-    "AR_STREAM_GROUPED_READ": lambda: os.getenv("AR_STREAM_GROUPED_READ", "0").lower() in ("1", "true", "yes"),
     # Streaming reader: max simultaneously open checkpoint shards (LRU pool).
     # Sequential consume-once access needs current + prefetch-next = 2; a
     # deeper pool only keeps already-read pages mapped, inflating RSS.
@@ -112,11 +104,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Streaming reader: drop evicted checkpoint shards' page-cache residency
     # (posix_fadvise DONTNEED) so mmap'd clean pages stop counting in RSS.
     "AR_STREAM_DROP_FILE_CACHE": lambda: os.getenv("AR_STREAM_DROP_FILE_CACHE", "0").lower() in ("1", "true", "yes"),
-    # Streaming loop: return freed host-heap pages to the OS after the chain
-    # rebuild and after every block (glibc malloc_trim). The streaming
-    # reader's many small per-tensor allocations fragment the allocator and
-    # would otherwise inflate RSS and the VmHWM peak monotonically.
-    "AR_STREAM_MALLOC_TRIM": lambda: os.getenv("AR_STREAM_MALLOC_TRIM", "0").lower() in ("1", "true", "yes"),
     # torch.compile cache size cap (recompile_limit); streaming block shapes
     # vary, a higher cap avoids spurious eager fallbacks.
     "AR_DYNAMO_CACHE_SIZE_LIMIT": lambda: int(os.getenv("AR_DYNAMO_CACHE_SIZE_LIMIT", "16")),

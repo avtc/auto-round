@@ -634,11 +634,11 @@ class CheckpointStreamer:
     def close_main_pool_(self) -> None:
         """Close the consumer pool's shard handles (prefetch pool untouched).
 
-        AR_STREAM_CLOSE_PER_BLOCK: touched pages stay resident until unmap,
-        so holding a shard open across the blocks it serves accumulates
-        their pages until shard end. Closing after each block's read bounds
-        the residency to the current block; the reopen cost is a header
-        parse (~ms). The prefetch reader keeps its own handles.
+        Called after every block's read: touched pages stay resident until
+        unmap, so holding a shard open across the blocks it serves accumulates
+        their pages until shard end. Closing per block bounds the residency to
+        the current block; the reopen cost is a header parse (~ms). The
+        prefetch reader keeps its own handles.
         """
         if not self._open_handles:
             return
@@ -702,11 +702,10 @@ class CheckpointStreamer:
         # wait out an in-flight prefetch of this very prefix instead of
         # racing it with a duplicate read (see _await_prefetch_prefix)
         self._await_prefetch_prefix(prefix)
-        if envs.AR_STREAM_GROUPED_READ:
-            # file-by-file reads: group the prefix's tensors by shard so each
-            # file is opened, fully read and (once consumed) closed before the
-            # next one opens, instead of interleaved module-tree order
-            names = sorted(names, key=lambda n: self.weight_map[n])
+        # file-by-file reads: group the prefix's tensors by shard so each
+        # file is opened, fully read and (once consumed) closed before the
+        # next one opens, instead of interleaved module-tree order
+        names = sorted(names, key=lambda n: self.weight_map[n])
         for name in names:
             tgt, mod_name = by_short.get(name), name
             if tgt is None and renames:

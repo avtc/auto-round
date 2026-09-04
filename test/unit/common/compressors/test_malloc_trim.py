@@ -18,12 +18,9 @@ from auto_round.compressors.orchestrator import CompressionOrchestrator
 
 
 class TestMallocTrim:
-    def test_env_default_off_and_lazy_read(self, monkeypatch):
-        assert envs.AR_STREAM_MALLOC_TRIM is False
-        monkeypatch.setenv("AR_STREAM_MALLOC_TRIM", "1")
-        assert envs.AR_STREAM_MALLOC_TRIM is True
-        monkeypatch.setenv("AR_STREAM_MALLOC_TRIM", "0")
-        assert envs.AR_STREAM_MALLOC_TRIM is False
+    def test_trim_env_removed(self):
+        # trims are unconditional in the streaming loop; the env gate is gone
+        assert not hasattr(envs, "AR_STREAM_MALLOC_TRIM")
 
     def test_trim_host_heap_never_raises_and_returns_bool(self):
         # On non-glibc hosts (Windows/macOS) the ctypes load fails and the
@@ -31,18 +28,19 @@ class TestMallocTrim:
         result = CompressionOrchestrator._trim_host_heap()
         assert isinstance(result, bool)
 
-    def test_trim_sites_gated_by_env_in_source(self):
-        # The two streaming-loop call sites must sit behind the env flag so
-        # the default behavior is unchanged.
+    def test_trim_sites_unconditional_in_source(self):
+        # The two streaming-loop call sites must be unconditional: the trim is
+        # cheap hygiene (ms per block) and keeps RSS/VmHWM from growing
+        # monotonically on glibc hosts.
         import inspect
 
         src = inspect.getsource(CompressionOrchestrator)
-        gated = [ln for ln in src.splitlines() if "_trim_host_heap()" in ln and "def " not in ln]
-        assert len(gated) == 2, "expected exactly 2 call sites"
-        for ln in gated:
-            idx = src.splitlines().index(ln)
-            window = "\n".join(src.splitlines()[max(0, idx - 3) : idx + 1])
-            assert "AR_STREAM_MALLOC_TRIM" in window, f"call site not env-gated:\n{window}"
+        lines = src.splitlines()
+        sites = [i for i, ln in enumerate(lines) if "_trim_host_heap()" in ln and "def " not in ln]
+        assert len(sites) == 2, "expected exactly 2 call sites"
+        for i in sites:
+            window = "\n".join(lines[max(0, i - 3) : i + 1])
+            assert "envs." not in window, f"call site still gated:\n{window}"
 
     def test_trim_helper_isolated_from_model_state(self):
         # must not require any instance state (called as static from the loop)
@@ -202,14 +200,8 @@ class TestPlannedSetClose:
 
 
 class TestPerBlockClose:
-    def test_env_and_close_main_pool(self, monkeypatch, tmp_path):
+    def test_close_main_pool(self, tmp_path):
         from auto_round.utils.checkpoint_streamer import CheckpointStreamer
-
-        import auto_round.envs as envs
-
-        assert envs.AR_STREAM_CLOSE_PER_BLOCK is False
-        monkeypatch.setenv("AR_STREAM_CLOSE_PER_BLOCK", "1")
-        assert envs.AR_STREAM_CLOSE_PER_BLOCK is True
 
         s = object.__new__(CheckpointStreamer)
         s._open_handles = {}
@@ -224,3 +216,30 @@ class TestPerBlockClose:
         assert exited == ["s0"]
         assert not s._open_handles and not s._open_order
         assert "s9" in s._prefetch_handles  # prefetch pool untouched
+
+
+class TestUnconditionalBoundedResidency:
+    """Grouped shard reads, per-block consumer-pool close and heap trims are
+    unconditional streaming behaviors now - bounded host residency is the
+    default contract, not an opt-in recipe."""
+
+    def test_env_gates_fully_removed(self):
+        assert not hasattr(envs, "AR_STREAM_GROUPED_READ")
+        assert not hasattr(envs, "AR_STREAM_CLOSE_PER_BLOCK")
+
+    def test_grouped_read_unconditional(self):
+        import inspect
+
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        src = inspect.getsource(CheckpointStreamer.load_module_)
+        assert "key=lambda n: self.weight_map[n]" in src
+        assert "AR_STREAM_GROUPED_READ" not in src
+
+    def test_loop_sites_ungated(self):
+        import inspect
+
+        src = inspect.getsource(CompressionOrchestrator)
+        assert "AR_STREAM_CLOSE_PER_BLOCK" not in src
+        assert "AR_STREAM_MALLOC_TRIM" not in src
+        assert "close_main_pool_()" in src
