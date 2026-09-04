@@ -81,7 +81,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         float(os.getenv("AR_SEARCH_SCALE_RATIO")) if os.getenv("AR_SEARCH_SCALE_RATIO") is not None else None
     ),
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
-    # Streaming loop: log a per-GPU memory inventory every 16 blocks.
+    # Streaming loop: log a per-GPU (and host) memory inventory every block.
     "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower() in ("1", "true", "yes"),
     # torch.compile cache size cap (recompile_limit); streaming block shapes
     # vary, a higher cap avoids spurious eager fallbacks.

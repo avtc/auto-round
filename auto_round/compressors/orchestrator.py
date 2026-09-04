@@ -669,14 +669,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             per_dev[dev][bucket] += t.numel() * t.element_size()
 
         for name, t in list(self.model.named_parameters()) + list(self.model.named_buffers()):
-            if t.device.type != "cuda" or id(t) in seen:
+            if t.device.type not in ("cuda", "cpu") or id(t) in seen:
                 continue
             seen.add(id(t))
             _add(str(t.device), self._mem_bucket(name), t)
 
         def _walk(v, dev_hint=None):
             if isinstance(v, torch.Tensor):
-                if v.device.type == "cuda" and id(v) not in seen:
+                if v.device.type in ("cuda", "cpu") and id(v) not in seen:
                     seen.add(id(v))
                     _add(str(v.device), "chain", v)
             elif isinstance(v, dict):
@@ -996,7 +996,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                             _n_moved,
                             load_device,
                         )
-                    if envs.AR_STREAM_MEM_INVENTORY and stream_block_idx % 16 == 0:
+                    if envs.AR_STREAM_MEM_INVENTORY:
                         self._log_device_inventory(calib_state, f"block {stream_block_idx}")
                 _t_load = _time.perf_counter() - _t_load
 

@@ -223,7 +223,7 @@ export AR_SCHEME_MEM_INVENTORY=1
 ### AR_STREAM_MEM_INVENTORY
 
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)
-- **Description**: Streaming-quantization diagnostic. When set, the zero-shot loop logs a per-GPU memory breakdown every 16 blocks (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
+- **Description**: Streaming-quantization diagnostic. When set, the zero-shot loop logs a per-GPU memory breakdown every block (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state) and a host line with process RSS vs tracked CPU tensors (chain residents under `--low_gpu_mem_usage`). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
 
 ### AR_DISABLE_BG_PACK
 - **Description**: Disables the background pack pipeline of the streaming quantization loop. By default, once a block finishes tuning under `--stream_quantization`, a background worker packs and writes it while the loop moves on to the next block. Setting this to `1` serializes packing into the main loop.

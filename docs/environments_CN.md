@@ -223,7 +223,7 @@ export AR_SCHEME_MEM_INVENTORY=1
 ### AR_STREAM_MEM_INVENTORY
 
 - **类型**：布尔值（`1`/`true`/`yes` 启用；默认关闭）
-- **描述**：流式量化诊断开关。启用后，zero-shot 循环每 16 个 block 输出一次按 GPU 的显存分解（`[stream-mem] ...`）：分配器视角（alloc/reserved）、按类别统计的张量（`block:<k>` 暂存 block 权重、`embeddings`、`nonblock:<...>` 初始化阶段创建的模块、`chain` 校准 fp/q 隐状态及 kwargs），以及 `other = alloc - tracked`（临时对象、打包缓冲、优化器状态）。用于查看主 GPU 上到底驻留了什么、为何占用如此之大。与 `AR_SCHEME_MEM_INVENTORY`（AutoScheme 评分池）互补。
+- **描述**：流式量化诊断开关。启用后，zero-shot 循环每个 block 输出一次按 GPU 的显存分解（`[stream-mem] ...`）：分配器视角（alloc/reserved）、按类别统计的张量（`block:<k>` 暂存 block 权重、`embeddings`、`nonblock:<...>` 初始化阶段创建的模块、`chain` 校准 fp/q 隐状态及 kwargs），以及 `other = alloc - tracked`（临时对象、打包缓冲、优化器状态）。用于查看主 GPU 上到底驻留了什么、为何占用如此之大。与 `AR_SCHEME_MEM_INVENTORY`（AutoScheme 评分池）互补。
 
 ### AR_DISABLE_BG_PACK
 - **描述**：禁用流式量化循环的后台打包流水线。默认情况下，`--stream_quantization` 下一个 block 调优完成后，后台工作线程会在主循环处理下一个 block 的同时完成打包与写出。设为 `1` 后打包将被串行化到主循环中。
