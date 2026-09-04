@@ -22,8 +22,10 @@ is one decoder block plus the streamed pass-through tensors.
 
 import json
 import os
+import re
 import threading
 import time
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -99,6 +101,34 @@ def _park_cpu_buffers_(module: torch.nn.Module, device) -> None:
     module._apply(_fn)
 
 
+@lru_cache(maxsize=None)
+def _name_rewrites_for(model_type):
+    """Compiled (checkpoint-pattern -> module-replacement) pairs for a family.
+
+    transformers' per-family conversion registry is the single authoritative
+    source: pure ``WeightRenaming`` aliases apply (checkpoint-side patterns
+    arrive regex-ready, module-side targets plain); fusions/splits
+    (``WeightConverter``) are skipped -- they are not name aliases and are
+    handled by the MoE replacement machinery. Families absent from the
+    registry resolve nothing here; unmatched parameters then fail loudly at
+    the materialization assert in the streaming loop.
+    """
+    if not model_type:
+        return ()
+    try:
+        from transformers.conversion_mapping import WeightRenaming, get_checkpoint_conversion_mapping
+    except ImportError:
+        return ()
+    pairs = []
+    for entry in get_checkpoint_conversion_mapping(model_type) or ():
+        if not isinstance(entry, WeightRenaming):
+            continue
+        for source in entry.source_patterns:
+            for target in entry.target_patterns:
+                pairs.append((re.compile(source), target))
+    return tuple(pairs)
+
+
 class CheckpointStreamer:
     """Streams tensors from a HuggingFace checkpoint on demand.
 
@@ -130,6 +160,7 @@ class CheckpointStreamer:
         # prefetcher's next one; deeper pools keep already-read pages mapped
         # (munmap on eviction is what releases them from RSS).
         self._max_open = int(envs.AR_STREAM_SHARD_POOL)
+        self._model_type = self._read_model_type()
 
         # Prefetch state: a background reader stages whole module prefixes into
         # host RAM ahead of the consumer; fetch() serves from that cache first.
@@ -166,6 +197,19 @@ class CheckpointStreamer:
             f"No streamable checkpoint found in {model_path!r} "
             "(expected model.safetensors.index.json, model.safetensors, or pytorch_model.bin_index.json)."
         )
+
+    def _read_model_type(self) -> Optional[str]:
+        """Family of the checkpoint, from ``config.json`` beside the shards.
+
+        Feeds the name-alias layers (transformers' conversion registry plus
+        auto-round's fallback registry); ``None`` when no readable config.
+        """
+        config_path = os.path.join(self.model_path, "config.json")
+        try:
+            with open(config_path) as f:
+                return json.load(f).get("model_type")
+        except (OSError, ValueError):
+            return None
 
     def _load_index(self, index_path: str) -> None:
         with open(index_path) as f:
@@ -609,6 +653,7 @@ class CheckpointStreamer:
         targets.update(dict(module.named_buffers(recurse=True)))
         by_short = {prefix + ("." if prefix else "") + k: v for k, v in targets.items()}
         loaded = []
+        renames = _name_rewrites_for(self._model_type)
         names = self.names_under(prefix)
         if envs.AR_STREAM_GROUPED_READ:
             # file-by-file reads: group the prefix's tensors by shard so each
@@ -617,6 +662,16 @@ class CheckpointStreamer:
             names = sorted(names, key=lambda n: self.weight_map[n])
         for name in names:
             tgt, mod_name = by_short.get(name), name
+            if tgt is None and renames:
+                # checkpoint families whose spellings differ from the modeling
+                # code: apply the registry aliases, never shadowing an exact hit
+                for pattern, replacement in renames:
+                    candidate = pattern.sub(lambda _m, r=replacement: r, name)
+                    if candidate != name:
+                        tgt = by_short.get(candidate)
+                        if tgt is not None:
+                            mod_name = candidate
+                            break
             if tgt is None:
                 logger.debug(f"[stream] {name} has no matching parameter/buffer in the module; skipped")
                 continue

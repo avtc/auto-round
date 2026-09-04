@@ -1177,8 +1177,12 @@ def get_checkpoint_conversion_mapping(model):
     """Get the checkpoint conversion mapping for a given model, if it exists."""
     checkpoint_conversion_mapping = {}
 
-    # transformers <= 5.3.0 use _checkpoint_conversion_mapping
-    checkpoint_conversion_mapping.update(getattr(model, "_checkpoint_conversion_mapping", {}))
+    # transformers <= 5.3.0 use _checkpoint_conversion_mapping; on newer
+    # versions the instance attribute may be absent or a non-dict (e.g. an
+    # empty string on config/meta-built models that never ran from_pretrained)
+    instance_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+    if isinstance(instance_mapping, dict):
+        checkpoint_conversion_mapping.update(instance_mapping)
 
     # transformers > 5.3.0 use get_checkpoint_conversion_mapping
     if hasattr(transformers, "conversion_mapping") and (
@@ -1206,10 +1210,31 @@ def get_checkpoint_conversion_mapping(model):
 
 
 def get_reverse_checkpoint_conversion_mapping(model):
-    """Get the reverse checkpoint conversion mapping for a given model, if it exists."""
-    reverse_checkpoint_conversion_mapping = {
-        v: k for k, v in getattr(model, "_checkpoint_conversion_mapping", {}).items()
-    }
+    """Get the reverse checkpoint conversion mapping for a given model, if it exists.
+
+    Sources, in priority order:
+      * the instance ``_checkpoint_conversion_mapping`` dict (models built via
+        ``from_pretrained``; absent or a non-dict on config/meta-built models),
+      * transformers' per-family conversion registry via
+        :func:`get_checkpoint_conversion_mapping` (covers families whose
+        checkpoints use aliased spellings even when the instance attribute
+        was never populated),
+      * ``_weight_conversions`` reverse transforms.
+    """
+    reverse_checkpoint_conversion_mapping = {}
+    instance_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+    if isinstance(instance_mapping, dict):
+        reverse_checkpoint_conversion_mapping.update({v: k for k, v in instance_mapping.items()})
+
+    for source_pattern, target_patterns in get_checkpoint_conversion_mapping(model).items():
+        if isinstance(target_patterns, str):
+            target_patterns = [target_patterns]
+        # registry keys arrive regex-escaped (``mlp\.shared_mlp\.``); as re.sub
+        # replacements those escapes would land verbatim (or raise), so
+        # unescape to the plain checkpoint-side spelling
+        replacement = re.sub(r"\\(.)", r"\1", source_pattern)
+        for target_pattern in target_patterns:
+            reverse_checkpoint_conversion_mapping.setdefault(target_pattern, replacement)
 
     if hasattr(model, "_weight_conversions"):
         weight_conversions = model._weight_conversions

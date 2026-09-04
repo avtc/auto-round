@@ -168,6 +168,27 @@ class CompressionOrchestrator(BaseOrchestrator):
         return res
 
     @staticmethod
+    def _assert_block_materialized(block: torch.nn.Module, block_name: str) -> None:
+        """Fail loudly when a streamed block still carries meta parameters.
+
+        After direct streaming and the replacement-module materialization ran,
+        every block PARAMETER must have real storage. A leftover meta parameter
+        means the checkpoint (even after the conversion-name aliases) had no
+        tensor for it -- silently continuing would crash later inside tuning
+        or packing with an opaque ``Cannot copy out of meta tensor``. Buffers
+        are exempt: computed tables (e.g. rotary) are rebuilt elsewhere.
+        """
+        still_meta = [name for name, p in block.named_parameters(recurse=True) if p.device.type == "meta"]
+        if still_meta:
+            shown = ", ".join(still_meta[:8]) + (" ..." if len(still_meta) > 8 else "")
+            raise ValueError(
+                f"[stream] {len(still_meta)} parameter(s) of {block_name!r} stayed on meta after streaming "
+                f"(no checkpoint tensor matched, even via conversion name aliases): {shown}. The checkpoint "
+                "may spell these differently from the modeling code; if transformers' conversion "
+                "registry lacks the family's renames, extend it there."
+            )
+
+    @staticmethod
     def _should_offload_after_pack(compress_context) -> bool:
         """Whether a just-processed block still needs an offloader state write.
 
@@ -1129,6 +1150,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         streamer.close_main_pool_()
                 materialize_model_(block)
                 if streamer is not None:
+                    self._assert_block_materialized(block, block_name)
                     strip_stale_device_hooks_(block)
                     _n_moved = rehome_block_(block, load_device)
                     block._stream_home_device = torch.device(load_device)
@@ -1436,21 +1458,31 @@ class CompressionOrchestrator(BaseOrchestrator):
             # Block groups that exist only in the checkpoint (e.g. an MTP
             # layer, which the modeling code does not instantiate) have no module
             # to quantize or write; pass their tensors through verbatim so the
-            # export stays complete.
+            # export stays complete. The scan is anchored on the model's own
+            # block list (any block-path spelling), not on a hard-coded prefix.
             claimed_blocks = {b for block in all_blocks for b in block}
-            ckpt_layer_ids = {n.split(".")[2] for n in streamer.tensor_names if n.startswith("model.layers.")}
-            for layer_id in sorted(ckpt_layer_ids):
-                blk = f"model.layers.{layer_id}"
-                if blk in claimed_blocks:
-                    continue
-                names = streamer.names_under(blk)
-                if not names:
-                    continue
-                logger.info(
-                    f"[stream] {blk} has no module counterpart; " f"writing {len(names)} checkpoint tensors verbatim"
-                )
-                for n in names:
-                    self.shard_writer.save_tensor(n, streamer.fetch(n, raw=True))
+            parent_prefixes = {b.rsplit(".", 1)[0] for b in claimed_blocks if "." in b}
+            passed = set()
+            for parent in sorted(parent_prefixes):
+                for n in streamer.tensor_names:
+                    if not n.startswith(parent + "."):
+                        continue
+                    layer_id = n[len(parent) + 1 :].split(".")[0]
+                    if not layer_id.isdigit():
+                        continue
+                    blk = f"{parent}.{layer_id}"
+                    if blk in claimed_blocks or blk in passed:
+                        continue
+                    passed.add(blk)
+                    names = streamer.names_under(blk)
+                    if not names:
+                        continue
+                    logger.info(
+                        f"[stream] {blk} has no module counterpart; "
+                        f"writing {len(names)} checkpoint tensors verbatim"
+                    )
+                    for n2 in names:
+                        self.shard_writer.save_tensor(n2, streamer.fetch(n2, raw=True))
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
