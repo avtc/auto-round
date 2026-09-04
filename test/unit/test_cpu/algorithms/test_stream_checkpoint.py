@@ -1356,9 +1356,11 @@ class TestLoadBreakdown:
             streamer.load_module_(block, "blk", device=None)
         finally:
             cs_mod.logger.removeHandler(handler)
-        perf_lines = [r for r in records if r.startswith("[perf] streamer")]
-        assert len(perf_lines) == 1
-        assert "read" in perf_lines[0] and "tensors" in perf_lines[0]
+        # no standalone line: the segs are handed to the caller, which folds
+        # them into its single [perf] block rollup
+        assert not [r for r in records if r.startswith("[perf] streamer")]
+        assert streamer._perf_segs and streamer._perf_segs["tensors"] >= 1
+        assert "read" in streamer._perf_segs
 
     @staticmethod
     def _tiny_fixture(tmp_path):

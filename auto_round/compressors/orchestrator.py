@@ -1454,32 +1454,31 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self.shard_writer.write(name=block_name)
                     block.to("meta")
                     _t_write = _time.perf_counter() - _t_write
-                    if envs.AR_PERF_COUNTERS:
-                        logger.info(
-                            "[perf] block %s: load %.1fs%s tune %.1fs pack %.1fs write %.1fs",
-                            block_name,
-                            _t_load,
-                            _format_load_breakdown(_load_sub),
-                            getattr(block, "_stream_tune_seconds", 0.0),
-                            _t_pack,
-                            _t_write,
-                        )
+                    _t_snap = 0.0
                     if rs is not None:
                         # crash-durability contract, same as the serial path:
                         # the manifest may claim this block done only after its
                         # tensors are durably flushed to a shard file
                         self.shard_writer._flush_shard()
-                        _t_snap = _time.perf_counter()
+                        _t0 = _time.perf_counter()
                         is_model_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
                         rs.mark_block_done(
                             block_name,
                             calib_state.get("q_inputs") if calib_state is not None else None,
                             (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None,
                         )
-                        if envs.AR_PERF_COUNTERS:
-                            logger.info(
-                                "[perf] block %s: resume snapshot %.1fs", block_name, _time.perf_counter() - _t_snap
-                            )
+                        _t_snap = _time.perf_counter() - _t0
+                    if envs.AR_PERF_COUNTERS:
+                        logger.info(
+                            "[perf] block %s: load %.1fs%s tune %.1fs pack %.1fs write %.1fs snap %.1fs",
+                            block_name,
+                            _t_load,
+                            _format_load_breakdown(_load_sub),
+                            getattr(block, "_stream_tune_seconds", 0.0),
+                            _t_pack,
+                            _t_write,
+                            _t_snap,
+                        )
                 else:
                     if self._main_loop_may_move_block_off_gpu(self.compress_context.is_immediate_saving):
                         mv_module_from_gpu(block)

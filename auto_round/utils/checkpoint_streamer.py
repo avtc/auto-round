@@ -156,10 +156,8 @@ class CheckpointStreamer:
         # every touched page in RSS until unmapped)
         self._shard_unread: dict[str, set] = {}
         self._open_order: list[str] = []
-        # Sequential consume-once reads only need the current shard plus the
-        # prefetcher's next one; deeper pools keep already-read pages mapped
-        # (munmap on eviction is what releases them from RSS).
-        self._max_open = 2
+        # Sequential consume-once reads: each shard closes the moment its
+        # last tensor is read (_close_if_consumed_), so no pool cap is needed.
         self._model_type = self._read_model_type()
 
         # Prefetch state: a background reader stages whole module prefixes into
@@ -239,11 +237,6 @@ class CheckpointStreamer:
         handle = safe_open(self._shard_path(shard_name), framework="pt", device="cpu")
         handles[shard_name] = handle
         order.append(shard_name)
-        while len(order) > self._max_open:
-            old = order.pop(0)
-            h = handles.pop(old, None)
-            if h is not None:
-                h.__exit__(None, None, None)
         return handle
 
     # -- Prefetch -------------------------------------------------------------
@@ -478,7 +471,7 @@ class CheckpointStreamer:
         shard = self.weight_map[name]
         if self._format == "safetensors":
             tensor = self._get_safe_open_pooled(shard, handles, order).get_tensor(name)
-            self._close_if_consumed_(shard, handles, order)
+            self._close_if_consumed_(name, shard, handles, order)
         else:
             # .bin shards: load (mmap-free) and keep a one-shard cache - shard
             # granularity is coarse for pickle checkpoints, but such shards are
@@ -491,26 +484,26 @@ class CheckpointStreamer:
                     data = torch.load(self._shard_path(shard), map_location="cpu")  # nosec
                 handles[cache_key] = data
                 order.append(cache_key)
-                while len(order) > self._max_open:
-                    old = order.pop(0)
-                    handles.pop(old, None)
             tensor = handles[cache_key][name]
+            self._close_if_consumed_(name, shard, handles, order)
         return tensor
 
-    def _close_if_consumed_(self, shard: str, handles: dict, order: list) -> None:
+    def _close_if_consumed_(self, name: str, shard: str, handles: dict, order: list) -> None:
         """Close a shard the moment its last tensor is read.
 
         Reads are consume-once for this access pattern, so a fully read
         shard is dead weight: its mapping keeps every touched page
-        resident until the LRU gets around to evicting it. Closing here
-        releases the pages immediately (munmap). Safe against concurrent
-        readers: the empty-set condition only becomes true after every
-        ``get_tensor`` for the shard has returned.
+        resident until it is closed. Discarding the just-read tensor and
+        releasing the shard here bounds every pool without a size cap.
+        Safe against concurrent readers: the set only becomes empty after
+        every tensor's discard has landed, and the pool pops are idempotent
+        so at most one caller closes.
         """
         unread = self._shard_unread.get(shard)
         if unread is None:
-            self._shard_unread[shard] = {n for n, s in self.weight_map.items() if s == shard}
-            unread = self._shard_unread[shard]
+            unread = {n for n, s in self.weight_map.items() if s == shard}
+            self._shard_unread[shard] = unread
+        unread.discard(name)
         if unread:
             return
         prefetch_handles = getattr(self, "_prefetch_handles", None)
@@ -585,7 +578,10 @@ class CheckpointStreamer:
         for shard in dead:
             closed = False
             for pool_handles, pool_order in pools:
-                handle = pool_handles.pop(shard, None)
+                handle = None
+                for key in (shard, f"__bin__{shard}"):
+                    h = pool_handles.pop(key, None)
+                    handle = handle or h
                 if handle is not None:
                     if hasattr(handle, "__exit__"):
                         try:
@@ -705,17 +701,10 @@ class CheckpointStreamer:
         if self._prefetch_thread is not None:
             self.prefetch_consumed(prefix)
         if perf is not None:
-            self._perf_segs = None
-            logger.info(
-                "[perf] streamer %s: pop %.2fs read %.2fs cast %.2fs copy %.2fs assign %.2fs (%d tensors)",
-                prefix,
-                perf.get("pop", 0.0),
-                perf.get("read", 0.0),
-                perf.get("cast", 0.0),
-                perf.get("copy", 0.0),
-                perf.get("assign", 0.0),
-                len(loaded),
-            )
+            # segs stay on the instance for the caller's perf rollup
+            # (AR_PERF_COUNTERS folds them into its block line)
+            perf["tensors"] = len(loaded)
+            self._perf_segs = perf
         return loaded
 
     def close(self) -> None:

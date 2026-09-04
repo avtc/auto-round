@@ -64,19 +64,6 @@ class TestMemDiagnosticsGatedByDebugLevel:
         assert 'logger.info(\n                "[stream-mem]' not in src
 
 
-class TestShardPool:
-    def test_depth_is_structural_constant(self):
-        # The LRU depth is a structural constant: sequential consume-once reads
-        # need current + prefetch-next; deeper only keeps already-read pages
-        # mapped in RSS with zero reuse benefit.
-        import inspect
-
-        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
-
-        src = inspect.getsource(CheckpointStreamer.__init__)
-        assert "self._max_open = 2" in src
-
-
 class TestConsumedShardClose:
     def _streamer(self, monkeypatch, tmp_path):
         from auto_round.utils.checkpoint_streamer import CheckpointStreamer
@@ -96,13 +83,9 @@ class TestConsumedShardClose:
         fake = SimpleNamespace(__exit__=lambda self_, *a: closed.append("s0"))
         s._open_handles["s0"] = fake
         s._open_order.append("s0")
-        s._close_if_consumed_("s0", s._open_handles, s._open_order)
+        s._close_if_consumed_("a.w", "s0", s._open_handles, s._open_order)
         assert closed == []  # two tensors still unread
-        s._shard_unread["s0"].discard("a.w")
-        s._close_if_consumed_("s0", s._open_handles, s._open_order)
-        assert closed == []  # one still unread
-        s._shard_unread["s0"].discard("b.w")
-        s._close_if_consumed_("s0", s._open_handles, s._open_order)
+        s._close_if_consumed_("b.w", "s0", s._open_handles, s._open_order)
         assert closed == ["s0"]  # last read -> closed + evicted
         assert "s0" not in s._open_handles and "s0" not in s._open_order
 
@@ -117,9 +100,17 @@ class TestConsumedShardClose:
         s._open_order.append("s1")
         s._prefetch_handle_order.append("s1")
         s._shard_unread["s1"] = set()  # all tensors of s1 already read
-        s._close_if_consumed_("s1", s._open_handles, s._open_order)
+        s._close_if_consumed_("c.w", "s1", s._open_handles, s._open_order)
         assert len(exit_calls) == 2
         assert not s._open_handles and not s._prefetch_handles
+
+    def test_bin_cache_evicted_when_drained(self, monkeypatch, tmp_path):
+        s = self._streamer(monkeypatch, tmp_path)
+        s._open_handles["__bin__s0"] = {"a.w": object(), "b.w": object()}
+        s._open_order.append("__bin__s0")
+        s._shard_unread["s0"] = {"a.w"}  # b.w already read
+        s._close_if_consumed_("a.w", "s0", s._open_handles, s._open_order)
+        assert "__bin__s0" not in s._open_handles and "__bin__s0" not in s._open_order
 
 
 from types import SimpleNamespace  # noqa: E402
