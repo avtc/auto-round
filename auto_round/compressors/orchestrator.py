@@ -999,6 +999,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # the replay leaves granular-read debris that would raise
                     # every later block's peak (VmHWM keeps the high-water mark)
                     logger.info("[stream] host heap trimmed after chain rebuild")
+            if streamer is not None:
+                # startup reads (embeddings / chain init) touch shards the
+                # block loop never revisits; close them before the prefetch
+                # pipeline starts so their mappings stop counting in RSS
+                streamer.release_startup_handles_()
 
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
         # of the quantize loop. With staging devices the blocks land directly

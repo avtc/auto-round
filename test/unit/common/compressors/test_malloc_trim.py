@@ -141,3 +141,24 @@ class TestConsumedShardClose:
 
 
 from types import SimpleNamespace  # noqa: E402
+
+
+class TestStartupRelease:
+    def _streamer(self, tmp_path):
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        s = object.__new__(CheckpointStreamer)
+        s._open_handles = {}
+        s._open_order = []
+        s._shard_path = lambda shard: str(tmp_path / shard)
+        return s
+
+    def test_release_closes_and_clears_all_pools(self, tmp_path):
+        s = self._streamer(tmp_path)
+        exited = []
+        s._open_handles["s0"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s0"))
+        s._open_handles["s1"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s1"))
+        s._open_order.extend(["s0", "s1"])
+        s.release_startup_handles_()
+        assert exited == ["s0", "s1"]
+        assert not s._open_handles and not s._open_order
