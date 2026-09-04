@@ -181,7 +181,7 @@ class TestPlannedSetClose:
         s = self._streamer(tmp_path)
         # s0 fully read except the never-planned vision tensor
         s._shard_unread["s0"] = {"vis.b"}
-        s._shard_unread["s1"] = set()
+        s._shard_unread["s1"] = {"blk1.a"}  # blk1 not yet read -> still serving
         exited = []
         s._open_handles["s0"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s0"))
         s._open_handles["s1"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s1"))
