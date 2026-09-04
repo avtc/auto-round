@@ -121,6 +121,10 @@ class CheckpointStreamer:
         self.weight_map: dict[str, str] = {}
         self._format: Optional[str] = None  # "safetensors" | "bin"
         self._open_handles: dict[str, object] = {}  # shard path -> safe_open handle
+        # shard -> tensor names not yet read; a shard whose set empties is
+        # fully consumed and gets closed immediately (its mapping holds
+        # every touched page in RSS until unmapped)
+        self._shard_unread: dict[str, set] = {}
         self._open_order: list[str] = []
         # Sequential consume-once reads only need the current shard plus the
         # prefetcher's next one; deeper pools keep already-read pages mapped
@@ -393,6 +397,7 @@ class CheckpointStreamer:
         shard = self.weight_map[name]
         if self._format == "safetensors":
             tensor = self._get_safe_open_pooled(shard, handles, order).get_tensor(name)
+            self._close_if_consumed_(shard, handles, order)
         else:
             # .bin shards: load (mmap-free) and keep a one-shard cache - shard
             # granularity is coarse for pickle checkpoints, but such shards are
@@ -430,6 +435,43 @@ class CheckpointStreamer:
                 os.close(fd)
         except (AttributeError, OSError):
             pass
+
+    def _close_if_consumed_(self, shard: str, handles: dict, order: list) -> None:
+        """Close a shard the moment its last tensor is read.
+
+        Reads are consume-once for this access pattern, so a fully read
+        shard is dead weight: its mapping keeps every touched page
+        resident until the LRU gets around to evicting it. Closing here
+        releases the pages immediately (munmap). Safe against concurrent
+        readers: the empty-set condition only becomes true after every
+        ``get_tensor`` for the shard has returned.
+        """
+        unread = self._shard_unread.get(shard)
+        if unread is None:
+            self._shard_unread[shard] = {n for n, s in self.weight_map.items() if s == shard}
+            unread = self._shard_unread[shard]
+        if unread:
+            return
+        prefetch_handles = getattr(self, "_prefetch_handles", None)
+        prefetch_order = getattr(self, "_prefetch_handle_order", None)
+        pools = [(handles, order), (self._open_handles, self._open_order)]
+        if prefetch_handles is not None:
+            pools.append((prefetch_handles, prefetch_order))
+        closed = False
+        for pool_handles, pool_order in pools:
+            for key in (shard, f"__bin__{shard}"):
+                handle = pool_handles.pop(key, None)
+                if handle is not None:
+                    if hasattr(handle, "__exit__"):
+                        try:
+                            handle.__exit__(None, None, None)
+                        except Exception:  # pragma: no cover - best effort
+                            pass
+                    closed = True
+                if key in pool_order:
+                    pool_order.remove(key)
+        if closed and envs.AR_STREAM_DROP_FILE_CACHE:
+            self._drop_file_cache(self._shard_path(shard))
 
     def names_under(self, prefix: str) -> list[str]:
         """Checkpoint tensor names belonging to a module prefix."""

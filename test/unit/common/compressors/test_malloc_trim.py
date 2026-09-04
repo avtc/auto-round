@@ -93,3 +93,51 @@ class TestShardPool:
 
         with pytest.raises(ValueError):
             _ = envs.AR_STREAM_SHARD_POOL  # noqa: B018
+
+
+class TestConsumedShardClose:
+    def _streamer(self, monkeypatch, tmp_path):
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        s = object.__new__(CheckpointStreamer)
+        s.weight_map = {"a.w": "s0", "b.w": "s0", "c.w": "s1"}
+        s._format = "safetensors"
+        s._open_handles = {}
+        s._open_order = []
+        s._shard_unread = {}
+        s._shard_path = lambda shard: str(tmp_path / shard)
+        return s
+
+    def test_closes_only_when_last_tensor_read(self, monkeypatch, tmp_path):
+        s = self._streamer(monkeypatch, tmp_path)
+        closed = []
+        fake = SimpleNamespace(__exit__=lambda self_, *a: closed.append("s0"))
+        s._open_handles["s0"] = fake
+        s._open_order.append("s0")
+        s._close_if_consumed_("s0", s._open_handles, s._open_order)
+        assert closed == []  # two tensors still unread
+        s._shard_unread["s0"].discard("a.w")
+        s._close_if_consumed_("s0", s._open_handles, s._open_order)
+        assert closed == []  # one still unread
+        s._shard_unread["s0"].discard("b.w")
+        s._close_if_consumed_("s0", s._open_handles, s._open_order)
+        assert closed == ["s0"]  # last read -> closed + evicted
+        assert "s0" not in s._open_handles and "s0" not in s._open_order
+
+    def test_closes_in_both_pools(self, monkeypatch, tmp_path):
+        s = self._streamer(monkeypatch, tmp_path)
+        s._prefetch_handles = {}
+        s._prefetch_handle_order = []
+        exit_calls = []
+        for pool in (s._open_handles, s._prefetch_handles):
+            fake = SimpleNamespace(__exit__=lambda self_, *a: exit_calls.append(id(pool)))
+            pool["s1"] = fake
+        s._open_order.append("s1")
+        s._prefetch_handle_order.append("s1")
+        s._shard_unread["s1"] = set()  # all tensors of s1 already read
+        s._close_if_consumed_("s1", s._open_handles, s._open_order)
+        assert len(exit_calls) == 2
+        assert not s._open_handles and not s._prefetch_handles
+
+
+from types import SimpleNamespace  # noqa: E402
