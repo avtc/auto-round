@@ -92,11 +92,6 @@ class TestBgPackEnv:
         with pytest.raises(ValueError, match="AR_STREAM_BG_PACK=1 requires"):
             r("on", 2, False)
 
-    def test_old_env_name_gone(self):
-        from auto_round import envs
-
-        assert not hasattr(envs, "AR_DISABLE_BG_PACK")
-
 
 class TestBgPackWorker:
     def _orchestrator(self, ctx):

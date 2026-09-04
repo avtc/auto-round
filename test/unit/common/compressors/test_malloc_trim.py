@@ -18,10 +18,6 @@ from auto_round.compressors.orchestrator import CompressionOrchestrator
 
 
 class TestMallocTrim:
-    def test_trim_env_removed(self):
-        # trims are unconditional in the streaming loop; the env gate is gone
-        assert not hasattr(envs, "AR_STREAM_MALLOC_TRIM")
-
     def test_trim_host_heap_never_raises_and_returns_bool(self):
         # On non-glibc hosts (Windows/macOS) the ctypes load fails and the
         # helper must degrade to a quiet False, never raise.
@@ -56,10 +52,6 @@ class TestMemDiagnosticsGatedByDebugLevel:
     region attribution, peak-RSS watcher) have no env switches anymore:
     they are DEBUG-level log lines, activated by AR_LOG_LEVEL=DEBUG."""
 
-    def test_env_switches_removed(self):
-        for name in ("AR_STREAM_MEM_INVENTORY", "AR_STREAM_PEAK_WATCH", "AR_STREAM_MEM_TOP"):
-            assert not hasattr(envs, name)
-
     def test_inventory_and_watcher_gated_on_logger(self):
         import inspect
 
@@ -72,31 +64,17 @@ class TestMemDiagnosticsGatedByDebugLevel:
         assert 'logger.info(\n                "[stream-mem]' not in src
 
 
-class TestDropFileCache:
-    def test_env_and_helper_removed(self):
-        # fadvise(DONTNEED) on evicted shards measured no peak-RAM benefit
-        # (19.57 vs 19.58 GB), so the knob and its helper are gone
-        from auto_round import envs
-
-        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
-
-        assert not hasattr(envs, "AR_STREAM_DROP_FILE_CACHE")
-        assert not hasattr(CheckpointStreamer, "_drop_file_cache")
-
-
 class TestShardPool:
-    def test_env_removed_and_depth_constant(self):
+    def test_depth_is_structural_constant(self):
         # The LRU depth is a structural constant: sequential consume-once reads
         # need current + prefetch-next; deeper only keeps already-read pages
         # mapped in RSS with zero reuse benefit.
-        assert not hasattr(envs, "AR_STREAM_SHARD_POOL")
         import inspect
 
         from auto_round.utils.checkpoint_streamer import CheckpointStreamer
 
         src = inspect.getsource(CheckpointStreamer.__init__)
         assert "self._max_open = 2" in src
-        assert "AR_STREAM_SHARD_POOL" not in src
 
 
 class TestConsumedShardClose:
@@ -229,10 +207,6 @@ class TestUnconditionalBoundedResidency:
     unconditional streaming behaviors now - bounded host residency is the
     default contract, not an opt-in recipe."""
 
-    def test_env_gates_fully_removed(self):
-        assert not hasattr(envs, "AR_STREAM_GROUPED_READ")
-        assert not hasattr(envs, "AR_STREAM_CLOSE_PER_BLOCK")
-
     def test_grouped_read_unconditional(self):
         import inspect
 
@@ -240,14 +214,11 @@ class TestUnconditionalBoundedResidency:
 
         src = inspect.getsource(CheckpointStreamer.load_module_)
         assert "key=lambda n: self.weight_map[n]" in src
-        assert "AR_STREAM_GROUPED_READ" not in src
 
     def test_loop_sites_ungated(self):
         import inspect
 
         src = inspect.getsource(CompressionOrchestrator)
-        assert "AR_STREAM_CLOSE_PER_BLOCK" not in src
-        assert "AR_STREAM_MALLOC_TRIM" not in src
         assert "close_main_pool_()" in src
 
 

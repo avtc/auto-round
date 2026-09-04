@@ -620,16 +620,18 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _t0 = _wtime.perf_counter()
                         rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
                         holder["snap"] = _wtime.perf_counter() - _t0
-                    logger.debug(
-                        "[stream] bg pack+write %s: pack %.1fs write %.1fs snapshot %.1fs",
-                        block_name,
-                        holder["pack"],
-                        holder["write"],
-                        holder["snap"],
-                    )
+                    if envs.AR_PERF_COUNTERS:
+                        logger.info(
+                            "[stream] bg pack+write %s: pack %.1fs write %.1fs snapshot %.1fs",
+                            block_name,
+                            holder["pack"],
+                            holder["write"],
+                            holder["snap"],
+                        )
                 else:
                     mv_module_from_gpu(block)
-                    logger.debug("[stream] bg pack %s: pack %.1fs", block_name, holder["pack"])
+                    if envs.AR_PERF_COUNTERS:
+                        logger.info("[stream] bg pack %s: pack %.1fs", block_name, holder["pack"])
             except BaseException as e:  # noqa: BLE001 - re-raised at join
                 holder["exc"] = e
             # NOTE: deliberately NO clear_memory()/gc here: empty_cache +
