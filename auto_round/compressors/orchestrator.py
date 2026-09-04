@@ -674,21 +674,29 @@ class CompressionOrchestrator(BaseOrchestrator):
             seen.add(id(t))
             _add(str(t.device), self._mem_bucket(name), t)
 
-        def _walk(v, dev_hint=None):
+        def _walk(v, bucket="chain"):
             if isinstance(v, torch.Tensor):
                 if v.device.type in ("cuda", "cpu") and id(v) not in seen:
                     seen.add(id(v))
-                    _add(str(v.device), "chain", v)
+                    _add(str(v.device), bucket, v)
             elif isinstance(v, dict):
                 for x in v.values():
-                    _walk(x)
+                    _walk(x, bucket)
             elif isinstance(v, (list, tuple)):
                 for x in v:
-                    _walk(x)
+                    _walk(x, bucket)
 
         if calib_state is not None:
-            for key in ("fp_inputs", "q_inputs", "input_others"):
+            for key in ("fp_inputs", "q_inputs"):
                 _walk(calib_state.get(key))
+            # masks / position ids / rope tables: persistent small residents
+            _walk(calib_state.get("input_others"), bucket="chain-kwargs")
+        if self.shard_writer is not None:
+            pending = getattr(self.shard_writer, "current_shard_tensors", None) or {}
+            for _t in pending.values():
+                if isinstance(_t, torch.Tensor) and _t.device.type in ("cuda", "cpu") and id(_t) not in seen:
+                    seen.add(id(_t))
+                    _add(str(_t.device), "shard-pending", _t)
 
         # host-side breakdown: tracked CPU tensors vs process RSS, so the
         # residual (allocator cache / fragmentation / untracked holders) is
@@ -698,11 +706,13 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             rss_gb = psutil.Process().memory_info().rss / 2**30
             host_parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in sorted(per_dev.get("cpu", {}).items()))
+            tracked_gb = sum(v for v in per_dev.get("cpu", {}).values()) / 2**30
             logger.info(
-                "[stream-mem] %s host: rss %.2fG | cpu tensors %s",
+                "[stream-mem] %s host: rss %.2fG | %s | residual(rss-tracked) %.2fG",
                 tag,
                 rss_gb,
-                host_parts or "none tracked",
+                host_parts or "no tracked cpu tensors",
+                max(0.0, rss_gb - tracked_gb),
             )
         except Exception:  # noqa: BLE001  diagnostics must never break the run
             pass
