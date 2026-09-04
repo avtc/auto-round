@@ -546,6 +546,28 @@ class CheckpointStreamer:
                 if envs.AR_STREAM_DROP_FILE_CACHE:
                     self._drop_file_cache(self._shard_path(shard))
 
+    def close_main_pool_(self) -> None:
+        """Close the consumer pool's shard handles (prefetch pool untouched).
+
+        AR_STREAM_CLOSE_PER_BLOCK: touched pages stay resident until unmap,
+        so holding a shard open across the blocks it serves accumulates
+        their pages until shard end. Closing after each block's read bounds
+        the residency to the current block; the reopen cost is a header
+        parse (~ms). The prefetch reader keeps its own handles.
+        """
+        if not self._open_handles:
+            return
+        for shard, handle in self._open_handles.items():
+            if hasattr(handle, "__exit__"):
+                try:
+                    handle.__exit__(None, None, None)
+                except Exception:  # pragma: no cover - best effort
+                    pass
+            if envs.AR_STREAM_DROP_FILE_CACHE:
+                self._drop_file_cache(self._shard_path(shard))
+        self._open_handles.clear()
+        self._open_order.clear()
+
     def names_under(self, prefix: str) -> list[str]:
         """Checkpoint tensor names belonging to a module prefix."""
         return [n for n in self.weight_map if n == prefix or n.startswith(prefix + ".")]

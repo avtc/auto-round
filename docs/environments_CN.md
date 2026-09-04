@@ -234,6 +234,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
+### AR_STREAM_CLOSE_PER_BLOCK
+
+- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
+- **描述**: 每个块读取完成后立即关闭消费池中的分片句柄。被触碰的页在解除映射前一直驻留，因此跨块持有分片会累积这些页直到分片结束；逐块关闭把驻留限制在当前块，重开开销仅为一次头解析（毫秒级）。预取读取器保有自己独立的句柄池，不受影响。
+
+```bash
+export AR_STREAM_CLOSE_PER_BLOCK=1
+```
+
 ### AR_STREAM_GROUPED_READ
 
 - **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）

@@ -94,6 +94,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Streaming loop: list individual tensors larger than this many GiB
     # (plus the top host memory regions) in the memory inventory. 0 = off.
     "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),
+    # Streaming reader: close the consumer pool's shard handles after every
+    # block's read (bounds mmap residency to the current block; ~ms reopen).
+    "AR_STREAM_CLOSE_PER_BLOCK": lambda: os.getenv("AR_STREAM_CLOSE_PER_BLOCK", "0").lower() in ("1", "true", "yes"),
     # Streaming reader: read a module's tensors grouped by checkpoint shard
     # (file-by-file) instead of module-tree order. Bounds residency to one
     # open shard per module even for adversarially interleaved checkpoints.

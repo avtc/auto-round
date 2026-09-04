@@ -199,3 +199,28 @@ class TestPlannedSetClose:
         s._open_order.append("s0")
         s.close_shards_not_serving_(["blk0"])  # blk0 still planned
         assert exited == []
+
+
+class TestPerBlockClose:
+    def test_env_and_close_main_pool(self, monkeypatch, tmp_path):
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        import auto_round.envs as envs
+
+        assert envs.AR_STREAM_CLOSE_PER_BLOCK is False
+        monkeypatch.setenv("AR_STREAM_CLOSE_PER_BLOCK", "1")
+        assert envs.AR_STREAM_CLOSE_PER_BLOCK is True
+
+        s = object.__new__(CheckpointStreamer)
+        s._open_handles = {}
+        s._open_order = []
+        s._shard_path = lambda shard: str(tmp_path / shard)
+        s._prefetch_handles = {"s9": SimpleNamespace(__exit__=lambda self_, *a: None)}
+        s._prefetch_handle_order = ["s9"]
+        exited = []
+        s._open_handles["s0"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s0"))
+        s._open_order.append("s0")
+        s.close_main_pool_()
+        assert exited == ["s0"]
+        assert not s._open_handles and not s._open_order
+        assert "s9" in s._prefetch_handles  # prefetch pool untouched

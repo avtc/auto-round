@@ -1105,6 +1105,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
                     streamer.close_shards_not_serving_(flat_block_names[flat_block_names.index(block_name) + 1 :])
+                    if envs.AR_STREAM_CLOSE_PER_BLOCK:
+                        streamer.close_main_pool_()
                 materialize_model_(block)
                 if streamer is not None:
                     strip_stale_device_hooks_(block)

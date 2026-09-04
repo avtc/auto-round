@@ -234,6 +234,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
+### AR_STREAM_CLOSE_PER_BLOCK
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Close the consumer pool's shard handles right after each block's read. Touched pages stay resident until unmap, so holding a shard across the blocks it serves accumulates their pages until shard end; per-block closing bounds residency to the current block, at a ~ms reopen cost (one header parse). The prefetch reader keeps its own handle pool and is unaffected.
+
+```bash
+export AR_STREAM_CLOSE_PER_BLOCK=1
+```
+
 ### AR_STREAM_GROUPED_READ
 
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)
