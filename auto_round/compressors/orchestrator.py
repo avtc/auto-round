@@ -713,6 +713,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             buckets = sorted(per_dev.get(dev, {}).items(), key=lambda kv: -kv[1])
             parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in buckets if v > 0)
             tracked = sum(v for _, v in buckets)
+            if tracked == 0 and alloc == 0.0:
+                # idle GPU (not mapped / nothing staged): all-zero lines are
+                # noise; any nonzero usage still shows below
+                continue
             other = max(0.0, alloc - tracked / 2**30)
             logger.info(
                 "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG",
