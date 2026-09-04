@@ -244,10 +244,6 @@ class CheckpointStreamer:
             h = handles.pop(old, None)
             if h is not None:
                 h.__exit__(None, None, None)
-                if envs.AR_STREAM_DROP_FILE_CACHE:
-                    # the evicted shard is consumed for good; release its
-                    # still-mapped page-cache residency from RSS
-                    self._drop_file_cache(self._shard_path(old))
         return handle
 
     # -- Prefetch -------------------------------------------------------------
@@ -501,26 +497,6 @@ class CheckpointStreamer:
             tensor = handles[cache_key][name]
         return tensor
 
-    @staticmethod
-    def _drop_file_cache(path: str) -> None:
-        """Drop a checkpoint shard's page-cache residency (posix_fadvise).
-
-        ``safe_open`` memory-maps each shard; pages touched by reads stay
-        resident in RSS for the lifetime of the mapping even though they are
-        clean, reclaimable and (for an evicted shard) never read again. The
-        accumulated residency inflates the process footprint (and the VmHWM
-        peak) by one shard per newly touched file. Best effort: silently
-        no-ops on non-POSIX hosts.
-        """
-        try:
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            finally:
-                os.close(fd)
-        except (AttributeError, OSError):
-            pass
-
     def _close_if_consumed_(self, shard: str, handles: dict, order: list) -> None:
         """Close a shard the moment its last tensor is read.
 
@@ -555,11 +531,9 @@ class CheckpointStreamer:
                     closed = True
                 if key in pool_order:
                     pool_order.remove(key)
-        if closed and envs.AR_STREAM_DROP_FILE_CACHE:
-            self._drop_file_cache(self._shard_path(shard))
 
     def release_startup_handles_(self) -> None:
-        """Close every pooled shard handle and drop its page-cache residency.
+        """Close every pooled shard handle.
 
         Startup reads (embeddings / chain init / resume rebuild) touch shards
         the block loop will never revisit; their mappings would otherwise
@@ -567,7 +541,6 @@ class CheckpointStreamer:
         before the prefetch pipeline starts, so no reader can race the close.
         Later reads simply reopen the shards they need.
         """
-        paths = []
         for handles, order in (
             (self._open_handles, self._open_order),
             (getattr(self, "_prefetch_handles", None), getattr(self, "_prefetch_handle_order", None)),
@@ -580,12 +553,8 @@ class CheckpointStreamer:
                         handle.__exit__(None, None, None)
                     except Exception:  # pragma: no cover - best effort
                         pass
-                paths.append(self._shard_path(shard))
             handles.clear()
             order.clear()
-        if envs.AR_STREAM_DROP_FILE_CACHE:
-            for path in paths:
-                self._drop_file_cache(path)
 
     def close_shards_not_serving_(self, prefixes) -> None:
         """Close open shards that no upcoming read can touch.
@@ -628,8 +597,6 @@ class CheckpointStreamer:
                     pool_order.remove(shard)
             if closed:
                 logger.debug(f"[stream] closed shard {shard}: no planned read remains")
-                if envs.AR_STREAM_DROP_FILE_CACHE:
-                    self._drop_file_cache(self._shard_path(shard))
 
     def close_main_pool_(self) -> None:
         """Close the consumer pool's shard handles (prefetch pool untouched).
@@ -648,8 +615,6 @@ class CheckpointStreamer:
                     handle.__exit__(None, None, None)
                 except Exception:  # pragma: no cover - best effort
                     pass
-            if envs.AR_STREAM_DROP_FILE_CACHE:
-                self._drop_file_cache(self._shard_path(shard))
         self._open_handles.clear()
         self._open_order.clear()
 
@@ -761,7 +726,5 @@ class CheckpointStreamer:
                     handle.__exit__(None, None, None)
                 except Exception:  # pragma: no cover - best effort
                     pass
-            if envs.AR_STREAM_DROP_FILE_CACHE:
-                self._drop_file_cache(self._shard_path(shard_name))
         self._open_handles.clear()
         self._open_order.clear()

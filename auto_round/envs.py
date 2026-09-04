@@ -96,9 +96,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_STREAM_BG_PACK": lambda: _get_choice_env(
         "AR_STREAM_BG_PACK", "auto", ("auto", "on", "off"), {"1": "on", "0": "off"}
     ),
-    # Streaming reader: drop evicted checkpoint shards' page-cache residency
-    # (posix_fadvise DONTNEED) so mmap'd clean pages stop counting in RSS.
-    "AR_STREAM_DROP_FILE_CACHE": lambda: os.getenv("AR_STREAM_DROP_FILE_CACHE", "0").lower() in ("1", "true", "yes"),
     # torch.compile cache size cap (recompile_limit); streaming block shapes
     # vary, a higher cap avoids spurious eager fallbacks.
     "AR_DYNAMO_CACHE_SIZE_LIMIT": lambda: int(os.getenv("AR_DYNAMO_CACHE_SIZE_LIMIT", "16")),

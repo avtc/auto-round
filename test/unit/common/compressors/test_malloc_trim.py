@@ -73,18 +73,15 @@ class TestMemDiagnosticsGatedByDebugLevel:
 
 
 class TestDropFileCache:
-    def test_env_parse(self, monkeypatch):
-        import auto_round.envs as envs
+    def test_env_and_helper_removed(self):
+        # fadvise(DONTNEED) on evicted shards measured no peak-RAM benefit
+        # (19.57 vs 19.58 GB), so the knob and its helper are gone
+        from auto_round import envs
 
-        assert envs.AR_STREAM_DROP_FILE_CACHE is False
-        monkeypatch.setenv("AR_STREAM_DROP_FILE_CACHE", "1")
-        assert envs.AR_STREAM_DROP_FILE_CACHE is True
-
-    def test_drop_file_cache_never_raises(self, tmp_path):
-        # non-POSIX hosts must silently no-op; a bogus path must not raise
         from auto_round.utils.checkpoint_streamer import CheckpointStreamer
 
-        CheckpointStreamer._drop_file_cache(str(tmp_path / "missing.safetensors"))
+        assert not hasattr(envs, "AR_STREAM_DROP_FILE_CACHE")
+        assert not hasattr(CheckpointStreamer, "_drop_file_cache")
 
 
 class TestShardPool:
