@@ -114,7 +114,7 @@ def cast_position_embeddings_to_block(input_others, block):
     input_others["position_embeddings"] = cast
 
 
-def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=None):
+def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=None, amp=False, amp_dtype=None):
     """Probe which attention-mask form this model's decoder layers accept.
 
     Runs one tiny no-grad forward of the block per candidate form and
@@ -123,6 +123,12 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
     full-attention blocks of the same model take the 4D form), so each block
     is probed; ``preferred`` tries the previous block's form first (block
     types come in runs, so most probes hit immediately).
+
+    The probe must mirror the real replay's execution policy: the replay
+    runs under autocast when amp is enabled, and attention implementations
+    routinely upcast internally (e.g. rope or softmax in fp32 while weights
+    stay low-precision). A raw eager probe would reject every candidate on
+    such models with a dtype error even though the real replay works.
     """
 
     def _to_dev(v, dev):
@@ -151,12 +157,21 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
     else:
         order = candidates
     last_err = None
+    amp_ctx = (
+        torch.autocast(device_type=dev.type, dtype=amp_dtype if amp_dtype is not None else torch.bfloat16)
+        if amp and dev.type in ("cuda", "cpu")
+        else None
+    )
     with torch.no_grad():
         for name, mask in order:
             probe_others = dict(row_others)
             probe_others["attention_mask"] = mask.to(dev)
             try:
-                block(fp_row, **probe_others)
+                if amp_ctx is not None:
+                    with amp_ctx:
+                        block(fp_row, **probe_others)
+                else:
+                    block(fp_row, **probe_others)
                 return name
             except Exception as e:  # noqa: BLE001  shape/dtype/type errors are the signal
                 last_err = e

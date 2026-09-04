@@ -192,3 +192,66 @@ class TestParkCpuBuffers:
         m.register_buffer("tbl", torch.ones(4, device="meta"))
         _park_cpu_buffers_(m, "cuda:0") if torch.cuda.is_available() else _park_cpu_buffers_(m, "cpu")
         assert m.tbl.device.type == "meta"
+
+
+class TestResolveChainMaskFormAmp:
+    """The mask-form probe must mirror the real replay's autocast policy.
+
+    Attention implementations routinely upcast internally (rope/softmax in
+    fp32 while weights stay low precision); a raw eager probe then rejects
+    every candidate form with a dtype error even though the real replay,
+    which runs under autocast, works fine.
+    """
+
+    def _upcasting_block(self):
+        import torch.nn as nn
+
+        class UpcastingAttn(nn.Module):
+            """Dtype-sensitive like a real attention stack.
+
+            The first op multiplies the incoming hidden states (chain-native
+            dtype, often fp32) against low-precision weights: a raw eager
+            call rejects every mask form with a mixed-dtype matmul error,
+            while autocast - what the real replay runs under - absorbs it.
+            """
+
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+
+            def forward(self, hidden_states, attention_mask=None, **kwargs):
+                h = hidden_states @ self.proj.weight.T
+                if attention_mask is not None and attention_mask.dtype == torch.bool:
+                    return h + 1.0
+                if attention_mask is not None and attention_mask.dim() == 2:
+                    return h + 2.0
+                return h
+
+        return UpcastingAttn()
+
+    def test_amp_probe_passes_where_raw_eager_rejects_all(self):
+        from auto_round.utils.streaming_calibration import resolve_chain_mask_form
+
+        block = self._upcasting_block()
+        row = torch.randn(1, 4, 8, dtype=torch.float32)  # chain-native fp32 row
+        keymask = torch.ones(1, 1, 4, dtype=torch.float32)
+        others = {"position_ids": [torch.arange(4)[None]]}
+
+        with pytest.raises(ValueError, match="rejected every candidate form"):
+            resolve_chain_mask_form(block, row, keymask, others, amp=False)
+
+        form = resolve_chain_mask_form(block, row, keymask, others, amp=True, amp_dtype=torch.bfloat16)
+        assert form == "4d_bool"
+
+    def test_preferred_form_tried_first_under_amp(self):
+        from auto_round.utils.streaming_calibration import resolve_chain_mask_form
+
+        block = self._upcasting_block()
+        row = torch.randn(1, 4, 8, dtype=torch.float32)
+        keymask = torch.ones(1, 1, 4, dtype=torch.float32)
+        others = {"position_ids": [torch.arange(4)[None]]}
+
+        form = resolve_chain_mask_form(
+            block, row, keymask, others, preferred="2d_float", amp=True, amp_dtype=torch.bfloat16
+        )
+        assert form == "2d_float"

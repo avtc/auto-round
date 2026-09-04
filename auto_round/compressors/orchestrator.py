@@ -808,8 +808,13 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             rss_gb = psutil.Process().memory_info().rss / 2**30
             peak_gb = self._peak_rss_gb()
-            host_parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in sorted(per_dev.get("cpu", {}).items()))
-            tracked_gb = sum(v for v in per_dev.get("cpu", {}).values()) / 2**30
+            host_buckets = per_dev.get("cpu", {})
+            nonzero = {k: v for k, v in host_buckets.items() if v > 0}
+            empty_blocks = len(host_buckets) - len(nonzero)
+            host_parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in sorted(nonzero.items()))
+            if empty_blocks:
+                host_parts = (host_parts + ", " if host_parts else "") + f"[{empty_blocks} empty buckets]"
+            tracked_gb = sum(v for v in host_buckets.values()) / 2**30
             logger.info(
                 "[stream-mem] %s host: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG",
                 tag,
@@ -944,7 +949,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if d.type == "meta":
                 raise ValueError(f"invalid staging device {d}: meta tensors hold no data")
         depth = int(getattr(self, "stream_prefetch", 0) or 0)
-        shown_depth = depth if depth else (len(devices) if devices else 1)
+        shown_depth = depth if depth else 1
         logger.info(
             "[stream] staging %d block(s) deep on %s; blocks quantize in place (round-robin homes)",
             shown_depth,
@@ -1058,13 +1063,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
         # of the quantize loop. With staging devices the blocks land directly
         # on those devices (round-robin by block index) and are quantized in
-        # place there; otherwise they wait in host RAM. A None depth (CLI
-        # 'auto'/'cpu'/device-list mode) derives one block per staging device,
-        # or 1 for host-RAM staging.
+        # place there; otherwise they wait in host RAM. Lookahead is ONE block
+        # regardless of staging-device count: quantize time per block dwarfs
+        # its load time, so deeper staging only holds extra block-sized VRAM.
         raw_depth = getattr(self, "stream_prefetch", 0)
         stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and raw_depth != 0) else None
         if raw_depth == 0 or raw_depth is None:
-            prefetch_depth = 0 if raw_depth == 0 else (len(stage_devices) if stage_devices else 1)
+            prefetch_depth = 0 if raw_depth == 0 else 1
         else:
             prefetch_depth = int(raw_depth)
         prefetch_names = flat_block_names
@@ -1209,6 +1214,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         calib_state["keymask_2d"][0],
                         calib_state["input_others"],
                         preferred=calib_state.get("_mask_form"),
+                        amp=self.amp,
+                        amp_dtype=self.amp_dtype,
                     )
                     if form != calib_state.get("_mask_form"):
                         # block types come in runs; the transition is the signal
