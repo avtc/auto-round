@@ -461,12 +461,6 @@ class AlgorithmComposer:
                 quant_hooks = self._get_fp_act_hooks(block)
                 reference_output = block_forward_fn(block, fp_inputs, input_others, cache_device=_out_dev)
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
-                # the runner retains its last output dict (auxiliary per-chunk
-                # states) until the NEXT forward overwrites it -- spanning the
-                # whole search/pack/write of this block. The reference we keep
-                # is held by the caller; drop the runner's alias so the other
-                # contents can be freed immediately.
-                block_forward_fn.last_output_dict = None
                 for h in quant_hooks:
                     h.remove()
 

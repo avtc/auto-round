@@ -76,19 +76,3 @@ def test_module_import_clean(unused):
     import auto_round.utils.peak_watch as m
 
     assert m.PeakWatcher is not None
-
-
-class TestRunnerAliasRelease:
-    def test_composer_source_releases_last_output_dict(self):
-        # the runner's alias must be cleared after the reference forward so
-        # auxiliary outputs do not span the whole search/pack/write phase
-        import inspect
-
-        from auto_round.algorithms import composer
-
-        src = inspect.getsource(composer)
-        anchor = 'reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output'
-        assert src.count(anchor) == 1
-        idx = src.splitlines().index([ln for ln in src.splitlines() if anchor in ln][0])
-        window = "\n".join(src.splitlines()[idx : idx + 9])
-        assert "last_output_dict = None" in window
