@@ -281,6 +281,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             convert_module_to_hp_if_necessary(m, self.model_context.amp_dtype, device_manager.device)
 
             m = self.alg_composer.dispatch_block(m, input_ids, input_others)
+            if self._peak_watch is not None:
+                self._peak_watch.set_phase("tune")
 
             if envs.AR_STREAM_MEM_INVENTORY:
                 self._log_device_inventory(
@@ -398,6 +400,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     f"block {i} post",
                     extra_buckets={"cache-remaining": input_others_extra_blocks or {}},
                 )
+            if self._peak_watch is not None:
+                self._peak_watch.set_phase("write")
+                self._peak_watch.log(f"block {i}")
+                self._peak_watch.reset_run_max()
             if resume_state is not None and nblocks == 1:
                 # `input_ids` was already reassigned to `next_input_ids`
                 # above -- it now holds the value the *next* block should use
@@ -407,6 +413,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         if pbar is not None:
             pbar.update(1)
 
+        if self._peak_watch is not None:
+            self._peak_watch.stop()
         if not self.compress_context.is_immediate_saving:
             self.model = mv_module_from_gpu(self.model)
         for n, m in self.model.named_modules():
@@ -1603,6 +1611,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self.shard_writer.adopt_existing_shards()
 
         _mem_inv = bool(envs.AR_STREAM_MEM_INVENTORY)
+        _peak_watch = PeakWatcher() if envs.AR_STREAM_PEAK_WATCH else None
+        self._peak_watch = _peak_watch
+        if _peak_watch is not None:
+            _peak_watch.start()
         if _mem_inv:
             self._log_device_inventory(
                 None, "cache-built", extra_buckets={"cache-remaining": all_inputs, "cache-q": all_q_inputs or {}}
