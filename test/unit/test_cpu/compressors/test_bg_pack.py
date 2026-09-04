@@ -132,3 +132,30 @@ class TestBgPackWorker:
 
         with pytest.raises(RuntimeError, match="pack exploded"):
             self._run(_Ctx(), pack_impl=_boom)
+
+
+class TestFormatHostBuckets:
+    """[stream-mem] host lines must not drown real residents in zero-bucket noise."""
+
+    def test_zero_and_subresolution_buckets_collapse(self):
+        from auto_round.compressors.orchestrator import _format_host_buckets
+
+        buckets = {f"block:{i}": 0 for i in range(80)}
+        buckets["block:1"] = int(0.4 * 2**30)  # real resident
+        buckets["block:2"] = 2 * 2**20  # 2 MiB renders as 0.00G -> negligible
+        out = _format_host_buckets(buckets)
+        assert out.startswith("block:1=0.40G")
+        assert "[79 negligible buckets]" in out
+        assert "block:2=" not in out
+        assert "block:0=" not in out
+
+    def test_all_real_buckets_listed_sorted(self):
+        from auto_round.compressors.orchestrator import _format_host_buckets
+
+        out = _format_host_buckets({"chain": 2 * 2**30, "quantizer": int(0.45 * 2**30)})
+        assert out == "chain=2.00G, quantizer=0.45G"
+
+    def test_empty_buckets_render_empty_string(self):
+        from auto_round.compressors.orchestrator import _format_host_buckets
+
+        assert _format_host_buckets({}) == ""

@@ -70,6 +70,22 @@ if TYPE_CHECKING:
 # TODO wenhuach align all the API args
 
 
+def _format_host_buckets(buckets: dict) -> str:
+    """Render host inventory buckets compactly for the [stream-mem] log line.
+
+    Buckets below the 0.01G render resolution (e.g. placeholder per-block
+    entries) would print as ``block:N=0.00G`` and drown the real residents,
+    so they collapse into one ``[N negligible buckets]`` marker. The
+    tracked-total sum still counts every bucket.
+    """
+    shown = {k: v for k, v in buckets.items() if v >= 0.005 * 2**30}
+    parts = [f"{k}={v / 2**30:.2f}G" for k, v in sorted(shown.items())]
+    skipped = len(buckets) - len(shown)
+    if skipped:
+        parts.append(f"[{skipped} negligible buckets]")
+    return ", ".join(parts)
+
+
 class CompressionOrchestrator(BaseOrchestrator):
 
     def __init__(
@@ -809,11 +825,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             rss_gb = psutil.Process().memory_info().rss / 2**30
             peak_gb = self._peak_rss_gb()
             host_buckets = per_dev.get("cpu", {})
-            nonzero = {k: v for k, v in host_buckets.items() if v > 0}
-            empty_blocks = len(host_buckets) - len(nonzero)
-            host_parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in sorted(nonzero.items()))
-            if empty_blocks:
-                host_parts = (host_parts + ", " if host_parts else "") + f"[{empty_blocks} empty buckets]"
+            host_parts = _format_host_buckets(host_buckets)
             tracked_gb = sum(v for v in host_buckets.values()) / 2**30
             logger.info(
                 "[stream-mem] %s host: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG",
