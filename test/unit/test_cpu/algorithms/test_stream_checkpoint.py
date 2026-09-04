@@ -1423,3 +1423,94 @@ class TestFragmentationRelease:
         monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
         assert cls._release_cached_segments_if_fragmented(stub, "cpu") is False
         assert calls == []
+
+
+class TestPrefetchConsumerWaits:
+    """load_module_ must wait out an in-flight prefetch of the same prefix.
+
+    Without the wait the consumer falls back to its own disk read while the
+    reader keeps staging the same block - two full copies on the staging
+    device, one freed only afterwards (block-sized reserved-but-unallocated
+    gap, first-forward OOMs on tightly-fitting GPUs).
+    """
+
+    def test_consumer_waits_for_inflight_staging(self, tmp_path, monkeypatch):
+        import threading
+        import time as _time
+
+        torch.manual_seed(0)
+        w = torch.randn(4, 8)
+        path = _make_sharded_checkpoint(tmp_path, {"single.safetensors": {"blk.a.weight": w}})
+        streamer = CheckpointStreamer(path)
+
+        import torch.nn as nn
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 4, bias=False)
+
+        with torch.device("meta"):
+            blk = Blk()
+
+        read_threads = []
+        real_read = streamer._read_tensor
+
+        def _slow_read(name, handles, order):
+            read_threads.append(threading.get_ident())
+            _time.sleep(0.05)
+            return real_read(name, handles, order)
+
+        monkeypatch.setattr(streamer, "_read_tensor", _slow_read)
+        streamer.start_prefetch(["blk"], depth=1, stage_devices=None)
+        try:
+            streamer.load_module_(blk, "blk", device=None)
+        finally:
+            streamer.stop_prefetch()
+        # every tensor came from the reader's staging, never the main thread
+        assert read_threads and set(read_threads) != {threading.get_ident()}
+        assert torch.equal(blk.a.weight.data, w)
+
+    def test_non_enqueued_prefix_does_not_wait(self, tmp_path, monkeypatch):
+        import threading
+        import time as _time
+
+        w = torch.randn(4, 8)
+        e = torch.randn(8, 4)
+        path = _make_sharded_checkpoint(tmp_path, {"single.safetensors": {"blk.a.weight": w, "embed.weight": e}})
+        streamer = CheckpointStreamer(path)
+
+        import torch.nn as nn
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 4, bias=False)
+
+        class Emb(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.zeros(8, 4, dtype=torch.float32).to("meta"))
+
+        started = threading.Event()
+        release = threading.Event()
+
+        real_read = streamer._read_tensor
+
+        def _gated_read(name, handles, order):
+            if name.startswith("blk."):
+                started.set()
+                release.wait(timeout=10)
+            return real_read(name, handles, order)
+
+        monkeypatch.setattr(streamer, "_read_tensor", _gated_read)
+        streamer.start_prefetch(["blk"], depth=1, stage_devices=None)
+        try:
+            assert started.wait(timeout=10)  # reader is mid-staging blk
+            with torch.device("meta"):
+                emb = Emb()
+            streamer.load_module_(emb, "embed", device=None)  # not enqueued: must not block
+            assert torch.equal(emb.weight.data, e)
+        finally:
+            release.set()
+            streamer.stop_prefetch()

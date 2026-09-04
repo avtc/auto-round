@@ -168,6 +168,8 @@ class CheckpointStreamer:
         self._prefetch_cond = threading.Condition()
         self._prefetch_remaining: list[str] = []  # prefixes not yet consumed
         self._prefetch_staged: list[str] = []  # staged, awaiting consumption
+        self._prefetch_remaining = []
+        self._prefetch_enqueued = set()
         self._prefetch_depth = 0
         self._perf_segs = None  # armed per load_module_ under AR_PERF_COUNTERS
         self._prefetch_thread: Optional[threading.Thread] = None
@@ -324,6 +326,7 @@ class CheckpointStreamer:
                         "use a real device (e.g. 'cpu' or 'cuda:k')"
                     )
         self._prefetch_remaining = list(module_prefixes)
+        self._prefetch_enqueued = set(module_prefixes)
         self._prefetch_depth = max(1, int(depth))
         self._prefetch_stop = False
         self._prefetch_err = None
@@ -401,6 +404,30 @@ class CheckpointStreamer:
         self._prefetch_thread = None
         with self._prefetch_cond:
             self._prefetch_cache.clear()
+
+    def _await_prefetch_prefix(self, prefix: str) -> None:
+        """Block until the reader finishes staging *prefix* (or skips past it).
+
+        Without this wait the consumer silently falls back to its own disk
+        read while the reader keeps staging the SAME prefix in parallel - two
+        full block copies on the staging device, one of them freed only after
+        the duplicate lands (observed as a block-sized reserved-but-unallocated
+        gap and first-forward OOMs on tightly-fitting devices). Prefixes the
+        reader was never asked to stage (embeddings, lm_head, outside-block
+        modules) return immediately.
+        """
+        if self._prefetch_thread is None or self._prefetch_stop:
+            return
+        with self._prefetch_cond:
+            if prefix not in self._prefetch_enqueued:
+                return
+            while (
+                prefix in self._prefetch_remaining
+                and prefix not in self._prefetch_staged
+                and self._prefetch_err is None
+                and not self._prefetch_stop
+            ):
+                self._prefetch_cond.wait(timeout=5.0)
 
     def _prefetch_pop(self, name: str) -> Optional[torch.Tensor]:
         if self._prefetch_err is not None:
@@ -672,6 +699,9 @@ class CheckpointStreamer:
         self._perf_segs = perf
         renames = _name_rewrites_for(self._model_type)
         names = self.names_under(prefix)
+        # wait out an in-flight prefetch of this very prefix instead of
+        # racing it with a duplicate read (see _await_prefetch_prefix)
+        self._await_prefetch_prefix(prefix)
         if envs.AR_STREAM_GROUPED_READ:
             # file-by-file reads: group the prefix's tensors by shard so each
             # file is opened, fully read and (once consumed) closed before the
