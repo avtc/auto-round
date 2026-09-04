@@ -50,7 +50,7 @@ from auto_round.utils import clear_memory
 from auto_round.utils.device_manager import device_manager
 
 
-def _stream_out_device(block):
+def _stream_out_device(block, low_gpu_mem_usage: bool = False):
     """Park collected calibration rows on the producing block's home.
 
     BlockForwardRunner parks returned rows on its fixed cache_device (the
@@ -58,9 +58,18 @@ def _stream_out_device(block):
     block would then pay a cross-device toll per tuning iteration. When the
     streaming loop has stamped a home device, collect there instead. Returns
     None for non-streaming runs (runner default, unchanged behavior).
+
+    ``low_gpu_mem_usage=True`` opts into the data-driven memory contract:
+    the chain stays on host RAM (the block runner chunks rows onto the GPU
+    per forward batch) instead of the home GPU -- lower VRAM at the cost of
+    the per-iteration host->device hop.
     """
     home = getattr(block, "_stream_home_device", None)
-    return torch.device(home) if home is not None else None
+    if home is None:
+        return None
+    if low_gpu_mem_usage:
+        return torch.device("cpu")
+    return torch.device(home)
 
 
 @dataclass
@@ -410,7 +419,8 @@ class AlgorithmComposer:
             - *reference_output*: FP reference output collected before optimization.
         """
         block_forward_fn = self.block_forward
-        _out_dev = _stream_out_device(block)
+        _ctx = getattr(self._orchestrator_ref, "compress_context", None)
+        _out_dev = _stream_out_device(block, low_gpu_mem_usage=bool(getattr(_ctx, "low_gpu_mem_usage", False)))
 
         # -- Step 0: Layer-wise rotation (before any reference/calibration) ----
         # Rotates this block's weights and installs online hooks so all downstream

@@ -438,7 +438,12 @@ class SignRoundQuantizer(BaseQuantizer):
         # Use quantized inputs if available and enabled
         active_inputs = q_inputs if (q_inputs is not None and self.enable_quanted_input) else fp_inputs
         _home = torch.device(device) if not isinstance(device, torch.device) else device
-        _rehome_calibration_state(active_inputs, fp_outputs, _home)
+        _park = _home
+        if self.compress_context.low_gpu_mem_usage:
+            # host-RAM chain contract: leave the rows where the runner parked
+            # them (cpu) instead of bulk-moving them onto the tuning GPU
+            _park = torch.device("cpu")
+        _rehome_calibration_state(active_inputs, fp_outputs, _park)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(

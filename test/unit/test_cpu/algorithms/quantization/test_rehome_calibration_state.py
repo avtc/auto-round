@@ -84,3 +84,18 @@ def test_stream_out_device_follows_stamp():
     block = nn.Linear(2, 2)
     block._stream_home_device = torch.device("cuda:1")
     assert _stream_out_device(block) == torch.device("cuda:1")
+
+
+def test_stream_out_device_low_gpu_parks_on_cpu():
+    """low_gpu_mem_usage opts the streaming chain into host-RAM parking,
+    matching the data-driven memory contract instead of the home GPU."""
+    import torch as _torch
+
+    from auto_round.algorithms.composer import _stream_out_device
+
+    block = _torch.nn.Linear(2, 2)
+    block._stream_home_device = "cuda:1"
+    assert _stream_out_device(block, low_gpu_mem_usage=True) == _torch.device("cpu")
+    assert _stream_out_device(block, low_gpu_mem_usage=False) == _torch.device("cuda:1")
+    # no streaming stamp -> still None regardless of the flag
+    assert _stream_out_device(_torch.nn.Linear(2, 2), low_gpu_mem_usage=True) is None

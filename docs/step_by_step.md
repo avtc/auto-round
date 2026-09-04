@@ -978,6 +978,14 @@ auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --str
 - Resume: `AR_RESUME_DIR` works with streaming runs; completed blocks are skipped and their output shards are
   adopted as-is. Python API users can pass `stream_prefetch_devices` to control staging explicitly.
 
+- Supported formats: streaming requires per-block packable integer formats (`auto_round`, `auto_round:llm_compressor`,
+  `auto_round:auto_gptq`, `auto_round:auto_awq`). GGUF and any format without per-block immediate packing fail fast
+  with an explicit error -- progressive shard writing is the streaming contract.
+- `--low_gpu_mem_usage`: by default the streaming calibration chain (the calibration rows feeding each block)
+  is parked on the block's home GPU for iteration speed. With `--low_gpu_mem_usage` the chain stays in host RAM
+  and rows are chunked onto the GPU per forward batch (the same memory contract as the ordinary data-driven
+  path) -- lower VRAM at some wall-clock cost.
+
 The calibration data flows through a bf16 reference chain, so the collected statistics match the ordinary
 data-driven calibration within float tolerance (equivalence is regression-tested).
 
