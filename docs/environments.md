@@ -225,6 +225,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)
 - **Description**: Streaming-quantization diagnostic. When set, the streaming zero-shot loop AND the data-driven block loop log a per-GPU memory breakdown every block (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state) and a host line with process RSS vs tracked CPU tensors (chain residents under `--low_gpu_mem_usage`). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
 
+### AR_STREAM_PEAK_WATCH
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Sample process RSS on a short interval (~20ms) and attribute every new high-water mark to the current pipeline phase (`load`/`tune`/`write`) plus a top-regions snapshot captured at the peak instant. Sampled inventories fire between phases and miss the during-block transient peak; this closes that gap. Most informative with `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072`, where every large allocation is its own anonymous mapping whose size equals the allocation size.
+
+```bash
+export AR_STREAM_PEAK_WATCH=1
+```
+
 ### AR_STREAM_MEM_TOP
 
 - **Type**: float, GiB threshold (default `0` = off)

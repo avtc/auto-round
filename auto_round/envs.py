@@ -91,6 +91,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
     # Streaming loop: log a per-GPU (and host) memory inventory every block.
     "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower() in ("1", "true", "yes"),
+    # Streaming loop: sample RSS on a short interval and attribute each new
+    # high-water mark to the current phase (load/tune/pack/write) plus a
+    # top-regions snapshot at the peak instant.
+    "AR_STREAM_PEAK_WATCH": lambda: os.getenv("AR_STREAM_PEAK_WATCH", "0").lower() in ("1", "true", "yes"),
     # Streaming loop: list individual tensors larger than this many GiB
     # (plus the top host memory regions) in the memory inventory. 0 = off.
     "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),

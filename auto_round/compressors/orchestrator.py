@@ -38,6 +38,7 @@ from auto_round.compressors.utils import (
 )
 from auto_round.data_type.utils import update_block_global_scale_if_needed
 from auto_round.logger import logger
+from auto_round.utils.peak_watch import PeakWatcher
 from auto_round.modeling.fused_moe.replace_modules import materialize_model_
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
@@ -1075,6 +1076,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         pbar = tqdm(range(total_block_cnt))
         stream_block_idx = 0
         blocks_before = 0
+        _peak_watch = PeakWatcher() if envs.AR_STREAM_PEAK_WATCH else None
+        if _peak_watch is not None:
+            _peak_watch.start()
         flat_block_names = [name for group in all_blocks for name in group]
         for g_idx, block_names in enumerate(all_blocks):
             rs = resume_states[g_idx] if resume_states is not None and g_idx < len(resume_states) else None
@@ -1091,6 +1095,8 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                 # ── Infrastructure: materialize ───────────────────────────
                 _t_load = _time.perf_counter()
+                if _peak_watch is not None:
+                    _peak_watch.set_phase("load")
                 if streamer is not None:
                     if stage_devices:
                         # the reader records where each block was ACTUALLY staged
@@ -1177,6 +1183,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     calib_state["_mask_form"] = form
                 if calib_state is not None and calib_state["fp_inputs"] is not None:
                     _t_tune = _time.perf_counter()
+                    if _peak_watch is not None:
+                        _peak_watch.set_phase("tune")
                     new_q_input, reference_output = self.alg_composer.compress_block(
                         block,
                         calib_state["fp_inputs"],
@@ -1292,12 +1300,18 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # post-tune sample: catches the during-tuning transient
                     # peak via VmHWM that the pre-tune snapshot misses
                     self._log_device_inventory(calib_state, f"block {stream_block_idx} post")
+                if _peak_watch is not None:
+                    _peak_watch.set_phase("write")
+                    _peak_watch.log(f"block {stream_block_idx}")
+                    _peak_watch.reset_run_max()
                 clear_memory()
                 if envs.AR_STREAM_MALLOC_TRIM:
                     self._trim_host_heap()
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
+            if _peak_watch is not None:
+                _peak_watch.stop()
             blocks_before += len(block_names)
 
         # Pipeline lifecycle: model-level teardown (also finalizes rotation)
