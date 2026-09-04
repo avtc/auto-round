@@ -159,7 +159,7 @@ class CheckpointStreamer:
         # Sequential consume-once reads only need the current shard plus the
         # prefetcher's next one; deeper pools keep already-read pages mapped
         # (munmap on eviction is what releases them from RSS).
-        self._max_open = int(envs.AR_STREAM_SHARD_POOL)
+        self._max_open = 2
         self._model_type = self._read_model_type()
 
         # Prefetch state: a background reader stages whole module prefixes into

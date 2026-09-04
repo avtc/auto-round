@@ -97,10 +97,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Streaming loop: list individual tensors larger than this many GiB
     # (plus the top host memory regions) in the memory inventory. 0 = off.
     "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),
-    # Streaming reader: max simultaneously open checkpoint shards (LRU pool).
-    # Sequential consume-once access needs current + prefetch-next = 2; a
-    # deeper pool only keeps already-read pages mapped, inflating RSS.
-    "AR_STREAM_SHARD_POOL": lambda: max(1, int(os.getenv("AR_STREAM_SHARD_POOL", "2"))),
     # Streaming reader: drop evicted checkpoint shards' page-cache residency
     # (posix_fadvise DONTNEED) so mmap'd clean pages stop counting in RSS.
     "AR_STREAM_DROP_FILE_CACHE": lambda: os.getenv("AR_STREAM_DROP_FILE_CACHE", "0").lower() in ("1", "true", "yes"),

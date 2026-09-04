@@ -243,15 +243,6 @@ export AR_STREAM_PEAK_WATCH=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
-### AR_STREAM_SHARD_POOL
-
-- **类型**: 整数（默认 `2`）
-- **描述**: 流式读取器 LRU 句柄池中同时打开的 checkpoint 分片上限。访问模式是顺序一次性消费：只需当前分片加预取的下一个分片。每个打开的分片在被淘汰（munmap）之前会使其被触碰的页一直驻留在 RSS 中，因此更深的池 - 或早期触碰后滞留在池中的分片 - 会保持数 GB 的驻留而没有任何复用收益。
-
-```bash
-export AR_STREAM_SHARD_POOL=2
-```
-
 ### AR_STREAM_DROP_FILE_CACHE
 
 - **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）

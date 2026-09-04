@@ -78,19 +78,18 @@ class TestDropFileCache:
 
 
 class TestShardPool:
-    def test_env_default_and_bounds(self, monkeypatch):
-        import auto_round.envs as envs
+    def test_env_removed_and_depth_constant(self):
+        # The LRU depth is a structural constant: sequential consume-once reads
+        # need current + prefetch-next; deeper only keeps already-read pages
+        # mapped in RSS with zero reuse benefit.
+        assert not hasattr(envs, "AR_STREAM_SHARD_POOL")
+        import inspect
 
-        assert envs.AR_STREAM_SHARD_POOL == 2
-        monkeypatch.setenv("AR_STREAM_SHARD_POOL", "4")
-        assert envs.AR_STREAM_SHARD_POOL == 4
-        monkeypatch.setenv("AR_STREAM_SHARD_POOL", "0")
-        assert envs.AR_STREAM_SHARD_POOL == 1  # clamped
-        monkeypatch.setenv("AR_STREAM_SHARD_POOL", "bogus")
-        import pytest
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
 
-        with pytest.raises(ValueError):
-            _ = envs.AR_STREAM_SHARD_POOL  # noqa: B018
+        src = inspect.getsource(CheckpointStreamer.__init__)
+        assert "self._max_open = 2" in src
+        assert "AR_STREAM_SHARD_POOL" not in src
 
 
 class TestConsumedShardClose:
