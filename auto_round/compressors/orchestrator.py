@@ -1075,6 +1075,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         pbar = tqdm(range(total_block_cnt))
         stream_block_idx = 0
         blocks_before = 0
+        flat_block_names = [name for group in all_blocks for name in group]
         for g_idx, block_names in enumerate(all_blocks):
             rs = resume_states[g_idx] if resume_states is not None and g_idx < len(resume_states) else None
             for k_idx, block_name in enumerate(block_names):
@@ -1103,6 +1104,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     else:
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
+                    streamer.close_shards_not_serving_(flat_block_names[flat_block_names.index(block_name) + 1 :])
                 materialize_model_(block)
                 if streamer is not None:
                     strip_stale_device_hooks_(block)

@@ -162,3 +162,40 @@ class TestStartupRelease:
         s.release_startup_handles_()
         assert exited == ["s0", "s1"]
         assert not s._open_handles and not s._open_order
+
+
+class TestPlannedSetClose:
+    def _streamer(self, tmp_path):
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        s = object.__new__(CheckpointStreamer)
+        s.weight_map = {"blk0.a": "s0", "vis.b": "s0", "blk1.a": "s1"}
+        s._format = "safetensors"
+        s._open_handles = {}
+        s._open_order = []
+        s._shard_unread = {}
+        s._shard_path = lambda shard: str(tmp_path / shard)
+        return s
+
+    def test_closes_shard_with_no_planned_reads(self, tmp_path):
+        s = self._streamer(tmp_path)
+        # s0 fully read except the never-planned vision tensor
+        s._shard_unread["s0"] = {"vis.b"}
+        s._shard_unread["s1"] = set()
+        exited = []
+        s._open_handles["s0"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s0"))
+        s._open_handles["s1"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s1"))
+        s._open_order.extend(["s0", "s1"])
+        s.close_shards_not_serving_(["blk1"])  # only blk1 remains planned
+        assert exited == ["s0"]  # s0 serves nothing planned (vis.b never read)
+        assert "s0" not in s._open_handles
+        assert "s1" in s._open_handles  # still serving blk1
+
+    def test_keeps_shard_serving_future_block(self, tmp_path):
+        s = self._streamer(tmp_path)
+        s._shard_unread["s0"] = {"blk0.a", "vis.b"}
+        exited = []
+        s._open_handles["s0"] = SimpleNamespace(__exit__=lambda self_, *a: exited.append("s0"))
+        s._open_order.append("s0")
+        s.close_shards_not_serving_(["blk0"])  # blk0 still planned
+        assert exited == []

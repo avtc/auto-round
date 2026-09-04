@@ -502,6 +502,50 @@ class CheckpointStreamer:
             for path in paths:
                 self._drop_file_cache(path)
 
+    def close_shards_not_serving_(self, prefixes) -> None:
+        """Close open shards that no upcoming read can touch.
+
+        A shard stays resident while its mapping is open even when its
+        remaining unread tensors will never be read in this run (skipped
+        resume blocks, or non-text tensors such as vision towers that text
+        streaming never materializes). Given the prefixes still planned,
+        close every open shard whose unread set does not intersect them;
+        later unplanned reads simply reopen the shard.
+        """
+        planned = set()
+        for prefix in prefixes or ():
+            planned.update(self.names_under(prefix))
+        if not planned:
+            return
+        dead = []
+        for shard, unread in self._shard_unread.items():
+            if not unread or planned.isdisjoint(unread):
+                dead.append(shard)
+        if not dead:
+            return
+        prefetch_handles = getattr(self, "_prefetch_handles", None)
+        prefetch_order = getattr(self, "_prefetch_handle_order", None)
+        pools = [(self._open_handles, self._open_order)]
+        if prefetch_handles is not None:
+            pools.append((prefetch_handles, prefetch_order))
+        for shard in dead:
+            closed = False
+            for pool_handles, pool_order in pools:
+                handle = pool_handles.pop(shard, None)
+                if handle is not None:
+                    if hasattr(handle, "__exit__"):
+                        try:
+                            handle.__exit__(None, None, None)
+                        except Exception:  # pragma: no cover - best effort
+                            pass
+                    closed = True
+                if shard in pool_order:
+                    pool_order.remove(shard)
+            if closed:
+                logger.debug(f"[stream] closed shard {shard}: no planned read remains")
+                if envs.AR_STREAM_DROP_FILE_CACHE:
+                    self._drop_file_cache(self._shard_path(shard))
+
     def names_under(self, prefix: str) -> list[str]:
         """Checkpoint tensor names belonging to a module prefix."""
         return [n for n in self.weight_map if n == prefix or n.startswith(prefix + ".")]
