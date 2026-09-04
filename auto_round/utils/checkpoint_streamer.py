@@ -169,6 +169,7 @@ class CheckpointStreamer:
         self._prefetch_remaining: list[str] = []  # prefixes not yet consumed
         self._prefetch_staged: list[str] = []  # staged, awaiting consumption
         self._prefetch_depth = 0
+        self._perf_segs = None  # armed per load_module_ under AR_PERF_COUNTERS
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_stop = False
         self._prefetch_err: Optional[BaseException] = None
@@ -425,13 +426,26 @@ class CheckpointStreamer:
         load-dtype policy (checkpoint-only tensors are passed through
         verbatim, mirroring the normal path where they never become part of
         the model and so are never dtype-converted)."""
+        _p = self._perf_segs
+        _t = [time.perf_counter()] if _p is not None else None
+
+        def _lap(key: str) -> None:
+            if _p is not None:
+                now = time.perf_counter()
+                _p[key] = _p.get(key, 0.0) + (now - _t[0])
+                _t[0] = now
+
         tensor = self._prefetch_pop(name)
+        _lap("pop")
         if tensor is None:
             tensor = self._read_tensor(name, self._open_handles, self._open_order)
+            _lap("read")
         if self.load_dtype is not None and not raw and tensor.is_floating_point():
             tensor = tensor.to(self.load_dtype)
+            _lap("cast")
         if device is not None:
             tensor = tensor.to(device)
+            _lap("copy")
         return tensor
 
     def _read_tensor(self, name: str, handles: dict, order: list) -> torch.Tensor:
@@ -653,6 +667,9 @@ class CheckpointStreamer:
         targets.update(dict(module.named_buffers(recurse=True)))
         by_short = {prefix + ("." if prefix else "") + k: v for k, v in targets.items()}
         loaded = []
+        # AR_PERF_COUNTERS: per-segment fetch accounting for this load only
+        perf = {} if envs.AR_PERF_COUNTERS else None
+        self._perf_segs = perf
         renames = _name_rewrites_for(self._model_type)
         names = self.names_under(prefix)
         if envs.AR_STREAM_GROUPED_READ:
@@ -681,8 +698,11 @@ class CheckpointStreamer:
                     f"[stream] shape mismatch for {name}: checkpoint {tuple(tensor.shape)} vs module {tuple(tgt.shape)}"
                 )
             rel = mod_name[len(prefix) + 1 :] if prefix else mod_name
+            _t_assign = time.perf_counter() if perf is not None else None
             if not self._assign_leaf_(module, rel, tensor):
                 raise RuntimeError(f"[stream] failed to assign {name!r} into module")
+            if perf is not None:
+                perf["assign"] = perf.get("assign", 0.0) + (time.perf_counter() - _t_assign)
             loaded.append(name)
         if not loaded:
             raise ValueError(f"[stream] no checkpoint tensors matched module prefix {prefix!r}")
@@ -690,6 +710,18 @@ class CheckpointStreamer:
             _park_cpu_buffers_(module, device)
         if self._prefetch_thread is not None:
             self.prefetch_consumed(prefix)
+        if perf is not None:
+            self._perf_segs = None
+            logger.info(
+                "[perf] streamer %s: pop %.2fs read %.2fs cast %.2fs copy %.2fs assign %.2fs (%d tensors)",
+                prefix,
+                perf.get("pop", 0.0),
+                perf.get("read", 0.0),
+                perf.get("cast", 0.0),
+                perf.get("copy", 0.0),
+                perf.get("assign", 0.0),
+                len(loaded),
+            )
         return loaded
 
     def close(self) -> None:

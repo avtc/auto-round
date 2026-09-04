@@ -70,6 +70,27 @@ if TYPE_CHECKING:
 # TODO wenhuach align all the API args
 
 
+def _mark_load_seg(parts: dict, key: str, t0: float) -> float:
+    """Fold one load sub-phase into the perf breakdown; returns a fresh t0."""
+    if parts is not None:
+        parts[key] = _time.perf_counter() - t0
+    return _time.perf_counter()
+
+
+def _format_load_breakdown(parts: dict, min_s: float = 0.05) -> str:
+    """Render the load sub-phase breakdown for the [perf] line.
+
+    Segments below ``min_s`` fold away so a fast load stays a single number;
+    empty string keeps the line unchanged for runs without the counters.
+    """
+    if not parts:
+        return ""
+    shown = [(k, v) for k, v in parts.items() if v >= min_s]
+    if not shown:
+        return ""
+    return " (" + ", ".join(f"{k} {v:.1f}s" for k, v in shown) + ")"
+
+
 def _format_host_buckets(buckets: dict) -> str:
     """Render host inventory buckets compactly for the [stream-mem] log line.
 
@@ -560,7 +581,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         """
         import threading as _threading
 
-        holder = {"exc": None, "pack": 0.0, "write": 0.0}
+        holder = {"exc": None, "pack": 0.0, "write": 0.0, "snap": 0.0}
 
         def _worker():
             import time as _wtime
@@ -595,12 +616,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                         # the manifest may claim this block done only after
                         # its tensors are durably flushed to a shard file
                         self.shard_writer._flush_shard()
+                        _t0 = _wtime.perf_counter()
                         rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
+                        holder["snap"] = _wtime.perf_counter() - _t0
                     logger.info(
-                        "[stream] bg pack+write %s: pack %.1fs write %.1fs",
+                        "[stream] bg pack+write %s: pack %.1fs write %.1fs snapshot %.1fs",
                         block_name,
                         holder["pack"],
                         holder["write"],
+                        holder["snap"],
                     )
                 else:
                     mv_module_from_gpu(block)
@@ -647,9 +671,47 @@ class CompressionOrchestrator(BaseOrchestrator):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 if reason:
-                    logger.info("[stream] cuda cache cleared after %s", reason)
+                    parts = []
+                    for idx in range(torch.cuda.device_count()):
+                        alloc = torch.cuda.memory_allocated(idx) / 2**30
+                        reserved = torch.cuda.memory_reserved(idx) / 2**30
+                        parts.append(f"cuda:{idx} alloc {alloc:.2f}G reserved {reserved:.2f}G")
+                    logger.info("[stream] cuda state after %s: %s", reason, "; ".join(parts))
         except Exception:  # noqa: BLE001  diagnostics only; never break the run
             pass
+
+    def _release_cached_segments_if_fragmented(self, device, min_gap_bytes: int = 2 * 2**30) -> bool:
+        """Return provably-free cached segments on ``device`` at a phase boundary.
+
+        A block-sized transient on the staging path leaves its segments in
+        the allocator's cache; the next block's tuning then OOMs on memory
+        that is free but reserved. Checked once per block right after load
+        (before any tuning allocation): when the free-in-reserve gap exceeds
+        ``min_gap_bytes`` the cached segments are released. Pure allocator
+        hygiene - no live tensor is touched.
+        """
+        try:
+            if not torch.cuda.is_available():
+                return False
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            if dev.type != "cuda":
+                return False
+            idx = dev.index if dev.index is not None else torch.cuda.current_device()
+            gap = torch.cuda.memory_reserved(idx) - torch.cuda.memory_allocated(idx)
+            if gap < min_gap_bytes:
+                return False
+            torch.cuda.empty_cache()
+            if not getattr(self, "_frag_release_logged", False):
+                self._frag_release_logged = True
+                logger.info(
+                    "[stream] released %.2fG of cached free segments on %s before tuning "
+                    "(allocator fragmentation hygiene; one-time log)",
+                    gap / 2**30,
+                    dev,
+                )
+            return True
+        except Exception:  # noqa: BLE001  diagnostics only; never break the run
+            return False
 
     @staticmethod
     def _trim_host_heap() -> bool:
@@ -1173,6 +1235,8 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                 # ── Infrastructure: materialize ───────────────────────────
                 _t_load = _time.perf_counter()
+                _load_sub = {} if envs.AR_PERF_COUNTERS else None
+                _t_seg = _time.perf_counter()
                 if _peak_watch is not None:
                     _peak_watch.set_phase("load")
                 if streamer is not None:
@@ -1188,10 +1252,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                     else:
                         load_device = str(self.device)
                     streamer.load_module_(block, block_name, device=load_device)
+                    _t_seg = _mark_load_seg(_load_sub, "io", _t_seg)
                     streamer.close_shards_not_serving_(flat_block_names[flat_block_names.index(block_name) + 1 :])
                     if envs.AR_STREAM_CLOSE_PER_BLOCK:
                         streamer.close_main_pool_()
+                    _t_seg = _mark_load_seg(_load_sub, "close", _t_seg)
                 materialize_model_(block)
+                _t_seg = _mark_load_seg(_load_sub, "mat", _t_seg)
                 if streamer is not None:
                     self._assert_block_materialized(block, block_name)
                     strip_stale_device_hooks_(block)
@@ -1213,8 +1280,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                             _n_moved,
                             load_device,
                         )
+                    _t_seg = _mark_load_seg(_load_sub, "rehome", _t_seg)
                     if envs.AR_STREAM_MEM_INVENTORY:
+                        # diagnostics: accounted separately so the io figure
+                        # stays honest about the actual load cost
                         self._log_device_inventory(calib_state, f"block {stream_block_idx}")
+                        _t_seg = _mark_load_seg(_load_sub, "inv", _t_seg)
+                    self._release_cached_segments_if_fragmented(load_device)
                 _t_load = _time.perf_counter() - _t_load
 
                 # ── Pure algorithm ────────────────────────────────────────
@@ -1349,9 +1421,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _t_write = _time.perf_counter() - _t_write
                     if envs.AR_PERF_COUNTERS:
                         logger.info(
-                            "[perf] block %s: load %.1fs tune %.1fs pack %.1fs write %.1fs",
+                            "[perf] block %s: load %.1fs%s tune %.1fs pack %.1fs write %.1fs",
                             block_name,
                             _t_load,
+                            _format_load_breakdown(_load_sub),
                             getattr(block, "_stream_tune_seconds", 0.0),
                             _t_pack,
                             _t_write,

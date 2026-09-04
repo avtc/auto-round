@@ -1315,3 +1315,111 @@ class TestResumeCudaCacheRelease:
 
         monkeypatch.setattr(_torch.cuda, "is_available", lambda: False)
         CompressionOrchestrator._release_cuda_cache("resume rebuild")
+
+
+class TestLoadBreakdown:
+    """AR_PERF_COUNTERS load sub-phase breakdown for the [perf] line."""
+
+    def test_empty_when_no_parts(self):
+        from auto_round.compressors.orchestrator import _format_load_breakdown
+
+        assert _format_load_breakdown({}) == ""
+        assert _format_load_breakdown(None) == ""
+
+    def test_subresolution_segments_fold_away(self):
+        from auto_round.compressors.orchestrator import _format_load_breakdown
+
+        assert _format_load_breakdown({"io": 0.01, "close": 0.02}) == ""
+
+    def test_breakdown_lists_significant_segments(self):
+        from auto_round.compressors.orchestrator import _format_load_breakdown
+
+        out = _format_load_breakdown({"io": 6.9, "close": 0.06, "inv": 2.0})
+        assert out == " (io 6.9s, close 0.1s, inv 2.0s)"
+
+    def test_streamer_reports_fetch_segments(self, tmp_path, monkeypatch):
+        import logging
+
+        monkeypatch.setenv("AR_PERF_COUNTERS", "1")
+        records = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        from auto_round.utils import checkpoint_streamer as cs_mod
+
+        handler = _Cap()
+        cs_mod.logger.addHandler(handler)
+        try:
+            streamer, block = self._tiny_fixture(tmp_path)
+            streamer.load_module_(block, "blk", device=None)
+        finally:
+            cs_mod.logger.removeHandler(handler)
+        perf_lines = [r for r in records if r.startswith("[perf] streamer")]
+        assert len(perf_lines) == 1
+        assert "read" in perf_lines[0] and "tensors" in perf_lines[0]
+
+    @staticmethod
+    def _tiny_fixture(tmp_path):
+        import torch.nn as nn
+
+        streamer = CheckpointStreamer(
+            _make_sharded_checkpoint(tmp_path, {"single.safetensors": {"blk.a.weight": torch.randn(4, 8)}})
+        )
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 4, bias=False)
+
+        with torch.device("meta"):
+            blk = Blk()
+        return streamer, blk
+
+
+class TestFragmentationRelease:
+    """Phase-boundary release of provably-free cached segments before tuning."""
+
+    def _mk(self):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        return CompressionOrchestrator, SimpleNamespace()
+
+    def test_releases_when_gap_exceeds_threshold(self, monkeypatch):
+        import torch as _torch
+
+        cls, stub = self._mk()
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(_torch.cuda, "memory_reserved", lambda idx: 13 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "memory_allocated", lambda idx: 6 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "current_device", lambda: 0)
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        assert cls._release_cached_segments_if_fragmented(stub, "cuda:0") is True
+        assert calls == [1]
+
+    def test_noop_when_gap_small(self, monkeypatch):
+        import torch as _torch
+
+        cls, stub = self._mk()
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(_torch.cuda, "memory_reserved", lambda idx: 7 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "memory_allocated", lambda idx: 6 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "current_device", lambda: 0)
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        assert cls._release_cached_segments_if_fragmented(stub, "cuda:0") is False
+        assert calls == []
+
+    def test_cpu_device_never_releases(self, monkeypatch):
+        import torch as _torch
+
+        cls, stub = self._mk()
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        assert cls._release_cached_segments_if_fragmented(stub, "cpu") is False
+        assert calls == []
