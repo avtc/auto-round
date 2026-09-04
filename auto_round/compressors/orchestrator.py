@@ -281,6 +281,16 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             m = self.alg_composer.dispatch_block(m, input_ids, input_others)
 
+            if envs.AR_STREAM_MEM_INVENTORY:
+                self._log_device_inventory(
+                    {"input_others": input_others},
+                    f"block {i}",
+                    extra_buckets={
+                        "cache-block": input_ids,
+                        "cache-remaining": input_others_extra_blocks or {},
+                    },
+                )
+
             # ── Pipeline lifecycle: per-block setup ───────────────────────────
             from auto_round.algorithms.composer import BlockContext
 
@@ -379,6 +389,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             # happened -- so a crash before this point correctly re-does the
             # block on resume instead of skipping it with incomplete/missing
             # output. See auto_round/utils/resume.py.
+            if envs.AR_STREAM_MEM_INVENTORY:
+                # post-tune sample: the VmHWM delta vs the pre-tune line
+                # measures this block's during-tuning transient peak
+                self._log_device_inventory(
+                    None,
+                    f"block {i} post",
+                    extra_buckets={"cache-remaining": input_others_extra_blocks or {}},
+                )
             if resume_state is not None and nblocks == 1:
                 # `input_ids` was already reassigned to `next_input_ids`
                 # above -- it now holds the value the *next* block should use
@@ -1496,12 +1514,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         for group_idx, block_names in enumerate(all_blocks):
             inputs = all_inputs[block_names[0]]
             all_inputs.pop(block_names[0])
-            if _mem_inv:
-                self._log_device_inventory(
-                    None,
-                    f"block {group_idx}",
-                    extra_buckets={"cache-block": inputs, "cache-remaining": all_inputs},
-                )
             q_inputs = None
             if all_q_inputs is not None:
                 q_inputs = all_q_inputs[block_names[0]]
@@ -1560,12 +1572,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     f"Expected exactly one packing format when 'immediate_packing' is True, "
                     f"but got {len(self.formats)} formats."
                 )
-            if _mem_inv:
-                self._log_device_inventory(
-                    None,
-                    f"block {group_idx} post",
-                    extra_buckets={"cache-remaining": all_inputs},
-                )
+
         if resume_states is not None:
             if self.compress_context.is_immediate_saving:
                 # Don't clear resume state yet when exporting to shards --
