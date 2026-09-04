@@ -643,6 +643,19 @@ class CompressionOrchestrator(BaseOrchestrator):
         return t
 
     @staticmethod
+    def _main_loop_may_move_block_off_gpu(is_immediate_saving: bool) -> bool:
+        """Whether the streaming loop itself may move the finished block off the GPU.
+
+        Only the non-immediate-saving path does: with immediate saving the
+        block's lifecycle is owned elsewhere (serial write inline, or the
+        background pack worker when the pipeline is active). Moving it from
+        the main loop while the worker compresses races the pack - weights
+        dragged toward cpu while the search's scale/zero-point attributes
+        stay on the home device.
+        """
+        return not is_immediate_saving
+
+    @staticmethod
     def _join_bg_pack(thread) -> None:
         """Join a background pack pipeline, surfacing any worker failure."""
         thread.join()
@@ -1446,9 +1459,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                                 "[perf] block %s: resume snapshot %.1fs", block_name, _time.perf_counter() - _t_snap
                             )
                 else:
-                    mv_module_from_gpu(block)
-                    if self.compress_context.low_cpu_mem_usage and streamer is None:
-                        self._offloader(self.model, block_name)
+                    if self._main_loop_may_move_block_off_gpu(self.compress_context.is_immediate_saving):
+                        mv_module_from_gpu(block)
+                        if self.compress_context.low_cpu_mem_usage and streamer is None:
+                            self._offloader(self.model, block_name)
 
                 if envs.AR_STREAM_MEM_INVENTORY:
                     # post-tune sample: catches the during-tuning transient

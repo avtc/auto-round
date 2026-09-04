@@ -159,3 +159,19 @@ class TestFormatHostBuckets:
         from auto_round.compressors.orchestrator import _format_host_buckets
 
         assert _format_host_buckets({}) == ""
+
+
+class TestMainLoopBlockOwnership:
+    """With immediate saving the finished block belongs to the pack pipeline,
+    never to the main loop: moving it from the loop races the worker's
+    compress (weights toward cpu, search scales still on the home device)."""
+
+    def test_immediate_saving_blocks_main_loop_move(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        assert CompressionOrchestrator._main_loop_may_move_block_off_gpu(True) is False
+
+    def test_non_saving_path_still_moves(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        assert CompressionOrchestrator._main_loop_may_move_block_off_gpu(False) is True
