@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     AR_NVFP4_E5M3_CACHE_HP_WEIGHT: bool = False
     AR_DISK_STREAM_MODEL: bool = False
     AR_RESUME_DIR: Optional[str] = None
+    AR_STREAM_MALLOC_TRIM: bool = False
     AR_FORCE_MOE_ROUTING_ALL_EXPERTS: bool = False
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
 
@@ -83,6 +84,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
     # Streaming loop: log a per-GPU (and host) memory inventory every block.
     "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower() in ("1", "true", "yes"),
+    # Streaming loop: return freed host-heap pages to the OS after the chain
+    # rebuild and after every block (glibc malloc_trim). The streaming
+    # reader's many small per-tensor allocations fragment the allocator and
+    # would otherwise inflate RSS and the VmHWM peak monotonically.
+    "AR_STREAM_MALLOC_TRIM": lambda: os.getenv("AR_STREAM_MALLOC_TRIM", "0").lower() in ("1", "true", "yes"),
     # torch.compile cache size cap (recompile_limit); streaming block shapes
     # vary, a higher cap avoids spurious eager fallbacks.
     "AR_DYNAMO_CACHE_SIZE_LIMIT": lambda: int(os.getenv("AR_DYNAMO_CACHE_SIZE_LIMIT", "16")),

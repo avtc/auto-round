@@ -587,6 +587,25 @@ class CompressionOrchestrator(BaseOrchestrator):
             ) from exc
 
     @staticmethod
+    def _trim_host_heap() -> bool:
+        """Best-effort glibc malloc_trim(0): hand freed host-heap pages back
+        to the OS.
+
+        The streaming reader allocates many small per-tensor buffers while
+        the long-lived calibration chain stays resident; freed buffers end up
+        scattered below live allocations, so the allocator keeps the pages
+        mapped and RSS (and the VmHWM peak) grows monotonically even though
+        nothing references the memory. A trim after each block collapses
+        that growth. Returns True when a trim actually ran.
+        """
+        try:
+            import ctypes
+
+            return bool(ctypes.CDLL("libc.so.6").malloc_trim(0))
+        except Exception:  # noqa: BLE001  diagnostics only; never break the run
+            return False
+
+    @staticmethod
     def _peak_rss_gb():
         """Kernel high-water mark RSS (VmHWM) when available, else None.
 
@@ -942,6 +961,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self._stream_resume_jump_chain(calib_state, resume_states)
                 if self.shard_writer is not None:
                     self.shard_writer.adopt_existing_shards()  # never overwrite the crashed run's shards
+                if envs.AR_STREAM_MALLOC_TRIM and self._trim_host_heap():
+                    # the replay leaves granular-read debris that would raise
+                    # every later block's peak (VmHWM keeps the high-water mark)
+                    logger.info("[stream] host heap trimmed after chain rebuild")
 
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
         # of the quantize loop. With staging devices the blocks land directly
@@ -1213,6 +1236,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # peak via VmHWM that the pre-tune snapshot misses
                     self._log_device_inventory(calib_state, f"block {stream_block_idx} post")
                 clear_memory()
+                if envs.AR_STREAM_MALLOC_TRIM:
+                    self._trim_host_heap()
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)

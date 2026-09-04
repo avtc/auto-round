@@ -225,6 +225,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 - **类型**：布尔值（`1`/`true`/`yes` 启用；默认关闭）
 - **描述**：流式量化诊断开关。启用后，zero-shot 循环流式零样本循环与数据驱动 block 循环都会为每个 block 输出一次按 GPU 的显存分解（`[stream-mem] ...`）：分配器视角（alloc/reserved）、按类别统计的张量（`block:<k>` 暂存 block 权重、`embeddings`、`nonblock:<...>` 初始化阶段创建的模块、`chain` 校准 fp/q 隐状态及 kwargs），以及 `other = alloc - tracked`（临时对象、打包缓冲、优化器状态）。用于查看主 GPU 上到底驻留了什么、为何占用如此之大。与 `AR_SCHEME_MEM_INVENTORY`（AutoScheme 评分池）互补。
 
+### AR_STREAM_MALLOC_TRIM
+
+- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
+- **描述**: 流式量化内存优化。流式读取器的大量小尺寸逐张量分配会造成宿主内存分配器碎片化，已释放的页仍被映射，即使没有任何对象引用它们，RSS（以及进程峰值 `VmHWM`）也会逐块单调增长。启用后，会在断点续跑的链重建之后以及每个量化块结束时执行 `malloc_trim(0)`，把已释放的堆页交还操作系统。尽力而为：非 glibc 平台（Windows/macOS）静默跳过。效果可直接在 `AR_STREAM_MEM_INVENTORY` 的 host 行中看到（residual 不再增长）。
+
+```bash
+export AR_STREAM_MALLOC_TRIM=1
+```
+
 ### AR_DISABLE_BG_PACK
 - **描述**：禁用流式量化循环的后台打包流水线。默认情况下，`--stream_quantization` 下一个 block 调优完成后，后台工作线程会在主循环处理下一个 block 的同时完成打包与写出。设为 `1` 后打包将被串行化到主循环中。
 - **默认值**：`0`（启用后台打包）

@@ -225,6 +225,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)
 - **Description**: Streaming-quantization diagnostic. When set, the streaming zero-shot loop AND the data-driven block loop log a per-GPU memory breakdown every block (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state) and a host line with process RSS vs tracked CPU tensors (chain residents under `--low_gpu_mem_usage`). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
 
+### AR_STREAM_MALLOC_TRIM
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Streaming-quantization memory mitigation. The streaming reader's many small per-tensor allocations fragment the host allocator, so freed pages stay mapped and RSS (and the process peak, `VmHWM`) grows monotonically block over block even though nothing references them. When set, `malloc_trim(0)` runs after the resume chain rebuild and after every quantized block, handing freed heap pages back to the OS. Best effort: non-glibc hosts (Windows/macOS) silently no-op. Effect is visible directly in the `AR_STREAM_MEM_INVENTORY` host lines (residual stops growing).
+
+```bash
+export AR_STREAM_MALLOC_TRIM=1
+```
+
 ### AR_DISABLE_BG_PACK
 - **Description**: Disables the background pack pipeline of the streaming quantization loop. By default, once a block finishes tuning under `--stream_quantization`, a background worker packs and writes it while the loop moves on to the next block. Setting this to `1` serializes packing into the main loop.
 - **Default**: `0` (background packing on)
