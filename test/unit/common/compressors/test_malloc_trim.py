@@ -51,3 +51,14 @@ class TestMallocTrim:
             CompressionOrchestrator._trim_host_heap()
             t += 1
         assert bool(t.sum() > 0)
+
+
+class TestStreamMemTop:
+    def test_env_parse(self, monkeypatch):
+        import auto_round.envs as envs
+
+        assert envs.AR_STREAM_MEM_TOP == 0.0
+        monkeypatch.setenv("AR_STREAM_MEM_TOP", "0.25")
+        assert abs(envs.AR_STREAM_MEM_TOP - 0.25) < 1e-9
+        monkeypatch.setenv("AR_STREAM_MEM_TOP", "not-a-float")
+        assert envs.AR_STREAM_MEM_TOP == 0.0

@@ -717,27 +717,32 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         seen: set = set()
         per_dev: dict = collections.defaultdict(lambda: collections.defaultdict(int))
+        top_thr = float(envs.AR_STREAM_MEM_TOP) * 2**30
+        big: list = []  # (nbytes, "dev:name") tuples when AR_STREAM_MEM_TOP is set
 
-        def _add(dev: str, bucket: str, t) -> None:
-            per_dev[dev][bucket] += t.numel() * t.element_size()
+        def _add(dev: str, bucket: str, t, name: str = None) -> None:
+            nbytes = t.numel() * t.element_size()
+            per_dev[dev][bucket] += nbytes
+            if top_thr and nbytes >= top_thr:
+                big.append((nbytes, f"{dev}:{name or bucket}"))
 
         for name, t in list(self.model.named_parameters()) + list(self.model.named_buffers()):
             if t.device.type not in ("cuda", "cpu") or id(t) in seen:
                 continue
             seen.add(id(t))
-            _add(str(t.device), self._mem_bucket(name), t)
+            _add(str(t.device), self._mem_bucket(name), t, name)
 
-        def _walk(v, bucket="chain"):
+        def _walk(v, bucket="chain", prefix=None):
             if isinstance(v, torch.Tensor):
                 if v.device.type in ("cuda", "cpu") and id(v) not in seen:
                     seen.add(id(v))
-                    _add(str(v.device), bucket, v)
+                    _add(str(v.device), bucket, v, prefix)
             elif isinstance(v, dict):
-                for x in v.values():
-                    _walk(x, bucket)
+                for k, x in v.items():
+                    _walk(x, bucket, f"{prefix}.{k}" if prefix else str(k))
             elif isinstance(v, (list, tuple)):
-                for x in v:
-                    _walk(x, bucket)
+                for j, x in enumerate(v):
+                    _walk(x, bucket, f"{prefix}[{j}]" if prefix else f"[{j}]")
 
         if calib_state is not None:
             for key in ("fp_inputs", "q_inputs"):
@@ -771,6 +776,26 @@ class CompressionOrchestrator(BaseOrchestrator):
                 host_parts or "no tracked cpu tensors",
                 max(0.0, rss_gb - tracked_gb),
             )
+            if top_thr:
+                top = sorted((b for b in big if b[1].startswith("cpu:")), reverse=True)[:12]
+                if top:
+                    logger.info(
+                        "[stream-mem] %s host top tensors: %s",
+                        tag,
+                        ", ".join(f"{n / 2**30:.2f}G {name}" for n, name in top),
+                    )
+                # regions classify the RESIDUAL (dead memory holds no tensor
+                # objects): [heap] => allocator fragmentation; anonymous
+                # mappings => CUDA pinned pools / torch host caches;
+                # file-backed => checkpoint mmaps
+                regions = sorted(psutil.Process().memory_maps(grouped=False), key=lambda m: -m.rss)[:8]
+                region_parts = "; ".join(
+                    f"rss {m.rss / 2**30:.2f}G size {m.size / 2**30:.2f}G {m.path or '[anon]'}"
+                    for m in regions
+                    if m.rss > 0
+                )
+                if region_parts:
+                    logger.info("[stream-mem] %s host regions: %s", tag, region_parts)
         except Exception:  # noqa: BLE001  diagnostics must never break the run
             pass
         for idx in range(torch.cuda.device_count()):
@@ -784,6 +809,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # idle GPU (not mapped / nothing staged): all-zero lines are
                 # noise; any nonzero usage still shows below
                 continue
+            if top_thr:
+                top = sorted((b for b in big if b[1].startswith(f"{dev}:")), reverse=True)[:12]
+                if top:
+                    logger.info(
+                        "[stream-mem] %s %s top tensors: %s",
+                        tag,
+                        dev,
+                        ", ".join(f"{n / 2**30:.2f}G {name.split(':', 1)[1]}" for n, name in top),
+                    )
             other = max(0.0, alloc - tracked / 2**30)
             logger.info(
                 "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG",

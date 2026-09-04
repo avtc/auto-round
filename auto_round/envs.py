@@ -38,6 +38,13 @@ if TYPE_CHECKING:
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
 
 
+def _get_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
     """Read an optional env var that must be a positive integer when set."""
     raw = os.getenv(name)
@@ -84,6 +91,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
     # Streaming loop: log a per-GPU (and host) memory inventory every block.
     "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower() in ("1", "true", "yes"),
+    # Streaming loop: list individual tensors larger than this many GiB
+    # (plus the top host memory regions) in the memory inventory. 0 = off.
+    "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),
     # Streaming loop: return freed host-heap pages to the OS after the chain
     # rebuild and after every block (glibc malloc_trim). The streaming
     # reader's many small per-tensor allocations fragment the allocator and

@@ -225,6 +225,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 - **类型**：布尔值（`1`/`true`/`yes` 启用；默认关闭）
 - **描述**：流式量化诊断开关。启用后，zero-shot 循环流式零样本循环与数据驱动 block 循环都会为每个 block 输出一次按 GPU 的显存分解（`[stream-mem] ...`）：分配器视角（alloc/reserved）、按类别统计的张量（`block:<k>` 暂存 block 权重、`embeddings`、`nonblock:<...>` 初始化阶段创建的模块、`chain` 校准 fp/q 隐状态及 kwargs），以及 `other = alloc - tracked`（临时对象、打包缓冲、优化器状态）。用于查看主 GPU 上到底驻留了什么、为何占用如此之大。与 `AR_SCHEME_MEM_INVENTORY`（AutoScheme 评分池）互补。
 
+### AR_STREAM_MEM_TOP
+
+- **类型**: 浮点数，GiB 阈值（默认 `0` = 关闭）
+- **描述**: `AR_STREAM_MEM_INVENTORY` 的配套项。设置为如 `0.2` 时，每条 inventory 行后会列出达到阈值的最大单个张量（含完整命名，host 与每个 GPU），并在 Linux 上额外输出 `/proc/self/smaps` 中按 RSS 排序的宿主内存区域。张量用于归类*存活*集合；内存区域用于归类 *residual*（已释放的内存不再持有张量对象）：`[heap]` 增长表示分配器碎片化（见 `AR_STREAM_MALLOC_TRIM`）；匿名映射表示 CUDA pinned 池或 torch 宿主缓存（无法 trim）；文件映射表示 checkpoint 的 mmap。
+
+```bash
+export AR_STREAM_MEM_TOP=0.2
+```
+
 ### AR_STREAM_MALLOC_TRIM
 
 - **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）

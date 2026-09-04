@@ -225,6 +225,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)
 - **Description**: Streaming-quantization diagnostic. When set, the streaming zero-shot loop AND the data-driven block loop log a per-GPU memory breakdown every block (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state) and a host line with process RSS vs tracked CPU tensors (chain residents under `--low_gpu_mem_usage`). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
 
+### AR_STREAM_MEM_TOP
+
+- **Type**: float, GiB threshold (default `0` = off)
+- **Description**: Companion to `AR_STREAM_MEM_INVENTORY`. When set to e.g. `0.2`, each inventory line is followed by the top individual tensors at or above the threshold (with qualified names, host and per-GPU) and — on Linux — the top host memory regions by RSS from `/proc/self/smaps`. Tensors classify the *live* set; regions classify the *residual* (dead memory holds no tensor objects): `[heap]` growth means allocator fragmentation (see `AR_STREAM_MALLOC_TRIM`), anonymous mappings mean CUDA pinned pools or torch host caches (not trimmable), and file-backed mappings mean checkpoint mmaps.
+
+```bash
+export AR_STREAM_MEM_TOP=0.2
+```
+
 ### AR_STREAM_MALLOC_TRIM
 
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)
