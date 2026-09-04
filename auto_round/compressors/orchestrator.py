@@ -633,6 +633,25 @@ class CompressionOrchestrator(BaseOrchestrator):
             ) from exc
 
     @staticmethod
+    def _release_cuda_cache(reason: str = "") -> None:
+        """Release reserved-but-unallocated CUDA segments (resume-rebuild debris).
+
+        The resume rebuild (chain jump, shard adoption, hydration) frees
+        transient CUDA allocations whose segments stay cached by the
+        allocator; the first post-resume block then OOMs on fragmentation
+        even though its live set fits comfortably (measured: ~6.8G reserved
+        but unallocated right before an OOM on a block the fresh run had
+        quantized in the same co-located placement).
+        """
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if reason:
+                    logger.info("[stream] cuda cache cleared after %s", reason)
+        except Exception:  # noqa: BLE001  diagnostics only; never break the run
+            pass
+
+    @staticmethod
     def _trim_host_heap() -> bool:
         """Best-effort glibc malloc_trim(0): hand freed host-heap pages back
         to the OS.
@@ -920,7 +939,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                     return None
                 logger.warning("[stream] stream_prefetch='auto' ignored: no CUDA devices visible")
                 return None
-            devices = [torch.device("cuda", i) for i in range(n_gpu) if i != quant_dev.index or n_gpu == 1]
+            # auto staging never reaches outside the user's device map: an
+            # explicit --device_map is a sandbox declaration (other GPUs may
+            # belong to other jobs), while the default (no --device_map)
+            # resolves to every visible GPU, so nothing changes there
+            allowed = [torch.device(str(d)) for d in device_manager.device_list if str(d).startswith("cuda")]
+            pool = allowed if allowed else [torch.device("cuda", i) for i in range(n_gpu)]
+            devices = [d for d in pool if d != quant_dev]
             # The primary joins the rotation when its free VRAM comfortably
             # holds the LARGEST block (block sizes vary by layer type - linear-attention vs
             # full-attention vs first/last): parent working set + block + tuning
@@ -928,7 +953,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             primary_fit = self._primary_fits_largest_block(quant_dev)
             if primary_fit is not None:
                 largest_gb, free_gb = primary_fit
-                devices = [torch.device("cuda", i) for i in range(n_gpu)]
+                devices = list(pool)
                 logger.info(
                     "[stream] auto staging includes the primary %s: largest block %.2fG fits free %.2fG "
                     "(headroom 3.0G for tuning transients)",
@@ -936,7 +961,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     largest_gb,
                     free_gb,
                 )
-            elif n_gpu == 1 and not devices:
+            elif len(pool) == 1 and not devices:
                 # sole GPU and the largest block does not fit with headroom:
                 # do not stage on it, host RAM takes the lookahead
                 logger.info("%s: largest block does not fit free VRAM on the sole GPU", ram_last_resort)
@@ -1064,6 +1089,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # the replay leaves granular-read debris that would raise
                     # every later block's peak (VmHWM keeps the high-water mark)
                     logger.info("[stream] host heap trimmed after chain rebuild")
+                self._release_cuda_cache("resume rebuild")
 
             if streamer is not None:
                 # startup reads (embeddings / chain init) touch shards the

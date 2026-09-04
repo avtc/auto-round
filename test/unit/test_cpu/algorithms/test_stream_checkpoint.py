@@ -1245,3 +1245,73 @@ class TestStreamQuantizeEquivalence:
             assert "model.layers.3.enorm.weight" in keys
             assert torch.equal(f.get_tensor("model.layers.3.eh_proj.weight"), extra["model.layers.3.eh_proj.weight"])
             assert torch.equal(f.get_tensor("model.layers.3.enorm.weight"), extra["model.layers.3.enorm.weight"])
+
+
+class TestAutoStagingScopesToDeviceMap:
+    """Auto staging never reaches outside the user's --device_map.
+
+    An explicit device map is a sandbox declaration (other GPUs may belong to
+    other jobs); the no-flag default resolves to every visible GPU, so
+    scoping changes nothing there.
+    """
+
+    def _resolve(self, monkeypatch, device_list, quant="cuda:1", primary_fit=None):
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "device_count", lambda: 4)
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        stub = SimpleNamespace(
+            stream_prefetch=None,
+            device=quant,
+            stream_prefetch_devices="auto",
+            _primary_fits_largest_block=lambda dev: primary_fit,
+        )
+        monkeypatch.setattr(
+            "auto_round.compressors.orchestrator.device_manager",
+            SimpleNamespace(device_list=device_list),
+        )
+        return CompressionOrchestrator._resolve_stream_stage_devices(stub)
+
+    def test_auto_excludes_gpus_outside_device_map(self, monkeypatch):
+        devices = self._resolve(monkeypatch, device_list=["cuda:1", "cuda:2"])
+        # cuda:0 and cuda:3 are visible but not in the map: never staged
+        assert [str(d) for d in devices] == ["cuda:2"]
+
+    def test_auto_primary_joins_only_within_device_map(self, monkeypatch):
+        devices = self._resolve(monkeypatch, device_list=["cuda:1", "cuda:2"], primary_fit=(6.9, 22.3))
+        assert sorted(str(d) for d in devices) == ["cuda:1", "cuda:2"]
+
+    def test_auto_default_map_uses_all_visible_gpus(self, monkeypatch):
+        # no --device_map: device_list still resolves to every visible GPU
+        devices = self._resolve(monkeypatch, device_list=[f"cuda:{i}" for i in range(4)], primary_fit=(6.9, 22.3))
+        assert sorted(str(d) for d in devices) == ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+
+    def test_auto_sole_gpu_in_map_without_fit_falls_back_to_ram(self, monkeypatch):
+        assert self._resolve(monkeypatch, device_list=["cuda:1"], primary_fit=None) is None
+
+
+class TestResumeCudaCacheRelease:
+    def test_releases_reserved_segments_when_cuda_available(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        CompressionOrchestrator._release_cuda_cache("resume rebuild")
+        assert calls == [1]
+
+    def test_never_raises_without_cuda(self, monkeypatch):
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: False)
+        CompressionOrchestrator._release_cuda_cache("resume rebuild")
