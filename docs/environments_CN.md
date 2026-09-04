@@ -234,6 +234,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
+### AR_STREAM_GROUPED_READ
+
+- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
+- **描述**: 按分片文件分组读取模块的 checkpoint 张量（逐文件：打开一个文件、读取该文件中属于此模块的全部张量、再进入下一个），而不是按模块树顺序。配合按消费关闭分片，即使 checkpoint 的张量在多个文件间交错分布，驻留也被限制在每模块单个打开的分片内。
+
+```bash
+export AR_STREAM_GROUPED_READ=1
+```
+
 ### AR_STREAM_SHARD_POOL
 
 - **类型**: 整数（默认 `2`）

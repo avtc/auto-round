@@ -234,6 +234,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_MEM_TOP=0.2
 ```
 
+### AR_STREAM_GROUPED_READ
+
+- **Type**: bool (`1`/`true`/`yes` to enable; default off)
+- **Description**: Read each module's checkpoint tensors grouped by shard file (file-by-file: open one file, read all its tensors for the module, then move on) instead of module-tree order. With the consumed-shard close this bounds residency to a single open shard per module even for checkpoints whose tensors are adversarially interleaved across files.
+
+```bash
+export AR_STREAM_GROUPED_READ=1
+```
+
 ### AR_STREAM_SHARD_POOL
 
 - **Type**: int (default `2`)

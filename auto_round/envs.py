@@ -94,6 +94,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Streaming loop: list individual tensors larger than this many GiB
     # (plus the top host memory regions) in the memory inventory. 0 = off.
     "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),
+    # Streaming reader: read a module's tensors grouped by checkpoint shard
+    # (file-by-file) instead of module-tree order. Bounds residency to one
+    # open shard per module even for adversarially interleaved checkpoints.
+    "AR_STREAM_GROUPED_READ": lambda: os.getenv("AR_STREAM_GROUPED_READ", "0").lower() in ("1", "true", "yes"),
     # Streaming reader: max simultaneously open checkpoint shards (LRU pool).
     # Sequential consume-once access needs current + prefetch-next = 2; a
     # deeper pool only keeps already-read pages mapped, inflating RSS.

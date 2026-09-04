@@ -543,7 +543,13 @@ class CheckpointStreamer:
         targets.update(dict(module.named_buffers(recurse=True)))
         by_short = {prefix + ("." if prefix else "") + k: v for k, v in targets.items()}
         loaded = []
-        for name in self.names_under(prefix):
+        names = self.names_under(prefix)
+        if envs.AR_STREAM_GROUPED_READ:
+            # file-by-file reads: group the prefix's tensors by shard so each
+            # file is opened, fully read and (once consumed) closed before the
+            # next one opens, instead of interleaved module-tree order
+            names = sorted(names, key=lambda n: self.weight_map[n])
+        for name in names:
             tgt, mod_name = by_short.get(name), name
             if tgt is None:
                 logger.debug(f"[stream] {name} has no matching parameter/buffer in the module; skipped")

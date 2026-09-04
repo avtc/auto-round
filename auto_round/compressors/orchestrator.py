@@ -732,23 +732,35 @@ class CompressionOrchestrator(BaseOrchestrator):
             seen.add(id(t))
             _add(str(t.device), self._mem_bucket(name), t, name)
 
-        def _walk(v, bucket="chain", prefix=None):
+        def _walk(v, bucket="chain", prefix=None, depth=0):
             if isinstance(v, torch.Tensor):
                 if v.device.type in ("cuda", "cpu") and id(v) not in seen:
                     seen.add(id(v))
                     _add(str(v.device), bucket, v, prefix)
             elif isinstance(v, dict):
                 for k, x in v.items():
-                    _walk(x, bucket, f"{prefix}.{k}" if prefix else str(k))
+                    _walk(x, bucket, f"{prefix}.{k}" if prefix else str(k), depth)
             elif isinstance(v, (list, tuple)):
                 for j, x in enumerate(v):
-                    _walk(x, bucket, f"{prefix}[{j}]" if prefix else f"[{j}]")
+                    _walk(x, bucket, f"{prefix}[{j}]" if prefix else f"[{j}]", depth)
+            elif (
+                depth < 4
+                and v is not self.model
+                and not isinstance(v, torch.nn.Module)
+                and hasattr(v, "__dict__")
+                and not isinstance(v, (str, bytes, type(None), int, float, bool))
+            ):
+                # plain holder objects (quantizer configs, collectors): walk
+                # their fields so live-but-untracked tensors get a bucket
+                for k, x in vars(v).items():
+                    _walk(x, bucket, f"{prefix}.{k}" if prefix else str(k), depth + 1)
 
         if calib_state is not None:
             for key in ("fp_inputs", "q_inputs"):
                 _walk(calib_state.get(key))
             # masks / position ids / rope tables: persistent small residents
             _walk(calib_state.get("input_others"), bucket="chain-kwargs")
+        _walk(getattr(self, "alg_composer", None), bucket="quantizer")
         for bucket_name, payload in (extra_buckets or {}).items():
             _walk(payload, bucket=bucket_name)
         if self.shard_writer is not None:
@@ -999,10 +1011,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # the replay leaves granular-read debris that would raise
                     # every later block's peak (VmHWM keeps the high-water mark)
                     logger.info("[stream] host heap trimmed after chain rebuild")
+
             if streamer is not None:
                 # startup reads (embeddings / chain init) touch shards the
-                # block loop never revisits; close them before the prefetch
-                # pipeline starts so their mappings stop counting in RSS
+                # block loop never revisits - on fresh runs too, not only
+                # resume; close them before the prefetch pipeline starts so
+                # their mappings stop counting in RSS
                 streamer.release_startup_handles_()
 
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
