@@ -520,7 +520,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         """
         if calib_state is None:
             return
-        jumped = False
         for rs in resume_states:
             if rs is None or rs.resume_index <= 0:
                 continue
@@ -531,9 +530,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             q_input = rs.load_q_input()
             if q_input is not None and self.alg_composer.need_quanted_input():
                 calib_state["q_inputs"] = q_input
-            jumped = True
-        if jumped:
-            logger.info("[stream] resume: calibration chain jumped to the saved frontier entry")
 
     @staticmethod
     def _stream_resume_pending_offset(all_blocks, resume_states):
@@ -712,7 +708,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         alloc = torch.cuda.memory_allocated(idx) / 2**30
                         reserved = torch.cuda.memory_reserved(idx) / 2**30
                         parts.append(f"cuda:{idx} alloc {alloc:.2f}G reserved {reserved:.2f}G")
-                    logger.info("[stream] cuda state after %s: %s", reason, "; ".join(parts))
+                    logger.debug("[stream] cuda state after %s: %s", reason, "; ".join(parts))
         except Exception:  # noqa: BLE001  diagnostics only; never break the run
             pass
 
@@ -737,14 +733,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             if gap < min_gap_bytes:
                 return False
             torch.cuda.empty_cache()
-            if not getattr(self, "_frag_release_logged", False):
-                self._frag_release_logged = True
-                logger.info(
-                    "[stream] released %.2fG of cached free segments on %s before tuning "
-                    "(allocator fragmentation hygiene; one-time log)",
-                    gap / 2**30,
-                    dev,
-                )
             return True
         except Exception:  # noqa: BLE001  diagnostics only; never break the run
             return False
@@ -1054,7 +1042,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if primary_fit is not None:
                 largest_gb, free_gb = primary_fit
                 devices = list(pool)
-                logger.info(
+                logger.debug(
                     "[stream] auto staging includes the primary %s: largest block %.2fG fits free %.2fG "
                     "(headroom 3.0G for tuning transients)",
                     quant_dev,
@@ -1067,7 +1055,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 logger.info("%s: largest block does not fit free VRAM on the sole GPU", ram_last_resort)
                 return None
             if forced and not devices:
-                logger.info("%s: no usable staging GPU", ram_last_resort)
+                logger.debug("%s: no usable staging GPU", ram_last_resort)
                 return None
         else:
             devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
@@ -1162,7 +1150,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "token_ids": summary.get("token_ids"),
                 "keymask_2d": summary.get("keymask_2d"),
             }
-            logger.info("[stream_calibration] chain initialized with %d row(s)", summary["rows"])
             # drop the local aliases: the block loop replaces
             # calib_state["fp_inputs"] with each new generation, but a live
             # local reference would pin the FIRST generation (a generation-
@@ -1185,10 +1172,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self._stream_resume_jump_chain(calib_state, resume_states)
                 if self.shard_writer is not None:
                     self.shard_writer.adopt_existing_shards()  # never overwrite the crashed run's shards
-                if self._trim_host_heap():
-                    # the replay leaves granular-read debris that would raise
-                    # every later block's peak (VmHWM keeps the high-water mark)
-                    logger.info("[stream] host heap trimmed after chain rebuild")
+                # the replay leaves granular-read debris that would raise every
+                # later block's peak (VmHWM keeps the high-water mark)
+                self._trim_host_heap()
                 self._release_cuda_cache("resume rebuild")
 
             if streamer is not None:
@@ -1580,7 +1566,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     with torch.no_grad():
                         t.data = t.data.to(self.amp_dtype)
                 n_streamed += 1
-            logger.info(
+            logger.debug(
                 "[stream] root pass-through: %d tensor(s) streamed from checkpoint, %d already materialized "
                 "in memory (%s)",
                 n_streamed,

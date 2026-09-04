@@ -225,11 +225,6 @@ class ModelContext(BaseContext):
                 logger.warning(f"[stream_quantization] tokenizer unavailable ({e}); continuing without it.")
                 self.tokenizer = None
         self.checkpoint_streamer = CheckpointStreamer(self.model_path)
-        logger.info(
-            f"[stream_quantization] model structure loaded on meta device; "
-            f"{len(self.checkpoint_streamer.tensor_names)} tensors will be streamed from "
-            f"{self.model_path} per block (model never fully materialized)."
-        )
 
     def _load_model(self):
         if self.stream_quantization and not isinstance(self.model, (str, os.PathLike)):

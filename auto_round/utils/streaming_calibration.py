@@ -251,7 +251,7 @@ def materialize_residual_meta(model, cfg, device):
                 pass
         stubborn.append(name)
     if rebuilt:
-        logger.info("[stream] rebuilt %d computed rotary buffer module(s) for export: %s", len(rebuilt), rebuilt[:6])
+        logger.debug("[stream] rebuilt %d computed rotary buffer module(s) for export: %s", len(rebuilt), rebuilt[:6])
     if stubborn:
         logger.warning(
             "[stream] %d module(s) still hold meta tensors at export time (no checkpoint source, " "not rotary): %s",
@@ -392,7 +392,6 @@ def _normalize_rows(dataset, tokenizer, seqlen, seed=42, nsamples=128, bs=1):
     # nsamples for every dataset type; the chain matches that semantics).
     if nsamples and len(rows) > nsamples:
         rows = rows[:nsamples]
-        logger.info("[stream_calibration] capping calibration rows to %d (nsamples)", nsamples)
     return rows
 
 
@@ -427,7 +426,6 @@ def prepare_streaming_calibration(
     rows = _normalize_rows(dataset, tokenizer, seqlen, nsamples=nsamples)
     if not rows:
         raise ValueError("stream_calibration: no usable calibration rows (all shorter than seqlen?)")
-    logger.info("[stream_calibration] chaining %d calibration rows (nsamples=%d)", len(rows), nsamples)
 
     embed_name, embed_mod = _find_embedding(model, streamer)
     if embed_mod is None:

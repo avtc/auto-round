@@ -610,10 +610,6 @@ class BaseOrchestrator(object):
             )
             if needs_chain:
                 self.stream_calibration = True
-                logger.info(
-                    "[stream_calibration] auto-engaged (streaming loop needs activations: "
-                    "iters > 0 tuning or imatrix enabled)"
-                )
         # API parity with the CLI: unset (None) enables the auto-engage above;
         # coerce the final value to bool either way
         if self.layerwise_rotation is None:
@@ -653,10 +649,6 @@ class BaseOrchestrator(object):
                 # weight-only under streaming.
                 if any(isinstance(c, _SignRound) for c in demanding):
                     return True
-            logger.info(
-                "[stream_quantization] streaming zero-shot loop covers the calibration "
-                "demand (weight-only search and/or stream_calibration chained rows)."
-            )
 
         # AutoScheme needs data for delta-loss scheme selection -- unless the
         # run streams: scoring happens in disk-stream workers / from the scheme
