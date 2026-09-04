@@ -879,10 +879,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     seen.add(id(v))
                     _add(str(v.device), bucket, v, prefix)
             elif isinstance(v, dict):
-                for k, x in v.items():
+                # snapshot: the bg pack worker mutates composer-held dicts
+                # concurrently; iterating them live raises mid-walk
+                for k, x in list(v.items()):
                     _walk(x, bucket, f"{prefix}.{k}" if prefix else str(k), depth)
             elif isinstance(v, (list, tuple)):
-                for j, x in enumerate(v):
+                for j, x in enumerate(list(v)):
                     _walk(x, bucket, f"{prefix}[{j}]" if prefix else f"[{j}]", depth)
             elif (
                 depth < 4
@@ -893,7 +895,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             ):
                 # plain holder objects (quantizer configs, collectors): walk
                 # their fields so live-but-untracked tensors get a bucket
-                for k, x in vars(v).items():
+                for k, x in list(vars(v).items()):
                     _walk(x, bucket, f"{prefix}.{k}" if prefix else str(k), depth + 1)
 
         if calib_state is not None:

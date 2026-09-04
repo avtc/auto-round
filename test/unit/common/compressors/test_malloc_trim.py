@@ -252,3 +252,36 @@ class TestUnconditionalBoundedResidency:
         assert "AR_STREAM_CLOSE_PER_BLOCK" not in src
         assert "AR_STREAM_MALLOC_TRIM" not in src
         assert "close_main_pool_()" in src
+
+
+class TestWalkConcurrentSafety:
+    """The inventory walk snapshots every container it iterates: the bg pack
+    worker mutates composer-held dicts while the main loop logs."""
+
+    def test_walk_snapshots_all_iterations(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._log_device_inventory)
+        assert "for k, x in list(v.items()):" in src
+        assert "for k, x in list(vars(v).items()):" in src
+        assert "for j, x in enumerate(list(v)):" in src
+        # no unsnapshotted live iteration remains
+        for bad in ("for k, x in v.items():", "for k, x in vars(v).items():", "for j, x in enumerate(v):"):
+            assert bad not in src
+
+    def test_walk_survives_dict_growing_during_holder_walk(self):
+        # a holder object whose __dict__ gains a key between snapshot and
+        # recursion must not crash the walk (bg worker inserting mid-walk)
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = CompressionOrchestrator.__new__(CompressionOrchestrator)
+
+        class _Holder:
+            pass
+
+        holder = _Holder()
+        holder.records = {"a": torch.zeros(8)}
+        orch.model = torch.nn.Sequential()  # empty: walk focuses on the holder
+        orch._log_device_inventory({"fp_inputs": [holder]}, "race-sim")
