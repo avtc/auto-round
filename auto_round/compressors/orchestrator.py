@@ -690,6 +690,22 @@ class CompressionOrchestrator(BaseOrchestrator):
             for key in ("fp_inputs", "q_inputs", "input_others"):
                 _walk(calib_state.get(key))
 
+        # host-side breakdown: tracked CPU tensors vs process RSS, so the
+        # residual (allocator cache / fragmentation / untracked holders) is
+        # visible next to the deliberate residents (chain, masks, rope)
+        try:
+            import psutil
+
+            rss_gb = psutil.Process().memory_info().rss / 2**30
+            host_parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in sorted(per_dev.get("cpu", {}).items()))
+            logger.info(
+                "[stream-mem] %s host: rss %.2fG | cpu tensors %s",
+                tag,
+                rss_gb,
+                host_parts or "none tracked",
+            )
+        except Exception:  # noqa: BLE001  diagnostics must never break the run
+            pass
         for idx in range(torch.cuda.device_count()):
             dev = f"cuda:{idx}"
             alloc = torch.cuda.memory_allocated(idx) / 2**30
