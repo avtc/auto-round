@@ -51,15 +51,25 @@ class TestMallocTrim:
         assert bool(t.sum() > 0)
 
 
-class TestStreamMemTop:
-    def test_env_parse(self, monkeypatch):
-        import auto_round.envs as envs
+class TestMemDiagnosticsGatedByDebugLevel:
+    """The streaming memory diagnostics (inventory buckets, top-tensor/
+    region attribution, peak-RSS watcher) have no env switches anymore:
+    they are DEBUG-level log lines, activated by AR_LOG_LEVEL=DEBUG."""
 
-        assert envs.AR_STREAM_MEM_TOP == 0.0
-        monkeypatch.setenv("AR_STREAM_MEM_TOP", "0.25")
-        assert abs(envs.AR_STREAM_MEM_TOP - 0.25) < 1e-9
-        monkeypatch.setenv("AR_STREAM_MEM_TOP", "not-a-float")
-        assert envs.AR_STREAM_MEM_TOP == 0.0
+    def test_env_switches_removed(self):
+        for name in ("AR_STREAM_MEM_INVENTORY", "AR_STREAM_PEAK_WATCH", "AR_STREAM_MEM_TOP"):
+            assert not hasattr(envs, name)
+
+    def test_inventory_and_watcher_gated_on_logger(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator)
+        assert src.count("logger.isEnabledFor(logging.DEBUG)") >= 6  # 4 inventory sites + 2 watcher sites
+        # emissions are debug-level: visible only under AR_LOG_LEVEL=DEBUG
+        assert 'logger.debug(\n                "[stream-mem]' in src
+        assert 'logger.info(\n                "[stream-mem]' not in src
 
 
 class TestDropFileCache:

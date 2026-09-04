@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import gc
+import logging
 import os
 import time as _time
 from functools import partial
@@ -342,7 +343,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if self._peak_watch is not None:
                 self._peak_watch.set_phase("tune")
 
-            if envs.AR_STREAM_MEM_INVENTORY:
+            if logger.isEnabledFor(logging.DEBUG):
                 self._log_device_inventory(
                     {"input_others": input_others},
                     f"block {i}",
@@ -450,7 +451,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # happened -- so a crash before this point correctly re-does the
             # block on resume instead of skipping it with incomplete/missing
             # output. See auto_round/utils/resume.py.
-            if envs.AR_STREAM_MEM_INVENTORY:
+            if logger.isEnabledFor(logging.DEBUG):
                 # post-tune sample: the VmHWM delta vs the pre-tune line
                 # measures this block's during-tuning transient peak
                 self._log_device_inventory(
@@ -847,7 +848,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         return largest / 2**30, free_gb
 
     def _log_device_inventory(self, calib_state: dict, tag: str, extra_buckets: dict = None) -> None:
-        """AR_STREAM_MEM_INVENTORY=1: per-GPU breakdown of the streaming parent's memory.
+        """DEBUG-gated diagnostic: per-GPU breakdown of the streaming parent's memory.
 
         Walks model tensors (meta skipped, deduped), the calibration chain
         state, and compares against the allocator's view; the residual
@@ -857,8 +858,8 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         seen: set = set()
         per_dev: dict = collections.defaultdict(lambda: collections.defaultdict(int))
-        top_thr = float(envs.AR_STREAM_MEM_TOP) * 2**30
-        big: list = []  # (nbytes, "dev:name") tuples when AR_STREAM_MEM_TOP is set
+        top_thr = 0.1 * 2**30  # list tensors >= 0.1G alongside the buckets
+        big: list = []  # (nbytes, "dev:name") tuples when the inventory threshold is set
 
         def _add(dev: str, bucket: str, t, name: str = None) -> None:
             nbytes = t.numel() * t.element_size()
@@ -921,7 +922,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             host_buckets = per_dev.get("cpu", {})
             host_parts = _format_host_buckets(host_buckets)
             tracked_gb = sum(v for v in host_buckets.values()) / 2**30
-            logger.info(
+            logger.debug(
                 "[stream-mem] %s host: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG",
                 tag,
                 rss_gb,
@@ -932,7 +933,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if top_thr:
                 top = sorted((b for b in big if b[1].startswith("cpu:")), reverse=True)[:12]
                 if top:
-                    logger.info(
+                    logger.debug(
                         "[stream-mem] %s host top tensors: %s",
                         tag,
                         ", ".join(f"{n / 2**30:.2f}G {name}" for n, name in top),
@@ -948,7 +949,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if m.rss > 0
                 )
                 if region_parts:
-                    logger.info("[stream-mem] %s host regions: %s", tag, region_parts)
+                    logger.debug("[stream-mem] %s host regions: %s", tag, region_parts)
         except Exception:  # noqa: BLE001  diagnostics must never break the run
             pass
         for idx in range(torch.cuda.device_count()):
@@ -965,14 +966,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             if top_thr:
                 top = sorted((b for b in big if b[1].startswith(f"{dev}:")), reverse=True)[:12]
                 if top:
-                    logger.info(
+                    logger.debug(
                         "[stream-mem] %s %s top tensors: %s",
                         tag,
                         dev,
                         ", ".join(f"{n / 2**30:.2f}G {name.split(':', 1)[1]}" for n, name in top),
                     )
             other = max(0.0, alloc - tracked / 2**30)
-            logger.info(
+            logger.debug(
                 "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG",
                 tag,
                 dev,
@@ -1229,7 +1230,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         pbar = tqdm(range(total_block_cnt))
         stream_block_idx = 0
         blocks_before = 0
-        _peak_watch = PeakWatcher() if envs.AR_STREAM_PEAK_WATCH else None
+        _peak_watch = PeakWatcher() if logger.isEnabledFor(logging.DEBUG) else None
         if _peak_watch is not None:
             _peak_watch.start()
         flat_block_names = [name for group in all_blocks for name in group]
@@ -1293,7 +1294,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                             load_device,
                         )
                     _t_seg = _mark_load_seg(_load_sub, "rehome", _t_seg)
-                    if envs.AR_STREAM_MEM_INVENTORY:
+                    if logger.isEnabledFor(logging.DEBUG):
                         # diagnostics: accounted separately so the io figure
                         # stays honest about the actual load cost
                         self._log_device_inventory(calib_state, f"block {stream_block_idx}")
@@ -1463,7 +1464,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         if self.compress_context.low_cpu_mem_usage and streamer is None:
                             self._offloader(self.model, block_name)
 
-                if envs.AR_STREAM_MEM_INVENTORY:
+                if logger.isEnabledFor(logging.DEBUG):
                     # post-tune sample: catches the during-tuning transient
                     # peak via VmHWM that the pre-tune snapshot misses
                     self._log_device_inventory(calib_state, f"block {stream_block_idx} post")
@@ -1778,8 +1779,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             if any(rs is not None and rs.resume_index > 0 for rs in resume_states) and self.shard_writer is not None:
                 self.shard_writer.adopt_existing_shards()
 
-        _mem_inv = bool(envs.AR_STREAM_MEM_INVENTORY)
-        _peak_watch = PeakWatcher() if envs.AR_STREAM_PEAK_WATCH else None
+        _mem_inv = logger.isEnabledFor(logging.DEBUG)
+        _peak_watch = PeakWatcher() if logger.isEnabledFor(logging.DEBUG) else None
         self._peak_watch = _peak_watch
         if _peak_watch is not None:
             _peak_watch.start()

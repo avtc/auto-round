@@ -37,13 +37,6 @@ if TYPE_CHECKING:
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
 
 
-def _get_float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return default
-
-
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
     """Read an optional env var that must be a positive integer when set."""
     raw = os.getenv(name)
@@ -88,15 +81,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         float(os.getenv("AR_SEARCH_SCALE_RATIO")) if os.getenv("AR_SEARCH_SCALE_RATIO") is not None else None
     ),
     "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
-    # Streaming loop: log a per-GPU (and host) memory inventory every block.
-    "AR_STREAM_MEM_INVENTORY": lambda: os.getenv("AR_STREAM_MEM_INVENTORY", "0").lower() in ("1", "true", "yes"),
-    # Streaming loop: sample RSS on a short interval and attribute each new
-    # high-water mark to the current phase (load/tune/pack/write) plus a
-    # top-regions snapshot at the peak instant.
-    "AR_STREAM_PEAK_WATCH": lambda: os.getenv("AR_STREAM_PEAK_WATCH", "0").lower() in ("1", "true", "yes"),
-    # Streaming loop: list individual tensors larger than this many GiB
-    # (plus the top host memory regions) in the memory inventory. 0 = off.
-    "AR_STREAM_MEM_TOP": lambda: _get_float_env("AR_STREAM_MEM_TOP", 0.0),
     # Streaming reader: drop evicted checkpoint shards' page-cache residency
     # (posix_fadvise DONTNEED) so mmap'd clean pages stop counting in RSS.
     "AR_STREAM_DROP_FILE_CACHE": lambda: os.getenv("AR_STREAM_DROP_FILE_CACHE", "0").lower() in ("1", "true", "yes"),

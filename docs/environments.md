@@ -15,6 +15,7 @@ AutoRound uses a centralized environment variable management system through the 
 - **Default**: `"INFO"`
 - **Valid Values**: `"TRACE"`,  `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`
 - **Usage**: Set this to control the verbosity of AutoRound logs
+- **Note**: `DEBUG` also activates the streaming quantization memory diagnostics (per-block `[stream-mem]` inventory buckets with top-tensor/region attribution, and the peak-RSS watcher that attributes high-water marks to pipeline phases)
 
 ```bash
 export AR_LOG_LEVEL=DEBUG
@@ -210,33 +211,10 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 export AR_SCHEME_MEM_INVENTORY=1
 ```
 
-### AR_STREAM_MEM_INVENTORY
-
-- **Type**: bool (`1`/`true`/`yes` to enable; default off)
-- **Description**: Streaming-quantization diagnostic. When set, the streaming zero-shot loop AND the data-driven block loop log a per-GPU memory breakdown every block (`[stream-mem] ...`): allocator view (alloc/reserved), tracked tensors bucketed as `block:<k>` (staged block weights), `embeddings`, `nonblock:<...>` (setup modules), and `chain` (calibration fp/q hidden states + kwargs), plus `other = alloc - tracked` (temporaries, packing buffers, optimizer state) and a host line with process RSS vs tracked CPU tensors (chain residents under `--low_gpu_mem_usage`). Use it to see what occupies the primary GPU and why. Complements `AR_SCHEME_MEM_INVENTORY` (AutoScheme scoring pool).
-
-### AR_STREAM_PEAK_WATCH
-
-- **Type**: bool (`1`/`true`/`yes` to enable; default off)
-- **Description**: Sample process RSS on a short interval (~20ms) and attribute every new high-water mark to the current pipeline phase (`load`/`tune`/`write`) plus a top-regions snapshot captured at the peak instant. Sampled inventories fire between phases and miss the during-block transient peak; this closes that gap. Most informative with `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072`, where every large allocation is its own anonymous mapping whose size equals the allocation size.
-
-```bash
-export AR_STREAM_PEAK_WATCH=1
-```
-
-### AR_STREAM_MEM_TOP
-
-- **Type**: float, GiB threshold (default `0` = off)
-- **Description**: Companion to `AR_STREAM_MEM_INVENTORY`. When set to e.g. `0.2`, each inventory line is followed by the top individual tensors at or above the threshold (with qualified names, host and per-GPU) and — on Linux — the top host memory regions by RSS from `/proc/self/smaps`. Tensors classify the *live* set; regions classify the *residual* (dead memory holds no tensor objects): `[heap]` growth means allocator fragmentation (the streaming loop trims the heap after every block), anonymous mappings mean CUDA pinned pools or torch host caches (not trimmable), and file-backed mappings mean checkpoint mmaps.
-
-```bash
-export AR_STREAM_MEM_TOP=0.2
-```
-
 ### AR_STREAM_DROP_FILE_CACHE
 
 - **Type**: bool (`1`/`true`/`yes` to enable; default off)
-- **Description**: The streaming reader memory-maps checkpoint shards (`safe_open`); pages touched by reads stay resident in RSS for the lifetime of the mapping even though they are clean, reclaimable and (for an evicted shard) never read again - the footprint grows by roughly one shard per newly touched file. When set, evicted and closed shards get `posix_fadvise(DONTNEED)`, dropping their residency from RSS. Best effort: non-POSIX hosts silently no-op. Effect is visible in the `AR_STREAM_MEM_TOP` regions lines (file-backed `*.safetensors` entries stop accumulating).
+- **Description**: The streaming reader memory-maps checkpoint shards (`safe_open`); pages touched by reads stay resident in RSS for the lifetime of the mapping even though they are clean, reclaimable and (for an evicted shard) never read again - the footprint grows by roughly one shard per newly touched file. When set, evicted and closed shards get `posix_fadvise(DONTNEED)`, dropping their residency from RSS. Best effort: non-POSIX hosts silently no-op. Effect is visible in the DEBUG-level regions lines (file-backed `*.safetensors` entries stop accumulating).
 
 ```bash
 export AR_STREAM_DROP_FILE_CACHE=1

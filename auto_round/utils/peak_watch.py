@@ -95,7 +95,7 @@ class PeakWatcher:
         """One INFO line with the current peak attribution."""
         if self.peak_rss_gb <= 0:
             return
-        logger.info(
+        logger.debug(
             "[stream-mem] %s peak: %.2fG @ phase=%s (t+%.1fs) | regions: %s",
             tag,
             self.peak_rss_gb,

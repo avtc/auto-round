@@ -41,10 +41,13 @@ class TestPeakWatcher:
 
         _handler = _Cap()
         _proj_logger.addHandler(_handler)
+        _orig_level = _proj_logger.level
+        _proj_logger.setLevel(logging.DEBUG)  # peak lines are debug-level now
         try:
             w.log("block 0")
         finally:
             _proj_logger.removeHandler(_handler)
+            _proj_logger.setLevel(_orig_level)
         assert any("phase=search" in r.getMessage() for r in records)
 
     def test_phase_update_visible_while_running(self):

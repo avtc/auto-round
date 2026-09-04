@@ -15,6 +15,7 @@ AutoRound 通过 `envs.py` 模块提供统一的环境变量管理系统，支�
 - **默认值**：`"INFO"`
 - **有效值**：`"TRACE"`、`"DEBUG"`、`"INFO"`、`"WARNING"`、`"ERROR"`、`"CRITICAL"`
 - **用途**：通过设置该变量控制 AutoRound 的日志详细程度
+- **注意**：`DEBUG` 还会激活流式量化内存诊断（逐 block 的 `[stream-mem]` inventory 分桶、大张量/内存区域归因，以及按流水线阶段归因峰值 RSS 的 peak watcher）
 
 ```bash
 export AR_LOG_LEVEL=DEBUG
@@ -210,33 +211,10 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 export AR_SCHEME_MEM_INVENTORY=1
 ```
 
-### AR_STREAM_MEM_INVENTORY
-
-- **类型**：布尔值（`1`/`true`/`yes` 启用；默认关闭）
-- **描述**：流式量化诊断开关。启用后，zero-shot 循环流式零样本循环与数据驱动 block 循环都会为每个 block 输出一次按 GPU 的显存分解（`[stream-mem] ...`）：分配器视角（alloc/reserved）、按类别统计的张量（`block:<k>` 暂存 block 权重、`embeddings`、`nonblock:<...>` 初始化阶段创建的模块、`chain` 校准 fp/q 隐状态及 kwargs），以及 `other = alloc - tracked`（临时对象、打包缓冲、优化器状态）。用于查看主 GPU 上到底驻留了什么、为何占用如此之大。与 `AR_SCHEME_MEM_INVENTORY`（AutoScheme 评分池）互补。
-
-### AR_STREAM_PEAK_WATCH
-
-- **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
-- **描述**: 以短间隔（约 20ms）采样进程 RSS，将每个新的高水位归因到当前流水线阶段（`load`/`tune`/`write`），并在峰值瞬间捕获 top 内存区域快照。采样式 inventory 在阶段之间触发，会漏掉块内瞬态峰值；此选项弥补该盲区。配合 `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072` 使用信息量最大 —— 此时每个大分配都是独立的匿名映射，区域大小即分配大小。
-
-```bash
-export AR_STREAM_PEAK_WATCH=1
-```
-
-### AR_STREAM_MEM_TOP
-
-- **类型**: 浮点数，GiB 阈值（默认 `0` = 关闭）
-- **描述**: `AR_STREAM_MEM_INVENTORY` 的配套项。设置为如 `0.2` 时，每条 inventory 行后会列出达到阈值的最大单个张量（含完整命名，host 与每个 GPU），并在 Linux 上额外输出 `/proc/self/smaps` 中按 RSS 排序的宿主内存区域。张量用于归类*存活*集合；内存区域用于归类 *residual*（已释放的内存不再持有张量对象）：`[heap]` 增长表示分配器碎片化（流式循环会在每个块后自动 trim 堆）；匿名映射表示 CUDA pinned 池或 torch 宿主缓存（无法 trim）；文件映射表示 checkpoint 的 mmap。
-
-```bash
-export AR_STREAM_MEM_TOP=0.2
-```
-
 ### AR_STREAM_DROP_FILE_CACHE
 
 - **类型**: 布尔值（`1`/`true`/`yes` 启用；默认关闭）
-- **描述**: 流式读取器对 checkpoint 分片做内存映射（`safe_open`）；读取触碰过的页在映射存活期间会一直计入 RSS，尽管它们是干净、可回收且（对已被淘汰的分片）不会再被读取的 —— 足迹随新触碰文件大约每个分片增长一份。启用后，被淘汰和关闭的分片会执行 `posix_fadvise(DONTNEED)`，将其驻留页从 RSS 释放。尽力而为：非 POSIX 平台静默跳过。效果可在 `AR_STREAM_MEM_TOP` 的 regions 行中看到（文件映射的 `*.safetensors` 条目不再累积）。
+- **描述**: 流式读取器对 checkpoint 分片做内存映射（`safe_open`）；读取触碰过的页在映射存活期间会一直计入 RSS，尽管它们是干净、可回收且（对已被淘汰的分片）不会再被读取的 —— 足迹随新触碰文件大约每个分片增长一份。启用后，被淘汰和关闭的分片会执行 `posix_fadvise(DONTNEED)`，将其驻留页从 RSS 释放。尽力而为：非 POSIX 平台静默跳过。效果可在 DEBUG 级别的 regions 行中看到（文件映射的 `*.safetensors` 条目不再累积）。
 
 ```bash
 export AR_STREAM_DROP_FILE_CACHE=1
