@@ -569,6 +569,22 @@ class CompressionOrchestrator(BaseOrchestrator):
             ) from exc
 
     @staticmethod
+    def _peak_rss_gb():
+        """Kernel high-water mark RSS (VmHWM) when available, else None.
+
+        Sampled inventories fire between tuning phases and miss the
+        during-tuning transient peak; the kernel counter catches it for free.
+        """
+        try:
+            with open("/proc/self/status", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) / 2**20  # kB -> GiB
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
     def _mem_bucket(name: str) -> str:
         """Bucket a module-path name for the device-memory inventory."""
         if ".layers." in name:
@@ -707,12 +723,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             import psutil
 
             rss_gb = psutil.Process().memory_info().rss / 2**30
+            peak_gb = self._peak_rss_gb()
             host_parts = ", ".join(f"{k}={v / 2**30:.2f}G" for k, v in sorted(per_dev.get("cpu", {}).items()))
             tracked_gb = sum(v for v in per_dev.get("cpu", {}).values()) / 2**30
             logger.info(
-                "[stream-mem] %s host: rss %.2fG | %s | residual(rss-tracked) %.2fG",
+                "[stream-mem] %s host: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG",
                 tag,
                 rss_gb,
+                peak_gb,
                 host_parts or "no tracked cpu tensors",
                 max(0.0, rss_gb - tracked_gb),
             )
@@ -1172,6 +1190,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if self.compress_context.low_cpu_mem_usage and streamer is None:
                         self._offloader(self.model, block_name)
 
+                if envs.AR_STREAM_MEM_INVENTORY:
+                    # post-tune sample: catches the during-tuning transient
+                    # peak via VmHWM that the pre-tune snapshot misses
+                    self._log_device_inventory(calib_state, f"block {stream_block_idx} post")
                 clear_memory()
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
@@ -1537,6 +1559,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 raise ValueError(
                     f"Expected exactly one packing format when 'immediate_packing' is True, "
                     f"but got {len(self.formats)} formats."
+                )
+            if _mem_inv:
+                self._log_device_inventory(
+                    None,
+                    f"block {group_idx} post",
+                    extra_buckets={"cache-remaining": all_inputs},
                 )
         if resume_states is not None:
             if self.compress_context.is_immediate_saving:
