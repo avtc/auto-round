@@ -37,6 +37,15 @@ if TYPE_CHECKING:
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
 
 
+def _get_choice_env(name: str, default: str, choices, aliases=None) -> str:
+    """Read an env var that must be one of a fixed choice set (case-insensitive)."""
+    raw = os.getenv(name, default).strip().lower()
+    raw = (aliases or {}).get(raw, raw)
+    if raw not in choices:
+        raise ValueError(f"{name} must be one of {sorted(choices)}, got {raw!r}")
+    return raw
+
+
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
     """Read an optional env var that must be a positive integer when set."""
     raw = os.getenv(name)
@@ -80,7 +89,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_SEARCH_SCALE_RATIO": lambda: (
         float(os.getenv("AR_SEARCH_SCALE_RATIO")) if os.getenv("AR_SEARCH_SCALE_RATIO") is not None else None
     ),
-    "AR_DISABLE_BG_PACK": lambda: os.getenv("AR_DISABLE_BG_PACK", "0").lower() in ("1", "true", "yes"),
+    # Streaming loop: background pack pipeline. "auto" (default) enables it
+    # whenever eligible (streaming with >=2 staging devices + immediate
+    # packing); "1" requires it and fails loudly when ineligible; "0"
+    # serializes the pack into the main loop.
+    "AR_STREAM_BG_PACK": lambda: _get_choice_env(
+        "AR_STREAM_BG_PACK", "auto", ("auto", "on", "off"), {"1": "on", "0": "off"}
+    ),
     # Streaming reader: drop evicted checkpoint shards' page-cache residency
     # (posix_fadvise DONTNEED) so mmap'd clean pages stop counting in RSS.
     "AR_STREAM_DROP_FILE_CACHE": lambda: os.getenv("AR_STREAM_DROP_FILE_CACHE", "0").lower() in ("1", "true", "yes"),

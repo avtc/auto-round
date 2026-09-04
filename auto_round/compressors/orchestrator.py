@@ -644,6 +644,26 @@ class CompressionOrchestrator(BaseOrchestrator):
         return t
 
     @staticmethod
+    def _resolve_bg_pack_mode(mode: str, stage_device_count: int, immediate_packing: bool) -> bool:
+        """Resolve AR_STREAM_BG_PACK (auto|1|0) against pipeline support.
+
+        "auto" runs the pipeline whenever supported (streaming with >=2
+        staging devices and immediate packing); "1" requires it and fails
+        loudly when unsupported rather than silently serializing; "0"
+        serializes the pack into the main loop.
+        """
+        supported = bool(stage_device_count >= 2 and immediate_packing)
+        if mode == "off":
+            return False
+        if mode == "on" and not supported:
+            raise ValueError(
+                "AR_STREAM_BG_PACK=1 requires the background pack pipeline to be supported: "
+                f"--stream_quantization with >=2 staging devices and immediate packing "
+                f"(stage_devices={stage_device_count}, immediate_packing={immediate_packing})"
+            )
+        return supported
+
+    @staticmethod
     def _main_loop_may_move_block_off_gpu(is_immediate_saving: bool) -> bool:
         """Whether the streaming loop itself may move the finished block off the GPU.
 
@@ -667,7 +687,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             raise RuntimeError(
                 f"background pack pipeline for a block failed ({exc!r}); refusing to continue -- "
                 "the checkpoint would silently miss packed tensors. Fix the underlying failure "
-                "or set AR_DISABLE_BG_PACK=1."
+                "or set AR_STREAM_BG_PACK=0."
             ) from exc
 
     @staticmethod
@@ -1203,21 +1223,19 @@ class CompressionOrchestrator(BaseOrchestrator):
         if streamer is not None and prefetch_depth > 0 and prefetch_names:
             streamer.start_prefetch(prefetch_names, depth=prefetch_depth, stage_devices=stage_devices)
 
-        # -- Background pack pipeline (default ON; AR_DISABLE_BG_PACK opts out)
+        # -- Background pack pipeline (AR_STREAM_BG_PACK=auto|1|0)
         # The finished block's immediate-pack + shard-write tail runs in a
         # background thread on its (now idle) ping-pong home while the loop
-        # advances to the next block's tune on the other group. Eligible only
+        # advances to the next block's tune on the other group. Supported only
         # with >=2 staging groups (the finished block must stay GPU-resident
         # on a group nobody else needs) and immediate packing; exactly one
         # pipeline thread runs at a time (the loop joins the previous one
         # before spawning the next, ordering shard writes and serializing the
         # lock-free ShardWriter behind a single writer at any moment).
-        _bg_pack_eligible = bool(
-            streamer is not None
-            and stage_devices
-            and len(stage_devices) >= 2
-            and self.compress_context.is_immediate_packing
-            and not envs.AR_DISABLE_BG_PACK
+        _bg_pack_eligible = self._resolve_bg_pack_mode(
+            envs.AR_STREAM_BG_PACK,
+            len(stage_devices) if stage_devices else 0,
+            self.compress_context.is_immediate_packing,
         )
         _bg_pack = None
 

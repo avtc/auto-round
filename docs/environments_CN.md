@@ -220,16 +220,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_DROP_FILE_CACHE=1
 ```
 
-### AR_DISABLE_BG_PACK
-- **描述**：禁用流式量化循环的后台打包流水线。默认情况下，`--stream_quantization` 下一个 block 调优完成后，后台工作线程会在主循环处理下一个 block 的同时完成打包与写出。设为 `1` 后打包将被串行化到主循环中。
-- **默认值**：`0`（启用后台打包）
-- **取值**：`0` / `1`
-- **用法**：在排查打包问题或内存受限的主机上，可将此变量设为 `1`。
+### AR_STREAM_BG_PACK
+
+- **类型**: 字符串（`auto` / `1` / `0`；默认 `auto`）
+- **描述**: 仅作用于流式量化。控制后台打包流水线：调优完成的 block 的即时打包与分片写出尾部会在后台线程中于其（此时空闲的）staging home 上执行，主循环同时推进到下一个 block 的调优。`auto` 在受支持时（`--stream_quantization` 且 >=2 个 staging 设备且即时打包）自动启用；`1` 强制要求，不支持时立即报错；`0` 将打包串行化到主循环中。
+- **用途**: 排查打包问题或内存受限主机上不希望后台线程产生瞬态缓冲时设为 `0`。
 
 ```bash
-export AR_DISABLE_BG_PACK=1
+export AR_STREAM_BG_PACK=0
 ```
-
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **描述**：控制 `NVFP4E5M3QuantLinear` 是否在首次前向后缓存解量化得到的高精度权重，而不是每次调用都从打包的 FP4 权重重新解量化。
 - **默认值**：`False`（等价于 `"0"`）

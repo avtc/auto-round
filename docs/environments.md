@@ -220,16 +220,15 @@ export AR_SCHEME_MEM_INVENTORY=1
 export AR_STREAM_DROP_FILE_CACHE=1
 ```
 
-### AR_DISABLE_BG_PACK
-- **Description**: Disables the background pack pipeline of the streaming quantization loop. By default, once a block finishes tuning under `--stream_quantization`, a background worker packs and writes it while the loop moves on to the next block. Setting this to `1` serializes packing into the main loop.
-- **Default**: `0` (background packing on)
-- **Valid Values**: `0` / `1`
-- **Usage**: Set to `1` when diagnosing packing issues or on memory-constrained hosts where the background worker's transient buffers are unwanted.
+### AR_STREAM_BG_PACK
+
+- **Type**: str (`auto` / `1` / `0`; default `auto`)
+- **Description**: Streaming-quantization only. Controls the background pack pipeline: the finished block's immediate-pack + shard-write tail runs in a background thread on its (now idle) staging home while the loop advances to the next block's tune. `auto` enables it whenever supported (`--stream_quantization` with >=2 staging devices and immediate packing); `1` requires it and fails loudly when unsupported; `0` serializes packing into the main loop.
+- **Usage**: Set to `0` when diagnosing packing issues or on memory-constrained hosts where the worker's transient buffers are unwanted.
 
 ```bash
-export AR_DISABLE_BG_PACK=1
+export AR_STREAM_BG_PACK=0
 ```
-
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **Description**: Controls whether `NVFP4E5M3QuantLinear` caches a dequantized high-precision weight after the first forward pass, instead of dequantizing the packed FP4 weight on every call.
 - **Default**: `False` (equivalent to `"0"`)

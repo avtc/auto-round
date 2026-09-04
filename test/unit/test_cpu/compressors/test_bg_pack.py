@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Background pack pipeline (default ON; AR_DISABLE_BG_PACK opts out).
+"""Background pack pipeline (AR_STREAM_BG_PACK=auto|1|0).
 
 The finished block's immediate-pack + shard-write tail runs in a background
 thread on its (now idle) ping-pong home while the loop advances to the next
@@ -58,13 +58,44 @@ class _RS:
 
 
 class TestBgPackEnv:
-    def test_default_on_and_opt_out(self, monkeypatch):
+    def test_tri_state_parse(self, monkeypatch):
+        import pytest
+
         from auto_round import envs
 
-        monkeypatch.delenv("AR_DISABLE_BG_PACK", raising=False)
-        assert envs.AR_DISABLE_BG_PACK is False
-        monkeypatch.setenv("AR_DISABLE_BG_PACK", "1")
-        assert envs.AR_DISABLE_BG_PACK is True
+        monkeypatch.delenv("AR_STREAM_BG_PACK", raising=False)
+        assert envs.AR_STREAM_BG_PACK == "auto"
+        monkeypatch.setenv("AR_STREAM_BG_PACK", "1")
+        assert envs.AR_STREAM_BG_PACK == "on"
+        monkeypatch.setenv("AR_STREAM_BG_PACK", "0")
+        assert envs.AR_STREAM_BG_PACK == "off"
+        monkeypatch.setenv("AR_STREAM_BG_PACK", "bogus")
+        with pytest.raises(ValueError):
+            _ = envs.AR_STREAM_BG_PACK
+
+    def test_resolve_mode_matrix(self):
+        import pytest
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        r = CompressionOrchestrator._resolve_bg_pack_mode
+        # auto: on exactly when supported
+        assert r("auto", 2, True) is True
+        assert r("auto", 1, True) is False
+        assert r("auto", 2, False) is False
+        # 0: always serialized
+        assert r("off", 2, True) is False
+        # 1: required - fails loudly when unsupported, never silent fallback
+        assert r("on", 2, True) is True
+        with pytest.raises(ValueError, match="AR_STREAM_BG_PACK=1 requires"):
+            r("on", 1, True)
+        with pytest.raises(ValueError, match="AR_STREAM_BG_PACK=1 requires"):
+            r("on", 2, False)
+
+    def test_old_env_name_gone(self):
+        from auto_round import envs
+
+        assert not hasattr(envs, "AR_DISABLE_BG_PACK")
 
 
 class TestBgPackWorker:
