@@ -1288,6 +1288,25 @@ class TestStreamQuantizeEquivalence:
                 keys |= set(f.keys())
         return keys
 
+    def test_pinned_fused_expert_stack_unfuses_per_expert(self, tiny_checkpoint, tmp_path):
+        """A pinned 3D fused expert stack in a checkpoint-only group must
+        unfuse into per-expert packed Linears (the same split the family
+        module replacement applies to the main body), not stay bf16."""
+        extra = {
+            "mtp2.layers.0.mlp.experts.gate_up_proj.weight": torch.randn(4, 64, 32),
+            "mtp2.layers.0.mlp.experts.down_proj.weight": torch.randn(4, 32, 32),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"mtp2": {"bits": 8}})
+        keys = self._export_keys(out)
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                assert (
+                    f"mtp2.layers.0.mlp.experts.{e}.{proj}.qweight" in keys
+                ), f"expert {e} {proj} not packed; keys: " + ", ".join(sorted(k for k in keys if "mtp2" in k))
+        assert "mtp2.layers.0.mlp.experts.gate_up_proj.weight" not in keys, "fused stack kept beside unfused experts"
+        assert "mtp2.layers.0.mlp.experts.down_proj.weight" not in keys
+
     def test_toplevel_checkpoint_only_group_with_pin_materializes(self, tiny_checkpoint, tmp_path):
         """Qwen-style topology: transformers strips a top-level ``mtp.*`` group
         at load. A pin must materialize + quantize it; siblings stay verbatim."""
@@ -1665,6 +1684,38 @@ class TestPrefetchConsumerWaits:
         finally:
             release.set()
             streamer.stop_prefetch()
+
+
+class TestOutsideBlockQuantDevice:
+    """Outside-block layers quantize on the accelerator when the run has one
+    (the block loop is done, GPUs idle; checkpoint-only groups can hold
+    hundreds of expert Linears); CPU otherwise."""
+
+    def _dev(self, device):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        stub = SimpleNamespace(model_context=SimpleNamespace(device=device))
+        return CompressionOrchestrator._outside_block_quant_device(stub)
+
+    def test_cpu_run_stays_cpu(self):
+        assert self._dev("cpu").type == "cpu"
+
+    def test_gpu_run_uses_quant_device(self):
+        assert self._dev("cuda:0").type == "cuda"
+
+    def test_missing_context_falls_back(self):
+        assert self._dev("not-a-device").type == "cpu"
+
+    def test_loop_wires_the_device(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
+        assert "_outside_block_quant_device()" in src
+        assert "device=str(outside_qdev)" in src
 
 
 class TestOutsideBlockPackUnderStreaming:

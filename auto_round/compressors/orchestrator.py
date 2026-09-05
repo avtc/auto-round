@@ -109,6 +109,50 @@ def _format_host_buckets(buckets: dict) -> str:
     return ", ".join(parts)
 
 
+_FUSED_EXPERT_PROJECTIONS = frozenset({"gate_up_proj", "gate_proj", "up_proj", "down_proj"})
+
+
+def _is_fused_expert_weight_name(tensor_name: str) -> bool:
+    """True for stacked per-expert weight tensors: the name under ``.weight``
+    is a fused MoE projection and the checkpoint stores one dim-0 stacked
+    tensor for all experts (the layout the family module replacements
+    unfuse for the main body)."""
+    leaf = tensor_name.removesuffix(".weight")
+    return leaf.rsplit(".", 1)[-1] in _FUSED_EXPERT_PROJECTIONS
+
+
+def materialize_placeholder_linear_from_tensor(
+    model: torch.nn.Module, path: str, tensor: torch.Tensor, entry: dict
+) -> None:
+    """Attach a CPU-weight ``nn.Linear`` placeholder at *path* from a real
+    tensor slice.
+
+    Used for checkpoint-only fused expert stacks: the per-expert module path
+    differs from the single 3D checkpoint tensor, so the outside-block loader
+    (which loads by name) cannot fetch these weights; they arrive real at
+    materialization time instead.
+    """
+    lin = torch.nn.Linear(int(tensor.shape[1]), int(tensor.shape[0]), bias=False)
+    with torch.no_grad():
+        lin.weight.copy_(tensor)
+    for key in ("bits", "group_size", "data_type", "sym", "scale_dtype"):
+        if entry.get(key) is not None:
+            setattr(lin, key, entry[key])
+    lin.act_bits = entry.get("act_bits", 16)
+    lin.act_sym = entry.get("act_sym", True)
+    lin.act_data_type = entry.get("act_data_type", None)
+    lin.global_name = path
+    segments = path.split(".")
+    parent = model
+    for seg in segments[:-1]:
+        child = getattr(parent, seg, None)
+        if child is None:
+            child = torch.nn.Module()
+            parent.add_module(seg, child)
+        parent = child
+    parent.add_module(segments[-1], lin)
+
+
 def materialize_placeholder_linear(
     model: torch.nn.Module, path: str, shape: tuple, entry: dict, has_bias: bool
 ) -> None:
@@ -1152,6 +1196,37 @@ class CompressionOrchestrator(BaseOrchestrator):
         )
         return devices or None
 
+    def _materialize_fused_expert_stack_(self, streamer, tensor_name: str, shape: tuple, entry: dict) -> int:
+        """Unfuse one pinned 3D expert stack into per-expert placeholder Linears.
+
+        Mirrors the family module replacement's materialization: a stacked
+        ``[E, 2I, H]`` ``gate_up_proj`` splits into per-expert ``gate_proj`` /
+        ``up_proj``, ``[E, H, I]`` ``down_proj`` becomes per-expert
+        ``down_proj``. The per-expert paths inherit the pin's quantization
+        entry (re-resolved per expert so precise pins keep working). Returns
+        the number of materialized experts.
+        """
+        base, proj = tensor_name[: -len(".weight")].rsplit(".", 1)
+        num_experts = int(shape[0])
+        stack = streamer.fetch(tensor_name)
+        made = 0
+        for e in range(num_experts):
+            if proj == "gate_up_proj":
+                intermediate = int(shape[1]) // 2
+                gate = stack[e, :intermediate, :].contiguous()
+                up = stack[e, intermediate:, :].contiguous()
+                for sub, t in (("gate_proj", gate), ("up_proj", up)):
+                    path = f"{base}.{e}.{sub}"
+                    sub_entry = self._pin_entry_for(path) or entry
+                    materialize_placeholder_linear_from_tensor(self.model, path, t, sub_entry)
+                made += 1
+            else:  # down_proj / gate_proj / up_proj stacked plain
+                path = f"{base}.{e}.{proj}"
+                sub_entry = self._pin_entry_for(path) or entry
+                materialize_placeholder_linear_from_tensor(self.model, path, stack[e].contiguous(), sub_entry)
+                made += 1
+        return made
+
     def _pin_entry_for(self, layer_path: str) -> Optional[dict]:
         """Quantization entry pinning *layer_path*, or None.
 
@@ -1242,9 +1317,20 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if not isinstance(bits, int) or bits >= 16:
                     continue  # unpinned or kept floating: verbatim path
                 meta = streamer.tensor_meta(n)
-                if meta is None or len(meta[0]) != 2:
-                    # norms and other buffers stay verbatim; pinned 3D stacks
-                    # (fused expert tensors) cannot become a plain Linear
+                if meta is None:
+                    continue
+                shape = meta[0]
+                if len(shape) == 3 and _is_fused_expert_weight_name(n):
+                    # fused expert stack (e.g. [E, 2I, H] gate_up / [E, H, I]
+                    # down): slice into per-expert placeholder Linears, the
+                    # same split the family's module replacement applies to
+                    # the main body - per-expert modules load by name, so the
+                    # slices arrive as real weights instead of meta
+                    self._materialize_fused_expert_stack_(streamer, n, shape, entry)
+                    claimed.add(n)
+                    continue
+                if len(shape) != 2:
+                    # norms and other buffers stay verbatim
                     skipped_non_2d += 1
                     continue
                 bias = layer_path + ".bias"
@@ -1266,6 +1352,19 @@ class CompressionOrchestrator(BaseOrchestrator):
                 skipped_non_2d,
             )
         return claimed
+
+    def _outside_block_quant_device(self) -> torch.device:
+        """Device for the outside-block pass. The block loop has finished by
+        then, so accelerators are idle: quantize there when one is available
+        (materialized checkpoint-only groups can hold hundreds of expert
+        Linears of compute-bound search); CPU otherwise."""
+        try:
+            d = torch.device(getattr(self.model_context, "device", "cpu"))
+            if d.type != "cpu":
+                return d
+        except (RuntimeError, ValueError):
+            pass
+        return torch.device("cpu")
 
     def _quantize_zero_shot(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Zero-shot (RTN) quantization path — no calibration data needed.
@@ -1709,12 +1808,19 @@ class CompressionOrchestrator(BaseOrchestrator):
             if any(n == block_name or n.startswith(f"{block_name}.") for block_name in block_name_set):
                 continue
             remain_layer_names.append(n)
+        outside_qdev = self._outside_block_quant_device()
         for name in remain_layer_names:
-            logger.info(f"Quantizing remaining layer {name} on CPU.")
+            module = get_module(self.model, name)
+            logger.info(f"Quantizing remaining layer {name} on {outside_qdev}.")
             if streamer is not None:
                 # load the layer itself; streaming its parent prefix would
-                # materialize the parent's whole subtree (every block weight)
-                streamer.load_module_(get_module(self.model, name), name, device="cpu")
+                # materialize the parent's whole subtree (every block weight).
+                # Placeholders whose weights arrived real (unfused expert
+                # slices) have no checkpoint tensors under their path.
+                if streamer.names_under(name) or any(p.is_meta for p in module.parameters()):
+                    streamer.load_module_(module, name, device=str(outside_qdev))
+                elif outside_qdev.type != "cpu":
+                    module.to(outside_qdev)
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             if streamer is not None and self.compress_context.is_immediate_saving:
                 # pack + write now: the export pack loop is skipped under the
@@ -1723,7 +1829,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # restore re-derives its scheme from there
                 from auto_round.compressors.utils import immediate_pack as _immediate_pack
 
-                _immediate_pack(name, self.layer_config, device="cpu")
+                _immediate_pack(name, self.layer_config, device=str(outside_qdev))
                 self.shard_writer.write(name=name)
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.
