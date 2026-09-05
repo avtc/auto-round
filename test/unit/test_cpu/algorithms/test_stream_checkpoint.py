@@ -295,64 +295,63 @@ class TestCheckpointStreamer:
 
 
 class TestStageDeviceResolution:
-    """stream_prefetch_devices kwarg + back-compat for the old _gpus spelling."""
+    """The single stream_prefetch knob resolves to at most one additional
+    staging device (two rotating homes under auto), host RAM, or None."""
 
     def _resolve(self, **attrs):
         from types import SimpleNamespace
 
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
-        stub = SimpleNamespace(stream_prefetch=2, device="cpu", **attrs)
+        fields = dict(stream_prefetch="auto", device="cpu")
+        fields.update(attrs)
+        stub = SimpleNamespace(**fields)
         return CompressionOrchestrator._resolve_stream_stage_devices(stub)
 
-    def test_none_means_host_ram(self):
-        assert self._resolve(stream_prefetch_devices=None) is None
+    def test_off_and_cpu_mean_host_ram(self):
+        assert self._resolve(stream_prefetch="off") is None
+        assert self._resolve(stream_prefetch="cpu") is None
 
-    def test_cuda_list_with_cpu_quant_falls_back_to_ram(self):
-        # all-GPU staging list with a CPU quant device -> host RAM by design
-        devices = self._resolve(stream_prefetch_devices=["cuda:0", "cuda:1"])
-        assert devices is None
+    def test_explicit_cuda_device_with_cpu_quant_falls_back_to_ram(self):
+        # GPU staging with a CPU quant device buys nothing: blocks would
+        # quantize on CPU
+        assert self._resolve(stream_prefetch="cuda:1") is None
 
-    def test_mixed_list_raises_even_with_cpu_quant(self):
-        with pytest.raises(ValueError, match="mixed GPU/CPU staging"):
-            self._resolve(stream_prefetch_devices=["cuda:0", "cpu"])
+    def test_explicit_device_resolves_to_itself(self):
+        devices = self._resolve(stream_prefetch="cuda:1", device="cuda:0")
+        assert [str(d) for d in devices] == ["cuda:1"]
 
-    def test_cpu_only_list_resolves_to_cpu(self):
-        devices = self._resolve(stream_prefetch_devices=["cpu"])
-        assert [str(d) for d in devices] == ["cpu"]
-
-    def test_int_list_with_cpu_quant_falls_back_to_ram(self):
-        # ints mean cuda:k; GPU staging with a CPU quant device buys nothing
-        assert self._resolve(stream_prefetch_devices=[0, 1]) is None
-
-    def test_meta_device_rejected(self):
+    def test_explicit_meta_device_rejected(self):
         with pytest.raises(ValueError, match="meta tensors hold no data"):
-            self._resolve(stream_prefetch_devices=["cpu", "meta"])
+            self._resolve(stream_prefetch="meta", device="cuda:0")
 
-    def test_on_value_parses(self):
+    def test_invalid_device_string_raises_actionably(self):
+        with pytest.raises(ValueError, match="not a valid device"):
+            self._resolve(stream_prefetch="not-a-device", device="cuda:0")
+
+    def test_parse_single_device_forms(self):
         from auto_round.cli.main import _parse_stream_prefetch
 
-        assert _parse_stream_prefetch("on") == (None, "on")
-        assert _parse_stream_prefetch("off") == (0, None)
-        assert _parse_stream_prefetch("auto") == (None, "auto")
+        assert _parse_stream_prefetch("on") == "on"
+        assert _parse_stream_prefetch("off") == "off"
+        assert _parse_stream_prefetch("auto") == "auto"
+        assert _parse_stream_prefetch("cpu") == "cpu"
+        assert _parse_stream_prefetch("1") == "cuda:1"
+        assert _parse_stream_prefetch("cuda:3") == "cuda:3"
+
+    def test_parse_device_list_rejected(self):
+        from auto_round.cli.main import _parse_stream_prefetch
+
+        with pytest.raises(ValueError, match="single staging device"):
+            _parse_stream_prefetch("1,2")
 
     def test_on_with_cpu_quant_stays_enabled_as_ram(self):
         # 'on' never silently disables: with a CPU quant device the chain
         # lands on host-RAM staging (devices None) without a warning-only bail
-        assert self._resolve(stream_prefetch_devices="on") is None
+        assert self._resolve(stream_prefetch="on") is None
 
     def test_auto_with_cpu_quant_is_none(self):
-        assert self._resolve(stream_prefetch_devices="auto") is None
-
-    def test_mixed_gpu_cpu_list_rejected_with_cuda_quant(self):
-        # in-place round-robin quantization: all-GPU or CPU-only, never mixed
-        from types import SimpleNamespace
-
-        from auto_round.compressors.orchestrator import CompressionOrchestrator
-
-        stub = SimpleNamespace(stream_prefetch=None, device="cuda:0", stream_prefetch_devices=["cuda:1", "cpu"])
-        with pytest.raises(ValueError, match="mixed GPU/CPU staging"):
-            CompressionOrchestrator._resolve_stream_stage_devices(stub)
+        assert self._resolve(stream_prefetch="auto") is None
 
 
 class TestStreamingRoutingWaiver:
@@ -741,8 +740,7 @@ class TestStreamQuantizeEquivalence:
         model_path,
         out_dir,
         stream,
-        stream_prefetch=0,
-        stream_prefetch_devices=None,
+        stream_prefetch="off",
         dataset=None,
         layer_config=None,
         iters=0,
@@ -768,7 +766,6 @@ class TestStreamQuantizeEquivalence:
             alg_configs=alg,
             stream_quantization=stream,
             stream_prefetch=stream_prefetch,
-            stream_prefetch_devices=stream_prefetch_devices,
             **kwargs,
             format="auto_round",
             disable_model_free=True,
@@ -1184,11 +1181,9 @@ class TestStreamQuantizeEquivalence:
         ck_b = str(tmp_path / "ck_b")
         shutil.copytree(tiny_checkpoint, ck_a)
         shutil.copytree(tiny_checkpoint, ck_b)
-        stage_devs = ["cpu"] if torch.cuda.device_count() < 2 else ["cuda:1"]
+        stage_devs = "cpu" if torch.cuda.device_count() < 2 else "cuda:1"
         plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
-        staged = self._quantize(
-            ck_b, str(tmp_path / "staged"), stream=True, stream_prefetch=2, stream_prefetch_devices=stage_devs
-        )
+        staged = self._quantize(ck_b, str(tmp_path / "staged"), stream=True, stream_prefetch=stage_devs)
 
         def load_all(d):
             from safetensors import safe_open
@@ -1326,6 +1321,41 @@ class TestStreamQuantizeEquivalence:
         assert "mtp.fc.qweight" in keys, "pinned top-level checkpoint-only layer was not packed"
         assert "mtp.fc.weight" not in keys, "plain weight written beside its packed form"
         assert "mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
+
+    def test_tensor_spelled_pin_beats_broader_module_pin(self, tiny_checkpoint, tmp_path):
+        """A pin pattern carrying the trailing tensor dot (``.*mtp.fc.``) must
+        win over a broader module-side pattern for the same layer: it matches
+        the module's tensor spelling. The user-facing failure was mtp.fc
+        quantized 8-bit under {'.*mtp.fc.': float, '.*mtp.*': 8} because the
+        lookup only ever saw the module path 'mtp.fc'."""
+        extra = {
+            "mtp.fc.weight": torch.randn(16, 32),
+            "mtp.norm.weight": torch.randn(32),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(
+            src,
+            str(tmp_path / "out"),
+            stream=True,
+            layer_config={".*mtp.fc.": {"bits": 16, "data_type": "float"}, ".*mtp.*": {"bits": 8}},
+        )
+        keys = self._export_keys(out)
+        assert "mtp.fc.weight" in keys, "float-pinned fc not written verbatim"
+        assert not any(k.startswith("mtp.fc.q") for k in keys), f"fc packed despite the float pin: {sorted(keys)}"
+
+    def test_pin_entry_for_matches_module_and_tensor_spellings(self):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = SimpleNamespace(
+            layer_config={},
+            regex_config={".*mtp.fc.": {"bits": 16, "data_type": "float"}, ".*mtp.*": {"bits": 8}},
+        )
+        entry = CompressionOrchestrator._pin_entry_for(orch, "mtp.fc")
+        assert entry == {"bits": 16, "data_type": "float"}, f"first pattern lost to the broader pin: {entry}"
+        assert CompressionOrchestrator._pin_entry_for(orch, "mtp.norm") == {"bits": 8}
+        assert CompressionOrchestrator._pin_entry_for(orch, "model.layers.3.mlp.up_proj") is None
 
     def test_nested_checkpoint_only_group_with_pin_materializes(self, tiny_checkpoint, tmp_path):
         """Depth-2 topology (``model.mtp.*``): same materialization semantics
@@ -1544,9 +1574,8 @@ class TestAutoStagingScopesToDeviceMap:
         monkeypatch.setattr(_torch.cuda, "device_count", lambda: 4)
         monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
         stub = SimpleNamespace(
-            stream_prefetch=None,
+            stream_prefetch="auto",
             device=quant,
-            stream_prefetch_devices="auto",
             _primary_fits_largest_block=lambda dev: primary_fit,
         )
         monkeypatch.setattr(
@@ -1557,17 +1586,19 @@ class TestAutoStagingScopesToDeviceMap:
 
     def test_auto_excludes_gpus_outside_device_map(self, monkeypatch):
         devices = self._resolve(monkeypatch, device_list=["cuda:1", "cuda:2"])
-        # cuda:0 and cuda:3 are visible but not in the map: never staged
+        # cuda:0 and cuda:3 are visible but not in the map: never staged;
+        # exactly ONE other device is picked (pool order)
         assert [str(d) for d in devices] == ["cuda:2"]
 
     def test_auto_primary_joins_only_within_device_map(self, monkeypatch):
         devices = self._resolve(monkeypatch, device_list=["cuda:1", "cuda:2"], primary_fit=(6.9, 22.3))
         assert sorted(str(d) for d in devices) == ["cuda:1", "cuda:2"]
 
-    def test_auto_default_map_uses_all_visible_gpus(self, monkeypatch):
-        # no --device_map: device_list still resolves to every visible GPU
-        devices = self._resolve(monkeypatch, device_list=[f"cuda:{i}" for i in range(4)], primary_fit=(6.9, 22.3))
-        assert sorted(str(d) for d in devices) == ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+    def test_auto_capped_to_one_other_device(self, monkeypatch):
+        # many visible GPUs: still quant + ONE other home; lookahead is one
+        # block, so extra homes would only spread block VRAM around
+        devices = self._resolve(monkeypatch, device_list=[f"cuda:{i}" for i in range(4)], primary_fit=None)
+        assert [str(d) for d in devices] == ["cuda:0"]
 
     def test_auto_sole_gpu_in_map_without_fit_falls_back_to_ram(self, monkeypatch):
         assert self._resolve(monkeypatch, device_list=["cuda:1"], primary_fit=None) is None

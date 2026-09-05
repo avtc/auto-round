@@ -629,9 +629,10 @@ class AlgorithmComposer:
     _STREAMED_ROTATION_MSG = (
         "Rotation transforms on a streamed model (stream_quantization / "
         "AR_DISK_STREAM_MODEL meta skeleton) can only run layer-wise: leave "
-        "layerwise_rotation unset (it auto-enables under both streaming modes) "
-        "or pass --layerwise_rotation, so each block is folded inside the "
-        "block loop instead of materializing the whole model."
+        "layerwise_rotation unset so it auto-engages under both streaming modes "
+        "(API callers may pass layerwise_rotation=True explicitly), and each "
+        "block is folded inside the block loop instead of materializing the "
+        "whole model."
     )
 
     def _model_has_meta(self, model) -> bool:

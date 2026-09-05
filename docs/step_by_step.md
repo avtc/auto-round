@@ -972,15 +972,14 @@ directly and never resolves hub ids); download the model first when starting fro
   is raised when both are set). Text LLMs should prefer this flag; the env path remains for multimodal runs
   that quantize the vision tower. For multimodal models the vision tower stays unquantized
   (`quant_nontext_module` is rejected under streaming).
-- `--stream_prefetch off|auto|on|cpu|<devices>`: stage the next block's weights on another device while the
-  current block is quantized. `auto` round-robins blocks across all GPUs except the primary, and includes the
-  primary too when its free VRAM fits the largest block; `cpu` stages on host memory (slowest, most capacity);
-  an explicit list (e.g. `cuda:1,cuda:2`) round-robins across the listed devices; `on` follows
-  the `auto` chain but is guaranteed enabled - host RAM at minimum instead of disabling.
-- `--layerwise_rotation`: apply rotation transforms per block instead of up front, so the full model never has
-  to be materialized. Engaged automatically when `--stream_quantization` is used with rotation algorithms.
-- Resume: `AR_RESUME_DIR` works with streaming runs; completed blocks are skipped and their output shards are
-  adopted as-is. Python API users can pass `stream_prefetch_devices` to control staging explicitly.
+- `--stream_prefetch off|auto|on|cpu|<device>`: stage the next block's weights on another device while the
+  current block is quantized. `auto` stages on one other GPU (the primary joins the rotation when its free
+  VRAM fits the largest block; host RAM as a last resort); `cpu` stages on host memory (slowest, most
+  capacity); a single device (e.g. `cuda:1`) stages there; `on` follows the `auto` chain but is guaranteed
+  enabled - host RAM at minimum instead of disabling. Lookahead is always one block: quantize time per block
+  dwarfs its load time, so device lists are not accepted. Staged blocks are quantized in place on their
+  staging home. Rotation transforms (e.g. Hadamard) always apply per block under streaming - the full model
+  is never materialized for an up-front pass.
 
 - Supported formats: streaming requires per-block packable integer formats (`auto_round`, `auto_round:llm_compressor`,
   `auto_round:auto_gptq`, `auto_round:auto_awq`). GGUF and any format without per-block immediate packing fail fast

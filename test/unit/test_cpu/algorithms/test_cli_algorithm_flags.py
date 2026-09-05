@@ -32,7 +32,7 @@ def _build(args):
 
 
 class TestStreamingCliFlags(unittest.TestCase):
-    """Streaming/layerwise CLI flags must reach the AutoRound compressor kwargs."""
+    """Streaming CLI flags must reach the AutoRound compressor kwargs."""
 
     @staticmethod
     def _compressor_kwargs(extra):
@@ -41,55 +41,48 @@ class TestStreamingCliFlags(unittest.TestCase):
         return _build_entry_compressor_kwargs(_parse(extra))
 
     def test_streaming_flags_reach_kwargs(self):
-        kwargs = self._compressor_kwargs(
-            [
-                "--layerwise_rotation",
-                "--stream_quantization",
-                "--iters",
-                "0",
-            ]
-        )
-        self.assertIs(kwargs["layerwise_rotation"], True)
+        kwargs = self._compressor_kwargs(["--stream_quantization", "--iters", "0"])
         self.assertIs(kwargs["stream_quantization"], True)
-        # unset prefetch -> off
-        self.assertEqual(kwargs["stream_prefetch"], 0)
-        self.assertIsNone(kwargs["stream_prefetch_devices"])
+        # unset prefetch -> off; no separate devices kwarg exists
+        self.assertEqual(kwargs["stream_prefetch"], "off")
+        self.assertNotIn("stream_prefetch_devices", kwargs)
+        # layerwise_rotation stays unset (auto-resolves under streaming)
+        self.assertNotIn("layerwise_rotation", kwargs)
 
     def test_prefetch_auto(self):
         kwargs = self._compressor_kwargs(["--stream_prefetch", "auto"])
-        self.assertIsNone(kwargs["stream_prefetch"], "auto derives depth at loop start")
-        self.assertEqual(kwargs["stream_prefetch_devices"], "auto")
+        self.assertEqual(kwargs["stream_prefetch"], "auto")
 
     def test_prefetch_cpu(self):
         kwargs = self._compressor_kwargs(["--stream_prefetch", "cpu"])
-        self.assertIsNone(kwargs["stream_prefetch"])
-        self.assertEqual(kwargs["stream_prefetch_devices"], ["cpu"])
+        self.assertEqual(kwargs["stream_prefetch"], "cpu")
 
-    def test_prefetch_gpu_list_ints(self):
-        kwargs = self._compressor_kwargs(["--stream_prefetch", "1,2"])
-        self.assertIsNone(kwargs["stream_prefetch"])
-        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:1", "cuda:2"])
+    def test_prefetch_single_device_int(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch", "1"])
+        self.assertEqual(kwargs["stream_prefetch"], "cuda:1")
 
-    def test_prefetch_gpu_list_names(self):
-        kwargs = self._compressor_kwargs(["--stream_prefetch", " cuda:3 , cuda:5 "])
-        self.assertEqual(kwargs["stream_prefetch_devices"], ["cuda:3", "cuda:5"])
+    def test_prefetch_single_device_name(self):
+        kwargs = self._compressor_kwargs(["--stream_prefetch", " cuda:3 "])
+        self.assertEqual(kwargs["stream_prefetch"], "cuda:3")
+
+    def test_prefetch_device_list_rejected(self):
+        from auto_round.cli.main import _build_entry_compressor_kwargs
+
+        args = _parse(["--stream_prefetch", "1,2"])
+        with self.assertRaises(ValueError):
+            _build_entry_compressor_kwargs(args)
 
     def test_prefetch_off_synonyms(self):
         for value in ("off", "", "0"):
             kwargs = self._compressor_kwargs(["--stream_prefetch", value] if value else [])
-            self.assertEqual(kwargs["stream_prefetch"], 0)
-            self.assertIsNone(kwargs["stream_prefetch_devices"])
+            self.assertEqual(kwargs["stream_prefetch"], "off")
 
-    def test_prefetch_empty_list_rejected(self):
-        from auto_round.cli.main import _build_entry_compressor_kwargs
-
-        args = _parse(["--stream_prefetch", " , "])
-        with self.assertRaises(ValueError):
-            _build_entry_compressor_kwargs(args)
+    def test_layerwise_rotation_flag_removed(self):
+        # the flag is gone: rotation mode auto-resolves under streaming
+        with self.assertRaises(SystemExit):
+            _parse(["--layerwise_rotation"])
 
     def test_defaults_are_api_neutral(self):
         kwargs = self._compressor_kwargs([])
-        self.assertIsNone(kwargs["layerwise_rotation"], "unset must auto-resolve, not force off")
         self.assertIs(kwargs["stream_quantization"], False)
-        self.assertEqual(kwargs["stream_prefetch"], 0)
-        self.assertIsNone(kwargs["stream_prefetch_devices"])
+        self.assertEqual(kwargs["stream_prefetch"], "off")

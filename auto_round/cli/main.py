@@ -82,51 +82,39 @@ def _build_entry_route_kwargs(args) -> dict:
 
 
 def _parse_stream_prefetch(value):
-    """Parse the combined --stream_prefetch flag into (depth, devices).
+    """Parse the --stream_prefetch flag into its single-string form.
 
-    'off' (default) -> (0, None); 'auto' -> (None, 'auto'): stage on the
-    other GPUs, or on the quant device itself when it is the only GPU and
-    the next block fits its free VRAM, or in host RAM as a last resort;
-    'on' -> same resolution chain but guaranteed enabled (host RAM at
-    minimum); 'cpu' -> (None, ['cpu']) host-RAM staging at depth 1; a comma
-    list of GPUs ('1,2' or 'cuda:1,cuda:2') -> (None, devices), one block
-    each, quantized in place.
+    'off' (default) disables staging; 'auto' resolves one staging GPU (one
+    other GPU first; the quant device itself when it is the only GPU and the
+    next block fits its free VRAM; host RAM as a last resort); 'on' is the
+    same chain guaranteed enabled (host RAM at minimum); 'cpu' stages in
+    host RAM; a single device ('1' or 'cuda:1') stages on that device.
+    Lists are not accepted: lookahead is always one block, so more than one
+    additional device would only spread block VRAM around.
     """
     text = (value or "off").strip()
     lowered = text.lower()
     if lowered in ("", "off", "0", "false"):
-        return 0, None
-    if lowered == "auto":
-        return None, "auto"
-    if lowered == "on":
-        return None, "on"
-    if lowered == "cpu":
-        return None, ["cpu"]
-    devices = []
-    for item in text.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        devices.append(f"cuda:{item}" if item.isdigit() else item)
-    if not devices:
-        raise ValueError(f"--stream_prefetch: cannot parse staging spec {value!r}")
-    return None, devices
+        return "off"
+    if lowered in ("auto", "on", "cpu"):
+        return lowered
+    if "," in text:
+        raise ValueError(
+            "--stream_prefetch accepts a single staging device (e.g. '1' or 'cuda:1'), not a list: "
+            "lookahead is always one block, so extra devices would only spread block VRAM around"
+        )
+    return f"cuda:{lowered}" if lowered.isdigit() else lowered
 
 
 def _build_entry_compressor_kwargs(args) -> dict:
-    depth, devices = _parse_stream_prefetch(getattr(args, "stream_prefetch", "off"))
-    layerwise = getattr(args, "layerwise_rotation", False)
+    prefetch = _parse_stream_prefetch(getattr(args, "stream_prefetch", "off"))
     return {
         "scale_dtype": args.scale_dtype,
         "ignore_layers": args.ignore_layers,
         "quant_lm_head": args.quant_lm_head,
         "to_quant_block_names": args.to_quant_block_names,
-        # None (unset) lets stream_quantization auto-enable layer-wise rotation
-        # when rotation transforms are present; True/False are explicit.
-        "layerwise_rotation": True if layerwise else None,
         "stream_quantization": getattr(args, "stream_quantization", False),
-        "stream_prefetch": depth,
-        "stream_prefetch_devices": devices,
+        "stream_prefetch": prefetch,
     }
 
 

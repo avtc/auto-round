@@ -1252,20 +1252,25 @@ class CompressionOrchestrator(BaseOrchestrator):
         return iters, routing
 
     def _resolve_stream_stage_devices(self):
-        """Resolve ``stream_prefetch_devices`` into a list of staging devices.
+        """Resolve the ``stream_prefetch`` mode into the staging-device list.
 
-        Returns None for host-RAM staging (the default). "auto" uses every CUDA
-        device except the quant device (all of them when only one exists);
-        explicit lists accept ints (``cuda:k``), device strings, or torch.device.
-        GPU staging with a CPU quant device falls back to host RAM: blocks
-        would quantize on CPU, so VRAM staging buys nothing there.
+        Returns None for host-RAM staging. "auto"/"on" pick ONE other CUDA
+        device from the device map (all visible GPUs when no map is set); the
+        quant device joins the rotation when its free VRAM fits the largest
+        block, and the sole-GPU case stages on the quant device itself under
+        the same fit rule -- host RAM is the last resort ("on" never silently
+        disables). An explicit device string stages on that device. At most
+        two homes ever rotate: lookahead is one block, so more devices would
+        only spread block VRAM around.
         """
-        value = getattr(self, "stream_prefetch_devices", None)
-        if not value:
+        mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
+        if mode in ("", "off", "0", "false"):
+            return None
+        if mode == "cpu":
             return None
         quant_dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
-        forced = isinstance(value, str) and value.strip().lower() == "on"
-        if isinstance(value, str) and value.strip().lower() in ("auto", "on"):
+        forced = mode == "on"
+        if mode in ("auto", "on"):
             ram_last_resort = (
                 "[stream] prefetch fallback: staging in host RAM (RAM->GPU hop still beats an on-demand "
                 "NVMe re-read)"
@@ -1289,51 +1294,40 @@ class CompressionOrchestrator(BaseOrchestrator):
             # resolves to every visible GPU, so nothing changes there
             allowed = [torch.device(str(d)) for d in device_manager.device_list if str(d).startswith("cuda")]
             pool = allowed if allowed else [torch.device("cuda", i) for i in range(n_gpu)]
-            devices = [d for d in pool if d != quant_dev]
-            # The primary joins the rotation when its free VRAM comfortably
-            # holds the LARGEST block (block sizes vary by layer type - linear-attention vs
-            # full-attention vs first/last): parent working set + block + tuning
-            # transients must coexist there for one block at a time.
-            primary_fit = self._primary_fits_largest_block(quant_dev)
-            if primary_fit is not None:
-                largest_gb, free_gb = primary_fit
-                devices = list(pool)
-                logger.debug(
-                    "[stream] auto staging includes the primary %s: largest block %.2fG fits free %.2fG "
-                    "(headroom 3.0G for tuning transients)",
-                    quant_dev,
-                    largest_gb,
-                    free_gb,
-                )
-            elif len(pool) == 1 and not devices:
-                # sole GPU and the largest block does not fit with headroom:
-                # do not stage on it, host RAM takes the lookahead
+            others = [d for d in pool if d != quant_dev]
+            if others:
+                devices = [others[0]]
+                # The primary joins the rotation when its free VRAM comfortably
+                # holds the LARGEST block (block sizes vary by layer type):
+                # parent working set + block + tuning transients must coexist
+                # there for one block at a time.
+                if self._primary_fits_largest_block(quant_dev) is not None:
+                    devices = [quant_dev, others[0]]
+            elif self._primary_fits_largest_block(quant_dev) is not None:
+                # sole GPU: it may stage on itself when the largest block fits
+                # with tuning headroom
+                devices = [quant_dev]
+            else:
                 logger.info("%s: largest block does not fit free VRAM on the sole GPU", ram_last_resort)
                 return None
-            if forced and not devices:
-                logger.debug("%s: no usable staging GPU", ram_last_resort)
-                return None
         else:
-            devices = [torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(d) for d in value]
-            if any(d.type == "cuda" for d in devices) and any(d.type == "cpu" for d in devices):
+            try:
+                dev = torch.device(mode)
+            except RuntimeError as e:
                 raise ValueError(
-                    "mixed GPU/CPU staging devices are not supported: staged blocks are "
-                    "quantized in place (round-robin homes), so staging must be all-GPU "
-                    "or CPU-only (host RAM); pass e.g. --stream_prefetch auto or --stream_prefetch cpu"
-                )
-            if quant_dev.type != "cuda" and any(d.type == "cuda" for d in devices):
+                    f"stream_prefetch {mode!r} is not a valid device; use off/auto/on/cpu or a device "
+                    "string like 'cuda:1'"
+                ) from e
+            if dev.type == "meta":
+                raise ValueError(f"invalid staging device {dev}: meta tensors hold no data")
+            if quant_dev.type != "cuda" and dev.type == "cuda":
                 logger.warning(
-                    "[stream] GPU staging devices ignored with CPU quant device %s; using host RAM", quant_dev
+                    "[stream] GPU staging device ignored with CPU quant device %s; using host RAM", quant_dev
                 )
                 return None
-        for d in devices:
-            if d.type == "meta":
-                raise ValueError(f"invalid staging device {d}: meta tensors hold no data")
-        depth = int(getattr(self, "stream_prefetch", 0) or 0)
-        shown_depth = depth if depth else 1
+            devices = [dev]
         logger.info(
-            "[stream] staging %d block(s) deep on %s; blocks quantize in place (round-robin homes)",
-            shown_depth,
+            "[stream] staging one block ahead on %s; staged blocks quantize in place",
             [str(d) for d in devices],
         )
         return devices or None
@@ -1388,15 +1382,21 @@ class CompressionOrchestrator(BaseOrchestrator):
         The resolver expands pins only over module-side names (checkpoint-only
         layers cannot receive plan entries), so pins for those live solely in
         regex_config: match the path against every pattern (exact pins are
-        normalized to regexes too) and return the first hit."""
+        normalized to regexes too) and return the first hit. Each pattern is
+        also tried against the layer's tensor spelling (``path + ".weight"``):
+        a pin written with the tensor dot (``.*mtp.fc.``) matches the tensor
+        but never the bare module path, and losing it to a broader module-side
+        pattern would silently quantize a layer the user pinned float."""
         from auto_round.utils.common import to_standard_regex
 
         entry = self.layer_config.get(layer_path)
         if isinstance(entry, dict):
             return entry
+        candidates = (layer_path, f"{layer_path}.weight")
         for pattern, val in (getattr(self, "regex_config", None) or {}).items():
             try:
-                if re.search(to_standard_regex(pattern), layer_path):
+                rx = to_standard_regex(pattern)
+                if any(re.search(rx, c) for c in candidates):
                     return val
             except re.error:  # pragma: no cover - malformed user pattern
                 continue
@@ -2120,25 +2120,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             streamer.release_startup_handles_()
 
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
-        # of the quantize loop. With staging devices the blocks land directly
-        # on those devices (round-robin by block index) and are quantized in
-        # place there; otherwise they wait in host RAM. Lookahead is ONE block
-        # regardless of staging-device count: quantize time per block dwarfs
-        # its load time, so deeper staging only holds extra block-sized VRAM.
-        raw_depth = getattr(self, "stream_prefetch", 0)
-        # API users may pass only stream_prefetch_devices (the docs suggest
-        # exactly that for resume control): treat present devices as opting
-        # into staging instead of silently ignoring them
-        if raw_depth in (0, None) and getattr(self, "stream_prefetch_devices", None):
-            raw_depth = None
-            logger.info(
-                "[stream] stream_prefetch_devices set without stream_prefetch; enabling block staging (depth 1)"
-            )
-        stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and raw_depth != 0) else None
-        if raw_depth == 0 or raw_depth is None:
-            prefetch_depth = 0 if raw_depth == 0 else 1
-        else:
-            prefetch_depth = int(raw_depth)
+        # of the quantize loop. With a staging device the blocks land directly
+        # on it and are quantized in place there (the quant device joins the
+        # rotation under 'auto' when its free VRAM fits); otherwise they wait
+        # in host RAM. Lookahead is ONE block, always: quantize time per block
+        # dwarfs its load time, so deeper staging would only hold extra
+        # block-sized VRAM.
+        _prefetch_mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
+        prefetch_depth = 0 if _prefetch_mode in ("", "off", "0", "false") else 1
+        stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and prefetch_depth > 0) else None
         prefetch_names = flat_block_names
         if resume_states is not None:
             _pending_offset = self._stream_resume_pending_offset(all_blocks, resume_states)

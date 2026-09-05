@@ -136,18 +136,6 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         help="Comma-separated algorithms such as 'awq' or 'awq,auto_round'.",
     )
     rt.add_argument(
-        "--layerwise_rotation",
-        dest="layerwise_rotation",
-        default=False,
-        action="store_true",
-        help=(
-            "Apply rotation transforms (e.g. Hadamard rotations) per block inside the streaming "
-            "block loop instead of one whole-model pass. Auto-enables under "
-            "--stream_quantization when rotation transforms are present; the flag "
-            "remains for explicit control on non-streamed models."
-        ),
-    )
-    rt.add_argument(
         "--stream_quantization",
         dest="stream_quantization",
         default=False,
@@ -167,14 +155,14 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         type=str,
         help=(
             "Background block staging for the streaming loop: 'off' (default), "
-            "'auto' (stage on the other GPUs; on the quant device itself when it "
-            "is the only GPU and the next block fits its free VRAM; in host RAM "
-            "as a last resort), 'on' (same chain, guaranteed enabled - host RAM "
-            "at minimum), 'cpu' (host RAM), or a comma list of staging GPUs "
-            "('1,2' or 'cuda:1,cuda:2'; a bare number is a DEVICE INDEX - "
-            "'1' stages on cuda:1, it does not set a lookahead depth). Each "
-            "staging GPU holds one in-flight block and quantizes it in place "
-            "(round-robin homes), so mixed GPU/CPU lists are not supported."
+            "'auto' (stage on one other GPU; the quant device itself when it is "
+            "the only GPU and the next block fits its free VRAM; host RAM as a "
+            "last resort), 'on' (same chain, guaranteed enabled - host RAM at "
+            "minimum), 'cpu' (host RAM), or a single staging device ('1' or "
+            "'cuda:1'; a bare number is a DEVICE INDEX, not a lookahead depth). "
+            "Lookahead is always one block: quantize time dwarfs load time, so "
+            "device lists are not accepted. Staged blocks are quantized in "
+            "place on their staging home."
         ),
     )
     rt.add_argument("--output_dir", default="./tmp_autoround", type=str, help="Directory to save quantized artifacts.")

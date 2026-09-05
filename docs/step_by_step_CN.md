@@ -932,14 +932,13 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantizati
 - `--stream_quantization`：启用流式路径。与 `AR_DISK_STREAM_MODEL` 互斥（同时设置会报错）。文本 LLM
   建议优先使用该 flag；env 路径保留给需要量化视觉塔的多模态运行。多模态模型的视觉塔保持不量化
   （流式模式下会拒绝 `quant_nontext_module`）。
-- `--stream_prefetch off|auto|on|cpu|<设备列表>`：在量化当前块的同时，在其他设备上预取下一块的权重。
-  `auto` 在除主 GPU 外的全部 GPU 间逐块轮转（当主 GPU 的空闲显存足以容纳最大块时也会加入轮转）；
-  `cpu` 在主机内存上预取（最慢、容量最大）；显式列表（如 `cuda:1,cuda:2`）在所列设备间轮转；`on` 走与 `auto` 相同的解析链，但保证启用——
-  最不济也会使用主机内存，而不是禁用预取。
-- `--layerwise_rotation`：逐块应用旋转类变换，而不是一次性前处理，从而无需物化完整模型。当
-  `--stream_quantization` 与旋转类算法同时使用时会自动启用。
-- 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。Python API
-  用户可通过 `stream_prefetch_devices` 显式控制预取设备。
+- `--stream_prefetch off|auto|on|cpu|<设备>`：在量化当前块的同时，在其他设备上预取下一块的权重。
+  `auto` 在另一块 GPU 上预取（当主 GPU 的空闲显存足以容纳最大块时，主 GPU 也会加入轮转；最后回退到
+  主机内存）；`cpu` 在主机内存上预取（最慢、容量最大）；单个设备（如 `cuda:1`）在指定设备上预取；
+  `on` 走与 `auto` 相同的解析链，但保证启用——最不济也会使用主机内存，而不是禁用预取。预取深度固定为
+  一个块：每块的量化时间远大于其加载时间，因此不接受设备列表。预取的块会在其预取设备上就地量化。
+  旋转类变换（如 Hadamard）在流式模式下总是逐块应用——不会为了预处理而物化完整模型。
+- 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。
 
 - 支持的格式：流式量化要求逐块可打包的整数格式（`auto_round`、`auto_round:llm_compressor`、
   `auto_round:auto_gptq`、`auto_round:auto_awq`）。GGUF 及任何不支持逐块立即打包的格式都会直接报错

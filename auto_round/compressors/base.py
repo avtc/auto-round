@@ -323,16 +323,21 @@ class BaseOrchestrator(object):
         # saving). For models far larger than host RAM.
         self.stream_quantization = kwargs.pop("stream_quantization", False)
         # Background block staging for the streaming loop (stream_quantization
-        # only): 0 disables it; None (CLI 'auto'/'cpu'/device-list mode) derives
-        # the depth at loop start -- one block per staging device, or 1 for
-        # host-RAM staging.
-        self.stream_prefetch = kwargs.pop("stream_prefetch", 0)
-        # Where prefetched blocks wait: None = host RAM (default); "auto" =
-        # every CUDA device except the quant device; or an explicit list of
-        # devices (ints / "cuda:k" / "cpu" -- never mixed: in-place round-robin
-        # quantization requires all-GPU or CPU-only staging). Requires
-        # stream_prefetch != 0.
-        self.stream_prefetch_devices = kwargs.pop("stream_prefetch_devices", None)
+        # only), one string knob: "off" (default) disables it; "auto" stages on
+        # one other CUDA device (the quant device joins the rotation when its
+        # free VRAM fits the largest block; host RAM as a last resort);
+        # "on" is the same chain guaranteed enabled (host RAM at minimum);
+        # "cpu" stages in host RAM; a single device string ("cuda:1") stages
+        # there. Lookahead is always ONE block: quantize time per block dwarfs
+        # its load time, so extra staging devices would only spread block
+        # VRAM around. Legacy forms tolerated: 0 -> "off", any other int or
+        # None -> "auto".
+        _prefetch_raw = kwargs.pop("stream_prefetch", "off")
+        if _prefetch_raw is None:
+            _prefetch_raw = "auto"
+        elif isinstance(_prefetch_raw, int) and not isinstance(_prefetch_raw, bool):
+            _prefetch_raw = "auto" if _prefetch_raw else "off"
+        self.stream_prefetch = str(_prefetch_raw).strip().lower() or "off"
         # Collect imatrix activation statistics with a streaming forward pass
         # before the zero-shot loop (stream_quantization only): one block at a
         # time is materialized, all calibration rows are pushed through, and
