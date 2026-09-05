@@ -13,6 +13,7 @@ import inspect
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -166,3 +167,70 @@ class TestTuningHeadroomProfile:
             None,
             None,
         )
+
+
+class TestBoundedStagingWait:
+    """The staging wait must be visible and bounded: log once (including the
+    previously-silent no-rescue case), force a second host-RAM slot after the
+    force timeout, raise after the raise timeout."""
+
+    def _streamer(self, tmp_path):
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        save_file({"blk.a.weight": torch.ones(2, 2)}, os.path.join(tmp_path, "model.safetensors"))
+        return CheckpointStreamer(str(tmp_path))
+
+    def _prime(self, streamer, monkeypatch, devices, cpu_staged):
+        import auto_round.utils.checkpoint_streamer as cs
+
+        streamer._prefetch_stage_devices = devices
+        streamer._prefetch_stop = False
+        streamer._prefetch_cpu_staged = cpu_staged
+        monkeypatch.setattr(cs, "pick_stage_device", lambda *a, **k: None)
+
+    def test_regular_rescue_unchanged(self, tmp_path, monkeypatch):
+        s = self._streamer(tmp_path)
+        self._prime(s, monkeypatch, [torch.device("cuda", 0)], cpu_staged=0)
+        s._staging_force_slot_after_s = 1e9
+        s._staging_raise_after_s = 1e9
+        assert s._wait_for_stage_device(0, "blk") == torch.device("cpu")
+        assert s._prefetch_cpu_staged == 1
+
+    def test_forced_second_slot_after_timeout(self, tmp_path, monkeypatch):
+        s = self._streamer(tmp_path)
+        self._prime(s, monkeypatch, [torch.device("cuda", 0)], cpu_staged=1)
+        s._staging_force_slot_after_s = 0.0  # deadline already passed
+        s._staging_raise_after_s = 1e9
+        assert s._wait_for_stage_device(0, "blk") == torch.device("cpu")
+        assert s._prefetch_cpu_staged == 2  # bounded: exactly one forced slot
+
+    def test_raises_when_both_slots_taken(self, tmp_path, monkeypatch):
+        s = self._streamer(tmp_path)
+        self._prime(s, monkeypatch, [torch.device("cuda", 0)], cpu_staged=2)
+        s._staging_force_slot_after_s = 0.0
+        s._staging_raise_after_s = 0.0
+        with pytest.raises(RuntimeError, match="staging wait"):
+            s._wait_for_stage_device(0, "blk")
+
+    def test_wait_logs_in_rescue_disallowed_case(self, tmp_path, monkeypatch):
+        """No CUDA staging device: previously this loop logged NOTHING. The
+        project logger does not propagate, so record calls on a stub."""
+        import auto_round.utils.checkpoint_streamer as cs
+
+        seen = []
+
+        class _Log:
+            def info(self, *a, **k):
+                seen.append(str(a))
+
+            def warning(self, *a, **k):
+                seen.append(str(a))
+
+        s = self._streamer(tmp_path)
+        self._prime(s, monkeypatch, [], cpu_staged=0)
+        s._staging_force_slot_after_s = 1e9
+        s._staging_raise_after_s = 0.0
+        monkeypatch.setattr(cs, "logger", _Log())
+        with pytest.raises(RuntimeError, match="no staging devices"):
+            s._wait_for_stage_device(0, "blk")
+        assert any("no host-RAM rescue" in msg for msg in seen)

@@ -330,41 +330,82 @@ class CheckpointStreamer:
             moe_routing_bytes=getattr(self, "_moe_routing_bytes", None),
         )
 
+    # Bounded staging wait: a stalled pick is visible fast and cannot hang
+    # forever. With correct rescue-slot bookkeeping a true deadlock is
+    # impossible (the main loop consumes the rescued prefix before waiting on
+    # the next), so these bounds only fire on a VRAM leak, fragmentation or a
+    # bookkeeping bug. Sizes chosen so whole quantizations of small models
+    # (minutes end to end) never trip them.
+    _staging_force_slot_after_s = 60.0  # then force a 2nd host-RAM rescue slot
+    _staging_raise_after_s = 300.0  # then fail loud with required-vs-free
+
     def _wait_for_stage_device(self, index: int, prefix: str) -> Optional[torch.device]:
         """Pick a staging device for *prefix*, waiting for VRAM.
 
         VRAM-first: a device qualifies when its free memory covers the block
         (``needed_bytes``) plus the search headroom for the active layer's
         tuning jobs. When no GPU qualifies, exactly ONE block may wait in host
-        RAM (rescue buffer, keeping some I/O overlap alive); further blocks
-        wait until VRAM frees or the rescue block is consumed.
+        RAM (rescue buffer, keeping some I/O overlap alive). The wait is
+        bounded: it always logs once, forces a SECOND host-RAM rescue slot
+        after ``_staging_force_slot_after_s`` (bounded overshoot), and raises
+        after ``_staging_raise_after_s`` so a VRAM leak cannot hang silently.
         """
         devices = self._prefetch_stage_devices
         needed = self._prefix_bytes_estimate(prefix) if devices else 0
         headroom = self._headroom_for(needed if devices else None)
         rescue_allowed = any(d.type == "cuda" for d in devices)
-        rescue_logged = False
+        max_rescue = 2  # one regular slot + one forced after the timeout
+        wait_logged = False
+        deadline_force = time.monotonic() + self._staging_force_slot_after_s
+        deadline_raise = time.monotonic() + self._staging_raise_after_s
         while not self._prefetch_stop:
             dev = pick_stage_device(devices, index, needed, headroom)
             if dev is not None:
                 return dev
+            if not wait_logged:
+                logger.info(
+                    "[stream] staging GPUs below block+headroom watermarks for %s "
+                    "(%d GiB block + %d GiB search headroom); waiting for VRAM%s",
+                    prefix,
+                    needed // (1024**3),
+                    headroom // (1024**3),
+                    "" if rescue_allowed else "; no host-RAM rescue (no CUDA staging device)",
+                )
+                wait_logged = True
             if rescue_allowed:
                 with self._prefetch_cond:
                     if self._prefetch_cpu_staged < 1:
                         self._prefetch_cpu_staged += 1
-                        if not rescue_logged:
-                            logger.info(
-                                "[stream] no staging GPU has %d GiB free for a %d GiB block + %d GiB search headroom; "
-                                "holding one block in host RAM",
-                                (needed + headroom) // (1024**3),
-                                needed // (1024**3),
-                                headroom // (1024**3),
-                            )
-                            rescue_logged = True
+                        logger.info(
+                            "[stream] no staging GPU has %d GiB free for a %d GiB block + %d GiB search headroom; "
+                            "holding one block in host RAM",
+                            (needed + headroom) // (1024**3),
+                            needed // (1024**3),
+                            headroom // (1024**3),
+                        )
                         return torch.device("cpu")
-            if not rescue_logged and rescue_allowed:
-                logger.info("[stream] staging GPUs below block+headroom watermarks; waiting for VRAM")
-                rescue_logged = True
+                    if time.monotonic() >= deadline_force and self._prefetch_cpu_staged < max_rescue:
+                        self._prefetch_cpu_staged += 1
+                        logger.warning(
+                            "[stream] staging wait for %s exceeded %ds; forcing a second host-RAM rescue slot "
+                            "(bounded overshoot: at most %d blocks held in host RAM)",
+                            prefix,
+                            int(self._staging_force_slot_after_s),
+                            max_rescue,
+                        )
+                        return torch.device("cpu")
+            if time.monotonic() >= deadline_raise:
+
+                def _free_desc(d):
+                    b = device_free_bytes(d)
+                    return "unknown" if b is None else f"{b // (1024**3)} GiB free"
+
+                free_desc = ", ".join(f"{d}: {_free_desc(d)}" for d in devices) or "no staging devices"
+                raise RuntimeError(
+                    f"staging wait for {prefix} exceeded {int(self._staging_raise_after_s)}s: "
+                    f"needs {needed // (1024**3)} GiB + {headroom // (1024**3)} GiB headroom; "
+                    f"free per device: {free_desc}. VRAM never freed - leak, fragmentation or a stall?"
+                )
             time.sleep(0.5)
         return None
 
