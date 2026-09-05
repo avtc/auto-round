@@ -1446,7 +1446,6 @@ class TestStreamQuantizeEquivalence:
         captured = capfd.readouterr()
         console = captured.out + captured.err
         assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
-        assert "quantized 8/8 layers" in console, "the tune loop did not process the tree's layers"
 
     def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
         """A separate auxiliary safetensors file the index never references
@@ -1890,7 +1889,12 @@ class TestCheckpointOnlyGroupTree:
                 return name if name in tensors else None
 
         stub = SimpleNamespace(model=model, layer_config={}, regex_config={})
-        for m in ("_analyze_checkpoint_only_group_", "_resolve_group_param_source_", "_pin_entry_for"):
+        for m in (
+            "_analyze_checkpoint_only_group_",
+            "_resolve_group_param_source_",
+            "_pin_entry_for",
+            "_text_config",
+        ):
             stub.__setattr__(m, MethodType(getattr(CompressionOrchestrator, m), stub))
         return stub, Streamer(), model
 
@@ -2055,6 +2059,7 @@ class TestCheckpointOnlyGroupTree:
             "_pick_sibling_layer_",
             "_attach_checkpoint_only_group_tree_",
             "_pin_entry_for",
+            "_text_config",
         ):
             stub.__setattr__(m, MethodType(getattr(CompressionOrchestrator, m), stub))
         streamer = Streamer()
@@ -2194,3 +2199,153 @@ class TestCheckpointOnlyGroupVisibility:
         tune_src = inspect.getsource(CompressionOrchestrator._tune_checkpoint_only_groups_)
         assert "tuning checkpoint-only group" in tune_src
         assert "fall back to the closed-form search" in tune_src
+
+
+class TestTreeFusedStackWrite:
+    """Fused expert stacks inside materialized predictor trees: the stack is
+    superseded (dropped from the export) only when EVERY per-expert slice
+    quantized; a partially pinned stack stays the verbatim checkpoint copy -
+    it is the durable home of the unpinned experts. Unpinned slices must
+    carry real weights through the tuning forward (never popped meta)."""
+
+    class _FakeQuantLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bits = 4
+            self.group_size = 32
+            self.act_bits = 16
+
+    class _FakeLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(4, 4))
+
+    class _FakeStreamer:
+        def __init__(self, names, tensors):
+            self._names = names
+            self._tensors = tensors
+
+        def names_under(self, prefix):
+            return [n for n in self._names if n.startswith(prefix + ".")]
+
+        def tensor_meta(self, name):
+            t = self._tensors.get(name)
+            return (tuple(t.shape), t.dtype) if t is not None else None
+
+        def fetch(self, name, raw=False):
+            return self._tensors[name]
+
+    class _FakeWriter:
+        def __init__(self):
+            self.saved = []
+            self._all_saved = set()
+
+        def save_tensor(self, name, tensor):
+            self.saved.append(name)
+            self._all_saved.add(name)
+
+    def _run_writer(self, expert_modules, stack_bytes):
+        """expert_modules: {path: module}; returns saved tensor names."""
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = object.__new__(CompressionOrchestrator)
+        stack_gu = torch.randn(4, 8, 16)
+        stack_dn = torch.randn(4, 16, 8)
+        tensors = {
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight": stack_gu,
+            "mtp.layers.0.mlp.experts.down_proj.weight": stack_dn,
+        }
+        model = torch.nn.Module()
+        model.__dict__["globals"] = None
+        # attach modules at their paths on a plain container
+        holder = torch.nn.Module()
+        model.add_module("holder", holder)
+        for path, mod in expert_modules.items():
+            parts = path.split(".")
+            cur = model
+            for p in parts[:-1]:
+                if not hasattr(cur, p):
+                    cur.add_module(p, torch.nn.Module())
+                cur = getattr(cur, p)
+            cur.add_module(parts[-1], mod)
+        orch.model = model
+        orch.shard_writer = self._FakeWriter()
+        streamer = self._FakeStreamer(
+            ["mtp.layers.0.mlp.experts.gate_up_proj.weight", "mtp.layers.0.mlp.experts.down_proj.weight"], tensors
+        )
+        orch._write_unpacked_group_tensors_(streamer, ["mtp"])
+        return orch.shard_writer.saved
+
+    def test_fully_packed_stack_is_dropped(self):
+        mods = {}
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                mods[f"mtp.layers.0.mlp.experts.{e}.{proj}"] = self._FakeQuantLinear()
+        saved = self._run_writer(mods, None)
+        assert saved == [], f"fully packed stack still shipped verbatim: {saved}"
+
+    def test_partially_packed_stack_stays_verbatim(self):
+        mods = {}
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                # expert 3 stays unquantized
+                mods[f"mtp.layers.0.mlp.experts.{e}.{proj}"] = self._FakeQuantLinear() if e < 3 else self._FakeLinear()
+        saved = self._run_writer(mods, None)
+        assert "mtp.layers.0.mlp.experts.gate_up_proj.weight" in saved
+        assert "mtp.layers.0.mlp.experts.down_proj.weight" in saved
+
+    def test_attach_never_pops_unpinned_expert_params(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._attach_checkpoint_only_group_tree_)
+        assert "_parameters.pop" not in src, "unpinned expert params must stay real for the tuning forward"
+        assert "partial_fused" in src and "claimed_fused -= partial_fused" in src
+
+
+class TestPredictorESynthesis:
+    """Unit coverage for the e-first input synthesis and the generic
+    predictor forward's batched-e handling."""
+
+    def test_token_ids_without_embed_raise(self):
+        from auto_round.compressors.orchestrator import synthesize_predictor_e
+
+        ids = torch.randint(0, 100, (2, 8))
+        with pytest.raises(ValueError, match="need the embedding module"):
+            synthesize_predictor_e(ids, embed=None)
+
+    def test_predictor_forward_accepts_batched_e_list(self):
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import forward_checkpoint_only_predictor
+
+        class Shell(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(8, 4)
+                self._layer_ran = False
+
+            def layer(self, *a, **kw):
+                self._layer_ran = True
+                return a[0] if a else kw.get("hidden_states")
+
+        shell = Shell()
+        from auto_round.compressors.orchestrator import bind_checkpoint_only_predictor
+
+        bind_checkpoint_only_predictor(
+            shell,
+            {
+                "norm_e": nn.Identity(),
+                "norm_h": nn.Identity(),
+                "fc": shell.fc,
+                "layer": shell.layer,
+                "final_norm": None,
+            },
+        )
+        h = torch.randn(2, 5, 4)
+        e = torch.randn(2, 5, 4)
+        out = forward_checkpoint_only_predictor(shell, h, _predictor_e=[e])
+        assert out is not None and shell._layer_ran

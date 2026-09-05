@@ -358,7 +358,16 @@ class CheckpointStreamer:
         wait_logged = False
         deadline_force = time.monotonic() + self._staging_force_slot_after_s
         deadline_raise = time.monotonic() + self._staging_raise_after_s
+        # the deadlines bound STALL, not total wait: a healthy wait lasts as
+        # long as the current block's tune (the staging GPU is occupied by
+        # it), so both reset whenever the reader or the consumer made
+        # observable progress (a prefix staged or consumed)
+        last_progress = self._prefetch_progress
         while not self._prefetch_stop:
+            if self._prefetch_progress != last_progress:
+                last_progress = self._prefetch_progress
+                deadline_force = time.monotonic() + self._staging_force_slot_after_s
+                deadline_raise = time.monotonic() + self._staging_raise_after_s
             dev = pick_stage_device(devices, index, needed, headroom)
             if dev is not None:
                 return dev
@@ -447,6 +456,10 @@ class CheckpointStreamer:
         self._prefetch_stage_devices = [torch.device(d) for d in stage_devices] if stage_devices else None
         self._prefetch_stage_dev = {}  # prefix -> device it was staged on
         self._prefetch_cpu_staged = 0  # outstanding rescue-buffered prefixes
+        # monotonic reader-liveness counter: bumped on every staged or
+        # consumed prefix so the bounded staging wait can tell a healthy long
+        # wait (a tune in progress elsewhere) from a true stall
+        self._prefetch_progress = 0
         self._tuning_iters = tuning_iters  # headroom profile: None keeps the class default
         self._moe_routing_bytes = moe_routing_bytes
 
@@ -476,6 +489,7 @@ class CheckpointStreamer:
                             self._prefetch_cache[name] = tensor
                     with self._prefetch_cond:
                         self._prefetch_staged.append(prefix)
+                        self._prefetch_progress += 1
                         if stage_dev is not None:
                             self._prefetch_stage_dev[prefix] = stage_dev
             except BaseException as e:  # surfaced at the next fetch
@@ -507,6 +521,7 @@ class CheckpointStreamer:
             dev = self._prefetch_stage_dev.pop(prefix, None)
             if dev is not None and dev.type != "cuda":
                 self._prefetch_cpu_staged = max(0, self._prefetch_cpu_staged - 1)
+            self._prefetch_progress += 1
             self._prefetch_cond.notify_all()
 
     def stop_prefetch(self) -> None:
@@ -573,7 +588,8 @@ class CheckpointStreamer:
             h = self._get_safe_open_pooled(shard, self._open_handles, self._open_order)
             sl = h.get_slice(name)
             return tuple(sl.get_shape()), sl.get_dtype()
-        except Exception:  # pragma: no cover - unreadable shard
+        except Exception as e:  # pragma: no cover - unreadable shard
+            logger.warning("cannot read metadata for %r from shard %s (%s)", name, shard, e)
             return None
 
     def fetch(self, name: str, device: Optional[str] = None, raw: bool = False) -> torch.Tensor:

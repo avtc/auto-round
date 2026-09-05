@@ -234,6 +234,19 @@ def _is_fused_expert_weight_name(tensor_name: str) -> bool:
     return leaf.rsplit(".", 1)[-1] in _FUSED_EXPERT_PROJECTIONS
 
 
+def _apply_pin_attrs(module: torch.nn.Module, entry: dict) -> None:
+    """Copy a layer_config pin's quantization attributes onto *module*.
+
+    Single source for every placeholder/pin materialization site (scattered
+    placeholders, fused-expert slices, tree Linears)."""
+    for key in ("bits", "group_size", "data_type", "sym", "scale_dtype"):
+        if entry.get(key) is not None:
+            setattr(module, key, entry[key])
+    module.act_bits = entry.get("act_bits", 16)
+    module.act_sym = entry.get("act_sym", True)
+    module.act_data_type = entry.get("act_data_type", None)
+
+
 def materialize_placeholder_linear_from_tensor(
     model: torch.nn.Module, path: str, tensor: torch.Tensor, entry: dict
 ) -> None:
@@ -248,22 +261,9 @@ def materialize_placeholder_linear_from_tensor(
     lin = torch.nn.Linear(int(tensor.shape[1]), int(tensor.shape[0]), bias=False)
     with torch.no_grad():
         lin.weight.copy_(tensor)
-    for key in ("bits", "group_size", "data_type", "sym", "scale_dtype"):
-        if entry.get(key) is not None:
-            setattr(lin, key, entry[key])
-    lin.act_bits = entry.get("act_bits", 16)
-    lin.act_sym = entry.get("act_sym", True)
-    lin.act_data_type = entry.get("act_data_type", None)
+    _apply_pin_attrs(lin, entry)
     lin.global_name = path
-    segments = path.split(".")
-    parent = model
-    for seg in segments[:-1]:
-        child = getattr(parent, seg, None)
-        if child is None:
-            child = torch.nn.Module()
-            parent.add_module(seg, child)
-        parent = child
-    parent.add_module(segments[-1], lin)
+    _ensure_module_path(model, path).add_module(path.rsplit(".", 1)[-1], lin)
 
 
 def materialize_placeholder_linear(
@@ -279,24 +279,12 @@ def materialize_placeholder_linear(
     other pinned layer. Weights start on the meta device so materialization
     costs no host RAM at checkpoint scale.
     """
-    segments = path.split(".")
-    parent = model
-    for seg in segments[:-1]:
-        child = getattr(parent, seg, None)
-        if child is None:
-            child = torch.nn.Module()
-            parent.add_module(seg, child)
-        parent = child
+    parent = _ensure_module_path(model, path)
     with torch.device("meta"):
         lin = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=has_bias)
-    for key in ("bits", "group_size", "data_type", "sym", "scale_dtype"):
-        if entry.get(key) is not None:
-            setattr(lin, key, entry[key])
-    lin.act_bits = entry.get("act_bits", 16)
-    lin.act_sym = entry.get("act_sym", True)
-    lin.act_data_type = entry.get("act_data_type", None)
+    _apply_pin_attrs(lin, entry)
     lin.global_name = path
-    parent.add_module(segments[-1], lin)
+    parent.add_module(path.rsplit(".", 1)[-1], lin)
 
 
 class CompressionOrchestrator(BaseOrchestrator):
@@ -1195,10 +1183,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         (None, None) for a MoE model whose shape cannot be derived so the
         streamer keeps the conservative default rather than under-reserving.
         """
-        quantizers = self.alg_composer.block_quantizer
-        if not isinstance(quantizers, (list, tuple)):
-            quantizers = [quantizers]
-        iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
+        iters = self._max_tune_iters()
         routing = None
         cfg = self.model_context.config
         if cfg is not None and is_moe_model_via_config(cfg):
@@ -1340,6 +1325,19 @@ class CompressionOrchestrator(BaseOrchestrator):
                 made += 1
         return made
 
+    def _max_tune_iters(self) -> int:
+        """Highest iters across the block quantizers (0 when closed-form)."""
+        quantizers = self.alg_composer.block_quantizer
+        if not isinstance(quantizers, (list, tuple)):
+            quantizers = [quantizers]
+        return max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
+
+    def _text_config(self):
+        """The text-backbone config (VL composites nest it under text_config)."""
+        cfg = getattr(self.model, "config", None)
+        text_cfg = getattr(cfg, "text_config", None)
+        return text_cfg if text_cfg is not None else cfg
+
     def _pin_entry_for(self, layer_path: str) -> Optional[dict]:
         """Quantization entry pinning *layer_path*, or None.
 
@@ -1347,8 +1345,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         layers cannot receive plan entries), so pins for those live solely in
         regex_config: match the path against every pattern (exact pins are
         normalized to regexes too) and return the first hit."""
-        import re
-
         from auto_round.utils.common import to_standard_regex
 
         entry = self.layer_config.get(layer_path)
@@ -1413,10 +1409,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 deep.append(n)
         if not deep:
             return None
-        cfg = getattr(self.model, "config", None)
-        text_cfg = getattr(cfg, "text_config", None)
-        if text_cfg is None:
-            text_cfg = cfg
+        text_cfg = self._text_config()
+        cfg = text_cfg
         hidden = getattr(text_cfg, "hidden_size", None) or getattr(cfg, "hidden_size", None)
         if not isinstance(hidden, int):
             return None
@@ -1541,17 +1535,26 @@ class CompressionOrchestrator(BaseOrchestrator):
         for n, m in layer_mod.named_modules():
             m.global_name = f"{layer_root}{('.' + n) if n else ''}"
 
-        # fused expert stacks have no per-expert checkpoint name: pinned
-        # experts get their slice now (one fetch per stack; the outside-block
-        # pass quantizes the real slices); unpinned experts drop the meta
-        # placeholder instead - their data ships as the verbatim fused stack
-        # below, and a leftover meta param would only spray per-tensor
-        # "missing from checkpoint" warnings through the root pass-through.
+        # fused expert stacks have no per-expert checkpoint name: every
+        # expert slice is assigned its real data now (one fetch per stack);
+        # pinned experts quantize through the outside-block pass, unpinned
+        # ones need the real weights so the tuning forward does not hit a
+        # popped/meta parameter. A stack is only claimed when ALL of its
+        # slices are pinned - a partially pinned stack stays the verbatim
+        # checkpoint copy (it is the durable home of the unpinned experts).
         # Direct-name params stay meta - the outside-block pass loads them
         # right before quantizing, and the root pass-through streams the rest,
         # keeping peak host RAM at one stack.
         fused_cache = {}
         claimed_fused = set()
+        partial_fused = set()
+
+        def _fused_slice(fused_name, idx, proj, stack):
+            if proj == "down_proj":
+                return stack[idx].contiguous()
+            inter = int(stack.shape[1]) // 2
+            return stack[idx, :inter, :].contiguous() if proj == "gate_proj" else stack[idx, inter:, :].contiguous()
+
         for rel, p in list(layer_mod.named_parameters()):
             if p.device.type != "meta":
                 continue
@@ -1562,31 +1565,25 @@ class CompressionOrchestrator(BaseOrchestrator):
                 )
             if src[0] != "fused":
                 continue
-            owner_path = f"{layer_root}.{rel[: -len('.weight')]}"
-            entry = self._pin_entry_for(owner_path)
-            bits = entry.get("bits") if isinstance(entry, dict) else None
-            pinned = isinstance(bits, int) and bits < 16
-            if not pinned:
-                owner = layer_mod.get_submodule(rel[: -len(".weight")])
-                owner._parameters.pop(rel.rsplit(".", 1)[-1], None)
-                continue
             _, fused_name, idx, proj = src
             if fused_name not in fused_cache:
                 fused_cache[fused_name] = streamer.fetch(fused_name)
             stack = fused_cache[fused_name]
-            if proj == "down_proj":
-                t = stack[idx].contiguous()
-            else:
-                inter = int(stack.shape[1]) // 2
-                t = stack[idx, :inter, :].contiguous() if proj == "gate_proj" else stack[idx, inter:, :].contiguous()
+            t = _fused_slice(fused_name, idx, proj, stack)
+            owner_path = f"{layer_root}.{rel[: -len('.weight')]}"
+            entry = self._pin_entry_for(owner_path)
+            bits = entry.get("bits") if isinstance(entry, dict) else None
+            pinned = isinstance(bits, int) and bits < 16
             streamer._assign_leaf_(layer_mod, rel, t)
-            claimed_fused.add(fused_name)
+            if pinned:
+                claimed_fused.add(fused_name)
+            else:
+                partial_fused.add(fused_name)
         fused_cache.clear()
+        claimed_fused -= partial_fused
 
-        cfg = getattr(self.model, "config", None)
-        text_cfg = getattr(cfg, "text_config", None)
-        if text_cfg is None:
-            text_cfg = cfg
+        text_cfg = self._text_config()
+        cfg = text_cfg
         hidden = getattr(text_cfg, "hidden_size", None) or getattr(cfg, "hidden_size", None)
         eps = float(getattr(text_cfg, "rms_norm_eps", 1e-6) or 1e-6)
 
@@ -1594,12 +1591,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             entry = self._pin_entry_for(path)
             bits = entry.get("bits") if isinstance(entry, dict) else None
             if isinstance(module, torch.nn.Linear) and isinstance(bits, int) and bits < 16:
-                for key in ("bits", "group_size", "data_type", "sym", "scale_dtype"):
-                    if entry.get(key) is not None:
-                        setattr(module, key, entry[key])
-                module.act_bits = entry.get("act_bits", 16)
-                module.act_sym = entry.get("act_sym", True)
-                module.act_data_type = entry.get("act_data_type", None)
+                _apply_pin_attrs(module, entry)
 
         for n, m in layer_mod.named_modules():
             if any(m.children()) or not isinstance(m, torch.nn.Linear):
@@ -1614,6 +1606,11 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         # prologue: concat mixer + norms under their checkpoint paths
         fc_meta = streamer.tensor_meta(info["fc"])
+        if fc_meta is None:
+            raise RuntimeError(
+                f"[stream] cannot read metadata for the predictor concat mixer {info['fc']!r} "
+                "(unknown name or unreadable shard)"
+            )
         fc_path = info["fc"][: -len(".weight")]
         with torch.device("meta"):
             fc = torch.nn.Linear(int(fc_meta[0][1]), int(fc_meta[0][0]), bias=False)
@@ -1763,8 +1760,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         Attaching a tree dissolves the group out of the checkpoint-only
         verbatim pass (its prefixes now exist in the module tree), so the
         tensors no path claimed would be silently dropped: tensors whose
-        owner module quantized are replaced by their packed forms (and fused
-        expert stacks by their per-expert packed slices); everything else
+        owner module quantized are replaced by their packed forms; a fused
+        expert stack is dropped only when EVERY per-expert slice under it
+        packed (a partially pinned stack stays the verbatim checkpoint copy
+        - it is the durable home of the unpinned experts); everything else
         (norms, unpinned weights, extras) is copied through byte-for-byte
         from the checkpoint."""
         from auto_round.utils.model import check_to_quantized, get_module
@@ -1777,11 +1776,32 @@ class CompressionOrchestrator(BaseOrchestrator):
                 owner = get_module(self.model, n.rsplit(".", 1)[0])
                 if owner is not None and check_to_quantized(owner):
                     continue  # its packed form was written by the outside-block pass
-                if owner is not None and not any(True for _ in owner.children()):
-                    meta = streamer.tensor_meta(n)
-                    if meta is not None and len(meta[0]) == 3 and any(check_to_quantized(m) for m in owner.modules()):
-                        continue  # fused stack whose per-expert slices packed
+                meta = streamer.tensor_meta(n)
+                if (
+                    meta is not None
+                    and len(meta[0]) == 3
+                    and _is_fused_expert_weight_name(n)
+                    and self._tree_fused_stack_fully_packed_(n, meta[0])
+                ):
+                    continue  # every per-expert slice packed; the stack is superseded
                 self.shard_writer.save_tensor(n, streamer.fetch(n, raw=True))
+
+    def _tree_fused_stack_fully_packed_(self, tensor_name: str, shape) -> bool:
+        """True when every per-expert slice of a fused expert stack quantized.
+
+        The tree spells per-expert modules (``experts.N.gate_proj`` ...) while
+        the checkpoint stores the fused 3D stack, so the stack's own module
+        lookup cannot answer this - walk the slices instead."""
+        from auto_round.utils.model import check_to_quantized, get_module
+
+        base, proj = tensor_name[: -len(".weight")].rsplit(".", 1)
+        sub_projs = ("gate_proj", "up_proj") if proj == "gate_up_proj" else (proj,)
+        for e in range(int(shape[0])):
+            for sub in sub_projs:
+                m = get_module(self.model, f"{base}.{e}.{sub}")
+                if m is None or not check_to_quantized(m):
+                    return False
+        return True
 
     def _materialize_pinned_checkpoint_only_blocks_(self, streamer, all_blocks, snapshots=None) -> tuple[set, list]:
         """Materialize pinned checkpoint-only blocks, preferring a REAL module
@@ -1802,11 +1822,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         """
         claimed = set()
         tree_groups = []
-        quantizers = self.alg_composer.block_quantizer
-        if not isinstance(quantizers, (list, tuple)):
-            quantizers = [quantizers]
         groups = self._checkpoint_only_groups_(streamer)
-        tune_iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
+        tune_iters = self._max_tune_iters()
         skipped_non_2d = 0
         for blk in groups:
             names = sorted(streamer.names_under(blk))
@@ -1822,6 +1839,21 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if meta is not None and (len(meta[0]) == 2 or (len(meta[0]) == 3 and _is_fused_expert_weight_name(n))):
                     pinned_quantizable.append(n)
             if not pinned_quantizable:
+                if any(
+                    isinstance((e := self._pin_entry_for(n[: -len(".weight")])), dict)
+                    and isinstance(e.get("bits"), int)
+                    and e["bits"] < 16
+                    for n in names
+                    if n.endswith(".weight")
+                ):
+                    # a pin targeted this group but nothing quantizable matched
+                    # (per-expert spellings the checkpoint never stores, 1D
+                    # norms, non-weight tensors): the group ships verbatim
+                    logger.warning(
+                        "[stream] checkpoint-only group %s stays verbatim: its pin matched no quantizable "
+                        "tensor (pins must target 2D weights or fused expert stacks by their checkpoint names)",
+                        blk,
+                    )
                 continue  # unpinned or kept floating: verbatim path
             info = self._analyze_checkpoint_only_group_(streamer, blk)
             sibling = self._pick_sibling_layer_(streamer, info, all_blocks, snapshots) if info is not None else None
@@ -2360,10 +2392,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             block_snapshots = None
             if tree_groups:
-                _q = self.alg_composer.block_quantizer
-                if not isinstance(_q, (list, tuple)):
-                    _q = [_q]
-                _tune_iters = max(int(getattr(q, "iters", 0) or 0) for q in _q) if _q else 0
+                _tune_iters = self._max_tune_iters()
                 if _tune_iters > 0:
                     mtp_tuned = self._tune_checkpoint_only_groups_(streamer, tree_groups, calib_state, total_block_cnt)
         if streamer is not None and prefetch_depth > 0:
@@ -2528,12 +2557,16 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if not os.path.isfile(path):
                     continue
                 with safe_open(path, framework="pt") as f:
-                    aux = {k: f.get_tensor(k) for k in f.keys()}
-                if not aux:
-                    continue
-                logger.info(f"[stream] writing {len(aux)} tensor(s) from unreferenced checkpoint file {fname} verbatim")
-                for k2, v2 in aux.items():
-                    self.shard_writer.save_tensor(k2, v2)
+                    keys = list(f.keys())
+                    if not keys:
+                        continue
+                    logger.info(
+                        f"[stream] writing {len(keys)} tensor(s) from unreferenced checkpoint file {fname} verbatim"
+                    )
+                    # one tensor resident at a time: the file can be a whole
+                    # predictor block (GB-scale) on memory-tight hosts
+                    for k2 in keys:
+                        self.shard_writer.save_tensor(k2, f.get_tensor(k2))
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
