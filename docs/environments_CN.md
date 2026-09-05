@@ -213,9 +213,9 @@ export AR_SCHEME_MEM_INVENTORY=1
 
 ### AR_MTP_ZERO_SHOT
 
-- **Type**: bool (`1` / `true` / `yes`; default off)
-- **Description**: Tuning runs (`--iters > 0`) normally leave checkpoint-only groups (e.g. a multi-token-prediction layer the modeling code never instantiates) unquantized, because such groups cannot join the model graph and no forward can feed them. With this variable set, pinned checkpoint-only layers are still quantized inside a tuning run, using the closed-form search (the zero-shot path) instead of tuning. The rest of the model is unaffected.
-- **Usage**: Set to `1` as a fallback when tuning-based quantization of a pinned multi-token-prediction layer is unwanted or misbehaves.
+- **类型**: bool (`1` / `true` / `yes`；默认关闭)
+- **描述**: 仅影响调优类运行(`--iters > 0`)。此类运行通常会跳过仅存在于 checkpoint 中的分组(例如建模代码不会实例化的多 token 预测层),因为这些分组无法加入模型图、也没有前向可以喂给它们。设置本变量后,被 pin 的仅 checkpoint 层仍会在调优运行内部以闭式搜索(零样本路径)完成量化,模型其余部分不受影响。
+- **用法**: 当不希望或不稳定于对被 pin 的多 token 预测层进行调优量化时,设为 `1` 作为回退。
 
 ```bash
 export AR_MTP_ZERO_SHOT=1
