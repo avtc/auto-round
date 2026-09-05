@@ -1404,9 +1404,10 @@ class TestStreamQuantizeEquivalence:
         assert "model.layers.3.mlp.gate_proj.weight" not in keys
         assert "model.layers.3.enorm.weight" in keys, "unpinned sibling tensor dropped in degraded mode"
 
-    def test_mtp_group_tree_tunes_with_sign_round(self, tiny_checkpoint, tmp_path):
+    def test_mtp_group_tree_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd):
         """A tuning run (iters>0) tunes the materialized predictor tree with
-        the run's own quantizer config: the tuned Linears pack, norms pass
+        the run's own quantizer config: the tune loop runs on the tree's
+        layers (visible in the log), the tuned Linears pack, norms pass
         through, and the export stays complete."""
         H = 32
         extra = {
@@ -1439,6 +1440,13 @@ class TestStreamQuantizeEquivalence:
         assert "model.layers.3.eh_proj.qweight" in keys
         for norm in ("enorm", "hnorm", "final_layernorm", "input_layernorm", "post_attention_layernorm"):
             assert f"model.layers.3.{norm}.weight" in keys, f"norm {norm} dropped from export"
+        # the tune loop must actually run on the tree (caplog cannot see the
+        # project logger: propagate=False, and its stream handler predates
+        # pytest's sys redirects) - capture at the file-descriptor level
+        captured = capfd.readouterr()
+        console = captured.out + captured.err
+        assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
+        assert "quantized 8/8 layers" in console, "the tune loop did not process the tree's layers"
 
     def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
         """A separate auxiliary safetensors file the index never references
@@ -2181,3 +2189,8 @@ class TestCheckpointOnlyGroupVisibility:
         src = inspect.getsource(CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_)
         assert "stays unquantized: tuning runs need a forward" in src
         assert "not 2D weights" in src and "skipped_non_2d" in src
+        # per-group decision visibility: recognized pattern vs degraded
+        assert "no decoder sibling" in src and "covers its tensors" in src
+        tune_src = inspect.getsource(CompressionOrchestrator._tune_checkpoint_only_groups_)
+        assert "tuning checkpoint-only group" in tune_src
+        assert "fall back to the closed-form search" in tune_src
