@@ -698,7 +698,23 @@ class CompressionOrchestrator(BaseOrchestrator):
             streamer.load_dtype = self.amp_dtype
 
         if not self.need_calib:
-            return self._quantize_zero_shot()
+            try:
+                return self._quantize_zero_shot()
+            except BaseException:
+                # exception-path teardown: without this, a failed run leaves
+                # the daemon prefetch reader alive - it keeps staging until it
+                # holds depth+1 block-sized tensors on the staging devices plus
+                # pooled shard handles, and an in-process retry (catch + rerun,
+                # the flow the context-reset design anticipates) starts with a
+                # zombie thread pinning VRAM it can never release
+                streamer = getattr(self.model_context, "checkpoint_streamer", None)
+                if streamer is not None:
+                    try:
+                        streamer.stop_prefetch()
+                        streamer.close()
+                    except Exception as teardown_err:  # noqa: BLE001 - never mask the original
+                        logger.warning("[stream] teardown after failure hit an error: %s", teardown_err)
+                raise
 
         return self._quantize_data_driven()
 
@@ -1782,6 +1798,20 @@ class CompressionOrchestrator(BaseOrchestrator):
             clear_memory()
         return tuned
 
+    def _park_untuned_tree_shells_(self, tree_groups, mtp_tuned) -> None:
+        """Park checkpoint-only group trees the tune path did not.
+
+        Groups the tune path handled park themselves after packing. For the
+        rest (zero-shot runs, or a tune that fell back early) the
+        outside-block pass packed the pinned experts and the verbatim stack
+        written by ``_write_unpacked_group_tensors_`` is the durable home of
+        the unpinned ones - real per-expert slices left in the tree would be
+        written a SECOND time by the finalize capture loop, under module
+        names no checkpoint carries (so no dedup stops them)."""
+        for group in tree_groups:
+            if group not in mtp_tuned:
+                self.model.get_submodule(group).to("meta")
+
     def _write_unpacked_group_tensors_(self, streamer, tree_groups) -> None:
         """Write every tree-group tensor that did not end up packed.
 
@@ -1951,8 +1981,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         if skipped_non_2d:
             logger.warning(
-                "[stream] %d pinned tensor(s) in checkpoint-only groups are not 2D weights (e.g. fused expert "
-                "stacks); leaving them unquantized",
+                "[stream] %d pinned tensor(s) in checkpoint-only groups are not 2D weights (e.g. 1D norms or "
+                "3D tensors whose names do not match the fused-expert patterns); leaving them unquantized",
                 skipped_non_2d,
             )
         return claimed, tree_groups
@@ -2380,8 +2410,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _peak_watch.set_phase("write")
                     _peak_watch.log(f"block {stream_block_idx}")
                     _peak_watch.reset_run_max()
-                clear_memory()
-                self._trim_host_heap()
+                if _bg_pack is not None:
+                    # the worker's pack/write kernels are in flight: the
+                    # process-wide gc/empty_cache of clear_memory() from this
+                    # thread is the exact hazard the worker's own NOTE forbids
+                    # (mirrored) - it corrupted in-flight accesses on the
+                    # server. Host-side hygiene only; the join at the next
+                    # block boundary runs the full clear single-threaded.
+                    self._trim_host_heap()
+                else:
+                    clear_memory()
+                    self._trim_host_heap()
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
@@ -2549,6 +2588,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # (tuned groups already wrote; the write pass is idempotent)
             if tree_groups:
                 self._write_unpacked_group_tensors_(streamer, tree_groups)
+                self._park_untuned_tree_shells_(tree_groups, mtp_tuned)
 
             # Checkpoint-only groups (an MTP layer kept as an extra digit block,
             # or a whole top-level subtree transformers strips at load) have no

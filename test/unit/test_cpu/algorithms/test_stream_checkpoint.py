@@ -2389,3 +2389,78 @@ class TestStreamingGlobalBlockIndex:
         ]
         assert direct_updates, "blocks_before update drifted out of the group loop"
         assert direct_updates[0].lineno > inner_loop.end_lineno, "blocks_before update nested inside the per-block loop"
+
+    def test_stream_quantization_with_diffusion_raises(self, monkeypatch):
+        """A diffusion pipeline cannot stream decoder blocks; the flag must
+        fail loud instead of silently materializing the pipeline."""
+        import pytest
+
+        from auto_round import envs
+        from auto_round.context.model import ModelContext
+
+        monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        monkeypatch.setattr("auto_round.context.model.is_mllm_model", lambda *a, **k: False)
+        monkeypatch.setattr("auto_round.context.model.is_diffusion_model", lambda *a, **k: True)
+        ModelContext.reset_context()
+        try:
+            with pytest.raises(ValueError, match="diffusion"):
+                ModelContext("dummy-model", stream_quantization=True)
+        finally:
+            ModelContext.reset_context()
+
+    def test_untuned_tree_shells_parked_after_write(self):
+        """Zero-shot/fallback tree groups must park to meta after the
+        verbatim write: real per-expert slices left in the tree would be
+        duplicated by the finalize capture loop under module names no
+        checkpoint carries."""
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = object.__new__(CompressionOrchestrator)
+        orch.model = nn.Module()
+        tuned = nn.Module()
+        untuned = nn.Module()
+        untuned.experts = nn.Module()
+        untuned.experts.fc = nn.Linear(4, 4)
+        orch.model.add_module("tuned", tuned)
+        orch.model.add_module("untreed", nn.Module())  # control: never touched
+        orch.model.add_module("untuned", untuned)
+        orch._park_untuned_tree_shells_(["tuned", "untuned"], {"tuned"})
+        assert all(p.is_meta for p in untuned.parameters()), "untuned tree shell stayed real"
+        assert not any(p.is_meta for p in tuned.parameters()), "tuned group must not be re-parked"
+
+
+class TestZeroShotExceptionTeardown:
+    """A failed zero-shot run must stop the prefetch reader and close the
+    streamer before the exception escapes: otherwise a library user catching
+    the exception and retrying in-process starts with a daemon thread pinning
+    depth+1 staged blocks of VRAM it can never release."""
+
+    def test_exception_stops_prefetch_and_closes(self, monkeypatch):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        calls = []
+
+        class _Streamer:
+            def stop_prefetch(self):
+                calls.append("stop")
+
+            def close(self):
+                calls.append("close")
+
+        orch = object.__new__(CompressionOrchestrator)
+
+        def _boom(self):
+            raise RuntimeError("tune exploded")
+
+        monkeypatch.setattr(CompressionOrchestrator, "_quantize_zero_shot", _boom)
+        orch.need_calib = False
+        orch._post_init_done = True  # skip post_init's calibrator construction
+        orch.amp_dtype = torch.float32
+        orch.model_context = type("MC", (), {"checkpoint_streamer": _Streamer()})()
+        import pytest
+
+        with pytest.raises(RuntimeError, match="tune exploded"):
+            orch.quantize()
+        assert calls == ["stop", "close"], f"teardown did not run (or ran partially): {calls}"

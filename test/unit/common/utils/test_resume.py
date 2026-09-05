@@ -176,3 +176,32 @@ class TestMarkBlockDoneInMemoryLastBlock:
         assert state.resume_index == 2
         # no successor entry for the final block: nothing to resume from
         assert not (tmp_path / "resume_input_ids.pt").exists()
+
+    def test_crash_window_successor_entry_is_rejected(self, tmp_path):
+        """mark_block_done saves the successor entry BEFORE the manifest
+        records the block. A process dying inside that window leaves the
+        fixed-name file one block ahead of the manifest; the loader must
+        reject that entry (fall back to the missing-file path) instead of
+        silently tuning the next block on the wrong frontier."""
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1", "b2"])
+        state.mark_block_done("b0", q_input=None, input_ids=torch.ones(2, 3))
+        # simulate the crash window for b1: b1's successor tensors land on
+        # disk, the manifest write never does
+        state2 = ResumeState(str(tmp_path), "sig", ["b0", "b1", "b2"])
+        state2.input_ids_path  # noqa: B018 - path exists from the b0 mark
+        torch.save({"_producer": "b1", "tensor": torch.ones(2, 3) * 9}, state2.input_ids_path)
+        # manifest still only records b0
+        resumed = ResumeState(str(tmp_path), "sig", ["b0", "b1", "b2"])
+        assert resumed.completed_blocks == ["b0"]
+        assert resumed.load_input_ids() is None, "entry written past the manifest frontier was consumed"
+
+    def test_matching_producer_entry_loads_and_legacy_form_accepted(self, tmp_path):
+        state = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        t = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        state.mark_block_done("b0", q_input=None, input_ids=t)
+        resumed = ResumeState(str(tmp_path), "sig", ["b0", "b1"])
+        assert torch.equal(resumed.load_input_ids(), t)
+        # legacy bare-tensor dirs (written before the producer guard) load as-is
+        resumed.input_ids_path
+        torch.save(t * 2, resumed.input_ids_path)
+        assert torch.equal(ResumeState(str(tmp_path), "sig", ["b0", "b1"]).load_input_ids(), t * 2)

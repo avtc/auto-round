@@ -25,15 +25,16 @@ class TestMallocTrim:
         assert isinstance(result, bool)
 
     def test_trim_sites_unconditional_in_source(self):
-        # The two streaming-loop call sites must be unconditional: the trim is
+        # The streaming-loop call sites must be unconditional: the trim is
         # cheap hygiene (ms per block) and keeps RSS/VmHWM from growing
-        # monotonically on glibc hosts.
+        # monotonically on glibc hosts. (3 sites: the plain block tail, the
+        # bg-pack-active block tail, and the resume rebuild.)
         import inspect
 
         src = inspect.getsource(CompressionOrchestrator)
         lines = src.splitlines()
         sites = [i for i, ln in enumerate(lines) if "_trim_host_heap()" in ln and "def " not in ln]
-        assert len(sites) == 2, "expected exactly 2 call sites"
+        assert len(sites) == 3, f"expected exactly 3 call sites, found {len(sites)}"
         for i in sites:
             window = "\n".join(lines[max(0, i - 3) : i + 1])
             assert "envs." not in window, f"call site still gated:\n{window}"

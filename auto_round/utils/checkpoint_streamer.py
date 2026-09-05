@@ -798,11 +798,6 @@ class CheckpointStreamer:
             return True
         return False
 
-    def fetch_into_(self, model: torch.nn.Module, name: str) -> bool:
-        """Stream a single tensor by full name straight into ``model``."""
-        tensor = self.fetch(name)
-        return self._assign_leaf_(model, name, tensor)
-
     def resolve_checkpoint_name(self, module_name: str) -> Optional[str]:
         """Resolve a module-side tensor name to its checkpoint-side counterpart.
 

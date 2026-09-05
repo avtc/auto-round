@@ -41,6 +41,7 @@ import inspect
 import torch
 
 from auto_round.logger import logger
+from auto_round.utils.model import check_to_quantized, set_module
 
 
 def _key_mask_2d(ids: torch.Tensor, pad_token_id=None) -> torch.Tensor:
@@ -291,9 +292,6 @@ def materialize_residual_meta(model, cfg, device):
             stubborn[:10],
         )
     return stubborn
-
-
-from auto_round.utils.model import check_to_quantized, set_module
 
 
 def _ensure_real_rotary(rotary, cfg, device):

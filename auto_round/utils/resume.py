@@ -134,10 +134,29 @@ class ResumeState:
         if not self.completed_blocks or not path.exists():
             return None
         try:
-            return torch.load(path, map_location="cpu")
+            obj = torch.load(path, map_location="cpu")
         except Exception as e:
             logger.warning(f"ResumeState: failed to load {path.name} ({e}); resuming without it.")
             return None
+        # Crash-window guard: mark_block_done saves the successor entry
+        # (block N's output) BEFORE the manifest records N. A process dying
+        # in that window leaves the fixed-name file one block AHEAD of the
+        # manifest, and consuming it would silently tune the next block on
+        # the wrong frontier - on every later resume. The dict form records
+        # its producer; a mismatch means the manifest write never landed, so
+        # the entry is rejected and the chain falls back to its missing-file
+        # behavior (re-embed and replay). A bare tensor is the legacy form
+        # (dirs written before the guard) and is accepted as-is.
+        if isinstance(obj, dict) and set(obj.keys()) == {"_producer", "tensor"}:
+            if obj["_producer"] != self.completed_blocks[-1]:
+                logger.warning(
+                    f"ResumeState: {path.name} was written by block {obj['_producer']!r} but the manifest's "
+                    f"last completed block is {self.completed_blocks[-1]!r} - the manifest write never landed; "
+                    "ignoring the stale chain entry"
+                )
+                return None
+            return obj["tensor"]
+        return obj
 
     def mark_block_done(self, block_name: str, q_input, input_ids) -> None:
         expected = self.block_names[len(self.completed_blocks)]
@@ -145,14 +164,14 @@ class ResumeState:
             block_name == expected
         ), f"ResumeState.mark_block_done called out of order: expected {expected!r}, got {block_name!r}"
         if q_input is not None:
-            torch.save(_to_cpu_recursive(q_input), self.q_input_path)
+            torch.save({"_producer": block_name, "tensor": _to_cpu_recursive(q_input)}, self.q_input_path)
         elif self.q_input_path.exists():
             self.q_input_path.unlink()
         # input_ids is the successor chain entry. It is only skippable for the
         # FINAL block of the run: no next block consumes it, and the streaming
         # path deliberately does not materialize a past-the-end chain state.
         if input_ids is not None:
-            torch.save(_to_cpu_recursive(input_ids), self.input_ids_path)
+            torch.save({"_producer": block_name, "tensor": _to_cpu_recursive(input_ids)}, self.input_ids_path)
         elif self.input_ids_path.exists():
             # mirror the q_input cleanup: a stale successor entry (e.g. left
             # by the previous block before this final one) must not survive

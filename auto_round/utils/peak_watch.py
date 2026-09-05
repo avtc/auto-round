@@ -92,7 +92,7 @@ class PeakWatcher:
     # -- reporting -----------------------------------------------------------
 
     def log(self, tag: str):
-        """One INFO line with the current peak attribution."""
+        """One DEBUG line with the current peak attribution."""
         if self.peak_rss_gb <= 0:
             return
         logger.debug(
