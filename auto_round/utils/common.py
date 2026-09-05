@@ -1222,9 +1222,25 @@ def get_reverse_checkpoint_conversion_mapping(model):
       * ``_weight_conversions`` reverse transforms.
     """
     reverse_checkpoint_conversion_mapping = {}
+
+    def _is_name_pattern(value) -> bool:
+        r"""Instance-mapping values are plain names only when they carry no
+        backreference: prefix-change transforms build module-side values as
+        re.sub REPLACEMENTS (``model\.\1``) - not invertible into a match
+        pattern (compiling raises ``invalid group reference``) and a naive
+        group inversion is ambiguous (it would also re-prefix names that
+        already carry the prefix). Such entries stay verbatim instead."""
+        return isinstance(value, str) and not re.search(r"\\g?<?\d+>?", value)
+
     instance_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
     if isinstance(instance_mapping, dict):
-        reverse_checkpoint_conversion_mapping.update({v: k for k, v in instance_mapping.items()})
+        for k, v in instance_mapping.items():
+            if isinstance(v, (list, tuple)):
+                v = v[0] if v else None
+            if _is_name_pattern(v):
+                reverse_checkpoint_conversion_mapping[v] = k
+            else:
+                logger.debug("skipping non-invertible conversion entry %r -> %r", k, v)
 
     for source_pattern, target_patterns in get_checkpoint_conversion_mapping(model).items():
         if isinstance(target_patterns, str):
@@ -1234,6 +1250,11 @@ def get_reverse_checkpoint_conversion_mapping(model):
         # unescape to the plain checkpoint-side spelling
         replacement = re.sub(r"\\(.)", r"\1", source_pattern)
         for target_pattern in target_patterns:
+            if not _is_name_pattern(target_pattern):
+                # prefix-change entries pair a group-bearing checkpoint
+                # pattern with a module-side replacement template - not a
+                # plain name; skip it (same rule as the instance mapping)
+                continue
             reverse_checkpoint_conversion_mapping.setdefault(target_pattern, replacement)
 
     if hasattr(model, "_weight_conversions"):
@@ -1241,7 +1262,8 @@ def get_reverse_checkpoint_conversion_mapping(model):
         for weight_conversion in weight_conversions:
             reverse_conversion_mapping = weight_conversion.reverse_transform()
             for source_pattern in reverse_conversion_mapping.source_patterns:
-                reverse_checkpoint_conversion_mapping[source_pattern] = reverse_conversion_mapping.target_patterns
+                if _is_name_pattern(source_pattern):
+                    reverse_checkpoint_conversion_mapping[source_pattern] = reverse_conversion_mapping.target_patterns
 
     return reverse_checkpoint_conversion_mapping
 
@@ -1270,7 +1292,16 @@ def revert_checkpoint_conversion_mapping(name: str, key_mapping: dict[str, str])
             else:
                 match_pattern = source_pattern
 
-            name, n_replace = re.subn(match_pattern, target_pattern, name)
+            try:
+                name, n_replace = re.subn(match_pattern, target_pattern, name)
+            except re.error:
+                # any mapping source emitting a pattern that does not compile
+                # (e.g. a replacement template used as a match pattern) must
+                # never kill a run at the first tensor write - skip it loudly
+                logger.warning_once(
+                    "skipping malformed reverse-conversion pattern %r (does not compile)", match_pattern
+                )
+                continue
             # Early exit of the loop
             if n_replace > 0:
                 return name

@@ -17,6 +17,10 @@ import re
 
 from auto_round.utils import checkpoint_streamer as cs_mod
 from auto_round.utils.checkpoint_streamer import CheckpointStreamer, reverse_name_map
+from auto_round.utils.common import (
+    get_reverse_checkpoint_conversion_mapping,
+    revert_checkpoint_conversion_mapping,
+)
 
 # registry-style rewrites: checkpoint-side patterns, PLAIN module-side targets
 _TOY_RENAMES = [
@@ -64,3 +68,48 @@ class TestReverseNameMap:
     def test_module_function(self, monkeypatch):
         monkeypatch.setattr(cs_mod, "_name_rewrites_for", lambda _mt: [(re.compile(r"a\.router\.b"), "a.b")])
         assert reverse_name_map("f", {"a.router.b": "s0"}) == {"a.b": "a.router.b"}
+
+
+class _ToyModel:
+    """Minimal model exposing an instance checkpoint-conversion mapping."""
+
+    def __init__(self, mapping=None):
+        if mapping is not None:
+            self._checkpoint_conversion_mapping = mapping
+
+
+class TestReverseConversionMappingBackrefs:
+    """Instance conversion mappings built from prefix-change transforms pair a
+    group-bearing checkpoint pattern with a module-side REPLACEMENT carrying
+    backreferences (``model\\.\\1``). A replacement template is not a name and
+    cannot be inverted into a match pattern: compiling it raises
+    ``invalid group reference``, and a naive group inversion is ambiguous
+    (``model\\.(.+)`` would also re-prefix names that already carry the
+    prefix). Such entries must be skipped, keeping those names verbatim."""
+
+    def test_backref_values_are_dropped_from_reverse_map(self):
+        model = _ToyModel(
+            {
+                "^model\\.language_model\\.(.+)$": "model\\.\\1",
+                "mlp.router.gate": "mlp.gate",
+            }
+        )
+        reverse = get_reverse_checkpoint_conversion_mapping(model)
+        assert "mlp.gate" in reverse
+        assert not any(re.search(r"\\g?<?\d+>?", k) for k in reverse), "backreference leaked into a match pattern"
+
+    def test_module_side_name_with_prefix_stays_verbatim(self):
+        # module tree of the composite (VL) layout already spells the
+        # checkpoint name; a mechanically inverted prefix strip would produce
+        # model.language_model.language_model.* - the entry must not exist
+        model = _ToyModel({"^model\\.language_model\\.(.+)$": "model\\.\\1"})
+        reverse = get_reverse_checkpoint_conversion_mapping(model)
+        name = "model.language_model.layers.0.mlp.up_proj.weight"
+        assert revert_checkpoint_conversion_mapping(name, reverse) == name
+
+    def test_malformed_pattern_never_raises(self, caplog):
+        # defense in depth: any future mapping source producing a pattern that
+        # does not compile must be skipped loudly, not kill the run at the
+        # first shard write
+        mapping = {"bad\\1.pattern": "replacement", "mlp.gate": "mlp.router.gate"}
+        assert revert_checkpoint_conversion_mapping("model.mlp.gate", mapping) == "model.mlp.router.gate"
