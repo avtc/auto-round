@@ -43,27 +43,25 @@ import torch
 from auto_round.logger import logger
 
 
-def build_causal_attention_mask(input_ids):
-    """4D boolean attention mask (True = allowed) combining the causal
-    structure with the data-driven calibration key mask (all ones, trailing
-    repeated tokens masked, last position always masked - mirrors
-    calibration/llm.py and the model-level causal-mask preparation)."""
-    seq_len = input_ids.shape[-1]
-    mask_2d = torch.ones_like(input_ids, dtype=torch.long)
-    batch_size = input_ids.shape[0]
-    for i in range(batch_size):
-        last_token = input_ids[i, -1]
-        j = seq_len - 2
+def _key_mask_2d(ids: torch.Tensor) -> torch.Tensor:
+    """Per-row 2D key mask (1.0 = keep, 0.0 = masked): all ones, trailing
+    repeated tokens masked, last position always masked - the form the
+    ordinary calibration path feeds model.forward (calibration/llm.py). The
+    row scan re-initializes its position for every row (a batch's rows can
+    each carry their own trailing run)."""
+    m = torch.ones(ids.shape, dtype=torch.float32, device=ids.device)
+    for b in range(ids.shape[0]):
+        last_token = ids[b, -1]
+        j = ids.shape[-1] - 2
         repeated = False
-        while j >= 0 and input_ids[i, j] == last_token:
+        while j >= 0 and ids[b, j] == last_token:
             repeated = True
-            mask_2d[i, j] = 0
+            m[b, j] = 0.0
             j -= 1
         if repeated:
-            mask_2d[i, -1] = 0
-    mask_2d[:, -1] = 0
-    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
-    return causal[None, None] & (mask_2d != 0)[:, None, None, :]
+            m[b, -1] = 0.0
+    m[:, -1] = 0.0
+    return m
 
 
 def mask_form_candidates(key_mask_2d):
@@ -480,21 +478,7 @@ def prepare_streaming_calibration(
     # GDN linear-attention layers consume the 2D padding mask directly), so
     # the loop resolves it once by probing the first block (see
     # resolve_chain_mask_form) and materializes the winning form.
-    masks = []
-    for ids in rows:
-        m = torch.ones(ids.shape, dtype=torch.float32, device=ids.device)
-        last_token = ids[:, -1]
-        j = ids.shape[-1] - 2
-        for b in range(ids.shape[0]):
-            repeated = False
-            while j >= 0 and ids[b, j] == last_token[b]:
-                repeated = True
-                m[b, j] = 0.0
-                j -= 1
-            if repeated:
-                m[b, -1] = 0.0
-        m[:, -1] = 0.0
-        masks.append(m.cpu())
+    masks = [_key_mask_2d(ids).cpu() for ids in rows]
     input_others = {
         "attention_mask": masks,
         "use_cache": False,

@@ -937,6 +937,13 @@ auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --str
 - 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。Python API
   用户可通过 `stream_prefetch_devices` 显式控制预取设备。
 
+- 支持的格式：流式量化要求逐块可打包的整数格式（`auto_round`、`auto_round:llm_compressor`、
+  `auto_round:auto_gptq`、`auto_round:auto_awq`）。GGUF 及任何不支持逐块立即打包的格式都会直接报错
+  ——渐进式分片写入是流式量化的基本契约。
+- `--low_gpu_mem_usage`：默认情况下，流式校准链（逐块输入的校准行）驻留在块的主 GPU 上以提升
+  迭代速度。启用 `--low_gpu_mem_usage` 后，校准链留在主机内存中，每次前向按批次分块送上 GPU
+  （与普通数据驱动路径相同的内存契约）——显存占用更低，但耗时略有增加。
+
 校准数据经由 bf16 参考链传递，因此收集到的统计量与普通数据驱动校准在浮点容差内一致（等价性有回归测试覆盖）。
 
 ### 旋转（Rotation）（研究性）

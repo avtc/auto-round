@@ -2121,7 +2121,9 @@ class BaseOrchestrator(object):
             if getattr(self.model_context, "image_processor", None) is not None:
                 kwargs.setdefault("image_processor", self.model_context.image_processor)
             missing = _hydrate_meta_from_checkpoint(
-                self.model_context.model, getattr(self.model_context, "model_path", None)
+                self.model_context.model,
+                getattr(self.model_context, "model_path", None),
+                amp_dtype=getattr(self, "amp_dtype", None),
             )
             if missing:
                 logger.warning(
@@ -2314,7 +2316,7 @@ class BaseOrchestrator(object):
         return model, folders
 
 
-def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
+def _hydrate_meta_from_checkpoint(model, ckpt_dir: str, amp_dtype: Optional[torch.dtype] = None) -> list[str]:
     """Load still-meta tensors straight from the model checkpoint files.
 
     Export reads the in-memory model. Some tensors (e.g. a vision tower in a
@@ -2371,6 +2373,10 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
         from auto_round.utils.checkpoint_streamer import reverse_name_map
 
         renames_rev = reverse_name_map(model_type, weight_map)
+    # resolve first (owner + shard), then read one shard at a time: a vision
+    # tower spreads hundreds of tensors over a handful of shards, and
+    # reopening the same file per tensor re-parses its header every time
+    jobs = []
     for n in meta_names:
         if quantized_prefixes and n.startswith(quantized_prefixes):
             # packed in shards already; packers must see it meta. These are
@@ -2382,16 +2388,27 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str) -> list[str]:
         if key is None or owner is None:
             missing.append(n)
             continue
-        shard = weight_map[key]
-        mod, kind, leaf = owner
+        jobs.append((weight_map[key], key, owner))
+    by_shard = {}
+    for shard, key, owner in jobs:
+        by_shard.setdefault(shard, []).append((key, owner))
+    # the run's amp dtype policy: every other streaming read path casts to it
+    # (CheckpointStreamer.load_dtype / the root pass-through); export-side
+    # hydration must not ship raw checkpoint precision beside policy-cast
+    # tensors (a bf16 checkpoint under an fp16 run exports a mixed model)
+    target_dtype = amp_dtype if isinstance(amp_dtype, torch.dtype) else None
+    for shard, entries in by_shard.items():
         with safe_open(os.path.join(ckpt_dir, shard), framework="pt") as f:
-            t = f.get_tensor(key)
-        old = mod._parameters[leaf] if kind == "param" else mod._buffers[leaf]
-        if kind == "param":
-            mod._parameters[leaf] = torch.nn.Parameter(t, requires_grad=bool(old.requires_grad))
-        else:
-            mod._buffers[leaf] = t
-        replaced += 1
+            for key, (mod, kind, leaf) in entries:
+                t = f.get_tensor(key)
+                if target_dtype is not None and t.is_floating_point() and t.dtype != target_dtype:
+                    t = t.to(target_dtype)
+                old = mod._parameters[leaf] if kind == "param" else mod._buffers[leaf]
+                if kind == "param":
+                    mod._parameters[leaf] = torch.nn.Parameter(t, requires_grad=bool(old.requires_grad))
+                else:
+                    mod._buffers[leaf] = t
+                replaced += 1
     if replaced:
         logger.info("hydrated %d meta tensor(s) from checkpoint for export", replaced)
     return missing

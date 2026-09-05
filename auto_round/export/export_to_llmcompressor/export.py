@@ -315,11 +315,11 @@ def _restore_packed_modules_from_shards(model, output_dir: str, metadata_only: b
             continue
         attrs = {}
         for suffix in ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point"):
-            path = shards.get(f"{name}.{suffix}")
+            path = shards.get(f"{key}.{suffix}")
             if path is None:
                 continue
             with safe_open(path, framework="pt") as h:
-                attrs[suffix] = h.get_tensor(f"{name}.{suffix}")
+                attrs[suffix] = h.get_tensor(f"{key}.{suffix}")
         if "weight_scale" not in attrs:
             continue
         layer.quantization_scheme = construct_ct_scheme(layer)

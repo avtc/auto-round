@@ -117,6 +117,19 @@ _FUSED_EXPERT_PROJECTIONS = frozenset({"gate_up_proj", "gate_proj", "up_proj", "
 _FUSED_STACK_RE = re.compile(r"^(.*\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
+def _first_chain_row(fp_inputs):
+    """The first calibration row from chain inputs.
+
+    Plain blocks forward a list of rows; block classes registered in
+    ``_BLOCK_OUTPUT_REGISTRY`` forward a dict of per-key row lists (e.g.
+    ``{"hidden_states": [...], "prev_topk_indices": ...}``) - prefer its
+    ``hidden_states``."""
+    rows = fp_inputs.get("hidden_states") if isinstance(fp_inputs, dict) else fp_inputs
+    if isinstance(rows, dict):
+        rows = next(iter(rows.values()))
+    return rows[0]
+
+
 def _canonical_group_leaf(name: str) -> str:
     """Fold a relative tensor/param name onto a layout-neutral spelling so
     module-side (unfused, per-expert) and checkpoint-side (fused 3D) trees
@@ -727,6 +740,32 @@ class CompressionOrchestrator(BaseOrchestrator):
             seen += len(blocks)
         return None
 
+    def _write_finished_block_(
+        self, block, block_name: str, tied_weights_layers: set, rs, q_snap, fp_snap, is_model_last: bool
+    ) -> None:
+        """Immediate-saving tail of a finished block, shared by the serial
+        path and the background pack worker: save non-quantized leaf modules,
+        write the block scope, park to meta, then - only after a durable
+        flush - let the manifest claim the block done (crash-durability
+        contract: done implies tensors are in a shard file)."""
+        for _n, m in block.named_modules():
+            if (
+                not any(m.children())
+                and len(m.state_dict()) > 0
+                and hasattr(m, "global_name")
+                and m.global_name not in tied_weights_layers
+                and not check_to_quantized(m)
+            ):
+                set_module(self.model, m.global_name, copy.deepcopy(m))
+                self.shard_writer.write(name=m.global_name)
+                get_module(self.model, m.global_name).to("meta")
+                m.to("meta")
+        self.shard_writer.write(name=block_name)
+        block.to("meta")
+        if rs is not None:
+            self.shard_writer._flush_shard()
+            rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
+
     def _start_bg_pack_block(
         self,
         block,
@@ -770,31 +809,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 holder["pack"] = _time.perf_counter() - _t0
                 if self.compress_context.is_immediate_saving:
                     _t0 = _time.perf_counter()
-                    # Save non-quantized leaf modules (e.g. norms, embeddings in block).
-                    for _n, m in block.named_modules():
-                        if (
-                            not any(m.children())
-                            and len(m.state_dict()) > 0
-                            and hasattr(m, "global_name")
-                            and m.global_name not in tied_weights_layers
-                            and not check_to_quantized(m)
-                        ):
-                            set_module(self.model, m.global_name, copy.deepcopy(m))
-                            self.shard_writer.write(name=m.global_name)
-                            get_module(self.model, m.global_name).to("meta")
-                            m.to("meta")
-                    # Write at block scope for any remaining params/buffers.
-                    self.shard_writer.write(name=block_name)
-                    block.to("meta")
+                    self._write_finished_block_(
+                        block, block_name, tied_weights_layers, rs, q_snap, fp_snap, is_model_last
+                    )
                     holder["write"] = _time.perf_counter() - _t0
-                    if rs is not None:
-                        # crash-durability contract, same as the serial path:
-                        # the manifest may claim this block done only after
-                        # its tensors are durably flushed to a shard file
-                        self.shard_writer._flush_shard()
-                        _t0 = _wtime.perf_counter()
-                        rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
-                        holder["snap"] = _wtime.perf_counter() - _t0
                     if envs.AR_PERF_COUNTERS:
                         logger.info(
                             "[stream] bg pack+write %s: pack %.1fs write %.1fs snapshot %.1fs",
@@ -1716,7 +1734,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 try:
                     form = resolve_chain_mask_form(
                         shell,
-                        fp_inputs[0],
+                        _first_chain_row(fp_inputs),
                         calib_state["keymask_2d"][0],
                         io,
                         preferred=calib_state.get("_mask_form"),
@@ -2054,12 +2072,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self._trim_host_heap()
                 self._release_cuda_cache("resume rebuild")
 
-            if streamer is not None:
-                # startup reads (embeddings / chain init) touch shards the
-                # block loop never revisits - on fresh runs too, not only
-                # resume; close them before the prefetch pipeline starts so
-                # their mappings stop counting in RSS
-                streamer.release_startup_handles_()
+        if streamer is not None:
+            # startup reads (embeddings / chain init) touch shards the block
+            # loop never revisits - on fresh runs too, not only resume; close
+            # them before the prefetch pipeline starts so their mappings stop
+            # counting in RSS
+            streamer.release_startup_handles_()
 
         # Prefetch pipeline: a background reader stages upcoming blocks ahead
         # of the quantize loop. With staging devices the blocks land directly
@@ -2225,7 +2243,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                     form = resolve_chain_mask_form(
                         block,
-                        calib_state["fp_inputs"][0],
+                        _first_chain_row(calib_state["fp_inputs"]),
                         calib_state["keymask_2d"][0],
                         calib_state["input_others"],
                         preferred=calib_state.get("_mask_form"),
@@ -2307,37 +2325,18 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # ── Infrastructure: shard write / device cleanup ──────────
                 if not _bg_pack_eligible and self.compress_context.is_immediate_saving:
                     _t_write = _time.perf_counter()
-                    # Save non-quantized leaf modules (e.g. norms, embeddings in block).
-                    for _n, m in block.named_modules():
-                        if (
-                            not any(m.children())
-                            and len(m.state_dict()) > 0
-                            and hasattr(m, "global_name")
-                            and m.global_name not in tied_weights_layers
-                            and not check_to_quantized(m)
-                        ):
-                            set_module(self.model, m.global_name, copy.deepcopy(m))
-                            self.shard_writer.write(name=m.global_name)
-                            get_module(self.model, m.global_name).to("meta")
-                            m.to("meta")
-                    # Write at block scope for any remaining params/buffers.
-                    self.shard_writer.write(name=block_name)
-                    block.to("meta")
+                    is_model_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
+                    self._write_finished_block_(
+                        block,
+                        block_name,
+                        tied_weights_layers,
+                        rs,
+                        calib_state.get("q_inputs") if calib_state is not None else None,
+                        (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None,
+                        is_model_last,
+                    )
                     _t_write = _time.perf_counter() - _t_write
                     _t_snap = 0.0
-                    if rs is not None:
-                        # crash-durability contract, same as the serial path:
-                        # the manifest may claim this block done only after its
-                        # tensors are durably flushed to a shard file
-                        self.shard_writer._flush_shard()
-                        _t0 = _time.perf_counter()
-                        is_model_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
-                        rs.mark_block_done(
-                            block_name,
-                            calib_state.get("q_inputs") if calib_state is not None else None,
-                            (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None,
-                        )
-                        _t_snap = _time.perf_counter() - _t0
                     if envs.AR_PERF_COUNTERS:
                         logger.info(
                             "[perf] block %s: load %.1fs%s tune %.1fs pack %.1fs write %.1fs snap %.1fs",

@@ -336,3 +336,21 @@ class TestResolveChainMaskFormBatchTwo:
         keymask = torch.ones(1, 8)
         form = resolve_chain_mask_form(block, row, keymask, input_others={})
         assert form in ("4d_bool", "4d_additive")
+
+
+class TestKeyMaskPerRow:
+    """The chain's key mask must mask every row's own trailing repeated-token
+    run (a batch's rows do not share one run; the scan position resets per
+    row)."""
+
+    def test_each_row_masks_its_own_run(self):
+        from auto_round.utils.streaming_calibration import _key_mask_2d
+
+        ids = torch.tensor([[5, 6, 7, 7], [9, 9, 9, 3], [1, 2, 3, 4]])
+        m = _key_mask_2d(ids)
+        # row 0: trailing 7,7 run -> positions 2,3 masked
+        assert m[0].tolist() == [1.0, 1.0, 0.0, 0.0]
+        # row 1: last token 3 is not repeated -> only the last position masked
+        assert m[1].tolist() == [1.0, 1.0, 1.0, 0.0]
+        # row 2: no repeats -> only the last position masked
+        assert m[2].tolist() == [1.0, 1.0, 1.0, 0.0]

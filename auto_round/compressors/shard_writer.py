@@ -191,9 +191,16 @@ class ShardWriter:
         for num in numbers:
             path = os.path.join(output_dir, seq[num][0])
             header = self._read_safetensors_header(path)
-            if header is None and seq[num][1]:
-                continue  # finalized files are complete by construction
             if header is None:
+                if seq[num][1]:
+                    # finalized files are renamed only after a successful full
+                    # flush; an unparseable header means external corruption -
+                    # silently skipping it would finalize an index without its
+                    # tensors
+                    raise RuntimeError(
+                        f"ShardWriter resume: finalized shard {seq[num][0]} in {output_dir} has an "
+                        "unparseable header (externally corrupted?). Use a fresh --output_dir."
+                    )
                 if num == numbers[-1]:
                     logger.warning(
                         "ShardWriter resume: tail shard %s is incomplete (crash mid-flush); deleting it -- "
@@ -221,17 +228,26 @@ class ShardWriter:
                     max_end = file_size  # unexpected spec: fall through to the size check
                     break
             if 8 + header_len + max_end > file_size:
-                if num == numbers[-1]:
-                    logger.warning(
-                        "ShardWriter resume: tail shard %s is truncated (crash mid-data-write); deleting it -- "
-                        "its block was not marked done and will be re-done",
-                        found[num],
+                if not seq[num][1]:
+                    if num == numbers[-1]:
+                        logger.warning(
+                            "ShardWriter resume: tail shard %s is truncated (crash mid-data-write); deleting it "
+                            "-- its block was not marked done and will be re-done",
+                            found[num],
+                        )
+                        os.remove(path)
+                        continue
+                    raise RuntimeError(
+                        f"ShardWriter resume: shard {found[num]} in {output_dir} is truncated (only the tail "
+                        "shard of a crashed run may be incomplete). Use a fresh --output_dir."
                     )
-                    os.remove(path)
-                    continue
+                # a finalized shard's blocks are durably done per the manifest;
+                # its tensors cannot be re-made - only a fresh output dir can
+                # recover from external truncation
                 raise RuntimeError(
-                    f"ShardWriter resume: shard {found[num]} in {output_dir} is truncated (only the tail "
-                    "shard of a crashed run may be incomplete). Use a fresh --output_dir."
+                    f"ShardWriter resume: finalized shard {seq[num][0]} in {output_dir} is truncated "
+                    "(externally corrupted?); its tensors are marked done and cannot be re-made. "
+                    "Use a fresh --output_dir."
                 )
             params = list(header.keys())
             fname, _is_final = seq[num]

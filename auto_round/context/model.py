@@ -85,7 +85,7 @@ class ModelContext(BaseContext):
         self.model = model
         self.tokenizer = tokenizer
         self.stream_quantization = stream_quantization
-        self.model_path = model if isinstance(model, str) else None
+        self.model_path = str(model) if isinstance(model, (str, os.PathLike)) else None
         self.checkpoint_streamer = None
 
         # MLLM / diffusion artifacts – always present so callers need no getattr guards.
