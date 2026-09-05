@@ -563,6 +563,19 @@ class CheckpointStreamer:
         self._prefetch_handles.clear()
         self._prefetch_handle_order.clear()
 
+    def tensor_meta(self, name: str) -> Optional[tuple]:
+        """(shape, dtype) of one checkpoint tensor, read from shard metadata
+        without loading any tensor data. ``None`` when the name is unknown."""
+        shard = self.weight_map.get(name)
+        if shard is None:
+            return None
+        try:
+            h = self._get_safe_open_pooled(shard, self._open_handles, self._open_order)
+            sl = h.get_slice(name)
+            return tuple(sl.get_shape()), sl.get_dtype()
+        except Exception:  # pragma: no cover - unreadable shard
+            return None
+
     def fetch(self, name: str, device: Optional[str] = None, raw: bool = False) -> torch.Tensor:
         """Read one tensor (CPU unless ``device`` given); prefetched tensors
         are served from the host-RAM cache. ``raw=True`` skips the resolved

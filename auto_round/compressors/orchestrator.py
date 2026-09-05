@@ -109,6 +109,39 @@ def _format_host_buckets(buckets: dict) -> str:
     return ", ".join(parts)
 
 
+def materialize_placeholder_linear(
+    model: torch.nn.Module, path: str, shape: tuple, entry: dict, has_bias: bool
+) -> None:
+    """Attach a meta-weight placeholder ``nn.Linear`` at *path* for a pinned
+    layer that exists only in the checkpoint (checkpoint-only blocks such as
+    an MTP layer the modeling code never instantiates).
+
+    The placeholder carries the pin's quantization attributes and the
+    checkpoint tensor path as ``global_name``; the outside-block pass then
+    loads its real weights and quantizes, packs and shard-writes it like any
+    other pinned layer. Weights start on the meta device so materialization
+    costs no host RAM at checkpoint scale.
+    """
+    segments = path.split(".")
+    parent = model
+    for seg in segments[:-1]:
+        child = getattr(parent, seg, None)
+        if child is None:
+            child = torch.nn.Module()
+            parent.add_module(seg, child)
+        parent = child
+    with torch.device("meta"):
+        lin = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=has_bias)
+    for key in ("bits", "group_size", "data_type", "sym", "scale_dtype"):
+        if entry.get(key) is not None:
+            setattr(lin, key, entry[key])
+    lin.act_bits = entry.get("act_bits", 16)
+    lin.act_sym = entry.get("act_sym", True)
+    lin.act_data_type = entry.get("act_data_type", None)
+    lin.global_name = path
+    parent.add_module(segments[-1], lin)
+
+
 class CompressionOrchestrator(BaseOrchestrator):
 
     def __init__(
@@ -1119,6 +1152,84 @@ class CompressionOrchestrator(BaseOrchestrator):
         )
         return devices or None
 
+    def _pin_entry_for(self, layer_path: str) -> Optional[dict]:
+        """Quantization entry pinning *layer_path*, or None.
+
+        The resolver expands pins only over module-side names (checkpoint-only
+        layers cannot receive plan entries), so pins for those live solely in
+        regex_config: match the path against every pattern (exact pins are
+        normalized to regexes too) and return the first hit."""
+        import re
+
+        from auto_round.utils.common import to_standard_regex
+
+        entry = self.layer_config.get(layer_path)
+        if isinstance(entry, dict):
+            return entry
+        for pattern, val in (getattr(self, "regex_config", None) or {}).items():
+            try:
+                if re.search(to_standard_regex(pattern), layer_path):
+                    return val
+            except re.error:  # pragma: no cover - malformed user pattern
+                continue
+        return None
+
+    def _materialize_pinned_checkpoint_only_blocks_(self, streamer, all_blocks) -> set:
+        """Materialize placeholder Linears for pinned checkpoint-only blocks.
+
+        Blocks whose tensors exist only in the checkpoint (an MTP layer the
+        modeling code never instantiates) normally pass through verbatim.
+        When the layer_config pins their layers for quantization, create
+        meta-weight placeholder Linears under the checkpoint tensor paths so
+        the outside-block pass quantizes, packs and shard-writes them like any
+        other pinned layer. Only zero-shot runs qualify: such a block has no
+        place in the model graph, so no forward could ever feed a tuning
+        pass. Returns the checkpoint tensor names the placeholders claimed
+        (the verbatim pass-through must skip them).
+        """
+        claimed = set()
+        quantizers = self.alg_composer.block_quantizer
+        if not isinstance(quantizers, (list, tuple)):
+            quantizers = [quantizers]
+        if any(int(getattr(q, "iters", 0) or 0) > 0 for q in quantizers):
+            return claimed
+        block_name_set = {b for block in all_blocks for b in block}
+        parent_prefixes = sorted({b.rsplit(".", 1)[0] for b in block_name_set if "." in b})
+        for parent in parent_prefixes:
+            layer_ids = set()
+            for n in streamer.tensor_names:
+                if not n.startswith(parent + "."):
+                    continue
+                layer_id = n[len(parent) + 1 :].split(".")[0]
+                if layer_id.isdigit() and f"{parent}.{layer_id}" not in block_name_set:
+                    layer_ids.add(layer_id)
+            for layer_id in sorted(layer_ids):
+                blk = f"{parent}.{layer_id}"
+                for n in sorted(streamer.names_under(blk)):
+                    if not n.endswith(".weight"):
+                        continue
+                    layer_path = n[: -len(".weight")]
+                    entry = self._pin_entry_for(layer_path)
+                    bits = entry.get("bits") if isinstance(entry, dict) else None
+                    if not isinstance(bits, int) or bits >= 16:
+                        continue  # unpinned or kept floating: verbatim path
+                    meta = streamer.tensor_meta(n)
+                    if meta is None or len(meta[0]) != 2:
+                        continue  # norms and other buffers stay verbatim
+                    bias = layer_path + ".bias"
+                    materialize_placeholder_linear(
+                        self.model, layer_path, meta[0], entry, has_bias=bias in streamer.tensor_names
+                    )
+                    claimed.add(n)
+                    if bias in streamer.tensor_names:
+                        claimed.add(bias)
+        if claimed:
+            logger.info(
+                "[stream] materialized %d pinned layer(s) from checkpoint-only blocks; " "they will be quantized",
+                len(claimed),
+            )
+        return claimed
+
     def _quantize_zero_shot(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Zero-shot (RTN) quantization path — no calibration data needed.
 
@@ -1544,6 +1655,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             streamer.close()
         self.alg_composer.finalize_run()
 
+        # Checkpoint-only blocks with a layer_config pin (e.g. an MTP layer
+        # the modeling code never instantiates): materialize placeholder
+        # Linears so the pin quantizes them instead of silently passing them
+        # through; zero-shot only (see method docstring).
+        materialized_tensors = set()
+        if streamer is not None:
+            materialized_tensors = self._materialize_pinned_checkpoint_only_blocks_(streamer, all_blocks)
+
         remain_layer_names = []
         block_name_set = set(name for block in all_blocks for name in block)
         for n, m in self.model.named_modules():
@@ -1678,6 +1797,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         f"writing {len(names)} checkpoint tensors verbatim"
                     )
                     for n2 in names:
+                        if n2 in materialized_tensors:
+                            continue  # claimed by a materialized placeholder (quantized + packed)
                         self.shard_writer.save_tensor(n2, streamer.fetch(n2, raw=True))
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)

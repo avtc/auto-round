@@ -744,6 +744,7 @@ class TestStreamQuantizeEquivalence:
         stream_prefetch=0,
         stream_prefetch_devices=None,
         dataset=None,
+        layer_config=None,
     ):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.autoround import AutoRound
@@ -753,6 +754,8 @@ class TestStreamQuantizeEquivalence:
             kwargs["dataset"] = dataset
             kwargs["seqlen"] = 32
             kwargs["nsamples"] = 8
+        if layer_config is not None:
+            kwargs["layer_config"] = layer_config
         ar = AutoRound(
             model_path,
             scheme="W4A16",
@@ -1245,6 +1248,56 @@ class TestStreamQuantizeEquivalence:
             assert "model.layers.3.enorm.weight" in keys
             assert torch.equal(f.get_tensor("model.layers.3.eh_proj.weight"), extra["model.layers.3.eh_proj.weight"])
             assert torch.equal(f.get_tensor("model.layers.3.enorm.weight"), extra["model.layers.3.enorm.weight"])
+
+    def test_unclaimed_block_with_pin_materializes(self, tiny_checkpoint, tmp_path):
+        """A layer_config pin on a checkpoint-only block (e.g. an MTP layer)
+        must materialize a placeholder Linear and quantize+pack it instead of
+        silently passing it through verbatim."""
+        import json
+        import os
+        import shutil
+
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        src = shutil.copytree(tiny_checkpoint, str(tmp_path / "ck"))
+        extra = {
+            "model.layers.3.eh_proj.weight": torch.randn(16, 32),
+            "model.layers.3.enorm.weight": torch.randn(32),
+        }
+        idx_path = os.path.join(src, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            idx = json.load(f)
+        last = sorted(set(idx["weight_map"].values()))[-1]
+        with safe_open(os.path.join(src, last), framework="pt") as f:
+            tensors = {k: f.get_tensor(k) for k in f.keys()}
+        tensors.update(extra)
+        save_file(tensors, os.path.join(src, last), metadata={"format": "pt"})
+        for k in extra:
+            idx["weight_map"][k] = last
+        with open(idx_path, "w") as f:
+            json.dump(idx, f)
+
+        out = self._quantize(
+            src,
+            str(tmp_path / "out"),
+            stream=True,
+            layer_config={"model.layers.3.eh_proj": {"bits": 8}},
+        )
+
+        from safetensors import safe_open
+
+        keys = set()
+        for shard_file in sorted(os.listdir(out)):
+            if not shard_file.endswith(".safetensors"):
+                continue
+            with safe_open(os.path.join(out, shard_file), framework="pt") as f:
+                keys |= set(f.keys())
+        assert (
+            "model.layers.3.eh_proj.qweight" in keys
+        ), "pinned checkpoint-only layer was not packed; keys: " + ", ".join(sorted(k for k in keys if "layers.3" in k))
+        assert "model.layers.3.eh_proj.weight" not in keys, "plain weight written beside its packed form"
+        assert "model.layers.3.enorm.weight" in keys, "unpinned sibling tensor dropped"
 
 
 class TestAutoStagingScopesToDeviceMap:
