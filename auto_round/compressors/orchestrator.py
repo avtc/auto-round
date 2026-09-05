@@ -1174,6 +1174,37 @@ class CompressionOrchestrator(BaseOrchestrator):
                 continue
         return None
 
+    def _checkpoint_only_groups_(self, streamer) -> list:
+        """Maximal checkpoint tensor subtrees with no module counterpart.
+
+        Families ship multi-token-prediction weights in different topologies:
+        a top-level ``mtp.*`` subtree the modeling class strips at load, a
+        ``model.mtp.*`` subtree one level down, or an extra digit-indexed
+        decoder block beyond the model's block list. All reduce to one derived
+        rule: for every tensor nothing claimed, the first path prefix absent
+        from the module tree anchors a checkpoint-only group. Conversion-
+        registry renames (e.g. a shared expert stored under a legacy prefix)
+        are claimed through their rewrite target and never form groups.
+        """
+        claimed = set()
+        for n, m in self.model.named_modules():
+            for leaf in list(m._parameters) + list(m._buffers):
+                resolved = streamer.resolve_checkpoint_name(f"{n}.{leaf}" if n else leaf)
+                if resolved is not None:
+                    claimed.add(resolved)
+        module_names = {n for n, _ in self.model.named_modules()}
+        groups = set()
+        for t in streamer.tensor_names:
+            if t in claimed:
+                continue
+            parts = t.split(".")
+            for i in range(1, len(parts)):
+                prefix = ".".join(parts[:i])
+                if prefix not in module_names:
+                    groups.add(prefix)
+                    break
+        return sorted(groups)
+
     def _materialize_pinned_checkpoint_only_blocks_(self, streamer, all_blocks) -> set:
         """Materialize placeholder Linears for pinned checkpoint-only blocks.
 
@@ -1193,36 +1224,25 @@ class CompressionOrchestrator(BaseOrchestrator):
             quantizers = [quantizers]
         if any(int(getattr(q, "iters", 0) or 0) > 0 for q in quantizers):
             return claimed
-        block_name_set = {b for block in all_blocks for b in block}
-        parent_prefixes = sorted({b.rsplit(".", 1)[0] for b in block_name_set if "." in b})
-        for parent in parent_prefixes:
-            layer_ids = set()
-            for n in streamer.tensor_names:
-                if not n.startswith(parent + "."):
+        for blk in self._checkpoint_only_groups_(streamer):
+            for n in sorted(streamer.names_under(blk)):
+                if not n.endswith(".weight"):
                     continue
-                layer_id = n[len(parent) + 1 :].split(".")[0]
-                if layer_id.isdigit() and f"{parent}.{layer_id}" not in block_name_set:
-                    layer_ids.add(layer_id)
-            for layer_id in sorted(layer_ids):
-                blk = f"{parent}.{layer_id}"
-                for n in sorted(streamer.names_under(blk)):
-                    if not n.endswith(".weight"):
-                        continue
-                    layer_path = n[: -len(".weight")]
-                    entry = self._pin_entry_for(layer_path)
-                    bits = entry.get("bits") if isinstance(entry, dict) else None
-                    if not isinstance(bits, int) or bits >= 16:
-                        continue  # unpinned or kept floating: verbatim path
-                    meta = streamer.tensor_meta(n)
-                    if meta is None or len(meta[0]) != 2:
-                        continue  # norms and other buffers stay verbatim
-                    bias = layer_path + ".bias"
-                    materialize_placeholder_linear(
-                        self.model, layer_path, meta[0], entry, has_bias=bias in streamer.tensor_names
-                    )
-                    claimed.add(n)
-                    if bias in streamer.tensor_names:
-                        claimed.add(bias)
+                layer_path = n[: -len(".weight")]
+                entry = self._pin_entry_for(layer_path)
+                bits = entry.get("bits") if isinstance(entry, dict) else None
+                if not isinstance(bits, int) or bits >= 16:
+                    continue  # unpinned or kept floating: verbatim path
+                meta = streamer.tensor_meta(n)
+                if meta is None or len(meta[0]) != 2:
+                    continue  # norms and other buffers stay verbatim
+                bias = layer_path + ".bias"
+                materialize_placeholder_linear(
+                    self.model, layer_path, meta[0], entry, has_bias=bias in streamer.tensor_names
+                )
+                claimed.add(n)
+                if bias in streamer.tensor_names:
+                    claimed.add(bias)
         if claimed:
             logger.info(
                 "[stream] materialized %d pinned layer(s) from checkpoint-only blocks; " "they will be quantized",
@@ -1770,36 +1790,38 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             materialize_residual_meta(self.model, self.model_context.model.config, torch.device("cpu"))
 
-            # Block groups that exist only in the checkpoint (e.g. an MTP
-            # layer, which the modeling code does not instantiate) have no module
-            # to quantize or write; pass their tensors through verbatim so the
-            # export stays complete. The scan is anchored on the model's own
-            # block list (any block-path spelling), not on a hard-coded prefix.
-            claimed_blocks = {b for block in all_blocks for b in block}
-            parent_prefixes = {b.rsplit(".", 1)[0] for b in claimed_blocks if "." in b}
-            passed = set()
-            for parent in sorted(parent_prefixes):
-                for n in streamer.tensor_names:
-                    if not n.startswith(parent + "."):
-                        continue
-                    layer_id = n[len(parent) + 1 :].split(".")[0]
-                    if not layer_id.isdigit():
-                        continue
-                    blk = f"{parent}.{layer_id}"
-                    if blk in claimed_blocks or blk in passed:
-                        continue
-                    passed.add(blk)
-                    names = streamer.names_under(blk)
-                    if not names:
-                        continue
-                    logger.info(
-                        f"[stream] {blk} has no module counterpart; "
-                        f"writing {len(names)} checkpoint tensors verbatim"
-                    )
-                    for n2 in names:
-                        if n2 in materialized_tensors:
-                            continue  # claimed by a materialized placeholder (quantized + packed)
-                        self.shard_writer.save_tensor(n2, streamer.fetch(n2, raw=True))
+            # Checkpoint-only groups (an MTP layer kept as an extra digit block,
+            # or a whole top-level subtree transformers strips at load) have no
+            # module to quantize or write; pass their tensors through verbatim
+            # so the export stays complete.
+            for blk in self._checkpoint_only_groups_(streamer):
+                names = streamer.names_under(blk)
+                if not names:
+                    continue
+                logger.info(
+                    f"[stream] {blk} has no module counterpart; " f"writing {len(names)} checkpoint tensors verbatim"
+                )
+                for n2 in names:
+                    if n2 in materialized_tensors:
+                        continue  # claimed by a materialized placeholder (quantized + packed)
+                    self.shard_writer.save_tensor(n2, streamer.fetch(n2, raw=True))
+            # Auxiliary safetensors files the checkpoint index never references
+            # (a family shipping its multi-token-prediction weights as a
+            # separate file) are invisible to every index-based scan; copy them
+            # through so the export stays complete.
+            import shutil
+
+            referenced = set(streamer.weight_map.values())
+            for fname in sorted(os.listdir(streamer.model_path)):
+                if not fname.endswith(".safetensors") or fname in referenced:
+                    continue
+                if not os.path.isfile(os.path.join(streamer.model_path, fname)):
+                    continue
+                logger.info(f"[stream] copying unreferenced checkpoint file {fname} verbatim")
+                os.makedirs(self.shard_writer.output_dir, exist_ok=True)
+                shutil.copy2(
+                    os.path.join(streamer.model_path, fname), os.path.join(self.shard_writer.output_dir, fname)
+                )
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 

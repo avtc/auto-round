@@ -1249,6 +1249,106 @@ class TestStreamQuantizeEquivalence:
             assert torch.equal(f.get_tensor("model.layers.3.eh_proj.weight"), extra["model.layers.3.eh_proj.weight"])
             assert torch.equal(f.get_tensor("model.layers.3.enorm.weight"), extra["model.layers.3.enorm.weight"])
 
+    @staticmethod
+    def _add_extra_group(tiny_checkpoint, dst, extra):
+        """Copy the fixture checkpoint and append *extra* tensors to the last shard."""
+        import json
+        import os
+        import shutil
+
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        src = shutil.copytree(tiny_checkpoint, str(dst))
+        idx_path = os.path.join(src, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            idx = json.load(f)
+        last = sorted(set(idx["weight_map"].values()))[-1]
+        with safe_open(os.path.join(src, last), framework="pt") as f:
+            tensors = {k: f.get_tensor(k) for k in f.keys()}
+        tensors.update(extra)
+        save_file(tensors, os.path.join(src, last), metadata={"format": "pt"})
+        for k in extra:
+            idx["weight_map"][k] = last
+        with open(idx_path, "w") as f:
+            json.dump(idx, f)
+        return src
+
+    @staticmethod
+    def _export_keys(out):
+        import os
+
+        from safetensors import safe_open
+
+        keys = set()
+        for shard_file in sorted(os.listdir(out)):
+            if not shard_file.endswith(".safetensors"):
+                continue
+            with safe_open(os.path.join(out, shard_file), framework="pt") as f:
+                keys |= set(f.keys())
+        return keys
+
+    def test_toplevel_checkpoint_only_group_with_pin_materializes(self, tiny_checkpoint, tmp_path):
+        """Qwen-style topology: transformers strips a top-level ``mtp.*`` group
+        at load. A pin must materialize + quantize it; siblings stay verbatim."""
+        extra = {
+            "mtp.fc.weight": torch.randn(16, 32),
+            "mtp.norm.weight": torch.randn(32),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"mtp.fc": {"bits": 8}})
+        keys = self._export_keys(out)
+        assert "mtp.fc.qweight" in keys, "pinned top-level checkpoint-only layer was not packed"
+        assert "mtp.fc.weight" not in keys, "plain weight written beside its packed form"
+        assert "mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
+
+    def test_nested_checkpoint_only_group_with_pin_materializes(self, tiny_checkpoint, tmp_path):
+        """Depth-2 topology (``model.mtp.*``): same materialization semantics
+        one level down. Renamed conversion-registry families must NOT be
+        mistaken for checkpoint-only groups (they resolve into modules)."""
+        extra = {
+            "model.mtp.fc.weight": torch.randn(16, 32),
+            "model.mtp.norm.weight": torch.randn(32),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"model.mtp.fc": {"bits": 8}})
+        keys = self._export_keys(out)
+        assert "model.mtp.fc.qweight" in keys, "pinned nested checkpoint-only layer was not packed"
+        assert "model.mtp.fc.weight" not in keys
+        assert "model.mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
+
+    def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
+        """A separate auxiliary safetensors file the index never references
+        (a family shipping MTP weights as their own file) must reach the
+        export; index-based scans cannot see it at all."""
+        import os
+
+        from safetensors.torch import save_file
+
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", {})
+        aux = {"mtp.fc.weight": torch.randn(4, 4)}
+        save_file(aux, os.path.join(src, "mtp.safetensors"), metadata={"format": "pt"})
+        out = self._quantize(src, str(tmp_path / "out"), stream=True)
+        copied = os.path.join(out, "mtp.safetensors")
+        assert os.path.isfile(copied), "unreferenced auxiliary checkpoint file dropped from export"
+        from safetensors import safe_open
+
+        with safe_open(copied, framework="pt") as f:
+            assert torch.equal(f.get_tensor("mtp.fc.weight"), aux["mtp.fc.weight"])
+
+    def test_toplevel_checkpoint_only_group_unpinned_written_verbatim(self, tiny_checkpoint, tmp_path):
+        """Completeness: an unpinned top-level checkpoint-only group must reach
+        the export (the root leaf-assign path drops it: no parent module)."""
+        extra = {
+            "mtp.fc.weight": torch.randn(16, 32),
+            "mtp.norm.weight": torch.randn(32),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(src, str(tmp_path / "out"), stream=True)
+        keys = self._export_keys(out)
+        assert "mtp.fc.weight" in keys, "unpinned top-level group tensor dropped from export"
+        assert "mtp.norm.weight" in keys
+
     def test_unclaimed_block_with_pin_materializes(self, tiny_checkpoint, tmp_path):
         """A layer_config pin on a checkpoint-only block (e.g. an MTP layer)
         must materialize a placeholder Linear and quantize+pack it instead of
