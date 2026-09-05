@@ -2219,7 +2219,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         _peak_watch = PeakWatcher() if logger.isEnabledFor(logging.DEBUG) else None
         if _peak_watch is not None:
             _peak_watch.start()
-        flat_block_names = [name for group in all_blocks for name in group]
         for g_idx, block_names in enumerate(all_blocks):
             rs = resume_states[g_idx] if resume_states is not None and g_idx < len(resume_states) else None
             for k_idx, block_name in enumerate(block_names):

@@ -208,6 +208,12 @@ class CheckpointStreamer:
         self.weight_map: dict[str, str] = {}
         self._format: Optional[str] = None  # "safetensors" | "bin"
         self._open_handles: dict[str, object] = {}  # shard path -> safe_open handle
+        # reader-liveness counter: bumped on every staged or consumed prefix
+        # so the bounded staging wait can tell a healthy long wait (a tune in
+        # progress elsewhere) from a true stall. Initialized here, not only in
+        # start_prefetch: any path entering _wait_for_stage_device on a fresh
+        # or never-prefetched streamer must find it.
+        self._prefetch_progress = 0
         # shard -> tensor names not yet read; a shard whose set empties is
         # fully consumed and gets closed immediately (its mapping holds
         # every touched page in RSS until unmapped)

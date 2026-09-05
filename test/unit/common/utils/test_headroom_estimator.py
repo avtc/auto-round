@@ -122,6 +122,8 @@ class TestTuningHeadroomProfile:
     """Profile derivation from quantizer configs + model config."""
 
     def _profile(self, quantizers, cfg, batch=8, seqlen=2048):
+        from types import MethodType
+
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
         stub = SimpleNamespace(
@@ -129,6 +131,8 @@ class TestTuningHeadroomProfile:
             model_context=SimpleNamespace(config=cfg),
             calibration_context=SimpleNamespace(batch_size=batch, seqlen=seqlen),
         )
+        # the profile reads iters through the extracted helper (1af535ea)
+        stub._max_tune_iters = MethodType(CompressionOrchestrator._max_tune_iters, stub)
         return CompressionOrchestrator._tuning_headroom_profile(stub)
 
     def test_dense_zero_shot(self):
@@ -279,6 +283,8 @@ class TestMtpZeroShotFallback:
         stub._checkpoint_only_groups_ = MethodType(CompressionOrchestrator._checkpoint_only_groups_, stub)
         stub._pin_entry_for = MethodType(CompressionOrchestrator._pin_entry_for, stub)
         stub._analyze_checkpoint_only_group_ = MethodType(CompressionOrchestrator._analyze_checkpoint_only_group_, stub)
+        # extracted helpers the materializer now calls (see 1af535ea)
+        stub._max_tune_iters = MethodType(CompressionOrchestrator._max_tune_iters, stub)
         claimed, tree_groups = CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_(stub, Streamer(), [])
         assert tree_groups == []
         return claimed, model
