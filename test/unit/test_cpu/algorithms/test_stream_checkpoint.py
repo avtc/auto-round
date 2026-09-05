@@ -1516,3 +1516,21 @@ class TestPrefetchConsumerWaits:
         finally:
             release.set()
             streamer.stop_prefetch()
+
+
+class TestOutsideBlockPackUnderStreaming:
+    """Outside-block layers (lm_head) must pack + shard-write during the run:
+    the export pack loop is skipped under the streaming meta skeleton, so the
+    shards are the only durable home for their packed state."""
+
+    def test_outside_block_pack_and_write_wired(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
+        i = src.index("Quantizing remaining layer")
+        window = src[i : i + 1600]
+        assert "immediate_pack" in window, "outside-block pass does not pack under streaming"
+        assert "shard_writer.write(name=name)" in window, "outside-block pass does not write to shards"
+        assert "is_immediate_saving" in window, "pack+write must be gated on immediate saving"

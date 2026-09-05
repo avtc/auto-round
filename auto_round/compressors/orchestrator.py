@@ -1516,6 +1516,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # materialize the parent's whole subtree (every block weight)
                 streamer.load_module_(get_module(self.model, name), name, device="cpu")
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
+            if streamer is not None and self.compress_context.is_immediate_saving:
+                # pack + write now: the export pack loop is skipped under the
+                # streaming meta skeleton (mixed meta/real), so shards are the
+                # only place the layer's packed state can live - the export
+                # restore re-derives its scheme from there
+                from auto_round.compressors.utils import immediate_pack as _immediate_pack
+
+                _immediate_pack(name, self.layer_config, device="cpu")
+                self.shard_writer.write(name=name)
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.
             clear_memory()
