@@ -962,8 +962,11 @@ block plus calibration state, and total disk usage is about one copy of the quan
 intermediate copies. All blockwise algorithms (RTN-family, SignRound with `iters > 0`) are supported.
 
 ```bash
-auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --stream_prefetch auto
+auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantization --stream_prefetch auto
 ```
+
+`--stream_quantization` reads the checkpoint from a local directory (it streams shards
+directly and never resolves hub ids); download the model first when starting from a hub id.
 
 - `--stream_quantization`: enable the streaming path. Mutually exclusive with `AR_DISK_STREAM_MODEL` (an error
   is raised when both are set). Text LLMs should prefer this flag; the env path remains for multimodal runs

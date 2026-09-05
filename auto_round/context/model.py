@@ -242,6 +242,16 @@ class ModelContext(BaseContext):
                 "Unset AR_DISK_STREAM_MODEL to use --stream_quantization."
             )
         if is_diffusion_model(self.model):
+            if self.stream_quantization:
+                # every other unsupported combination fails loud; a diffusion
+                # pipeline cannot stream decoder blocks (its blocks are not a
+                # decoder list, and the pipeline would be fully materialized
+                # anyway), so silently ignoring the flag here would ship a
+                # run the user believes is memory-bounded but is not
+                raise ValueError(
+                    "--stream_quantization does not support diffusion pipelines (no per-block decoder "
+                    "streaming); drop the flag and rely on offloading, or quantize a text-only checkpoint"
+                )
             self.is_diffusion = True
             self.preloaded_diffusion_pipeline = not isinstance(self.model, str)
             default_torch_dtype = "auto"

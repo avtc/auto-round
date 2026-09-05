@@ -2385,7 +2385,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
-                blocks_before += len(block_names)
+            # group tail: advance the global-index base by THIS group's block
+            # count once (an update inside the k_idx loop would scale it by
+            # the block count of every block)
+            blocks_before += len(block_names)
         if _peak_watch is not None:
             # stop once after ALL groups: a per-group stop would kill the
             # sampler after the first group and later groups would lose peak

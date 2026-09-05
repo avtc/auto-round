@@ -923,8 +923,11 @@ auto-round --model_name Qwen/Qwen3-0.6B  --scheme "W4A16" --quant_lm_head --form
 校准状态，磁盘总占用约为量化后模型的一份拷贝。所有块级算法（RTN 系列、`iters > 0` 的 SignRound）均受支持。
 
 ```bash
-auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --stream_prefetch auto
+auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantization --stream_prefetch auto
 ```
+
+`--stream_quantization` 从本地目录读取 checkpoint（直接流式读取分片，不解析 hub id）；
+如果起点是 hub id，请先下载模型。
 
 - `--stream_quantization`：启用流式路径。与 `AR_DISK_STREAM_MODEL` 互斥（同时设置会报错）。文本 LLM
   建议优先使用该 flag；env 路径保留给需要量化视觉塔的多模态运行。多模态模型的视觉塔保持不量化

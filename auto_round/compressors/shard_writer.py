@@ -116,10 +116,18 @@ class ShardWriter:
         try:
             with open(path, "rb") as f:
                 n = struct.unpack("<Q", f.read(8))[0]
+                # a corrupt declared length must not preempt the caller's
+                # corrupt/tail handling with a raw MemoryError: headers are a
+                # small fraction of any shard, so anything beyond the file
+                # itself is corruption by definition
+                f.seek(0, 2)
+                if n > f.tell():
+                    return None
+                f.seek(8)
                 header = json.loads(f.read(n))
             header.pop("__metadata__", None)
             return header
-        except (OSError, ValueError, struct.error, OverflowError):
+        except (OSError, ValueError, struct.error, OverflowError, MemoryError):
             return None
 
     def adopt_existing_shards(self) -> int:

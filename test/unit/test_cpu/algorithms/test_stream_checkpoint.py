@@ -2356,17 +2356,36 @@ class TestStreamingGlobalBlockIndex:
     data-driven parity contract); a multi-group quant_block_list must see
     monotonically advancing indices across groups, not group-local ones."""
 
-    def test_blocks_before_advances_inside_group_loop(self):
+    def test_blocks_before_update_nests_at_group_tail(self):
+        import ast
         import inspect
 
         from auto_round.compressors import orchestrator as orch_mod
 
-        src = inspect.getsource(orch_mod.CompressionOrchestrator._quantize_zero_shot)
-        loop_start = src.index("for g_idx, block_names in enumerate(all_blocks):")
-        loop_body = src[loop_start:]
-        # the accumulator update belongs INSIDE the group loop body (an
-        # accidentally dedented update made every group-local index and no
-        # global position after group 0)
-        assert "blocks_before += len(block_names)" in loop_body[: loop_body.index("# Pipeline lifecycle")]
-        tail = loop_body[loop_body.index("# Pipeline lifecycle") :]
-        assert "blocks_before +=" not in tail, "accumulator update drifted out of the group loop"
+        # structural (AST) pin: the accumulator update must be a DIRECT
+        # statement of the group loop's body (not nested inside the inner
+        # per-block loop, not after the loop) - source-substring checks
+        # cannot see nesting and let two regressions through
+        import textwrap
+
+        fn = orch_mod.CompressionOrchestrator._quantize_zero_shot
+        fn_node = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+        group_loop = next(
+            n
+            for n in ast.walk(fn_node)
+            if isinstance(n, ast.For)
+            and isinstance(n.iter, ast.Call)
+            and getattr(n.iter.func, "id", getattr(n.iter.func, "attr", None)) == "enumerate"
+        )
+        inner_loop = next(
+            n
+            for n in ast.walk(group_loop)
+            if n is not group_loop and isinstance(n, ast.For) and n.lineno > group_loop.lineno
+        )
+        direct_updates = [
+            s
+            for s in group_loop.body
+            if isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name) and s.target.id == "blocks_before"
+        ]
+        assert direct_updates, "blocks_before update drifted out of the group loop"
+        assert direct_updates[0].lineno > inner_loop.end_lineno, "blocks_before update nested inside the per-block loop"
