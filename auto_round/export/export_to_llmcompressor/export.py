@@ -252,7 +252,7 @@ def pack_layer(name, model, device=None):
 
 
 @torch.no_grad()
-def _restore_packed_modules_from_shards(model, output_dir: str, metadata_only: bool = False) -> int:
+def _restore_packed_modules_from_shards(model, output_dir: str, metadata_only: bool = False, name_resolver=None) -> int:
     """Rebuild packed-module state from already-written output shards.
 
     A resumed streaming session skips blocks a previous run already packed
@@ -298,7 +298,15 @@ def _restore_packed_modules_from_shards(model, output_dir: str, metadata_only: b
             continue
         if getattr(layer, "quantization_status", None) is not None or hasattr(layer, "scale"):
             continue
-        if f"{name}.weight_packed" not in shards:
+        # the shards may carry checkpoint-side names (conversion-registry
+        # aliases, e.g. shared_mlp vs shared_experts): resolve before the
+        # packed-key lookup so renamed modules still get marked
+        key = name
+        if f"{key}.weight_packed" not in shards and name_resolver is not None:
+            resolved = name_resolver(name)
+            if resolved is not None and f"{resolved}.weight_packed" in shards:
+                key = resolved
+        if f"{key}.weight_packed" not in shards:
             continue
         if metadata_only:
             layer.quantization_scheme = construct_ct_scheme(layer)
@@ -382,8 +390,18 @@ def save_quantized_as_llmcompressor(
     # a resumed streaming session skipped blocks already packed and written
     # by an earlier run; rebuild their packed-module state from the shards
     # (metadata only: the weights stay durably in the shards under immediate
-    # saving and would never be consumed from memory)
-    _restore_packed_modules_from_shards(model, output_dir, metadata_only=immediate_saving)
+    # saving and would never be consumed from memory). The streamer provides
+    # checkpoint-name resolution so modules whose shard tensors live under
+    # conversion-registry aliases still get marked.
+    from auto_round.context.model import ModelContext
+
+    streamer = getattr(ModelContext.get_context(), "checkpoint_streamer", None)
+    _restore_packed_modules_from_shards(
+        model,
+        output_dir,
+        metadata_only=immediate_saving,
+        name_resolver=getattr(streamer, "resolve_checkpoint_name", None),
+    )
 
     # generate q_weight
     device = get_major_device(device)

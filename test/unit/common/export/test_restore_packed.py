@@ -97,3 +97,42 @@ class TestRestorePackedFromShards:
         _write_shards(tmp_path, {"other.weight_packed": torch.zeros(1)})
         assert _restore_packed_modules_from_shards(model, str(tmp_path), metadata_only=True) == 0
         assert getattr(lin, "quantization_status", None) is None
+
+
+class TestRestoreRenamedShardKeys:
+    """Shards may carry checkpoint-side names (conversion aliases): the
+    restore must resolve module names before the packed-key lookup."""
+
+    def test_resolver_marks_module_packed_under_checkpoint_name(self, tmp_path):
+        lin = _fake_layer()
+        model = torch.nn.Module()
+        container = torch.nn.Module()
+        se = torch.nn.Module()
+        se.add_module("gate_proj", lin)
+        container.add_module("shared_experts", se)
+        model.add_module("mlp", container)
+        packed = torch.randint(-127, 128, (4, 4), dtype=torch.int8)
+        # shard key uses the CHECKPOINT name (shared_mlp), module uses the
+        # transformers name (shared_experts)
+        _write_shards(
+            tmp_path,
+            {
+                "mlp.shared_mlp.gate_proj.weight_packed": packed,
+                "mlp.shared_mlp.gate_proj.weight_scale": torch.ones(4, 1),
+            },
+        )
+        resolver = lambda n: n.replace("shared_experts", "shared_mlp")  # noqa: E731
+        n = _restore_packed_modules_from_shards(model, str(tmp_path), metadata_only=True, name_resolver=resolver)
+        assert n == 1
+        assert lin.quantization_status is QuantizationStatus.COMPRESSED
+
+    def test_resolver_miss_leaves_module_unmarked(self, tmp_path):
+        lin = _fake_layer()
+        model = torch.nn.Module()
+        model.add_module("blk", lin)
+        _write_shards(tmp_path, {"other.weight_packed": torch.zeros(1)})
+        resolver = lambda n: None  # noqa: E731
+        assert (
+            _restore_packed_modules_from_shards(model, str(tmp_path), metadata_only=True, name_resolver=resolver) == 0
+        )
+        assert getattr(lin, "quantization_status", None) is None
