@@ -1683,3 +1683,18 @@ class TestOutsideBlockPackUnderStreaming:
         assert "immediate_pack" in window, "outside-block pass does not pack under streaming"
         assert "shard_writer.write(name=name)" in window, "outside-block pass does not write to shards"
         assert "is_immediate_saving" in window, "pack+write must be gated on immediate saving"
+
+
+class TestCheckpointOnlyGroupVisibility:
+    """Silent skips must be visible: iters>0 keeps groups verbatim with a
+    warning, and pinned non-2D tensors (fused expert stacks) report that they
+    stay unquantized."""
+
+    def test_skip_paths_log(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_)
+        assert "stay unquantized: tuning runs need a forward" in src
+        assert "not 2D weights" in src and "skipped_non_2d" in src

@@ -1222,9 +1222,17 @@ class CompressionOrchestrator(BaseOrchestrator):
         quantizers = self.alg_composer.block_quantizer
         if not isinstance(quantizers, (list, tuple)):
             quantizers = [quantizers]
+        groups = self._checkpoint_only_groups_(streamer)
         if any(int(getattr(q, "iters", 0) or 0) > 0 for q in quantizers):
+            if groups:
+                logger.warning(
+                    "[stream] checkpoint-only groups %s stay unquantized: tuning runs need a forward these "
+                    "blocks cannot join (no module counterpart); pin them on a zero-shot run to quantize",
+                    ", ".join(groups),
+                )
             return claimed
-        for blk in self._checkpoint_only_groups_(streamer):
+        skipped_non_2d = 0
+        for blk in groups:
             for n in sorted(streamer.names_under(blk)):
                 if not n.endswith(".weight"):
                     continue
@@ -1235,7 +1243,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     continue  # unpinned or kept floating: verbatim path
                 meta = streamer.tensor_meta(n)
                 if meta is None or len(meta[0]) != 2:
-                    continue  # norms and other buffers stay verbatim
+                    # norms and other buffers stay verbatim; pinned 3D stacks
+                    # (fused expert tensors) cannot become a plain Linear
+                    skipped_non_2d += 1
+                    continue
                 bias = layer_path + ".bias"
                 materialize_placeholder_linear(
                     self.model, layer_path, meta[0], entry, has_bias=bias in streamer.tensor_names
@@ -1247,6 +1258,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.info(
                 "[stream] materialized %d pinned layer(s) from checkpoint-only blocks; " "they will be quantized",
                 len(claimed),
+            )
+        if skipped_non_2d:
+            logger.warning(
+                "[stream] %d pinned tensor(s) in checkpoint-only groups are not 2D weights (e.g. fused expert "
+                "stacks); leaving them unquantized",
+                skipped_non_2d,
             )
         return claimed
 
