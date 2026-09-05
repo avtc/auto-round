@@ -745,8 +745,10 @@ class TestStreamQuantizeEquivalence:
         stream_prefetch_devices=None,
         dataset=None,
         layer_config=None,
+        iters=0,
     ):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
         from auto_round.autoround import AutoRound
 
         kwargs = {}
@@ -756,10 +758,14 @@ class TestStreamQuantizeEquivalence:
             kwargs["nsamples"] = 8
         if layer_config is not None:
             kwargs["layer_config"] = layer_config
+        if iters:
+            alg = [SignRoundConfig(group_size=16, iters=iters, lr=5e-3)]
+        else:
+            alg = [RTNConfig(group_size=16, disable_opt_rtn=False)]
         ar = AutoRound(
             model_path,
             scheme="W4A16",
-            alg_configs=[RTNConfig(group_size=16, disable_opt_rtn=False)],
+            alg_configs=alg,
             stream_quantization=stream,
             stream_prefetch=stream_prefetch,
             stream_prefetch_devices=stream_prefetch_devices,
@@ -1397,6 +1403,42 @@ class TestStreamQuantizeEquivalence:
         assert "model.layers.3.eh_proj.qweight" in keys
         assert "model.layers.3.mlp.gate_proj.weight" not in keys
         assert "model.layers.3.enorm.weight" in keys, "unpinned sibling tensor dropped in degraded mode"
+
+    def test_mtp_group_tree_tunes_with_sign_round(self, tiny_checkpoint, tmp_path):
+        """A tuning run (iters>0) tunes the materialized predictor tree with
+        the run's own quantizer config: the tuned Linears pack, norms pass
+        through, and the export stays complete."""
+        H = 32
+        extra = {
+            "model.layers.3.eh_proj.weight": torch.randn(H, 2 * H),
+            "model.layers.3.enorm.weight": torch.randn(H),
+            "model.layers.3.hnorm.weight": torch.randn(H),
+            "model.layers.3.final_layernorm.weight": torch.randn(H),
+            "model.layers.3.input_layernorm.weight": torch.randn(H),
+            "model.layers.3.post_attention_layernorm.weight": torch.randn(H),
+            "model.layers.3.self_attn.q_proj.weight": torch.randn(H, H),
+            "model.layers.3.self_attn.k_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.v_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.o_proj.weight": torch.randn(H, H),
+            "model.layers.3.mlp.gate_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.up_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.down_proj.weight": torch.randn(H, 64),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(
+            src,
+            str(tmp_path / "out"),
+            stream=True,
+            dataset="NeelNanda/pile-10k",
+            layer_config={"model.layers.3": {"bits": 8}},
+            iters=2,
+        )
+        keys = self._export_keys(out)
+        assert "model.layers.3.self_attn.q_proj.qweight" in keys, "tuned tree layer not packed"
+        assert "model.layers.3.self_attn.q_proj.weight" not in keys, "plain weight kept beside packed form"
+        assert "model.layers.3.eh_proj.qweight" in keys
+        for norm in ("enorm", "hnorm", "final_layernorm", "input_layernorm", "post_attention_layernorm"):
+            assert f"model.layers.3.{norm}.weight" in keys, f"norm {norm} dropped from export"
 
     def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
         """A separate auxiliary safetensors file the index never references
@@ -2137,5 +2179,5 @@ class TestCheckpointOnlyGroupVisibility:
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
         src = inspect.getsource(CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_)
-        assert "stay unquantized: tuning runs need a forward" in src
+        assert "stays unquantized: tuning runs need a forward" in src
         assert "not 2D weights" in src and "skipped_non_2d" in src

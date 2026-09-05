@@ -185,16 +185,24 @@ def forward_checkpoint_only_predictor(shell: torch.nn.Module, hidden_states: tor
     """Run a materialized predictor tree like a decoder block.
 
     norm_e(e) concat norm_h(h) -> concat mixer -> decoder layer -> final
-    norm, with ``e`` bound on the shell (``bind_checkpoint_only_predictor``)
-    and every keyword input passing through to the layer unchanged."""
+    norm. The embedding-side input arrives as the ``_predictor_e`` batch
+    input (per-row tensors the forward runner batches like any other
+    auxiliary input) or falls back to the value bound on the shell; every
+    other keyword input passes through to the layer unchanged."""
     refs = getattr(shell, "_predictor_refs", None)
     if refs is None:
         raise RuntimeError("predictor forward called on a shell without bound role refs")
-    e = shell._predictor_e
+    e = input_others.pop("_predictor_e", None)
+    if e is None:
+        e = shell._predictor_e
     if e is None:
         raise RuntimeError(
             "predictor embedding-side input is not bound yet; synthesize it from the chain " "state before tuning"
         )
+    if isinstance(e, (list, tuple)):
+        e = torch.cat(list(e), dim=0)
+    if e.device != hidden_states.device:
+        e = e.to(hidden_states.device)
     x = torch.cat([refs["norm_e"](e), refs["norm_h"](hidden_states)], dim=-1)
     x = refs["fc"](x)
     x = refs["layer"](x, **input_others)
@@ -1518,6 +1526,16 @@ class CompressionOrchestrator(BaseOrchestrator):
         group, layer_root = info["prefix"], info["layer_root"]
         claimed = set()
         layer_mod = copy.deepcopy(sibling)
+        # the snapshot copies instance-level forwards too (positional adapters,
+        # replacement wrappers) whose closures bind the ORIGINAL module -
+        # calling them re-enters the source block instead of the copy. Restore
+        # each module's class forward; modern block signatures take the same
+        # keyword inputs the forward runner already passes.
+        for m in layer_mod.modules():
+            if "forward" in m.__dict__:
+                cls_fwd = getattr(type(m), "forward", None)
+                if cls_fwd is not None:
+                    m.forward = cls_fwd.__get__(m, type(m))
         parent = _ensure_module_path(self.model, layer_root)
         parent.add_module(layer_root.rsplit(".", 1)[-1], layer_mod)
         for n, m in layer_mod.named_modules():
@@ -1614,8 +1632,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             claimed.add(name)
         # bind the predictor forward onto the group shell so tuning machinery
         # can run the tree like a decoder block (embedding-side input bound
-        # later, from the calibration chain)
+        # later, from the calibration chain). When the group IS the layer
+        # (extra digit-block topology), the shell is the layer module itself:
+        # binding the predictor forward overwrites the layer forward, so the
+        # layer must be called through its restored class forward instead of
+        # the module (calling the module would re-enter the predictor).
         shell = self.model.get_submodule(group)
+        layer_call = layer_mod
+        if shell is layer_mod:
+            layer_call = type(layer_mod).forward.__get__(layer_mod, type(layer_mod))
         bind_checkpoint_only_predictor(
             shell,
             {
@@ -1625,31 +1650,128 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self.model.get_submodule(info["final_norm"][: -len(".weight")]) if info.get("final_norm") else None
                 ),
                 "fc": fc,
-                "layer": layer_mod,
+                "layer": layer_call,
             },
         )
         return claimed
 
-    def _write_unpacked_group_tensors_(self, streamer, tree_groups, claimed) -> None:
+    def _tune_checkpoint_only_groups_(self, streamer, tree_groups, calib_state, block_count) -> set:
+        """Tune materialized predictor trees with the run's tuning config.
+
+        The tree joins the chain's tail as one extra block: hidden states are
+        the final FP/quantized chain output, the embedding-side input is
+        synthesized from the chain's token ids (shifted by one), positional
+        inputs are reused from the chain's auxiliary inputs, and the SAME
+        quantizer configuration tunes the tree's pinned Linears. Afterwards
+        pack + shard-write mirror the block loop's tail. Returns the groups
+        that tuned; a group that cannot (missing chain state) falls back to
+        the closed-form outside-block search."""
+        from auto_round.algorithms.composer import BlockContext
+        from auto_round.compressors.utils import immediate_pack_block as _immediate_pack_block
+        from auto_round.utils.model import check_to_quantized as _ctq
+        from auto_round.utils.streaming_calibration import materialize_residual_meta
+
+        tuned = set()
+        fp_inputs = (calib_state or {}).get("fp_inputs")
+        token_ids = (calib_state or {}).get("token_ids")
+        if not fp_inputs or not token_ids:
+            if tree_groups:
+                logger.warning(
+                    "[stream] checkpoint-only groups %s fall back to the closed-form search: the calibration "
+                    "chain kept no token ids to synthesize predictor inputs from",
+                    ", ".join(tree_groups),
+                )
+            return tuned
+        embed = self.model.get_input_embeddings()
+        embed_name = next((n for n, m in self.model.named_modules() if m is embed), None)
+        if embed is None or embed_name is None:
+            logger.warning(
+                "[stream] checkpoint-only groups %s fall back to the closed-form search: no input embeddings",
+                ", ".join(tree_groups),
+            )
+            return tuned
+        if any(p.is_meta for p in embed.parameters()):
+            # embedding lookup only - keep the (possibly vocabulary-sized)
+            # table on host RAM, the synthesized rows move to the tune device
+            streamer.load_module_(embed, embed_name, device="cpu")
+        e_rows = [synthesize_predictor_e(ids, embed=embed) for ids in token_ids]
+        cfg = self.model_context.model.config
+        for group in tree_groups:
+            shell = self.model.get_submodule(group)
+            streamer.load_module_(shell, group, device=str(self.device))
+            materialize_residual_meta(shell, cfg, self.device)
+            # single-row fallback so direct calls (mask probes, spot checks)
+            # work without the batched input plumbing
+            shell._predictor_e = e_rows[0]
+            io = dict(calib_state["input_others"])
+            if calib_state.get("keymask_2d"):
+                # resolve the predictor layer's attention-mask convention by
+                # probe, exactly like the block loop (a full-attention
+                # predictor behind gated-delta-net blocks must flip forms)
+                from auto_round.utils.streaming_calibration import materialize_mask_form, resolve_chain_mask_form
+
+                form = resolve_chain_mask_form(
+                    shell,
+                    fp_inputs[0],
+                    calib_state["keymask_2d"][0],
+                    io,
+                    preferred=calib_state.get("_mask_form"),
+                    amp=self.amp,
+                    amp_dtype=self.amp_dtype,
+                )
+                io["attention_mask"] = [materialize_mask_form(m, form) for m in calib_state["keymask_2d"]]
+            io["_predictor_e"] = e_rows
+            ctx = BlockContext(
+                model=self.model,
+                block_names=[group],
+                block_name=group,
+                block_index=block_count,
+                block_cnt=block_count + 1,
+            )
+            logger.info("[stream] tuning checkpoint-only group %s with the run's tuning config", group)
+            try:
+                self.alg_composer.compress_block(
+                    shell,
+                    fp_inputs,
+                    io,
+                    block_ctx=ctx,
+                    q_inputs=calib_state.get("q_inputs"),
+                    input_ids=token_ids,
+                )
+            finally:
+                io.pop("_predictor_e", None)
+            _immediate_pack_block(shell, group, self.layer_config, nblocks=self.nblocks, device=str(self.device))
+            self.shard_writer.write(name=group)
+            self._write_unpacked_group_tensors_(streamer, [group])
+            shell.to("meta")
+            tuned.add(group)
+            clear_memory()
+        return tuned
+
+    def _write_unpacked_group_tensors_(self, streamer, tree_groups) -> None:
         """Write every tree-group tensor that did not end up packed.
 
         Attaching a tree dissolves the group out of the checkpoint-only
         verbatim pass (its prefixes now exist in the module tree), so the
-        tensors no path claimed would be silently dropped: pinned Linears are
-        already packed+written; fused stacks whose experts quantized are
-        replaced by their per-expert packed forms; everything else (norms,
-        unpinned weights, extras) is copied through byte-for-byte from the
-        checkpoint."""
+        tensors no path claimed would be silently dropped: tensors whose
+        owner module quantized are replaced by their packed forms (and fused
+        expert stacks by their per-expert packed slices); everything else
+        (norms, unpinned weights, extras) is copied through byte-for-byte
+        from the checkpoint."""
         from auto_round.utils.model import check_to_quantized, get_module
 
         saved = set(getattr(self.shard_writer, "_all_saved", None) or [])
         for group in tree_groups:
             for n in streamer.names_under(group):
-                if n in saved or n in claimed:
+                if n in saved:
                     continue
                 owner = get_module(self.model, n.rsplit(".", 1)[0])
                 if owner is not None and check_to_quantized(owner):
                     continue  # its packed form was written by the outside-block pass
+                if owner is not None and not any(True for _ in owner.children()):
+                    meta = streamer.tensor_meta(n)
+                    if meta is not None and len(meta[0]) == 3 and any(check_to_quantized(m) for m in owner.modules()):
+                        continue  # fused stack whose per-expert slices packed
                 self.shard_writer.save_tensor(n, streamer.fetch(n, raw=True))
 
     def _materialize_pinned_checkpoint_only_blocks_(self, streamer, all_blocks, snapshots=None) -> tuple[set, list]:
@@ -1664,9 +1786,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         sibling becomes a real tree (pinned Linears quantize+pack through the
         outside-block pass; the tree is forward-capable for tuning runs);
         otherwise scattered placeholder Linears keep the pinned tensors
-        quantizable. Only zero-shot runs qualify unless AR_MTP_ZERO_SHOT is
-        set: tuning needs synthesized inputs these blocks cannot join on
-        their own. Returns ``(claimed tensor names, tree group prefixes)``.
+        quantizable. Tuning runs tune real trees with the run's own config;
+        groups without a covering sibling stay verbatim there unless
+        AR_MTP_ZERO_SHOT forces the closed-form search. Returns ``(claimed
+        tensor names, tree group prefixes)``.
         """
         claimed = set()
         tree_groups = []
@@ -1675,15 +1798,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             quantizers = [quantizers]
         groups = self._checkpoint_only_groups_(streamer)
         tune_iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
-        if tune_iters > 0 and not envs.AR_MTP_ZERO_SHOT:
-            if groups:
-                logger.warning(
-                    "[stream] checkpoint-only groups %s stay unquantized: tuning runs need a forward these "
-                    "blocks cannot join (no module counterpart); pin them on a zero-shot run to quantize, or "
-                    "set AR_MTP_ZERO_SHOT=1 to quantize them with the closed-form search inside this run",
-                    ", ".join(groups),
-                )
-            return claimed, tree_groups
         skipped_non_2d = 0
         for blk in groups:
             names = sorted(streamer.names_under(blk))
@@ -1703,8 +1817,19 @@ class CompressionOrchestrator(BaseOrchestrator):
             info = self._analyze_checkpoint_only_group_(streamer, blk)
             sibling = self._pick_sibling_layer_(streamer, info, all_blocks, snapshots) if info is not None else None
             if sibling is not None:
+                # a real tree can join the chain's tail on tuning runs - the
+                # tune step quantizes it with the run's own config
                 tree_groups.append(blk)
                 claimed |= self._attach_checkpoint_only_group_tree_(streamer, info, sibling[1], sibling[2])
+                continue
+            if tune_iters > 0 and not envs.AR_MTP_ZERO_SHOT:
+                logger.warning(
+                    "[stream] checkpoint-only group %s stays unquantized: tuning runs need a forward these "
+                    "blocks cannot join (no module counterpart and no covering sibling); pin them on a zero-shot "
+                    "run to quantize, or set AR_MTP_ZERO_SHOT=1 to quantize them with the closed-form search "
+                    "inside this run",
+                    blk,
+                )
                 continue
             if info is not None:
                 logger.warning(
@@ -2212,23 +2337,31 @@ class CompressionOrchestrator(BaseOrchestrator):
             # last block's pack pipeline must be complete first
             self._join_bg_pack(_bg_pack)
             _bg_pack = None
-        if streamer is not None and prefetch_depth > 0:
-            streamer.stop_prefetch()
-        if streamer is not None:
-            streamer.close()
-        self.alg_composer.finalize_run()
-
         # Checkpoint-only blocks with a layer_config pin (e.g. an MTP layer
-        # the modeling code never instantiates): materialize placeholder
-        # Linears so the pin quantizes them instead of silently passing them
-        # through; zero-shot only (see method docstring).
+        # the modeling code never instantiates): materialize BEFORE the run
+        # finalizes - tuning runs join these groups to the chain's tail with
+        # the run's own tuning config, and the composer must stay live for
+        # that. Zero-shot runs quantize them through the outside-block pass.
         materialized_tensors = set()
         tree_groups = []
+        mtp_tuned = set()
         if streamer is not None:
             materialized_tensors, tree_groups = self._materialize_pinned_checkpoint_only_blocks_(
                 streamer, all_blocks, block_snapshots
             )
             block_snapshots = None
+            if tree_groups:
+                _q = self.alg_composer.block_quantizer
+                if not isinstance(_q, (list, tuple)):
+                    _q = [_q]
+                _tune_iters = max(int(getattr(q, "iters", 0) or 0) for q in _q) if _q else 0
+                if _tune_iters > 0:
+                    mtp_tuned = self._tune_checkpoint_only_groups_(streamer, tree_groups, calib_state, total_block_cnt)
+        if streamer is not None and prefetch_depth > 0:
+            streamer.stop_prefetch()
+        if streamer is not None:
+            streamer.close()
+        self.alg_composer.finalize_run()
 
         remain_layer_names = []
         block_name_set = set(name for block in all_blocks for name in block)
@@ -2237,6 +2370,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 continue
             # Skip if this layer is part of any block (by prefix match)
             if any(n == block_name or n.startswith(f"{block_name}.") for block_name in block_name_set):
+                continue
+            # Tuned predictor groups are already packed + written by the tune
+            # step; re-running the closed-form search on packed modules would
+            # corrupt them
+            if any(n == t or n.startswith(f"{t}.") for t in mtp_tuned):
                 continue
             remain_layer_names.append(n)
         outside_qdev = self._outside_block_quant_device()
@@ -2347,8 +2485,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             # Tree-materialized groups dissolved out of the checkpoint-only
             # verbatim pass below (their prefixes now live in the module
             # tree); write whatever their trees did not pack byte-for-byte
+            # (tuned groups already wrote; the write pass is idempotent)
             if tree_groups:
-                self._write_unpacked_group_tensors_(streamer, tree_groups, materialized_tensors)
+                self._write_unpacked_group_tensors_(streamer, tree_groups)
 
             # Checkpoint-only groups (an MTP layer kept as an extra digit block,
             # or a whole top-level subtree transformers strips at load) have no
