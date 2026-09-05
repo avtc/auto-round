@@ -1298,11 +1298,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         if not isinstance(quantizers, (list, tuple)):
             quantizers = [quantizers]
         groups = self._checkpoint_only_groups_(streamer)
-        if any(int(getattr(q, "iters", 0) or 0) > 0 for q in quantizers):
+        tune_iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
+        if tune_iters > 0 and not envs.AR_MTP_ZERO_SHOT:
             if groups:
                 logger.warning(
                     "[stream] checkpoint-only groups %s stay unquantized: tuning runs need a forward these "
-                    "blocks cannot join (no module counterpart); pin them on a zero-shot run to quantize",
+                    "blocks cannot join (no module counterpart); pin them on a zero-shot run to quantize, or "
+                    "set AR_MTP_ZERO_SHOT=1 to quantize them with the closed-form search inside this run",
                     ", ".join(groups),
                 )
             return claimed

@@ -234,3 +234,60 @@ class TestBoundedStagingWait:
         with pytest.raises(RuntimeError, match="no staging devices"):
             s._wait_for_stage_device(0, "blk")
         assert any("no host-RAM rescue" in msg for msg in seen)
+
+
+class TestMtpZeroShotFallback:
+    """AR_MTP_ZERO_SHOT=1 lets a tuning run quantize pinned checkpoint-only
+    groups with the closed-form search instead of leaving them verbatim."""
+
+    def _run(self, iters, monkeypatch, env="0"):
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setenv("AR_MTP_ZERO_SHOT", env)
+        model = nn.Module()
+        outer = nn.Module()
+        layers = nn.Module()
+        blk = nn.Module()
+        blk.a = nn.Linear(8, 8, bias=False)
+        layers.add_module("0", blk)
+        outer.add_module("layers", layers)
+        model.add_module("model", outer)
+        tensors = ["model.layers.0.a.weight", "mtp.fc.weight", "mtp.norm.weight"]
+
+        class Streamer:
+            tensor_names = tensors
+
+            def names_under(self, prefix):
+                return [n for n in tensors if n.startswith(prefix + ".")]
+
+            def tensor_meta(self, name):
+                return {"mtp.fc.weight": ((16, 32), "BF16"), "mtp.norm.weight": ((32,), "BF16")}.get(name)
+
+            def resolve_checkpoint_name(self, name):
+                return name if name in tensors else None
+
+        from types import MethodType
+
+        stub = SimpleNamespace(
+            alg_composer=SimpleNamespace(block_quantizer=[SimpleNamespace(iters=iters)]),
+            model=model,
+            layer_config={"mtp.fc": {"bits": 8, "data_type": "int"}},
+            regex_config={},
+        )
+        stub._checkpoint_only_groups_ = MethodType(CompressionOrchestrator._checkpoint_only_groups_, stub)
+        stub._pin_entry_for = MethodType(CompressionOrchestrator._pin_entry_for, stub)
+        claimed = CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_(stub, Streamer(), [])
+        return claimed, model
+
+    def test_tuning_run_defaults_to_verbatim(self, monkeypatch):
+        claimed, model = self._run(10, monkeypatch)
+        assert claimed == set()
+        assert not hasattr(model, "mtp")
+
+    def test_env_forces_zero_shot_materialization(self, monkeypatch):
+        claimed, model = self._run(10, monkeypatch, env="1")
+        assert "mtp.fc.weight" in claimed
+        lin = model.mtp.fc
+        assert lin.bits == 8 and lin.global_name == "mtp.fc"
