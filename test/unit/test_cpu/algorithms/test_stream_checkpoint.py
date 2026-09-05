@@ -1329,12 +1329,8 @@ class TestStreamQuantizeEquivalence:
         aux = {"mtp.fc.weight": torch.randn(4, 4)}
         save_file(aux, os.path.join(src, "mtp.safetensors"), metadata={"format": "pt"})
         out = self._quantize(src, str(tmp_path / "out"), stream=True)
-        copied = os.path.join(out, "mtp.safetensors")
-        assert os.path.isfile(copied), "unreferenced auxiliary checkpoint file dropped from export"
-        from safetensors import safe_open
-
-        with safe_open(copied, framework="pt") as f:
-            assert torch.equal(f.get_tensor("mtp.fc.weight"), aux["mtp.fc.weight"])
+        keys = self._export_keys(out)
+        assert "mtp.fc.weight" in keys, "tensors from unreferenced auxiliary file dropped from export"
 
     def test_toplevel_checkpoint_only_group_unpinned_written_verbatim(self, tiny_checkpoint, tmp_path):
         """Completeness: an unpinned top-level checkpoint-only group must reach

@@ -1806,22 +1806,26 @@ class CompressionOrchestrator(BaseOrchestrator):
                         continue  # claimed by a materialized placeholder (quantized + packed)
                     self.shard_writer.save_tensor(n2, streamer.fetch(n2, raw=True))
             # Auxiliary safetensors files the checkpoint index never references
-            # (a family shipping its multi-token-prediction weights as a
-            # separate file) are invisible to every index-based scan; copy them
-            # through so the export stays complete.
-            import shutil
+            # (a family shipping its multi-token-prediction weights as their own
+            # file) are invisible to every index-based scan; route their tensors
+            # through the shard writer so the export index covers them (loaders
+            # discover weights through the index, not by globbing the folder).
+            from safetensors import safe_open
 
             referenced = set(streamer.weight_map.values())
             for fname in sorted(os.listdir(streamer.model_path)):
                 if not fname.endswith(".safetensors") or fname in referenced:
                     continue
-                if not os.path.isfile(os.path.join(streamer.model_path, fname)):
+                path = os.path.join(streamer.model_path, fname)
+                if not os.path.isfile(path):
                     continue
-                logger.info(f"[stream] copying unreferenced checkpoint file {fname} verbatim")
-                os.makedirs(self.shard_writer.output_dir, exist_ok=True)
-                shutil.copy2(
-                    os.path.join(streamer.model_path, fname), os.path.join(self.shard_writer.output_dir, fname)
-                )
+                with safe_open(path, framework="pt") as f:
+                    aux = {k: f.get_tensor(k) for k in f.keys()}
+                if not aux:
+                    continue
+                logger.info(f"[stream] writing {len(aux)} tensor(s) from unreferenced checkpoint file {fname} verbatim")
+                for k2, v2 in aux.items():
+                    self.shard_writer.save_tensor(k2, v2)
         if self.compress_context.is_immediate_saving:
             self.shard_writer.write(is_finalize=True)
 
