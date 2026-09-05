@@ -764,7 +764,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         block.to("meta")
         if rs is not None:
             self.shard_writer._flush_shard()
+            _t0 = _time.perf_counter()
             rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
+            return _time.perf_counter() - _t0
+        return 0.0
 
     def _start_bg_pack_block(
         self,
@@ -809,8 +812,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 holder["pack"] = _time.perf_counter() - _t0
                 if self.compress_context.is_immediate_saving:
                     _t0 = _time.perf_counter()
-                    self._write_finished_block_(
-                        block, block_name, tied_weights_layers, rs, q_snap, fp_snap, is_model_last
+                    holder["snap"] = (
+                        self._write_finished_block_(
+                            block, block_name, tied_weights_layers, rs, q_snap, fp_snap, is_model_last
+                        )
+                        or 0.0
                     )
                     holder["write"] = _time.perf_counter() - _t0
                     if envs.AR_PERF_COUNTERS:
@@ -1000,7 +1006,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         scheme_desc = (
             str(self.scheme)
             + "|"
-            + layer_config_fingerprint(getattr(getattr(self, "quantizer", None), "layer_config", None))
+            + layer_config_fingerprint(getattr(self, "layer_config", None))
             + "|qi="
             + str(bool(self.alg_composer.need_quanted_input()))
         )
@@ -1115,7 +1121,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             _walk(payload, bucket=bucket_name)
         if self.shard_writer is not None:
             pending = getattr(self.shard_writer, "current_shard_tensors", None) or {}
-            for _t in pending.values():
+            # the bg pack worker inserts into this dict concurrently; iterate
+            # a stable copy (same hazard the composer walk snapshots against)
+            for _t in list(pending.values()):
                 if isinstance(_t, torch.Tensor) and _t.device.type in ("cuda", "cpu") and id(_t) not in seen:
                     seen.add(id(_t))
                     _add(str(_t.device), "shard-pending", _t)
@@ -2367,8 +2375,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
-            if _peak_watch is not None:
-                _peak_watch.stop()
+        if _peak_watch is not None:
+            # stop once after ALL groups: a per-group stop would kill the
+            # sampler after the first group and later groups would lose peak
+            # attribution entirely
+            _peak_watch.stop()
             blocks_before += len(block_names)
 
         # Pipeline lifecycle: model-level teardown (also finalizes rotation)

@@ -223,7 +223,6 @@ class CheckpointStreamer:
         self._prefetch_cond = threading.Condition()
         self._prefetch_remaining: list[str] = []  # prefixes not yet consumed
         self._prefetch_staged: list[str] = []  # staged, awaiting consumption
-        self._prefetch_remaining = []
         self._prefetch_enqueued = set()
         self._prefetch_depth = 0
         self._perf_segs = None  # armed per load_module_ under AR_PERF_COUNTERS
@@ -490,6 +489,9 @@ class CheckpointStreamer:
                     with self._prefetch_cond:
                         self._prefetch_staged.append(prefix)
                         self._prefetch_progress += 1
+                        # wake a consumer blocked in _await_prefetch_prefix
+                        # (its 5s poll tick would otherwise stall each block)
+                        self._prefetch_cond.notify_all()
                         if stage_dev is not None:
                             self._prefetch_stage_dev[prefix] = stage_dev
             except BaseException as e:  # surfaced at the next fetch
@@ -696,7 +698,7 @@ class CheckpointStreamer:
         ):
             if not handles:
                 continue
-            for shard, handle in handles.items():
+            for shard, handle in list(handles.items()):
                 if hasattr(handle, "__exit__"):
                     try:
                         handle.__exit__(None, None, None)
@@ -721,7 +723,10 @@ class CheckpointStreamer:
         if not planned:
             return
         dead = []
-        for shard, unread in self._shard_unread.items():
+        # the prefetch reader mutates _shard_unread on its own thread while
+        # this runs on the main thread (same hazard _log_device_inventory
+        # snapshots against); iterate a stable copy
+        for shard, unread in list(self._shard_unread.items()):
             if not unread or planned.isdisjoint(unread):
                 dead.append(shard)
         if not dead:
@@ -761,7 +766,7 @@ class CheckpointStreamer:
         """
         if not self._open_handles:
             return
-        for shard, handle in self._open_handles.items():
+        for shard, handle in list(self._open_handles.items()):
             if hasattr(handle, "__exit__"):
                 try:
                     handle.__exit__(None, None, None)
