@@ -969,10 +969,11 @@ auto-round --model "Qwen/Qwen3-14B" --scheme "W4A16" --stream_quantization --str
   is raised when both are set). Text LLMs should prefer this flag; the env path remains for multimodal runs
   that quantize the vision tower. For multimodal models the vision tower stays unquantized
   (`quant_nontext_module` is rejected under streaming).
-- `--stream_prefetch off|auto|cpu|<devices>`: stage the next block's weights on another device while the
+- `--stream_prefetch off|auto|on|cpu|<devices>`: stage the next block's weights on another device while the
   current block is quantized. `auto` round-robins blocks across all GPUs except the primary, and includes the
   primary too when its free VRAM fits the largest block; `cpu` stages on host memory (slowest, most capacity);
-  an explicit list (e.g. `cuda:1,cuda:2`) round-robins across the listed devices.
+  an explicit list (e.g. `cuda:1,cuda:2`) round-robins across the listed devices; `on` follows
+  the `auto` chain but is guaranteed enabled - host RAM at minimum instead of disabling.
 - `--layerwise_rotation`: apply rotation transforms per block instead of up front, so the full model never has
   to be materialized. Engaged automatically when `--stream_quantization` is used with rotation algorithms.
 - Resume: `AR_RESUME_DIR` works with streaming runs; completed blocks are skipped and their output shards are

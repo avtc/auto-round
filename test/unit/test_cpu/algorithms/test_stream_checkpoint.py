@@ -2349,3 +2349,24 @@ class TestPredictorESynthesis:
         e = torch.randn(2, 5, 4)
         out = forward_checkpoint_only_predictor(shell, h, _predictor_e=[e])
         assert out is not None and shell._layer_ran
+
+
+class TestStreamingGlobalBlockIndex:
+    """BlockContext.block_index is the position in the FULL block list (the
+    data-driven parity contract); a multi-group quant_block_list must see
+    monotonically advancing indices across groups, not group-local ones."""
+
+    def test_blocks_before_advances_inside_group_loop(self):
+        import inspect
+
+        from auto_round.compressors import orchestrator as orch_mod
+
+        src = inspect.getsource(orch_mod.CompressionOrchestrator._quantize_zero_shot)
+        loop_start = src.index("for g_idx, block_names in enumerate(all_blocks):")
+        loop_body = src[loop_start:]
+        # the accumulator update belongs INSIDE the group loop body (an
+        # accidentally dedented update made every group-local index and no
+        # global position after group 0)
+        assert "blocks_before += len(block_names)" in loop_body[: loop_body.index("# Pipeline lifecycle")]
+        tail = loop_body[loop_body.index("# Pipeline lifecycle") :]
+        assert "blocks_before +=" not in tail, "accumulator update drifted out of the group loop"

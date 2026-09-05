@@ -43,12 +43,17 @@ import torch
 from auto_round.logger import logger
 
 
-def _key_mask_2d(ids: torch.Tensor) -> torch.Tensor:
-    """Per-row 2D key mask (1.0 = keep, 0.0 = masked): all ones, trailing
-    repeated tokens masked, last position always masked - the form the
-    ordinary calibration path feeds model.forward (calibration/llm.py). The
+def _key_mask_2d(ids: torch.Tensor, pad_token_id=None) -> torch.Tensor:
+    """Per-row 2D key mask (1.0 = keep, 0.0 = masked), mirroring the ordinary
+    calibration path's priority (calibration/llm.py): when the tokenizer
+    defines a pad token, masked = pad positions; otherwise all ones with
+    trailing repeated tokens masked and the last position always masked. The
     row scan re-initializes its position for every row (a batch's rows can
     each carry their own trailing run)."""
+    if pad_token_id is not None:
+        m = (ids != pad_token_id).to(torch.float32)
+        m[:, -1] = 0.0
+        return m
     m = torch.ones(ids.shape, dtype=torch.float32, device=ids.device)
     for b in range(ids.shape[0]):
         last_token = ids[b, -1]
@@ -394,6 +399,12 @@ def _normalize_rows(dataset, tokenizer, seqlen, seed=42, nsamples=128, bs=1):
     construction."""
     rows = []
     if isinstance(dataset, str):
+        if tokenizer is None:
+            raise ValueError(
+                "stream_calibration needs a tokenizer to tokenize the calibration dataset, but the streaming "
+                "model load reported none available (check the earlier tokenizer warning - the checkpoint dir "
+                "may lack tokenizer files)"
+            )
         from auto_round.calib_dataset import get_dataloader
 
         dataset = get_dataloader(tokenizer, seqlen, dataset.replace(" ", ""), seed=seed, bs=bs, nsamples=nsamples)
@@ -478,7 +489,12 @@ def prepare_streaming_calibration(
     # GDN linear-attention layers consume the 2D padding mask directly), so
     # the loop resolves it once by probing the first block (see
     # resolve_chain_mask_form) and materializes the winning form.
-    masks = [_key_mask_2d(ids).cpu() for ids in rows]
+    # key-mask rule mirrors the data-driven priority (calibration/llm.py):
+    # a tokenizer pad token wins over the trailing-repeat heuristic
+    pad_token_id = None
+    if tokenizer is not None and getattr(tokenizer, "pad_token_id", None) is not None:
+        pad_token_id = tokenizer.pad_token_id
+    masks = [_key_mask_2d(ids, pad_token_id=pad_token_id).cpu() for ids in rows]
     input_others = {
         "attention_mask": masks,
         "use_cache": False,

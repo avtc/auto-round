@@ -310,3 +310,42 @@ class TestAdoptExistingShards:
         w = self._writer(out, monkeypatch)
         with pytest.raises(RuntimeError, match="safetensors"):
             w.adopt_existing_shards()
+
+    def test_adopt_temp_and_final_same_ordinal_keeps_temp(self, tmp_path, monkeypatch):
+        """A reused output dir can hold a stale finalized shard from a previous
+        lineage next to the current lineage's temp shard at the same ordinal:
+        the temp (resumable artifact) must win regardless of listdir order and
+        the stale final must be named, not silently dropped."""
+        from safetensors.torch import load_file, save_file
+
+        out = str(tmp_path)
+        stale = torch.randn(4, 4) + 100.0
+        save_file({"stale.w": stale}, os.path.join(out, "model-00001-of-00009.safetensors"))
+        w1 = self._writer(out, monkeypatch)
+        t0 = torch.randn(4, 4)
+        w1.save_tensor("blk.0.w", t0)
+        w1._flush_shard()  # leaves model-shard-00001.safetensors
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 1
+        assert "blk.0.w" in w2._all_saved
+        assert "stale.w" not in w2._all_saved
+        t1 = torch.randn(4, 4)
+        w2.save_tensor("blk.1.w", t1)
+        w2.finalize()
+        import json
+
+        index = json.loads(open(os.path.join(out, "model.safetensors.index.json"), encoding="utf-8").read())
+        assert "blk.0.w" in index["weight_map"] and "blk.1.w" in index["weight_map"]
+        assert "stale.w" not in index["weight_map"]
+        assert torch.equal(load_file(os.path.join(out, "model-00001-of-00002.safetensors"))["blk.0.w"], t0)
+
+    def test_add_tensor_dedups_across_conversion_spellings(self, tmp_path, monkeypatch):
+        """The duplicate guard normalizes to the checkpoint-side spelling first:
+        a renamed-family tensor offered under both spellings is written once."""
+        w = self._writer(str(tmp_path), monkeypatch)
+        w.reverse_checkpoint_conversion_mapping = {"mlp.gate": "mlp.router.gate"}
+        t = torch.randn(4, 4)
+        w.save_tensor("model.layers.0.mlp.router.gate.weight", t)  # checkpoint-side
+        w.save_tensor("model.layers.0.mlp.gate.weight", t.clone())  # module-side alias
+        assert w.total_param_elems == t.numel(), "the aliased spelling was written a second time"

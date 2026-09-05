@@ -164,11 +164,28 @@ class ShardWriter:
         for fname in os.listdir(output_dir):
             mobj = temp_pattern.match(fname)
             if mobj:
-                seq[int(mobj.group(1))] = (fname, False)
+                num = int(mobj.group(1))
+                prior = seq.get(num)
+                if prior is not None and prior[1]:
+                    # a temp and a finalized file claim one ordinal: leftovers
+                    # of a previous lineage in a reused output dir. The temp
+                    # is the resumable artifact of the CURRENT lineage - keep
+                    # it and name the stale final so nothing silently drops
+                    logger.warning(
+                        "ShardWriter resume: ignoring stale finalized shard %s (ordinal %d also claimed by "
+                        "temp shard %s); use a fresh --output_dir to avoid mixed lineages",
+                        prior[0],
+                        num,
+                        fname,
+                    )
+                seq[num] = (fname, False)
                 continue
             mobj = final_pattern.match(fname)
             if mobj:
-                seq[int(mobj.group(1))] = (fname, True)
+                num = int(mobj.group(1))
+                if num in seq and not seq[num][1]:
+                    continue  # the temp shard of the current lineage owns this ordinal
+                seq[num] = (fname, True)
                 continue
             if fname == "model.safetensors":
                 single_file = fname
@@ -359,22 +376,29 @@ class ShardWriter:
             self.skipped_meta_tensors.append(name)
             return
 
+        # The duplicate guard must see the canonical (checkpoint-side)
+        # spelling: a conversion-renamed family reaches the writer under both
+        # spellings (module-side from the live tree, checkpoint-side from
+        # adopted shard headers), and a guard on the caller's spelling would
+        # let the same tensor be written twice under two keys. The fused
+        # expert expansion below, however, must keep the ORIGINAL name (its
+        # per-expert split keys off the pre-revert spelling).
+        canonical = revert_checkpoint_conversion_mapping(name, self.reverse_checkpoint_conversion_mapping)
+
         # Guard against duplicate saving of the same parameter
-        if name in self._all_saved or name in self.current_shard_tensors:
+        if canonical in self._all_saved or canonical in self.current_shard_tensors:
             return
 
         # Expand fused 3D expert parameters into per-expert 2D tensors if necessary
         if tensor.dim() == 3:
             expanded = self._expand_fused_experts(name, tensor)
             if expanded is not None:
-                self._all_saved.add(name)
+                self._all_saved.add(canonical)
                 for sub_name, sub_tensor in expanded:
                     self._add_tensor(sub_name, sub_tensor)
                 return
 
-        # transformers will handle _checkpoint_conversion_mapping automatically if is_immediate_saving=False
-        name = revert_checkpoint_conversion_mapping(name, self.reverse_checkpoint_conversion_mapping)
-
+        name = canonical
         t_size = tensor.nbytes
         self.total_param_elems += tensor.numel()
         self.total_param_size_bytes += t_size

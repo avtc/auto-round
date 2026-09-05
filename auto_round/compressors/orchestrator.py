@@ -690,9 +690,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         # streamer materializes must follow the same dtype policy or the
         # streamed run quantizes raw checkpoint precision while a fully
         # loaded run quantizes the converted dtype (amp state resolves here,
-        # after the context finished loading)
+        # after the context finished loading). Applies at amp=False too:
+        # amp_dtype resolves to fp32 there, matching _set_amp_dtype's full
+        # upcast of a non-streamed run
         streamer = getattr(self.model_context, "checkpoint_streamer", None)
-        if streamer is not None and getattr(self, "amp", False):
+        if streamer is not None:
             streamer.load_dtype = self.amp_dtype
 
         if not self.need_calib:
@@ -2094,6 +2096,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         # regardless of staging-device count: quantize time per block dwarfs
         # its load time, so deeper staging only holds extra block-sized VRAM.
         raw_depth = getattr(self, "stream_prefetch", 0)
+        # API users may pass only stream_prefetch_devices (the docs suggest
+        # exactly that for resume control): treat present devices as opting
+        # into staging instead of silently ignoring them
+        if raw_depth in (0, None) and getattr(self, "stream_prefetch_devices", None):
+            raw_depth = None
+            logger.info(
+                "[stream] stream_prefetch_devices set without stream_prefetch; enabling block staging (depth 1)"
+            )
         stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and raw_depth != 0) else None
         if raw_depth == 0 or raw_depth is None:
             prefetch_depth = 0 if raw_depth == 0 else 1
@@ -2375,12 +2385,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
+                blocks_before += len(block_names)
         if _peak_watch is not None:
             # stop once after ALL groups: a per-group stop would kill the
             # sampler after the first group and later groups would lose peak
             # attribution entirely
             _peak_watch.stop()
-            blocks_before += len(block_names)
 
         # Pipeline lifecycle: model-level teardown (also finalizes rotation)
         if _bg_pack is not None:
@@ -2867,6 +2877,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         # Dump a summary
         quantized_layers = []
         unquantized_layers = []
+        # mirror the zero-shot path's lifecycle: free member-owned caches
+        # (SignRound LFQ/lm_head refs, AWQ/SVDQuant stats) and finalize
+        # layer-wise rotation once the block loop is done
+        self.alg_composer.finalize_run()
         for n, m in self.model_context.model.named_modules():
             if isinstance(m, tuple(SUPPORTED_LAYER_TYPES)):
                 if check_to_quantized(m):

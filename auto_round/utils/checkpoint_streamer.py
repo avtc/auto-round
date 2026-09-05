@@ -841,6 +841,18 @@ class CheckpointStreamer:
         # wait out an in-flight prefetch of this very prefix instead of
         # racing it with a duplicate read (see _await_prefetch_prefix)
         self._await_prefetch_prefix(prefix)
+        # the caller resolved its device hint BEFORE this wait; when the
+        # consumer had caught up with the reader, that guess may differ from
+        # where the block actually landed. The recorded stage home (written
+        # when staging completed) is authoritative - honor it so fetches do
+        # not cross-copy a whole block to the guessed device.
+        if device is not None:
+            recorded = getattr(self, "_prefetch_stage_dev", {}).get(prefix)
+            if recorded is not None and str(recorded) != str(device):
+                logger.debug(
+                    "[stream] %s staged on %s while the caller guessed %s; loading in place", prefix, recorded, device
+                )
+                device = str(recorded)
         # file-by-file reads: group the prefix's tensors by shard so each
         # file is opened, fully read and (once consumed) closed before the
         # next one opens, instead of interleaved module-tree order
