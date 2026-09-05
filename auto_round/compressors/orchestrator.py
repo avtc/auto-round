@@ -164,6 +164,59 @@ def _ensure_module_path(model: torch.nn.Module, path: str) -> torch.nn.Module:
     return parent
 
 
+def synthesize_predictor_e(input_rows: torch.Tensor, embed=None) -> torch.Tensor:
+    """Build the embedding-side predictor input (e-first concat).
+
+    ``input_rows`` is either the already-embedded chain rows (the first
+    block's input, the cheapest source at tuning time) or raw token ids
+    together with ``embed``. Position ``t`` consumes token ``t+1``'s
+    embedding; the final position repeats the last row - the uniform
+    convention of the verified predictor families (the concat is
+    embedding-side first everywhere)."""
+    if input_rows.dtype in (torch.int64, torch.int32, torch.int16, torch.int8):
+        if embed is None:
+            raise ValueError("token-id rows need the embedding module to build the predictor input")
+        shifted = torch.cat([input_rows[:, 1:], input_rows[:, -1:]], dim=1)
+        return embed(shifted)
+    return torch.cat([input_rows[:, 1:], input_rows[:, -1:]], dim=1)
+
+
+def forward_checkpoint_only_predictor(shell: torch.nn.Module, hidden_states: torch.Tensor, **input_others):
+    """Run a materialized predictor tree like a decoder block.
+
+    norm_e(e) concat norm_h(h) -> concat mixer -> decoder layer -> final
+    norm, with ``e`` bound on the shell (``bind_checkpoint_only_predictor``)
+    and every keyword input passing through to the layer unchanged."""
+    refs = getattr(shell, "_predictor_refs", None)
+    if refs is None:
+        raise RuntimeError("predictor forward called on a shell without bound role refs")
+    e = shell._predictor_e
+    if e is None:
+        raise RuntimeError(
+            "predictor embedding-side input is not bound yet; synthesize it from the chain " "state before tuning"
+        )
+    x = torch.cat([refs["norm_e"](e), refs["norm_h"](hidden_states)], dim=-1)
+    x = refs["fc"](x)
+    x = refs["layer"](x, **input_others)
+    x = x[0] if isinstance(x, (tuple, list)) else x
+    final_norm = refs.get("final_norm")
+    return final_norm(x) if final_norm is not None else x
+
+
+def bind_checkpoint_only_predictor(shell: torch.nn.Module, refs: dict, e: torch.Tensor = None) -> None:
+    """Attach the predictor forward and role refs to the group shell.
+
+    The ref dict keeps module handles out of ``named_modules`` (the real tree
+    already registers them once under their checkpoint paths), and the bound
+    forward lets block-level machinery call the group like any decoder
+    block. ``e`` may be bound later, right before the first forward."""
+    shell._predictor_refs = refs
+    shell._predictor_e = e
+    shell.forward = lambda hidden_states, **input_others: forward_checkpoint_only_predictor(
+        shell, hidden_states, **input_others
+    )
+
+
 def _is_fused_expert_weight_name(tensor_name: str) -> bool:
     """True for stacked per-expert weight tensors: the name under ``.weight``
     is a fused MoE projection and the checkpoint stores one dim-0 stacked
@@ -1559,6 +1612,22 @@ class CompressionOrchestrator(BaseOrchestrator):
             mod.global_name = path
             _ensure_module_path(self.model, path).add_module(path.rsplit(".", 1)[-1], mod)
             claimed.add(name)
+        # bind the predictor forward onto the group shell so tuning machinery
+        # can run the tree like a decoder block (embedding-side input bound
+        # later, from the calibration chain)
+        shell = self.model.get_submodule(group)
+        bind_checkpoint_only_predictor(
+            shell,
+            {
+                "norm_e": self.model.get_submodule(info["norm_e"][: -len(".weight")]),
+                "norm_h": self.model.get_submodule(info["norm_h"][: -len(".weight")]),
+                "final_norm": (
+                    self.model.get_submodule(info["final_norm"][: -len(".weight")]) if info.get("final_norm") else None
+                ),
+                "fc": fc,
+                "layer": layer_mod,
+            },
+        )
         return claimed
 
     def _write_unpacked_group_tensors_(self, streamer, tree_groups, claimed) -> None:

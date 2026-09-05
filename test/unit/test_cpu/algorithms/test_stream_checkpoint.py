@@ -2038,6 +2038,94 @@ class TestCheckpointOnlyGroupTree:
         assert torch.equal(norm(x), ref)
 
 
+class TestCheckpointOnlyPredictorForward:
+    """The generic predictor forward and e-first input synthesis."""
+
+    def test_predictor_e_from_token_ids(self):
+        import torch
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import synthesize_predictor_e
+
+        embed = nn.Embedding(10, 4)
+        ids = torch.tensor([[5, 9, 3, 7]])
+        e = synthesize_predictor_e(ids, embed=embed)
+        assert torch.equal(e, embed(torch.tensor([[9, 3, 7, 7]]))), "position t must consume token t+1"
+
+    def test_predictor_e_from_embedded_rows(self):
+        import torch
+
+        from auto_round.compressors.orchestrator import synthesize_predictor_e
+
+        rows = torch.randn(2, 5, 4)
+        e = synthesize_predictor_e(rows)
+        assert e.shape == rows.shape
+        assert torch.equal(e[:, :-1], rows[:, 1:]) and torch.equal(e[:, -1], rows[:, -1])
+
+    @staticmethod
+    def _bound_shell():
+        import torch
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import (
+            CheckpointOnlyRMSNorm,
+            bind_checkpoint_only_predictor,
+        )
+
+        H = 8
+        torch.manual_seed(3)
+        shell = nn.Module()
+        norm_e = CheckpointOnlyRMSNorm(H, eps=1e-6)
+        norm_h = CheckpointOnlyRMSNorm(H, eps=1e-6)
+        final_norm = CheckpointOnlyRMSNorm(H, eps=1e-6)
+        norm_e.weight = torch.nn.Parameter(torch.randn(H), requires_grad=False)
+        norm_h.weight = torch.nn.Parameter(torch.randn(H), requires_grad=False)
+        final_norm.weight = torch.nn.Parameter(torch.randn(H), requires_grad=False)
+        fc = nn.Linear(2 * H, H, bias=False)
+
+        class Layer(nn.Module):
+            def forward(self, x, position_ids=None):
+                self.seen_position_ids = position_ids
+                return (x * 1.0 + 0.0,)
+
+        layer = Layer()
+        e = torch.randn(1, 6, H)
+        h = torch.randn(1, 6, H)
+        bind_checkpoint_only_predictor(
+            shell, {"norm_e": norm_e, "norm_h": norm_h, "fc": fc, "layer": layer, "final_norm": final_norm}, e=e
+        )
+        return shell, e, h, norm_e, norm_h, fc, layer, final_norm
+
+    def test_forward_math_e_first(self):
+        import torch
+
+        shell, e, h, norm_e, norm_h, fc, layer, final_norm = self._bound_shell()
+        pos = torch.arange(6).unsqueeze(0)
+        out = shell(h, position_ids=pos)
+        assert torch.equal(layer.seen_position_ids, pos), "keyword inputs must pass through to the layer"
+        ref = final_norm(fc(torch.cat([norm_e(e), norm_h(h)], dim=-1)))
+        assert torch.allclose(out, ref, atol=1e-5), "e-first concat order broken"
+        wrong = final_norm(fc(torch.cat([norm_h(h), norm_e(e)], dim=-1)))
+        assert not torch.allclose(out, wrong), "h-first concat would also pass the check"
+
+    def test_forward_requires_bound_e(self):
+        import torch
+
+        from auto_round.compressors.orchestrator import bind_checkpoint_only_predictor
+
+        shell, _, h, *_ = self._bound_shell()
+        shell._predictor_e = None
+        try:
+            shell(h)
+            raise AssertionError("unbound e must raise")
+        except RuntimeError:
+            pass
+
+    def test_binding_does_not_duplicate_modules(self):
+        before = [n for n, _ in self._bound_shell()[0].named_modules()]
+        assert before == [""]  # refs live in a plain dict, never registered
+
+
 class TestCheckpointOnlyGroupVisibility:
     """Silent skips must be visible: iters>0 keeps groups verbatim with a
     warning, and pinned non-2D tensors (fused expert stacks) report that they
