@@ -300,6 +300,11 @@ def materialize_placeholder_linear(
     parent.add_module(path.rsplit(".", 1)[-1], lin)
 
 
+# values that disable block staging; shared by the loop-start depth check and
+# the staging-device resolver - the CLI parser mirrors it via the same tuple
+STREAM_PREFETCH_OFF = ("", "off", "0", "false")
+
+
 class CompressionOrchestrator(BaseOrchestrator):
 
     def __init__(
@@ -707,6 +712,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # pooled shard handles, and an in-process retry (catch + rerun,
                 # the flow the context-reset design anticipates) starts with a
                 # zombie thread pinning VRAM it can never release
+                bg_t = getattr(self, "_bg_pack_thread", None)
+                if bg_t is not None and bg_t.is_alive():
+                    # join (bounded: one block's pack+write) so no orphan
+                    # keeps writing shards after the exception escapes; a
+                    # worker-side error is NOT re-raised here - the original
+                    # failure wins
+                    try:
+                        bg_t.join()
+                    except Exception as join_err:  # noqa: BLE001 - never mask the original
+                        logger.warning("[stream] bg-pack join during teardown hit an error: %s", join_err)
+                self._bg_pack_thread = None
                 streamer = getattr(self.model_context, "checkpoint_streamer", None)
                 if streamer is not None:
                     try:
@@ -733,9 +749,27 @@ class CompressionOrchestrator(BaseOrchestrator):
         for rs in resume_states:
             if rs is None or rs.resume_index <= 0:
                 continue
+            fully_done = rs.resume_index >= len(rs.block_names)
             entry = rs.load_input_ids()
             if entry is None:
-                continue
+                if fully_done:
+                    continue  # nothing left to consume the entry in this group
+                # A group with pending blocks but no loadable successor entry:
+                # either the crash-window guard rejected an entry written past
+                # the manifest, or the chain file is missing/corrupt. Continuing
+                # would skip manifest-done blocks while the chain stays at the
+                # raw embedding outputs - silent wrong-input tuning, the exact
+                # corruption the guard exists to prevent. The shards written by
+                # such a run were computed on the wrong chain, so salvage is not
+                # safe: fail loud and tell the user what to delete.
+                raise RuntimeError(
+                    f"[stream] resume state for group {rs.block_names[0]}..{rs.block_names[-1]} is "
+                    "inconsistent: {}/{} blocks marked done but the successor chain entry is missing "
+                    "or was rejected (crash between the tensor save and the manifest write, or a "
+                    "deleted/corrupt chain file). Automatic salvage would tune the frontier block "
+                    "on the wrong inputs; delete the resume directory AND the output directory "
+                    "and rerun.".format(rs.resume_index, len(rs.block_names))
+                )
             calib_state["fp_inputs"] = entry
             q_input = rs.load_q_input()
             if q_input is not None and self.alg_composer.need_quanted_input():
@@ -860,6 +894,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         t = _threading.Thread(target=_worker, daemon=True, name=f"bg-pack-{block_name}")
         t.autoround_state = holder
         t.start()
+        # the exception-path teardown must be able to reach this worker: an
+        # orphaned pack thread keeps writing to the (lock-free) shard writer
+        # and a same-object catch-and-rerun would race it
+        self._bg_pack_thread = t
         return t
 
     @staticmethod
@@ -1264,7 +1302,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         only spread block VRAM around.
         """
         mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
-        if mode in ("", "off", "0", "false"):
+        if mode in STREAM_PREFETCH_OFF:
             return None
         if mode == "cpu":
             return None
@@ -2127,7 +2165,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         # dwarfs its load time, so deeper staging would only hold extra
         # block-sized VRAM.
         _prefetch_mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
-        prefetch_depth = 0 if _prefetch_mode in ("", "off", "0", "false") else 1
+        prefetch_depth = 0 if _prefetch_mode in STREAM_PREFETCH_OFF else 1
         stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and prefetch_depth > 0) else None
         prefetch_names = flat_block_names
         if resume_states is not None:
@@ -2323,6 +2361,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # order and the ShardWriter has no internal locking
                     self._join_bg_pack(_bg_pack)
                     _bg_pack = None
+                    self._bg_pack_thread = None
                 if _bg_pack_eligible:
                     # pack + write of the FINISHED block move to a background
                     # pipeline thread: they run on this block's (now idle)
@@ -2430,6 +2469,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # last block's pack pipeline must be complete first
             self._join_bg_pack(_bg_pack)
             _bg_pack = None
+            self._bg_pack_thread = None
         # Checkpoint-only blocks with a layer_config pin (e.g. an MTP layer
         # the modeling code never instantiates): materialize BEFORE the run
         # finalizes - tuning runs join these groups to the chain's tail with

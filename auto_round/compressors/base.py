@@ -335,7 +335,9 @@ class BaseOrchestrator(object):
         _prefetch_raw = kwargs.pop("stream_prefetch", "off")
         if _prefetch_raw is None:
             _prefetch_raw = "auto"
-        elif isinstance(_prefetch_raw, int) and not isinstance(_prefetch_raw, bool):
+        elif isinstance(_prefetch_raw, bool):
+            _prefetch_raw = "auto" if _prefetch_raw else "off"
+        elif isinstance(_prefetch_raw, int):
             _prefetch_raw = "auto" if _prefetch_raw else "off"
         self.stream_prefetch = str(_prefetch_raw).strip().lower() or "off"
         # Collect imatrix activation statistics with a streaming forward pass

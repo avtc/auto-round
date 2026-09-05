@@ -92,9 +92,11 @@ def _parse_stream_prefetch(value):
     Lists are not accepted: lookahead is always one block, so more than one
     additional device would only spread block VRAM around.
     """
+    from auto_round.compressors.orchestrator import STREAM_PREFETCH_OFF
+
     text = (value or "off").strip()
     lowered = text.lower()
-    if lowered in ("", "off", "0", "false"):
+    if lowered in STREAM_PREFETCH_OFF:
         return "off"
     if lowered in ("auto", "on", "cpu"):
         return lowered

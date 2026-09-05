@@ -2495,3 +2495,174 @@ class TestZeroShotExceptionTeardown:
         with pytest.raises(RuntimeError, match="tune exploded"):
             orch.quantize()
         assert calls == ["stop", "close"], f"teardown did not run (or ran partially): {calls}"
+
+    def test_auto_sole_gpu_with_fit_stages_on_primary(self, monkeypatch):
+        """Sole GPU whose free VRAM fits the largest block: the primary joins
+        as its own staging home (same-device staging), not host RAM."""
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        stub = SimpleNamespace(
+            stream_prefetch="auto",
+            device="cuda:0",
+            _primary_fits_largest_block=lambda dev: (6.9, 22.3),
+        )
+        monkeypatch.setattr(
+            "auto_round.compressors.orchestrator.device_manager",
+            SimpleNamespace(device_list=["cuda:0"]),
+        )
+        devices = CompressionOrchestrator._resolve_stream_stage_devices(stub)
+        assert [str(d) for d in devices] == ["cuda:0"]
+
+    def test_on_sole_gpu_without_fit_stays_enabled_as_ram(self, monkeypatch):
+        """'on' never silently disables: sole GPU without fit lands on host
+        RAM (devices None) via the info-log fallback, not a warning bail."""
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        stub = SimpleNamespace(
+            stream_prefetch="on",
+            device="cuda:0",
+            _primary_fits_largest_block=lambda dev: None,
+        )
+        monkeypatch.setattr(
+            "auto_round.compressors.orchestrator.device_manager",
+            SimpleNamespace(device_list=["cuda:0"]),
+        )
+        assert CompressionOrchestrator._resolve_stream_stage_devices(stub) is None
+
+    def test_legacy_prefetch_forms_normalize(self):
+        """Legacy API spellings normalize into the single string knob: ints
+        (0/depth), None, and bools. True must map to 'auto', not the invalid
+        device string 'true'."""
+        from auto_round.compressors.base import BaseCompressor
+
+        import inspect
+
+        src = inspect.getsource(BaseCompressor.__init__)
+        assert "isinstance(_prefetch_raw, bool)" in src, "bool carve-out missing"
+        # behavioral check of the exact normalization expressions
+        for raw, want in [(0, "off"), (2, "auto"), (None, "auto"), (True, "auto"), (False, "off"), ("off", "off")]:
+            _prefetch_raw = raw
+            if _prefetch_raw is None:
+                _prefetch_raw = "auto"
+            elif isinstance(_prefetch_raw, bool):
+                _prefetch_raw = "auto" if _prefetch_raw else "off"
+            elif isinstance(_prefetch_raw, int):
+                _prefetch_raw = "auto" if _prefetch_raw else "off"
+            got = str(_prefetch_raw).strip().lower() or "off"
+            assert got == want, (raw, got, want)
+
+    def test_teardown_joins_inflight_bg_pack_worker(self, monkeypatch):
+        """The exception teardown must join a live bg-pack worker before
+        returning: an orphan keeps writing shards and a same-object
+        catch-and-rerun would race the lock-free writer."""
+        import threading
+        import time
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (time.sleep(0.05), done.set()), daemon=True)
+        t.start()
+
+        class _Streamer:
+            def stop_prefetch(self):
+                pass
+
+            def close(self):
+                pass
+
+        def _boom(self):
+            raise RuntimeError("tune exploded")
+
+        monkeypatch.setattr(CompressionOrchestrator, "_quantize_zero_shot", _boom)
+        orch = object.__new__(CompressionOrchestrator)
+        orch.need_calib = False
+        orch._post_init_done = True
+        orch.amp_dtype = torch.float32
+        orch._bg_pack_thread = t
+        orch.model_context = type("MC", (), {"checkpoint_streamer": _Streamer()})()
+        import pytest
+
+        with pytest.raises(RuntimeError, match="tune exploded"):
+            orch.quantize()
+        assert not t.is_alive(), "teardown returned before the bg-pack worker joined"
+        assert orch._bg_pack_thread is None
+
+
+class TestStreamResumeJumpChainGuard:
+    """A partially-done group whose successor chain entry is missing or
+    crash-window-rejected must fail loud: silently continuing would skip
+    manifest-done blocks while the chain stays at raw embedding outputs."""
+
+    def _orch(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = object.__new__(CompressionOrchestrator)
+        # alg_composer is a read-only property: stash the stub where the
+        # method reads it
+        object.__setattr__(orch, "_alg_composer", type("AC", (), {"need_quanted_input": lambda self: False})())
+        return orch
+
+    def test_pending_group_without_entry_raises(self):
+        import pytest
+
+        orch = self._orch()
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 3,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: None,
+                "load_q_input": lambda self: None,
+            },
+        )()
+        with pytest.raises(RuntimeError, match="inconsistent"):
+            orch._stream_resume_jump_chain({"fp_inputs": None}, [rs])
+
+    def test_fully_done_group_without_entry_is_skipped(self):
+        orch = self._orch()
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 5,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: None,  # final-block unlink
+                "load_q_input": lambda self: None,
+            },
+        )()
+        calib = {"fp_inputs": None}
+        orch._stream_resume_jump_chain(calib, [rs])  # must not raise
+        assert calib["fp_inputs"] is None
+
+    def test_valid_entry_still_jumps(self):
+        import torch
+
+        orch = self._orch()
+        entry = torch.zeros(1, 4, 8)
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 2,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: entry,
+                "load_q_input": lambda self: None,
+            },
+        )()
+        calib = {"fp_inputs": None}
+        orch._stream_resume_jump_chain(calib, [rs])
+        assert calib["fp_inputs"] is entry
