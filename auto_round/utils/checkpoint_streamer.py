@@ -63,6 +63,43 @@ def device_free_bytes(device: torch.device) -> Optional[int]:
         return None
 
 
+# Transient VRAM the tuning pass needs on the device a block was staged to,
+# beyond the block's own weights. Grounded in the chunk caps the quantizers
+# already enforce; sized per staged block at prefetch time.
+_QDQ_CHUNK_BYTES = 2**28 * 4  # in-place qdq chunk cap (fp32 elements)
+_SEARCH_TMP_BYTES = 3 * 2**25 * 4  # grid-search temporaries, ~3 live (fp32)
+_SYSTEM_ALLOWANCE_BYTES = int(0.5 * 1024**3)  # pack buffers + chunked chain rows + allocator jitter
+_DEFAULT_HEADROOM_BYTES = 4 * 1024**3  # historical fallback when inputs are unknown
+
+
+def estimate_search_headroom_bytes(iters=None, block_bytes=None, moe_routing_bytes=None, ddp_world_size=1) -> int:
+    """Estimate the VRAM a staged block needs beyond its own weights.
+
+    ``iters=0`` (closed-form search): the qdq chunk cap plus grid-search
+    temporaries and, for MoE models, one forward chunk's router-affinity
+    buffer. ``iters>0`` additionally holds the tuning fan-out: fp32 value
+    params (2x the staged bf16 weights) plus gradients (1x); momentum
+    defaults to zero so there is no optimizer-state term. ``ddp_world_size``
+    shards only the data-dependent terms (each replica processes its share
+    of the calibration rows); tuning params are replicated on every device
+    so they never shrink - reserved for the data-parallel tuning work, inert
+    until a caller passes a world size. Returns the historical 4 GiB
+    constant whenever the dominant term of the requested profile is unknown
+    (iters unknown, or iters>0 without block bytes).
+    """
+    if iters is None:
+        return _DEFAULT_HEADROOM_BYTES
+    headroom = _QDQ_CHUNK_BYTES + _SEARCH_TMP_BYTES + _SYSTEM_ALLOWANCE_BYTES
+    if moe_routing_bytes:
+        world = max(1, int(ddp_world_size or 1))
+        headroom += int(moe_routing_bytes) // world
+    if iters > 0:
+        if block_bytes is None:
+            return _DEFAULT_HEADROOM_BYTES
+        headroom += 3 * int(block_bytes)
+    return headroom
+
+
 def pick_stage_device(devices: list, index: int, needed_bytes: int, headroom: int) -> Optional[torch.device]:
     """Choose a staging device for prefix *index*, or ``None`` when no CUDA
     device can hold ``needed_bytes`` while keeping ``headroom`` free for the
@@ -261,9 +298,11 @@ class CheckpointStreamer:
 
     # -- Prefetch -------------------------------------------------------------
 
-    # Bytes reserved per staging GPU for the tuning fan-out's share of the
-    # active block's search batches (chunked stacks + intermediates).
-    _staging_search_headroom = 4 * 1024**3
+    # Bytes reserved per staging GPU for the tuning pass's transients while it
+    # works on the staged block. Default keeps the historical constant; a
+    # caller-provided tuning profile (start_prefetch) sizes it per block via
+    # estimate_search_headroom_bytes.
+    _staging_search_headroom = _DEFAULT_HEADROOM_BYTES
 
     def _prefix_bytes_estimate(self, prefix: str) -> int:
         """Exact staged size of the tensors under *prefix*, from shard metadata
@@ -278,6 +317,19 @@ class CheckpointStreamer:
             total += math.prod(sl.get_shape()) * _DTYPE_BYTES.get(sl.get_dtype().upper(), 4)
         return total
 
+    def _headroom_for(self, block_bytes: Optional[int]) -> int:
+        """Search headroom for a staged block, from the run's tuning profile.
+
+        Falls back to the class default when no profile was supplied (unknown
+        iters / routing shape)."""
+        if getattr(self, "_tuning_iters", None) is None:
+            return int(getattr(self, "_staging_search_headroom", 0) or 0)
+        return estimate_search_headroom_bytes(
+            iters=self._tuning_iters,
+            block_bytes=block_bytes,
+            moe_routing_bytes=getattr(self, "_moe_routing_bytes", None),
+        )
+
     def _wait_for_stage_device(self, index: int, prefix: str) -> Optional[torch.device]:
         """Pick a staging device for *prefix*, waiting for VRAM.
 
@@ -288,8 +340,8 @@ class CheckpointStreamer:
         wait until VRAM frees or the rescue block is consumed.
         """
         devices = self._prefetch_stage_devices
-        headroom = int(getattr(self, "_staging_search_headroom", 0) or 0)
         needed = self._prefix_bytes_estimate(prefix) if devices else 0
+        headroom = self._headroom_for(needed if devices else None)
         rescue_allowed = any(d.type == "cuda" for d in devices)
         rescue_logged = False
         while not self._prefetch_stop:
@@ -316,7 +368,14 @@ class CheckpointStreamer:
             time.sleep(0.5)
         return None
 
-    def start_prefetch(self, module_prefixes: list, depth: int = 1, stage_devices: Optional[list] = None) -> None:
+    def start_prefetch(
+        self,
+        module_prefixes: list,
+        depth: int = 1,
+        stage_devices: Optional[list] = None,
+        tuning_iters: Optional[int] = None,
+        moe_routing_bytes: Optional[int] = None,
+    ) -> None:
         """Stream whole module prefixes ahead of the consumer on a background
         thread.
 
@@ -324,6 +383,11 @@ class CheckpointStreamer:
         staged-but-unconsumed prefixes beyond the current one; the consumer
         releases a prefix with :meth:`prefetch_consumed`. Host RAM use is
         bounded at roughly (depth + 1) prefixes worth of tensors.
+
+        ``tuning_iters`` and ``moe_routing_bytes`` describe the run's tuning
+        profile and size the per-block search headroom (see
+        :func:`estimate_search_headroom_bytes`); leaving them unset keeps the
+        conservative class default.
         """
         if self._prefetch_thread is not None:
             raise RuntimeError("prefetch already running; call stop_prefetch() first")
@@ -342,6 +406,8 @@ class CheckpointStreamer:
         self._prefetch_stage_devices = [torch.device(d) for d in stage_devices] if stage_devices else None
         self._prefetch_stage_dev = {}  # prefix -> device it was staged on
         self._prefetch_cpu_staged = 0  # outstanding rescue-buffered prefixes
+        self._tuning_iters = tuning_iters  # headroom profile: None keeps the class default
+        self._moe_routing_bytes = moe_routing_bytes
 
         def _reader():
             try:

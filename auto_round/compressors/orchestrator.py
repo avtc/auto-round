@@ -62,6 +62,7 @@ from auto_round.utils.device import (
     _force_trim_malloc,
 )
 from auto_round.utils.device_manager import device_manager
+from auto_round.utils.model import is_moe_model_via_config
 from auto_round.wrapper import WrapperMultiblock
 
 if TYPE_CHECKING:
@@ -995,6 +996,42 @@ class CompressionOrchestrator(BaseOrchestrator):
                 other,
             )
 
+    def _tuning_headroom_profile(self):
+        """(iters, moe_routing_bytes) sizing the staging search headroom.
+
+        iters: max across the block quantizers (a config without the field is
+        zero-shot by construction). moe_routing_bytes: one chunked forward
+        keeps a [tokens, top_k, hidden] fp32 router-affinity buffer. Returns
+        (None, None) for a MoE model whose shape cannot be derived so the
+        streamer keeps the conservative default rather than under-reserving.
+        """
+        quantizers = self.alg_composer.block_quantizer
+        if not isinstance(quantizers, (list, tuple)):
+            quantizers = [quantizers]
+        iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
+        routing = None
+        cfg = self.model_context.config
+        if cfg is not None and is_moe_model_via_config(cfg):
+            # VL/MoE families nest the text backbone's fields on text_config;
+            # num_experts_per_tok is the transformers-wide convention (family
+            # attribute_maps remap local spellings onto it), moe_top_k is dbrx
+            text_cfg = getattr(cfg, "text_config", None)
+            if text_cfg is not None:
+                cfg = text_cfg
+            hidden = getattr(cfg, "hidden_size", None)
+            topk = None
+            for attr in ("num_experts_per_tok", "num_experts_per_token", "moe_top_k", "n_experts_per_tok"):
+                topk = getattr(cfg, attr, None)
+                if topk:
+                    break
+            batch = getattr(self.calibration_context, "batch_size", None)
+            seqlen = getattr(self.calibration_context, "seqlen", None)
+            if hidden and topk and batch and seqlen:
+                routing = int(batch) * int(seqlen) * int(topk) * int(hidden) * 4
+            else:
+                return None, None
+        return iters, routing
+
     def _resolve_stream_stage_devices(self):
         """Resolve ``stream_prefetch_devices`` into a list of staging devices.
 
@@ -1209,7 +1246,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 )
                 prefetch_names = flat_block_names[_pending_offset:]
         if streamer is not None and prefetch_depth > 0 and prefetch_names:
-            streamer.start_prefetch(prefetch_names, depth=prefetch_depth, stage_devices=stage_devices)
+            tuning_iters, moe_routing_bytes = self._tuning_headroom_profile()
+            streamer.start_prefetch(
+                prefetch_names,
+                depth=prefetch_depth,
+                stage_devices=stage_devices,
+                tuning_iters=tuning_iters,
+                moe_routing_bytes=moe_routing_bytes,
+            )
 
         # -- Background pack pipeline (AR_STREAM_BG_PACK=auto|1|0)
         # The finished block's immediate-pack + shard-write tail runs in a
