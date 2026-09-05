@@ -38,11 +38,9 @@ class BailingMoeModel(TextModel):
     def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
         if n_head_kv is not None and n_head != n_head_kv:
             n_head = n_head_kv
-        return (
-            weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
-            .swapaxes(1, 2)
-            .reshape(weights.shape)
-        )
+        return (weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
+                .swapaxes(1, 2)
+                .reshape(weights.shape))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         n_head = self.hparams["num_attention_heads"]
@@ -59,15 +57,9 @@ class BailingMoeModel(TextModel):
         elif name.endswith("query_key_value.weight"):
             q, k, v = data_torch.split([n_head * head_dim, n_kv_head * head_dim, n_kv_head * head_dim], dim=-2)
 
-            yield from super().modify_tensors(
-                BailingMoeModel.permute(q, n_head, n_head), self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid), bid
-            )
-            yield from super().modify_tensors(
-                BailingMoeModel.permute(k, n_head, n_kv_head),
-                self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid),
-                bid,
-            )
-            yield from super().modify_tensors(v, self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid), bid)
+            yield from super().modify_tensors(BailingMoeModel.permute(q, n_head, n_head), self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid), bid)
+            yield from super().modify_tensors(BailingMoeModel.permute(k, n_head, n_kv_head), self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid), bid)
+            yield from super().modify_tensors(v,self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid), bid)
             return
         elif name.find("mlp.experts") != -1:
             n_experts = self.find_hparam(["num_local_experts", "num_experts"])
@@ -136,17 +128,11 @@ class BailingMoeV2Model(TextModel):
         if (rope_dim := hparams.get("head_dim")) is None:
             rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
 
-        self.gguf_writer.add_rope_dimension_count(
-            int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.5))
-        )
+        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.5)))
         self.gguf_writer.add_leading_dense_block_count(hparams["first_k_dense_replace"])
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
         self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
-        self.gguf_writer.add_expert_shared_feed_forward_length(
-            hparams.get(
-                "moe_shared_expert_intermediate_size", hparams["moe_intermediate_size"] * hparams["num_shared_experts"]
-            )
-        )
+        self.gguf_writer.add_expert_shared_feed_forward_length(hparams.get("moe_shared_expert_intermediate_size", hparams["moe_intermediate_size"] * hparams["num_shared_experts"]))
         self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
         self.gguf_writer.add_expert_shared_count(hparams["num_shared_experts"])
         self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
@@ -230,5 +216,4 @@ class SarvamMoEModel(BailingMoeV2Model):
             def gen():
                 t = inner()
                 return t - t.mean()
-
         return super().filter_tensors((name, gen))

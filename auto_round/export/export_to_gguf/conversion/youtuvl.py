@@ -49,7 +49,7 @@ class YoutuVLVisionModel(MmprojModel):
         name, gen = item
 
         # Skip language model tensors
-        skip_prefixes = ("lm_head.", "model.layers.", "model.embed_tokens.", "model.norm.")
+        skip_prefixes = ('lm_head.', 'model.layers.', 'model.embed_tokens.', 'model.norm.')
         if name.startswith(skip_prefixes):
             return None
 

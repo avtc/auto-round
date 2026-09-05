@@ -37,7 +37,7 @@ class GroveMoeModel(TextModel):
 
         # process the experts separately
         if name.find("chunk_experts") != -1:
-            n_experts = self.find_hparam(["num_local_experts", "num_experts"]) // 2  # see add_experts_per_group
+            n_experts = self.find_hparam(["num_local_experts", "num_experts"]) // 2 # see add_experts_per_group
             assert bid is not None
 
             if self._chunk_experts is None:

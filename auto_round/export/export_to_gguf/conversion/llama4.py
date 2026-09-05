@@ -35,6 +35,6 @@ class Llama4VisionModel(MmprojModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if "multi_modal_projector.linear_1" in name:
             # despite the name with number postfix, this is a single fully connected layer
-            yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_MMPROJ_FC] + ".weight", data_torch)
+            yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_MMPROJ_FC] + '.weight', data_torch)
         else:
             yield from super().modify_tensors(data_torch, name, bid)

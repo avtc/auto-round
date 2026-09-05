@@ -21,7 +21,6 @@ class ChatGLMModel(TextModel):
         scores: list[float] = []
 
         from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(dir_model, trust_remote_code=True)
         vocab_size = hparams.get("padded_vocab_size", len(tokenizer.get_vocab()))  # ty: ignore[unresolved-attribute]
         assert max(tokenizer.get_vocab().values()) < vocab_size  # ty: ignore[unresolved-attribute]
@@ -40,9 +39,7 @@ class ChatGLMModel(TextModel):
             score = 0.0
             # Referencing the tokenizer Python implementation(https://huggingface.co/THUDM/chatglm3-6b/blob/main/tokenization_chatglm.py),
             # it is only valid if it is less than tokenizer.tokenizer.sp_model.vocab_size()
-            if (
-                len(piece) != 0 and token_id < tokenizer.tokenizer.sp_model.vocab_size()
-            ):  # ty: ignore[unresolved-attribute, invalid-argument-type]
+            if len(piece) != 0 and token_id < tokenizer.tokenizer.sp_model.vocab_size():  # ty: ignore[unresolved-attribute, invalid-argument-type]
                 score = tokenizer.tokenizer.sp_model.get_score(token_id)  # ty: ignore[unresolved-attribute]
 
             if token_id >= tokenizer.tokenizer.sp_model.vocab_size():  # ty: ignore[unresolved-attribute]
@@ -86,9 +83,8 @@ class ChatGLMModel(TextModel):
     @staticmethod
     def token_bytes_to_string(b):
         from transformers.convert_slow_tokenizer import bytes_to_unicode
-
         byte_encoder = bytes_to_unicode()
-        return "".join([byte_encoder[ord(char)] for char in b.decode("latin-1")])
+        return ''.join([byte_encoder[ord(char)] for char in b.decode('latin-1')])
 
     @staticmethod
     def bpe(mergeable_ranks: dict[bytes, int], token: bytes, max_rank: int | None = None) -> list[bytes]:
@@ -104,7 +100,7 @@ class ChatGLMModel(TextModel):
             if min_rank is None or (max_rank is not None and min_rank >= max_rank):
                 break
             assert min_idx is not None
-            parts = parts[:min_idx] + [parts[min_idx] + parts[min_idx + 1]] + parts[min_idx + 2 :]
+            parts = parts[:min_idx] + [parts[min_idx] + parts[min_idx + 1]] + parts[min_idx + 2:]
         return parts
 
     def set_vocab(self):
@@ -118,9 +114,8 @@ class ChatGLMModel(TextModel):
         toktypes: list[int] = []
 
         from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(dir_model, trust_remote_code=True)
-        vocab_size = hparams.get("padded_vocab_size", hparams["vocab_size"])
+        vocab_size = hparams.get("padded_vocab_size",hparams["vocab_size"])
         assert max(tokenizer.get_vocab().values()) < vocab_size  # ty: ignore[unresolved-attribute]
 
         tokens, toktypes, tokpre = self.get_vocab_base()
@@ -130,16 +125,10 @@ class ChatGLMModel(TextModel):
         self.gguf_writer.add_token_types(toktypes)
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
         # only add special tokens when they were not already loaded from config.json
-        special_vocab._set_special_token(
-            "eos", tokenizer.get_added_vocab()["<|endoftext|>"]
-        )  # ty: ignore[unresolved-attribute]
-        special_vocab._set_special_token(
-            "eot", tokenizer.get_added_vocab()["<|user|>"]
-        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token("eos", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])  # ty: ignore[unresolved-attribute]
         # this one is usually not in config.json anyway
-        special_vocab._set_special_token(
-            "unk", tokenizer.get_added_vocab()["<|endoftext|>"]
-        )  # ty: ignore[unresolved-attribute]
+        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
         special_vocab.add_to_gguf(self.gguf_writer)
 
     def set_gguf_parameters(self):
@@ -150,21 +139,17 @@ class ChatGLMModel(TextModel):
         n_head_kv = self.hparams.get("multi_query_group_num", self.hparams.get("num_key_value_heads", n_head))
         self.gguf_writer.add_context_length(self.hparams.get("seq_length", n_embed))
         self.gguf_writer.add_embedding_length(n_embed)
-        self.gguf_writer.add_feed_forward_length(
-            self.hparams.get("ffn_hidden_size", self.hparams.get("intermediate_size", 4 * n_embed))
-        )
+        self.gguf_writer.add_feed_forward_length(self.hparams.get("ffn_hidden_size", self.hparams.get("intermediate_size", 4 * n_embed)))
         self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_head_count(n_head)
         self.gguf_writer.add_head_count_kv(n_head_kv)
-        self.gguf_writer.add_layer_norm_rms_eps(self.hparams.get("layernorm_epsilon", 1e-5))
+        self.gguf_writer.add_layer_norm_rms_eps(self.hparams.get("layernorm_epsilon",1e-5))
         self.gguf_writer.add_file_type(self.ftype)
         if "attention_dim" in self.hparams:
             rope_dim = self.hparams["attention_dim"]
         else:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
-        self.gguf_writer.add_rope_dimension_count(
-            int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.5))
-        )
+        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.5)))
         self.gguf_writer.add_add_bos_token(False)
         rope_freq = 10000
         if "rope_ratio" in self.hparams:

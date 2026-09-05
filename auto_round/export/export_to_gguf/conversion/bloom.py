@@ -37,7 +37,7 @@ class BloomModel(TextModel):
         assert n_head is not None
         assert n_embed is not None
 
-        name = re.sub(r"transformer\.", "", name)
+        name = re.sub(r'transformer\.', '', name)
 
         if re.match(r"h\.\d+\.self_attention\.query_key_value\.weight", name):
             # Map bloom-style qkv_linear to gpt-style qkv_linear

@@ -35,18 +35,15 @@ class BitnetModel(TextModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         new_name = self.map_tensor_name(name)
 
-        if any(
-            self.match_model_tensor_name(new_name, key, bid)
-            for key in [
-                gguf.MODEL_TENSOR.ATTN_Q,
-                gguf.MODEL_TENSOR.ATTN_K,
-                gguf.MODEL_TENSOR.ATTN_V,
-                gguf.MODEL_TENSOR.ATTN_OUT,
-                gguf.MODEL_TENSOR.FFN_UP,
-                gguf.MODEL_TENSOR.FFN_DOWN,
-                gguf.MODEL_TENSOR.FFN_GATE,
-            ]
-        ):
+        if any(self.match_model_tensor_name(new_name, key, bid) for key in [
+            gguf.MODEL_TENSOR.ATTN_Q,
+            gguf.MODEL_TENSOR.ATTN_K,
+            gguf.MODEL_TENSOR.ATTN_V,
+            gguf.MODEL_TENSOR.ATTN_OUT,
+            gguf.MODEL_TENSOR.FFN_UP,
+            gguf.MODEL_TENSOR.FFN_DOWN,
+            gguf.MODEL_TENSOR.FFN_GATE,
+        ]):
             # transform weight into 1/0/-1 (in fp32)
             data_torch = self.weight_quant(data_torch)
 

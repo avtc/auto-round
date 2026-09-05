@@ -36,7 +36,7 @@ class DeepseekOCRVisionModel(MmprojModel):
         self.gguf_writer.add_vision_use_gelu(True)
         # calculate proj_scale_factor (used by tinygemma3 test model)
         image_seq_length = self.preprocessor_config.get("image_seq_length", 256)
-        n_per_side = int(image_seq_length**0.5)
+        n_per_side = int(image_seq_length ** 0.5)
         image_size = self.hparams["image_size"]
         patch_size = self.hparams["patch_size"]
         proj_scale_factor = (image_size // patch_size) // n_per_side
@@ -51,32 +51,30 @@ class DeepseekOCRVisionModel(MmprojModel):
         self.gguf_writer.add_vision_preproc_max_tiles(self.preproc_max_tiles)
 
         # SAM configuration
-        sam_hparams = hparams["sam"]
-        self.gguf_writer.add_vision_sam_layers_count(sam_hparams["layers"])
-        self.gguf_writer.add_vision_sam_embedding_length(sam_hparams["width"])
-        self.gguf_writer.add_vision_sam_head_count(sam_hparams["heads"])
+        sam_hparams = hparams['sam']
+        self.gguf_writer.add_vision_sam_layers_count(sam_hparams['layers'])
+        self.gguf_writer.add_vision_sam_embedding_length(sam_hparams['width'])
+        self.gguf_writer.add_vision_sam_head_count(sam_hparams['heads'])
 
     def get_vision_config(self) -> dict[str, Any]:
         vision_config: dict[str, Any] | None = self.global_config.get("vision_config")
 
         if not vision_config:
-            raise ValueError(
-                "DeepseekOCR model requires 'vision_config' in the model configuration, but it was not found"
-            )
+            raise ValueError("DeepseekOCR model requires 'vision_config' in the model configuration, but it was not found")
 
-        vision_config["sam"] = vision_config["width"]["sam_vit_b"]
-        if vision_config["width"].get("clip-l-14-224") is not None:
-            vision_config.update(vision_config["width"]["clip-l-14-224"])
-        if isinstance(vision_config["width"], int):
-            vision_config["hidden_size"] = vision_config["width"]
-        if vision_config.get("heads") is not None:
-            vision_config["num_heads"] = vision_config["heads"]
-            vision_config["intermediate_size"] = vision_config["heads"] * 4
+        vision_config['sam'] = vision_config['width']['sam_vit_b']
+        if vision_config['width'].get('clip-l-14-224') is not None:
+            vision_config.update(vision_config['width']['clip-l-14-224'])
+        if isinstance(vision_config['width'], int):
+            vision_config['hidden_size'] = vision_config['width']
+        if vision_config.get('heads') is not None:
+            vision_config['num_heads'] = vision_config['heads']
+            vision_config['intermediate_size'] = vision_config['heads'] * 4
 
         return vision_config
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
-        for nq_name in (".embeddings.", "pos_embed", ".rel_pos_h", ".rel_pos_w", ".neck.", ".net_"):
+        for nq_name in ('.embeddings.', 'pos_embed', '.rel_pos_h', '.rel_pos_w', '.neck.', '.net_'):
             if nq_name in name:
                 return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
@@ -132,9 +130,9 @@ class DeepseekOCR2VisionModel(DeepseekOCRVisionModel):
 
     def get_vision_config(self) -> dict[str, Any]:
         vision_config = super().get_vision_config()
-        vision_config["hidden_size"] = vision_config["width"]["qwen2-0-5b"]["dim"]
-        if vision_config.get("layers") is None:
-            vision_config["layers"] = 24
+        vision_config['hidden_size'] = vision_config['width']['qwen2-0-5b']['dim']
+        if vision_config.get('layers') is None:
+            vision_config['layers'] = 24
         return vision_config
 
 
@@ -170,11 +168,9 @@ class DeepseekModel(TextModel):
     def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
         if n_head_kv is not None and n_head != n_head_kv:
             n_head = n_head_kv
-        return (
-            weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
-            .swapaxes(1, 2)
-            .reshape(weights.shape)
-        )
+        return (weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
+                .swapaxes(1, 2)
+                .reshape(weights.shape))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         n_head = self.hparams["num_attention_heads"]
@@ -248,7 +244,7 @@ class DeepseekV2Model(TextModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         hparams: dict = ModelBase.load_hparams(self.dir_model, is_mistral_format=False)
-        self.origin_hf_arch = hparams.get("architectures", [None])[0]
+        self.origin_hf_arch = hparams.get('architectures', [None])[0]
 
         # special handling for Deepseek OCR
         if self.origin_hf_arch in ("DeepseekOCRForCausalLM", "DeepseekOCR2ForCausalLM", "UnlimitedOCRForCausalLM"):
@@ -274,7 +270,6 @@ class DeepseekV2Model(TextModel):
             pass
 
         from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
         tokpre = self.get_vocab_base_pre(tokenizer)
 
@@ -289,12 +284,12 @@ class DeepseekV2Model(TextModel):
                     continue
                 merged = QwenModel.bpe(mergeable_ranks, token, max_rank=rank)
                 if len(merged) == 2:
-                    merges.append(" ".join(map(QwenModel.token_bytes_to_string, merged)))
+                    merges.append(' '.join(map(QwenModel.token_bytes_to_string, merged)))
 
             # Build token list
             vocab_size = self.hparams["vocab_size"]
             special_tokens = tokenizer.special_tokens  # ty: ignore[unresolved-attribute]
-            reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in {**vocab, **special_tokens}.items()}
+            reverse_vocab = {id_ : encoded_tok for encoded_tok, id_ in {**vocab, **special_tokens}.items()}
             tokens: list[str] = []
             toktypes: list[int] = []
 
@@ -322,15 +317,15 @@ class DeepseekV2Model(TextModel):
             raise NotImplementedError(f"Deepseek pre-tokenizer {tokpre!r} is not supported yet!")
 
     def set_gguf_parameters(self):
-        is_ocr = self.model_arch == gguf.MODEL_ARCH.DEEPSEEK2OCR
+        is_ocr = (self.model_arch == gguf.MODEL_ARCH.DEEPSEEK2OCR)
 
         if is_ocr:
-            self.hparams["rope_theta"] = self.hparams.get("rope_theta", 10000.0)
+            self.hparams['rope_theta'] = self.hparams.get('rope_theta', 10000.0)
         else:
             # note: deepseek2 using MLA converts into MQA (ie: GQA with 1 group)
             self.hparams["num_key_value_heads"] = 1
 
-        self.hparams["rms_norm_eps"] = self.hparams.get("rms_norm_eps", 1e-6)
+        self.hparams['rms_norm_eps'] = self.hparams.get('rms_norm_eps', 1e-6)
 
         super().set_gguf_parameters()
         hparams = self.hparams
@@ -501,15 +496,8 @@ class DeepseekV32Model(DeepseekV2Model):
             return None
         # --mtp: keep ONLY NextN-block tensors plus the shared embeddings/
         # norm/lm_head (so the resulting GGUF carries just the draft head).
-        if (
-            cls.mtp_only
-            and not is_mtp
-            and name
-            not in (
-                "model.embed_tokens.weight",
-                "model.norm.weight",
-                "lm_head.weight",
-            )
+        if cls.mtp_only and not is_mtp and name not in (
+            "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
         ):
             return None
 
@@ -517,11 +505,8 @@ class DeepseekV32Model(DeepseekV2Model):
 
     def set_vocab(self):
         from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        assert getattr(
-            tokenizer, "add_bos_token", False
-        ), "Change value of add_bos_token to true in tokenizer_config.json file."
+        assert getattr(tokenizer, "add_bos_token", False), "Change value of add_bos_token to true in tokenizer_config.json file."
         self._set_vocab_gpt2()
 
     def set_gguf_parameters(self):
@@ -617,10 +602,8 @@ class DeepseekV4Model(TextModel):
             if suffix in root_hc_head:
                 name = suffix
             elif suffix in (
-                "e_proj.weight",
-                "e_proj.scale",
-                "h_proj.weight",
-                "h_proj.scale",
+                "e_proj.weight", "e_proj.scale",
+                "h_proj.weight", "h_proj.scale",
             ):
                 name = f"layers.{bid}.nextn.{suffix}"
             elif suffix == "enorm.weight":
@@ -648,12 +631,10 @@ class DeepseekV4Model(TextModel):
     @staticmethod
     def _float8_dtypes() -> tuple[torch.dtype, ...]:
         return tuple(
-            dtype
-            for dtype in (
+            dtype for dtype in (
                 getattr(torch, "float8_e4m3fn", None),
                 getattr(torch, "float8_e5m2", None),
-            )
-            if dtype is not None
+            ) if dtype is not None
         )
 
     @staticmethod
@@ -757,9 +738,7 @@ class DeepseekV4Model(TextModel):
         assert data is not None
         new_name = self.format_tensor_name(tensor_key, bid)
         shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
-        logger.info(
-            f"{new_name}: repacked routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}"
-        )
+        logger.info(f"{new_name}: repacked routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
         self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
         return consumed
@@ -775,9 +754,7 @@ class DeepseekV4Model(TextModel):
             data_torch = LazyTorchTensor.to_eager(self.model_tensors[name]())
             data = data_torch.to(torch.int32).cpu().numpy()
             new_name = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_TID2EID, bid, ".weight")
-            logger.info(
-                f"{new_name}: converted hash routing table to I32, shape = {{{', '.join(str(n) for n in reversed(data.shape))}}}"
-            )
+            logger.info(f"{new_name}: converted hash routing table to I32, shape = {{{', '.join(str(n) for n in reversed(data.shape))}}}")
             self.gguf_writer.add_tensor(new_name, data)
             consumed.append(name)
 
@@ -907,9 +884,7 @@ class DeepseekV4Model(TextModel):
 
         return [(self._format_dsv4_tensor_name(tensor_key, bid, suffix), data_torch)]
 
-    def tensor_force_quant(
-        self, name: str, new_name: str, bid: int | None, n_dims: int
-    ) -> gguf.GGMLQuantizationType | bool:
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         del bid  # unused
 
         if name in self._dsv4_fp8_dequantized and n_dims >= 2:
@@ -932,14 +907,8 @@ class DeepseekV4Model(TextModel):
 
         output_type: str = self.ftype.name.partition("_")[2]
         fname_default: str = gguf.naming_convention(
-            self.metadata.name,
-            self.metadata.basename,
-            self.metadata.finetune,
-            self.metadata.version,
-            size_label=None,
-            output_type=output_type,
-            model_type=None,
-        )
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)
         self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
     def prepare_tensors(self):
@@ -965,7 +934,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
         super().__init__(*args, **kwargs)
 
         self.block_count = 1 + max(
-            int(match.group(1)) for name in self.model_tensors if (match := re.match(r"layers\.(\d+)\.", name))
+            int(match.group(1)) for name in self.model_tensors
+            if (match := re.match(r"layers\.(\d+)\.", name))
         )
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
@@ -979,7 +949,10 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
         with open(self.dir_model / "model.safetensors.index.json", "r", encoding="utf-8") as f:
             weight_map = json.load(f)["weight_map"]
 
-        part_names = sorted({part_name for name, part_name in weight_map.items() if name.startswith("mtp.")})
+        part_names = sorted({
+            part_name for name, part_name in weight_map.items()
+            if name.startswith("mtp.")
+        })
         tensors: dict[str, Callable[[], Tensor]] = {}
 
         for part_name in part_names:

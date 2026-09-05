@@ -17,9 +17,8 @@ class RefactModel(TextModel):
         super().set_vocab()
 
         # TODO: how to determine special FIM tokens automatically?
-        special_vocab = gguf.SpecialVocab(
-            self.dir_model, load_merges=False, special_token_types=["prefix", "suffix", "middle", "eot"]
-        )
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False,
+                                          special_token_types = ['prefix', 'suffix', 'middle', 'eot'])
         special_vocab._set_special_token("prefix", 1)
         special_vocab._set_special_token("suffix", 3)
         special_vocab._set_special_token("middle", 2)
@@ -56,25 +55,15 @@ class RefactModel(TextModel):
 
         if bid is not None:
             if name == f"transformer.h.{bid}.attn.kv.weight":
-                yield from super().modify_tensors(
-                    data_torch[: n_head_kv * head_dim], self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid), bid
-                )
-                yield from super().modify_tensors(
-                    data_torch[n_head_kv * head_dim :], self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid), bid
-                )
+                yield from super().modify_tensors(data_torch[:n_head_kv * head_dim], self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid), bid)
+                yield from super().modify_tensors(data_torch[n_head_kv * head_dim:], self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid), bid)
                 return
             if name == f"transformer.h.{bid}.attn.q.weight":
-                yield from super().modify_tensors(
-                    data_torch, self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid), bid
-                )
+                yield from super().modify_tensors(data_torch, self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid), bid)
                 return
             if name == f"transformer.h.{bid}.mlp.gate_up_proj.weight":
-                yield from super().modify_tensors(
-                    data_torch[:ff_dim], self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE, bid), bid
-                )
-                yield from super().modify_tensors(
-                    data_torch[ff_dim:], self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP, bid), bid
-                )
+                yield from super().modify_tensors(data_torch[:ff_dim], self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE, bid), bid)
+                yield from super().modify_tensors(data_torch[ff_dim:], self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP, bid), bid)
                 return
 
         yield from super().modify_tensors(data_torch, name, bid)

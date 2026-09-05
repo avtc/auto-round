@@ -18,7 +18,7 @@ class PanguEmbeddedModel(TextModel):
     def set_vocab(self):
         self._set_vocab_sentencepiece()
 
-        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
+        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
         if tokenizer_config_file.is_file():
             with open(tokenizer_config_file, "r", encoding="utf-8") as f:
                 tokenizer_config_json = json.load(f)

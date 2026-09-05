@@ -16,7 +16,7 @@ class KimiVLModel(MmprojModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
-        self.hparams_vision["image_size"] = 64 * 14  # for compatibility
+        self.hparams_vision["image_size"] = 64 * 14 # for compatibility
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -94,7 +94,7 @@ class KimiK25Model(MmprojModel):
         # Note: in_patch_limit is for images, in_patch_limit_each_frame is for video (not supported yet)
         in_patch_limit = self.preprocessor_config.get("in_patch_limit", 16384)
         min_patches = 8  # reasonable minimum
-        pixels_per_patch = self.patch_size**2
+        pixels_per_patch = self.patch_size ** 2
         self.gguf_writer.add_vision_min_pixels(min_patches * pixels_per_patch)
         self.gguf_writer.add_vision_max_pixels(in_patch_limit * pixels_per_patch)
 
@@ -130,12 +130,12 @@ class KimiK25Model(MmprojModel):
             head_dim = qkv_dim // n_head
 
             if "weight" in name:
-                wq, wk, wv = data_torch[:qkv_dim, :], data_torch[qkv_dim : 2 * qkv_dim, :], data_torch[2 * qkv_dim :, :]
+                wq, wk, wv = data_torch[:qkv_dim, :], data_torch[qkv_dim:2 * qkv_dim, :], data_torch[2 * qkv_dim:, :]
                 wq = self.permute(wq, n_head)
                 wk = self.permute(wk, n_head)
                 data_torch = torch.cat([wq, wk, wv], dim=0)
             elif "bias" in name:
-                bq, bk, bv = data_torch[:qkv_dim], data_torch[qkv_dim : 2 * qkv_dim], data_torch[2 * qkv_dim :]
+                bq, bk, bv = data_torch[:qkv_dim], data_torch[qkv_dim:2 * qkv_dim], data_torch[2 * qkv_dim:]
                 bq = bq.reshape(n_head, head_dim // 4, 2, 2).permute(0, 2, 1, 3).reshape(-1)
                 bk = bk.reshape(n_head, head_dim // 4, 2, 2).permute(0, 2, 1, 3).reshape(-1)
                 data_torch = torch.cat([bq, bk, bv], dim=0)

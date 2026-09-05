@@ -39,9 +39,7 @@ class BailingMoeV3Model(TextModel):
     def is_full_attention(self, bid: int) -> bool:
         n_layer = self.hparams["num_hidden_layers"]
         layer_group_size = self.hparams["layer_group_size"]
-        return (
-            bid >= n_layer or (bid + 1) % layer_group_size == 0 or bid >= n_layer // layer_group_size * layer_group_size
-        )
+        return bid >= n_layer or (bid + 1) % layer_group_size == 0 or bid >= n_layer // layer_group_size * layer_group_size
 
     def set_gguf_parameters(self):
         if not self.hparams.get("no_kda_lora", False):
@@ -85,7 +83,7 @@ class BailingMoeV3Model(TextModel):
             values = self.hparams.get(key)
             if values is None:
                 return None
-            values = [0.0 if value is None else float(value) for value in values[: self.block_count]]
+            values = [0.0 if value is None else float(value) for value in values[:self.block_count]]
             return values + [0.0] * (self.block_count - len(values))
 
         if (values := clamp_limits("expert_swiglu_limit_list")) is not None:
@@ -105,14 +103,8 @@ class BailingMoeV3Model(TextModel):
 
         output_type: str = self.ftype.name.partition("_")[2]
         fname_default: str = gguf.naming_convention(
-            self.metadata.name,
-            self.metadata.basename,
-            self.metadata.finetune,
-            self.metadata.version,
-            size_label=None,
-            output_type=output_type,
-            model_type=None,
-        )
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)
         self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
     @classmethod
@@ -129,15 +121,8 @@ class BailingMoeV3Model(TextModel):
 
         if is_mtp and cls.no_mtp:
             return None
-        if (
-            cls.mtp_only
-            and not is_mtp
-            and name
-            not in (
-                "model.word_embeddings.weight",
-                "model.norm.weight",
-                "lm_head.weight",
-            )
+        if cls.mtp_only and not is_mtp and name not in (
+            "model.word_embeddings.weight", "model.norm.weight", "lm_head.weight",
         ):
             return None
 

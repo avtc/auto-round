@@ -16,7 +16,6 @@ from .qwen import QwenModel
 @ModelBase.example("moonshotai/Kimi-Linear-48B-A3B-Instruct")
 class KimiLinearModel(TextModel):
     """Kimi-Linear model with hybrid MLA+KDA architecture"""
-
     model_arch = gguf.MODEL_ARCH.KIMI_LINEAR
 
     _experts: list[dict[str, Tensor]] | None = None
@@ -29,7 +28,6 @@ class KimiLinearModel(TextModel):
             pass
 
         from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
         tokpre = self.get_vocab_base_pre(tokenizer)
 
@@ -44,11 +42,11 @@ class KimiLinearModel(TextModel):
                     continue
                 merged = QwenModel.bpe(mergeable_ranks, token, max_rank=rank)
                 if len(merged) == 2:
-                    merges.append(" ".join(map(QwenModel.token_bytes_to_string, merged)))
+                    merges.append(' '.join(map(QwenModel.token_bytes_to_string, merged)))
             # Build token list
             vocab_size = self.hparams["vocab_size"]
             special_tokens = tokenizer.special_tokens  # ty: ignore[unresolved-attribute]
-            reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in {**vocab, **special_tokens}.items()}
+            reverse_vocab = {id_ : encoded_tok for encoded_tok, id_ in {**vocab, **special_tokens}.items()}
             tokens: list[str] = []
             toktypes: list[int] = []
 
@@ -165,16 +163,12 @@ class KimiLinearModel(TextModel):
                 d_inner, d_conv = data_torch.shape
                 # Reshape to (1, d_inner, 1, d_conv) - memory layout preserved (d_conv fastest)
                 data_torch = data_torch.reshape(1, d_inner, 1, d_conv)
-                logger.info(
-                    f"Reshaped conv1d weight {name}: [d_inner={d_inner}, d_conv={d_conv}] -> numpy {tuple(data_torch.shape)} -> ggml ne=[{d_conv}, 1, {d_inner}, 1]"
-                )
+                logger.info(f"Reshaped conv1d weight {name}: [d_inner={d_inner}, d_conv={d_conv}] -> numpy {tuple(data_torch.shape)} -> ggml ne=[{d_conv}, 1, {d_inner}, 1]")
             elif data_torch.ndim == 3:
                 # Already 3D [d_inner, 1, d_conv] from unsqueeze
                 d_inner, _, d_conv = data_torch.shape
                 data_torch = data_torch.reshape(1, d_inner, 1, d_conv)
-                logger.info(
-                    f"Reshaped conv1d weight {name}: [d_inner={d_inner}, 1, d_conv={d_conv}] -> numpy {tuple(data_torch.shape)} -> ggml ne=[{d_conv}, 1, {d_inner}, 1]"
-                )
+                logger.info(f"Reshaped conv1d weight {name}: [d_inner={d_inner}, 1, d_conv={d_conv}] -> numpy {tuple(data_torch.shape)} -> ggml ne=[{d_conv}, 1, {d_inner}, 1]")
 
         # Handle A_log: iHF stores as [1, 1, num_heads, 1]
         # llama.cpp expects ggml ne = [1, num_heads, 1, 1]
@@ -198,11 +192,9 @@ class KimiLinearModel(TextModel):
             if len(self._experts[bid]) >= n_experts * 3:
                 # merge the experts into a single 3d tensor
                 # w1: gate, w2: down, w3: up
-                for wid, tname in [
-                    ("w1", gguf.MODEL_TENSOR.FFN_GATE_EXP),
-                    ("w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP),
-                    ("w3", gguf.MODEL_TENSOR.FFN_UP_EXP),
-                ]:
+                for wid, tname in [("w1", gguf.MODEL_TENSOR.FFN_GATE_EXP),
+                                   ("w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP),
+                                   ("w3", gguf.MODEL_TENSOR.FFN_UP_EXP)]:
                     datas: list[Tensor] = []
                     for xid in range(n_experts):
                         ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{wid}.weight"

@@ -23,11 +23,7 @@ class Rwkv6Model(TextModel):
         hidden_size = self.hparams["hidden_size"]
         layer_norm_eps = self.hparams["layer_norm_epsilon"]
         rescale_every_n_layers = self.hparams["rescale_every"]
-        intermediate_size = (
-            self.hparams["intermediate_size"]
-            if self.hparams["intermediate_size"] is not None
-            else int((hidden_size * 3.5) // 32 * 32)
-        )
+        intermediate_size = self.hparams["intermediate_size"] if self.hparams["intermediate_size"] is not None else int((hidden_size * 3.5) // 32 * 32)
         time_mix_extra_dim = 64 if hidden_size == 4096 else 32
         time_decay_extra_dim = 128 if hidden_size == 4096 else 64
 
@@ -54,11 +50,7 @@ class Rwkv6Model(TextModel):
         if not (new_name.endswith(".weight") or new_name.endswith(".bias")):
             new_name += ".weight"
 
-        if (
-            new_name.endswith("time_mix_w1.weight")
-            or new_name.endswith("time_mix_decay_w1.weight")
-            or new_name.endswith("time_mix_decay_w2.weight")
-        ):
+        if new_name.endswith("time_mix_w1.weight") or new_name.endswith("time_mix_decay_w1.weight") or new_name.endswith("time_mix_decay_w2.weight"):
             data_torch = data_torch.transpose(0, 1)
 
         if new_name.endswith("time_mix_w2.weight"):
@@ -82,18 +74,9 @@ class Rwkv6Model(TextModel):
                 self.lerp_weights[bid][new_name] = data_torch
             except KeyError:
                 self.lerp_weights[bid] = {new_name: data_torch}
-            if all(
-                f"blk.{bid}.time_mix_lerp_{i}.weight" in self.lerp_weights[bid].keys()
-                for i in ["w", "k", "v", "r", "g"]
-            ):
+            if all(f"blk.{bid}.time_mix_lerp_{i}.weight" in self.lerp_weights[bid].keys() for i in ["w", "k", "v", "r", "g"]):
                 new_name = f"blk.{bid}.time_mix_lerp_fused.weight"
-                data = torch.stack(
-                    [
-                        self.lerp_weights[bid][f"blk.{bid}.time_mix_lerp_{i}.weight"].unsqueeze(0)
-                        for i in ["w", "k", "v", "r", "g"]
-                    ],
-                    dim=0,
-                ).unsqueeze(1)
+                data = torch.stack([self.lerp_weights[bid][f"blk.{bid}.time_mix_lerp_{i}.weight"].unsqueeze(0) for i in ["w", "k", "v", "r", "g"]], dim=0).unsqueeze(1)
                 yield (new_name, data)
             return
 
@@ -163,7 +146,7 @@ class Rwkv7Model(TextModel):
         self._set_vocab_rwkv_world()
 
     def calc_lora_rank(self, hidden_size, exponent, multiplier):
-        return max(1, round(hidden_size**exponent * multiplier / 32)) * 32
+        return max(1, round(hidden_size ** exponent * multiplier / 32)) * 32
 
     def set_gguf_parameters(self):
         try:
@@ -173,53 +156,19 @@ class Rwkv7Model(TextModel):
             head_size = self.hparams["head_dim"]
             layer_norm_eps = self.hparams["norm_eps"]
         hidden_size = self.hparams["hidden_size"]
-        intermediate_size = (
-            self.hparams["intermediate_size"] if self.hparams["intermediate_size"] is not None else (hidden_size * 4)
-        )
+        intermediate_size = self.hparams["intermediate_size"] if self.hparams["intermediate_size"] is not None else (hidden_size * 4)
 
         # ICLR: In-Context-Learning-Rate
         try:
-            lora_rank_decay = (
-                self.hparams["lora_rank_decay"]
-                if self.hparams["lora_rank_decay"] is not None
-                else self.calc_lora_rank(hidden_size, 0.5, 1.8)
-            )
-            lora_rank_iclr = (
-                self.hparams["lora_rank_iclr"]
-                if self.hparams["lora_rank_iclr"] is not None
-                else self.calc_lora_rank(hidden_size, 0.5, 1.8)
-            )
-            lora_rank_value_residual_mix = (
-                self.hparams["lora_rank_value_residual_mix"]
-                if self.hparams["lora_rank_value_residual_mix"] is not None
-                else self.calc_lora_rank(hidden_size, 0.5, 1.3)
-            )
-            lora_rank_gate = (
-                self.hparams["lora_rank_gate"]
-                if self.hparams["lora_rank_gate"] is not None
-                else self.calc_lora_rank(hidden_size, 0.8, 0.6)
-            )
+            lora_rank_decay = self.hparams["lora_rank_decay"] if self.hparams["lora_rank_decay"] is not None else self.calc_lora_rank(hidden_size, 0.5, 1.8)
+            lora_rank_iclr = self.hparams["lora_rank_iclr"] if self.hparams["lora_rank_iclr"] is not None else self.calc_lora_rank(hidden_size, 0.5, 1.8)
+            lora_rank_value_residual_mix = self.hparams["lora_rank_value_residual_mix"] if self.hparams["lora_rank_value_residual_mix"] is not None else self.calc_lora_rank(hidden_size, 0.5, 1.3)
+            lora_rank_gate = self.hparams["lora_rank_gate"] if self.hparams["lora_rank_gate"] is not None else self.calc_lora_rank(hidden_size, 0.8, 0.6)
         except KeyError:
-            lora_rank_decay = (
-                self.hparams["decay_low_rank_dim"]
-                if self.hparams["decay_low_rank_dim"] is not None
-                else self.calc_lora_rank(hidden_size, 0.5, 1.8)
-            )
-            lora_rank_iclr = (
-                self.hparams["a_low_rank_dim"]
-                if self.hparams["a_low_rank_dim"] is not None
-                else self.calc_lora_rank(hidden_size, 0.5, 1.8)
-            )
-            lora_rank_value_residual_mix = (
-                self.hparams["v_low_rank_dim"]
-                if self.hparams["v_low_rank_dim"] is not None
-                else self.calc_lora_rank(hidden_size, 0.5, 1.3)
-            )
-            lora_rank_gate = (
-                self.hparams["gate_low_rank_dim"]
-                if self.hparams["gate_low_rank_dim"] is not None
-                else self.calc_lora_rank(hidden_size, 0.8, 0.6)
-            )
+            lora_rank_decay = self.hparams["decay_low_rank_dim"] if self.hparams["decay_low_rank_dim"] is not None else self.calc_lora_rank(hidden_size, 0.5, 1.8)
+            lora_rank_iclr = self.hparams["a_low_rank_dim"] if self.hparams["a_low_rank_dim"] is not None else self.calc_lora_rank(hidden_size, 0.5, 1.8)
+            lora_rank_value_residual_mix = self.hparams["v_low_rank_dim"] if self.hparams["v_low_rank_dim"] is not None else self.calc_lora_rank(hidden_size, 0.5, 1.3)
+            lora_rank_gate = self.hparams["gate_low_rank_dim"] if self.hparams["gate_low_rank_dim"] is not None else self.calc_lora_rank(hidden_size, 0.8, 0.6)
 
         # RWKV isn't context limited
         self.gguf_writer.add_context_length(1048576)
@@ -283,9 +232,7 @@ class Rwkv7Model(TextModel):
                     self.lerp_weights[bid] = {name: data_torch}
                 if all(f"model.layers.{bid}.attention.x_{i}" in self.lerp_weights[bid].keys() for i in lerp_list):
                     new_name = f"blk.{bid}.time_mix_lerp_fused.weight"
-                    data = torch.stack(
-                        [self.lerp_weights[bid][f"model.layers.{bid}.attention.x_{i}"] for i in lerp_list], dim=0
-                    )
+                    data = torch.stack([self.lerp_weights[bid][f"model.layers.{bid}.attention.x_{i}"] for i in lerp_list], dim=0)
                     yield (new_name, data)
             return
         else:
@@ -296,21 +243,16 @@ class Rwkv7Model(TextModel):
                 new_name += ".weight"
 
             if self.lora_needs_transpose and any(
-                new_name.endswith(t)
-                for t in [
-                    "time_mix_w1.weight",
-                    "time_mix_w2.weight",
-                    "time_mix_a1.weight",
-                    "time_mix_a2.weight",
-                    "time_mix_v1.weight",
-                    "time_mix_v2.weight",
-                    "time_mix_g1.weight",
-                    "time_mix_g2.weight",
+                new_name.endswith(t) for t in [
+                    "time_mix_w1.weight", "time_mix_w2.weight",
+                    "time_mix_a1.weight", "time_mix_a2.weight",
+                    "time_mix_v1.weight", "time_mix_v2.weight",
+                    "time_mix_g1.weight", "time_mix_g2.weight",
                 ]
             ):
                 data_torch = data_torch.transpose(0, 1)
 
-            if "r_k" in new_name:
+            if 'r_k' in new_name:
                 data_torch = data_torch.flatten()
 
             if bid == 0 and "time_mix_a" in new_name:

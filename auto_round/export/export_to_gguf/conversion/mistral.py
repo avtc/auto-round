@@ -52,12 +52,10 @@ class MistralModel(LlamaModel):
 
     @staticmethod
     def get_community_chat_template(vocab: MistralVocab, templates_dir: Path, is_mistral_format: bool):
-        assert (
-            TokenizerVersion is not None and Tekkenizer is not None and SentencePieceTokenizer is not None
-        ), _mistral_import_error_msg
-        assert isinstance(
-            vocab.tokenizer, (Tekkenizer, SentencePieceTokenizer)
-        ), f"Expected Tekkenizer or SentencePieceTokenizer, got {type(vocab.tokenizer)}"
+        assert TokenizerVersion is not None and Tekkenizer is not None and SentencePieceTokenizer is not None, _mistral_import_error_msg
+        assert isinstance(vocab.tokenizer, (Tekkenizer, SentencePieceTokenizer)), (
+            f"Expected Tekkenizer or SentencePieceTokenizer, got {type(vocab.tokenizer)}"
+        )
 
         if vocab.tokenizer.version == TokenizerVersion.v1:
             return "mistral-v1"
@@ -181,7 +179,7 @@ class MistralMoeModel(DeepseekV2Model):
         # [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]
         # note: for legacy reasons, this is not consistent with the other usages of self.gguf_writer.add_rope_scaling_yarn_log_mul
         # ref https://github.com/ggml-org/llama.cpp/pull/17945
-        self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1)  # mscale_all_dim * 0.1
+        self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1) # mscale_all_dim * 0.1
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

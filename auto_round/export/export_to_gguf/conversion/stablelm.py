@@ -30,14 +30,10 @@ class StableLMModel(TextModel):
         self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_feed_forward_length(hparams["intermediate_size"])
         rotary_factor = self.rope_parameters["partial_rotary_factor"]
-        self.gguf_writer.add_rope_dimension_count(
-            int(rotary_factor * (hparams["hidden_size"] // hparams["num_attention_heads"]))
-        )
+        self.gguf_writer.add_rope_dimension_count(int(rotary_factor * (hparams["hidden_size"] // hparams["num_attention_heads"])))
         self.gguf_writer.add_head_count(hparams["num_attention_heads"])
         self.gguf_writer.add_head_count_kv(hparams["num_key_value_heads"])
-        self.gguf_writer.add_parallel_residual(
-            hparams["use_parallel_residual"] if "use_parallel_residual" in hparams else True
-        )
+        self.gguf_writer.add_parallel_residual(hparams["use_parallel_residual"] if "use_parallel_residual" in hparams else True)
         self.gguf_writer.add_layer_norm_eps(self.find_hparam(["layer_norm_eps", "norm_eps"]))
         self.gguf_writer.add_file_type(self.ftype)
 
@@ -94,7 +90,9 @@ class StableLMModel(TextModel):
 
         if self._q_norms is not None or self._k_norms is not None:
             # flatten two `list[dict[str, Tensor]]` into a single `list[str]`
-            norms = ([k for d in self._q_norms for k in d.keys()] if self._q_norms is not None else []) + (
+            norms = (
+                [k for d in self._q_norms for k in d.keys()] if self._q_norms is not None else []
+            ) + (
                 [k for d in self._k_norms for k in d.keys()] if self._k_norms is not None else []
             )
             if len(norms) > 0:

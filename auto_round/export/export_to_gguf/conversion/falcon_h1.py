@@ -47,7 +47,10 @@ class FalconH1Model(Mamba2Model):
     def find_hparam(self, keys: Iterable[str], *args, **kwargs) -> Any:
         prefixed = []
         for pfx in self.hparam_prefixes:
-            prefixed.extend("_".join([pfx, k]) for k in keys)
+            prefixed.extend(
+                "_".join([pfx, k])
+                for k in keys
+            )
         keys = list(keys) + prefixed
         return super().find_hparam(keys, *args, **kwargs)
 
@@ -59,7 +62,7 @@ class FalconH1Model(Mamba2Model):
         tensor = tensors[0][1]
 
         if "down_proj" in name:
-            tensor = tensor * self.mlp_multipliers[1]
+            tensor = tensor  * self.mlp_multipliers[1]
         elif "gate_proj" in name:
             tensor = tensor * self.mlp_multipliers[0]
         elif "k_proj" in name:
@@ -78,12 +81,10 @@ class FalconH1Model(Mamba2Model):
             intermediate_size = self.hparams["mamba_d_ssm"]
             groups_time_state_size = self.hparams["mamba_n_groups"] * self.hparams["mamba_d_state"]
             tensor[:intermediate_size, :] *= zxbcdt_multipliers[0]
-            tensor[intermediate_size : 2 * intermediate_size, :] *= zxbcdt_multipliers[1]
-            tensor[2 * intermediate_size : 2 * intermediate_size + groups_time_state_size, :] *= zxbcdt_multipliers[2]
-            tensor[
-                2 * intermediate_size + groups_time_state_size : 2 * intermediate_size + 2 * groups_time_state_size, :
-            ] *= zxbcdt_multipliers[3]
-            tensor[2 * intermediate_size + 2 * groups_time_state_size :, :] *= zxbcdt_multipliers[4]
+            tensor[intermediate_size:2 * intermediate_size, :] *= zxbcdt_multipliers[1]
+            tensor[2 * intermediate_size:2 * intermediate_size + groups_time_state_size, :] *= zxbcdt_multipliers[2]
+            tensor[2 * intermediate_size + groups_time_state_size:2 * intermediate_size + 2 * groups_time_state_size, :] *= zxbcdt_multipliers[3]
+            tensor[2 * intermediate_size + 2 * groups_time_state_size:, :] *= zxbcdt_multipliers[4]
         elif "lm_head" in name:
             tensor = tensor * self.hparams["lm_head_multiplier"]
         elif "embed_tokens" in name:
@@ -105,16 +106,14 @@ class FalconH1Model(Mamba2Model):
         self.gguf_writer.add_feed_forward_length(self.hparams["intermediate_size"])
 
         ## Attention params ##
-        self.gguf_writer.add_head_count(self.hparams["num_attention_heads"])  # Override value 0 from Mamba2
+        self.gguf_writer.add_head_count(self.hparams["num_attention_heads"]) # Override value 0 from Mamba2
         self.gguf_writer.add_head_count_kv(self.hparams["num_key_value_heads"])
         self.gguf_writer.add_key_length(self.hparams["head_dim"])
         self.gguf_writer.add_value_length(self.hparams["head_dim"])
 
         ## Validation ##
         assert self.hparams.get("hidden_act") in [None, "silu"], "Only SILU activation supported"
-        assert (
-            self.d_inner % self.d_head == 0
-        ), f"SSM inner size {self.d_inner} not a multiple of head dim {self.d_head}"
+        assert self.d_inner % self.d_head == 0, f"SSM inner size {self.d_inner} not a multiple of head dim {self.d_head}"
 
         # Add any other Falcon Mamba2 specific configuration
         self.gguf_writer.add_rope_freq_base(self.rope_parameters["rope_theta"])

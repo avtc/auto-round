@@ -18,14 +18,12 @@ class GrokModel(TextModel):
     model_arch = gguf.MODEL_ARCH.GROK
 
     def set_vocab(self):
-        if (self.dir_model / "tokenizer.model").is_file():
+        if (self.dir_model / 'tokenizer.model').is_file():
             self._set_vocab_sentencepiece()
             return
 
-        if not (self.dir_model / "tokenizer.json").is_file() or not (self.dir_model / "chat_template.jinja").is_file():
-            logger.error(
-                "Error: Missing vocab and chat template, download files from https://huggingface.co/alvarobartt/grok-2-tokenizer"
-            )
+        if not (self.dir_model / 'tokenizer.json').is_file() or not (self.dir_model / 'chat_template.jinja').is_file():
+            logger.error('Error: Missing vocab and chat template, download files from https://huggingface.co/alvarobartt/grok-2-tokenizer')
             sys.exit(1)
 
         self._set_vocab_gpt2()
@@ -38,7 +36,7 @@ class GrokModel(TextModel):
 
         self.gguf_writer.add_attn_logit_softcapping(self.hparams.get("attn_logit_softcapping", 30.0))
         self.gguf_writer.add_router_logit_softcapping(self.hparams.get("router_logit_softcapping", 30.0))
-        if final_logit_softcap := self.hparams.get("final_logit_softcapping"):
+        if (final_logit_softcap := self.hparams.get("final_logit_softcapping")):
             self.gguf_writer.add_final_logit_softcapping(final_logit_softcap)
 
         if (rope_dim := self.hparams.get("head_dim")) is None:

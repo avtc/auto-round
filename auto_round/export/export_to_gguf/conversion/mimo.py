@@ -29,9 +29,9 @@ class MimoV2Model(TextModel):
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
     @staticmethod
-    def _tp_aware_qkv_dequant(
-        weight: Tensor, scale_inv: Tensor, n_q: int, n_kv: int, hd: int, vhd: int, bs: int = 128
-    ) -> Tensor:
+    def _tp_aware_qkv_dequant(weight: Tensor, scale_inv: Tensor,
+                              n_q: int, n_kv: int, hd: int, vhd: int,
+                              bs: int = 128) -> Tensor:
         # MiMo-V2.5 (TP=4) and V2.5-Pro (TP=8) ship qkv_proj sharded across TP
         # ranks; per rank, rows are stacked as [Q_per | K_per | V_per].
         # weight_scale_inv has ceil(rows_per_rank/bs) block-rows per rank (last
@@ -59,8 +59,8 @@ class MimoV2Model(TextModel):
                 break
         if tp is None:
             raise ValueError(
-                f"qkv_proj: cannot detect TP - scale_inv rows {scale_inv.shape[0]}, " f"q+k+v {total_rows}"
-            )
+                f"qkv_proj: cannot detect TP - scale_inv rows {scale_inv.shape[0]}, "
+                f"q+k+v {total_rows}")
 
         q_per = q_size // tp
         k_per = k_size // tp
@@ -130,9 +130,8 @@ class MimoV2Model(TextModel):
             is_swa = True if bid >= n_layer_text else hybrid[bid] == 1
             n_kv = self.hparams["swa_num_key_value_heads" if is_swa else "num_key_value_heads"]
             self.model_tensors[weight_name] = (
-                lambda w_fn=w_fn, s_fn=s_fn, n_q=n_q, n_kv=n_kv, hd=hd, vhd=vhd: MimoV2Model._tp_aware_qkv_dequant(
-                    w_fn(), s_fn(), n_q, n_kv, hd, vhd
-                )
+                lambda w_fn=w_fn, s_fn=s_fn, n_q=n_q, n_kv=n_kv, hd=hd, vhd=vhd:
+                    MimoV2Model._tp_aware_qkv_dequant(w_fn(), s_fn(), n_q, n_kv, hd, vhd)
             )
 
     def set_gguf_parameters(self):
@@ -336,7 +335,7 @@ class MiMoV2VisionAudioModel(MmprojModel):
             if kt != 2:
                 raise ValueError(f"unexpected temporal_patch_size: {kt}")
             embd_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH]
-            yield (embd_name + ".weight", data_torch[:, :, 0, ...])
+            yield (embd_name + ".weight",   data_torch[:, :, 0, ...])
             yield (embd_name + ".weight.1", data_torch[:, :, 1, ...])
             return
 

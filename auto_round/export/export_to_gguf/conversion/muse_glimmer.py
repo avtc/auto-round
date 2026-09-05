@@ -36,7 +36,6 @@ class MuseGlimmerModel(TextModel):
         self._set_vocab_gpt2()
 
         from transformers import AutoTokenizer
-
         tok = AutoTokenizer.from_pretrained(self.dir_model)
         eot_id = tok.convert_tokens_to_ids("<|eot|>")
         if isinstance(eot_id, int) and eot_id >= 0:
@@ -111,7 +110,7 @@ class MuseGlimmerVisionModel(MmprojModel):
     _MM_MLP_MAP = {
         "model.vision_adapter.fc1": (gguf.MODEL_TENSOR.V_MMPROJ, 0),
         "model.vision_adapter.fc2": (gguf.MODEL_TENSOR.V_MMPROJ, 1),
-        "model.vision_projection": (gguf.MODEL_TENSOR.V_MMPROJ, 2),
+        "model.vision_projection":  (gguf.MODEL_TENSOR.V_MMPROJ, 2),
     }
 
     def modify_tensors(self, data_torch, name, bid):
@@ -149,7 +148,6 @@ class MuseGlimmerAssistantModel(TextModel):
         self.dir_model = self.target_model_dir
 
         from . import get_model_class
-
         with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
             target_arch = json.load(f)["architectures"][0]
         target_cls = get_model_class(target_arch)

@@ -67,7 +67,9 @@ class Cohere2Model(TextModel):
 class Cohere2MoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.COHERE2MOE
     _n_main_layers: int | None = None
-    _expert_tensor_re = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(down_proj|gate_proj|up_proj)\.weight")
+    _expert_tensor_re = re.compile(
+        r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(down_proj|gate_proj|up_proj)\.weight"
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -126,20 +128,11 @@ class Cohere2MoeModel(TextModel):
         name, gen = titem
 
         if cls._n_main_layers is not None:
-            is_mtp = (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None and int(
-                m.group(1)
-            ) >= cls._n_main_layers
+            is_mtp = (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None and int(m.group(1)) >= cls._n_main_layers
             if is_mtp and cls.no_mtp:
                 return None
-            if (
-                cls.mtp_only
-                and not is_mtp
-                and name
-                not in (
-                    "model.embed_tokens.weight",
-                    "model.norm.weight",
-                    "lm_head.weight",
-                )
+            if cls.mtp_only and not is_mtp and name not in (
+                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
             ):
                 return None
 

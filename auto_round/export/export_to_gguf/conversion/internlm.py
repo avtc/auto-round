@@ -26,26 +26,24 @@ class InternLM2Model(TextModel):
         from sentencepiece import SentencePieceProcessor
         from sentencepiece import sentencepiece_model_pb2 as model
 
-        tokenizer_path = self.dir_model / "tokenizer.model"
+        tokenizer_path = self.dir_model / 'tokenizer.model'
 
         tokens: list[bytes] = []
         scores: list[float] = []
         toktypes: list[int] = []
 
         if not tokenizer_path.is_file():
-            logger.error(f"Error: Missing {tokenizer_path}")
+            logger.error(f'Error: Missing {tokenizer_path}')
             sys.exit(1)
 
-        sentencepiece_model = (
-            model.ModelProto()
-        )  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
         sentencepiece_model.ParseFromString(open(tokenizer_path, "rb").read())
         add_prefix = sentencepiece_model.normalizer_spec.add_dummy_prefix
 
         tokenizer = SentencePieceProcessor()
         tokenizer.LoadFromFile(str(tokenizer_path))
 
-        vocab_size = self.hparams.get("vocab_size", tokenizer.vocab_size())
+        vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
 
         for token_id in range(vocab_size):
             piece = tokenizer.IdToPiece(token_id)
@@ -67,14 +65,14 @@ class InternLM2Model(TextModel):
             elif tokenizer.IsByte(token_id):
                 toktype = SentencePieceTokenTypes.BYTE
             # take care of ununsed raw token
-            if piece.startswith("[UNUSED"):
+            if piece.startswith('[UNUSED'):
                 toktype = SentencePieceTokenTypes.UNUSED
 
             tokens.append(text)
             scores.append(score)
             toktypes.append(toktype)
 
-        added_tokens_file = self.dir_model / "added_tokens.json"
+        added_tokens_file = self.dir_model / 'added_tokens.json'
         if added_tokens_file.is_file():
             with open(added_tokens_file, "r", encoding="utf-8") as f:
                 added_tokens_json = json.load(f)
@@ -84,10 +82,10 @@ class InternLM2Model(TextModel):
                     scores.append(-1000.0)
                     toktypes.append(SentencePieceTokenTypes.USER_DEFINED)
 
-        chat_eos_token = "<|im_end|>"
+        chat_eos_token = '<|im_end|>'
         chat_eos_token_id = None
 
-        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
+        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
         if tokenizer_config_file.is_file():
             with open(tokenizer_config_file, "r", encoding="utf-8") as f:
                 tokenizer_config_json = json.load(f)
@@ -100,16 +98,14 @@ class InternLM2Model(TextModel):
                     token = token.encode("utf-8")
                     if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
                         if tokens[token_id] != token:
-                            logger.warning(
-                                f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}'
-                            )
+                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}')
                     tokens[token_id] = token
                     scores[token_id] = -1000.0
                     toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
                     if foken_data.get("special"):
                         toktypes[token_id] = SentencePieceTokenTypes.CONTROL
 
-        tokenizer_file = self.dir_model / "tokenizer.json"
+        tokenizer_file = self.dir_model / 'tokenizer.json'
         if tokenizer_file.is_file():
             with open(tokenizer_file, "r", encoding="utf-8") as f:
                 tokenizer_json = json.load(f)
@@ -122,9 +118,7 @@ class InternLM2Model(TextModel):
                     token = token.encode("utf-8")
                     if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
                         if tokens[token_id] != token:
-                            logger.warning(
-                                f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}'
-                            )
+                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}')
                     tokens[token_id] = token
                     scores[token_id] = -1000.0
                     toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
@@ -145,10 +139,8 @@ class InternLM2Model(TextModel):
             # TODO: this is a hack, should be fixed
             #       https://github.com/ggml-org/llama.cpp/pull/6745#issuecomment-2067687048
             special_vocab.special_token_ids["eos"] = chat_eos_token_id
-            logger.warning(
-                f"Replace eos:{old_eos} with a special token:{chat_eos_token_id}"
-                " in chat mode so that the conversation can end normally."
-            )
+            logger.warning(f"Replace eos:{old_eos} with a special token:{chat_eos_token_id}"
+                           " in chat mode so that the conversation can end normally.")
 
         special_vocab.add_to_gguf(self.gguf_writer)
 
@@ -164,7 +156,7 @@ class InternLM2Model(TextModel):
             qkv = data_torch
 
             qkv = qkv.reshape((num_groups, q_per_kv + 2, head_dim, n_embd))
-            q, k, v = qkv[:, :q_per_kv], qkv[:, -2], qkv[:, -1]
+            q, k, v = qkv[:, : q_per_kv], qkv[:, -2], qkv[:, -1]
 
             # The model weights of q and k equire additional reshape.
             q = LlamaModel.permute(q.reshape((-1, q.shape[-1])), num_heads, num_heads)
@@ -194,7 +186,7 @@ class InternLM3Model(TextModel):
 
         special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
 
-        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
+        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
         if tokenizer_config_file.is_file():
             with open(tokenizer_config_file, "r", encoding="utf-8") as f:
                 tokenizer_config_json = json.load(f)
@@ -208,7 +200,7 @@ class InternLM3Model(TextModel):
                             token = token_data["content"]
                             special_vocab._set_special_token(token, token_id)
                             # update eos token
-                            if token == "<|im_end|>" and "eos" in special_vocab.special_token_ids:
+                            if token == '<|im_end|>' and "eos" in special_vocab.special_token_ids:
                                 special_vocab.special_token_ids["eos"] = token_id
 
         special_vocab.add_to_gguf(self.gguf_writer)

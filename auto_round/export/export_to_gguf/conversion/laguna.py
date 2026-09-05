@@ -109,12 +109,12 @@ class LagunaModel(TextModel):
         # rope_freq_base(_swa) and the YaRN params from self.rope_parameters.
         head_dim = hparams["head_dim"]
         full_rope = self.rope_parameters["full_attention"]
-        self.gguf_writer.add_rope_dimension_count(int(head_dim * float(full_rope.get("partial_rotary_factor", 1.0))))
+        self.gguf_writer.add_rope_dimension_count(
+            int(head_dim * float(full_rope.get("partial_rotary_factor", 1.0))))
         swa_rope = self.rope_parameters.get("sliding_attention")
         if swa_rope is not None:
             self.gguf_writer.add_rope_dimension_count_swa(
-                int(head_dim * float(swa_rope.get("partial_rotary_factor", 1.0)))
-            )
+                int(head_dim * float(swa_rope.get("partial_rotary_factor", 1.0))))
 
     def _attn_gate_types(self) -> list[str]:
         """Per-layer attention output gate type: "per_head" or "per_element".
@@ -143,9 +143,8 @@ class LagunaModel(TextModel):
             raise ValueError(f"Laguna: unrecognised attention gate type {t!r}")
 
         if gating_types:
-            assert (
-                len(gating_types) == n_layer
-            ), f"gating_types length {len(gating_types)} != num_hidden_layers {n_layer}"
+            assert len(gating_types) == n_layer, (
+                f"gating_types length {len(gating_types)} != num_hidden_layers {n_layer}")
             types = [_norm(t) for t in gating_types]
         elif isinstance(gating, str):
             types = [_norm(gating)] * n_layer
@@ -153,16 +152,16 @@ class LagunaModel(TextModel):
             types = ["per_head"] * n_layer
         else:
             raise ValueError(
-                f"Laguna: cannot determine attention gate type " f"(gating={gating!r}, gating_types={gating_types!r})"
-            )
+                f"Laguna: cannot determine attention gate type "
+                f"(gating={gating!r}, gating_types={gating_types!r})")
 
-        if any(t == "per_element" for t in types) and not (isinstance(gating, str) and _norm(gating) == "per_element"):
+        if any(t == "per_element" for t in types) and not (
+                isinstance(gating, str) and _norm(gating) == "per_element"):
             raise ValueError(
                 f"Laguna config declares a per-element attention gate but "
-                f'`gating`={gating!r} is not the string "per-element". Runtimes that '
+                f"`gating`={gating!r} is not the string \"per-element\". Runtimes that "
                 f"read `gating` (vLLM, transformers) will mis-handle this checkpoint as "
-                f'per-head. Set gating="per-element" in the source config.'
-            )
+                f"per-head. Set gating=\"per-element\" in the source config.")
 
         self._gate_types = types
         return types
@@ -179,17 +178,12 @@ class LagunaModel(TextModel):
             if self._experts is None:
                 self._experts = [{} for _ in range(self.block_count)]
             self._experts[bid][name] = data_torch
-            needed = [
-                f"model.layers.{bid}.mlp.experts.{x}.{w}.weight"
-                for x in range(n_experts)
-                for w in ("gate_proj", "up_proj", "down_proj")
-            ]
+            needed = [f"model.layers.{bid}.mlp.experts.{x}.{w}.weight"
+                      for x in range(n_experts) for w in ("gate_proj", "up_proj", "down_proj")]
             if all(e in self._experts[bid] for e in needed):
                 for w_name in ["gate_proj", "up_proj", "down_proj"]:
-                    datas = [
-                        self._experts[bid][f"model.layers.{bid}.mlp.experts.{x}.{w_name}.weight"]
-                        for x in range(n_experts)
-                    ]
+                    datas = [self._experts[bid][f"model.layers.{bid}.mlp.experts.{x}.{w_name}.weight"]
+                             for x in range(n_experts)]
                     stacked = torch.stack(datas, dim=0)
                     merged = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
                     yield from TextModel.modify_tensors(self, stacked, merged, bid)
@@ -199,10 +193,8 @@ class LagunaModel(TextModel):
         # Cross-check the gate projection width against the declared gate type;
         # a mismatch means the weights and config disagree -> fail, do not guess.
         if bid is not None and name.endswith("self_attn.g_proj.weight"):
-            heads = (
-                self.hparams.get("num_attention_heads_per_layer")
-                or [self.hparams["num_attention_heads"]] * self.hparams["num_hidden_layers"]
-            )
+            heads = (self.hparams.get("num_attention_heads_per_layer")
+                     or [self.hparams["num_attention_heads"]] * self.hparams["num_hidden_layers"])
             n_head = heads[bid]
             head_dim = self.hparams["head_dim"]
             gate_type = self._attn_gate_types()[bid]
@@ -211,7 +203,6 @@ class LagunaModel(TextModel):
             if out_features != expected:
                 raise ValueError(
                     f"Laguna layer {bid}: g_proj output width {out_features} contradicts the "
-                    f"declared {gate_type} gate (expected {expected}); weights and config disagree."
-                )
+                    f"declared {gate_type} gate (expected {expected}); weights and config disagree.")
 
         yield from TextModel.modify_tensors(self, data_torch, name, bid)

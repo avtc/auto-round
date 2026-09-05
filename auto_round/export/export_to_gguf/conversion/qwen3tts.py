@@ -76,7 +76,7 @@ class Qwen3TTSTalkerModel(TextModel):
         for key, val in self._talker_config.items():
             if not key.endswith("_id"):
                 continue
-            prefix = key[: -len("_id")]
+            prefix = key[:-len("_id")]
             if isinstance(val, int):
                 names[val] = f"<|{prefix}|>"
             elif isinstance(val, dict):
@@ -128,9 +128,10 @@ class Qwen3TTSTalkerModel(TextModel):
 
         vocab_size = self.hparams["vocab_size"] + self.n_codec_vocab
         codec_eos_token_id = self.hparams["vocab_size"] + self._talker_config["codec_eos_token_id"]
-        self.gguf_writer.add_suppress_tokens(
-            [i for i in range(vocab_size - 1024, vocab_size) if i != codec_eos_token_id]
-        )
+        self.gguf_writer.add_suppress_tokens([
+            i for i in range(vocab_size - 1024, vocab_size)
+            if i != codec_eos_token_id
+        ])
         self.gguf_writer.add_eos_token_id(codec_eos_token_id)
         self.gguf_writer.add_add_eos_token(False)
 
@@ -141,7 +142,7 @@ class Qwen3TTSTalkerModel(TextModel):
         if not name.startswith("talker.") or name.startswith("talker.code_predictor."):
             return None
 
-        name = name[len("talker.") :]
+        name = name[len("talker."):]
         return super().filter_tensors((name, gen))
 
     def _maybe_emit_token_embd(self) -> Iterable[tuple[str, Tensor]]:
@@ -171,18 +172,12 @@ class Qwen3TTSTalkerModel(TextModel):
             # fold MLP into the embedding table at conversion time, MLP won't be used at inference time anyway
             act_fn = _ACT2FN[self.hparams["hidden_act"]]
             embed = self._text_proj_buffer["model.text_embedding.weight"]
-            hidden = act_fn(
-                F.linear(
-                    embed,
-                    self._text_proj_buffer["text_projection.linear_fc1.weight"],
-                    self._text_proj_buffer["text_projection.linear_fc1.bias"],
-                )
-            )
-            folded = F.linear(
-                hidden,
-                self._text_proj_buffer["text_projection.linear_fc2.weight"],
-                self._text_proj_buffer["text_projection.linear_fc2.bias"],
-            )
+            hidden = act_fn(F.linear(embed,
+                                     self._text_proj_buffer["text_projection.linear_fc1.weight"],
+                                     self._text_proj_buffer["text_projection.linear_fc1.bias"]))
+            folded = F.linear(hidden,
+                              self._text_proj_buffer["text_projection.linear_fc2.weight"],
+                              self._text_proj_buffer["text_projection.linear_fc2.bias"])
             self._folded_text_embed = folded
             yield from self._maybe_emit_token_embd()
             return
@@ -335,9 +330,9 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
             return
 
         if name.startswith("talker.code_predictor.model.layers."):
-            rest = name.split("model.layers.")[1]  # "{bid}.<key>.weight"
-            _, key_with_suffix = rest.split(".", 1)  # "<key>.weight"
-            key = key_with_suffix.rsplit(".", 1)[0]  # "<key>"
+            rest = name.split("model.layers.")[1]        # "{bid}.<key>.weight"
+            _, key_with_suffix = rest.split(".", 1)       # "<key>.weight"
+            key = key_with_suffix.rsplit(".", 1)[0]        # "<key>"
             tensor = self._CODE_LAYER_TENSOR_MAP.get(key)
             if tensor is not None:
                 yield (self.format_tensor_name(tensor, bid), data_torch)
@@ -382,63 +377,36 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
         T = gguf.MODEL_TENSOR
 
         # --- quantizer: RVQ codebook decode ---
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_QUANT_FIRST_IN),
-            get("decoder.quantizer.rvq_first.input_proj.weight").squeeze(-1),
-        )
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_QUANT_FIRST_OUT),
-            get("decoder.quantizer.rvq_first.output_proj.weight").squeeze(-1),
-        )
+        yield (self.format_tensor_name(T.A_GEN_WAV_QUANT_FIRST_IN), get("decoder.quantizer.rvq_first.input_proj.weight").squeeze(-1))
+        yield (self.format_tensor_name(T.A_GEN_WAV_QUANT_FIRST_OUT), get("decoder.quantizer.rvq_first.output_proj.weight").squeeze(-1))
         yield (self.format_tensor_name(T.A_GEN_WAV_QUANT_FIRST_CB), rvq_codebook("decoder.quantizer.rvq_first", 1))
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_QUANT_REST_IN),
-            get("decoder.quantizer.rvq_rest.input_proj.weight").squeeze(-1),
-        )
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_QUANT_REST_OUT),
-            get("decoder.quantizer.rvq_rest.output_proj.weight").squeeze(-1),
-        )
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_QUANT_REST_CB),
-            rvq_codebook("decoder.quantizer.rvq_rest", self._CODE_GEN_N_CODEBOOKS),
-        )
+        yield (self.format_tensor_name(T.A_GEN_WAV_QUANT_REST_IN), get("decoder.quantizer.rvq_rest.input_proj.weight").squeeze(-1))
+        yield (self.format_tensor_name(T.A_GEN_WAV_QUANT_REST_OUT), get("decoder.quantizer.rvq_rest.output_proj.weight").squeeze(-1))
+        yield (self.format_tensor_name(T.A_GEN_WAV_QUANT_REST_CB), rvq_codebook("decoder.quantizer.rvq_rest", self._CODE_GEN_N_CODEBOOKS))
 
         # --- pre_conv ---
         yield (self.format_tensor_name(T.A_GEN_WAV_PRE_CONV, suffix=".weight"), get("decoder.pre_conv.conv.weight"))
         yield (self.format_tensor_name(T.A_GEN_WAV_PRE_CONV, suffix=".bias"), get("decoder.pre_conv.conv.bias"))
 
         # --- pre_transformer ---
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_TFM_IN_PROJ, suffix=".weight"),
-            get("decoder.pre_transformer.input_proj.weight"),
-        )
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_TFM_IN_PROJ, suffix=".bias"),
-            get("decoder.pre_transformer.input_proj.bias"),
-        )
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_TFM_OUT_PROJ, suffix=".weight"),
-            get("decoder.pre_transformer.output_proj.weight"),
-        )
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_TFM_OUT_PROJ, suffix=".bias"),
-            get("decoder.pre_transformer.output_proj.bias"),
-        )
+        yield (self.format_tensor_name(T.A_GEN_WAV_TFM_IN_PROJ, suffix=".weight"), get("decoder.pre_transformer.input_proj.weight"))
+        yield (self.format_tensor_name(T.A_GEN_WAV_TFM_IN_PROJ, suffix=".bias"), get("decoder.pre_transformer.input_proj.bias"))
+        yield (self.format_tensor_name(T.A_GEN_WAV_TFM_OUT_PROJ, suffix=".weight"), get("decoder.pre_transformer.output_proj.weight"))
+        yield (self.format_tensor_name(T.A_GEN_WAV_TFM_OUT_PROJ, suffix=".bias"), get("decoder.pre_transformer.output_proj.bias"))
         yield (self.format_tensor_name(T.A_GEN_WAV_TFM_OUTPUT_NORM), get("decoder.pre_transformer.norm.weight"))
 
         tfm_layer_map = {
-            "input_layernorm.weight": T.A_GEN_WAV_TFM_ATTN_NORM,
-            "self_attn.q_proj.weight": T.A_GEN_WAV_TFM_ATTN_Q,
-            "self_attn.k_proj.weight": T.A_GEN_WAV_TFM_ATTN_K,
-            "self_attn.v_proj.weight": T.A_GEN_WAV_TFM_ATTN_V,
-            "self_attn.o_proj.weight": T.A_GEN_WAV_TFM_ATTN_OUT,
-            "self_attn_layer_scale.scale": T.A_GEN_WAV_TFM_ATTN_SCALE,
+            "input_layernorm.weight":         T.A_GEN_WAV_TFM_ATTN_NORM,
+            "self_attn.q_proj.weight":        T.A_GEN_WAV_TFM_ATTN_Q,
+            "self_attn.k_proj.weight":        T.A_GEN_WAV_TFM_ATTN_K,
+            "self_attn.v_proj.weight":        T.A_GEN_WAV_TFM_ATTN_V,
+            "self_attn.o_proj.weight":        T.A_GEN_WAV_TFM_ATTN_OUT,
+            "self_attn_layer_scale.scale":    T.A_GEN_WAV_TFM_ATTN_SCALE,
             "post_attention_layernorm.weight": T.A_GEN_WAV_TFM_FFN_NORM,
-            "mlp.gate_proj.weight": T.A_GEN_WAV_TFM_FFN_GATE,
-            "mlp.up_proj.weight": T.A_GEN_WAV_TFM_FFN_UP,
-            "mlp.down_proj.weight": T.A_GEN_WAV_TFM_FFN_DOWN,
-            "mlp_layer_scale.scale": T.A_GEN_WAV_TFM_FFN_SCALE,
+            "mlp.gate_proj.weight":           T.A_GEN_WAV_TFM_FFN_GATE,
+            "mlp.up_proj.weight":             T.A_GEN_WAV_TFM_FFN_UP,
+            "mlp.down_proj.weight":           T.A_GEN_WAV_TFM_FFN_DOWN,
+            "mlp_layer_scale.scale":          T.A_GEN_WAV_TFM_FFN_SCALE,
         }
         assert wav_config is not None
         for bid in range(wav_config["num_hidden_layers"]):
@@ -447,17 +415,17 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
 
         # --- upsample: 2x (causal ConvTranspose1d + ConvNeXt block) ---
         up_map = {
-            "0.conv.weight": (T.A_GEN_WAV_UP_CONV, ".weight"),
-            "0.conv.bias": (T.A_GEN_WAV_UP_CONV, ".bias"),
+            "0.conv.weight":     (T.A_GEN_WAV_UP_CONV, ".weight"),
+            "0.conv.bias":       (T.A_GEN_WAV_UP_CONV, ".bias"),
             "1.dwconv.conv.weight": (T.A_GEN_WAV_UP_DWCONV, ".weight"),
-            "1.dwconv.conv.bias": (T.A_GEN_WAV_UP_DWCONV, ".bias"),
-            "1.norm.weight": (T.A_GEN_WAV_UP_NORM, ".weight"),
-            "1.norm.bias": (T.A_GEN_WAV_UP_NORM, ".bias"),
-            "1.pwconv1.weight": (T.A_GEN_WAV_UP_PW1, ".weight"),
-            "1.pwconv1.bias": (T.A_GEN_WAV_UP_PW1, ".bias"),
-            "1.pwconv2.weight": (T.A_GEN_WAV_UP_PW2, ".weight"),
-            "1.pwconv2.bias": (T.A_GEN_WAV_UP_PW2, ".bias"),
-            "1.gamma": (T.A_GEN_WAV_UP_GAMMA, ""),
+            "1.dwconv.conv.bias":   (T.A_GEN_WAV_UP_DWCONV, ".bias"),
+            "1.norm.weight":     (T.A_GEN_WAV_UP_NORM, ".weight"),
+            "1.norm.bias":       (T.A_GEN_WAV_UP_NORM, ".bias"),
+            "1.pwconv1.weight":  (T.A_GEN_WAV_UP_PW1, ".weight"),
+            "1.pwconv1.bias":    (T.A_GEN_WAV_UP_PW1, ".bias"),
+            "1.pwconv2.weight":  (T.A_GEN_WAV_UP_PW2, ".weight"),
+            "1.pwconv2.bias":    (T.A_GEN_WAV_UP_PW2, ".bias"),
+            "1.gamma":           (T.A_GEN_WAV_UP_GAMMA, ""),
         }
         for bid in range(len(wav_config["upsampling_ratios"])):
             for key, (tensor_id, suffix) in up_map.items():
@@ -474,22 +442,13 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
             a, b = snake_fold(get(f"decoder.decoder.{py}.block.0.alpha"), get(f"decoder.decoder.{py}.block.0.beta"))
             yield (self.format_tensor_name(T.A_GEN_WAV_DAC_UP_SNAKE, bid, suffix=".alpha"), a)
             yield (self.format_tensor_name(T.A_GEN_WAV_DAC_UP_SNAKE, bid, suffix=".beta"), b)
-            yield (
-                self.format_tensor_name(T.A_GEN_WAV_DAC_UP_CONV, bid, suffix=".weight"),
-                get(f"decoder.decoder.{py}.block.1.conv.weight"),
-            )
-            yield (
-                self.format_tensor_name(T.A_GEN_WAV_DAC_UP_CONV, bid, suffix=".bias"),
-                get(f"decoder.decoder.{py}.block.1.conv.bias"),
-            )
+            yield (self.format_tensor_name(T.A_GEN_WAV_DAC_UP_CONV, bid, suffix=".weight"), get(f"decoder.decoder.{py}.block.1.conv.weight"))
+            yield (self.format_tensor_name(T.A_GEN_WAV_DAC_UP_CONV, bid, suffix=".bias"), get(f"decoder.decoder.{py}.block.1.conv.bias"))
 
             for xid in range(3):
                 ridx = xid + 2  # block.2/3/4 are the 3 residual units
 
-                a1, b1 = snake_fold(
-                    get(f"decoder.decoder.{py}.block.{ridx}.act1.alpha"),
-                    get(f"decoder.decoder.{py}.block.{ridx}.act1.beta"),
-                )
+                a1, b1 = snake_fold(get(f"decoder.decoder.{py}.block.{ridx}.act1.alpha"), get(f"decoder.decoder.{py}.block.{ridx}.act1.beta"))
                 name1 = gguf.TENSOR_NAMES[T.A_GEN_WAV_DAC_RES_ACT1].format(bid=bid, xid=xid)
                 yield (name1 + ".alpha", a1)
                 yield (name1 + ".beta", b1)
@@ -498,10 +457,7 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
                 yield (name_conv1 + ".weight", get(f"decoder.decoder.{py}.block.{ridx}.conv1.conv.weight"))
                 yield (name_conv1 + ".bias", get(f"decoder.decoder.{py}.block.{ridx}.conv1.conv.bias"))
 
-                a2, b2 = snake_fold(
-                    get(f"decoder.decoder.{py}.block.{ridx}.act2.alpha"),
-                    get(f"decoder.decoder.{py}.block.{ridx}.act2.beta"),
-                )
+                a2, b2 = snake_fold(get(f"decoder.decoder.{py}.block.{ridx}.act2.alpha"), get(f"decoder.decoder.{py}.block.{ridx}.act2.beta"))
                 name2 = gguf.TENSOR_NAMES[T.A_GEN_WAV_DAC_RES_ACT2].format(bid=bid, xid=xid)
                 yield (name2 + ".alpha", a2)
                 yield (name2 + ".beta", b2)
@@ -513,8 +469,5 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
         a5, b5 = snake_fold(get("decoder.decoder.5.alpha"), get("decoder.decoder.5.beta"))
         yield (self.format_tensor_name(T.A_GEN_WAV_DAC_POST_SNAKE, suffix=".alpha"), a5)
         yield (self.format_tensor_name(T.A_GEN_WAV_DAC_POST_SNAKE, suffix=".beta"), b5)
-        yield (
-            self.format_tensor_name(T.A_GEN_WAV_DAC_POST_CONV, suffix=".weight"),
-            get("decoder.decoder.6.conv.weight"),
-        )
+        yield (self.format_tensor_name(T.A_GEN_WAV_DAC_POST_CONV, suffix=".weight"), get("decoder.decoder.6.conv.weight"))
         yield (self.format_tensor_name(T.A_GEN_WAV_DAC_POST_CONV, suffix=".bias"), get("decoder.decoder.6.conv.bias"))

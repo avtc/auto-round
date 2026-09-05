@@ -53,13 +53,13 @@ class LFM2Model(TextModel):
             # skip multimodal tensors
             return None
 
-        name = name.replace("lfm.", "model.")  # audio
+        name = name.replace("lfm.", "model.")      # audio
 
         return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # conv op requires 2d tensor
-        if "conv.conv" in name:
+        if 'conv.conv' in name:
             data_torch = data_torch.squeeze(1)
 
         yield from super().modify_tensors(data_torch, name, bid)
@@ -86,7 +86,6 @@ class LFM2ColBertModel(LFM2Model):
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         # optional dense tensor is stored in a separate safetensors file
         from safetensors.torch import load_file
-
         tensors_file = self.dir_model / "1_Dense" / "model.safetensors"
         if not tensors_file.is_file():
             return
@@ -130,11 +129,11 @@ class LFM2MoeModel(TextModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # conv op requires 2d tensor
-        if "conv.conv" in name:
+        if 'conv.conv' in name:
             data_torch = data_torch.squeeze(1)
 
         # merge expert weights
-        if "experts" in name:
+        if 'experts' in name:
             n_experts = self.find_hparam(["num_local_experts", "num_experts"])
             assert bid is not None
 

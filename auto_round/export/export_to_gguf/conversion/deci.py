@@ -33,8 +33,8 @@ class DeciModel(TextModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        if "block_configs" in self.hparams:  # Llama-3_1-Nemotron-51B
-            _block_configs: list[dict[str, Any]] = self.hparams["block_configs"]
+        if "block_configs" in self.hparams: # Llama-3_1-Nemotron-51B
+            _block_configs: list[dict[str,Any]] = self.hparams["block_configs"]
             assert self.block_count == len(_block_configs)
             self._num_kv_heads = list()
             self._num_heads = list()
@@ -61,11 +61,9 @@ class DeciModel(TextModel):
                         self._num_kv_heads.append(0)
                         self._num_heads.append(0)
                 else:
-                    self._num_kv_heads.append(
-                        self.hparams["num_attention_heads"] // _block_configs[il]["attention"]["n_heads_in_group"]
-                    )
+                    self._num_kv_heads.append(self.hparams["num_attention_heads"] // _block_configs[il]["attention"]["n_heads_in_group"])
                     self._num_heads.append(self.hparams["num_attention_heads"])
-                if _block_configs[il]["ffn"]["ffn_mult"] is None:  # dummy layer
+                if _block_configs[il]["ffn"]["ffn_mult"] is None: # dummy layer
                     _ffn_multipliers.append(0.0)
                 else:
                     _ffn_multipliers.append(_block_configs[il]["ffn"]["ffn_mult"])
@@ -97,7 +95,7 @@ class DeciModel(TextModel):
             self._set_vocab_llama_hf()
 
     def set_gguf_parameters(self):
-        if "block_configs" in self.hparams:  # Llama-3_1-Nemotron-51B
+        if "block_configs" in self.hparams: # Llama-3_1-Nemotron-51B
             assert self.block_count == len(self._num_kv_heads)
             assert self.block_count == len(self._num_heads)
             assert self.block_count == len(self._ffn_dims)
@@ -113,9 +111,9 @@ class DeciModel(TextModel):
             self.gguf_writer.add_key_length(self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
             self.gguf_writer.add_value_length(self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
             self.gguf_writer.add_file_type(self.ftype)
-        else:  # DeciLM-7B
+        else: # DeciLM-7B
             super().set_gguf_parameters()
-            if "num_key_value_heads_per_layer" in self.hparams:  # DeciLM-7B
+            if "num_key_value_heads_per_layer" in self.hparams: # DeciLM-7B
                 self._num_kv_heads: list[int] = self.hparams["num_key_value_heads_per_layer"]
                 assert self.block_count == len(self._num_kv_heads)
                 self.gguf_writer.add_head_count_kv(self._num_kv_heads)
@@ -130,11 +128,9 @@ class DeciModel(TextModel):
     def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
         if n_head_kv is not None and n_head != n_head_kv:
             n_head = n_head_kv
-        return (
-            weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
-            .swapaxes(1, 2)
-            .reshape(weights.shape)
-        )
+        return (weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
+                .swapaxes(1, 2)
+                .reshape(weights.shape))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         n_head = self.hparams["num_attention_heads"]
@@ -157,7 +153,7 @@ class DeciModel(TextModel):
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if rope_params := self.rope_parameters.get("full_attention", self.rope_parameters):
-            if rope_params.get("rope_type", "").lower() == "llama3":
+            if rope_params.get("rope_type", '').lower() == "llama3":
                 base = rope_params.get("rope_theta", 10000.0)
                 if (dim := self.hparams.get("head_dim")) is None:
                     dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
@@ -183,10 +179,7 @@ class DeciModel(TextModel):
                         smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
                         rope_factors.append(1 / ((1 - smooth) / factor + smooth))
 
-                yield (
-                    self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS),
-                    torch.tensor(rope_factors, dtype=torch.float32),
-                )
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), torch.tensor(rope_factors, dtype=torch.float32))
 
     def prepare_tensors(self):
         super().prepare_tensors()

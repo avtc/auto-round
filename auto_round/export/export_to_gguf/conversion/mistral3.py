@@ -31,15 +31,15 @@ class Mistral3Model(TextModel):
 
     class Mistral4Model(DeepseekV2Model):
         model_arch = gguf.MODEL_ARCH.MISTRAL4
-        skip_mtp = False  # model contains no MTP layers, so no need to skip
-        merge_expert = False  # experts are already stacked as 3D
+        skip_mtp = False # model contains no MTP layers, so no need to skip
+        merge_expert = False # experts are already stacked as 3D
 
         def modify_tensors(self, data_torch, name, bid):
             if name.endswith(".down_proj") or name.endswith(".gate_up_proj"):
                 name = name + ".weight"
             yield from super().modify_tensors(data_torch, name, bid)
 
-    model_arch = gguf.MODEL_ARCH.MISTRAL3  # unused
+    model_arch = gguf.MODEL_ARCH.MISTRAL3 # unused
     impl: TextModel
 
     def __init__(self, *args, **kwargs):

@@ -11,13 +11,11 @@ from .base import MmprojModel, ModelBase, TextModel, gguf
 @ModelBase.register("UltravoxModel")
 @ModelBase.example("fixie-ai/ultravox-v0_5-llama-3_2-1b")
 class UltravoxModel(TextModel):
-    model_arch = gguf.MODEL_ARCH.LLAMA  # dummy
+    model_arch = gguf.MODEL_ARCH.LLAMA # dummy
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        raise NotImplementedError(
-            "Ultravox does not have text decoder. Instead, it uses Llama or other models for text. If you want to get the audio encoder, please use --mmproj argument"
-        )
+        raise NotImplementedError("Ultravox does not have text decoder. Instead, it uses Llama or other models for text. If you want to get the audio encoder, please use --mmproj argument")
 
 
 @ModelBase.register("GlmasrModel")
@@ -54,11 +52,11 @@ class GlmASRWhisperEncoderModel(MmprojModel):
             return None
 
         if name.startswith("audio_encoder.whisper."):
-            name = name.replace("audio_encoder.whisper.", "audio_tower.")
+            name = name.replace("audio_encoder.whisper.","audio_tower.")
         if "audio_encoder.layer_norm." in name or "audio_encoder.proj." in name:
             name = name.replace("audio_encoder.", "audio_encoder.adapting.")
         if name.startswith("audio_encoder.adapting."):
-            name = name.replace("audio_encoder.adapting.", "audio.multi_modal_projector.")
+            name = name.replace("audio_encoder.adapting.","audio.multi_modal_projector.")
             if ".layer_norm." in name:
                 name = name.replace(".layer_norm.", ".ln_pre.")
             if ".0." in name:
@@ -88,7 +86,7 @@ class GlmASRWhisperEncoderModel(MmprojModel):
 @ModelBase.register("Qwen2AudioForConditionalGeneration")
 @ModelBase.example("Qwen/Qwen2-Audio-7B-Instruct")
 class WhisperEncoderModel(MmprojModel):
-    has_vision_encoder = False  # no vision encoder
+    has_vision_encoder = False # no vision encoder
     has_audio_encoder = True
 
     def __init__(self, *args, **kwargs):
@@ -130,7 +128,7 @@ class WhisperEncoderModel(MmprojModel):
 @ModelBase.register("UltravoxModel")
 @ModelBase.example("fixie-ai/ultravox-v0_5-llama-3_2-1b")
 class UltravoxWhisperEncoderModel(WhisperEncoderModel):
-    has_vision_encoder = False  # no vision encoder
+    has_vision_encoder = False # no vision encoder
     has_audio_encoder = True
 
     def set_gguf_parameters(self):
@@ -189,13 +187,13 @@ class MERaLiONWhisperEncoderModel(WhisperEncoderModel):
 @ModelBase.register("VoxtralForConditionalGeneration")
 @ModelBase.example("mistralai/Voxtral-Mini-3B-2507")
 class VoxtralWhisperEncoderModel(WhisperEncoderModel):
-    has_vision_encoder = False  # no vision encoder
+    has_vision_encoder = False # no vision encoder
     has_audio_encoder = True
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.VOXTRAL)
-        self.gguf_writer.add_audio_stack_factor(4)  # == intermediate_size // hidden_size
+        self.gguf_writer.add_audio_stack_factor(4) # == intermediate_size // hidden_size
 
 
 @ModelBase.register("AudioFlamingo3ForConditionalGeneration")

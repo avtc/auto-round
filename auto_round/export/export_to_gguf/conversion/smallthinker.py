@@ -25,7 +25,7 @@ class SmallThinkerModel(TextModel):
             self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
             self.gguf_writer.add_feed_forward_length(moe_intermediate_size)
             logger.info(f"gguf: expert feed forward length = {moe_intermediate_size}")
-        if self.hparams.get("moe_primary_router_apply_softmax"):
+        if (self.hparams.get('moe_primary_router_apply_softmax')):
             self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SOFTMAX)
         else:
             self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
@@ -44,9 +44,7 @@ class SmallThinkerModel(TextModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # process the experts separately
         if name.find("experts") != -1:
-            n_experts = self.hparams.get("moe_num_primary_experts") or self.find_hparam(
-                ["num_local_experts", "num_experts"]
-            )
+            n_experts = self.hparams.get("moe_num_primary_experts") or self.find_hparam(["num_local_experts", "num_experts"])
             assert bid is not None
 
             if self._experts is None:

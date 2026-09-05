@@ -14,7 +14,7 @@ class DotsOCRVisionModel(MmprojModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
-        self.hparams_vision["image_size"] = 0  # dynamic resolution
+        self.hparams_vision["image_size"] = 0 # dynamic resolution
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
