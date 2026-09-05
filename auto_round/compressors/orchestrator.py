@@ -1710,15 +1710,24 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # predictor behind gated-delta-net blocks must flip forms)
                 from auto_round.utils.streaming_calibration import materialize_mask_form, resolve_chain_mask_form
 
-                form = resolve_chain_mask_form(
-                    shell,
-                    fp_inputs[0],
-                    calib_state["keymask_2d"][0],
-                    io,
-                    preferred=calib_state.get("_mask_form"),
-                    amp=self.amp,
-                    amp_dtype=self.amp_dtype,
-                )
+                # the probe runs two rows: match the shell's single-row
+                # fallback e-input to that batch so the predictor forward's
+                # cat does not reject every form on shape
+                _e_single = shell._predictor_e
+                if isinstance(_e_single, torch.Tensor) and _e_single.dim() >= 1 and _e_single.shape[0] == 1:
+                    shell._predictor_e = torch.cat([_e_single, _e_single], dim=0)
+                try:
+                    form = resolve_chain_mask_form(
+                        shell,
+                        fp_inputs[0],
+                        calib_state["keymask_2d"][0],
+                        io,
+                        preferred=calib_state.get("_mask_form"),
+                        amp=self.amp,
+                        amp_dtype=self.amp_dtype,
+                    )
+                finally:
+                    shell._predictor_e = _e_single
                 io["attention_mask"] = [materialize_mask_form(m, form) for m in calib_state["keymask_2d"]]
             io["_predictor_e"] = e_rows
             ctx = BlockContext(

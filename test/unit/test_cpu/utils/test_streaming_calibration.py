@@ -255,3 +255,84 @@ class TestResolveChainMaskFormAmp:
             block, row, keymask, others, preferred="2d_float", amp=True, amp_dtype=torch.bfloat16
         )
         assert form == "2d_float"
+
+
+class TestResolveChainMaskFormBatchTwo:
+    """The mask-form probe must run with a two-row batch.
+
+    Per-row masks are ``[1, S]``: against a one-row probe forward such a mask
+    is broadcast-compatible with EVERY attention shape (SDPA broadcasts the
+    singleton head/position dims away), so at a layer-type transition the
+    probe accepts the previous block's form - e.g. the 2D float mask of GDN
+    blocks reaching a full-attention sdpa block - and the real replay, which
+    concatenates rows to ``[B, S]``, dies with a broadcast error inside
+    scaled_dot_product_attention. Two rows make wrong forms fail on shape.
+    The fakes below call the real F.scaled_dot_product_attention so the
+    broadcast semantics are the production ones.
+    """
+
+    def _full_attn_block(self):
+        class FullAttn(nn.Module):
+            """Full-attention block: mask goes straight into SDPA (4D only)."""
+
+            def __init__(self):
+                super().__init__()
+                self.heads = 4
+                self.head_dim = 8
+
+            def forward(self, hidden_states, attention_mask=None, **kwargs):
+                import torch.nn.functional as F
+
+                bsz, seq, hidden = hidden_states.shape
+                q = hidden_states.view(bsz, seq, self.heads, self.head_dim).transpose(1, 2)
+                k = q
+                v = q
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+                return out.transpose(1, 2).reshape(bsz, seq, hidden)
+
+        return FullAttn()
+
+    def _gdn_block(self):
+        class Gdn(nn.Module):
+            """Linear-attention block: consumes the 2D padding mask directly."""
+
+            def forward(self, hidden_states, attention_mask=None, **kwargs):
+                if attention_mask is not None:
+                    if attention_mask.dim() != 2 or attention_mask.shape != hidden_states.shape[:2]:
+                        raise ValueError("gdn mask must be [bsz, seq]")
+                return hidden_states * 1.0
+
+        return Gdn()
+
+    def test_gdn_to_full_attn_transition_rejects_2d_mask(self):
+        from auto_round.utils.streaming_calibration import resolve_chain_mask_form
+
+        block = self._full_attn_block()
+        row = torch.randn(1, 8, 32)
+        keymask = torch.ones(1, 8)  # per-row [1, S] like the chain stores
+        others = {}
+        # preferred = the GDN blocks' form: the probe must not accept it here
+        form = resolve_chain_mask_form(block, row, keymask, input_others={}, preferred="2d_float")
+        assert form != "2d_float", "one-row broadcast let the 2D mask into an SDPA block"
+        assert form in ("4d_bool", "4d_additive")
+
+    def test_gdn_blocks_keep_the_2d_form(self):
+        from auto_round.utils.streaming_calibration import resolve_chain_mask_form
+
+        block = self._gdn_block()
+        row = torch.randn(1, 8, 32)
+        keymask = torch.ones(1, 8)
+        form = resolve_chain_mask_form(block, row, keymask, input_others={}, preferred="2d_float")
+        assert form == "2d_float"
+        # and from the other direction: a full-attn form must not stick here
+        form = resolve_chain_mask_form(block, row, keymask, input_others={}, preferred="4d_bool")
+        assert form == "2d_float"
+
+    def test_full_attn_first_block_default_order(self):
+        from auto_round.utils.streaming_calibration import resolve_chain_mask_form
+
+        block = self._full_attn_block()
+        row = torch.randn(1, 8, 32)
+        keymask = torch.ones(1, 8)
+        form = resolve_chain_mask_form(block, row, keymask, input_others={})
+        assert form in ("4d_bool", "4d_additive")

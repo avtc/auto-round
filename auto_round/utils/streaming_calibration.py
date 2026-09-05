@@ -129,6 +129,14 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
     routinely upcast internally (e.g. rope or softmax in fp32 while weights
     stay low-precision). A raw eager probe would reject every candidate on
     such models with a dtype error even though the real replay works.
+
+    The probe also runs with a TWO-row batch. Per-row masks are ``[1, S]``:
+    against a one-row forward such a mask is broadcast-compatible with every
+    attention shape (SDPA broadcasts the singleton dims away), so at a
+    layer-type transition the probe would accept the previous block's form -
+    a 2D float mask sailing through a full-attention sdpa block - while the
+    real replay, which concatenates rows to ``[B, S]``, dies with a broadcast
+    error. With two rows, wrong forms fail on shape.
     """
 
     def _to_dev(v, dev):
@@ -151,7 +159,28 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
     row_others = {k: _to_dev(v, dev) for k, v in row_others.items()}
     cast_position_embeddings_to_block(row_others, block)
     fp_row = fp_row[:1].to(dev)
-    candidates = mask_form_candidates(key_mask_2d)
+    # two probe rows (duplicate the single row the chain carries): makes
+    # shape-incompatible masks fail the probe instead of broadcasting through
+    probe_row = fp_row[:2] if fp_row.shape[0] >= 2 else torch.cat([fp_row, fp_row], dim=0)
+
+    def _tile_batch2(v):
+        # row-level companions (position ids, predictor e-inputs, ...) carry
+        # the chain's single row; scale them to the probe's two rows so batch
+        # arithmetic inside the forward does not reject every form
+        if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == 1:
+            return torch.cat([v, v], dim=0)
+        if isinstance(v, tuple):
+            return tuple(_tile_batch2(x) for x in v)
+        return v
+
+    row_others = {k: _tile_batch2(v) for k, v in row_others.items()}
+    if key_mask_2d.dim() == 1:
+        probe_key_mask = torch.stack([key_mask_2d, key_mask_2d])
+    elif key_mask_2d.shape[0] >= 2:
+        probe_key_mask = key_mask_2d[:2]
+    else:
+        probe_key_mask = torch.cat([key_mask_2d, key_mask_2d], dim=0)
+    candidates = mask_form_candidates(probe_key_mask)
     if preferred is not None:
         order = [c for c in candidates if c[0] == preferred] + [c for c in candidates if c[0] != preferred]
     else:
@@ -169,9 +198,9 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
             try:
                 if amp_ctx is not None:
                     with amp_ctx:
-                        block(fp_row, **probe_others)
+                        block(probe_row, **probe_others)
                 else:
-                    block(fp_row, **probe_others)
+                    block(probe_row, **probe_others)
                 return name
             except Exception as e:  # noqa: BLE001  shape/dtype/type errors are the signal
                 last_err = e
