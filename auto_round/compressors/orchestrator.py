@@ -15,6 +15,7 @@ import copy
 import gc
 import logging
 import os
+import re
 import time as _time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -110,6 +111,57 @@ def _format_host_buckets(buckets: dict) -> str:
 
 
 _FUSED_EXPERT_PROJECTIONS = frozenset({"gate_up_proj", "gate_proj", "up_proj", "down_proj"})
+
+#: per-expert unfused projection -> its fused on-disk stack, e.g.
+#: ``mlp.experts.7.gate_proj.weight`` lives inside ``mlp.experts.gate_up_proj``
+_FUSED_STACK_RE = re.compile(r"^(.*\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+
+
+def _canonical_group_leaf(name: str) -> str:
+    """Fold a relative tensor/param name onto a layout-neutral spelling so
+    module-side (unfused, per-expert) and checkpoint-side (fused 3D) trees
+    compare equal for sibling matching: digit segments collapse and the
+    per-expert split projections map onto their fused stack names."""
+    m = _FUSED_STACK_RE.match(name)
+    if m:
+        base, _, proj = m.groups()
+        fused = "gate_up_proj" if proj in ("gate_proj", "up_proj") else "down_proj"
+        return f"{base}.{fused}.weight"
+    return re.sub(r"\.\d+\.", ".", name)
+
+
+class CheckpointOnlyRMSNorm(torch.nn.Module):
+    """Generic RMSNorm for checkpoint-only predictor groups (e.g. the prologue
+    norms of a multi-token-prediction block the modeling code never builds).
+
+    The checkpoint supplies only the weight vector; the forward follows the
+    transformers numerics convention (fp32 compute, one downcast) so a
+    materialized group tree can run like any decoder block later on."""
+
+    def __init__(self, hidden: int, eps: float = 1e-6):
+        super().__init__()
+        with torch.device("meta"):
+            self.weight = torch.nn.Parameter(torch.empty(hidden), requires_grad=False)
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        hs = hidden_states.float()
+        hs = hs * torch.rsqrt(hs.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+        return (hs * self.weight.float()).to(hidden_states.dtype)
+
+
+def _ensure_module_path(model: torch.nn.Module, path: str) -> torch.nn.Module:
+    """Walk/create intermediate shells for *path* and return the parent that
+    a leaf module should be attached to."""
+    segments = path.split(".")
+    parent = model
+    for seg in segments[:-1]:
+        child = getattr(parent, seg, None)
+        if child is None:
+            child = torch.nn.Module()
+            parent.add_module(seg, child)
+        parent = child
+    return parent
 
 
 def _is_fused_expert_weight_name(tensor_name: str) -> bool:
@@ -1280,20 +1332,275 @@ class CompressionOrchestrator(BaseOrchestrator):
                     break
         return sorted(groups)
 
-    def _materialize_pinned_checkpoint_only_blocks_(self, streamer, all_blocks) -> set:
-        """Materialize placeholder Linears for pinned checkpoint-only blocks.
+    def _analyze_checkpoint_only_group_(self, streamer, group) -> Optional[dict]:
+        """Classify a checkpoint-only group into predictor roles by shape and
+        name keywords alone (no family registry): the group-level 2D
+        ``[hidden, 2*hidden]`` weight is the concat mixer; 1D ``[hidden]``
+        vectors with an embedding/hidden keyword are the prologue norms; any
+        remaining 1D vector is the final norm; the decoder-layer subtree root
+        is found by descending while every deep tensor shares one head
+        component. Returns None when the group does not match the uniform
+        predictor pattern (families all verified: e-norm cat h-norm -> mixer
+        -> one decoder layer -> final norm -> shared head)."""
+        tensors = streamer.names_under(group)
+        direct, deep = {}, []
+        for n in tensors:
+            rel = n[len(group) + 1 :]
+            if rel.count(".") == 1 and rel.endswith(".weight"):
+                direct[rel[: -len(".weight")]] = n
+            elif rel.count(".") >= 2:
+                deep.append(n)
+        if not deep:
+            return None
+        cfg = getattr(self.model, "config", None)
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is None:
+            text_cfg = cfg
+        hidden = getattr(text_cfg, "hidden_size", None) or getattr(cfg, "hidden_size", None)
+        if not isinstance(hidden, int):
+            return None
+        fc = norm_e = norm_h = final_norm = None
+        for leaf, full in direct.items():
+            meta = streamer.tensor_meta(full)
+            shape = meta[0] if meta else None
+            low = leaf.lower()
+            if shape is not None and len(shape) == 2 and fc is None and shape[0] == hidden and shape[1] == 2 * hidden:
+                fc = full
+            elif shape is not None and len(shape) == 1 and shape[0] == hidden:
+                if norm_e is None and ("embed" in low or low.endswith("enorm") or low.startswith("e_")):
+                    norm_e = full
+                elif norm_h is None and ("hidden" in low or low.endswith("hnorm") or low.startswith("h_")):
+                    norm_h = full
+                elif final_norm is None:
+                    final_norm = full
+        if fc is None or norm_e is None or norm_h is None:
+            return None
+        rels = [n[len(group) + 1 :] for n in deep]
+        root = ""
+        while True:
+            heads = {r[len(root) + 1 :].split(".")[0] if root else r.split(".")[0] for r in rels}
+            if len(heads) != 1:
+                break
+            nxt = f"{root}.{next(iter(heads))}" if root else next(iter(heads))
+            if any(r == nxt for r in rels) or not all(r == nxt or r.startswith(nxt + ".") for r in rels):
+                break
+            root = nxt
+        return {
+            "prefix": group,
+            "fc": fc,
+            "norm_e": norm_e,
+            "norm_h": norm_h,
+            "final_norm": final_norm,
+            "layer_root": f"{group}.{root}" if root else group,
+        }
+
+    def _resolve_group_param_source_(self, streamer, sibling_name, layer_root, param_rel):
+        """Map one sibling param (relative name) to its checkpoint source
+        under the group's layer root: the registry-resolved spelling of the
+        sibling's own tensor first (``resolve_checkpoint_name``), then the
+        identity spelling when the group side already uses it, then the
+        fused expert-stack bridge. Returns ``("direct", ckpt_name)`` /
+        ``("fused", fused_name, expert_idx, projection)`` or None."""
+        rel = None
+        resolved = streamer.resolve_checkpoint_name(f"{sibling_name}.{param_rel}")
+        if resolved is not None and resolved.startswith(sibling_name + "."):
+            rel = resolved[len(sibling_name) + 1 :]
+        elif f"{layer_root}.{param_rel}" in streamer.weight_map:
+            # the group side already spells the param exactly like the module
+            # tree (identity families, or the sibling's own tensors are absent
+            # from this checkpoint view)
+            rel = param_rel
+        if rel is not None:
+            cand = f"{layer_root}.{rel}"
+            if cand in streamer.weight_map:
+                return ("direct", cand)
+        m = _FUSED_STACK_RE.match(param_rel)
+        if m:
+            base, idx, proj = m.group(1), int(m.group(2)), m.group(3)
+            fused = f"{base}.gate_up_proj.weight" if proj in ("gate_proj", "up_proj") else f"{base}.down_proj.weight"
+            cand = f"{layer_root}.{fused}"
+            if cand in streamer.weight_map:
+                return ("fused", cand, idx, proj)
+        return None
+
+    def _pick_sibling_layer_(self, streamer, info, all_blocks, snapshots=None):
+        """Pick the decoder block whose parameter set best matches the
+        group's layer tensors and covers it completely (every sibling param
+        resolves to a checkpoint source). Returns ``(score, block_name,
+        module)`` or None; families whose blocks differ (e.g. full-attention
+        vs gated-delta-net) auto-select the right sibling by name overlap.
+        ``snapshots`` holds pristine pre-quantization structure copies (the
+        live tree is packed QuantLinear by the time this runs)."""
+        from auto_round.utils.model import get_module
+
+        layer_root = info["layer_root"]
+        ckpt_set = {_canonical_group_leaf(n[len(layer_root) + 1 :]) for n in streamer.names_under(layer_root)}
+        best = None
+        for block in all_blocks:
+            for bname in block:
+                if bname == layer_root or bname.startswith(layer_root + ".") or layer_root.startswith(bname + "."):
+                    continue  # never sibling against the group itself
+                mod = (snapshots or {}).get(bname)
+                if mod is None:
+                    mod = get_module(self.model, bname)
+                if mod is None or not any(True for _ in mod.children()) or not any(True for _ in mod.parameters()):
+                    continue
+                params = [rel for rel, _ in mod.named_parameters()]
+                sources = [self._resolve_group_param_source_(streamer, bname, layer_root, rel) for rel in params]
+                if any(s is None for s in sources):
+                    continue  # incomplete coverage would leave a meta param
+                score = len({_canonical_group_leaf(rel) for rel in params} & ckpt_set)
+                if best is None or score > best[0]:
+                    best = (score, bname, mod)
+        return best
+
+    def _attach_checkpoint_only_group_tree_(self, streamer, info, sibling_name, sibling) -> set:
+        """Build a REAL module tree for the group: deep-copy the sibling
+        block's (meta) structure as the predictor layer, attach the prologue
+        modules (mixer Linear + RMSNorms), and load only what no later pass
+        can load (fused expert slices; everything else stays meta for the
+        outside-block/root pass-through streams). Pinned Linears receive the
+        pin's quantization attributes so they quantize like any pinned layer.
+        Returns the checkpoint tensor names the tree claimed."""
+        group, layer_root = info["prefix"], info["layer_root"]
+        claimed = set()
+        layer_mod = copy.deepcopy(sibling)
+        parent = _ensure_module_path(self.model, layer_root)
+        parent.add_module(layer_root.rsplit(".", 1)[-1], layer_mod)
+        for n, m in layer_mod.named_modules():
+            m.global_name = f"{layer_root}{('.' + n) if n else ''}"
+
+        # fused expert stacks have no per-expert checkpoint name: pinned
+        # experts get their slice now (one fetch per stack; the outside-block
+        # pass quantizes the real slices); unpinned experts drop the meta
+        # placeholder instead - their data ships as the verbatim fused stack
+        # below, and a leftover meta param would only spray per-tensor
+        # "missing from checkpoint" warnings through the root pass-through.
+        # Direct-name params stay meta - the outside-block pass loads them
+        # right before quantizing, and the root pass-through streams the rest,
+        # keeping peak host RAM at one stack.
+        fused_cache = {}
+        claimed_fused = set()
+        for rel, p in list(layer_mod.named_parameters()):
+            if p.device.type != "meta":
+                continue
+            src = self._resolve_group_param_source_(streamer, sibling_name, layer_root, rel)
+            if src is None:
+                raise RuntimeError(  # defensive: _pick_sibling_layer_ guarantees coverage
+                    f"[stream] sibling param {rel!r} lost its checkpoint source while building {group!r}"
+                )
+            if src[0] != "fused":
+                continue
+            owner_path = f"{layer_root}.{rel[: -len('.weight')]}"
+            entry = self._pin_entry_for(owner_path)
+            bits = entry.get("bits") if isinstance(entry, dict) else None
+            pinned = isinstance(bits, int) and bits < 16
+            if not pinned:
+                owner = layer_mod.get_submodule(rel[: -len(".weight")])
+                owner._parameters.pop(rel.rsplit(".", 1)[-1], None)
+                continue
+            _, fused_name, idx, proj = src
+            if fused_name not in fused_cache:
+                fused_cache[fused_name] = streamer.fetch(fused_name)
+            stack = fused_cache[fused_name]
+            if proj == "down_proj":
+                t = stack[idx].contiguous()
+            else:
+                inter = int(stack.shape[1]) // 2
+                t = stack[idx, :inter, :].contiguous() if proj == "gate_proj" else stack[idx, inter:, :].contiguous()
+            streamer._assign_leaf_(layer_mod, rel, t)
+            claimed_fused.add(fused_name)
+        fused_cache.clear()
+
+        cfg = getattr(self.model, "config", None)
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is None:
+            text_cfg = cfg
+        hidden = getattr(text_cfg, "hidden_size", None) or getattr(cfg, "hidden_size", None)
+        eps = float(getattr(text_cfg, "rms_norm_eps", 1e-6) or 1e-6)
+
+        def _pin_linear(path, module):
+            entry = self._pin_entry_for(path)
+            bits = entry.get("bits") if isinstance(entry, dict) else None
+            if isinstance(module, torch.nn.Linear) and isinstance(bits, int) and bits < 16:
+                for key in ("bits", "group_size", "data_type", "sym", "scale_dtype"):
+                    if entry.get(key) is not None:
+                        setattr(module, key, entry[key])
+                module.act_bits = entry.get("act_bits", 16)
+                module.act_sym = entry.get("act_sym", True)
+                module.act_data_type = entry.get("act_data_type", None)
+
+        for n, m in layer_mod.named_modules():
+            if any(m.children()) or not isinstance(m, torch.nn.Linear):
+                continue
+            path = f"{layer_root}.{n}" if n else layer_root
+            m.global_name = path
+            _pin_linear(path, m)
+            src = self._resolve_group_param_source_(streamer, sibling_name, layer_root, n + ".weight")
+            if src is not None and src[0] == "direct":
+                claimed.add(src[1])
+        claimed |= claimed_fused
+
+        # prologue: concat mixer + norms under their checkpoint paths
+        fc_meta = streamer.tensor_meta(info["fc"])
+        fc_path = info["fc"][: -len(".weight")]
+        with torch.device("meta"):
+            fc = torch.nn.Linear(int(fc_meta[0][1]), int(fc_meta[0][0]), bias=False)
+        fc.global_name = fc_path
+        _ensure_module_path(self.model, fc_path).add_module(fc_path.rsplit(".", 1)[-1], fc)
+        _pin_linear(fc_path, fc)
+        claimed.add(info["fc"])
+        for role in ("norm_e", "norm_h", "final_norm"):
+            name = info.get(role)
+            if name is None:
+                continue
+            path = name[: -len(".weight")]
+            mod = CheckpointOnlyRMSNorm(hidden, eps)
+            mod.global_name = path
+            _ensure_module_path(self.model, path).add_module(path.rsplit(".", 1)[-1], mod)
+            claimed.add(name)
+        return claimed
+
+    def _write_unpacked_group_tensors_(self, streamer, tree_groups, claimed) -> None:
+        """Write every tree-group tensor that did not end up packed.
+
+        Attaching a tree dissolves the group out of the checkpoint-only
+        verbatim pass (its prefixes now exist in the module tree), so the
+        tensors no path claimed would be silently dropped: pinned Linears are
+        already packed+written; fused stacks whose experts quantized are
+        replaced by their per-expert packed forms; everything else (norms,
+        unpinned weights, extras) is copied through byte-for-byte from the
+        checkpoint."""
+        from auto_round.utils.model import check_to_quantized, get_module
+
+        saved = set(getattr(self.shard_writer, "_all_saved", None) or [])
+        for group in tree_groups:
+            for n in streamer.names_under(group):
+                if n in saved or n in claimed:
+                    continue
+                owner = get_module(self.model, n.rsplit(".", 1)[0])
+                if owner is not None and check_to_quantized(owner):
+                    continue  # its packed form was written by the outside-block pass
+                self.shard_writer.save_tensor(n, streamer.fetch(n, raw=True))
+
+    def _materialize_pinned_checkpoint_only_blocks_(self, streamer, all_blocks, snapshots=None) -> tuple[set, list]:
+        """Materialize pinned checkpoint-only blocks, preferring a REAL module
+        tree (sibling structure snapshot + predictor prologue) over scattered
+        placeholder Linears.
 
         Blocks whose tensors exist only in the checkpoint (an MTP layer the
         modeling code never instantiates) normally pass through verbatim.
-        When the layer_config pins their layers for quantization, create
-        meta-weight placeholder Linears under the checkpoint tensor paths so
-        the outside-block pass quantizes, packs and shard-writes them like any
-        other pinned layer. Only zero-shot runs qualify: such a block has no
-        place in the model graph, so no forward could ever feed a tuning
-        pass. Returns the checkpoint tensor names the placeholders claimed
-        (the verbatim pass-through must skip them).
+        When the layer_config pins their layers for quantization: a group
+        matching the uniform predictor pattern with a fully-covering decoder
+        sibling becomes a real tree (pinned Linears quantize+pack through the
+        outside-block pass; the tree is forward-capable for tuning runs);
+        otherwise scattered placeholder Linears keep the pinned tensors
+        quantizable. Only zero-shot runs qualify unless AR_MTP_ZERO_SHOT is
+        set: tuning needs synthesized inputs these blocks cannot join on
+        their own. Returns ``(claimed tensor names, tree group prefixes)``.
         """
         claimed = set()
+        tree_groups = []
         quantizers = self.alg_composer.block_quantizer
         if not isinstance(quantizers, (list, tuple)):
             quantizers = [quantizers]
@@ -1307,10 +1614,36 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "set AR_MTP_ZERO_SHOT=1 to quantize them with the closed-form search inside this run",
                     ", ".join(groups),
                 )
-            return claimed
+            return claimed, tree_groups
         skipped_non_2d = 0
         for blk in groups:
-            for n in sorted(streamer.names_under(blk)):
+            names = sorted(streamer.names_under(blk))
+            pinned_quantizable = []
+            for n in names:
+                if not n.endswith(".weight"):
+                    continue
+                entry = self._pin_entry_for(n[: -len(".weight")])
+                bits = entry.get("bits") if isinstance(entry, dict) else None
+                if not isinstance(bits, int) or bits >= 16:
+                    continue
+                meta = streamer.tensor_meta(n)
+                if meta is not None and (len(meta[0]) == 2 or (len(meta[0]) == 3 and _is_fused_expert_weight_name(n))):
+                    pinned_quantizable.append(n)
+            if not pinned_quantizable:
+                continue  # unpinned or kept floating: verbatim path
+            info = self._analyze_checkpoint_only_group_(streamer, blk)
+            sibling = self._pick_sibling_layer_(streamer, info, all_blocks, snapshots) if info is not None else None
+            if sibling is not None:
+                tree_groups.append(blk)
+                claimed |= self._attach_checkpoint_only_group_tree_(streamer, info, sibling[1], sibling[2])
+                continue
+            if info is not None:
+                logger.warning(
+                    "[stream] checkpoint-only group %s resembles a predictor block but no decoder sibling "
+                    "covers its tensors; quantizing its pinned layers as scattered placeholders",
+                    blk,
+                )
+            for n in names:
                 if not n.endswith(".weight"):
                     continue
                 layer_path = n[: -len(".weight")]
@@ -1342,6 +1675,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 claimed.add(n)
                 if bias in streamer.tensor_names:
                     claimed.add(bias)
+        if tree_groups:
+            logger.info(
+                "[stream] built real module tree(s) for checkpoint-only group(s) %s; pinned layers quantize "
+                "through the outside-block pass",
+                ", ".join(tree_groups),
+            )
         if claimed:
             logger.info(
                 "[stream] materialized %d pinned layer(s) from checkpoint-only blocks; " "they will be quantized",
@@ -1353,7 +1692,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "stacks); leaving them unquantized",
                 skipped_non_2d,
             )
-        return claimed
+        return claimed, tree_groups
 
     def _outside_block_quant_device(self) -> torch.device:
         """Device for the outside-block pass. The block loop has finished by
@@ -1411,6 +1750,23 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         all_blocks = self.quant_block_list or get_block_names(self.model)
         flat_block_names = [name for group in all_blocks for name in group]
+
+        # Pristine structure snapshots for checkpoint-only groups: by the
+        # time the materializer runs (after the block loop) every block has
+        # been packed to QuantLinear and lost its plain parameter names - the
+        # sibling structure snapshot must be taken while the meta skeleton is
+        # still untouched. Snapshots are structure-only (meta tensors, no
+        # data) and only captured when the checkpoint actually carries
+        # groups no module claims.
+        block_snapshots = None
+        if streamer is not None and flat_block_names:
+            ckpt_only = self._checkpoint_only_groups_(streamer)
+            if ckpt_only:
+                block_snapshots = {
+                    name: copy.deepcopy(get_module(self.model, name))
+                    for name in flat_block_names
+                    if get_module(self.model, name) is not None
+                }
 
         # Optional streaming calibration: the rows are embedded once and each
         # block's compress_block reference output (replay through the
@@ -1798,8 +2154,12 @@ class CompressionOrchestrator(BaseOrchestrator):
         # Linears so the pin quantizes them instead of silently passing them
         # through; zero-shot only (see method docstring).
         materialized_tensors = set()
+        tree_groups = []
         if streamer is not None:
-            materialized_tensors = self._materialize_pinned_checkpoint_only_blocks_(streamer, all_blocks)
+            materialized_tensors, tree_groups = self._materialize_pinned_checkpoint_only_blocks_(
+                streamer, all_blocks, block_snapshots
+            )
+            block_snapshots = None
 
         remain_layer_names = []
         block_name_set = set(name for block in all_blocks for name in block)
@@ -1914,6 +2274,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             from auto_round.utils.streaming_calibration import materialize_residual_meta
 
             materialize_residual_meta(self.model, self.model_context.model.config, torch.device("cpu"))
+
+            # Tree-materialized groups dissolved out of the checkpoint-only
+            # verbatim pass below (their prefixes now live in the module
+            # tree); write whatever their trees did not pack byte-for-byte
+            if tree_groups:
+                self._write_unpacked_group_tensors_(streamer, tree_groups, materialized_tensors)
 
             # Checkpoint-only groups (an MTP layer kept as an extra digit block,
             # or a whole top-level subtree transformers strips at load) have no

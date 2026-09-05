@@ -278,7 +278,9 @@ class TestMtpZeroShotFallback:
         )
         stub._checkpoint_only_groups_ = MethodType(CompressionOrchestrator._checkpoint_only_groups_, stub)
         stub._pin_entry_for = MethodType(CompressionOrchestrator._pin_entry_for, stub)
-        claimed = CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_(stub, Streamer(), [])
+        stub._analyze_checkpoint_only_group_ = MethodType(CompressionOrchestrator._analyze_checkpoint_only_group_, stub)
+        claimed, tree_groups = CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_(stub, Streamer(), [])
+        assert tree_groups == []
         return claimed, model
 
     def test_tuning_run_defaults_to_verbatim(self, monkeypatch):

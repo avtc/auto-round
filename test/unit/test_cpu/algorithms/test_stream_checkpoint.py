@@ -1336,6 +1336,68 @@ class TestStreamQuantizeEquivalence:
         assert "model.mtp.fc.weight" not in keys
         assert "model.mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
 
+    def test_mtp_group_tree_materializes_from_sibling(self, tiny_checkpoint, tmp_path):
+        """A pinned predictor group whose tensors fully cover a decoder
+        sibling builds a REAL module tree (sibling structure snapshot):
+        pinned Linears quantize + pack under their checkpoint names, norms
+        and unpinned tensors pass through verbatim, nothing is duplicated."""
+        H = 32
+        extra = {
+            "model.layers.3.eh_proj.weight": torch.randn(H, 2 * H),
+            "model.layers.3.enorm.weight": torch.randn(H),
+            "model.layers.3.hnorm.weight": torch.randn(H),
+            "model.layers.3.final_layernorm.weight": torch.randn(H),
+            "model.layers.3.input_layernorm.weight": torch.randn(H),
+            "model.layers.3.post_attention_layernorm.weight": torch.randn(H),
+            "model.layers.3.self_attn.q_proj.weight": torch.randn(H, H),
+            "model.layers.3.self_attn.k_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.v_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.o_proj.weight": torch.randn(H, H),
+            "model.layers.3.mlp.gate_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.up_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.down_proj.weight": torch.randn(H, 64),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"model.layers.3": {"bits": 8}})
+        keys = self._export_keys(out)
+        for leaf in (
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ):
+            assert f"model.layers.3.{leaf}.qweight" in keys, f"{leaf} not packed; keys: " + ", ".join(
+                sorted(k for k in keys if "layers.3" in k)
+            )
+            assert f"model.layers.3.{leaf}.weight" not in keys, f"plain weight kept beside packed form: {leaf}"
+        assert "model.layers.3.eh_proj.qweight" in keys, "pinned predictor fc not packed"
+        assert "model.layers.3.eh_proj.weight" not in keys
+        for norm in ("enorm", "hnorm", "final_layernorm", "input_layernorm", "post_attention_layernorm"):
+            assert f"model.layers.3.{norm}.weight" in keys, f"norm {norm} dropped from export"
+
+    def test_mtp_group_tree_degraded_when_sibling_incomplete(self, tiny_checkpoint, tmp_path):
+        """A predictor-shaped group whose layer tensors do NOT cover any
+        decoder sibling (missing attention) must not build a tree: it falls
+        back to scattered per-layer placeholders so the pinned tensors still
+        quantize and the rest passes through verbatim."""
+        H = 32
+        extra = {
+            "model.layers.3.eh_proj.weight": torch.randn(H, 2 * H),
+            "model.layers.3.enorm.weight": torch.randn(H),
+            "model.layers.3.hnorm.weight": torch.randn(H),
+            "model.layers.3.mlp.gate_proj.weight": torch.randn(64, H),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"model.layers.3": {"bits": 8}})
+        keys = self._export_keys(out)
+        assert "model.layers.3.mlp.gate_proj.qweight" in keys, "pinned 2D tensor not quantized in degraded mode"
+        assert "model.layers.3.eh_proj.qweight" in keys
+        assert "model.layers.3.mlp.gate_proj.weight" not in keys
+        assert "model.layers.3.enorm.weight" in keys, "unpinned sibling tensor dropped in degraded mode"
+
     def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
         """A separate auxiliary safetensors file the index never references
         (a family shipping MTP weights as their own file) must reach the
@@ -1734,6 +1796,246 @@ class TestOutsideBlockPackUnderStreaming:
         assert "immediate_pack" in window, "outside-block pass does not pack under streaming"
         assert "shard_writer.write(name=name)" in window, "outside-block pass does not write to shards"
         assert "is_immediate_saving" in window, "pack+write must be gated on immediate saving"
+
+
+class TestCheckpointOnlyGroupTree:
+    """Unit coverage for the checkpoint-only group analyzer and the fused
+    expert-stack resolution used when building a real module tree from a
+    sibling structure snapshot."""
+
+    @staticmethod
+    def _stub(tensors, shapes):
+        from types import MethodType, SimpleNamespace
+
+        import torch.nn as nn
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        model = nn.Module()
+        outer = nn.Module()
+        layers = nn.Module()
+        for i in range(2):
+            blk = nn.Module()
+            blk.self_attn = nn.Module()
+            blk.self_attn.q_proj = nn.Linear(8, 8, bias=False)
+            blk.mlp = nn.Module()
+            blk.mlp.gate_proj = nn.Linear(8, 8, bias=False)
+            blk.input_layernorm = nn.Module()
+            layers.add_module(str(i), blk)
+        outer.add_module("layers", layers)
+        model.add_module("model", outer)
+        model.config = SimpleNamespace(hidden_size=8)
+
+        class Streamer:
+            tensor_names = list(tensors)
+            weight_map = {n: "shard0" for n in tensors}
+
+            def names_under(self, prefix):
+                return [n for n in tensors if n.startswith(prefix + ".")]
+
+            def tensor_meta(self, name):
+                meta = shapes.get(name)
+                return (meta, "BF16") if meta else None
+
+            def resolve_checkpoint_name(self, name):
+                return name if name in tensors else None
+
+        stub = SimpleNamespace(model=model, layer_config={}, regex_config={})
+        for m in ("_analyze_checkpoint_only_group_", "_resolve_group_param_source_", "_pin_entry_for"):
+            stub.__setattr__(m, MethodType(getattr(CompressionOrchestrator, m), stub))
+        return stub, Streamer(), model
+
+    def test_analyze_digit_block_group(self):
+        H = 8
+        tensors = [
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.3.eh_proj.weight",
+            "model.layers.3.enorm.weight",
+            "model.layers.3.hnorm.weight",
+            "model.layers.3.self_attn.q_proj.weight",
+            "model.layers.3.mlp.gate_proj.weight",
+        ]
+        shapes = {
+            "model.layers.3.eh_proj.weight": (H, 2 * H),
+            "model.layers.3.enorm.weight": (H,),
+            "model.layers.3.hnorm.weight": (H,),
+        }
+        stub, streamer, _ = self._stub(tensors, shapes)
+        info = stub._analyze_checkpoint_only_group_(streamer, "model.layers.3")
+        assert info is not None
+        assert info["fc"] == "model.layers.3.eh_proj.weight"
+        assert info["norm_e"] == "model.layers.3.enorm.weight"
+        assert info["norm_h"] == "model.layers.3.hnorm.weight"
+        assert info["layer_root"] == "model.layers.3"
+
+    def test_analyze_nested_layer_root(self):
+        H = 8
+        tensors = [
+            "mtp.fc.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.norm.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+        ]
+        shapes = {
+            "mtp.fc.weight": (H, 2 * H),
+            "mtp.pre_fc_norm_embedding.weight": (H,),
+            "mtp.pre_fc_norm_hidden.weight": (H,),
+            "mtp.norm.weight": (H,),
+        }
+        stub, streamer, _ = self._stub(tensors, shapes)
+        info = stub._analyze_checkpoint_only_group_(streamer, "mtp")
+        assert info is not None
+        assert info["fc"] == "mtp.fc.weight"
+        assert info["norm_e"].endswith("pre_fc_norm_embedding.weight")
+        assert info["norm_h"].endswith("pre_fc_norm_hidden.weight")
+        assert info["final_norm"].endswith("mtp.norm.weight")
+        assert info["layer_root"] == "mtp.layers.0"
+
+    def test_analyze_rejects_group_without_prologue(self):
+        tensors = ["mtp.layers.0.self_attn.q_proj.weight", "mtp.layers.0.mlp.gate_proj.weight"]
+        stub, streamer, _ = self._stub(tensors, {})
+        assert stub._analyze_checkpoint_only_group_(streamer, "mtp") is None
+
+    def test_fused_expert_stack_resolution(self):
+        tensors = [
+            "model.layers.3.mlp.experts.gate_up_proj.weight",
+            "model.layers.3.mlp.experts.down_proj.weight",
+            "model.layers.3.mlp.experts.0.gate_proj.weight",  # never both layouts; resolution must prefer exact
+        ]
+        stub, streamer, _ = self._stub(tensors, {})
+        src = stub._resolve_group_param_source_(
+            streamer, "model.layers.1", "model.layers.3", "mlp.experts.2.gate_proj.weight"
+        )
+        assert src is not None and src[0] == "fused"
+        assert src[1] == "model.layers.3.mlp.experts.gate_up_proj.weight"
+        assert src[2] == 2 and src[3] == "gate_proj"
+        down = stub._resolve_group_param_source_(
+            streamer, "model.layers.1", "model.layers.3", "mlp.experts.5.down_proj.weight"
+        )
+        assert down is not None and down[0] == "fused"
+        assert down[1] == "model.layers.3.mlp.experts.down_proj.weight"
+
+    def test_tree_attach_slices_fused_expert_stacks(self):
+        """Building a tree over a fused-3D checkpoint slices each pinned
+        per-expert projection out of its stack (real weights, claimed tensor
+        names), so the outside-block pass can quantize experts per-module."""
+        import torch.nn as nn
+        from types import MethodType, SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        H, E, I = 8, 3, 4
+        model = nn.Module()
+        outer = nn.Module()
+        layers = nn.Module()
+        blk = nn.Module()
+        blk.self_attn = nn.Module()
+        with torch.device("meta"):
+            blk.self_attn.q_proj = nn.Linear(H, H, bias=False)
+        blk.mlp = nn.Module()
+        experts = nn.ModuleList()
+        for e in range(E):
+            m = nn.Module()
+            with torch.device("meta"):
+                m.gate_proj = nn.Linear(H, I, bias=False)
+                m.up_proj = nn.Linear(H, I, bias=False)
+                m.down_proj = nn.Linear(I, H, bias=False)
+            experts.add_module(str(e), m)
+        blk.mlp.experts = experts
+        blk.input_layernorm = nn.Module()
+        layers.add_module("0", blk)
+        outer.add_module("layers", layers)
+        model.add_module("model", outer)
+        model.config = SimpleNamespace(hidden_size=H)
+
+        tensors = [
+            "mtp.fc.weight",
+            "mtp.enorm.weight",
+            "mtp.hnorm.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight",
+            "mtp.layers.0.mlp.experts.down_proj.weight",
+        ]
+        shapes = {
+            "mtp.fc.weight": (H, 2 * H),
+            "mtp.enorm.weight": (H,),
+            "mtp.hnorm.weight": (H,),
+        }
+        weights = {
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight": torch.randn(E, 2 * I, H),
+            "mtp.layers.0.mlp.experts.down_proj.weight": torch.randn(E, H, I),
+        }
+
+        class Streamer:
+            tensor_names = tensors
+            weight_map = {n: "s0" for n in tensors}
+
+            def names_under(self, prefix):
+                return [n for n in tensors if n.startswith(prefix + ".")]
+
+            def tensor_meta(self, name):
+                meta = shapes.get(name) or (tuple(weights[name].shape) if name in weights else None)
+                return (meta, "BF16") if meta else None
+
+            def resolve_checkpoint_name(self, name):
+                return name if name in tensors else None
+
+            def fetch(self, name, device=None, raw=False):
+                assert name in weights, name
+                return weights[name].clone()
+
+            def _assign_leaf_(self, module, rel_name, tensor):
+                parts = rel_name.split(".")
+                parent = module.get_submodule(".".join(parts[:-1]))
+                leaf = parts[-1]
+                assert leaf in parent._parameters, rel_name
+                parent._parameters[leaf] = torch.nn.Parameter(tensor, requires_grad=False)
+                return True
+
+        stub = SimpleNamespace(
+            model=model,
+            layer_config={"mtp.fc": {"bits": 8}},
+            regex_config={"mtp": {"bits": 8}},  # prefix pin, normalized like real runs
+        )
+        for m in (
+            "_analyze_checkpoint_only_group_",
+            "_resolve_group_param_source_",
+            "_pick_sibling_layer_",
+            "_attach_checkpoint_only_group_tree_",
+            "_pin_entry_for",
+        ):
+            stub.__setattr__(m, MethodType(getattr(CompressionOrchestrator, m), stub))
+        streamer = Streamer()
+        info = stub._analyze_checkpoint_only_group_(streamer, "mtp")
+        assert info is not None and info["layer_root"] == "mtp.layers.0"
+        sibling = stub._pick_sibling_layer_(streamer, info, [["model.layers.0"]])
+        assert sibling is not None, "per-expert sibling must cover via the fused bridge"
+        claimed = stub._attach_checkpoint_only_group_tree_(streamer, info, sibling[1], sibling[2])
+        assert "mtp.layers.0.mlp.experts.gate_up_proj.weight" in claimed
+        assert "mtp.layers.0.mlp.experts.down_proj.weight" in claimed
+        tree = model.get_submodule("mtp.layers.0")
+        e1 = tree.mlp.experts[1]
+        assert e1.gate_proj.weight.device.type != "meta"
+        assert torch.equal(e1.gate_proj.weight.data, weights["mtp.layers.0.mlp.experts.gate_up_proj.weight"][1, :I])
+        assert torch.equal(e1.down_proj.weight.data, weights["mtp.layers.0.mlp.experts.down_proj.weight"][1])
+        assert getattr(e1.gate_proj, "bits", None) == 8
+        fc = model.get_submodule("mtp.fc")
+        assert isinstance(fc, nn.Linear) and fc.in_features == 2 * H and getattr(fc, "bits", None) == 8
+
+    def test_group_rmsnorm_numerics(self):
+        import torch
+
+        from auto_round.compressors.orchestrator import CheckpointOnlyRMSNorm
+
+        norm = CheckpointOnlyRMSNorm(8, eps=1e-6)
+        norm.weight = torch.nn.Parameter(torch.randn(8), requires_grad=False)  # streamed in, like production
+        x = torch.randn(2, 8, dtype=torch.bfloat16)
+        ref = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6) * norm.weight.float()).to(
+            torch.bfloat16
+        )
+        assert torch.equal(norm(x), ref)
 
 
 class TestCheckpointOnlyGroupVisibility:
