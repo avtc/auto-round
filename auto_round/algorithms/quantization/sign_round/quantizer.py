@@ -884,16 +884,24 @@ class SignRoundQuantizer(BaseQuantizer):
                     if valid_token_mask:
                         cat_mask = torch.cat([valid_token_mask[i] for i in indices], dim=0).to(device)
                         cat_mask = cat_mask.unsqueeze(-1)
+                    # a row-blocked wrapper keeps its autograd graph per output
+                    # block, so backward must run per block too: the MSE sum
+                    # decomposes over output columns and gradients accumulate,
+                    # making the result identical to one big backward
+                    blockwise = getattr(wrapper_linear, "_row_block_decision", False) is True
+                    block_bounds = wrapper_linear.row_block_bounds() if blockwise else None
                     for start in range(0, sample_rows, chunk_rows):
                         end = min(start + chunk_rows, sample_rows)
                         chunk_input = current_input[:, start:end] if rows_axis == 1 else current_input[start:end]
                         chunk_ref_input = org_input[:, start:end] if rows_axis == 1 else org_input[start:end]
                         with torch.no_grad():
                             chunk_ref = layer(chunk_ref_input)
+                        if cat_mask is not None:
+                            chunk_mask = cat_mask[start:end]
+                    if not blockwise:
                         with autocast_ctx:
                             chunk_q = wrapper_linear(chunk_input)  # pylint: disable=not-callable
                         if cat_mask is not None:
-                            chunk_mask = cat_mask[start:end]
                             loss = mse_sum_loss(
                                 (chunk_q * chunk_mask).to(torch.float32),
                                 (chunk_ref * chunk_mask).to(torch.float32),
@@ -904,6 +912,24 @@ class SignRoundQuantizer(BaseQuantizer):
                         num_elm = 1 if num_elm <= 0 else num_elm
                         total_loss += loss.item() / num_elm
                         self._scale_loss_and_backward(scaler, loss)
+                    else:
+                        num_elm = 1 if num_elm <= 0 else num_elm
+                        for b0, b1 in block_bounds:
+                            # forward, loss, and backward complete per block so
+                            # only one block's autograd graph is ever live
+                            with autocast_ctx:
+                                chunk_q_block = wrapper_linear.forward_rows(chunk_input, b0, b1)
+                            ref_block = chunk_ref[..., b0:b1]
+                            if cat_mask is not None:
+                                loss = mse_sum_loss(
+                                    (chunk_q_block * chunk_mask).to(torch.float32),
+                                    (ref_block * chunk_mask).to(torch.float32),
+                                )
+                            else:
+                                loss = mse_sum_loss(chunk_q_block.to(torch.float32), ref_block.to(torch.float32))
+                            loss = loss / sum_denom
+                            total_loss += loss.item() / num_elm
+                            self._scale_loss_and_backward(scaler, loss)
             if i == 0:
                 init_loss = total_loss
                 log_cuda_memory_census(f"outside-block first backward done {layer_name}", device)
