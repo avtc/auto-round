@@ -100,30 +100,128 @@ def _ct_int_mixed_groups(groups, quant_format):
     return True
 
 
+_CT_MODULE_TYPE_TARGETS = frozenset(
+    {
+        "Linear",
+        "Conv1d",
+        "Conv2d",
+        "Conv3d",
+        "Embedding",
+        "LayerNorm",
+        "RMSNorm",
+        "GroupNorm",
+        "DynamicConv1d",
+    }
+)
+
+
 def _ct_weights_for_tensor(name, groups):
     """Resolve the compressed-tensors ``weights`` config for one tensor.
 
     Multi-group exports pin different bit widths per module (for example an
-    8-bit lm_head over a 4-bit body). Group ``targets`` are either module-type
-    names (``Linear``) or regexes; a regex match on the tensor name wins and
-    the first module-type group acts as the default. Returns ``None`` when
-    nothing matches."""
+    8-bit lm_head over a 4-bit body). Group ``targets`` are module-type names
+    (``Linear``), leaf module names (``lm_head``), dotted module paths, or
+    regexes; non-module-type targets are matched as regexes against the tensor
+    name and the first module-type group acts as the default. Wrapper
+    checkpoints may drop their ``language_model.`` segment in tensor names
+    while the config keeps it, so the re-nested spelling is tried as well."""
+    candidates = [name]
+    if name.startswith("model.") and not name.startswith("model.language_model."):
+        candidates.append("model.language_model." + name[len("model.") :])
     default = None
+    for candidate in candidates:
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            weights = group.get("weights")
+            if weights is None:
+                continue
+            for target in group.get("targets") or ():
+                if not isinstance(target, str):
+                    continue
+                if target in _CT_MODULE_TYPE_TARGETS:
+                    if default is None:
+                        default = weights
+                elif re.search(target, candidate):
+                    return weights
+    return default
+
+
+def _ct_int_mixed_groups(groups, quant_format):
+    """Whether a multi-group config is entirely integer quantized.
+
+    compressed-tensors reports several top-level formats for pinned-width
+    exports (``int-quantized``, ``mixed-precision``, ``pack-quantized``) and
+    per-group formats are often absent; as long as every group is integer
+    weights the packed tensors still dequantize per group."""
+    if quant_format not in ("pack-quantized", "int-quantized", "mixed-precision"):
+        return False
     for group in groups.values():
         if not isinstance(group, dict):
             continue
         weights = group.get("weights")
         if weights is None:
             continue
-        for target in group.get("targets") or ():
-            if not isinstance(target, str):
+        if weights.get("type", "int") != "int":
+            return False
+        # groups often carry an explicit "format": null
+        if (group.get("format") or "pack-quantized") not in ("pack-quantized", "int-quantized"):
+            return False
+    return True
+
+
+_CT_MODULE_TYPE_TARGETS = frozenset(
+    {
+        "Linear",
+        "Conv1d",
+        "Conv2d",
+        "Conv3d",
+        "Embedding",
+        "LayerNorm",
+        "RMSNorm",
+        "GroupNorm",
+        "DynamicConv1d",
+    }
+)
+
+
+def _ct_weights_for_tensor(name, groups):
+    """Resolve the compressed-tensors ``weights`` config for one tensor.
+
+    Multi-group exports pin different bit widths per module (for example an
+    8-bit lm_head over a 4-bit body). Group ``targets`` are module-type names
+    (``Linear``), leaf module names (``lm_head``), dotted module paths, or
+    regexes; every target is matched as a regex against the tensor name and
+    the first module-type group acts as the default. Wrapper checkpoints may
+    drop their ``language_model.`` segment in tensor names while the config
+    keeps it, so the re-nested spelling is tried as well."""
+    for candidate in (name, "model.language_model." + name[len("model.") :]) if name.startswith("model.") else (name,):
+        default = None
+        for group in groups.values():
+            if not isinstance(group, dict):
                 continue
-            if target.isidentifier():
-                if default is None:
-                    default = weights
-            elif re.search(target, name):
-                return weights
-    return default
+            weights = group.get("weights")
+            if weights is None:
+                continue
+            for target in group.get("targets") or ():
+                if not isinstance(target, str):
+                    continue
+                if target in _CT_MODULE_TYPE_TARGETS:
+                    if default is None:
+                        default = weights
+                elif re.search(target, candidate):
+                    return weights
+        if any(
+            re.search(t, candidate)
+            for g in groups.values()
+            if isinstance(g, dict)
+            for t in (g.get("targets") or ())
+            if isinstance(t, str)
+        ):
+            return None if False else default if default is not None else None
+        if default is not None:
+            return default
+    return None
 
 
 class ModelBase:

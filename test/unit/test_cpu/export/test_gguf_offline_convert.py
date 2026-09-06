@@ -283,3 +283,44 @@ class TestDequantMismatchDiagnostic:
         m.dequant_model()
         with pytest.raises(RuntimeError, match="in_proj_qkv.*num_bits=8.*scale_groups_per_row=40"):
             m.model_tensors[name + ".weight"]()
+
+    def test_denested_wrapper_names_and_leaf_targets(self):
+        """Wrapper checkpoints may drop the language_model segment in tensor
+        names while config targets keep it; leaf names like lm_head must match
+        as regexes, never as module-type defaults."""
+        from auto_round.export.export_to_gguf.conversion.base import _ct_weights_for_tensor
+
+        w4 = {"num_bits": 4, "group_size": 128, "type": "int", "strategy": "group"}
+        w8 = {"num_bits": 8, "group_size": 128, "type": "int", "strategy": "group"}
+        groups = {
+            "group_0": {"targets": ["model.language_model.layers.0.linear_attn.in_proj_qkv"], "weights": w4},
+            "group_1": {"targets": ["lm_head"], "weights": w8},
+        }
+        # de-nested body name resolves through the re-nested alias, NOT the
+        # lm_head default (the original bug: isidentifier made lm_head a
+        # module-type default and every body tensor got 8 bits)
+        assert _ct_weights_for_tensor("model.layers.0.linear_attn.in_proj_qkv.weight", groups) is w4
+        assert _ct_weights_for_tensor("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", groups) is w4
+        assert _ct_weights_for_tensor("lm_head.weight", groups) is w8
+
+    def test_real_denested_config_resolves_every_packed_tensor(self):
+        import json
+        import os
+
+        from auto_round.export.export_to_gguf.conversion.base import _ct_weights_for_tensor
+
+        d = "E:/sync/unique/AIServer/tmp/qwen-3.8-27b/qwen3.8-27b-w4g128-10iters-head-mtp-8bit"
+        if not os.path.isfile(os.path.join(d, "config.json")):
+            pytest.skip("real pinned-export config not available locally")
+        cfg = json.load(open(os.path.join(d, "config.json")))["quantization_config"]
+        index = json.load(open(os.path.join(d, "model.safetensors.index.json")))["weight_map"]
+        # names as the offline loader presents them: language_model stripped
+        counts = {}
+        for k in index:
+            if not k.endswith(".weight_packed"):
+                continue
+            loader_name = k.replace("language_model.", "") if "language_model." in k else k
+            wc = _ct_weights_for_tensor(loader_name.removesuffix("_packed"), cfg["config_groups"])
+            assert wc is not None, f"unresolved: {loader_name}"
+            counts[wc["num_bits"]] = counts.get(wc["num_bits"], 0) + 1
+        assert counts == {4: 400, 8: 9}, counts
