@@ -43,7 +43,12 @@ if deepspeed_exists:
 # lm_head) that cannot coexist with the rounding parameter and its gradient.
 # Blocking is exact: quantization groups never straddle output rows, so the
 # per-block results and gradients equal the full-tensor computation.
-_ROW_BLOCKED_WEIGHT_ELEMS = 2**26
+# Row blocking exists for weights whose full-width fp32 fake-quant intermediates
+# (~6x the weight bytes) cannot share a 24GB GPU with the tuning residents:
+# full-vocabulary lm_heads. Typical FFN projections stay on the fast whole-
+# layer path (compiled graph, single GEMM); the threshold is far below their
+# size on purpose.
+_ROW_BLOCKED_WEIGHT_ELEMS = 2**27
 
 
 class _GradScatterSlice(torch.autograd.Function):
