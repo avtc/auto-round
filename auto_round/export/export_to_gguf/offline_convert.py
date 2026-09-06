@@ -75,38 +75,58 @@ def _install_ggml_quant_bridge():
 
     The pip gguf package implements only some GGML types in python; the rest
     raise NotImplementedError. AutoRound's own packing implements the full
-    support surface (classics, k-quants, bf16) and is what the interactive
-    GGUF export uses, so delegating keeps offline numerics identical to it.
-    Float types must still be CAST to their storage dtype (the original
-    quantize does astype; returning fp32 bytes tagged F16 would corrupt the
-    file). Returns the patching context manager.
+    quantized support surface and is what the interactive GGUF export uses,
+    so delegating keeps offline numerics identical to it. Float storage
+    types (F32/F16/BF16) stay with the original implementation, which casts
+    (or byte-views for BF16) correctly. Returns the patching context manager.
     """
     from contextlib import contextmanager
-    from unittest.mock import patch
 
     import gguf as _gguf
     import numpy as np
 
     from auto_round.export.export_to_gguf.packing import ggml_quant
 
+    original_quantize = _gguf.quants.quantize
+    float_types = {
+        _gguf.GGMLQuantizationType.F32,
+        _gguf.GGMLQuantizationType.F16,
+        _gguf.GGMLQuantizationType.BF16,
+    }
+
     def quantize(data, qtype):
+        if qtype in float_types:
+            # the original handles float storage (astype, bf16 byte view) and
+            # materializes lazy mmap tensors itself
+            return original_quantize(data, qtype)
         # np.array materializes gguf's lazy mmap tensors (ndarray subclasses)
         # into a base-class array torch.from_numpy can consume
-        materialized = np.array(data)
-        name = qtype.name.lower()
-        if name == "f32":
-            return materialized.astype(np.float32, copy=False)
-        if name == "f16":
-            return materialized.astype(np.float16, copy=False)
-        out = ggml_quant(torch.from_numpy(materialized), name, device="cpu")
+        out = ggml_quant(torch.from_numpy(np.array(data)), qtype.name.lower(), device="cpu")
         return out if isinstance(out, np.ndarray) else np.asarray(out)
 
     @contextmanager
     def _bridge():
-        with patch.object(_gguf.quants, "quantize", side_effect=quantize):
+        with _patch_object(_gguf.quants, "quantize", quantize):
             yield
 
     return _bridge()
+
+
+def _patch_object(obj, attr, value):
+    """Scoped attribute replacement without pulling unittest.mock into the
+    production path."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        saved = getattr(obj, attr)
+        setattr(obj, attr, value)
+        try:
+            yield
+        finally:
+            setattr(obj, attr, saved)
+
+    return _ctx()
 
 
 def _make_official_mixed_selector(model_instance, hparams, ftype):
@@ -189,8 +209,9 @@ def convert_checkpoint_to_gguf(
     os.makedirs(output_dir, exist_ok=True)
 
     conversion = get_conversion(checkpoint_dir, model_type=ModelType.TEXT)
-    is_mistral_format = False
-    hparams = conversion.ModelBase.load_hparams(Path(checkpoint_dir), is_mistral_format)
+    hparams = conversion.ModelBase.load_hparams(Path(checkpoint_dir), False)
+    if "mistral" in str(hparams.get("model_type", "")) and "params.json" in os.listdir(checkpoint_dir):
+        hparams = conversion.ModelBase.load_hparams(Path(checkpoint_dir), True)
     # keep quantization_config in hparams: the conversion dequantizes
     # compressed-tensors packed weights itself when it is present
     model_architecture = conversion.get_model_architecture(hparams, conversion.model_type(ModelType.TEXT))

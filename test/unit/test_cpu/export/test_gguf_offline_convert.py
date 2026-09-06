@@ -139,6 +139,23 @@ class TestOfflineConvertEndToEnd:
         assert two_d, "expected 2D tensors in the file"
         assert all(t.tensor_type == gguf.GGMLQuantizationType.F16 for t in two_d)
 
+    def test_convert_bf16_checkpoint_roundtrips(self, tmp_path, tiny_qwen_model_path):
+        """bf16 delegates to the reference float-storage implementation (the
+        torch bf16 packer does not run on CPU)."""
+        path = _convert(tiny_qwen_model_path, str(tmp_path / "gguf"), "gguf:bf16")
+        reader = gguf.GGUFReader(path)
+        two_d = [t for t in reader.tensors if len(t.shape) == 2]
+        assert two_d
+        assert all(t.tensor_type == gguf.GGMLQuantizationType.BF16 for t in two_d)
+        # spot-check one tensor decodes to a sane value
+        import numpy as np
+
+        t = two_d[0]
+        raw = np.frombuffer(t.data, dtype=np.uint8).reshape(-1, 2)
+        bits = (raw[:, 0].astype(np.uint16) | (raw[:, 1].astype(np.uint16) << 8)).astype(np.uint16)
+        vals = (bits.astype(np.uint32) << 16).view(np.float32)
+        assert np.isfinite(vals).all()
+
     def test_convert_is_deterministic(self, tmp_path, tiny_qwen_model_path):
         _ct_required()
         export_dir = _quantize_to_ct(tiny_qwen_model_path, str(tmp_path / "ct_export"))
