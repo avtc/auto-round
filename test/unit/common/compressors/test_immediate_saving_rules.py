@@ -84,3 +84,24 @@ class TestImmediateSavingRules:
         fake = _fake_self(stream=False, quant_cfg=RTNConfig())
         BaseCompressor._adjust_immediate_packing_and_saving(fake)
         assert fake.compress_context.low_cpu_mem_usage is True
+
+
+class _GgufFmt(_Fmt):
+    def is_gguf(self):
+        return True
+
+
+class TestGgufStreamBlobRules:
+    def test_streaming_gguf_keeps_immediate_saving(self):
+        fake = _fake_self(stream=True, quant_cfg=RTNConfig())
+        fake.formats = [_GgufFmt()]
+        BaseCompressor._adjust_immediate_packing_and_saving(fake)
+        assert fake.compress_context.low_cpu_mem_usage is True
+        assert fake.compress_context.is_immediate_saving is True
+
+    def test_non_streaming_gguf_still_downgrades(self):
+        fake = _fake_self(stream=False, quant_cfg=RTNConfig())
+        fake.formats = [_GgufFmt()]
+        BaseCompressor._adjust_immediate_packing_and_saving(fake)
+        assert fake.compress_context.low_cpu_mem_usage is False
+        assert fake.compress_context.is_immediate_saving is False

@@ -1978,12 +1978,21 @@ class BaseOrchestrator(object):
 
         if self.compress_context.low_cpu_mem_usage and self.compress_context.is_immediate_packing:
             if formats[0].is_gguf():
-                logger.warning(
-                    "`low_cpu_mem_usage` is not fully supported for gguf format. "
-                    "Setting `low_cpu_mem_usage` to False."
-                )
-                self.compress_context.low_cpu_mem_usage = False
-                self.compress_context.is_immediate_saving = False
+                if len(formats) == 1 and getattr(self, "stream_quantization", False):
+                    # Streaming GGUF runs write per-block ggml payloads into
+                    # blob shards and assemble the container at save time, so
+                    # progressive saving is supported after all.
+                    logger.info(
+                        "streaming gguf export: per-block ggml payloads spill to blob shards; "
+                        "the container is assembled from them at save time"
+                    )
+                else:
+                    logger.warning(
+                        "`low_cpu_mem_usage` is not fully supported for gguf format. "
+                        "Setting `low_cpu_mem_usage` to False."
+                    )
+                    self.compress_context.low_cpu_mem_usage = False
+                    self.compress_context.is_immediate_saving = False
             elif (
                 self.has_qlayer_outside_block
                 and getattr(self, "disable_opt_rtn", None)

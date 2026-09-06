@@ -119,6 +119,7 @@ def create_model_class(
     device="cpu",
     quant_nontext_module: bool = False,
     is_auto_scheme: bool = False,
+    blob_store=None,
 ):
     tmp_work_dir = model.name_or_path
     os.makedirs(output_dir, exist_ok=True)
@@ -174,6 +175,9 @@ def create_model_class(
                 is_auto_scheme=is_auto_scheme,
             )
         model_instance = handle_special_model(model_instance, model_architecture)
+    if blob_store is not None:
+        role = "mmproj" if model_type == ModelType.MMPROJ else "text"
+        blob_store.attach_recorder(model_instance, role)
     return model_instance
 
 
@@ -192,6 +196,7 @@ def pack_gguf_layer(
     device="cpu",
     quant_nontext_module=False,
     is_auto_scheme=False,
+    blob_store=None,
 ):
     """Export the model to gguf format."""
     global gguf_model_instance_global
@@ -207,6 +212,7 @@ def pack_gguf_layer(
                 device=device,
                 quant_nontext_module=quant_nontext_module,
                 is_auto_scheme=is_auto_scheme,
+                blob_store=blob_store,
             )
         ]
         if model_type == ModelType.MMPROJ:
@@ -221,6 +227,7 @@ def pack_gguf_layer(
                     device=device,
                     quant_nontext_module=quant_nontext_module,
                     is_auto_scheme=is_auto_scheme,
+                    blob_store=blob_store,
                 )
             )
 
@@ -258,6 +265,12 @@ def pack_gguf_layer(
             gguf_model.current_packing_block = model.last_layer_name_to_block_name[name]
             gguf_model.prepare_tensors()
 
+        if blob_store is not None:
+            # durability contract: blobs of this block reach the shard files
+            # before the caller marks the block done in its resume manifest
+            for gguf_model in gguf_model_instance_global:
+                role = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"
+                blob_store.flush(role)
         for n, m in block.named_modules():
             if hasattr(m, "weight"):
                 m.weight = None
@@ -279,6 +292,7 @@ def save_quantized_as_gguf(
     device="cpu",
     quant_nontext_module=False,
     is_auto_scheme=False,
+    blob_store=None,
     **kwargs,
 ):
     """Export the model to gguf format."""
@@ -296,6 +310,7 @@ def save_quantized_as_gguf(
                 device=device,
                 quant_nontext_module=quant_nontext_module,
                 is_auto_scheme=is_auto_scheme,
+                blob_store=blob_store,
             )
         ]
         if mllm:
@@ -309,6 +324,7 @@ def save_quantized_as_gguf(
                     device=device,
                     quant_nontext_module=quant_nontext_module,
                     is_auto_scheme=is_auto_scheme,
+                    blob_store=blob_store,
                 )
             )
 
@@ -317,6 +333,14 @@ def save_quantized_as_gguf(
             model_kind = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"
             logger.info("Start writing %s GGUF model to %s", model_kind, gguf_model.fname_out)
             gguf_model.write()
+            if blob_store is not None:
+                # blob mode: write() only recorded metadata and spilled tensor
+                # payloads; rebuild the container from the shards (pure
+                # assembly, no quantization math)
+                role = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"
+                blob_store.finalize_role(gguf_model, role)
+                [out_path] = blob_store.assemble(roles=(role,), progress=True)
+                logger.info("Assembled %s GGUF model to %s", model_kind, out_path)
             rt = time.time() - st
             logger.info(f"Model successfully exported to {gguf_model.fname_out}, running time={rt}")
     finally:

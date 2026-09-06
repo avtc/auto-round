@@ -829,6 +829,12 @@ def prepare_tensors(cls):
         data_torch = restored.tensor_fn()
         if data_torch is None or data_torch.numel() == 0:
             continue
+        if data_torch.device.type == "meta":
+            # streaming runs park already-packed blocks on the meta device;
+            # their ggml payloads are durably in the blob shards, and the
+            # interactive path never sees meta tensors, so skipping here is a
+            # no-op for it
+            continue
         # we don't need these
         if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
             continue

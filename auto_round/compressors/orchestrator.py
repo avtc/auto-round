@@ -804,6 +804,20 @@ class CompressionOrchestrator(BaseOrchestrator):
             seen += len(blocks)
         return None
 
+    def _gguf_blob_mode(self) -> bool:
+        """True when a streaming GGUF run packs per-block ggml payloads to blob shards.
+
+        In this mode the GGUF container cannot be written progressively (it is
+        a single file), so packed payloads spill to ``gguf-blobs/`` shards via
+        :class:`GgufBlobStore` and the final container is assembled from them
+        at save time. Compressed-tensors shard writes are skipped for such
+        runs: the blobs are the durable output.
+        """
+        formats = getattr(self, "formats", None)
+        if not isinstance(formats, list) or len(formats) != 1 or not formats[0].is_gguf():
+            return False
+        return bool(getattr(self.model_context, "stream_quantization", False))
+
     def _write_finished_block_(
         self, block, block_name: str, tied_weights_layers: set, rs, q_snap, fp_snap, is_model_last: bool
     ) -> None:
@@ -812,22 +826,25 @@ class CompressionOrchestrator(BaseOrchestrator):
         write the block scope, park to meta, then - only after a durable
         flush - let the manifest claim the block done (crash-durability
         contract: done implies tensors are in a shard file)."""
-        for _n, m in block.named_modules():
-            if (
-                not any(m.children())
-                and len(m.state_dict()) > 0
-                and hasattr(m, "global_name")
-                and m.global_name not in tied_weights_layers
-                and not check_to_quantized(m)
-            ):
-                set_module(self.model, m.global_name, copy.deepcopy(m))
-                self.shard_writer.write(name=m.global_name)
-                get_module(self.model, m.global_name).to("meta")
-                m.to("meta")
-        self.shard_writer.write(name=block_name)
+        gguf_blob = self._gguf_blob_mode()
+        if not gguf_blob:
+            for _n, m in block.named_modules():
+                if (
+                    not any(m.children())
+                    and len(m.state_dict()) > 0
+                    and hasattr(m, "global_name")
+                    and m.global_name not in tied_weights_layers
+                    and not check_to_quantized(m)
+                ):
+                    set_module(self.model, m.global_name, copy.deepcopy(m))
+                    self.shard_writer.write(name=m.global_name)
+                    get_module(self.model, m.global_name).to("meta")
+                    m.to("meta")
+            self.shard_writer.write(name=block_name)
         block.to("meta")
         if rs is not None:
-            self.shard_writer._flush_shard()
+            if not gguf_blob:
+                self.shard_writer._flush_shard()
             _t0 = _time.perf_counter()
             rs.mark_block_done(block_name, q_snap, None if is_model_last else fp_snap)
             return _time.perf_counter() - _t0
@@ -2384,6 +2401,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             len(stage_devices) if stage_devices else 0,
             self.compress_context.is_immediate_packing,
         )
+        if _bg_pack_eligible and self._gguf_blob_mode():
+            # GGUF blob packing runs the conversion instance's prepare_tensors
+            # with shared mutable state (current_packing_block); it is not
+            # safe to overlap with the next block's tune on a worker thread
+            logger.info("[stream] gguf blob mode: packing runs serially in the main loop")
+            _bg_pack_eligible = False
         _bg_pack = None
 
         # Model-level algorithm lifecycle before the block loop, mirroring the
@@ -2736,7 +2759,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 from auto_round.compressors.utils import immediate_pack as _immediate_pack
 
                 _immediate_pack(name, self.layer_config, device=str(outside_qdev))
-                self.shard_writer.write(name=name)
+                if not self._gguf_blob_mode():
+                    self.shard_writer.write(name=name)
+                # gguf blob mode keeps the module live here on purpose: the
+                # save-time prepare_tensors pass packs outside-block tensors
+                # (embeddings, lm_head, norms) from the in-memory qdq weights
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.
             clear_memory()
@@ -2746,7 +2773,15 @@ class CompressionOrchestrator(BaseOrchestrator):
         convert_module_to_hp_if_necessary(self.model, self.amp_dtype, self.device)
         if self.compress_context.low_cpu_mem_usage and streamer is None:
             self._offloader.reload(self.model)
-        if streamer is not None and self.compress_context.is_immediate_saving:
+        if streamer is not None and self.compress_context.is_immediate_saving and self._gguf_blob_mode():
+            # GGUF blob mode: still-meta root tensors (norms, vision tower on
+            # MLLM, ...) get hydrated from the checkpoint at save time by
+            # _hydrate_meta_from_checkpoint, and the save-time
+            # prepare_tensors pass packs them straight into blob shards - the
+            # compressed-tensors root pass-through below would only duplicate
+            # them into shards this run never reads.
+            logger.info("[stream] gguf blob mode: root tensors deferred to the save-time gguf pass")
+        elif streamer is not None and self.compress_context.is_immediate_saving:
             # Root pass-through tensors (embeddings, final norm, lm_head, ...) are
             # still meta; stream them in so ShardWriter.finalize() sees real data
             # (finalize silently skips meta tensors).
@@ -2867,8 +2902,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # predictor block (GB-scale) on memory-tight hosts
                     for k2 in keys:
                         self.shard_writer.save_tensor(k2, f.get_tensor(k2))
-        if self.compress_context.is_immediate_saving:
+        if self.compress_context.is_immediate_saving and not self._gguf_blob_mode():
             self.shard_writer.write(is_finalize=True)
+        elif self.compress_context.is_immediate_saving:
+            logger.info("[stream] gguf blob mode: final output is assembled by the gguf save path")
 
         self.model_context.quantized = True
         return self.model, self.layer_config
