@@ -866,12 +866,22 @@ class SignRoundQuantizer(BaseQuantizer):
                 rows_axis = 1 if current_input.dim() == 3 else 0
                 sample_rows = current_input.shape[rows_axis]
                 out_features = layer.weight.shape[0] if layer.weight.dim() == 2 else None
+                # row-blocked wrappers keep only one block's graph alive, so the
+                # position-chunk budget must size against the block width, not
+                # the full output; they must also take the interleaved loop
+                # even when one chunk covers all rows (a single-shot forward
+                # would hold every block's graph at once)
+                blockwise = wrapper_linear.row_block_active()
+                block_bounds = wrapper_linear.row_block_bounds() if blockwise else None
+                chunk_out_features = out_features
+                if blockwise:
+                    chunk_out_features = block_bounds[0][1] - block_bounds[0][0]
                 chunk_rows = (
-                    _outside_tune_rows_per_chunk(out_features, sample_rows, _OUTSIDE_TUNE_CHUNK_OUT_ELEMS)
-                    if out_features is not None
+                    _outside_tune_rows_per_chunk(chunk_out_features, sample_rows, _OUTSIDE_TUNE_CHUNK_OUT_ELEMS)
+                    if chunk_out_features is not None
                     else sample_rows
                 )
-                if chunk_rows >= sample_rows:
+                if chunk_rows >= sample_rows and not blockwise:
                     with torch.no_grad():
                         current_output = layer(org_input)
                     if valid_token_mask:
@@ -911,8 +921,6 @@ class SignRoundQuantizer(BaseQuantizer):
                     # block, so backward must run per block too: the MSE sum
                     # decomposes over output columns and gradients accumulate,
                     # making the result identical to one big backward
-                    blockwise = wrapper_linear.row_block_active()
-                    block_bounds = wrapper_linear.row_block_bounds() if blockwise else None
                     num_elm = 1 if num_elm <= 0 else num_elm
                     for start in range(0, sample_rows, chunk_rows):
                         end = min(start + chunk_rows, sample_rows)
