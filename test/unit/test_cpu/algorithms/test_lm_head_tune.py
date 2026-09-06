@@ -370,6 +370,45 @@ class TestRowBlockedWrapperForward:
         monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 60, raising=False)
         assert wrapper._use_row_blocked_output() is False
 
+    def test_unwrapper_matches_full_path_when_blocked(self, monkeypatch):
+        """The final quantize/dequantize in unwrapper must equal the full-tensor
+        computation when it runs row-blocked (multi-block budget)."""
+        import auto_round.wrapper as wmod
+
+        torch.manual_seed(11)
+        layer = _mk_quant_linear(24, 10, group_size=4)
+
+        outputs = []
+        for cap in (2**26, 40):  # full path vs 4-row blocks
+            torch.manual_seed(5)
+            fresh = _mk_quant_linear(24, 10, group_size=4)
+            with torch.no_grad():
+                fresh.weight.copy_(layer.weight)
+                fresh.bias.copy_(layer.bias)
+            wrapper = self._wrapper(fresh, minmax=True)
+            with torch.no_grad():
+                torch.manual_seed(6)
+                for p in wrapper.parameters():
+                    p.add_(torch.randn_like(p) * 1e-3)
+            monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", cap, raising=False)
+            best = {k: v.detach().clone() for k, v in wrapper.state_dict().items()}
+            restored = wrapper.unwrapper(best)
+            outputs.append(restored.weight.detach().clone())
+        assert torch.equal(outputs[0], outputs[1]), "blocked unwrapper diverged from full quantize"
+
+    def test_row_block_bounds_partition_rows(self, monkeypatch):
+        import auto_round.wrapper as wmod
+
+        layer = _mk_quant_linear(24, 10, group_size=4)
+        wrapper = self._wrapper(layer)
+        monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 40, raising=False)
+        bounds = wrapper.row_block_bounds()
+        flat = [r for b in bounds for r in b]
+        assert flat[0] == 0 and flat[-1] == 24
+        assert all(e > s for s, e in bounds)
+        assert all(bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1)), "gaps/overlaps"
+        assert len(bounds) > 1, "expected multiple blocks under the tiny budget"
+
 
 class TestLmHeadNameResolution:
     """lm_head resolves from the quantization plan, never from module order."""
