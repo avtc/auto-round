@@ -684,6 +684,17 @@ class SignRoundQuantizer(BaseQuantizer):
                 total / 1024**3,
             )
 
+    def _best_param_device(self, value_elements: int):
+        """Where to park the best-parameters snapshot.
+
+        A huge layer's snapshot is as large as its rounding parameter; keeping
+        a second copy on the GPU alongside the live parameters, gradients, and
+        block transients overflows a 24GB card on the first improving
+        iteration, so it always parks on the host."""
+        if value_elements > _OUTSIDE_TUNE_CHUNK_OUT_ELEMS:
+            return torch.device("cpu")
+        return self.compress_context.cache_device
+
     def quantize_layer_outside_block(
         self,
         layer: "torch.nn.Module",
@@ -969,10 +980,10 @@ class SignRoundQuantizer(BaseQuantizer):
             if total_loss < best_loss:
                 best_loss = total_loss
                 if not self.not_use_best_mse:
-                    best_params = collect_best_params(wrapper_linear, self.compress_context.cache_device)
+                    best_params = collect_best_params(wrapper_linear, self._best_param_device(value_elements))
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
-                best_params = collect_best_params(wrapper_linear, self.compress_context.cache_device)
+                best_params = collect_best_params(wrapper_linear, self._best_param_device(value_elements))
 
             if not self.not_use_best_mse:
                 if 0 < self.dynamic_max_gap <= i - last_best_iter:
