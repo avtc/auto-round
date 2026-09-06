@@ -40,7 +40,6 @@ from auto_round.compressors.utils import (
 )
 from auto_round.data_type.utils import update_block_global_scale_if_needed
 from auto_round.logger import logger
-from auto_round.utils.peak_watch import PeakWatcher
 from auto_round.modeling.fused_moe.replace_modules import materialize_model_
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
@@ -64,6 +63,7 @@ from auto_round.utils.device import (
 )
 from auto_round.utils.device_manager import device_manager
 from auto_round.utils.model import is_moe_model_via_config
+from auto_round.utils.peak_watch import PeakWatcher
 from auto_round.wrapper import WrapperMultiblock
 
 if TYPE_CHECKING:
@@ -2706,6 +2706,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.info(f"Quantizing remaining layer {name} on {outside_qdev}.")
             from auto_round.utils.device import log_cuda_memory_census
 
+            # phase boundary: the block loop just freed its large tuning
+            # buffers; returning them to the driver keeps the allocator pool
+            # compact before the (potentially huge) outside-block wrappers are
+            # built, instead of reserving fragmented segments nobody can use
+            if torch.cuda.is_available() and str(outside_qdev).startswith("cuda"):
+                torch.cuda.empty_cache()
             log_cuda_memory_census(f"outside-block loop entry {name}", outside_qdev)
             if streamer is not None:
                 # load the layer itself; streaming its parent prefix would

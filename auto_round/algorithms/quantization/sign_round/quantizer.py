@@ -662,6 +662,28 @@ class SignRoundQuantizer(BaseQuantizer):
         logger.infoclean(dump_info)
         return best_params
 
+    @staticmethod
+    def _preallocate_tuning_grads_(optimizer, layer_name=""):
+        """Create zero ``.grad`` buffers so autograd accumulates in place.
+
+        The first backward would otherwise allocate a dense gradient for every
+        tuning parameter mid-run (as large as the rounding parameter itself);
+        allocating it up front keeps the peak inside the budget measured at
+        wrapper-construction time and is gradient-identical (accumulate into
+        zeros)."""
+        total = 0
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if param.grad is None and param.requires_grad:
+                    param.grad = torch.zeros_like(param)
+                    total += param.grad.numel() * param.grad.element_size()
+        if total:
+            logger.debug(
+                "pre-allocated tuning gradient buffers for %s (%.2fGiB)",
+                layer_name,
+                total / 1024**3,
+            )
+
     def quantize_layer_outside_block(
         self,
         layer: "torch.nn.Module",
@@ -775,6 +797,7 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         else:
             optimizer = self.optimizer(round_params, lr=lr, weight_decay=0)
+        self._preallocate_tuning_grads_(optimizer, layer_name)
 
         if self.lr_scheduler is None:
             lr_schedule = torch.optim.lr_scheduler.LinearLR(
@@ -890,6 +913,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     # making the result identical to one big backward
                     blockwise = getattr(wrapper_linear, "_row_block_decision", False) is True
                     block_bounds = wrapper_linear.row_block_bounds() if blockwise else None
+                    num_elm = 1 if num_elm <= 0 else num_elm
                     for start in range(0, sample_rows, chunk_rows):
                         end = min(start + chunk_rows, sample_rows)
                         chunk_input = current_input[:, start:end] if rows_axis == 1 else current_input[start:end]
@@ -898,38 +922,36 @@ class SignRoundQuantizer(BaseQuantizer):
                             chunk_ref = layer(chunk_ref_input)
                         if cat_mask is not None:
                             chunk_mask = cat_mask[start:end]
-                    if not blockwise:
-                        with autocast_ctx:
-                            chunk_q = wrapper_linear(chunk_input)  # pylint: disable=not-callable
-                        if cat_mask is not None:
-                            loss = mse_sum_loss(
-                                (chunk_q * chunk_mask).to(torch.float32),
-                                (chunk_ref * chunk_mask).to(torch.float32),
-                            )
-                        else:
-                            loss = mse_sum_loss(chunk_q.to(torch.float32), chunk_ref.to(torch.float32))
-                        loss = loss / sum_denom
-                        num_elm = 1 if num_elm <= 0 else num_elm
-                        total_loss += loss.item() / num_elm
-                        self._scale_loss_and_backward(scaler, loss)
-                    else:
-                        num_elm = 1 if num_elm <= 0 else num_elm
-                        for b0, b1 in block_bounds:
-                            # forward, loss, and backward complete per block so
-                            # only one block's autograd graph is ever live
+                        if not blockwise:
                             with autocast_ctx:
-                                chunk_q_block = wrapper_linear.forward_rows(chunk_input, b0, b1)
-                            ref_block = chunk_ref[..., b0:b1]
+                                chunk_q = wrapper_linear(chunk_input)  # pylint: disable=not-callable
                             if cat_mask is not None:
                                 loss = mse_sum_loss(
-                                    (chunk_q_block * chunk_mask).to(torch.float32),
-                                    (ref_block * chunk_mask).to(torch.float32),
+                                    (chunk_q * chunk_mask).to(torch.float32),
+                                    (chunk_ref * chunk_mask).to(torch.float32),
                                 )
                             else:
-                                loss = mse_sum_loss(chunk_q_block.to(torch.float32), ref_block.to(torch.float32))
+                                loss = mse_sum_loss(chunk_q.to(torch.float32), chunk_ref.to(torch.float32))
                             loss = loss / sum_denom
                             total_loss += loss.item() / num_elm
                             self._scale_loss_and_backward(scaler, loss)
+                        else:
+                            for b0, b1 in block_bounds:
+                                # forward, loss, and backward complete per block
+                                # so only one block's autograd graph is ever live
+                                with autocast_ctx:
+                                    chunk_q_block = wrapper_linear.forward_rows(chunk_input, b0, b1)
+                                ref_block = chunk_ref[..., b0:b1]
+                                if cat_mask is not None:
+                                    loss = mse_sum_loss(
+                                        (chunk_q_block * chunk_mask).to(torch.float32),
+                                        (ref_block * chunk_mask).to(torch.float32),
+                                    )
+                                else:
+                                    loss = mse_sum_loss(chunk_q_block.to(torch.float32), ref_block.to(torch.float32))
+                                loss = loss / sum_denom
+                                total_loss += loss.item() / num_elm
+                                self._scale_loss_and_backward(scaler, loss)
             if i == 0:
                 init_loss = total_loss
                 log_cuda_memory_census(f"outside-block first backward done {layer_name}", device)
@@ -1019,5 +1041,8 @@ class SignRoundQuantizer(BaseQuantizer):
         # for hpu
         if is_hpex_available():
             htcore.mark_step()
-        optimizer.zero_grad()
+        # keep the buffers: reallocating a dense gradient as large as the
+        # rounding parameter would break the memory budget of huge layers
+        # (outside-block lm_head tuning) in every iteration after the first
+        optimizer.zero_grad(set_to_none=False)
         lr_schedule.step()
