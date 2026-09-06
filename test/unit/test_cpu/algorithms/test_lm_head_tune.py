@@ -311,6 +311,30 @@ class TestRowBlockedWrapperForward:
         monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 60, raising=False)
         assert wrapper._use_row_blocked_output() is False
 
+    def test_attached_none_scheme_fields_still_block(self, monkeypatch):
+        """The plan machinery attaches every scheme field (None when unset) to
+        quantized layers; a None super_bits must not disable blocking."""
+        import auto_round.wrapper as wmod
+
+        layer = _mk_quant_linear(24, 10, group_size=4)
+        layer.super_bits = None
+        layer.super_group_size = None
+        layer.rotation_config = None
+        layer.act_dynamic = True
+        wrapper = self._wrapper(layer)
+        monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 60, raising=False)
+        assert wrapper._use_row_blocked_output() is True
+
+    def test_real_super_bits_never_blocks(self, monkeypatch):
+        import auto_round.wrapper as wmod
+
+        layer = _mk_quant_linear(24, 10, group_size=4)
+        layer.super_bits = 6
+        layer.super_group_size = 8
+        wrapper = self._wrapper(layer)
+        monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 60, raising=False)
+        assert wrapper._use_row_blocked_output() is False
+
 
 class TestLmHeadNameResolution:
     """lm_head resolves from the quantization plan, never from module order."""
