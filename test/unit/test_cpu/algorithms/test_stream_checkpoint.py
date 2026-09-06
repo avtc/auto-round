@@ -2246,7 +2246,7 @@ class TestCheckpointOnlyGroupVisibility:
         # pinned groups quantize in BOTH regimes now (no env-gated verbatim
         # skip); the remaining visible skips are the non-quantizable pin and
         # the non-2D tail
-        assert "stays verbatim: its pin matched no quantizable tensor" in src
+        assert "stays verbatim: its pin matched no quantizable" in src  # message spans source lines
         assert "not 2D weights" in src and "skipped_non_2d" in src
         # per-group decision visibility: recognized pattern vs degraded
         assert "no decoder sibling" in src and "covers its tensors" in src
