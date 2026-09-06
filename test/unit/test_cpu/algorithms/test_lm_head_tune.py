@@ -165,6 +165,80 @@ class TestOutsideTuneChunking:
         assert torch.equal(results[0], results[1]), "chunked tune diverged from single-shot"
 
 
+    def test_huge_value_parameter_skips_torch_compile(self, monkeypatch):
+        """Inductor's backward adds a full-size buffer for billion-element
+        rounding parameters; the wrapper must stay eager for those."""
+        from types import MethodType
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as qmod
+
+        captured = {}
+        real_wrapper = qmod.WrapperLinear
+
+        def recording_wrapper(layer, **kwargs):
+            captured.update(kwargs)
+            return real_wrapper(layer, **kwargs)
+
+        monkeypatch.setattr(qmod, "WrapperLinear", recording_wrapper)
+        torch.manual_seed(5)
+        layer = torch.nn.Linear(16, 5)
+        layer.global_name = "lm_head"
+        layer.bits = 8
+        layer.group_size = 32
+        layer.sym = True
+        layer.data_type = "int"
+        layer.scale_dtype = None
+        layer.iters = 2
+        layer.act_bits = 16
+        layer.act_sym = True
+        layer.act_data_type = None
+        layer.act_group_size = None
+        cfg = type("C", (), {
+            "iters": 2,
+            "lr": 5e-3,
+            "compute_lr": lambda self, bits: None,
+            "compute_minmax_lr": lambda self, bits: None,
+        })()
+        quant = SimpleNamespace(
+            config=cfg,
+            _config=cfg,
+            iters=2,
+            lr=5e-3,
+            minmax_lr=1e-3,
+            lr_scheduler=None,
+            enable_minmax_tuning=False,
+            gradient_accumulate_steps=1,
+            not_use_best_mse=False,
+            dynamic_max_gap=0,
+            optimizer=qmod.SignSGD,
+            lr_is_auto=False,
+            model=torch.nn.Module(),
+            calibration_context=SimpleNamespace(batch_size=1),
+            model_context=SimpleNamespace(amp=False, amp_dtype=torch.bfloat16),
+            compress_context=SimpleNamespace(enable_torch_compile=True, cache_device="cpu"),
+        )
+        for name in ("_get_scaler", "_scale_loss_and_backward", "_step", "_maybe_log_low_bit_lr"):
+            setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
+        quant._logged_low_bit_lr = set()
+        fp = [torch.randn(1, 7, 16) for _ in range(2)]
+
+        # 16x5=80 elements fit the default budget: compile honored
+        qmod.SignRoundQuantizer.quantize_layer_outside_block(quant, layer, fp_inputs=[t.clone() for t in fp])
+        assert captured["enable_torch_compile"] is True
+
+        # shrink the budget below the layer size: compile must be skipped
+        monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", 16, raising=False)
+        fresh = torch.nn.Linear(16, 5)
+        for attr, val in (
+            ("global_name", "lm_head"), ("bits", 8), ("group_size", 32), ("sym", True),
+            ("data_type", "int"), ("scale_dtype", None), ("iters", 2), ("act_bits", 16),
+            ("act_sym", True), ("act_data_type", None), ("act_group_size", None),
+        ):
+            setattr(fresh, attr, val)
+        qmod.SignRoundQuantizer.quantize_layer_outside_block(quant, fresh, fp_inputs=[t.clone() for t in fp])
+        assert captured["enable_torch_compile"] is False
+
+
 class TestLmHeadNameResolution:
     """lm_head resolves from the quantization plan, never from module order."""
 
