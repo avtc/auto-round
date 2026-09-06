@@ -343,7 +343,7 @@ class WrapperLinear(torch.nn.Module):
         if weight.dim() == 2 and self.row_block_active():
             # the final quantize/dequantize of a huge layer runs the same
             # fp32 intermediates as the forward; keep them block-sized too
-            in_features = weight.shape[1]
+            out_features, in_features = weight.shape
             group_size = self.orig_layer.group_size
             groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
             weight_q_parts, scale_parts, zp_parts = [], [], []
@@ -356,10 +356,12 @@ class WrapperLinear(torch.nn.Module):
                     self._slice_tunable(max_scale, g_start, g_end),
                     self._slice_tunable(self.weight_min, g_start, g_end),
                     self._slice_tunable(self.weight_max, g_start, g_end),
+                    init_scale=self._sliced_init_scale(g_start, g_end, out_features * groups_per_row),
                 )
                 weight_q_parts.append(wq)
                 scale_parts.append(sc)
                 zp_parts.append(zp)
+                del wq, sc, zp
             weight_q = torch.cat(weight_q_parts, dim=0)
             scale = torch.cat(scale_parts, dim=0) if isinstance(scale_parts[0], torch.Tensor) else scale_parts[0]
             zp = torch.cat(zp_parts, dim=0) if isinstance(zp_parts[0], torch.Tensor) else zp_parts[0]
@@ -442,6 +444,29 @@ class WrapperLinear(torch.nn.Module):
                 rows = max(1024, min(rows, budget_rows))
         return [(start, min(start + rows, out_features)) for start in range(0, out_features, rows)]
 
+    def _sliced_init_scale(self, g_start, g_end, total_groups=None):
+        """init_scale sliced to a group window, with full-width fallback."""
+        init_scale = getattr(self, "init_scale", None)
+        if not isinstance(init_scale, torch.Tensor) or init_scale.dim() < 1:
+            return init_scale
+        expected = total_groups
+        if expected is None:
+            weight = self.orig_layer.weight
+            _, in_features = weight.shape
+            group_size = self.orig_layer.group_size
+            groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
+            expected = weight.shape[0] * groups_per_row
+        if init_scale.shape[0] == expected:
+            # per-group initial scales follow the same row-major window
+            return init_scale[g_start:g_end]
+        logger.warning_once(
+            "[tune] row-blocked forward keeps an init_scale of shape %s (expected leading dim %d); "
+            "passing it through unsliced",
+            tuple(init_scale.shape),
+            expected,
+        )
+        return init_scale
+
     def _row_block_params(self, start, end):
         """Sliced tuning parameters and weight for one output-row window."""
         weight = self.orig_layer.weight.to(self.device)
@@ -449,19 +474,7 @@ class WrapperLinear(torch.nn.Module):
         group_size = self.orig_layer.group_size
         groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
         g_start, g_end = start * groups_per_row, end * groups_per_row
-        init_scale = getattr(self, "init_scale", None)
-        block_init_scale = init_scale
-        if isinstance(init_scale, torch.Tensor) and init_scale.dim() >= 1:
-            if init_scale.shape[0] == weight.shape[0] * groups_per_row:
-                # per-group initial scales follow the same row-major window
-                block_init_scale = init_scale[g_start:g_end]
-            else:
-                logger.warning_once(
-                    "[tune] row-blocked forward keeps an init_scale of shape %s (expected leading dim %d); "
-                    "passing it through unsliced",
-                    tuple(init_scale.shape),
-                    weight.shape[0] * groups_per_row,
-                )
+        block_init_scale = self._sliced_init_scale(g_start, g_end, weight.shape[0] * groups_per_row)
         min_bound, max_bound = self.minmax_scale_bound
         self.min_scale.data.clamp_(min_bound, max_bound)
         self.max_scale.data.clamp_(min_bound, max_bound)
