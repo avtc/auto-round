@@ -525,6 +525,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.info(f"Quantizing remaining layer {name} on CPU.")
             from auto_round.utils.device import log_cuda_memory_census
 
+            # phase boundary: the block loop just freed its large tuning
+            # buffers; returning them to the driver keeps the allocator pool
+            # compact before the (potentially huge) outside-block wrappers
+            # are built, instead of reserving fragmented segments nobody can use
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             log_cuda_memory_census(f"outside-block loop entry {name}")
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just

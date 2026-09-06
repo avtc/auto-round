@@ -46,6 +46,33 @@ if deepspeed_exists:
 _ROW_BLOCKED_WEIGHT_ELEMS = 2**26
 
 
+class _GradScatterSlice(torch.autograd.Function):
+    """Row-window view of a tuning parameter with block-sized gradient memory.
+
+    Slicing a leaf parameter directly makes autograd materialize a dense
+    gradient the size of the whole parameter (SliceBackward starts from a full
+    zeros tensor), which is precisely the allocation that overflows a 24GB GPU
+    for a 248k-vocabulary lm_head. This view accumulates its gradient straight
+    into the parameter's ``.grad`` buffer instead, so every intermediate stays
+    the size of one row window."""
+
+    @staticmethod
+    def forward(ctx, param, g_start, g_end):
+        ctx.param = param
+        ctx.g_start = g_start
+        ctx.g_end = g_end
+        return param.detach()[g_start:g_end].clone()
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        param = ctx.param
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
+        with torch.no_grad():
+            param.grad[ctx.g_start : ctx.g_end] += grad_out.to(param.grad.dtype)
+        return None, None, None
+
+
 def get_scale_shape(weight, group_size):
     """Computes the shape of the scale tensor for quantization based on the weight tensor and group size.
 
@@ -385,9 +412,9 @@ class WrapperLinear(torch.nn.Module):
         self.max_scale.data.clamp_(min_bound, max_bound)
         weight_q, *_ = self._qdq_weight_block(
             weight[start:end],
-            self.value[g_start:g_end],
-            self.min_scale[g_start:g_end],
-            self.max_scale[g_start:g_end],
+            _GradScatterSlice.apply(self.value, g_start, g_end),
+            _GradScatterSlice.apply(self.min_scale, g_start, g_end),
+            _GradScatterSlice.apply(self.max_scale, g_start, g_end),
             self.weight_min[g_start:g_end] if self.weight_min is not None else None,
             self.weight_max[g_start:g_end] if self.weight_max is not None else None,
             init_scale=block_init_scale,

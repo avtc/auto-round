@@ -154,8 +154,14 @@ class TestOutsideTuneChunking:
                 model_context=SimpleNamespace(amp=False, amp_dtype=torch.bfloat16),
                 compress_context=SimpleNamespace(enable_torch_compile=False, cache_device="cpu"),
             )
-            for name in ("_get_scaler", "_scale_loss_and_backward", "_step", "_maybe_log_low_bit_lr"):
+            for name in (
+                "_get_scaler",
+                "_scale_loss_and_backward",
+                "_step",
+                "_maybe_log_low_bit_lr",
+            ):
                 setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
+            quant._preallocate_tuning_grads_ = qmod.SignRoundQuantizer._preallocate_tuning_grads_
             quant._logged_low_bit_lr = set()
             monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", cap, raising=False)
             qmod.SignRoundQuantizer.quantize_layer_outside_block(
@@ -222,6 +228,7 @@ class TestOutsideTuneChunking:
         )
         for name in ("_get_scaler", "_scale_loss_and_backward", "_step", "_maybe_log_low_bit_lr"):
             setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
+        quant._preallocate_tuning_grads_ = qmod.SignRoundQuantizer._preallocate_tuning_grads_
         quant._logged_low_bit_lr = set()
         fp = [torch.randn(1, 7, 16) for _ in range(2)]
 
@@ -561,3 +568,81 @@ class TestLmHeadTuneWiring:
     def test_helper_only_runs_under_streaming(self):
         src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
         assert "if streamer is not None else None" in src
+
+
+class TestTuningGradBuffers:
+    """Outside-block tuning must keep gradient buffers stable in memory."""
+
+    def _params(self):
+        w = torch.nn.Parameter(torch.randn(6, 5))
+        s = torch.nn.Parameter(torch.randn(6, 1))
+        return [w, s]
+
+    def test_preallocate_creates_zero_grads(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        params = self._params()
+        opt = torch.optim.SGD(params, lr=1e-3)
+        SignRoundQuantizer._preallocate_tuning_grads_(opt, "probe")
+        for p in params:
+            assert p.grad is not None
+            assert p.grad.shape == p.shape
+            assert torch.count_nonzero(p.grad) == 0
+
+    def test_preallocate_idempotent_and_keeps_values(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        params = self._params()
+        opt = torch.optim.SGD(params, lr=1e-3)
+        SignRoundQuantizer._preallocate_tuning_grads_(opt, "probe")
+        params[0].grad.add_(1.0)
+        SignRoundQuantizer._preallocate_tuning_grads_(opt, "probe")
+        assert torch.all(params[0].grad == 1.0), "pre-allocation must not clobber live gradients"
+
+    def test_optimizer_step_zeroes_in_place(self):
+        """The shared step helper must zero grads without dropping the buffers."""
+        import inspect
+
+        from auto_round.algorithms.quantization.sign_round import quantizer as qmod
+
+        src = inspect.getsource(qmod.SignRoundQuantizer._step)
+        assert "zero_grad(set_to_none=False)" in src
+
+    def test_outside_block_loop_releases_cached_blocks(self):
+        src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
+        assert "torch.cuda.empty_cache()" in src
+
+
+class TestGradScatterSlice:
+    """The row-window view must produce the exact gradients of a plain slice."""
+
+    def test_blocked_gradients_match_plain_slice(self):
+        from auto_round.wrapper import _GradScatterSlice
+
+        torch.manual_seed(7)
+        param = torch.nn.Parameter(torch.randn(12, 8))
+        x = torch.randn(3, 8)
+        ref = torch.randn(3, 6)
+
+        plain = torch.nn.Parameter(param.detach().clone())
+        plain_out = torch.nn.functional.linear(x, plain[6:12])
+        torch.nn.functional.mse_loss(plain_out, ref, reduction="sum").backward()
+
+        param.grad = torch.zeros_like(param)
+        scatter_out = torch.nn.functional.linear(x, _GradScatterSlice.apply(param, 6, 12))
+        torch.nn.functional.mse_loss(scatter_out, ref, reduction="sum").backward()
+
+        assert param.grad[0:6].abs().sum() == 0, "outside rows must stay zero"
+        assert torch.allclose(param.grad[6:12], plain.grad[6:12], atol=1e-6), "scatter must equal plain-slice grad"
+
+    def test_accumulates_across_multiple_views(self):
+        from auto_round.wrapper import _GradScatterSlice
+
+        param = torch.nn.Parameter(torch.randn(8, 4))
+        param.grad = torch.zeros_like(param)
+        y = torch.randn(2, 4)
+        for _ in range(3):
+            out = torch.nn.functional.linear(y, _GradScatterSlice.apply(param, 2, 5))
+            out.sum().backward()
+        assert torch.allclose(param.grad[2:5], torch.ones(3, 4) * y.sum(0).unsqueeze(0) * 3, atol=1e-6)
+        assert param.grad[0:2].abs().sum() == 0 and param.grad[5:].abs().sum() == 0
