@@ -344,3 +344,15 @@ class TestDequantMismatchDiagnostic:
         assert _ct_weights_for_tensor("model.layers.64.self_attn.q_proj.weight", groups, n_layers=n) is w8
         # body layers stay untouched by the reverse remap
         assert _ct_weights_for_tensor("model.layers.64.mlp.gate_proj.weight", groups, n_layers=None) is None
+
+    def test_exact_rename_record_beats_heuristics(self):
+        """The arch-provided rename record resolves config groups exactly."""
+        from auto_round.export.export_to_gguf.conversion.base import _ct_weights_for_tensor
+
+        w8 = {"num_bits": 8, "group_size": 128, "type": "int", "strategy": "group"}
+        groups = {"group_1": {"targets": ["mtp.fc"], "weights": w8}}
+        renames = {"model.layers.64.eh_proj.weight_packed": "mtp.fc.weight_packed"}
+        # exact record wins even when heuristics alone would fail
+        assert _ct_weights_for_tensor("model.layers.64.eh_proj.weight", groups, n_layers=None, renames=renames) is w8
+        # heuristic fallback still applies when the record is silent
+        assert _ct_weights_for_tensor("mtp.fc.weight", groups, n_layers=None) is w8

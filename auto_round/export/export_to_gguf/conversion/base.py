@@ -155,17 +155,20 @@ def _ct_candidate_names(name, n_layers=None):
     return candidates
 
 
-def _ct_weights_for_tensor(name, groups, n_layers=None):
+def _ct_weights_for_tensor(name, groups, n_layers=None, renames=None):
     """Resolve the compressed-tensors ``weights`` config for one tensor.
 
     Multi-group exports pin different bit widths per module (for example an
     8-bit lm_head over a 4-bit body). Group ``targets`` are module-type names
     (``Linear``), leaf module names (``lm_head``), dotted module paths, or
     regexes; non-module-type targets are matched as regexes against the tensor
-    name and the first module-type group acts as the default. Every loader
-    spelling from ``_ct_candidate_names`` is tried before falling back."""
+    name and the first module-type group acts as the default. The loader's
+    exact rename record is consulted first (each arch class renames tensors in
+    its own ``filter_tensors``); the spelling heuristics only back it up."""
     default = None
-    for candidate in _ct_candidate_names(name, n_layers):
+    spelled = [renames[name]] if renames and name in renames else []
+    spelled += _ct_candidate_names(name, n_layers)
+    for candidate in spelled:
         for group in groups.values():
             if not isinstance(group, dict):
                 continue
@@ -271,6 +274,10 @@ class ModelBase:
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
+        # exact reversed record of every rename filter_tensors applied while
+        # indexing shards: renamed name -> original checkpoint name. The CT
+        # dequantizer resolves config groups against the original spellings.
+        self._loader_renames: dict[str, str] = {}
         self.model_tensors = self.index_tensors(remote_hf_model_id=remote_hf_model_id)
         self.metadata_override = metadata_override
         self.model_name = model_name
@@ -341,6 +348,8 @@ class ModelBase:
                 if titem := self.filter_tensors((name, data_gen)):
                     tname, tgen = titem
                     tensors[tname] = tgen
+                    if tname != name:
+                        self._loader_renames[tname] = name
 
             return tensors
 
@@ -410,6 +419,8 @@ class ModelBase:
                     if titem := self.filter_tensors((name, data_gen)):
                         tname, tgen = titem
                         tensors[tname] = tgen
+                        if tname != name:
+                            self._loader_renames[tname] = name
 
         # verify tensor name presence and identify potentially missing files
         if len(tensor_names_from_index) > 0:
@@ -694,7 +705,12 @@ class ModelBase:
                         tensor_config = (
                             weight_config
                             if len(groups) == 1
-                            else _ct_weights_for_tensor(base_name, groups, n_layers=_ct_layer_base(self.hparams))
+                            else _ct_weights_for_tensor(
+                                base_name,
+                                groups,
+                                n_layers=_ct_layer_base(self.hparams),
+                                renames=getattr(self, "_loader_renames", None),
+                            )
                         )
                         if tensor_config is None:
                             raise NotImplementedError(f"No compressed-tensors config group matches {base_name!r}")
