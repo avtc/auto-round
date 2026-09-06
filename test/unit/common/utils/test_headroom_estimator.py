@@ -240,16 +240,16 @@ class TestBoundedStagingWait:
         assert any("no host-RAM rescue" in msg for msg in seen)
 
 
-class TestMtpZeroShotFallback:
-    """AR_MTP_ZERO_SHOT=1 lets a tuning run quantize pinned checkpoint-only
-    groups with the closed-form search instead of leaving them verbatim."""
+class TestMtpPinnedPlaceholderQuantization:
+    """Pinned checkpoint-only groups without a covering sibling quantize
+    through the closed-form search in BOTH regimes (they cannot join the
+    tuning forward); unpinned groups stay verbatim."""
 
-    def _run(self, iters, monkeypatch, env="0"):
+    def _run(self, iters, monkeypatch=None):
         import torch.nn as nn
 
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
-        monkeypatch.setenv("AR_MTP_ZERO_SHOT", env)
         model = nn.Module()
         outer = nn.Module()
         layers = nn.Module()
@@ -289,13 +289,14 @@ class TestMtpZeroShotFallback:
         assert tree_groups == []
         return claimed, model
 
-    def test_tuning_run_defaults_to_verbatim(self, monkeypatch):
-        claimed, model = self._run(10, monkeypatch)
-        assert claimed == set()
-        assert not hasattr(model, "mtp")
+    def test_tuning_run_quantizes_pinned_placeholders(self):
+        claimed, model = self._run(10)
+        assert "mtp.fc.weight" in claimed
+        lin = model.mtp.fc
+        assert lin.bits == 8 and lin.global_name == "mtp.fc"
 
-    def test_env_forces_zero_shot_materialization(self, monkeypatch):
-        claimed, model = self._run(10, monkeypatch, env="1")
+    def test_zero_shot_run_quantizes_pinned_placeholders(self):
+        claimed, model = self._run(0)
         assert "mtp.fc.weight" in claimed
         lin = model.mtp.fc
         assert lin.bits == 8 and lin.global_name == "mtp.fc"

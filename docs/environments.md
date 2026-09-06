@@ -211,16 +211,6 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 export AR_SCHEME_MEM_INVENTORY=1
 ```
 
-### AR_MTP_ZERO_SHOT
-
-- **Type**: bool (`1` / `true` / `yes`; default off)
-- **Description**: Tuning runs (`--iters > 0`) normally leave checkpoint-only groups (e.g. a multi-token-prediction layer the modeling code never instantiates) unquantized. EXCEPTION: a group materialized as a real module tree (its tensors fully cover a decoder sibling) JOINS the tuning run - the tune step synthesizes its predictor inputs from the calibration chain and tunes it with the run's own quantizer config. For groups WITHOUT a covering sibling this variable forces the fallback: pinned checkpoint-only layers are quantized inside a tuning run using the closed-form search (the zero-shot path) instead of being left verbatim. The rest of the model is unaffected.
-- **Usage**: Set to `1` when a pinned checkpoint-only group cannot build a tree (no covering sibling) but must still be quantized inside a tuning run.
-
-```bash
-export AR_MTP_ZERO_SHOT=1
-```
-
 ### AR_STREAM_BG_PACK
 
 - **Type**: str (`auto` / `on` / `off`; `1`/`0` aliases; default `auto`)
