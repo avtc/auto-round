@@ -248,3 +248,38 @@ class TestMixedPrecisionIntGroups:
         assert _ct_weights_for_tensor("lm_head.weight", groups) is w8
         assert _ct_weights_for_tensor("mtp.fc.weight", groups) is w8
         assert _ct_weights_for_tensor("mtp.layers.0.mlp.gate_proj.weight", groups) is w8
+
+
+class TestDequantMismatchDiagnostic:
+    """A config/data mismatch must fail with the tensor name and parameters."""
+
+    def test_wrong_bits_reported_with_context(self, tmp_path, monkeypatch):
+        import torch
+
+        from auto_round.export.export_to_gguf.conversion.base import TextModel
+
+        d = "E:/sync/unique/AIServer/tmp/qwen-3.8-27b/qwen3.8-27b-w4g128-10iters-head-mtp-8bit"
+        import json
+        import os
+
+        cfg_path = os.path.join(d, "config.json")
+        if not os.path.isfile(cfg_path):
+            pytest.skip("real pinned-export config not available locally")
+        cfg = json.load(open(cfg_path))
+        cfg["quantization_config"]["config_groups"]["group_0"]["weights"]["num_bits"] = 8
+
+        m = object.__new__(TextModel)
+        m.hparams = cfg
+        m.lazy = False
+        m._fp8_as_q8 = False
+        m._is_nvfp4 = False
+        m._fp8_dequantized = set()
+        name = "model.language_model.layers.0.linear_attn.in_proj_qkv"
+        m.model_tensors = {
+            name + ".weight_packed": lambda: torch.zeros([10240, 640], dtype=torch.int32),
+            name + ".weight_scale": lambda: torch.ones([10240, 40], dtype=torch.float16),
+            name + ".weight_shape": lambda: torch.tensor([10240, 5120]),
+        }
+        m.dequant_model()
+        with pytest.raises(RuntimeError, match="in_proj_qkv.*num_bits=8.*scale_groups_per_row=40"):
+            m.model_tensors[name + ".weight"]()

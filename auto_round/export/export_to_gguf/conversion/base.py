@@ -476,6 +476,7 @@ class ModelBase:
                 zero_point: Tensor | None,
                 num_bits: int,
                 group_size: int,
+                tensor_name: str = "",
             ):
                 assert w.dtype == torch.int32
                 shape = tuple(shape_tensor.tolist())
@@ -503,6 +504,19 @@ class ModelBase:
 
                 # trim padding
                 unpacked = unpacked[:, : shape[1]]
+
+                # fail with full context instead of an opaque broadcast error
+                values_per_row = unpacked.shape[-1]
+                scale_groups = scale.shape[-1] if scale.dim() == 2 else -1
+                expected_values = (shape[1] + group_size - 1) // group_size * group_size
+                if values_per_row < shape[1] or (scale_groups > 0 and values_per_row // group_size != scale_groups):
+                    raise RuntimeError(
+                        f"packed dequantization mismatch for {tensor_name!r}: num_bits={num_bits} "
+                        f"group_size={group_size} packed_words_per_row={w.shape[-1] if w.dim() == 2 else w.numel()} "
+                        f"logical_shape={tuple(shape)} unpacked_values_per_row={values_per_row} "
+                        f"scale_groups_per_row={scale_groups} (expected {max(1, (shape[1] + group_size - 1) // group_size)}); "
+                        f"expected_values_per_row={expected_values} - the config group and the packed data disagree"
+                    )
 
                 # prepare for broadcast of the scale
                 unpacked = unpacked.reshape(shape[0], (unpacked.shape[-1] + group_size - 1) // group_size, group_size)
@@ -634,13 +648,14 @@ class ModelBase:
                         shape = self.model_tensors[base_name + "_shape"]
                         zero_point = self.model_tensors.get(base_name + "_zero_point", lambda: None)
                         new_tensors[base_name] = (
-                            lambda w=w, scale=scale, shape=shape, zero_point=zero_point, nb=num_bits, gs=group_size: dequant_packed(  # noqa: E501
+                            lambda w=w, scale=scale, shape=shape, zero_point=zero_point, nb=num_bits, gs=group_size, tn=base_name: dequant_packed(  # noqa: E501
                                 w(),
                                 scale(),
                                 shape(),
                                 zero_point(),
                                 nb,
                                 gs,
+                                tn,
                             )
                         )
                         tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
