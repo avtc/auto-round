@@ -32,18 +32,111 @@ class _NoNorm(nn.Module):
         self.lm_head = nn.Linear(4, 8)
 
 
+class _Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = nn.Linear(4, 8)
+
+
+class _TrailingTree(nn.Module):
+    """lm_head followed by an attached checkpoint-only placeholder subtree -
+    the module-order "last leaf" lands inside the placeholder, not on lm_head."""
+
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.LayerNorm(4)
+        self.lm_head = nn.Linear(4, 8)
+        self.mtp = nn.Module()
+        self.mtp.pre_fc_norm_hidden = nn.LayerNorm(4)
+
+
+class _BackboneWrapper(nn.Module):
+    """Text backbone + vision tower wrapper: the vision norms sit between the
+    last text block and lm_head and share the 1D-weight (and even width)
+    signature, so the final-norm scan must be restricted to the backbone."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList([_Block()])
+        self.model.language_model.norm = nn.LayerNorm(4)
+        self.model.visual = nn.Module()
+        self.model.visual.merger = nn.Module()
+        self.model.visual.merger.norm = nn.LayerNorm(4)
+        self.lm_head = nn.Linear(4, 8)
+
+
 def _orch(iters, remain, model=None):
     orch = SimpleNamespace(model=model or _Tiny())
     orch._max_tune_iters = lambda: iters
-    for name in ("_lm_head_tune_inputs_", "_final_norm_module_"):
+    for name in ("_lm_head_tune_inputs_", "_final_norm_module_", "_resolve_lm_head_name_"):
         setattr(orch, name, MethodType(getattr(CompressionOrchestrator, name), orch))
-    # staticmethod: attach the plain function (instance attrs never bind self)
+    # staticmethods: attach the plain function (instance attrs never bind self)
     orch._chain_hidden_rows = CompressionOrchestrator._chain_hidden_rows
+    orch._block_backbone_prefix_ = CompressionOrchestrator._block_backbone_prefix_
     return orch
 
 
 def _rows(n=2):
     return [torch.randn(1, 5, 4) for _ in range(n)]
+
+
+class TestLmHeadNameResolution:
+    """lm_head resolves from the quantization plan, never from module order."""
+
+    def test_trailing_placeholder_tree_still_resolves_lm_head(self):
+        orch = _orch(200, ["lm_head"], model=_TrailingTree())
+        assert orch._resolve_lm_head_name_(["lm_head"]) == "lm_head"
+
+    def test_trailing_placeholder_tree_tunes_end_to_end(self):
+        state = {"fp_inputs": _rows(2), "token_ids": [torch.zeros(1, 5)] * 2}
+        orch = _orch(200, ["lm_head"], model=_TrailingTree())
+        out = orch._lm_head_tune_inputs_(state, ["lm_head"])
+        assert out is not None  # no silent closed-form fallback
+
+    def test_unpinned_lm_head_resolves_to_none(self, capfd):
+        assert _orch(200, ["norm"])._resolve_lm_head_name_(["norm"]) is None
+        assert "warning" not in capfd.readouterr().err.lower()
+
+    def test_multiple_candidates_warn(self, capfd):
+        names = ["lm_head", "decoder.lm_head"]
+        orch = _orch(200, names)
+        assert orch._resolve_lm_head_name_(names) == "lm_head"
+        assert "multiple lm_head candidates" in capfd.readouterr().err
+
+    def test_substring_fallback_resolves_prefixed_heads(self):
+        orch = _orch(200, ["model.lm_head_proj"])
+        assert orch._resolve_lm_head_name_(["model.lm_head_proj"]) == "model.lm_head_proj"
+
+
+class _FlatLlama(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_Block()])
+        self.model.norm = nn.LayerNorm(4)
+        self.lm_head = nn.Linear(4, 8)
+
+
+class TestFinalNormDiscovery:
+    def test_wrapper_vision_norms_are_not_picked(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "get_block_names", lambda model: [["model.language_model.layers.0"]])
+        orch = _orch(200, ["lm_head"], model=_BackboneWrapper())
+        name, mod = orch._final_norm_module_("lm_head")
+        assert name == "model.language_model.norm"
+        assert mod is orch.model.model.language_model.norm
+
+    def test_flat_model_norm_still_found(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "get_block_names", lambda model: [["model.layers.0"]])
+        orch = _orch(200, ["lm_head"], model=_FlatLlama())
+        name, mod = orch._final_norm_module_("lm_head")
+        assert name == "model.norm"
+        assert mod is orch.model.model.norm
 
 
 class TestLmHeadTuneInputs:

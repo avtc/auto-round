@@ -2057,9 +2057,13 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         lm_head consumes the POST-norm hidden states (``model.norm`` in
         Llama-family models); the chain tail holds the raw last-block output.
-        Discovery is name-agnostic: the last leaf module between the final
-        block and lm_head whose only parameters are a 1D weight (plus an
-        optional 1D bias) - the LayerNorm/RMSNorm shape signature."""
+        Discovery is name-agnostic: a leaf module in the backbone that parents
+        the blocks, after the last block and before lm_head, whose only
+        parameters are a 1D weight (plus an optional 1D bias) - the
+        LayerNorm/RMSNorm shape signature. The backbone restriction matters on
+        wrapper models: vision towers and predictor placeholders also sit
+        between the last text block and lm_head and carry same-signature (even
+        same-width) norms."""
         blocks = get_block_names(self.model) or []
         # get_block_names returns groups of full block module names
         block_prefixes = [b for group in blocks for b in group]
@@ -2071,9 +2075,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             if any(n == b or n.startswith(b + ".") for b in block_prefixes):
                 last_block_pos = max(last_block_pos, idx)
         lm_pos = positions.get(lm_head_name, len(mods))
+        backbone = self._block_backbone_prefix_(block_prefixes)
         best = None
         for idx, (n, m) in enumerate(mods):
             if idx <= last_block_pos or idx >= lm_pos:
+                continue
+            if backbone is not None and not (n == backbone or n.startswith(backbone + ".")):
                 continue
             if list(m.children()):
                 continue
@@ -2086,7 +2093,41 @@ class CompressionOrchestrator(BaseOrchestrator):
             best = (n, m)  # last match: the one adjacent to lm_head
         return best if best is not None else (None, None)
 
-    def _lm_head_tune_inputs_(self, calib_state, remain_layer_names, streamer=None):
+    @staticmethod
+    def _block_backbone_prefix_(block_prefixes):
+        """Module prefix of the container that parents all blocks (e.g.
+        ``model.language_model`` for ``model.language_model.layers.*``), or
+        ``None`` when it cannot be derived."""
+        if not block_prefixes:
+            return None
+        splits = [b.split(".") for b in block_prefixes]
+        depth = 0
+        while True:
+            if any(len(s) <= depth + 1 for s in splits) or any(s[depth] != splits[0][depth] for s in splits):
+                break
+            depth += 1
+        # ``depth`` counts the shared components INCLUDING the block-list
+        # container (``layers``); the backbone is its parent
+        return ".".join(splits[0][: max(depth - 1, 0)]) if depth >= 2 else None
+
+    def _resolve_lm_head_name_(self, remain_layer_names):
+        """lm_head's module name from the quantization plan, or ``None``.
+
+        Plan-derived names are the anchor (the data-driven path matches
+        ``"lm_head" in layer_name`` the same way). Module order is
+        deliberately NOT consulted: checkpoint-only placeholder trees attach
+        after lm_head and steal the last-leaf position."""
+        candidates = [n for n in remain_layer_names if n == "lm_head" or n.rsplit(".", 1)[-1] == "lm_head"]
+        if not candidates:
+            candidates = [n for n in remain_layer_names if "lm_head" in n]
+        if not candidates:
+            logger.debug("[stream] no lm_head in the outside-block plan; lm_head is not quantized this run")
+            return None
+        if len(candidates) > 1:
+            logger.warning("[stream] multiple lm_head candidates in the plan %s; tuning %s", candidates, candidates[0])
+        return candidates[0]
+
+    def _lm_head_tune_inputs_(self, calib_state, remain_layer_names, streamer=None, lm_head_name=None):
         """Per-sample ``(fp_rows, q_rows, token_ids)`` for tuning lm_head from
         the calibration chain's tail, or ``None`` to keep the closed-form search.
 
@@ -2094,11 +2135,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         data-driven path already uses for outside-block layers - tunes lm_head
         here. The chain tail is the RAW last-block output; lm_head consumes
         POST-final-norm states, so the final norm is applied to the rows (its
-        weights stream in when still meta)."""
+        weights stream in when still meta). ``lm_head_name`` may be passed by
+        the caller (already resolved from the plan); left unset it is resolved
+        here the same way."""
         if self._max_tune_iters() <= 0:
             return None
-        lm_head_name = get_lm_head_name(self.model)
-        if lm_head_name is None or lm_head_name not in remain_layer_names:
+        if lm_head_name is None:
+            lm_head_name = self._resolve_lm_head_name_(remain_layer_names)
+        if lm_head_name is None:
             return None
         fp_inputs = (calib_state or {}).get("fp_inputs")
         token_ids = (calib_state or {}).get("token_ids")
@@ -2645,13 +2689,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                 continue
             remain_layer_names.append(n)
         outside_qdev = self._outside_block_quant_device()
-        lm_head_name = get_lm_head_name(self.model)
+        # resolve from the plan: placeholder trees attach after lm_head and
+        # break module-order detection (last-leaf heuristics)
+        lm_head_name = self._resolve_lm_head_name_(remain_layer_names)
         # iters>0: tune lm_head with the chain's final hidden states, exactly
         # like the data-driven path tunes outside-block layers (the
         # per-sample tune loop lives in quantize_layer_outside_block);
         # iters=0 keeps the closed-form search on the same device
         lm_tune = (
-            self._lm_head_tune_inputs_(calib_state, remain_layer_names, streamer=streamer)
+            self._lm_head_tune_inputs_(calib_state, remain_layer_names, streamer=streamer, lm_head_name=lm_head_name)
             if streamer is not None
             else None
         )
