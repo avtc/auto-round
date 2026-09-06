@@ -34,7 +34,7 @@ from auto_round.utils import (
     mv_module_from_gpu,
     set_amax_for_all_moe_layers,
 )
-from auto_round.utils.device import clear_memory_if_reached_threshold
+from auto_round.utils.device import clear_memory_if_reached_threshold, log_cuda_memory_census
 from auto_round.utils.device_manager import device_manager
 
 
@@ -714,17 +714,35 @@ class SignRoundQuantizer(BaseQuantizer):
         logger.info(f"quantizing layer {layer_name}")
         # Layer is already on the correct device (placed by the caller / AlgorithmComposer).
         device = layer.weight.device if hasattr(layer, "weight") else device_manager.device
+        log_cuda_memory_census(f"outside-block tune start {layer_name}", device)
         for i in range(len(fp_inputs)):
             fp_inputs[i] = fp_inputs[i].to(layer.weight.dtype)
             if q_inputs is not None:
                 q_inputs[i] = q_inputs[i].to(layer.weight.dtype)
 
+        # Inductor's backward for a 1B+-element value parameter materializes
+        # an extra full-size tiled buffer (observed ~4.7GiB on a 248k-vocab
+        # lm_head) on top of the value, its gradient, and the quantized
+        # weight autograd saves - compiled eager autograd fits where the
+        # compiled graph does not. Compiling one outside-block layer for a
+        # handful of iterations buys no measurable speed, so skip it for
+        # wrappers whose rounding parameter exceeds the chunking budget.
+        value_elements = layer.weight.numel() if getattr(layer, "weight", None) is not None else 0
+        compile_wrapper = self.compress_context.enable_torch_compile and value_elements <= _OUTSIDE_TUNE_CHUNK_OUT_ELEMS
+        if self.compress_context.enable_torch_compile and not compile_wrapper:
+            logger.info(
+                "skipping torch.compile for %s (rounding parameter of %d elements; compiled backward "
+                "would exceed the memory budget)",
+                getattr(layer, "global_name", "layer"),
+                value_elements,
+            )
         wrapper_linear = WrapperLinear(
             layer,
             enable_minmax_tuning=self.enable_minmax_tuning,
-            enable_torch_compile=self.compress_context.enable_torch_compile,
+            enable_torch_compile=compile_wrapper,
             device=device,
         ).to(device)
+        log_cuda_memory_census(f"outside-block wrapper ready {layer_name} (compile={compile_wrapper})", device)
         round_params = []
         minmax_params = []
         for key in wrapper_linear.params.keys():
@@ -888,6 +906,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         self._scale_loss_and_backward(scaler, loss)
             if i == 0:
                 init_loss = total_loss
+                log_cuda_memory_census(f"outside-block first backward done {layer_name}", device)
             current_lr = optimizer.param_groups[0]["lr"]
             logger.debug("iter %d loss: %.3e lr: %s", i, total_loss, current_lr)
 

@@ -2704,6 +2704,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         for name in remain_layer_names:
             module = get_module(self.model, name)
             logger.info(f"Quantizing remaining layer {name} on {outside_qdev}.")
+            from auto_round.utils.device import log_cuda_memory_census
+
+            log_cuda_memory_census(f"outside-block loop entry {name}", outside_qdev)
             if streamer is not None:
                 # load the layer itself; streaming its parent prefix would
                 # materialize the parent's whole subtree (every block weight).

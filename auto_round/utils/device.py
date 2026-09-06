@@ -1652,3 +1652,50 @@ def dispatch_model_by_all_available_devices(
     device_map = infer_auto_device_map(model, max_memory=new_max_memory, no_split_module_classes=no_split_modules)
     model = dispatch_model(model, device_map=device_map)
     return model
+
+
+def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
+    """Log a DEBUG-level VRAM census: allocator totals plus the largest live tensors.
+
+    Intended for diagnosing memory pressure at specific points (tuning huge
+    layers, staged-model phases): ``mem_get_info`` and torch's allocator are
+    the ground truth, while the python-side walk names the tensors holding
+    the memory; the gap between the two is allocator-internal (autograd-saved
+    or graph-owned storage). No-op without CUDA.
+    """
+    import torch
+
+    if device is None:
+        device = torch.device("cuda") if torch.cuda.is_available() else None
+    if device is None or getattr(device, "type", "cpu") != "cuda":
+        return
+    try:
+        free_b, total_b = torch.cuda.mem_get_info(device)
+    except Exception:  # pylint: disable=broad-except
+        return
+    allocated_b = torch.cuda.memory_allocated(device)
+    reserved_b = torch.cuda.memory_reserved(device)
+    groups = {}
+    for obj in gc.get_objects():  # noqa: C417  pylint: disable=too-many-nested-blocks
+        try:
+            if torch.is_tensor(obj) and obj.device == device:
+                key = (tuple(obj.shape), str(obj.dtype))
+                groups[key] = groups.get(key, [0, 0])
+                groups[key][0] += 1
+                groups[key][1] += obj.element_size() * obj.numel()
+        except Exception:  # pylint: disable=broad-except
+            continue
+    lines = [
+        "[vram] %s: free %.2fGiB / total %.2fGiB | torch allocated %.2fGiB reserved %.2fGiB | "
+        "python-visible %.2fGiB in %d tensor groups",
+        tag,
+        free_b / 2**30,
+        total_b / 2**30,
+        allocated_b / 2**30,
+        reserved_b / 2**30,
+        sum(v[1] for v in groups.values()) / 2**30,
+        len(groups),
+    ]
+    logger.debug(*lines)
+    for (shape, dtype), (count, nbytes) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]:
+        logger.debug("[vram]   %6.3fGiB x%-3d %s %s", nbytes / 2**30, count, dtype, shape)
