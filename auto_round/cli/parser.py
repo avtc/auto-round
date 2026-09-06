@@ -347,7 +347,7 @@ def build_convert_parser(*, prog: str = "auto_round convert") -> argparse.Argume
         "(reads shards lazily; supports compressed-tensors packed exports, e.g. "
         "stream_quantization outputs saved with the auto_round:llm_compressor format).",
     )
-    parser.add_argument("--model", "--model_name", dest="model", required=True, help="Checkpoint directory to convert.")
+    parser.add_argument("--model", required=True, help="Local checkpoint directory to convert.")
     parser.add_argument(
         "--format",
         default="gguf:q4_k_m",

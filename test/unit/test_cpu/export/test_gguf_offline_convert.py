@@ -24,7 +24,6 @@ import os
 import pytest
 
 gguf = pytest.importorskip("gguf", reason="gguf package required for offline conversion tests")
-pytest.importorskip("compressed_tensors", reason="compressed-tensors exports are the primary input")
 
 
 def _convert(ckpt, out, fmt):
@@ -63,6 +62,13 @@ class TestConvertArgumentValidation:
         with pytest.raises(ValueError, match="unsupported gguf format"):
             convert_checkpoint_to_gguf(tiny_qwen_model_path, output_dir=str(tmp_path / "out"), gguf_format="gguf:q9_9")
 
+    def test_auto_format_raises(self, tmp_path, tiny_qwen_model_path):
+        """gguf:auto passes the ftype table but only a real format is convertible."""
+        from auto_round.export.export_to_gguf.offline_convert import convert_checkpoint_to_gguf
+
+        with pytest.raises(ValueError, match="unsupported gguf format"):
+            convert_checkpoint_to_gguf(tiny_qwen_model_path, output_dir=str(tmp_path / "out"), gguf_format="gguf:auto")
+
 
 class TestConvertCli:
     def test_dispatch_and_parser(self, tmp_path, monkeypatch):
@@ -90,9 +96,15 @@ class TestConvertCli:
         assert _normalize_cli_invocation(["convert", "--model", "x"])[0] == "convert"
 
 
+def _ct_required():
+    """compressed-tensors exports are the primary input; skip e2e without it."""
+    pytest.importorskip("compressed_tensors", reason="compressed-tensors required for CT export e2e")
+
+
 @pytest.mark.slow
 class TestOfflineConvertEndToEnd:
     def test_convert_llm_compressor_export(self, tmp_path, tiny_qwen_model_path):
+        _ct_required()
         export_dir = _quantize_to_ct(tiny_qwen_model_path, str(tmp_path / "ct_export"))
         assert any(f.endswith(".safetensors") for f in os.listdir(export_dir))
 
@@ -106,17 +118,29 @@ class TestOfflineConvertEndToEnd:
         assert gguf.GGMLQuantizationType.Q4_0 in dtypes
 
     def test_convert_official_mixed_format(self, tmp_path, tiny_qwen_model_path):
+        _ct_required()
         export_dir = _quantize_to_ct(tiny_qwen_model_path, str(tmp_path / "ct_export"))
         path = _convert(export_dir, str(tmp_path / "gguf"), "gguf:q4_k_m")
         reader = gguf.GGUFReader(path)
-        assert len(reader.tensors) > 0
-        # mixed formats keep per-tensor types: at least one quantized type
-        # plus the always-float norms
-        dtypes = {t.tensor_type for t in reader.tensors}
-        assert gguf.GGMLQuantizationType.F32 in dtypes
-        assert any(d != gguf.GGMLQuantizationType.F32 for d in dtypes)
+        # mixed formats keep per-tensor types: float norms plus at least two
+        # distinct quantized types (the official mix boosts attention-v and
+        # ffn-down tensors)
+        float_types = {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}
+        quantized = {t.tensor_type for t in reader.tensors} - float_types
+        assert gguf.GGMLQuantizationType.F32 in {t.tensor_type for t in reader.tensors}
+        assert len(quantized) >= 2, f"official mixed should select several quantized types, got {quantized}"
+
+    def test_convert_f16_stores_genuine_float16(self, tmp_path, tiny_qwen_model_path):
+        """Float passthrough must CAST: f32 bytes tagged F16 would corrupt the file."""
+        _ct_required()
+        path = _convert(tiny_qwen_model_path, str(tmp_path / "gguf"), "gguf:f16")
+        reader = gguf.GGUFReader(path)
+        two_d = [t for t in reader.tensors if len(t.shape) == 2]
+        assert two_d, "expected 2D tensors in the file"
+        assert all(t.tensor_type == gguf.GGMLQuantizationType.F16 for t in two_d)
 
     def test_convert_is_deterministic(self, tmp_path, tiny_qwen_model_path):
+        _ct_required()
         export_dir = _quantize_to_ct(tiny_qwen_model_path, str(tmp_path / "ct_export"))
 
         a = _convert(export_dir, str(tmp_path / "g1"), "gguf:q4_0")
