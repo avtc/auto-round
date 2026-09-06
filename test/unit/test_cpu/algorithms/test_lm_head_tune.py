@@ -303,6 +303,34 @@ class TestRowBlockedWrapperForward:
         assert torch.allclose(results[0][1], results[1][1], atol=1e-7), "blocked value grad diverged"
         assert torch.allclose(results[0][2], results[1][2], atol=1e-7), "blocked min_scale grad diverged"
 
+    def test_blocked_with_per_group_init_scale_matches(self, monkeypatch):
+        """Per-group init_scale (OptRTN/AWQ anchors) must follow the same row
+        window as the other tuning parameters."""
+        import auto_round.wrapper as wmod
+
+        torch.manual_seed(4)
+        layer = _mk_quant_linear(24, 10, group_size=4)  # 6 groups per row -> 144 groups
+        x = torch.randn(2, 3, 10)
+        target = torch.randn(2, 3, 24)
+        n_groups = 24 * 3  # ceil handled by layout: in=10, gs=4 -> 3 groups/row
+
+        results = []
+        for cap, scale_shape in ((2**26, (n_groups, 1)), (60, (n_groups, 1))):
+            torch.manual_seed(23)
+            fresh = _mk_quant_linear(24, 10, group_size=4)
+            with torch.no_grad():
+                fresh.weight.copy_(layer.weight)
+                fresh.bias.copy_(layer.bias)
+            wrapper = self._wrapper(fresh, minmax=True)
+            torch.manual_seed(31)
+            wrapper.init_scale = torch.rand(scale_shape) * 0.01 + 0.005
+            monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", cap, raising=False)
+            out = wrapper(x)
+            loss = torch.nn.functional.mse_loss(out, target)
+            loss.backward()
+            results.append(out.detach().clone())
+        assert torch.allclose(results[0], results[1], atol=1e-6), "blocked init_scale forward diverged"
+
     def test_per_tensor_group_size_never_blocks(self, monkeypatch):
         import auto_round.wrapper as wmod
 
