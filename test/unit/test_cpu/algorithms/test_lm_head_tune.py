@@ -390,6 +390,8 @@ class TestRowBlockedWrapperForward:
                 torch.manual_seed(6)
                 for p in wrapper.parameters():
                     p.add_(torch.randn_like(p) * 1e-3)
+                # per-group OptRTN/AWQ anchors take part in the final quantize
+                wrapper.init_scale = torch.rand(24 * 3, 1) * 0.01 + 0.005
             monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", cap, raising=False)
             best = {k: v.detach().clone() for k, v in wrapper.state_dict().items()}
             restored = wrapper.unwrapper(best)
