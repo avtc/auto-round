@@ -127,6 +127,7 @@ class WrapperLinear(torch.nn.Module):
         else:
             self.q_scale_thresh = 1e-5
         self._init_tuning_params_and_quant_func()
+        self._row_block_decision = None
         if deepspeed_exists:
             if type(self.orig_layer) in (torch.nn.Linear, LinearLayer):
                 self.orig_forward = self.linear_forward
@@ -318,18 +319,33 @@ class WrapperLinear(torch.nn.Module):
 
     def _use_row_blocked_output(self):
         """Whether the forward should compute the quantized weight one output-row
-        block at a time. Only plain Linear layers with a weight beyond the
-        element budget qualify: meta weights are materialized whole by
-        ``get_weight`` anyway, non-linear forwards take un-sliced weights, and
-        per-tensor group layouts (group_size 0) share scale across rows so
-        blocking would change the math."""
+        block at a time; decided once per wrapper."""
+        if self._row_block_decision is None:
+            self._row_block_decision = self._compute_row_blocked_eligibility()
+            if self._row_block_decision:
+                logger.debug(
+                    "[tune] row-blocked weight forward for %s (%d elements)",
+                    getattr(self.orig_layer, "global_name", "layer"),
+                    self.orig_layer.weight.numel(),
+                )
+        return self._row_block_decision
+
+    def _compute_row_blocked_eligibility(self):
+        """Eligibility for row-blocked fake-quant forwards. Only plain Linear
+        layers with a weight beyond the element budget qualify: meta weights
+        are materialized whole by ``get_weight`` anyway, non-linear forwards
+        take un-sliced weights, k-quant super groups and per-tensor group
+        layouts (group_size 0) share scale across rows so blocking would
+        change the math."""
         layer = self.orig_layer
         if type(layer) is not torch.nn.Linear or self.orig_forward != self.linear_forward:
             return False
         weight = layer.weight
         if weight.dim() != 2 or weight.device.type == "meta":
             return False
-        if hasattr(layer, "super_bits"):
+        # scheme fields are attached to every quantized layer (None when unset),
+        # so test the value, not the attribute's presence
+        if getattr(layer, "super_bits", None) is not None:
             return False
         group_size = getattr(layer, "group_size", -1)
         if not isinstance(group_size, int) or group_size == 0:

@@ -1680,9 +1680,11 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
     for obj in gc.get_objects():  # noqa: C417  pylint: disable=too-many-nested-blocks
         try:
             if torch.is_tensor(obj) and obj.device == device:
+                nbytes = obj.element_size() * obj.numel()
                 key = (tuple(obj.shape), str(obj.dtype))
                 groups.setdefault(key, [0, 0])
                 groups[key][0] += 1
+                groups[key][1] += nbytes
                 # views share storage; count each storage once for the total
                 ptr = obj.untyped_storage().data_ptr()
                 if ptr not in storages:
