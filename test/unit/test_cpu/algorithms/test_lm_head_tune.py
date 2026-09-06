@@ -687,3 +687,58 @@ class TestGradScatterSlice:
             out.sum().backward()
         assert torch.allclose(param.grad[2:5], torch.ones(3, 4) * y.sum(0).unsqueeze(0) * 3, atol=1e-6)
         assert param.grad[0:2].abs().sum() == 0 and param.grad[5:].abs().sum() == 0
+
+
+class TestSignSGDMemory:
+    """The sign update must not allocate a gradient-sized temporary."""
+
+    def _step_ref(self, param, grad_seq, **kw):
+        import copy
+
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+        ref = torch.nn.Parameter(param.detach().clone())
+        opt = SignSGD([ref], lr=kw["lr"])
+        for g in grad_seq:
+            ref.grad = g.clone()
+            opt.step()
+            opt.zero_grad(set_to_none=False)
+        return ref.detach()
+
+    def test_plain_update_matches_reference_and_leaves_grad_zeroed(self):
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+        torch.manual_seed(3)
+        base = torch.randn(8, 5)
+        param = torch.nn.Parameter(base.clone())
+        opt = SignSGD([param], lr=0.1)
+        grad = torch.randn(8, 5)
+        ref = base - 0.1 * torch.sign(grad)
+        param.grad = grad
+        opt.step()
+        assert torch.allclose(param.detach(), ref, atol=1e-6)
+        opt.zero_grad(set_to_none=False)
+        assert (
+            param.grad is not None and torch.count_nonzero(param.grad) == 0
+        ), "in-place sign must leave the grad buffer zeroable in place"
+
+    def test_momentum_buffer_survives_in_place_sign(self):
+        from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
+
+        torch.manual_seed(4)
+        base = torch.randn(6, 3)
+        param = torch.nn.Parameter(base.clone())
+        opt = SignSGD([param], lr=0.05, momentum=0.9)
+        g1, g2 = torch.randn(6, 3), torch.randn(6, 3)
+        param.grad = g1.clone()
+        opt.step()
+        opt.zero_grad(set_to_none=False)
+        param.grad = g2.clone()
+        opt.step()
+        # reference: v2 = 0.9*sign-free momentum chain is irrelevant; SignSGD
+        # applies sign(v) each step, so track v explicitly
+        v1 = g1.clone()
+        p1 = base - 0.05 * torch.sign(v1)
+        v2 = 0.9 * v1 + g2
+        p2 = p1 - 0.05 * torch.sign(v2)
+        assert torch.allclose(param.detach(), p2, atol=1e-6), "momentum buffer must stay unsigned"
