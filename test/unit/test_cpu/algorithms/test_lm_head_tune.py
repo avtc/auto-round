@@ -782,3 +782,28 @@ class TestBestParamSnapshotDevice:
         fn = SignRoundQuantizer._best_param_device
         assert fn(q, 2**28) == torch.device("cpu"), "vocabulary-head snapshots must park on the host"
         assert fn(q, 1024) == torch.device("cuda:0"), "small layers keep the context cache device"
+
+
+class TestUnwrapStreaming:
+    """Huge-layer unwrap must tolerate host-resident best parameters."""
+
+    def test_blocked_unwrap_accepts_cpu_best_params(self, monkeypatch):
+        import auto_round.wrapper as wmod
+
+        torch.manual_seed(13)
+        layer = _mk_quant_linear(24, 10, group_size=4)
+        wrapper = self._make(layer)
+        with torch.no_grad():
+            torch.manual_seed(14)
+            for p in wrapper.parameters():
+                p.add_(torch.randn_like(p) * 1e-3)
+        monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 40, raising=False)
+        cpu_best = {k: v.detach().clone() for k, v in wrapper.state_dict().items()}
+        restored = wrapper.unwrapper(cpu_best)
+        assert restored is layer or restored.weight.shape == (24, 10)
+
+    @staticmethod
+    def _make(layer):
+        from auto_round.wrapper import WrapperLinear
+
+        return WrapperLinear(layer, enable_minmax_tuning=True, enable_torch_compile=False, device="cpu")

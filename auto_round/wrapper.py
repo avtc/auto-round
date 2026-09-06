@@ -352,13 +352,20 @@ class WrapperLinear(torch.nn.Module):
             group_size = self.orig_layer.group_size
             groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
             weight_q_parts, scale_parts, zp_parts = [], [], []
+
+            def _win(t, g0, g1):
+                sliced = self._slice_tunable(t, g0, g1)
+                if isinstance(sliced, torch.Tensor) and sliced.device != weight.device:
+                    return sliced.to(weight.device)
+                return sliced
+
             for b_start, b_end in self.row_block_bounds():
                 g_start, g_end = b_start * groups_per_row, b_end * groups_per_row
                 wq, sc, zp = self._qdq_weight_block(
                     weight[b_start:b_end],
-                    self._slice_tunable(value, g_start, g_end),
-                    self._slice_tunable(min_scale, g_start, g_end),
-                    self._slice_tunable(max_scale, g_start, g_end),
+                    _win(value, g_start, g_end),
+                    _win(min_scale, g_start, g_end),
+                    _win(max_scale, g_start, g_end),
                     self._slice_tunable(self.weight_min, g_start, g_end),
                     self._slice_tunable(self.weight_max, g_start, g_end),
                     init_scale=self._sliced_init_scale(g_start, g_end, out_features * groups_per_row),
@@ -578,9 +585,17 @@ class WrapperLinear(torch.nn.Module):
             return layer
 
         best_params = best_params or {}
-        v = best_params.get("value", torch.tensor(0.0)).to(self.device)
-        min_scale = best_params.get("min_scale", torch.tensor(1.0)).to(self.device)
-        max_scale = best_params.get("max_scale", torch.tensor(1.0)).to(self.device)
+        v = best_params.get("value", torch.tensor(0.0))
+        min_scale = best_params.get("min_scale", torch.tensor(1.0))
+        max_scale = best_params.get("max_scale", torch.tensor(1.0))
+        # huge layers keep their best-parameters on the host: moving the whole
+        # rounding parameter to the GPU beside its live copy and gradient
+        # buffers would overflow the card during the final quantize. The
+        # row-blocked path streams one window at a time instead.
+        if not self.row_block_active():
+            v = v.to(self.device)
+            min_scale = min_scale.to(self.device)
+            max_scale = max_scale.to(self.device)
 
         if self.orig_layer.weight.device.type == "meta":
             self.orig_layer.to(self.device)
