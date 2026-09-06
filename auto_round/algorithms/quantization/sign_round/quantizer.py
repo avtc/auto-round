@@ -96,6 +96,24 @@ if TYPE_CHECKING:
     from auto_round.algorithms.composer import BlockContext
 
 
+# Output-element budget for one forward/backward while tuning an outside-block
+# layer: a full-vocabulary lm_head at long seqlen cannot hold its fp32 logits
+# plus backward transients on a single GPU, so the tune loop slices the
+# sample's rows to stay within this many output elements per slice (64M = a
+# 256MB fp32 logits tensor; the accumulated gradient is unchanged)
+_OUTSIDE_TUNE_CHUNK_OUT_ELEMS = 2**26
+
+
+def _outside_tune_rows_per_chunk(out_features, sample_rows, budget=_OUTSIDE_TUNE_CHUNK_OUT_ELEMS):
+    """Rows of one sample processed per forward/backward slice.
+
+    Small-output layers (every decoder projection) get their whole sample in
+    one slice; only huge-output layers (lm_head-class vocabularies) split."""
+    if out_features is None or out_features <= 0:
+        return sample_rows
+    return max(1, min(sample_rows, budget // out_features))
+
+
 @register_pipeline_member(SignRoundConfig)
 class SignRoundQuantizer(BaseQuantizer):
 
@@ -763,6 +781,7 @@ class SignRoundQuantizer(BaseQuantizer):
         if gradient_accumulate_steps != 1:
             mse_reduction = "sum"
         mse_loss = torch.nn.MSELoss(reduction=mse_reduction).to(device)
+        mse_sum_loss = torch.nn.MSELoss(reduction="sum").to(device)
         batch_size = 1  # Force to low gpu
         global_batch_size = gradient_accumulate_steps
         global_batch_size = min(nsamples, global_batch_size)
@@ -793,37 +812,80 @@ class SignRoundQuantizer(BaseQuantizer):
                     current_input = [fp_inputs[i] for i in indices]
                     current_input = torch.cat(current_input, dim=0).to(device)
                     org_input = current_input
-                with torch.no_grad():
-                    current_output = layer(org_input)
                 autocast_ctx = (
                     nullcontext()
                     if not self.model_context.amp
                     else autocast(device_type=str(device).split(":")[0], dtype=self.model_context.amp_dtype)
                 )
-                if valid_token_mask:
-                    tmp_valid_mask = [valid_token_mask[i] for i in indices]
-                    tmp_valid_mask = torch.cat(tmp_valid_mask, dim=0).to(device)
-                    tmp_valid_mask.unsqueeze_(-1)
+                # Huge-output layers (a full-vocabulary lm_head) cannot hold one
+                # sample's fp32 logits plus the backward transients on a single
+                # GPU; slice the sample's rows so each forward stays within the
+                # output-element budget. Gradients accumulate across slices, so
+                # the result is identical to the single-shot loss.
+                rows_axis = 1 if current_input.dim() == 3 else 0
+                sample_rows = current_input.shape[rows_axis]
+                out_features = layer.weight.shape[0] if layer.weight.dim() == 2 else None
+                chunk_rows = (
+                    _outside_tune_rows_per_chunk(out_features, sample_rows, _OUTSIDE_TUNE_CHUNK_OUT_ELEMS)
+                    if out_features is not None
+                    else sample_rows
+                )
+                if chunk_rows >= sample_rows:
+                    with torch.no_grad():
+                        current_output = layer(org_input)
+                    if valid_token_mask:
+                        tmp_valid_mask = [valid_token_mask[i] for i in indices]
+                        tmp_valid_mask = torch.cat(tmp_valid_mask, dim=0).to(device)
+                        tmp_valid_mask.unsqueeze_(-1)
 
-                    with autocast_ctx:
-                        output_q = wrapper_linear(current_input)  # pylint: disable=not-callable
-                        loss = mse_loss(  # pylint: disable=not-callable
-                            (output_q * tmp_valid_mask).to(torch.float32),
-                            (current_output * tmp_valid_mask).to(torch.float32),
-                        )
+                        with autocast_ctx:
+                            output_q = wrapper_linear(current_input)  # pylint: disable=not-callable
+                            loss = mse_loss(  # pylint: disable=not-callable
+                                (output_q * tmp_valid_mask).to(torch.float32),
+                                (current_output * tmp_valid_mask).to(torch.float32),
+                            )
 
+                    else:
+                        with autocast_ctx:
+                            output_q = wrapper_linear(current_input)  # pylint: disable=not-callable
+                            loss = mse_loss(  # pylint: disable=not-callable
+                                output_q.to(torch.float32),
+                                current_output.to(torch.float32),  # mul 1.0 will copy the output
+                            )
+
+                    num_elm = 1 if num_elm <= 0 else num_elm
+                    total_loss += loss.item() / num_elm
+
+                    self._scale_loss_and_backward(scaler, loss)
                 else:
-                    with autocast_ctx:
-                        output_q = wrapper_linear(current_input)  # pylint: disable=not-callable
-                        loss = mse_loss(  # pylint: disable=not-callable
-                            output_q.to(torch.float32),
-                            current_output.to(torch.float32),  # mul 1.0 will copy the output
-                        )
-
-                num_elm = 1 if num_elm <= 0 else num_elm
-                total_loss += loss.item() / num_elm
-
-                self._scale_loss_and_backward(scaler, loss)
+                    # chunk-sum losses divide by the same denominator the
+                    # single-shot reduction uses, so both the accumulated
+                    # gradient and the logged total stay unchanged
+                    sum_denom = sample_rows * out_features if mse_reduction == "mean" else 1
+                    cat_mask = None
+                    if valid_token_mask:
+                        cat_mask = torch.cat([valid_token_mask[i] for i in indices], dim=0).to(device)
+                        cat_mask = cat_mask.unsqueeze(-1)
+                    for start in range(0, sample_rows, chunk_rows):
+                        end = min(start + chunk_rows, sample_rows)
+                        chunk_input = current_input[:, start:end] if rows_axis == 1 else current_input[start:end]
+                        chunk_ref_input = org_input[:, start:end] if rows_axis == 1 else org_input[start:end]
+                        with torch.no_grad():
+                            chunk_ref = layer(chunk_ref_input)
+                        with autocast_ctx:
+                            chunk_q = wrapper_linear(chunk_input)  # pylint: disable=not-callable
+                        if cat_mask is not None:
+                            chunk_mask = cat_mask[start:end]
+                            loss = mse_sum_loss(
+                                (chunk_q * chunk_mask).to(torch.float32),
+                                (chunk_ref * chunk_mask).to(torch.float32),
+                            )
+                        else:
+                            loss = mse_sum_loss(chunk_q.to(torch.float32), chunk_ref.to(torch.float32))
+                        loss = loss / sum_denom
+                        num_elm = 1 if num_elm <= 0 else num_elm
+                        total_loss += loss.item() / num_elm
+                        self._scale_loss_and_backward(scaler, loss)
             if i == 0:
                 init_loss = total_loss
             current_lr = optimizer.param_groups[0]["lr"]

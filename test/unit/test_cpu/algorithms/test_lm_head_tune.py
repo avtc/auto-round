@@ -82,6 +82,89 @@ def _rows(n=2):
     return [torch.randn(1, 5, 4) for _ in range(n)]
 
 
+class TestOutsideTuneChunking:
+    """Position-chunked forward/backward for huge-output outside-block layers.
+
+    A 248k-vocab lm_head tuned at seqlen 2048 OOMs a 24GB GPU if the MSE is
+    computed over the full logits; chunking rows keeps transients bounded and
+    must not change the tune (gradients accumulate to the same values)."""
+
+    def test_rows_per_chunk_clamps_to_output_budget(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.quantizer as qmod
+
+        # 64M-element budget: big vocab -> few rows per chunk, small dims -> everything
+        assert qmod._outside_tune_rows_per_chunk(248320, 2048, 2**26) == 270
+        assert qmod._outside_tune_rows_per_chunk(64, 32, 2**26) == 32
+        assert qmod._outside_tune_rows_per_chunk(7, 100, 2**5) == 4  # at least one row
+
+    def test_chunked_tune_matches_single_shot(self, monkeypatch):
+        """Same layer, same seed: many tiny chunks must reproduce the single-shot
+        tuned parameter bit-for-bit (gradient accumulation is exact)."""
+        from types import MethodType
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as qmod
+
+        torch.manual_seed(3)
+        layer = torch.nn.Linear(16, 5)
+        fp = [torch.randn(1, 13, 16) for _ in range(2)]
+
+        results = []
+        for cap in (2**26, 2**4):  # single shot vs 3 rows per chunk
+            torch.manual_seed(11)
+            fresh = torch.nn.Linear(16, 5)
+            with torch.no_grad():
+                fresh.weight.copy_(layer.weight)
+                fresh.bias.copy_(layer.bias)
+            fresh.global_name = "lm_head"
+            fresh.bits = 8
+            fresh.group_size = 32
+            fresh.sym = True
+            fresh.data_type = "int"
+            fresh.scale_dtype = None
+            fresh.iters = 3
+            fresh.act_bits = 16
+            fresh.act_sym = True
+            fresh.act_data_type = None
+            fresh.act_group_size = None
+            cfg = type(
+                "C",
+                (),
+                {
+                    "iters": 3,
+                    "lr": 5e-3,
+                    "compute_lr": lambda self, bits: None,
+                    "compute_minmax_lr": lambda self, bits: None,
+                },
+            )()
+            quant = SimpleNamespace(
+                config=cfg,
+                _config=cfg,
+                iters=3,
+                lr=5e-3,
+                minmax_lr=1e-3,
+                lr_scheduler=None,
+                enable_minmax_tuning=False,
+                gradient_accumulate_steps=1,
+                not_use_best_mse=False,
+                dynamic_max_gap=0,
+                optimizer=qmod.SignSGD,
+                lr_is_auto=False,
+                model=torch.nn.Module(),
+                calibration_context=SimpleNamespace(batch_size=1),
+                model_context=SimpleNamespace(amp=False, amp_dtype=torch.bfloat16),
+                compress_context=SimpleNamespace(enable_torch_compile=False, cache_device="cpu"),
+            )
+            for name in ("_get_scaler", "_scale_loss_and_backward", "_step", "_maybe_log_low_bit_lr"):
+                setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
+            quant._logged_low_bit_lr = set()
+            monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", cap, raising=False)
+            qmod.SignRoundQuantizer.quantize_layer_outside_block(
+                quant, fresh, fp_inputs=[t.clone() for t in fp], input_ids=None
+            )
+            results.append(fresh.weight.detach().clone())
+        assert torch.equal(results[0], results[1]), "chunked tune diverged from single-shot"
+
+
 class TestLmHeadNameResolution:
     """lm_head resolves from the quantization plan, never from module order."""
 
