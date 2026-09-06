@@ -19,6 +19,7 @@ llama.cpp conversion reads such a directory lazily and unpacks the packed
 weights itself, so the offline pass is a thin, streaming-free bridge.
 """
 
+import json
 import os
 
 import pytest
