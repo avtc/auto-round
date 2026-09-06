@@ -36,6 +36,7 @@ This document presents step-by-step instructions for auto-round llm quantization
     - [Enable multiple gpus calibration in lm_head quantization](#enable-multiple-gpus-calibration-in-lm_head-quantization)
   + [Adjust Hyperparameters](#adjust-hyperparameters)
   + [Streaming Quantization (large models)](#streaming-quantization-large-models)
+  + [Convert a saved checkpoint to GGUF (offline)](#convert-a-saved-checkpoint-to-gguf-offline)
   + [Rotation (Research)](#rotation-research)
 * [4 Inference](#4-inference)
   + [CPU](#cpu)
@@ -984,7 +985,9 @@ directly and never resolves hub ids); download the model first when starting fro
 
 - Supported formats: streaming requires per-block packable integer formats (`auto_round`, `auto_round:llm_compressor`,
   `auto_round:auto_gptq`, `auto_round:auto_awq`). GGUF and any format without per-block immediate packing fail fast
-  with an explicit error -- progressive shard writing is the streaming contract.
+  with an explicit error -- progressive shard writing is the streaming contract. To produce a GGUF artifact from a
+  streaming run, stream to one of the supported formats first and convert afterwards:
+  see [Convert a saved checkpoint to GGUF (offline)](#convert-a-saved-checkpoint-to-gguf-offline).
 - `--low_gpu_mem_usage`: by default the streaming calibration chain (the calibration rows feeding each block)
   is parked on the block's home GPU for iteration speed. With `--low_gpu_mem_usage` the chain stays in host RAM
   and rows are chunked onto the GPU per forward batch (the same memory contract as the ordinary data-driven
@@ -992,6 +995,30 @@ directly and never resolves hub ids); download the model first when starting fro
 
 The calibration data flows through a bf16 reference chain, so the collected statistics match the ordinary
 data-driven calibration within float tolerance (equivalence is regression-tested).
+
+### Convert a saved checkpoint to GGUF (offline)
+
+`--stream_quantization` writes progressive shards in a per-block packable format and cannot emit a
+`.gguf` file directly: GGUF is a single-container format whose tensor directory is only known once
+every block has been seen. Produce GGUF artifacts with the offline `convert` subcommand instead:
+
+```bash
+auto-round convert --model /path/to/exported/model --format gguf:q4_k_m --output_dir /path/to/out
+```
+
+- `--model` accepts any saved checkpoint directory: streaming exports (`auto_round`,
+  `auto_round:llm_compressor`, `auto_round:auto_gptq`, `auto_round:auto_awq`) as well as plain
+  fp16/bf16 checkpoints. Tensors are read lazily shard by shard and the model is never loaded into
+  memory, so the conversion works for models far larger than host RAM.
+- `--format gguf:<qtype>` selects the target quantization; every ggml k-quant type listed in the
+  [GGUF format](#gguf-format) section is available (plus `gguf:bf16` for a plain float copy).
+- The conversion is a pure post-pass: it is deterministic and idempotent, and can simply be re-run.
+  It quantizes onto the ggml k-quant grids, so results differ numerically from the source
+  checkpoint's own format -- GGUF stores k-quant blocks, not arbitrary group quantization, so a
+  re-quantization is inherent to the format.
+- The converter writes a single main-model file. Companion files that llama.cpp consumes separately
+  (draft models via `--model-draft`, multimodal projectors via `--mmproj`) are not produced;
+  multimodal checkpoints are out of scope for the offline converter.
 
 ### Rotation (Research)
 

@@ -37,6 +37,7 @@
     - [手动配置设备映射](#手动配置设备映射)
   + [超参数调整](#超参数调整)
   + [流式量化（大模型）](#流式量化大模型)
+  + [离线将已保存的 checkpoint 转换为 GGUF](#离线将已保存的-checkpoint-转换为-gguf)
   + [旋转（Rotation）（研究性）](#旋转rotation研究性)
 * [4 推理部署](#4-推理部署)
   + [CPU](#cpu)
@@ -943,12 +944,34 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantizati
 
 - 支持的格式：流式量化要求逐块可打包的整数格式（`auto_round`、`auto_round:llm_compressor`、
   `auto_round:auto_gptq`、`auto_round:auto_awq`）。GGUF 及任何不支持逐块立即打包的格式都会直接报错
-  ——渐进式分片写入是流式量化的基本契约。
+  ——渐进式分片写入是流式量化的基本契约。如需从流式运行产出 GGUF 产物，请先流式导出为上述受支持
+  格式之一，再进行事后转换：见[离线将已保存的 checkpoint 转换为 GGUF](#离线将已保存的-checkpoint-转换为-gguf)。
 - `--low_gpu_mem_usage`：默认情况下，流式校准链（逐块输入的校准行）驻留在块的主 GPU 上以提升
   迭代速度。启用 `--low_gpu_mem_usage` 后，校准链留在主机内存中，每次前向按批次分块送上 GPU
   （与普通数据驱动路径相同的内存契约）——显存占用更低，但耗时略有增加。
 
 校准数据经由 bf16 参考链传递，因此收集到的统计量与普通数据驱动校准在浮点容差内一致（等价性有回归测试覆盖）。
+
+### 离线将已保存的 checkpoint 转换为 GGUF
+
+`--stream_quantization` 以逐块可打包的格式写入渐进式分片，无法直接产出 `.gguf` 文件：GGUF 是单一
+容器格式，只有当所有块都处理完毕后才能确定其张量目录。请改用离线 `convert` 子命令来产出 GGUF 产物：
+
+```bash
+auto-round convert --model /path/to/exported/model --format gguf:q4_k_m --output_dir /path/to/out
+```
+
+- `--model` 接受任意已保存的 checkpoint 目录：流式导出（`auto_round`、`auto_round:llm_compressor`、
+  `auto_round:auto_gptq`、`auto_round:auto_awq`）以及普通的 fp16/bf16 checkpoint 均可。张量按分片
+  惰性读取，模型不会整体加载进内存，因此远大于主机内存的模型也可以完成转换。
+- `--format gguf:<qtype>` 选择目标量化类型；[GGUF 格式](#gguf-格式量化)一节列出的所有 ggml k-quant
+  类型均可用（另有 `gguf:bf16` 可做普通浮点拷贝）。
+- 该转换是纯粹的事后处理：结果确定且幂等，可直接重复运行。转换会重新量化到 ggml k-quant 网格上，
+  因此数值上与源 checkpoint 自身的格式有所不同——GGUF 存储的是 k-quant 块而非任意分组量化，
+  重量化是该格式的固有行为。
+- 转换器只输出单一的主模型文件。llama.cpp 单独消费的配套文件（通过 `--model-draft` 使用的
+  draft 模型、通过 `--mmproj` 使用的多模态投影器）不会生成；多模态 checkpoint 不在离线转换器
+  的支持范围内。
 
 ### 旋转（Rotation）（研究性）
 
