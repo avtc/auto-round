@@ -340,6 +340,12 @@ class BaseOrchestrator(object):
         elif isinstance(_prefetch_raw, int):
             _prefetch_raw = "auto" if _prefetch_raw else "off"
         self.stream_prefetch = str(_prefetch_raw).strip().lower() or "off"
+        if self.stream_prefetch not in ("off",) and not self.stream_quantization:
+            logger.warning(
+                "stream_prefetch=%s set without stream_quantization: block staging only applies to the "
+                "streaming quantization loop; ignoring it",
+                self.stream_prefetch,
+            )
         # Collect imatrix activation statistics with a streaming forward pass
         # before the zero-shot loop (stream_quantization only): one block at a
         # time is materialized, all calibration rows are pushed through, and

@@ -2648,6 +2648,29 @@ class TestStreamResumeJumpChainGuard:
         orch._stream_resume_jump_chain(calib, [rs])  # must not raise
         assert calib["fp_inputs"] is None
 
+    def test_missing_q_input_with_quanted_chain_raises(self):
+        import pytest
+
+        orch = self._orch()
+        object.__setattr__(
+            orch,
+            "_alg_composer",
+            type("AC", (), {"need_quanted_input": lambda self: True})(),
+        )
+        entry = torch.zeros(1, 4, 8)
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 2,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: entry,
+                "load_q_input": lambda self: None,  # crash-window rejected / removed
+            },
+        )()
+        with pytest.raises(RuntimeError, match="quantized-input entry"):
+            orch._stream_resume_jump_chain({"fp_inputs": None}, [rs])
+
     def test_valid_entry_still_jumps(self):
         import torch
 

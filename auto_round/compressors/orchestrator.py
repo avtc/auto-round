@@ -772,7 +772,19 @@ class CompressionOrchestrator(BaseOrchestrator):
                 )
             calib_state["fp_inputs"] = entry
             q_input = rs.load_q_input()
-            if q_input is not None and self.alg_composer.need_quanted_input():
+            if self.alg_composer.need_quanted_input():
+                # the quantized-input chain is required (SignRound default):
+                # a missing or crash-window-rejected q_input must fail loud
+                # like input_ids above, not silently tune the frontier block
+                # on FP inputs
+                if q_input is None:
+                    raise RuntimeError(
+                        f"[stream] resume state for group {rs.block_names[0]}..{rs.block_names[-1]} has a "
+                        "usable FP chain entry but no quantized-input entry, while the quantizer requires "
+                        "one (enable_quanted_input). The run that wrote this state crashed between the "
+                        "chain tensor saves, or the file was removed; delete the resume directory AND the "
+                        "output directory and rerun."
+                    )
                 calib_state["q_inputs"] = q_input
 
     @staticmethod

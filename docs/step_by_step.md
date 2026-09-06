@@ -978,8 +978,9 @@ directly and never resolves hub ids); download the model first when starting fro
   capacity); a single device (e.g. `cuda:1`) stages there; `on` follows the `auto` chain but is guaranteed
   enabled - host RAM at minimum instead of disabling. Lookahead is always one block: quantize time per block
   dwarfs its load time, so device lists are not accepted. Staged blocks are quantized in place on their
-  staging home. Rotation transforms (e.g. Hadamard) always apply per block under streaming - the full model
-  is never materialized for an up-front pass.
+  staging home. Rotation transforms are NOT yet supported under streaming: whole-model folding would
+  materialize the model and no transform implements the layer-wise protocol yet, so a rotation config
+  fails loud with guidance.
 
 - Supported formats: streaming requires per-block packable integer formats (`auto_round`, `auto_round:llm_compressor`,
   `auto_round:auto_gptq`, `auto_round:auto_awq`). GGUF and any format without per-block immediate packing fail fast
