@@ -2139,11 +2139,30 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "feeds it (needed to turn chain rows into lm_head inputs)"
             )
             return None
+        # a mis-picked leaf (learned gate, per-head norm) is detectable: the
+        # real final norm scales the hidden dim lm_head consumes
+        in_features = getattr(get_module(self.model, lm_head_name), "in_features", None)
+        if in_features is not None and norm_mod.weight.numel() != in_features:
+            logger.warning(
+                "[stream] lm_head falls back to the closed-form search: candidate final norm %s does not "
+                "match lm_head's input width (%d vs %d)",
+                norm_name,
+                norm_mod.weight.numel(),
+                in_features,
+            )
+            return None
         if any(p.is_meta for p in norm_mod.parameters()):
             if streamer is None:
                 logger.warning(
                     "[stream] lm_head falls back to the closed-form search: the final norm is still meta and "
                     "no checkpoint streamer is available to load it"
+                )
+                return None
+            if not streamer.names_under(norm_name):
+                logger.warning(
+                    "[stream] lm_head falls back to the closed-form search: the checkpoint stores no "
+                    "tensors under the final norm path %s",
+                    norm_name,
                 )
                 return None
             streamer.load_module_(norm_mod, norm_name, device=str(fp_rows[0].device))
