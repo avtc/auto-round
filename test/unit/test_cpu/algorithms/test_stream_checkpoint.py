@@ -1892,7 +1892,7 @@ class TestOutsideBlockPackUnderStreaming:
 
         src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
         i = src.index("Quantizing remaining layer")
-        window = src[i : i + 1600]
+        window = src[i : i + 2600]  # lm_head tune wiring sits between the log line and the pack tail
         assert "immediate_pack" in window, "outside-block pass does not pack under streaming"
         assert "shard_writer.write(name=name)" in window, "outside-block pass does not write to shards"
         assert "is_immediate_saving" in window, "pack+write must be gated on immediate saving"
@@ -2243,7 +2243,10 @@ class TestCheckpointOnlyGroupVisibility:
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
         src = inspect.getsource(CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_)
-        assert "stays unquantized: tuning runs need a forward" in src
+        # pinned groups quantize in BOTH regimes now (no env-gated verbatim
+        # skip); the remaining visible skips are the non-quantizable pin and
+        # the non-2D tail
+        assert "stays verbatim: its pin matched no quantizable tensor" in src
         assert "not 2D weights" in src and "skipped_non_2d" in src
         # per-group decision visibility: recognized pattern vs degraded
         assert "no decoder sibling" in src and "covers its tensors" in src
