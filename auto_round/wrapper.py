@@ -311,6 +311,12 @@ class WrapperLinear(torch.nn.Module):
         weight_q = weight_q.to(weight.dtype)
         return weight_q, scale, zp
 
+    def _slice_tunable(self, t, g_start, g_end):
+        """Slice a tuning parameter by group window, keeping scalars intact."""
+        if t is None or t.numel() == 1:
+            return t
+        return t[g_start:g_end]
+
     def _qdq_weight(self, value, min_scale, max_scale):
         """Quantizes and dequantizes weights with tuning parameters.
 
@@ -333,17 +339,50 @@ class WrapperLinear(torch.nn.Module):
         if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
             weight = weight.t()
 
-        weight_q, scale, zp = self._qdq_weight_block(
-            weight.to(self.device),
-            value,
-            min_scale,
-            max_scale,
-            self.weight_min,
-            self.weight_max,
-        )
+        weight = weight.to(self.device)
+        if weight.dim() == 2 and self.row_block_active():
+            # the final quantize/dequantize of a huge layer runs the same
+            # fp32 intermediates as the forward; keep them block-sized too
+            in_features = weight.shape[1]
+            group_size = self.orig_layer.group_size
+            groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
+            weight_q_parts, scale_parts, zp_parts = [], [], []
+            for b_start, b_end in self.row_block_bounds():
+                g_start, g_end = b_start * groups_per_row, b_end * groups_per_row
+                wq, sc, zp = self._qdq_weight_block(
+                    weight[b_start:b_end],
+                    self._slice_tunable(value, g_start, g_end),
+                    self._slice_tunable(min_scale, g_start, g_end),
+                    self._slice_tunable(max_scale, g_start, g_end),
+                    self._slice_tunable(self.weight_min, g_start, g_end),
+                    self._slice_tunable(self.weight_max, g_start, g_end),
+                )
+                weight_q_parts.append(wq)
+                scale_parts.append(sc)
+                zp_parts.append(zp)
+            weight_q = torch.cat(weight_q_parts, dim=0)
+            scale = torch.cat(scale_parts, dim=0) if isinstance(scale_parts[0], torch.Tensor) else scale_parts[0]
+            zp = torch.cat(zp_parts, dim=0) if isinstance(zp_parts[0], torch.Tensor) else zp_parts[0]
+        else:
+            weight_q, scale, zp = self._qdq_weight_block(
+                weight,
+                value,
+                min_scale,
+                max_scale,
+                self.weight_min,
+                self.weight_max,
+            )
         if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
             weight_q = weight_q.t()
         return weight_q, scale, zp
+
+    def row_block_active(self):
+        """Compute (once) and return the row-blocked-forward decision.
+
+        Tune loops must ask this BEFORE the first forward so their loss loop
+        picks the per-block backward path instead of a full forward whose
+        graphs for every block stay alive at once."""
+        return self._use_row_blocked_output()
 
     def _use_row_blocked_output(self):
         """Whether the forward should compute the quantized weight one output-row
@@ -381,10 +420,26 @@ class WrapperLinear(torch.nn.Module):
         return weight.numel() > _ROW_BLOCKED_WEIGHT_ELEMS
 
     def row_block_bounds(self):
-        """Output-row windows used by the row-blocked paths."""
+        """Output-row windows used by the row-blocked paths.
+
+        The window shrinks below the element budget when the GPU is nearly
+        full, so a block's fp32 intermediates always fit the free pool (about
+        six block-sized fp32 arrays are live in the quantize/backward math).
+        Boundaries always land on whole rows, so any window size reproduces
+        the full-tensor computation exactly."""
         weight = self.orig_layer.weight
         out_features, in_features = weight.shape
         rows = max(1, _ROW_BLOCKED_WEIGHT_ELEMS // max(1, in_features))
+        if weight.is_cuda:
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(weight.device)
+            except (RuntimeError, ValueError):  # pragma: no cover - exotic devices
+                free_bytes = None
+            if free_bytes is not None:
+                # ~6 fp32 arrays of rows x in_features live per block; use half
+                # the free pool to leave room for transients and fragmentation
+                budget_rows = int(free_bytes * 0.5 // (in_features * 4 * 6))
+                rows = max(1024, min(rows, budget_rows))
         return [(start, min(start + rows, out_features)) for start in range(0, out_features, rows)]
 
     def _row_block_params(self, start, end):

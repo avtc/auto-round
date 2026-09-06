@@ -911,7 +911,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     # block, so backward must run per block too: the MSE sum
                     # decomposes over output columns and gradients accumulate,
                     # making the result identical to one big backward
-                    blockwise = getattr(wrapper_linear, "_row_block_decision", False) is True
+                    blockwise = wrapper_linear.row_block_active()
                     block_bounds = wrapper_linear.row_block_bounds() if blockwise else None
                     num_elm = 1 if num_elm <= 0 else num_elm
                     for start in range(0, sample_rows, chunk_rows):
