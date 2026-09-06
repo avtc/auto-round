@@ -2040,16 +2040,61 @@ class CompressionOrchestrator(BaseOrchestrator):
             pass
         return torch.device("cpu")
 
-    def _lm_head_tune_inputs_(self, calib_state, remain_layer_names):
+    @staticmethod
+    def _chain_hidden_rows(chain_state):
+        """A chain input/output as a plain list of per-sample row tensors.
+
+        The chain keeps rows as a list, or a dict of per-key row lists for
+        block classes registered in ``_BLOCK_OUTPUT_REGISTRY`` (e.g.
+        gated-delta-net): take its ``hidden_states`` rows."""
+        rows = chain_state.get("hidden_states") if isinstance(chain_state, dict) else chain_state
+        if isinstance(rows, dict):
+            rows = next(iter(rows.values()))
+        return rows
+
+    def _final_norm_module_(self, lm_head_name):
+        """``(name, module)`` of the final norm feeding lm_head, or ``(None, None)``.
+
+        lm_head consumes the POST-norm hidden states (``model.norm`` in
+        Llama-family models); the chain tail holds the raw last-block output.
+        Discovery is name-agnostic: the last leaf module between the final
+        block and lm_head whose only parameters are a 1D weight (plus an
+        optional 1D bias) - the LayerNorm/RMSNorm shape signature."""
+        blocks = get_block_names(self.model) or []
+        # get_block_names returns groups of full block module names
+        block_prefixes = [b for group in blocks for b in group]
+        mods = list(self.model.named_modules())
+        last_block_pos = -1
+        positions = {}
+        for idx, (n, _m) in enumerate(mods):
+            positions[n] = idx
+            if any(n == b or n.startswith(b + ".") for b in block_prefixes):
+                last_block_pos = max(last_block_pos, idx)
+        lm_pos = positions.get(lm_head_name, len(mods))
+        best = None
+        for idx, (n, m) in enumerate(mods):
+            if idx <= last_block_pos or idx >= lm_pos:
+                continue
+            if list(m.children()):
+                continue
+            params = dict(m.named_parameters(recurse=False))
+            weight = params.get("weight")
+            if weight is None or weight.dim() != 1:
+                continue
+            if any(k != "weight" and (k != "bias" or params[k].dim() != 1) for k in params):
+                continue
+            best = (n, m)  # last match: the one adjacent to lm_head
+        return best if best is not None else (None, None)
+
+    def _lm_head_tune_inputs_(self, calib_state, remain_layer_names, streamer=None):
         """Per-sample ``(fp_rows, q_rows, token_ids)`` for tuning lm_head from
         the calibration chain's tail, or ``None`` to keep the closed-form search.
 
-        The chain's final hidden states are lm_head's inputs: at iters>0 the
-        same SignRound loop that tunes blocks - and that the data-driven path
-        already uses for outside-block layers - tunes lm_head here. The chain
-        keeps rows as a list of per-sample tensors, or a dict of per-key row
-        lists for block classes registered in ``_BLOCK_OUTPUT_REGISTRY``
-        (e.g. gated-delta-net): take its ``hidden_states`` rows."""
+        At iters>0 the same SignRound loop that tunes blocks - and that the
+        data-driven path already uses for outside-block layers - tunes lm_head
+        here. The chain tail is the RAW last-block output; lm_head consumes
+        POST-final-norm states, so the final norm is applied to the rows (its
+        weights stream in when still meta)."""
         if self._max_tune_iters() <= 0:
             return None
         lm_head_name = get_lm_head_name(self.model)
@@ -2065,12 +2110,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "final hidden states or token ids to tune from"
             )
             return None
-        fp_rows = fp_inputs.get("hidden_states") if isinstance(fp_inputs, dict) else fp_inputs
-        if isinstance(fp_rows, dict):
-            fp_rows = next(iter(fp_rows.values()))
+        fp_rows = self._chain_hidden_rows(fp_inputs)
         if (
             not isinstance(fp_rows, (list, tuple))
             or len(fp_rows) == 0
+            or len(token_ids) != len(fp_rows)
             or not all(isinstance(r, torch.Tensor) for r in fp_rows)
         ):
             logger.warning("[stream] lm_head falls back to the closed-form search: unexpected chain-tail row format")
@@ -2078,15 +2122,36 @@ class CompressionOrchestrator(BaseOrchestrator):
         q_inputs = (calib_state or {}).get("q_inputs")
         q_rows = None
         if q_inputs is not None:
-            q_rows = q_inputs.get("hidden_states") if isinstance(q_inputs, dict) else q_inputs
-            if isinstance(q_rows, dict):
-                q_rows = next(iter(q_rows.values()))
+            q_rows = self._chain_hidden_rows(q_inputs)
             if not isinstance(q_rows, (list, tuple)) or len(q_rows) != len(fp_rows):
                 logger.warning(
                     "[stream] lm_head tuning uses FP chain inputs (enable_quanted_input cannot be honored): "
                     "quantized chain rows are missing or mis-shaped"
                 )
                 q_rows = None
+        # lm_head consumes POST-final-norm hidden states; the chain tail holds
+        # the raw last-block output. Apply the final norm before tuning - a
+        # tune on the wrong scale fits clip params to the wrong distribution.
+        norm_name, norm_mod = self._final_norm_module_(lm_head_name)
+        if norm_mod is None:
+            logger.warning(
+                "[stream] lm_head falls back to the closed-form search: cannot locate the final norm that "
+                "feeds it (needed to turn chain rows into lm_head inputs)"
+            )
+            return None
+        if any(p.is_meta for p in norm_mod.parameters()):
+            if streamer is None:
+                logger.warning(
+                    "[stream] lm_head falls back to the closed-form search: the final norm is still meta and "
+                    "no checkpoint streamer is available to load it"
+                )
+                return None
+            streamer.load_module_(norm_mod, norm_name, device=str(fp_rows[0].device))
+        with torch.no_grad():
+            dev, dt = fp_rows[0].device, norm_mod.weight.dtype
+            fp_rows = [norm_mod(r.to(dev).to(dt)).to(dev) for r in fp_rows]
+            if q_rows is not None:
+                q_rows = [norm_mod(r.to(dev).to(dt)).to(dev) for r in q_rows]
         # fresh lists: the tune loop reassigns entries (dtype/device casts) and
         # must not mutate the chain state it shares tensors with
         return list(fp_rows), (list(q_rows) if q_rows is not None else None), token_ids
@@ -2526,7 +2591,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         # the modeling code never instantiates): materialize BEFORE the run
         # finalizes - tuning runs join these groups to the chain's tail with
         # the run's own tuning config, and the composer must stay live for
-        # that. Zero-shot runs quantize them through the outside-block pass.
+        # that. Pinned groups without a covering sibling quantize through the
+        # closed-form search in both regimes instead.
         materialized_tensors = set()
         tree_groups = []
         mtp_tuned = set()
@@ -2565,7 +2631,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         # like the data-driven path tunes outside-block layers (the
         # per-sample tune loop lives in quantize_layer_outside_block);
         # iters=0 keeps the closed-form search on the same device
-        lm_tune = self._lm_head_tune_inputs_(calib_state, remain_layer_names) if streamer is not None else None
+        lm_tune = (
+            self._lm_head_tune_inputs_(calib_state, remain_layer_names, streamer=streamer)
+            if streamer is not None
+            else None
+        )
         for name in remain_layer_names:
             module = get_module(self.model, name)
             logger.info(f"Quantizing remaining layer {name} on {outside_qdev}.")

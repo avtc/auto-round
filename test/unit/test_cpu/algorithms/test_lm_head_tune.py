@@ -26,10 +26,19 @@ class _Tiny(nn.Module):
         self.lm_head = nn.Linear(4, 8)
 
 
-def _orch(iters, remain):
-    orch = SimpleNamespace(model=_Tiny())
+class _NoNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lm_head = nn.Linear(4, 8)
+
+
+def _orch(iters, remain, model=None):
+    orch = SimpleNamespace(model=model or _Tiny())
     orch._max_tune_iters = lambda: iters
-    orch._lm_head_tune_inputs_ = MethodType(CompressionOrchestrator._lm_head_tune_inputs_, orch)
+    for name in ("_lm_head_tune_inputs_", "_final_norm_module_"):
+        setattr(orch, name, MethodType(getattr(CompressionOrchestrator, name), orch))
+    # staticmethod: attach the plain function (instance attrs never bind self)
+    orch._chain_hidden_rows = CompressionOrchestrator._chain_hidden_rows
     return orch
 
 
@@ -48,14 +57,32 @@ class TestLmHeadTuneInputs:
         assert out is None
         assert "falls back" not in capfd.readouterr().err
 
-    def test_pinned_tuning_run_returns_rows(self):
+    def test_pinned_tuning_run_returns_post_norm_rows(self):
         rows, qrows, ids = _rows(3), _rows(3), [torch.randint(0, 8, (1, 5)) for _ in range(3)]
         state = {"fp_inputs": rows, "q_inputs": qrows, "token_ids": ids}
-        out = _orch(200, ["lm_head"])._lm_head_tune_inputs_(state, ["lm_head"])
-        assert out is not None
-        fp, q, tok = out
-        assert fp == rows and q == qrows and tok == ids
+        orch = _orch(200, ["lm_head"])
+        fp, q, tok = orch._lm_head_tune_inputs_(state, ["lm_head"])
+        norm = orch.model.norm
+        for got, src_rows in ((fp, rows), (q, qrows)):
+            assert tok is ids
+            for r, s in zip(got, src_rows):
+                torch.testing.assert_close(r, norm(s.to(norm.weight.dtype)), msg="rows must be post-final-norm")
         assert fp is not rows  # fresh list: the tune loop reassigns entries in place
+
+    def test_missing_final_norm_falls_back(self, capfd):
+        state = {"fp_inputs": _rows(2), "token_ids": [torch.zeros(1, 5)] * 2}
+        out = _orch(200, ["lm_head"], model=_NoNorm())._lm_head_tune_inputs_(state, ["lm_head"])
+        assert out is None
+        assert "cannot locate the final norm" in capfd.readouterr().err
+
+    def test_meta_final_norm_without_streamer_falls_back(self, capfd):
+        orch = _orch(200, ["lm_head"])
+        with torch.device("meta"):
+            orch.model.norm = nn.LayerNorm(4)
+        state = {"fp_inputs": _rows(2), "token_ids": [torch.zeros(1, 5)] * 2}
+        out = orch._lm_head_tune_inputs_(state, ["lm_head"], streamer=None)
+        assert out is None
+        assert "final norm is still meta" in capfd.readouterr().err
 
     def test_dict_chain_tail_unwraps_hidden_states(self):
         rows, qrows, ids = _rows(2), _rows(2), [torch.randint(0, 8, (1, 5)) for _ in range(2)]
@@ -64,8 +91,12 @@ class TestLmHeadTuneInputs:
             "q_inputs": {"hidden_states": qrows, "prev_topk_indices": torch.zeros(2)},
             "token_ids": ids,
         }
-        fp, q, _ = _orch(200, ["lm_head"])._lm_head_tune_inputs_(state, ["lm_head"])
-        assert fp == rows and q == qrows
+        orch = _orch(200, ["lm_head"])
+        fp, q, _ = orch._lm_head_tune_inputs_(state, ["lm_head"])
+        norm = orch.model.norm
+        for got, src_rows in ((fp, rows), (q, qrows)):
+            for r, s in zip(got, src_rows):
+                torch.testing.assert_close(r, norm(s.to(norm.weight.dtype)))
 
     def test_missing_chain_state_warns_and_falls_back(self, capfd):
         out = _orch(200, ["lm_head"])._lm_head_tune_inputs_({}, ["lm_head"])

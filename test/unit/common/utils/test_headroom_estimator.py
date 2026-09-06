@@ -245,7 +245,7 @@ class TestMtpPinnedPlaceholderQuantization:
     through the closed-form search in BOTH regimes (they cannot join the
     tuning forward); unpinned groups stay verbatim."""
 
-    def _run(self, iters, monkeypatch=None):
+    def _run(self, iters, layer_config=None):
         import torch.nn as nn
 
         from auto_round.compressors.orchestrator import CompressionOrchestrator
@@ -277,7 +277,7 @@ class TestMtpPinnedPlaceholderQuantization:
         stub = SimpleNamespace(
             alg_composer=SimpleNamespace(block_quantizer=[SimpleNamespace(iters=iters)]),
             model=model,
-            layer_config={"mtp.fc": {"bits": 8, "data_type": "int"}},
+            layer_config=layer_config if layer_config is not None else {"mtp.fc": {"bits": 8, "data_type": "int"}},
             regex_config={},
         )
         stub._checkpoint_only_groups_ = MethodType(CompressionOrchestrator._checkpoint_only_groups_, stub)
@@ -288,6 +288,12 @@ class TestMtpPinnedPlaceholderQuantization:
         claimed, tree_groups = CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_(stub, Streamer(), [])
         assert tree_groups == []
         return claimed, model
+
+    def test_unpinned_group_stays_verbatim_in_both_regimes(self):
+        for iters in (0, 10):
+            claimed, model = self._run(iters, layer_config={})
+            assert claimed == set()
+            assert not hasattr(model, "mtp")
 
     def test_tuning_run_quantizes_pinned_placeholders(self):
         claimed, model = self._run(10)
