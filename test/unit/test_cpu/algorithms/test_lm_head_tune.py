@@ -162,6 +162,7 @@ class TestOutsideTuneChunking:
             ):
                 setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
             quant._preallocate_tuning_grads_ = qmod.SignRoundQuantizer._preallocate_tuning_grads_
+            setattr(quant, "_best_param_device", MethodType(qmod.SignRoundQuantizer._best_param_device, quant))
             quant._logged_low_bit_lr = set()
             monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", cap, raising=False)
             qmod.SignRoundQuantizer.quantize_layer_outside_block(
@@ -229,6 +230,7 @@ class TestOutsideTuneChunking:
         for name in ("_get_scaler", "_scale_loss_and_backward", "_step", "_maybe_log_low_bit_lr"):
             setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
         quant._preallocate_tuning_grads_ = qmod.SignRoundQuantizer._preallocate_tuning_grads_
+        setattr(quant, "_best_param_device", MethodType(qmod.SignRoundQuantizer._best_param_device, quant))
         quant._logged_low_bit_lr = set()
         fp = [torch.randn(1, 7, 16) for _ in range(2)]
 
@@ -766,3 +768,17 @@ class TestRowBlockThreshold:
         w = WrapperLinear(layer, enable_minmax_tuning=False, enable_torch_compile=False, device="cpu")
         monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 64, raising=False)
         assert w.row_block_active() is True
+
+
+class TestBestParamSnapshotDevice:
+    """Huge-layer snapshots must park on the host, not beside the live params."""
+
+    def test_device_selection(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        q = SimpleNamespace(compress_context=SimpleNamespace(cache_device=torch.device("cuda:0")))
+        fn = SignRoundQuantizer._best_param_device
+        assert fn(q, 2**28) == torch.device("cpu"), "vocabulary-head snapshots must park on the host"
+        assert fn(q, 1024) == torch.device("cuda:0"), "small layers keep the context cache device"
