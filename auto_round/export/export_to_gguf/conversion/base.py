@@ -166,7 +166,13 @@ def _ct_weights_for_tensor(name, groups, n_layers=None, renames=None):
     exact rename record is consulted first (each arch class renames tensors in
     its own ``filter_tensors``); the spelling heuristics only back it up."""
     default = None
-    spelled = [renames[name]] if renames and name in renames else []
+    spelled = []
+    if renames:
+        # the record holds full tensor keys (including the _packed suffix the
+        # dequantizer strips); recover the original checkpoint spelling
+        original = renames.get(name) or renames.get(name + "_packed")
+        if original is not None:
+            spelled.append(original.removesuffix("_packed"))
     spelled += _ct_candidate_names(name, n_layers)
     for candidate in spelled:
         for group in groups.values():
