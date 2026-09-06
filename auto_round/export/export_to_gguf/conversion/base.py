@@ -115,21 +115,57 @@ _CT_MODULE_TYPE_TARGETS = frozenset(
 )
 
 
-def _ct_weights_for_tensor(name, groups):
+_CT_MTP_REVERSE_REMAP = {
+    "eh_proj.weight": "fc.weight",
+    "enorm.weight": "pre_fc_norm_embedding.weight",
+    "hnorm.weight": "pre_fc_norm_hidden.weight",
+    "shared_head.norm.weight": "norm.weight",
+}
+
+
+def _ct_layer_base(hparams):
+    """Decoder-layer count the config targets are spelled against (MTP blocks
+    extend past it; wrapper configs keep it in text_config)."""
+    merged = {**hparams, **(hparams.get("text_config") or {})}
+    for key in ("num_hidden_layers", "n_layers", "n_layer", "num_layers"):
+        if key in merged:
+            return int(merged[key])
+    return None
+
+
+def _ct_candidate_names(name, n_layers=None):
+    """Spellings of a tensor name that config-group targets may use.
+
+    Loader classes rename wrapper and MTP tensors when indexing shards, while
+    the quantization config keeps the checkpoint spellings: the wrapper
+    ``language_model.`` segment may be dropped, and MTP tensors become
+    llama.cpp-style extended blocks (``mtp.fc`` -> ``model.layers.N.eh_proj``,
+    ``mtp.layers.0.x`` -> ``model.layers.N.x``)."""
+    candidates = [name]
+    if name.startswith("model.") and not name.startswith("model.language_model."):
+        candidates.append("model.language_model." + name[len("model.") :])
+    m = re.match(r"^model\.layers\.(\d+)\.(.+)$", name)
+    if m and n_layers is not None:
+        idx, rest = int(m.group(1)), m.group(2)
+        if idx >= n_layers:
+            if rest in _CT_MTP_REVERSE_REMAP:
+                candidates.append("mtp." + _CT_MTP_REVERSE_REMAP[rest])
+            else:
+                candidates.append(f"mtp.layers.{idx - n_layers}.{rest}")
+    return candidates
+
+
+def _ct_weights_for_tensor(name, groups, n_layers=None):
     """Resolve the compressed-tensors ``weights`` config for one tensor.
 
     Multi-group exports pin different bit widths per module (for example an
     8-bit lm_head over a 4-bit body). Group ``targets`` are module-type names
     (``Linear``), leaf module names (``lm_head``), dotted module paths, or
     regexes; non-module-type targets are matched as regexes against the tensor
-    name and the first module-type group acts as the default. Wrapper
-    checkpoints may drop their ``language_model.`` segment in tensor names
-    while the config keeps it, so the re-nested spelling is tried as well."""
-    candidates = [name]
-    if name.startswith("model.") and not name.startswith("model.language_model."):
-        candidates.append("model.language_model." + name[len("model.") :])
+    name and the first module-type group acts as the default. Every loader
+    spelling from ``_ct_candidate_names`` is tried before falling back."""
     default = None
-    for candidate in candidates:
+    for candidate in _ct_candidate_names(name, n_layers):
         for group in groups.values():
             if not isinstance(group, dict):
                 continue
@@ -145,83 +181,6 @@ def _ct_weights_for_tensor(name, groups):
                 elif re.search(target, candidate):
                     return weights
     return default
-
-
-def _ct_int_mixed_groups(groups, quant_format):
-    """Whether a multi-group config is entirely integer quantized.
-
-    compressed-tensors reports several top-level formats for pinned-width
-    exports (``int-quantized``, ``mixed-precision``, ``pack-quantized``) and
-    per-group formats are often absent; as long as every group is integer
-    weights the packed tensors still dequantize per group."""
-    if quant_format not in ("pack-quantized", "int-quantized", "mixed-precision"):
-        return False
-    for group in groups.values():
-        if not isinstance(group, dict):
-            continue
-        weights = group.get("weights")
-        if weights is None:
-            continue
-        if weights.get("type", "int") != "int":
-            return False
-        # groups often carry an explicit "format": null
-        if (group.get("format") or "pack-quantized") not in ("pack-quantized", "int-quantized"):
-            return False
-    return True
-
-
-_CT_MODULE_TYPE_TARGETS = frozenset(
-    {
-        "Linear",
-        "Conv1d",
-        "Conv2d",
-        "Conv3d",
-        "Embedding",
-        "LayerNorm",
-        "RMSNorm",
-        "GroupNorm",
-        "DynamicConv1d",
-    }
-)
-
-
-def _ct_weights_for_tensor(name, groups):
-    """Resolve the compressed-tensors ``weights`` config for one tensor.
-
-    Multi-group exports pin different bit widths per module (for example an
-    8-bit lm_head over a 4-bit body). Group ``targets`` are module-type names
-    (``Linear``), leaf module names (``lm_head``), dotted module paths, or
-    regexes; every target is matched as a regex against the tensor name and
-    the first module-type group acts as the default. Wrapper checkpoints may
-    drop their ``language_model.`` segment in tensor names while the config
-    keeps it, so the re-nested spelling is tried as well."""
-    for candidate in (name, "model.language_model." + name[len("model.") :]) if name.startswith("model.") else (name,):
-        default = None
-        for group in groups.values():
-            if not isinstance(group, dict):
-                continue
-            weights = group.get("weights")
-            if weights is None:
-                continue
-            for target in group.get("targets") or ():
-                if not isinstance(target, str):
-                    continue
-                if target in _CT_MODULE_TYPE_TARGETS:
-                    if default is None:
-                        default = weights
-                elif re.search(target, candidate):
-                    return weights
-        if any(
-            re.search(t, candidate)
-            for g in groups.values()
-            if isinstance(g, dict)
-            for t in (g.get("targets") or ())
-            if isinstance(t, str)
-        ):
-            return None if False else default if default is not None else None
-        if default is not None:
-            return default
-    return None
 
 
 class ModelBase:
@@ -732,7 +691,11 @@ class ModelBase:
                         base_name = name.removesuffix("_packed")
                         # multi-group exports resolve each packed tensor to its
                         # own weights config (pinned widths differ per module)
-                        tensor_config = weight_config if len(groups) == 1 else _ct_weights_for_tensor(base_name, groups)
+                        tensor_config = (
+                            weight_config
+                            if len(groups) == 1
+                            else _ct_weights_for_tensor(base_name, groups, n_layers=_ct_layer_base(self.hparams))
+                        )
                         if tensor_config is None:
                             raise NotImplementedError(f"No compressed-tensors config group matches {base_name!r}")
                         assert tensor_config.get("strategy") == "group"

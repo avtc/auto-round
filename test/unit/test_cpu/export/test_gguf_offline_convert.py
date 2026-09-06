@@ -324,3 +324,23 @@ class TestDequantMismatchDiagnostic:
             assert wc is not None, f"unresolved: {loader_name}"
             counts[wc["num_bits"]] = counts.get(wc["num_bits"], 0) + 1
         assert counts == {4: 400, 8: 9}, counts
+
+    def test_mtp_renamed_loader_names_resolve(self):
+        """The qwen loader renames mtp tensors to extended-block spellings
+        (mtp.fc -> model.layers.64.eh_proj); the resolver must map back."""
+        from auto_round.export.export_to_gguf.conversion.base import _ct_layer_base, _ct_weights_for_tensor
+
+        w8 = {"num_bits": 8, "group_size": 128, "type": "int", "strategy": "group"}
+        groups = {
+            "group_1": {
+                "targets": ["lm_head", "mtp.fc", "mtp.layers.0.mlp.gate_proj", "mtp.layers.0.self_attn.q_proj"],
+                "weights": w8,
+            }
+        }
+        n = 64
+        assert _ct_layer_base({"num_hidden_layers": 64}) == n
+        assert _ct_weights_for_tensor("model.layers.64.eh_proj.weight", groups, n_layers=n) is w8
+        assert _ct_weights_for_tensor("model.layers.64.mlp.gate_proj.weight", groups, n_layers=n) is w8
+        assert _ct_weights_for_tensor("model.layers.64.self_attn.q_proj.weight", groups, n_layers=n) is w8
+        # body layers stay untouched by the reverse remap
+        assert _ct_weights_for_tensor("model.layers.64.mlp.gate_proj.weight", groups, n_layers=None) is None
