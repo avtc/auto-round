@@ -353,6 +353,55 @@ class WrapperLinear(torch.nn.Module):
             return False
         return weight.numel() > _ROW_BLOCKED_WEIGHT_ELEMS
 
+    def row_block_bounds(self):
+        """Output-row windows used by the row-blocked paths."""
+        weight = self.orig_layer.weight
+        out_features, in_features = weight.shape
+        rows = max(1, _ROW_BLOCKED_WEIGHT_ELEMS // max(1, in_features))
+        return [(start, min(start + rows, out_features)) for start in range(0, out_features, rows)]
+
+    def _row_block_params(self, start, end):
+        """Sliced tuning parameters and weight for one output-row window."""
+        weight = self.orig_layer.weight.to(self.device)
+        _, in_features = weight.shape
+        group_size = self.orig_layer.group_size
+        groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
+        g_start, g_end = start * groups_per_row, end * groups_per_row
+        init_scale = getattr(self, "init_scale", None)
+        block_init_scale = init_scale
+        if isinstance(init_scale, torch.Tensor) and init_scale.dim() >= 1:
+            if init_scale.shape[0] == weight.shape[0] * groups_per_row:
+                # per-group initial scales follow the same row-major window
+                block_init_scale = init_scale[g_start:g_end]
+            else:
+                logger.warning_once(
+                    "[tune] row-blocked forward keeps an init_scale of shape %s (expected leading dim %d); "
+                    "passing it through unsliced",
+                    tuple(init_scale.shape),
+                    weight.shape[0] * groups_per_row,
+                )
+        min_bound, max_bound = self.minmax_scale_bound
+        self.min_scale.data.clamp_(min_bound, max_bound)
+        self.max_scale.data.clamp_(min_bound, max_bound)
+        weight_q, *_ = self._qdq_weight_block(
+            weight[start:end],
+            self.value[g_start:g_end],
+            self.min_scale[g_start:g_end],
+            self.max_scale[g_start:g_end],
+            self.weight_min[g_start:g_end] if self.weight_min is not None else None,
+            self.weight_max[g_start:g_end] if self.weight_max is not None else None,
+            init_scale=block_init_scale,
+        )
+        return weight_q
+
+    def forward_rows(self, x, start, end, bias=None):
+        """Output columns ``[start:end)`` computed with the row-blocked fake-quant
+        math, keeping only this block's autograd graph alive. Tuning loops use
+        this to backward per block; the summed loss equals the full-tensor
+        loss because the MSE decomposes over output columns."""
+        block_bias = bias[start:end] if bias is not None else None
+        return self.linear_forward(x, self._row_block_params(start, end), block_bias)
+
     def _row_blocked_output(self, x, bias):
         """Forward with per-row-block fake-quant math (see ``_qdq_weight_block``).
 
@@ -360,43 +409,7 @@ class WrapperLinear(torch.nn.Module):
         window of output rows maps to a consecutive window of groups; blocking
         therefore reproduces the full-tensor computation exactly while the
         fp32 intermediates stay bounded."""
-        weight = self.orig_layer.weight.to(self.device)
-        out_features, in_features = weight.shape
-        group_size = self.orig_layer.group_size
-        groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
-        rows = max(1, _ROW_BLOCKED_WEIGHT_ELEMS // max(1, in_features))
-        min_bound, max_bound = self.minmax_scale_bound
-        self.min_scale.data.clamp_(min_bound, max_bound)
-        self.max_scale.data.clamp_(min_bound, max_bound)
-        outputs = []
-        init_scale = getattr(self, "init_scale", None)
-        for start in range(0, out_features, rows):
-            end = min(start + rows, out_features)
-            g_start, g_end = start * groups_per_row, end * groups_per_row
-            block_init_scale = init_scale
-            if isinstance(init_scale, torch.Tensor) and init_scale.dim() >= 1:
-                if init_scale.shape[0] == out_features * groups_per_row:
-                    # per-group initial scales follow the same row-major window
-                    block_init_scale = init_scale[g_start:g_end]
-                else:
-                    logger.warning_once(
-                        "[tune] row-blocked forward keeps an init_scale of shape %s (expected leading dim %d); "
-                        "passing it through unsliced",
-                        tuple(init_scale.shape),
-                        out_features * groups_per_row,
-                    )
-                    block_init_scale = init_scale
-            weight_q, *_ = self._qdq_weight_block(
-                weight[start:end],
-                self.value[g_start:g_end],
-                self.min_scale[g_start:g_end],
-                self.max_scale[g_start:g_end],
-                self.weight_min[g_start:g_end] if self.weight_min is not None else None,
-                self.weight_max[g_start:g_end] if self.weight_max is not None else None,
-                init_scale=block_init_scale,
-            )
-            block_bias = bias[start:end] if bias is not None else None
-            outputs.append(self.linear_forward(x, weight_q, block_bias))
+        outputs = [self.forward_rows(x, start, end, bias) for start, end in self.row_block_bounds()]
         return torch.cat(outputs, dim=-1)
 
     def _qdq_act(self, x, act_min_scale=torch.tensor(1.0), act_max_scale=torch.tensor(1.0), act_max=None):
