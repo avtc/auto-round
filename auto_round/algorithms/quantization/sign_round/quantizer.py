@@ -995,6 +995,12 @@ class SignRoundQuantizer(BaseQuantizer):
         if not self.not_use_best_mse:
             last_loss = best_loss
             best_iter = last_best_iter
+        # tuning is complete: the gradient buffers (as large as the rounding
+        # parameter on huge layers, zeroed in place between steps) are dead
+        # weight for the final quantize/dequantize transients that follow
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                param.grad = None
         with torch.no_grad():
             unwrapper_layer(self.model, wrapper_linear, layer_name, best_params)
         mv_module_from_gpu(layer)
