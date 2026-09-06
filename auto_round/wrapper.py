@@ -252,11 +252,12 @@ class WrapperLinear(torch.nn.Module):
 
         setattr(self, name, p)
 
-    def _qdq_weight_block(self, weight, value, min_scale, max_scale, tensor_min, tensor_max):
+    def _qdq_weight_block(self, weight, value, min_scale, max_scale, tensor_min, tensor_max, init_scale=None):
         """Fake-quantize an explicit block of rows (see ``_qdq_weight``).
 
         Split out so the row-blocked forward can bound the fp32 intermediates
-        of huge layers; the kwargs are identical to the full-tensor call."""
+        of huge layers; the kwargs are identical to the full-tensor call.
+        ``init_scale`` may be passed pre-sliced by the blocked caller."""
         quant_kwargs = {}
         if hasattr(self.orig_layer, "super_bits"):
             quant_kwargs["super_bits"] = self.orig_layer.super_bits
@@ -277,7 +278,7 @@ class WrapperLinear(torch.nn.Module):
             q_scale_thresh=self.q_scale_thresh,
             imatrix=self.orig_layer.imatrix.to(weight.device) if hasattr(self.orig_layer, "imatrix") else None,
             global_scale=getattr(self, "weight_global_scale", None),
-            init_scale=getattr(self, "init_scale", None),
+            init_scale=init_scale if init_scale is not None else getattr(self, "init_scale", None),
             **quant_kwargs,
         )
         weight_q = weight_q.to(weight.dtype)
@@ -368,9 +369,23 @@ class WrapperLinear(torch.nn.Module):
         self.min_scale.data.clamp_(min_bound, max_bound)
         self.max_scale.data.clamp_(min_bound, max_bound)
         outputs = []
+        init_scale = getattr(self, "init_scale", None)
         for start in range(0, out_features, rows):
             end = min(start + rows, out_features)
             g_start, g_end = start * groups_per_row, end * groups_per_row
+            block_init_scale = init_scale
+            if isinstance(init_scale, torch.Tensor) and init_scale.dim() >= 1:
+                if init_scale.shape[0] == out_features * groups_per_row:
+                    # per-group initial scales follow the same row-major window
+                    block_init_scale = init_scale[g_start:g_end]
+                else:
+                    logger.warning_once(
+                        "[tune] row-blocked forward keeps an init_scale of shape %s (expected leading dim %d); "
+                        "passing it through unsliced",
+                        tuple(init_scale.shape),
+                        out_features * groups_per_row,
+                    )
+                    block_init_scale = init_scale
             weight_q, *_ = self._qdq_weight_block(
                 weight[start:end],
                 self.value[g_start:g_end],
@@ -378,6 +393,7 @@ class WrapperLinear(torch.nn.Module):
                 self.max_scale[g_start:g_end],
                 self.weight_min[g_start:g_end] if self.weight_min is not None else None,
                 self.weight_max[g_start:g_end] if self.weight_max is not None else None,
+                init_scale=block_init_scale,
             )
             block_bias = bias[start:end] if bias is not None else None
             outputs.append(self.linear_forward(x, weight_q, block_bias))
