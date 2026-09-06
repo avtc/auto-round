@@ -36,6 +36,16 @@ if deepspeed_exists:
     from deepspeed.module_inject import LinearAllreduce, LinearLayer
 
 
+# Weight-element budget for row-blocked fake-quant forwards: layers whose
+# weight exceeds this many elements compute their quantized-weight math one
+# output-row block at a time, because the eager quant functions materialize
+# several full-size fp32 intermediates (observed ~4.7GiB each on a 248k-vocab
+# lm_head) that cannot coexist with the rounding parameter and its gradient.
+# Blocking is exact: quantization groups never straddle output rows, so the
+# per-block results and gradients equal the full-tensor computation.
+_ROW_BLOCKED_WEIGHT_ELEMS = 2**26
+
+
 def get_scale_shape(weight, group_size):
     """Computes the shape of the scale tensor for quantization based on the weight tensor and group size.
 
@@ -241,6 +251,37 @@ class WrapperLinear(torch.nn.Module):
 
         setattr(self, name, p)
 
+    def _qdq_weight_block(self, weight, value, min_scale, max_scale, tensor_min, tensor_max):
+        """Fake-quantize an explicit block of rows (see ``_qdq_weight``).
+
+        Split out so the row-blocked forward can bound the fp32 intermediates
+        of huge layers; the kwargs are identical to the full-tensor call."""
+        quant_kwargs = {}
+        if hasattr(self.orig_layer, "super_bits"):
+            quant_kwargs["super_bits"] = self.orig_layer.super_bits
+            quant_kwargs["super_group_size"] = self.orig_layer.super_group_size
+        if hasattr(self, "_extra_quant_kwargs"):
+            quant_kwargs.update(self._extra_quant_kwargs())
+        weight_q, scale, zp = self.weight_quant_func(
+            weight,
+            bits=self.orig_layer.bits,
+            group_size=self.orig_layer.group_size,
+            v=value,
+            min_scale=min_scale,
+            max_scale=max_scale,
+            scale_dtype=self.orig_layer.scale_dtype,
+            tensor_min=tensor_min,
+            tensor_max=tensor_max,
+            data_type=self.data_type,
+            q_scale_thresh=self.q_scale_thresh,
+            imatrix=self.orig_layer.imatrix.to(weight.device) if hasattr(self.orig_layer, "imatrix") else None,
+            global_scale=getattr(self, "weight_global_scale", None),
+            init_scale=getattr(self, "init_scale", None),
+            **quant_kwargs,
+        )
+        weight_q = weight_q.to(weight.dtype)
+        return weight_q, scale, zp
+
     def _qdq_weight(self, value, min_scale, max_scale):
         """Quantizes and dequantizes weights with tuning parameters.
 
@@ -263,34 +304,68 @@ class WrapperLinear(torch.nn.Module):
         if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
             weight = weight.t()
 
-        quant_kwargs = {}
-        if hasattr(self.orig_layer, "super_bits"):
-            quant_kwargs["super_bits"] = self.orig_layer.super_bits
-            quant_kwargs["super_group_size"] = self.orig_layer.super_group_size
-        if hasattr(self, "_extra_quant_kwargs"):
-            quant_kwargs.update(self._extra_quant_kwargs())
-
-        weight_q, scale, zp = self.weight_quant_func(
+        weight_q, scale, zp = self._qdq_weight_block(
             weight.to(self.device),
-            bits=self.orig_layer.bits,
-            group_size=self.orig_layer.group_size,
-            v=value,
-            min_scale=min_scale,
-            max_scale=max_scale,
-            scale_dtype=self.orig_layer.scale_dtype,
-            tensor_min=self.weight_min,
-            tensor_max=self.weight_max,
-            data_type=self.data_type,
-            q_scale_thresh=self.q_scale_thresh,
-            imatrix=self.orig_layer.imatrix.to(weight.device) if hasattr(self.orig_layer, "imatrix") else None,
-            global_scale=getattr(self, "weight_global_scale", None),
-            init_scale=getattr(self, "init_scale", None),
-            **quant_kwargs,
+            value,
+            min_scale,
+            max_scale,
+            self.weight_min,
+            self.weight_max,
         )
-        weight_q = weight_q.to(weight.dtype)
         if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
             weight_q = weight_q.t()
         return weight_q, scale, zp
+
+    def _use_row_blocked_output(self):
+        """Whether the forward should compute the quantized weight one output-row
+        block at a time. Only plain Linear layers with a weight beyond the
+        element budget qualify: meta weights are materialized whole by
+        ``get_weight`` anyway, non-linear forwards take un-sliced weights, and
+        per-tensor group layouts (group_size 0) share scale across rows so
+        blocking would change the math."""
+        layer = self.orig_layer
+        if type(layer) is not torch.nn.Linear or self.orig_forward != self.linear_forward:
+            return False
+        weight = layer.weight
+        if weight.dim() != 2 or weight.device.type == "meta":
+            return False
+        if hasattr(layer, "super_bits"):
+            return False
+        group_size = getattr(layer, "group_size", -1)
+        if not isinstance(group_size, int) or group_size == 0:
+            return False
+        return weight.numel() > _ROW_BLOCKED_WEIGHT_ELEMS
+
+    def _row_blocked_output(self, x, bias):
+        """Forward with per-row-block fake-quant math (see ``_qdq_weight_block``).
+
+        Groups are laid out row-major in the flattened tuning parameters, so a
+        window of output rows maps to a consecutive window of groups; blocking
+        therefore reproduces the full-tensor computation exactly while the
+        fp32 intermediates stay bounded."""
+        weight = self.orig_layer.weight.to(self.device)
+        out_features, in_features = weight.shape
+        group_size = self.orig_layer.group_size
+        groups_per_row = (in_features + group_size - 1) // group_size if 0 < group_size < in_features else 1
+        rows = max(1, _ROW_BLOCKED_WEIGHT_ELEMS // max(1, in_features))
+        min_bound, max_bound = self.minmax_scale_bound
+        self.min_scale.data.clamp_(min_bound, max_bound)
+        self.max_scale.data.clamp_(min_bound, max_bound)
+        outputs = []
+        for start in range(0, out_features, rows):
+            end = min(start + rows, out_features)
+            g_start, g_end = start * groups_per_row, end * groups_per_row
+            weight_q, *_ = self._qdq_weight_block(
+                weight[start:end],
+                self.value[g_start:g_end],
+                self.min_scale[g_start:g_end],
+                self.max_scale[g_start:g_end],
+                self.weight_min[g_start:g_end] if self.weight_min is not None else None,
+                self.weight_max[g_start:g_end] if self.weight_max is not None else None,
+            )
+            block_bias = bias[start:end] if bias is not None else None
+            outputs.append(self.linear_forward(x, weight_q, block_bias))
+        return torch.cat(outputs, dim=-1)
 
     def _qdq_act(self, x, act_min_scale=torch.tensor(1.0), act_max_scale=torch.tensor(1.0), act_max=None):
         """Quantizes and dequantizes activations.
@@ -525,7 +600,10 @@ class WrapperLinear(torch.nn.Module):
         """
         # logger.info(self.orig_layer.global_name)
         x = x.to(self.device)
-        weight_q, *_ = self._qdq_weight(self.value, self.min_scale, self.max_scale)
+        row_blocked = self._use_row_blocked_output()
+        weight_q = None
+        if not row_blocked:
+            weight_q, *_ = self._qdq_weight(self.value, self.min_scale, self.max_scale)
 
         if self.enable_act_quant:
             # Run orig_layer's forward_pre_hooks (e.g., online Hadamard transform)
@@ -553,7 +631,11 @@ class WrapperLinear(torch.nn.Module):
         if self.enable_norm_bias_tuning:
             bias, _, _ = self._qdq_bias(bias, self.bias_v)
 
-        output = self.orig_forward(x, weight_q, bias).to(self.output_device)
+        if row_blocked:
+            output = self._row_blocked_output(x, bias)
+        else:
+            output = self.orig_forward(x, weight_q, bias)
+        output = output.to(self.output_device)
 
         # Execute post-hooks from orig_layer (e.g., v_proj per-head Hadamard
         # when online rotation is not fused into weights).

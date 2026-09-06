@@ -1676,24 +1676,29 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
     allocated_b = torch.cuda.memory_allocated(device)
     reserved_b = torch.cuda.memory_reserved(device)
     groups = {}
+    storages = {}
     for obj in gc.get_objects():  # noqa: C417  pylint: disable=too-many-nested-blocks
         try:
             if torch.is_tensor(obj) and obj.device == device:
                 key = (tuple(obj.shape), str(obj.dtype))
-                groups[key] = groups.get(key, [0, 0])
+                groups.setdefault(key, [0, 0])
                 groups[key][0] += 1
-                groups[key][1] += obj.element_size() * obj.numel()
+                # views share storage; count each storage once for the total
+                ptr = obj.untyped_storage().data_ptr()
+                if ptr not in storages:
+                    storages[ptr] = obj.untyped_storage().nbytes()
         except Exception:  # pylint: disable=broad-except
             continue
     lines = [
         "[vram] %s: free %.2fGiB / total %.2fGiB | torch allocated %.2fGiB reserved %.2fGiB | "
-        "python-visible %.2fGiB in %d tensor groups",
+        "python-visible %.2fGiB (%.2fGiB unique storages) in %d tensor groups",
         tag,
         free_b / 2**30,
         total_b / 2**30,
         allocated_b / 2**30,
         reserved_b / 2**30,
         sum(v[1] for v in groups.values()) / 2**30,
+        sum(storages.values()) / 2**30,
         len(groups),
     ]
     logger.debug(*lines)

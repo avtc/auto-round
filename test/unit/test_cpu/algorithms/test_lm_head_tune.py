@@ -164,7 +164,6 @@ class TestOutsideTuneChunking:
             results.append(fresh.weight.detach().clone())
         assert torch.equal(results[0], results[1]), "chunked tune diverged from single-shot"
 
-
     def test_huge_value_parameter_skips_torch_compile(self, monkeypatch):
         """Inductor's backward adds a full-size buffer for billion-element
         rounding parameters; the wrapper must stay eager for those."""
@@ -193,12 +192,16 @@ class TestOutsideTuneChunking:
         layer.act_sym = True
         layer.act_data_type = None
         layer.act_group_size = None
-        cfg = type("C", (), {
-            "iters": 2,
-            "lr": 5e-3,
-            "compute_lr": lambda self, bits: None,
-            "compute_minmax_lr": lambda self, bits: None,
-        })()
+        cfg = type(
+            "C",
+            (),
+            {
+                "iters": 2,
+                "lr": 5e-3,
+                "compute_lr": lambda self, bits: None,
+                "compute_minmax_lr": lambda self, bits: None,
+            },
+        )()
         quant = SimpleNamespace(
             config=cfg,
             _config=cfg,
@@ -230,13 +233,83 @@ class TestOutsideTuneChunking:
         monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", 16, raising=False)
         fresh = torch.nn.Linear(16, 5)
         for attr, val in (
-            ("global_name", "lm_head"), ("bits", 8), ("group_size", 32), ("sym", True),
-            ("data_type", "int"), ("scale_dtype", None), ("iters", 2), ("act_bits", 16),
-            ("act_sym", True), ("act_data_type", None), ("act_group_size", None),
+            ("global_name", "lm_head"),
+            ("bits", 8),
+            ("group_size", 32),
+            ("sym", True),
+            ("data_type", "int"),
+            ("scale_dtype", None),
+            ("iters", 2),
+            ("act_bits", 16),
+            ("act_sym", True),
+            ("act_data_type", None),
+            ("act_group_size", None),
         ):
             setattr(fresh, attr, val)
         qmod.SignRoundQuantizer.quantize_layer_outside_block(quant, fresh, fp_inputs=[t.clone() for t in fp])
         assert captured["enable_torch_compile"] is False
+
+
+def _mk_quant_linear(out_f, in_f, bits=4, group_size=4):
+    layer = torch.nn.Linear(in_f, out_f)
+    layer.global_name = "lm_head"
+    layer.bits = bits
+    layer.group_size = group_size
+    layer.sym = True
+    layer.data_type = "int"
+    layer.scale_dtype = None
+    layer.iters = 2
+    layer.act_bits = 16
+    layer.act_sym = True
+    layer.act_data_type = None
+    layer.act_group_size = None
+    return layer
+
+
+class TestRowBlockedWrapperForward:
+    """Huge-weight wrappers quantize one row block at a time; outputs and
+    gradients must match the full-tensor path exactly (groups never straddle
+    output rows)."""
+
+    def _wrapper(self, layer, minmax=False):
+        from auto_round.wrapper import WrapperLinear
+
+        return WrapperLinear(layer, enable_minmax_tuning=minmax, enable_torch_compile=False, device="cpu")
+
+    def test_blocked_output_and_gradients_match(self, monkeypatch):
+        import auto_round.wrapper as wmod
+
+        torch.manual_seed(9)
+        layer = _mk_quant_linear(24, 10, group_size=4)  # 240 elements
+        x = torch.randn(3, 2, 10)
+        target = torch.randn(3, 2, 24)
+
+        results = []
+        for cap in (2**26, 60):  # full path vs 4-row blocks (4 rows x 10 in)
+            torch.manual_seed(21)
+            fresh = _mk_quant_linear(24, 10, group_size=4)
+            with torch.no_grad():
+                fresh.weight.copy_(layer.weight)
+                fresh.bias.copy_(layer.bias)
+            wrapper = self._wrapper(fresh, minmax=True)
+            monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", cap, raising=False)
+            out = wrapper(x)
+            loss = torch.nn.functional.mse_loss(out, target)
+            loss.backward()
+            results.append(
+                (out.detach().clone(), wrapper.value.grad.detach().clone(), wrapper.min_scale.grad.detach().clone())
+            )
+        assert torch.allclose(results[0][0], results[1][0], atol=1e-6), "blocked forward output diverged"
+        assert torch.allclose(results[0][1], results[1][1], atol=1e-7), "blocked value grad diverged"
+        assert torch.allclose(results[0][2], results[1][2], atol=1e-7), "blocked min_scale grad diverged"
+
+    def test_per_tensor_group_size_never_blocks(self, monkeypatch):
+        import auto_round.wrapper as wmod
+
+        layer = _mk_quant_linear(24, 10, group_size=0)
+        wrapper = self._wrapper(layer)
+        monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 60, raising=False)
+        assert wrapper._use_row_blocked_output() is False
 
 
 class TestLmHeadNameResolution:
