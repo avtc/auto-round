@@ -77,6 +77,29 @@ class ModelType(IntEnum):
     MMPROJ = 2
 
 
+def _ct_int_mixed_groups(groups, quant_format):
+    """Whether a multi-group config is entirely integer quantized.
+
+    compressed-tensors reports several top-level formats for pinned-width
+    exports (``int-quantized``, ``mixed-precision``, ``pack-quantized``) and
+    per-group formats are often absent; as long as every group is integer
+    weights the packed tensors still dequantize per group."""
+    if quant_format not in ("pack-quantized", "int-quantized", "mixed-precision"):
+        return False
+    for group in groups.values():
+        if not isinstance(group, dict):
+            continue
+        weights = group.get("weights")
+        if weights is None:
+            continue
+        if weights.get("type", "int") != "int":
+            return False
+        # groups often carry an explicit "format": null
+        if (group.get("format") or "pack-quantized") not in ("pack-quantized", "int-quantized"):
+            return False
+    return True
+
+
 def _ct_weights_for_tensor(name, groups):
     """Resolve the compressed-tensors ``weights`` config for one tensor.
 
@@ -551,15 +574,23 @@ class ModelBase:
                     and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
                 )
 
-                if len(groups) > 1 and not nvfp4_compressed_tensors and quant_format != "pack-quantized":
-                    raise NotImplementedError("Can't handle multiple config groups for compressed-tensors yet")
+                if len(groups) > 1 and not nvfp4_compressed_tensors and not _ct_int_mixed_groups(groups, quant_format):
+                    raise NotImplementedError(
+                        "Can't handle multiple config groups for compressed-tensors yet: "
+                        f"format={quant_format!r}, groups="
+                        + ", ".join(
+                            f"{gname}: format={g.get('format')!r} weights={g.get('weights')!r}"
+                            for gname, g in groups.items()
+                            if isinstance(g, dict)
+                        )
+                    )
                 weight_config = tuple(groups.values())[0]["weights"]
 
                 if (
                     quant_format == "float-quantized"
                     or quant_format == "int-quantized"
                     or quant_format == "naive-quantized"
-                ):
+                ) and len(groups) == 1:
                     block_size = weight_config.get("block_structure", None)
                     strategy = weight_config.get("strategy")
                     assert strategy == "channel" or strategy == "block"
@@ -578,7 +609,11 @@ class ModelBase:
                             tensors_to_remove.append(name)
                             if self._fp8_as_q8 and is_fp8:
                                 self._fp8_dequantized.add(weight_name)
-                elif quant_format == "pack-quantized":
+                elif any(k.endswith(".weight_packed") for k in self.model_tensors) and (
+                    quant_format == "pack-quantized"
+                    or quant_format == "int-quantized"
+                    or (quant_format == "mixed-precision" and not nvfp4_compressed_tensors)
+                ):
                     for name in list(self.model_tensors.keys()):
                         if not name.endswith(".weight_packed"):
                             continue
@@ -611,6 +646,25 @@ class ModelBase:
                         tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
                         if (base_name + "_zero_point") in self.model_tensors:
                             tensors_to_remove.append(base_name + "_zero_point")
+                    if quant_format == "mixed-precision":
+                        # channel-strategy int groups store a 1-D weight_scale
+                        # beside a plain integer weight
+                        for name in list(self.model_tensors.keys()):
+                            if not name.endswith(".weight_scale"):
+                                continue
+                            weight_name = name.removesuffix("_scale")
+                            if weight_name not in self.model_tensors:
+                                tensors_to_remove.append(name)
+                                continue
+                            tensor_config = (
+                                weight_config if len(groups) == 1 else _ct_weights_for_tensor(weight_name, groups)
+                            )
+                            if tensor_config is None or tensor_config.get("strategy") != "channel":
+                                continue
+                            w = self.model_tensors[weight_name]
+                            s = self.model_tensors[name]
+                            new_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
+                            tensors_to_remove.append(name)
                 elif nvfp4_compressed_tensors:
                     # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
                     pass

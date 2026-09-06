@@ -170,3 +170,81 @@ class TestOfflineConvertEndToEnd:
         path = _convert(tiny_qwen_model_path, str(tmp_path / "gguf"), "gguf:q4_0")
         reader = gguf.GGUFReader(path)
         assert len(reader.tensors) > 0
+
+
+class TestMixedPrecisionIntGroups:
+    """mixed-precision configs whose groups are all integer must dequant."""
+
+    def test_int_mixed_groups_accepted(self):
+        from auto_round.export.export_to_gguf.conversion.base import _ct_int_mixed_groups
+
+        groups = {
+            "group_0": {
+                "targets": ["Linear"],
+                "format": "pack-quantized",
+                "weights": {"num_bits": 4, "group_size": 128, "type": "int", "strategy": "group"},
+            },
+            "group_1": {
+                "targets": ["lm_head"],
+                "format": "pack-quantized",
+                "weights": {"num_bits": 8, "group_size": 128, "type": "int", "strategy": "group"},
+            },
+        }
+        assert _ct_int_mixed_groups(groups, "mixed-precision") is True
+        assert _ct_int_mixed_groups(groups, "pack-quantized") is True
+
+    def test_float_group_rejected(self):
+        from auto_round.export.export_to_gguf.conversion.base import _ct_int_mixed_groups
+
+        groups = {
+            "group_0": {"targets": ["Linear"], "weights": {"num_bits": 8, "type": "float"}},
+            "group_1": {"targets": ["lm_head"], "weights": {"num_bits": 4, "type": "int"}},
+        }
+        assert _ct_int_mixed_groups(groups, "mixed-precision") is False
+        assert _ct_int_mixed_groups(groups, "float-quantized") is False
+
+    def test_dequant_model_handles_mixed_precision(self, tmp_path, tiny_qwen_model_path, monkeypatch):
+        """Rewrite a converted export's format to mixed-precision and convert again."""
+        _ct_required()
+        from auto_round.export.export_to_gguf.offline_convert import convert_checkpoint_to_gguf
+
+        export_dir = _quantize_to_ct(tiny_qwen_model_path, str(tmp_path / "ct_export"))
+        cfg_path = os.path.join(export_dir, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        cfg["quantization_config"]["format"] = "mixed-precision"
+        for g in cfg["quantization_config"]["config_groups"].values():
+            g.setdefault("format", "pack-quantized")
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+
+        path = convert_checkpoint_to_gguf(export_dir, output_dir=str(tmp_path / "gguf"), gguf_format="gguf:q4_0")
+        reader = gguf.GGUFReader(path)
+        names = [t.name for t in reader.tensors]
+        assert any(n.startswith("blk.") for n in names)
+
+    def test_int_quantized_toplevel_with_explicit_paths(self):
+        """The pinned-export shape seen on real runs: top-level int-quantized,
+        group_0 with explicit module-path targets (no per-group format), and a
+        pack-quantized pin group."""
+        from auto_round.export.export_to_gguf.conversion.base import _ct_int_mixed_groups, _ct_weights_for_tensor
+
+        w4 = {"num_bits": 4, "group_size": 128, "type": "int", "strategy": "group"}
+        w8 = {"num_bits": 8, "group_size": 128, "type": "int", "strategy": "group"}
+        groups = {
+            "group_0": {
+                "targets": ["model.language_model.layers.0.mlp.gate_proj", "model.layers.1.mlp.up_proj"],
+                "weights": w4,
+            },
+            "group_1": {
+                "targets": ["lm_head", "mtp.fc", "mtp.layers.0.mlp.gate_proj"],
+                "format": "pack-quantized",
+                "weights": w8,
+            },
+        }
+        assert _ct_int_mixed_groups(groups, "int-quantized") is True
+        assert _ct_weights_for_tensor("model.language_model.layers.0.mlp.gate_proj.weight", groups) is w4
+        assert _ct_weights_for_tensor("model.layers.1.mlp.up_proj.weight", groups) is w4
+        assert _ct_weights_for_tensor("lm_head.weight", groups) is w8
+        assert _ct_weights_for_tensor("mtp.fc.weight", groups) is w8
+        assert _ct_weights_for_tensor("mtp.layers.0.mlp.gate_proj.weight", groups) is w8
