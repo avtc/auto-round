@@ -1924,14 +1924,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         outside-block pass; the tree is forward-capable for tuning runs);
         otherwise scattered placeholder Linears keep the pinned tensors
         quantizable. Tuning runs tune real trees with the run's own config;
-        groups without a covering sibling stay verbatim there unless
-        AR_MTP_ZERO_SHOT forces the closed-form search. Returns ``(claimed
-        tensor names, tree group prefixes)``.
+        groups without a covering sibling cannot join the tuning forward, so
+        their pinned layers quantize through the closed-form search instead.
+        Returns ``(claimed tensor names, tree group prefixes)``.
         """
         claimed = set()
         tree_groups = []
         groups = self._checkpoint_only_groups_(streamer)
-        tune_iters = self._max_tune_iters()
         skipped_non_2d = 0
         for blk in groups:
             names = sorted(streamer.names_under(blk))
@@ -1970,15 +1969,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # tune step quantizes it with the run's own config
                 tree_groups.append(blk)
                 claimed |= self._attach_checkpoint_only_group_tree_(streamer, info, sibling[1], sibling[2])
-                continue
-            if tune_iters > 0 and not envs.AR_MTP_ZERO_SHOT:
-                logger.warning(
-                    "[stream] checkpoint-only group %s stays unquantized: tuning runs need a forward these "
-                    "blocks cannot join (no module counterpart and no covering sibling); pin them on a zero-shot "
-                    "run to quantize, or set AR_MTP_ZERO_SHOT=1 to quantize them with the closed-form search "
-                    "inside this run",
-                    blk,
-                )
                 continue
             if info is not None:
                 logger.warning(
@@ -2049,6 +2039,57 @@ class CompressionOrchestrator(BaseOrchestrator):
         except (RuntimeError, ValueError):
             pass
         return torch.device("cpu")
+
+    def _lm_head_tune_inputs_(self, calib_state, remain_layer_names):
+        """Per-sample ``(fp_rows, q_rows, token_ids)`` for tuning lm_head from
+        the calibration chain's tail, or ``None`` to keep the closed-form search.
+
+        The chain's final hidden states are lm_head's inputs: at iters>0 the
+        same SignRound loop that tunes blocks - and that the data-driven path
+        already uses for outside-block layers - tunes lm_head here. The chain
+        keeps rows as a list of per-sample tensors, or a dict of per-key row
+        lists for block classes registered in ``_BLOCK_OUTPUT_REGISTRY``
+        (e.g. gated-delta-net): take its ``hidden_states`` rows."""
+        if self._max_tune_iters() <= 0:
+            return None
+        lm_head_name = get_lm_head_name(self.model)
+        if lm_head_name is None or lm_head_name not in remain_layer_names:
+            return None
+        fp_inputs = (calib_state or {}).get("fp_inputs")
+        token_ids = (calib_state or {}).get("token_ids")
+        # len() not truthiness: a raw tensor chain tail must not hit ambiguous
+        # bool evaluation on the way to the format rejection below
+        if fp_inputs is None or token_ids is None or len(fp_inputs) == 0 or len(token_ids) == 0:
+            logger.warning(
+                "[stream] lm_head falls back to the closed-form search: the calibration chain kept no "
+                "final hidden states or token ids to tune from"
+            )
+            return None
+        fp_rows = fp_inputs.get("hidden_states") if isinstance(fp_inputs, dict) else fp_inputs
+        if isinstance(fp_rows, dict):
+            fp_rows = next(iter(fp_rows.values()))
+        if (
+            not isinstance(fp_rows, (list, tuple))
+            or len(fp_rows) == 0
+            or not all(isinstance(r, torch.Tensor) for r in fp_rows)
+        ):
+            logger.warning("[stream] lm_head falls back to the closed-form search: unexpected chain-tail row format")
+            return None
+        q_inputs = (calib_state or {}).get("q_inputs")
+        q_rows = None
+        if q_inputs is not None:
+            q_rows = q_inputs.get("hidden_states") if isinstance(q_inputs, dict) else q_inputs
+            if isinstance(q_rows, dict):
+                q_rows = next(iter(q_rows.values()))
+            if not isinstance(q_rows, (list, tuple)) or len(q_rows) != len(fp_rows):
+                logger.warning(
+                    "[stream] lm_head tuning uses FP chain inputs (enable_quanted_input cannot be honored): "
+                    "quantized chain rows are missing or mis-shaped"
+                )
+                q_rows = None
+        # fresh lists: the tune loop reassigns entries (dtype/device casts) and
+        # must not mutate the chain state it shares tensors with
+        return list(fp_rows), (list(q_rows) if q_rows is not None else None), token_ids
 
     def _quantize_zero_shot(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Zero-shot (RTN) quantization path — no calibration data needed.
@@ -2519,6 +2560,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 continue
             remain_layer_names.append(n)
         outside_qdev = self._outside_block_quant_device()
+        lm_head_name = get_lm_head_name(self.model)
+        # iters>0: tune lm_head with the chain's final hidden states, exactly
+        # like the data-driven path tunes outside-block layers (the
+        # per-sample tune loop lives in quantize_layer_outside_block);
+        # iters=0 keeps the closed-form search on the same device
+        lm_tune = self._lm_head_tune_inputs_(calib_state, remain_layer_names) if streamer is not None else None
         for name in remain_layer_names:
             module = get_module(self.model, name)
             logger.info(f"Quantizing remaining layer {name} on {outside_qdev}.")
@@ -2531,7 +2578,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     streamer.load_module_(module, name, device=str(outside_qdev))
                 elif outside_qdev.type != "cpu":
                     module.to(outside_qdev)
-            self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
+            tune_kwargs = {}
+            if lm_tune is not None and name == lm_head_name:
+                _fp_rows, _q_rows, _token_ids = lm_tune
+                tune_kwargs = {"fp_inputs": _fp_rows, "q_inputs": _q_rows, "input_ids": _token_ids}
+                logger.info("[stream] tuning lm_head with the run's tuning config on %s", outside_qdev)
+            self.alg_composer.compress_layer_outside_block(get_module(self.model, name), **tune_kwargs)
             if streamer is not None and self.compress_context.is_immediate_saving:
                 # pack + write now: the export pack loop is skipped under the
                 # streaming meta skeleton (mixed meta/real), so shards are the

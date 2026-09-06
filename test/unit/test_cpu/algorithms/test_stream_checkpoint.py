@@ -1477,6 +1477,26 @@ class TestStreamQuantizeEquivalence:
         console = captured.out + captured.err
         assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
 
+    def test_lm_head_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd):
+        """iters>0 tunes a pinned lm_head with the chain's final hidden states
+        (the same per-sample loop the data-driven path uses): the tune runs,
+        the layer packs into the shards, and no closed-form fallback fires."""
+        out = self._quantize(
+            tiny_checkpoint,
+            str(tmp_path / "out"),
+            stream=True,
+            dataset="NeelNanda/pile-10k",
+            layer_config={"lm_head": {"bits": 8}},
+            iters=2,
+        )
+        keys = self._export_keys(out)
+        assert "lm_head.qweight" in keys, "tuned lm_head not packed"
+        assert "lm_head.weight" not in keys, "plain weight kept beside packed form"
+        captured = capfd.readouterr()
+        console = captured.out + captured.err
+        assert "[stream] tuning lm_head with the run's tuning config" in console, "lm_head tune never started"
+        assert "[stream] lm_head falls back to the closed-form search" not in console, "unexpected fallback"
+
     def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
         """A separate auxiliary safetensors file the index never references
         (a family shipping MTP weights as their own file) must reach the
