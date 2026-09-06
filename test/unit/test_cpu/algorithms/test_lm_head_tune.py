@@ -742,3 +742,27 @@ class TestSignSGDMemory:
         v2 = 0.9 * v1 + g2
         p2 = p1 - 0.05 * torch.sign(v2)
         assert torch.allclose(param.detach(), p2, atol=1e-6), "momentum buffer must stay unsigned"
+
+
+class TestRowBlockThreshold:
+    """Blocking must engage only for genuinely huge weights."""
+
+    def test_default_threshold_spares_ffn_sized_layers(self):
+        """A 67M-element FFN projection (the old threshold) stays whole-layer:
+        blocking it would split the compiled graph and add per-block overhead
+        for no memory benefit (~2GiB of intermediates fits easily)."""
+        from auto_round.wrapper import WrapperLinear
+
+        layer = _mk_quant_linear(2048, 32768, group_size=128)  # 2**26 elements
+        assert layer.weight.numel() == 2**26
+        w = WrapperLinear(layer, enable_minmax_tuning=False, enable_torch_compile=False, device="cpu")
+        assert w.row_block_active() is False
+
+    def test_threshold_still_catches_vocabulary_heads(self, monkeypatch):
+        import auto_round.wrapper as wmod
+        from auto_round.wrapper import WrapperLinear
+
+        layer = _mk_quant_linear(64, 512, group_size=128)
+        w = WrapperLinear(layer, enable_minmax_tuning=False, enable_torch_compile=False, device="cpu")
+        monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", 64, raising=False)
+        assert w.row_block_active() is True
