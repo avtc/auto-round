@@ -110,6 +110,40 @@ class TestLmHeadNameResolution:
         assert orch._resolve_lm_head_name_(["model.lm_head_proj"]) == "model.lm_head_proj"
 
 
+class _FlatMoe(nn.Module):
+    """Flat MoE layout: blocks and the final norm at the model root, with a
+    top-level lm_head (the checkpoint-only predictor is a plain extra block
+    in the list, not an attached placeholder)."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(8, 4)
+        self.model.layers = nn.ModuleList([_Block(), _Block()])
+        self.model.norm = nn.LayerNorm(4)
+        self.lm_head = nn.Linear(4, 8)
+
+
+class _VisionWrapper(nn.Module):
+    """Vision-wrapper layout: text backbone nested one level deeper, with
+    same-width 1D norms in the projector and the vision tower sitting between
+    the backbone norm and lm_head - the width cross-check alone would NOT
+    reject these decoys."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.embed_tokens = nn.Embedding(8, 4)
+        self.model.language_model.layers = nn.ModuleList([_Block()])
+        self.model.language_model.norm = nn.LayerNorm(4)
+        self.model.multi_modal_projector = nn.Module()
+        self.model.multi_modal_projector.norm = nn.LayerNorm(4)
+        self.model.vision_tower = nn.Module()
+        self.model.vision_tower.ln_pre = nn.LayerNorm(4)
+        self.lm_head = nn.Linear(4, 8)
+
+
 class _FlatLlama(nn.Module):
     def __init__(self):
         super().__init__()
@@ -137,6 +171,27 @@ class TestFinalNormDiscovery:
         name, mod = orch._final_norm_module_("lm_head")
         assert name == "model.norm"
         assert mod is orch.model.model.norm
+
+    def test_flat_moe_layout(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "get_block_names", lambda model: [["model.layers.0"], ["model.layers.1"]])
+        orch = _orch(200, ["lm_head"], model=_FlatMoe())
+        name, mod = orch._final_norm_module_("lm_head")
+        assert name == "model.norm"
+        assert mod is orch.model.model.norm
+
+    def test_vision_wrapper_same_width_decoys_rejected(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "get_block_names", lambda model: [["model.language_model.layers.0"]])
+        orch = _orch(200, ["lm_head"], model=_VisionWrapper())
+        name, mod = orch._final_norm_module_("lm_head")
+        assert name == "model.language_model.norm"
+        assert mod is orch.model.model.language_model.norm
+        # the decoys share the hidden width; only the backbone filter rejects them
+        assert orch.model.model.vision_tower.ln_pre.weight.numel() == 4
+        assert orch.model.model.multi_modal_projector.norm.weight.numel() == 4
 
 
 class TestLmHeadTuneInputs:
