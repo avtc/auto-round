@@ -174,12 +174,13 @@ def _apply_name_rewrites(name, renames):
     reverse map builder and the per-tensor loader loop.
     """
     for pattern, replacement in renames:
-        m = pattern.match(name)
+        # search, not match: registry patterns are not guaranteed start-anchored
+        # (the hy_v3 MoE families rename mid-name spans; re.sub semantics)
+        m = pattern.search(name)
         if m is None:
             continue
         # m.expand honors backreferences but only covers the matched span;
-        # splice the untouched remainder back in (patterns are start-anchored,
-        # so this is the suffix)
+        # splice the untouched remainder back in
         candidate = name[: m.start()] + m.expand(replacement) + name[m.end() :]
         if candidate != name:
             return candidate

@@ -32,9 +32,20 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+from auto_round.utils.checkpoint_streamer import CheckpointStreamer, _apply_name_rewrites
 
 _HY_V3 = "hy_v3"  # model_type whose registry entries exercise all three renames
+
+
+def test_apply_name_rewrites_finds_non_anchored_spans():
+    # registry patterns are not guaranteed start-anchored (the hy_v3 MoE
+    # families rename mid-name spans): the rewrite must find them like
+    # re.sub did, splicing around the matched span only
+    import re
+
+    renames = ((re.compile(r"router\.gate"), "router_gate"),)
+    got = _apply_name_rewrites("model.layers.1.mlp.router.gate.weight", renames)
+    assert got == "model.layers.1.mlp.router_gate.weight"
 
 
 def _make_checkpoint(tmp_path, tensors, model_type):
