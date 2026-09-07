@@ -818,6 +818,58 @@ class CompressionOrchestrator(BaseOrchestrator):
             return False
         return bool(getattr(self.model_context, "stream_quantization", False))
 
+    def _ensure_gguf_blob_conversion_(self, streamer) -> None:
+        """Create the GGUF conversion instance up front for streaming blob runs.
+
+        Two reasons this cannot stay lazy (first block's pack): (a) MTP
+        detection must see checkpoint-only predictor trees, which only
+        materialize at group tail - hours after the first block - or nextn
+        blocks are silently excluded; (b) resume adoption happens before the
+        loop, and the blob store must exist by then.
+        """
+        if not self._gguf_blob_mode():
+            return
+        from auto_round.compressors.utils import _get_save_folder_name
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+        from auto_round.export.export_to_gguf.config import ModelType
+        from auto_round.export.export_to_gguf.export import create_model_class
+
+        save_folder = _get_save_folder_name(self.formats[0])
+        store = GgufBlobStore.get_or_create(save_folder)
+        mtp_names = None
+        if streamer is not None:
+            mtp_names = [n for n in streamer.weight_map if n.startswith(("mtp.", "model.mtp."))]
+        create_model_class(
+            save_folder,
+            self.model,
+            self.layer_config,
+            self.formats[0].get_backend_name(),
+            low_cpu_mem_usage=True,
+            model_type=ModelType.TEXT,
+            device=str(self.device),
+            quant_nontext_module=getattr(self.model_context, "quant_nontext_module", False),
+            is_auto_scheme=getattr(self.formats[0], "is_auto_scheme", False),
+            blob_store=store,
+            mtp_checkpoint_names=mtp_names,
+        )
+
+    def _adopt_blob_store_(self) -> None:
+        """Adopt a crashed run's blob shards when resuming a streaming GGUF export.
+
+        Mirrors ``ShardWriter.adopt_existing_shards``: without this, a fresh
+        store restarts the shard counter at 1 and overwrites the crashed run's
+        blobs while the resume manifest skips their already-done blocks.
+        """
+        if not self._gguf_blob_mode():
+            return
+        from auto_round.compressors.utils import _get_save_folder_name
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+
+        store = GgufBlobStore.get_or_create(_get_save_folder_name(self.formats[0]))
+        adopted = store.adopt_existing()
+        if adopted:
+            logger.info("[stream] gguf blob resume: adopted %d tensor(s) from prior shards", adopted)
+
     def _write_finished_block_(
         self, block, block_name: str, tied_weights_layers: set, rs, q_snap, fp_snap, is_model_last: bool
     ) -> None:
@@ -1858,9 +1910,17 @@ class CompressionOrchestrator(BaseOrchestrator):
             finally:
                 io.pop("_predictor_e", None)
             _immediate_pack_block(shell, group, self.layer_config, nblocks=self.nblocks, device=str(self.device))
-            self.shard_writer.write(name=group)
-            self._write_unpacked_group_tensors_(streamer, [group])
-            shell.to("meta")
+            if self._gguf_blob_mode():
+                # blob mode: no ggml pack happens here (the group is not a
+                # block-last layer), and CT shards must not leak into the
+                # GGUF output dir. Keep the tuned tree live: the save-time
+                # prepare_tensors pass packs it from the in-memory qdq
+                # weights straight into blob shards.
+                pass
+            else:
+                self.shard_writer.write(name=group)
+                self._write_unpacked_group_tensors_(streamer, [group])
+                shell.to("meta")
             tuned.add(group)
             clear_memory()
         return tuned
@@ -2276,6 +2336,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "stream_quantization=True requires immediate saving "
                 "(enable low_cpu_mem_usage=True and keep inplace packing; int data types only)."
             )
+        if streamer is not None and isinstance(self.formats, list) and len(self.formats) > 1:
+            if any(fmt.is_gguf() for fmt in self.formats):
+                # the GGUF blob path is single-artifact by design; a mixed
+                # format list would emit stray compressed-tensors shards into
+                # the GGUF output dir (and the blob branches key on formats[0])
+                raise ValueError(
+                    "stream_quantization with a gguf format must be single-format "
+                    f"(got {len(self.formats)} formats); run the GGUF export separately."
+                )
 
         all_blocks = self.quant_block_list or get_block_names(self.model)
         flat_block_names = [name for group in all_blocks for name in group]
@@ -2343,10 +2412,16 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self._stream_resume_jump_chain(calib_state, resume_states)
                 if self.shard_writer is not None:
                     self.shard_writer.adopt_existing_shards()  # never overwrite the crashed run's shards
+                self._adopt_blob_store_()
                 # the replay leaves granular-read debris that would raise every
                 # later block's peak (VmHWM keeps the high-water mark)
                 self._trim_host_heap()
                 self._release_cuda_cache("resume rebuild")
+
+        # GGUF blob runs create their conversion instance up front: MTP
+        # detection needs the checkpoint-side mtp.* names before any
+        # checkpoint-only predictor tree materializes at group tail
+        self._ensure_gguf_blob_conversion_(streamer)
 
         if streamer is not None:
             # startup reads (embeddings / chain init) touch shards the block
@@ -3066,8 +3141,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             resume_states = self._build_resume_states(all_blocks)
             # a resumed run must never overwrite shards the crashed run wrote:
             # adopt them so the writer continues at the next shard index
-            if any(rs is not None and rs.resume_index > 0 for rs in resume_states) and self.shard_writer is not None:
-                self.shard_writer.adopt_existing_shards()
+            if any(rs is not None and rs.resume_index > 0 for rs in resume_states):
+                if self.shard_writer is not None:
+                    self.shard_writer.adopt_existing_shards()
+                self._adopt_blob_store_()
 
         _mem_inv = logger.isEnabledFor(logging.DEBUG)
         _peak_watch = PeakWatcher() if logger.isEnabledFor(logging.DEBUG) else None
