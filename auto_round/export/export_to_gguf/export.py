@@ -92,18 +92,34 @@ def _set_mmproj_output_path(model_instance):
     return model_instance
 
 
-def _create_conversion_model(model_class, hparams, **kwargs):
+def _count_mtp_layers(model) -> int:
+    """MTP layer count from the live module tree (``mtp.layers.N``)."""
+    n_mtp = 0
+    for name, _ in model.named_modules():
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+        if not name.startswith("mtp.layers."):
+            continue
+        tail = name[len("mtp.layers.") :].split(".", 1)[0]
+        if tail.isdecimal():
+            n_mtp = max(n_mtp, int(tail) + 1)
+    return n_mtp
+
+
+def _create_conversion_model(model_class, hparams, include_mtp=False, **kwargs):
     if not getattr(model_class, "supports_mtp_export", False):
         return model_class(hparams=hparams, **kwargs)
 
     # AutoRound exports the target model only; unlike llama.cpp's CLI, it does not
-    # provide a separate MTP export mode. Conversion filters read this flag from
-    # the concrete class, so restore it immediately after constructing the instance.
+    # provide a separate MTP export mode. Streaming blob exports keep the
+    # embedded nextn blocks (spec-decode) by passing include_mtp=True.
+    # Conversion filters read this flag from the concrete class, so restore it
+    # immediately after constructing the instance.
     original_no_mtp = model_class.no_mtp
     try:
-        model_class.no_mtp = True
+        model_class.no_mtp = not include_mtp
         model_instance = model_class(hparams=hparams, **kwargs)
-        model_instance.no_mtp = True
+        model_instance.no_mtp = not include_mtp
         return model_instance
     finally:
         model_class.no_mtp = original_no_mtp
@@ -148,9 +164,24 @@ def create_model_class(
         output_type = FTYPE_MAP.get(output_type.lower())
 
         hparams.pop("quantization_config", None)
+        # Streaming blob exports keep the embedded MTP/nextn blocks when the
+        # live tree carries them: the conversion class needs the layer count
+        # up front (its __init__ extends block_count before the tensor map is
+        # built), and configs without mtp_num_hidden_layers (e.g. Qwen3-Next)
+        # get it from the module tree instead of a checkpoint scan.
+        include_mtp = False
+        if blob_store is not None and getattr(model_class, "supports_mtp_export", False):
+            n_mtp = _count_mtp_layers(model)
+            has_mtp = n_mtp > 0 or any(
+                n == "mtp" or n == "model.mtp" or n.startswith(("mtp.", "model.mtp.")) for n, _ in model.named_modules()
+            )
+            if has_mtp:
+                hparams.setdefault("mtp_num_hidden_layers", max(n_mtp, 1))
+                include_mtp = True
         model_instance = _create_conversion_model(
             model_class,
             hparams,
+            include_mtp=include_mtp,
             dir_model=Path(tmp_work_dir),
             ftype=output_type,
             fname_out=Path(output_dir),

@@ -388,3 +388,63 @@ class TestStreamGgufBlobE2E:
         assert dtypes["blk.0.attn_q.weight"] == gguf.GGMLQuantizationType.Q4_0
         assert dtypes["blk.0.ffn_norm.weight"] == gguf.GGMLQuantizationType.F32
         assert manifest["roles"]["text"]["kv_ops"], "metadata must be captured for replay"
+
+
+class TestMtpNextnRemap:
+    """Embedded nextn enablement: name remap + tree counting (streaming blob path)."""
+
+    @pytest.fixture()
+    def qwen_mtp_cls(self):
+        from auto_round.export.export_to_gguf.conversion.qwen import Qwen3NextModel
+
+        return Qwen3NextModel
+
+    def test_remap_table(self, qwen_mtp_cls):
+        remap = qwen_mtp_cls._remap_mtp_name_
+        assert remap("mtp.fc.weight", 64) == "model.layers.64.eh_proj.weight"
+        assert remap("mtp.pre_fc_norm_embedding.weight", 64) == "model.layers.64.enorm.weight"
+        assert remap("mtp.pre_fc_norm_hidden.weight", 64) == "model.layers.64.hnorm.weight"
+        assert remap("mtp.norm.weight", 64) == "model.layers.64.shared_head.norm.weight"
+        assert remap("mtp.layers.0.self_attn.q_proj.weight", 64) == "model.layers.64.self_attn.q_proj.weight"
+        assert remap("model.mtp.fc.weight", 64) == "model.layers.64.eh_proj.weight"
+        # non-MTP names pass through untouched
+        assert remap("model.layers.3.fc1.weight", 64) == "model.layers.3.fc1.weight"
+
+    def test_count_mtp_layers(self):
+        from auto_round.export.export_to_gguf.export import _count_mtp_layers
+
+        def _model(names):
+            return SimpleNamespace(named_modules=lambda: [(n, None) for n in names])
+
+        assert _count_mtp_layers(_model(["model.layers.0.a", "mtp.fc", "mtp.layers.0.x", "mtp.layers.0.y"])) == 1
+        assert _count_mtp_layers(_model(["model.mtp.layers.0.a", "model.mtp.layers.1.b"])) == 2
+        assert _count_mtp_layers(_model(["mtp.fc", "mtp.norm"])) == 0
+        assert _count_mtp_layers(_model(["model.layers.0.a"])) == 0
+
+    def test_create_conversion_model_include_mtp(self, monkeypatch):
+        from auto_round.export.export_to_gguf.export import _create_conversion_model
+
+        constructed = {}
+
+        class _FakeMtp:
+            supports_mtp_export = True
+            no_mtp = True
+
+            def __init__(self, hparams, **kwargs):
+                constructed["hparams"] = hparams
+                constructed["kwargs"] = kwargs
+                self.no_mtp = _FakeMtp.no_mtp
+
+        class _FakePlain:
+            supports_mtp_export = False
+
+            def __init__(self, hparams, **kwargs):
+                constructed["plain"] = True
+
+        inst = _create_conversion_model(_FakeMtp, {"a": 1}, include_mtp=True, extra=2)
+        assert inst.no_mtp is False and _FakeMtp.no_mtp is True, "class flag must be restored"
+        inst = _create_conversion_model(_FakeMtp, {"a": 1})
+        assert inst.no_mtp is True
+        constructed.pop("plain", None)
+        _create_conversion_model(_FakePlain, {"a": 1}, include_mtp=True)
+        assert constructed["plain"], "non-MTP classes construct directly regardless of the flag"

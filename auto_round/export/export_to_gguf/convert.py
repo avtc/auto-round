@@ -184,17 +184,45 @@ def get_restored_tensors(cls) -> Iterator[RestoredTensor]:
     written_checkpoint_names = getattr(cls, "_gguf_written_checkpoint_names", set())
     cls.model.tensor_name_list = list(written_hf_names | written_checkpoint_names)
 
+    # Live-model MTP names: the in-memory tree keeps the mtp.* module names
+    # (streaming exports read the state dict directly), while the tensor map
+    # only knows the layer-indexed nextn spellings. Remap the CHECKPOINT name
+    # for mapping/qtype purposes; hf_names keep the real module spellings so
+    # tuned-attribute lookups (get_module) keep working.
+    mtp_remap = getattr(cls, "_remap_mtp_name_", None) if not getattr(cls, "no_mtp", True) else None
+
+    def _remap_name(name: str) -> str:
+        if mtp_remap is None or not name.startswith(("mtp.", "model.mtp.")):
+            return name
+        base = getattr(cls, "_original_block_count", None)
+        if base is None:
+            hparams = {**cls.hparams, **cls.hparams.get("text_config", {})}
+            base = next(
+                (hparams[k] for k in ("n_layers", "num_hidden_layers", "n_layer", "num_layers") if k in hparams),
+                None,
+            )
+            if base is None:
+                logger.warning("%s: cannot remap MTP tensors without a block count; keeping %s", cls, name)
+                return name
+            type(cls)._original_block_count = base
+        return mtp_remap(name, base)
+
     pending_checkpoint_tensors = {}
     for restored in HFCheckpointRestorer(cls.model, completed_hf_names=written_hf_names).iter_tensors():
         tensor = restored.tensor_fn()
+        checkpoint_name = _remap_name(restored.checkpoint_name)
+        # hf_names deliberately keep the real module spellings (mtp.*):
+        # layer_config pins and get_module attribute lookups key on them
         if tensor is None or tensor.numel() == 0:
-            pending_checkpoint_tensors[restored.checkpoint_name] = restored
+            pending_checkpoint_tensors[checkpoint_name] = RestoredTensor(
+                checkpoint_name, restored.tensor_fn, restored.hf_names, restored.transform_kind, restored.moe_sources
+            )
             continue
-        for tensor_name in (restored.checkpoint_name, *restored.hf_names):
+        for tensor_name in (checkpoint_name, *restored.hf_names):
             if tensor_name not in cls.model.tensor_name_list:
                 cls.model.tensor_name_list.append(tensor_name)
         yield RestoredTensor(
-            restored.checkpoint_name,
+            checkpoint_name,
             lambda tensor=tensor: tensor,
             restored.hf_names,
             restored.transform_kind,
