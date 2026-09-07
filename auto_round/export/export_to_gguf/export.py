@@ -415,6 +415,10 @@ def save_quantized_as_gguf(
                 logger.info("Assembled %s GGUF model to %s", model_kind, out_path)
             rt = time.time() - st
             logger.info(f"Model successfully exported to {gguf_model.fname_out}, running time={rt}")
+        if blob_store is not None:
+            # every role is assembled - the shards were the resumable
+            # intermediate and now only duplicate the final bytes on disk
+            blob_store.discard_shards()
     finally:
         _clear_gguf_model_instances()
 

@@ -417,6 +417,26 @@ class GgufBlobStore:
             raise ValueError(f"blob manifest carries no tensors for roles {roles}")
         return outputs
 
+    def discard_shards(self) -> int:
+        """Delete the blob shard files once every role is assembled.
+
+        The shards are the resumable intermediate: once the final .gguf
+        containers exist they only duplicate ~the assembled bytes on disk.
+        The manifest stays behind (small) as the record of what was
+        assembled and where. Only called after ALL roles assembled
+        successfully - a crashed run keeps its shards for resume adoption.
+        """
+        removed = 0
+        for shard in self.blob_dir.glob("blob-*.safetensors"):
+            try:
+                shard.unlink()
+                removed += 1
+            except OSError as e:
+                logger.warning("[gguf-blob] could not remove %s: %s", shard, e)
+        if removed:
+            logger.info("[gguf-blob] all roles assembled; removed %d blob shard file(s) (manifest kept)", removed)
+        return removed
+
 
 def _coerce_gguf_endian(value) -> Any:
     """Accept the enum, its value, its name, or 'little'/'big' and return ``GGUFEndian``."""

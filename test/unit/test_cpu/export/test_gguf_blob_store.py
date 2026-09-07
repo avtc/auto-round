@@ -937,3 +937,65 @@ class TestFloatPinKeepsTensorUnquantized:
                 source_dtype=dtype,
             )
             assert got == want, (dtype, got)
+
+
+class TestDiscardShardsAfterAssembly:
+    """Blob shards are the resumable intermediate: once every role is
+    assembled they are removed automatically (manifest kept as the record)."""
+
+    def test_discard_shards_removes_shards_keeps_manifest(self, store, tmp_path):
+        import json as _json
+
+        conv = _FakeConversion(fname_out=str(tmp_path / "m.gguf"))
+        rec = store.attach_recorder(conv, "text")
+        _add_q4_tensor(rec, "blk.0.attn_q.weight", 4)
+        store.flush("text")
+
+        assert store.discard_shards() == 1
+        assert not list(store.blob_dir.glob("blob-*.safetensors")), "shards must be gone"
+        assert (store.blob_dir / "manifest.json").is_file(), "manifest must stay"
+        manifest = _json.loads((store.blob_dir / "manifest.json").read_text())
+        assert manifest["roles"]["text"]["tensors"], "manifest still records what was assembled"
+
+    def test_save_calls_discard_after_all_roles(self, monkeypatch, tmp_path):
+        """The save path discards only AFTER every instance was written."""
+        import auto_round.export.export_to_gguf.export as gguf_export
+        from auto_round.export.export_to_gguf.config import ModelType
+
+        calls = []
+
+        class _FakeInst:
+            model_arch = object()
+            fname_out = str(tmp_path / "out")
+
+            def write(self):
+                calls.append("write")
+
+        class _FakeStore:
+            def __init__(self):
+                self.discarded = False
+
+            def finalize_role(self, inst, role):
+                calls.append(f"finalize:{role}")
+
+            def assemble(self, roles, progress=False):
+                calls.append(f"assemble:{roles[0]}")
+                return [Path(self_out) if False else tmp_path / f"{roles[0]}.gguf"]
+
+            def discard_shards(self):
+                assert calls[-1].startswith("assemble"), calls
+                self.discarded = True
+                calls.append("discard")
+
+        fake_store = _FakeStore()
+        gguf_export.__dict__.pop("gguf_model_instance_global", None)
+        monkeypatch.setattr(
+            gguf_export,
+            "create_model_class",
+            lambda *a, **kw: _FakeInst(),
+        )
+        gguf_export.save_quantized_as_gguf(
+            str(tmp_path / "out"), model=object(), layer_config={}, mllm=False, blob_store=fake_store
+        )
+        assert calls == ["write", "finalize:text", "assemble:text", "discard"], calls
+        assert fake_store.discarded
