@@ -899,6 +899,27 @@ class CompressionOrchestrator(BaseOrchestrator):
         if adopted:
             logger.info("[stream] gguf blob resume: adopted %d tensor(s) from prior shards", adopted)
 
+    @staticmethod
+    def _snapshot_chain_rows_(state):
+        """Detached deep copy of chain rows for a resume snapshot.
+
+        The bg-finish worker serializes the snapshot seconds later, while the
+        main loop has already reset the shared chain containers for the next
+        block (27B evidence: the saved entry read back as rows[128] with a
+        None first row). Copying here - on the main thread, at capture time -
+        makes the snapshot immune to that mutation. None slots are preserved:
+        the resume-entry validation rejects them loudly instead of letting a
+        partially-filled chain masquerade as a usable frontier."""
+
+        def _cp(v):
+            return v.detach().to("cpu", copy=True) if isinstance(v, torch.Tensor) else v
+
+        if isinstance(state, dict):
+            return {k: CompressionOrchestrator._snapshot_chain_rows_(v) for k, v in state.items()}
+        if isinstance(state, (list, tuple)):
+            return type(state)(CompressionOrchestrator._snapshot_chain_rows_(v) for v in state)
+        return _cp(state)
+
     def _write_finished_block_(
         self, block, block_name: str, tied_weights_layers: set, rs, q_snap, fp_snap, is_model_last: bool
     ) -> None:
@@ -2772,8 +2793,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # block's tune on the other group. Snapshots of the next
                     # block's inputs are captured NOW -- the main loop mutates
                     # calib_state as soon as it advances.
-                    _q_snap = calib_state.get("q_inputs") if calib_state is not None else None
-                    _fp_snap = calib_state["fp_inputs"] if calib_state is not None else None
+                    _q_snap = self._snapshot_chain_rows_(
+                        calib_state.get("q_inputs") if calib_state is not None else None
+                    )
+                    _fp_snap = self._snapshot_chain_rows_(calib_state["fp_inputs"] if calib_state is not None else None)
                     _is_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
                     _bg_pack = self._start_bg_pack_block(
                         block,
@@ -2814,8 +2837,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                         block_name,
                         tied_weights_layers,
                         rs,
-                        calib_state.get("q_inputs") if calib_state is not None else None,
-                        (None if _is_last else calib_state["fp_inputs"]) if calib_state is not None else None,
+                        self._snapshot_chain_rows_(calib_state.get("q_inputs") if calib_state is not None else None),
+                        self._snapshot_chain_rows_(
+                            (None if _is_last else calib_state["fp_inputs"]) if calib_state is not None else None
+                        ),
                         _is_last,
                     )
                     _t_write = 0.0
@@ -2839,8 +2864,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                         block_name,
                         tied_weights_layers,
                         rs,
-                        calib_state.get("q_inputs") if calib_state is not None else None,
-                        (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None,
+                        self._snapshot_chain_rows_(calib_state.get("q_inputs") if calib_state is not None else None),
+                        self._snapshot_chain_rows_(
+                            (None if is_model_last else calib_state["fp_inputs"]) if calib_state is not None else None
+                        ),
                         is_model_last,
                     )
                     _t_write = _time.perf_counter() - _t_write

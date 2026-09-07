@@ -59,6 +59,41 @@ class _RS:
         self.calls.append(("mark", name, q, fp))
 
 
+class TestSnapshotChainRows:
+    """_snapshot_chain_rows_: resume snapshots must be immune to chain mutation.
+
+    The bg-finish worker serializes the snapshot seconds after capture; the
+    main loop resets the shared chain containers meanwhile (27B evidence:
+    saved entry read back as rows[128] with a None first row)."""
+
+    def test_deep_copies_tensors_and_containers(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        rows = [torch.ones(2, 3), {"hidden_states": [torch.zeros(1, 1)]}]
+        snap = CompressionOrchestrator._snapshot_chain_rows_(rows)
+        rows[0][0, 0] = 99
+        rows[1]["hidden_states"][0][0, 0] = 99
+        assert snap[0][0, 0] == 1
+        assert snap[1]["hidden_states"][0][0, 0] == 0
+        # copies are detached and on the host
+        assert not snap[0].requires_grad and snap[0].device.type == "cpu"
+
+    def test_none_slots_and_scalars_pass_through(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        snap = CompressionOrchestrator._snapshot_chain_rows_([None, 3, torch.tensor([1.0])])
+        assert snap[0] is None and snap[1] == 3 and torch.equal(snap[2], torch.tensor([1.0]))
+
+    def test_none_state_and_dict_roundtrip(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        assert CompressionOrchestrator._snapshot_chain_rows_(None) is None
+        d = {"a": [torch.tensor(2.0)], "b": (torch.tensor(3.0),)}
+        snap = CompressionOrchestrator._snapshot_chain_rows_(d)
+        assert isinstance(snap, dict) and isinstance(snap["b"], tuple)
+        assert snap["a"][0].item() == 2.0 and snap["b"][0].item() == 3.0
+
+
 class TestBgPackEnv:
     def test_tri_state_parse(self, monkeypatch):
         import pytest
