@@ -332,6 +332,11 @@ def save_quantized_as_gguf(
         for gguf_model in gguf_model_instance_global:
             model_kind = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"
             logger.info("Start writing %s GGUF model to %s", model_kind, gguf_model.fname_out)
+            if blob_store is not None:
+                # blob mode skips every step that would have created the save
+                # folder (shard writes); without it prepare_metadata's
+                # is_dir() fallback assembles the file one level too high
+                os.makedirs(gguf_model.fname_out, exist_ok=True)
             gguf_model.write()
             if blob_store is not None:
                 # blob mode: write() only recorded metadata and spilled tensor

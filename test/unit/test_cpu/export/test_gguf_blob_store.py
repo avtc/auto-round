@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -295,19 +296,65 @@ class TestBlobModeBranches:
         assert written, "CT path keeps writing"
 
 
+@pytest.mark.slow
 class TestStreamGgufBlobE2E:
-    """End-to-end: stream-quantize a tiny model straight to blob shards + assembled GGUF."""
+    """End-to-end: stream-quantize a tiny model straight to blob shards + assembled GGUF.
 
-    def test_stream_quantize_assembles_gguf(self, tiny_qwen_model_path, tmp_path):
+    Uses the synthetic tiny Llama checkpoint (same one as the streaming
+    equivalence suite) plus a gpt2-style fast tokenizer so the GGUF vocab
+    embedding path is exercised without a network-fetched fixture.
+    """
+
+    @pytest.fixture(scope="class")
+    def tiny_checkpoint(self, tmp_path_factory):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        cfg = LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+        )
+        torch.manual_seed(11)
+        model = LlamaForCausalLM(cfg)
+        d = tmp_path_factory.mktemp("tiny_gguf_ckpt")
+        from tokenizers import Tokenizer
+        from tokenizers import decoders, models as tk_models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        # BPE + ByteLevel keeps the GGUF vocab embedding on the recognized
+        # gpt2 path (a plain WordLevel/Whitespace tokenizer is rejected by
+        # get_vocab_base_pre)
+        tk = Tokenizer(tk_models.BPE(vocab={"[UNK]": 0, "a": 1, "b": 2}, merges=[]))
+        tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tk.decoder = decoders.ByteLevel()
+        PreTrainedTokenizerFast(tokenizer_object=tk).save_pretrained(str(d))
+        model.save_pretrained(str(d), max_shard_size="40KB")
+        return str(d)
+
+    def test_stream_quantize_assembles_gguf(self, tiny_checkpoint, tmp_path, monkeypatch):
         gguf = pytest.importorskip("gguf")
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.autoround import AutoRound
         from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+        from auto_round.export.export_to_gguf import llama_cpp_conversion as lcc
 
+        # the synthetic tokenizer cannot reproduce any real model's
+        # pre-tokenizer checksum; the blob machinery under test is agnostic
+        # to which pre-tokenizer the vocab claims. The conversion classes load
+        # under the top-level "conversion" package (cached module), so patch
+        # them there - the auto_round copy of the same files is not the one
+        # the live export instantiates.
+        lcc.get_conversion(tiny_checkpoint)
+        conversion_llama = importlib.import_module("conversion.llama")
+        monkeypatch.setattr(conversion_llama.LlamaModel, "get_vocab_base_pre", lambda self, tokenizer: "gpt2")
         GgufBlobStore.reset_singletons()
         out_dir = str(tmp_path / "out")
         ar = AutoRound(
-            tiny_qwen_model_path,
+            tiny_checkpoint,
             scheme="gguf:q4_0",
             alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
             stream_quantization=True,
@@ -326,9 +373,14 @@ class TestStreamGgufBlobE2E:
         entries = manifest["roles"]["text"]["tensors"]
         assert entries, "no blob tensors recorded"
 
-        gguf_files = [p for p in Path(ar.output_dir).glob("*.gguf")]
-        assert gguf_files, "assembled .gguf missing"
-        reader = gguf.GGUFReader(str(gguf_files[0]))
+        # NOTE: on Windows, absolute model paths defeat the "/"-split leaf
+        # derivation in _get_export_dir (a pre-existing quirk; relative paths
+        # and POSIX paths derive correctly), so the assembled file's exact
+        # folder can differ - the manifest's recorded out_path is the source
+        # of truth for where assembly put it.
+        out_path = Path(manifest["roles"]["text"]["out_path"])
+        assert out_path.is_file(), f"assembled .gguf missing at {out_path}"
+        reader = gguf.GGUFReader(str(out_path))
         names = {t.name for t in reader.tensors}
         manifest_names = {e["name"] for e in entries}
         assert names == manifest_names, "assembled tensors must match the manifest exactly"
