@@ -860,6 +860,10 @@ class TestMoeImatrixContract:
 
         assert moe_imatrix_required(gguf_pkg.GGMLQuantizationType.IQ4_XS)
         assert moe_imatrix_required(gguf_pkg.GGMLQuantizationType.IQ2_XXS)
+        # K-quants feed the imatrix into their double-quant search
+        assert moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q2_K)
+        assert moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q4_K)
+        assert moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q6_K)
         assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q4_0)
-        assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q4_K)
         assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q8_0)
+        assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q8_K)

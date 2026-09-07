@@ -150,26 +150,40 @@ def reverse_name_map(model_type, names) -> dict:
     if not renames:
         return rev
     for ckpt_name in names:
-        for pattern, replacement in renames:
-            m = pattern.match(ckpt_name)
-            if m is None:
-                continue
-            # m.expand honors backreferences but only covers the matched
-            # span; splice the untouched remainder back in (patterns are
-            # start-anchored, so this is the suffix)
-            candidate = ckpt_name[: m.start()] + m.expand(replacement) + ckpt_name[m.end() :]
-            if candidate != ckpt_name:
-                rev.setdefault(candidate, ckpt_name)
-                break
+        candidate = _apply_name_rewrites(ckpt_name, renames)
+        if candidate != ckpt_name:
+            rev.setdefault(candidate, ckpt_name)
     return rev
 
 
 # Families whose shipped checkpoints spell the text backbone flat
-# (``model.*``) while transformers 5.x nests it under
-# ``model.language_model.*``. The conversion registry has no entries for
-# them, so the streamer carries the rewrite itself. Vision towers keep their
-# top-level prefix in both spellings and need no rule.
-_VL_FLAT_TEXT_REWRITES = ((re.compile(r"^model\.(embed_tokens|layers|norm)\."), r"model.language_model.\1."),)
+# (``model.*``) and the vision tower top-level (``visual.*``) while
+# transformers 5.x nests both under ``model.language_model.*`` / ``model.visual.*``.
+# The conversion registry carries no entries for these model_types, so the
+# streamer carries the rewrites itself.
+_VL_FLAT_TEXT_REWRITES = (
+    (re.compile(r"^model\.(embed_tokens|layers|norm)\."), r"model.language_model.\1."),
+    (re.compile(r"^visual\."), r"model.visual."),
+)
+
+
+def _apply_name_rewrites(name, renames):
+    """Rewrite a checkpoint-side name to its module-side spelling.
+
+    Returns ``name`` unchanged when no pattern matches. Shared by the
+    reverse map builder and the per-tensor loader loop.
+    """
+    for pattern, replacement in renames:
+        m = pattern.match(name)
+        if m is None:
+            continue
+        # m.expand honors backreferences but only covers the matched span;
+        # splice the untouched remainder back in (patterns are start-anchored,
+        # so this is the suffix)
+        candidate = name[: m.start()] + m.expand(replacement) + name[m.end() :]
+        if candidate != name:
+            return candidate
+    return name
 
 
 @lru_cache(maxsize=None)
@@ -892,16 +906,11 @@ class CheckpointStreamer:
             if tgt is None and renames:
                 # checkpoint families whose spellings differ from the modeling
                 # code: apply the registry aliases, never shadowing an exact hit
-                for pattern, replacement in renames:
-                    m = pattern.match(name)
-                    if m is None:
-                        continue
-                    candidate = name[: m.start()] + m.expand(replacement) + name[m.end() :]
-                    if candidate != name:
-                        tgt = by_short.get(candidate)
-                        if tgt is not None:
-                            mod_name = candidate
-                            break
+                candidate = _apply_name_rewrites(name, renames)
+                if candidate != name:
+                    tgt = by_short.get(candidate)
+                    if tgt is not None:
+                        mod_name = candidate
             if tgt is None:
                 logger.debug(f"[stream] {name} has no matching parameter/buffer in the module; skipped")
                 continue

@@ -2795,7 +2795,9 @@ class TestVlFlatCheckpointRenames:
             assert rev["model.language_model.layers.0.self_attn.q_proj.weight"] == (
                 "model.layers.0.self_attn.q_proj.weight"
             ), mt
-            assert "model.language_model.visual.blocks.0.mlp.fc1.weight" not in rev, "vision must not be rewritten"
+            assert (
+                rev["model.visual.blocks.0.mlp.fc1.weight"] == "visual.blocks.0.mlp.fc1.weight"
+            ), "vision must rewrite to the nested model.visual.* spelling"
 
     def test_reverse_name_map_noop_for_other_families(self):
         from auto_round.utils.checkpoint_streamer import reverse_name_map
@@ -2822,7 +2824,8 @@ class TestVlFlatCheckpointRenames:
         got = s.names_under("model.language_model.layers.0")
         assert got == ["model.layers.0.self_attn.q_proj.weight"], got
         assert s.resolve_checkpoint_name("model.language_model.embed_tokens.weight") == "model.embed_tokens.weight"
-        assert s.names_under("visual") == ["visual.blocks.0.mlp.fc1.weight"]
+        assert s.names_under("model.visual") == ["visual.blocks.0.mlp.fc1.weight"]
+        assert s.resolve_checkpoint_name("model.visual.blocks.0.mlp.fc1.weight") == "visual.blocks.0.mlp.fc1.weight"
 
 
 class TestProbePositionIds:

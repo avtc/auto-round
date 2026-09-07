@@ -129,11 +129,13 @@ def validate_moe_source_qtypes(
 def moe_imatrix_required(qtype) -> bool:
     """Whether a ggml quant type consumes a per-source imatrix.
 
-    Only the importance-aware (IQ*) quants read the imatrix; for every other
-    qtype a partially-covered expert stack (routed experts only fire when the
-    gate selects them) is harmless and must not fail the pack.
+    The importance-aware (IQ*) quants and the K-quants whose double-quant
+    search reads per-channel weights (Q2_K..Q6_K) consume the imatrix; for
+    every other qtype a partially-covered expert stack (routed experts only
+    fire when the gate selects them) is harmless and must not fail the pack.
     """
-    return str(getattr(qtype, "name", qtype)).startswith("IQ")
+    name = str(getattr(qtype, "name", qtype))
+    return name.startswith("IQ") or name in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K")
 
 
 def validate_moe_imatrices(
