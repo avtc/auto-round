@@ -292,7 +292,16 @@ _MOE_EXP_SUFFIX_TO_HF_WNAME = {
 
 
 def _quant_data_with_args(
-    data_torch, data_qtype, scale, zp, d_scale=None, wmin=None, d_wmin=None, imatrix=None, device=None
+    data_torch,
+    data_qtype,
+    scale,
+    zp,
+    d_scale=None,
+    wmin=None,
+    d_wmin=None,
+    imatrix=None,
+    device=None,
+    source_dtype=None,
 ):
     device = data_torch.device if device is None else device
     data_torch = data_torch.to(torch.float32)
@@ -514,7 +523,18 @@ def _validate_quant_attr_shapes(data_torch, data_qtype, kwargs, name, new_name):
             )
 
 
-def _quant_data(cls, data_torch, data_qtype, name, modify_name, new_name, bid, device=None, use_layer_attrs=True):
+def _quant_data(
+    cls,
+    data_torch,
+    data_qtype,
+    name,
+    modify_name,
+    new_name,
+    bid,
+    device=None,
+    use_layer_attrs=True,
+    source_dtype=None,
+):
     """
 
     Args:
@@ -537,7 +557,11 @@ def _quant_data(cls, data_torch, data_qtype, name, modify_name, new_name, bid, d
     module = get_module(cls.model, layer_name)
     kwargs = {"scale": None, "zp": None, "d_scale": None, "d_wmin": None, "wmin": None, "imatrix": None}
     source_qtype = get_qtype_by_layer_config(
-        cls.layer_config, name, data_qtype, explicit_only=True, source_dtype=data_torch.dtype
+        cls.layer_config,
+        name,
+        data_qtype,
+        explicit_only=True,
+        source_dtype=source_dtype if source_dtype is not None else data_torch.dtype,
     )
     if use_layer_attrs:
         compatible_stored_qtype = source_qtype == data_qtype
@@ -720,7 +744,14 @@ def _should_keep_recipe_qtype(layer_config_qtype, fallback_qtype, allow_recipe_f
     """Keep llama.cpp fixed-format recipe upgrades unless AutoScheme owns dtype selection."""
     if not allow_recipe_fallback or layer_config_qtype is None:
         return False
-    return _qtype_precision_rank(fallback_qtype) > _qtype_precision_rank(layer_config_qtype)
+    if _qtype_precision_rank(fallback_qtype) <= _qtype_precision_rank(layer_config_qtype):
+        return False
+    # a float pin storing the SOURCE-EXACT float type is not a precision
+    # downgrade: F32-over-BF16 is a lossless upcast of already-bf16 data
+    # (2x the bytes for nothing); the pin must win over a float fallback
+    if _qtype_precision_rank(layer_config_qtype) >= 16 and _qtype_precision_rank(fallback_qtype) >= 16:
+        return False
+    return True
 
 
 def resolve_restored_qtype(
@@ -1076,7 +1107,10 @@ def prepare_tensors(cls):
                         else []
                     ),
                     allow_recipe_fallback=not getattr(cls, "is_auto_scheme", False),
-                    source_dtype=data_torch.dtype,
+                    # the ORIGINAL source dtype, before the walk's bf16->fp32
+                    # upcast: a float pin must store the type that is exact
+                    # for the checkpoint source (bf16 -> BF16, not F32)
+                    source_dtype=old_dtype,
                 )
                 # # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if layer_config_qtype is not None:
@@ -1207,7 +1241,9 @@ def prepare_tensors(cls):
                     # by lora-rank) would no longer apply to the right axis and must be dropped too.
                     imatrix = getattr(module, "imatrix", None)
                     attr_list["imatrix"] = imatrix if (not is_k_b and isinstance(imatrix, torch.Tensor)) else None
-                    data = _quant_data_with_args(data_torch, data_qtype, device=device, **attr_list)
+                    data = _quant_data_with_args(
+                        data_torch, data_qtype, device=device, source_dtype=old_dtype, **attr_list
+                    )
 
                 # for MOE model
                 # Spec-backed models must not enter this native-fused fallback.
@@ -1248,6 +1284,7 @@ def prepare_tensors(cls):
                         new_name,
                         bid,
                         device=device,
+                        source_dtype=old_dtype,
                         use_layer_attrs=len(hf_names) == 1,
                     )
 

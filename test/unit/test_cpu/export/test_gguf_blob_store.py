@@ -239,6 +239,67 @@ def test_float16_passthrough_and_bytes_kv(store, tmp_path):
     assert bytes(bytearray(np.asarray(pre).view(np.uint8).ravel())) == bytes([0x1, 0x2, 0x3])
 
 
+def _expected_float_qtype(ckpt_dir):
+    """The exact-float GGUF type for a checkpoint's embedding storage."""
+    import os
+
+    import gguf as _gg
+    from safetensors import safe_open
+
+    import glob
+
+    shard = next(
+        (p for p in glob.glob(os.path.join(ckpt_dir, "*.safetensors")) if "embd" not in os.path.basename(p)), None
+    )
+    if shard is None:
+        return _gg.GGMLQuantizationType.F32
+    with safe_open(shard, framework="pt") as f:
+        keys = [k for k in f.keys() if k.endswith("embed_tokens.weight")]
+        if not keys:
+            return _gg.GGMLQuantizationType.F32
+        dt = f.get_slice(keys[0]).get_dtype()
+    return {
+        "F32": _gg.GGMLQuantizationType.F32,
+        "BF16": _gg.GGMLQuantizationType.BF16,
+        "F16": _gg.GGMLQuantizationType.F16,
+    }.get(dt, _gg.GGMLQuantizationType.F32)
+
+
+class TestFloatPinSourceDtype:
+    """A float pin stores the float type exact for the SOURCE dtype, and the
+    resolve chain must not let a float fallback 'upgrade' it (27B embed was
+    shipped F32 instead of BF16 - 2x bytes for nothing)."""
+
+    def test_bf16_source_pin_maps_to_bf16(self):
+        import torch
+
+        from auto_round.export.export_to_gguf.convert import get_qtype_by_layer_config
+
+        lc = {"model.embed_tokens": {"bits": 16, "data_type": "float"}}
+        got = get_qtype_by_layer_config(
+            lc, "model.embed_tokens.weight", None, explicit_only=True, source_dtype=torch.bfloat16
+        )
+        assert got.name == "BF16"
+
+    def test_pin_wins_over_float_fallback(self):
+        import gguf
+
+        from auto_round.export.export_to_gguf.convert import resolve_restored_qtype
+
+        lc = {"model.embed_tokens": {"bits": 16, "data_type": "float"}}
+        got = resolve_restored_qtype(
+            lc,
+            ("model.embed_tokens.weight",),
+            "model.embed_tokens.weight",
+            "token_embd.weight",
+            gguf.GGMLQuantizationType.F32,  # the recipe's float fallback
+            [],
+            allow_recipe_fallback=True,
+            source_dtype=__import__("torch").bfloat16,
+        )
+        assert got.name == "BF16", "float pin must not be upcast to the fallback float type"
+
+
 class TestRecorderOwnsPayloadMemory:
     """The recorder must OWN the payload bytes it defers to flush.
 
@@ -250,7 +311,7 @@ class TestRecorderOwnsPayloadMemory:
     def test_add_tensor_copies_view_backing_buffer(self, tmp_path):
         import numpy as np
 
-        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore, RecordingGgufWriter
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
 
         GgufBlobStore.reset_singletons()
         store = GgufBlobStore.get_or_create(str(tmp_path / "blobs"))
@@ -743,7 +804,11 @@ class TestStreamGgufBlobMtpE2E:
         assert all(
             dtypes[n] == gguf.GGMLQuantizationType.Q8_0 for n in cloned_q
         ), f"cloned MTP layer tensors not Q8_0: {[(n, dtypes[n].name) for n in cloned_q[:4]]}"
-        assert dtypes["token_embd.weight"] == gguf.GGMLQuantizationType.F32, "embed float pin did not keep F32"
+        assert dtypes["token_embd.weight"] in (
+            gguf.GGMLQuantizationType.F32,
+            gguf.GGMLQuantizationType.BF16,
+            gguf.GGMLQuantizationType.F16,
+        ), "embed float pin did not keep an unquantized float type"
         assert manifest["roles"]["text"]["kv_ops"], "metadata must be captured for replay"
 
 
@@ -861,9 +926,9 @@ class TestStreamGgufBlobMmprojE2E:
         import numpy as np
 
         nz = sum(1 for t in mmproj_reader.tensors if float(np.abs(t.data).max()) > 0.0)
-        assert nz == len(mmproj_reader.tensors), (
-            f"{len(mmproj_reader.tensors) - nz} all-zero mmproj tensors (lazy mmap closed before the walk?)"
-        )
+        assert nz == len(
+            mmproj_reader.tensors
+        ), f"{len(mmproj_reader.tensors) - nz} all-zero mmproj tensors (lazy mmap closed before the walk?)"
         # resumed-run contract (folded from the llama crash-resume e2e):
         # outside-block roots survive the resume and the pins hold
         text_reader = gguf.GGUFReader(str(Path(roles["text"]["out_path"])))
@@ -873,10 +938,15 @@ class TestStreamGgufBlobMmprojE2E:
         # absent from the container (tied models read token_embd); the untied
         # lm_head root is covered by the nextn e2e
         assert "output_norm.weight" in text_dtypes, "resumed run dropped the final norm"
-        assert text_dtypes["token_embd.weight"] == gguf.GGMLQuantizationType.F32, "embed float pin"
-        body_q = [
-            n for n in text_dtypes if n.startswith("blk.") and "norm" not in n and not n.endswith(".bias")
-        ]
+        # the float pin must keep the embed UNQUANTIZED in a float type whose
+        # exactness follows the walked tensor's dtype (the bf16 27B pipeline
+        # stores BF16; a CPU fp32 model stores F32)
+        assert text_dtypes["token_embd.weight"] in (
+            gguf.GGMLQuantizationType.F32,
+            gguf.GGMLQuantizationType.BF16,
+            gguf.GGMLQuantizationType.F16,
+        ), "embed float pin did not keep an unquantized float type"
+        body_q = [n for n in text_dtypes if n.startswith("blk.") and "norm" not in n and not n.endswith(".bias")]
         assert body_q and all(
             text_dtypes[n] == gguf.GGMLQuantizationType.Q4_0 for n in body_q
         ), "unpinned body lost the scheme default"
