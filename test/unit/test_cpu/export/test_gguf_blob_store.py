@@ -14,9 +14,12 @@
 
 import gc
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
+import torch
 import pytest
 
 gguf = pytest.importorskip("gguf")
@@ -291,3 +294,46 @@ class TestBlobModeBranches:
         fake._gguf_blob_mode = lambda: False
         CompressionOrchestrator._write_finished_block_(fake, _Block(), "model.layers.0", set(), rs, None, None, True)
         assert written, "CT path keeps writing"
+
+
+class TestStreamGgufBlobE2E:
+    """End-to-end: stream-quantize a tiny model straight to blob shards + assembled GGUF."""
+
+    def test_stream_quantize_assembles_gguf(self, tiny_qwen_model_path, tmp_path):
+        gguf = pytest.importorskip("gguf")
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.autoround import AutoRound
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+
+        GgufBlobStore.reset_singletons()
+        out_dir = str(tmp_path / "out")
+        ar = AutoRound(
+            tiny_qwen_model_path,
+            scheme="gguf:q4_0",
+            alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
+            stream_quantization=True,
+            stream_prefetch="off",
+            format="gguf:q4_0",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.quantize_and_save(out_dir, format="gguf:q4_0")
+
+        blobs = Path(ar.output_dir) / "gguf-blobs"
+        assert (blobs / "manifest.json").is_file(), "blob manifest missing"
+        manifest = json.loads((blobs / "manifest.json").read_text())
+        entries = manifest["roles"]["text"]["tensors"]
+        assert entries, "no blob tensors recorded"
+
+        gguf_files = [p for p in Path(ar.output_dir).glob("*.gguf")]
+        assert gguf_files, "assembled .gguf missing"
+        reader = gguf.GGUFReader(str(gguf_files[0]))
+        names = {t.name for t in reader.tensors}
+        manifest_names = {e["name"] for e in entries}
+        assert names == manifest_names, "assembled tensors must match the manifest exactly"
+        dtypes = {t.name: t.tensor_type for t in reader.tensors}
+        assert dtypes["blk.0.attn_q.weight"] == gguf.GGMLQuantizationType.Q4_0
+        assert dtypes["blk.0.ffn_norm.weight"] == gguf.GGMLQuantizationType.F32
+        assert manifest["roles"]["text"]["kv_ops"], "metadata must be captured for replay"

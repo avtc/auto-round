@@ -339,7 +339,7 @@ class GgufBlobStore:
             )
         state = self._role_state(role)
         state["meta"]["arch"] = gguf.MODEL_ARCH_NAMES[conversion_instance.model_arch]
-        state["meta"]["endianess"] = str(getattr(conversion_instance, "endianess", "little"))
+        state["meta"]["endianess"] = getattr(conversion_instance, "endianess", "little")
         state["meta"]["out_path"] = str(conversion_instance.fname_out)
         state["meta"]["kv_ops"] = recorder.kv_ops
         self.flush(role, reason="finalize")
@@ -392,13 +392,15 @@ class GgufBlobStore:
 
 
 def _coerce_gguf_endian(value) -> Any:
-    """Accept the enum, its name, or 'little'/'big' and return ``GGUFEndian``."""
+    """Accept the enum, its value, its name, or 'little'/'big' and return ``GGUFEndian``."""
     if isinstance(value, gguf.GGUFEndian):
         return value
+    if isinstance(value, int):
+        return gguf.GGUFEndian(value)
     name = str(value).rsplit(".", 1)[-1].lower()
-    if name == "little":
+    if name in ("little", "0"):
         return gguf.GGUFEndian.LITTLE
-    if name == "big":
+    if name in ("big", "1"):
         return gguf.GGUFEndian.BIG
     raise ValueError(f"unsupported endianess {value!r}")
 
