@@ -587,7 +587,10 @@ class TestLmHeadTuneInputs:
         state = {"fp_inputs": torch.zeros(2), "token_ids": [torch.zeros(1, 5)]}
         out = _orch(200, ["lm_head"])._lm_head_tune_inputs_(state, ["lm_head"])
         assert out is None
-        assert "falls back" in capfd.readouterr().err
+        err = capfd.readouterr().err
+        assert "falls back" in err
+        # the diagnostic must name the offending shapes, not just the fallback
+        assert "fp_rows=Tensor" in err and "token_ids=1" in err
 
     def test_mis_shaped_q_rows_tune_on_fp_inputs(self, capfd):
         state = {"fp_inputs": _rows(3), "q_inputs": _rows(2), "token_ids": [torch.zeros(1, 5)] * 3}

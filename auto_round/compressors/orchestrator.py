@@ -2307,7 +2307,19 @@ class CompressionOrchestrator(BaseOrchestrator):
             or len(token_ids) != len(fp_rows)
             or not all(isinstance(r, torch.Tensor) for r in fp_rows)
         ):
-            logger.warning("[stream] lm_head falls back to the closed-form search: unexpected chain-tail row format")
+            _shape_desc = (
+                f"{type(fp_rows).__name__}"
+                if not isinstance(fp_rows, (list, tuple))
+                else f"list[{len(fp_rows)}] of {type(fp_rows[0]).__name__ if fp_rows else 'empty'}"
+                + (f" dim{tuple(fp_rows[0].shape)}" if fp_rows and isinstance(fp_rows[0], torch.Tensor) else "")
+            )
+            logger.warning(
+                "[stream] lm_head falls back to the closed-form search: unexpected chain-tail row format "
+                f"(fp_rows={_shape_desc}, token_ids={len(token_ids)}, "
+                f"fp_inputs={type(fp_inputs).__name__}"
+                + (f" keys={sorted(fp_inputs.keys())[:6]}" if isinstance(fp_inputs, dict) else "")
+                + ")"
+            )
             return None
         q_inputs = (calib_state or {}).get("q_inputs")
         q_rows = None
