@@ -1281,7 +1281,7 @@ class TestStreamQuantizeEquivalence:
             str(tmp_path / "out"),
             stream=True,
             dataset="NeelNanda/pile-10k",
-            layer_config={"model.layers.3": {"bits": 8}},
+            layer_config={"model.layers.3": {"bits": 8}, "lm_head": {"bits": 8}},
             iters=1,
         )
         keys = self._export_keys(out)
@@ -1296,6 +1296,12 @@ class TestStreamQuantizeEquivalence:
         captured = capfd.readouterr()
         console = captured.out + captured.err
         assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
+        assert (
+            "[stream] tuning lm_head with the run's tuning config" in console
+        ), "lm_head tune never started (tree tune consumed the chain tail)"
+        assert "[stream] lm_head falls back to the closed-form search" not in console, "unexpected fallback"
+        assert "lm_head.qweight" in keys, "tuned lm_head not packed"
+        assert "lm_head.weight" not in keys, "plain lm_head kept beside packed form"
         for leaf in (
             "self_attn.k_proj",
             "self_attn.v_proj",

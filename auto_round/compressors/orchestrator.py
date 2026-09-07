@@ -2335,7 +2335,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.warning("[stream] multiple lm_head candidates in the plan %s; tuning %s", candidates, candidates[0])
         return candidates[0]
 
-    def _lm_head_tune_inputs_(self, calib_state, remain_layer_names, streamer=None, lm_head_name=None):
+    def _lm_head_tune_inputs_(
+        self, calib_state, remain_layer_names, streamer=None, lm_head_name=None, pre_captured=None
+    ):
         """Per-sample ``(fp_rows, q_rows, token_ids)`` for tuning lm_head from
         the calibration chain's tail, or ``None`` to keep the closed-form search.
 
@@ -2352,8 +2354,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             lm_head_name = self._resolve_lm_head_name_(remain_layer_names)
         if lm_head_name is None:
             return None
-        fp_inputs = (calib_state or {}).get("fp_inputs")
-        token_ids = (calib_state or {}).get("token_ids")
+        if pre_captured is not None:
+            # the checkpoint-only tree tune consumes/mutates the shared chain
+            # tail (a 27B run read it back as placeholder rows); the caller
+            # captured an immutable copy BEFORE that tune
+            fp_inputs, token_ids = pre_captured
+        else:
+            fp_inputs = (calib_state or {}).get("fp_inputs")
+            token_ids = (calib_state or {}).get("token_ids")
         # len() not truthiness: a raw tensor chain tail must not hit ambiguous
         # bool evaluation on the way to the format rejection below
         if fp_inputs is None or token_ids is None or len(fp_inputs) == 0 or len(token_ids) == 0:
@@ -2968,6 +2976,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 streamer, all_blocks, block_snapshots
             )
             block_snapshots = None
+            _lm_pre_capture = None
+            if tree_groups and calib_state is not None and self._max_tune_iters() > 0:
+                _fp = calib_state.get("fp_inputs")
+                _tok = calib_state.get("token_ids")
+                if _fp is not None and _tok is not None:
+                    _lm_pre_capture = (self._snapshot_chain_rows_(_fp), _tok)
             if tree_groups:
                 _tune_iters = self._max_tune_iters()
                 if _tune_iters > 0:
@@ -3001,7 +3015,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         # per-sample tune loop lives in quantize_layer_outside_block);
         # iters=0 keeps the closed-form search on the same device
         lm_tune = (
-            self._lm_head_tune_inputs_(calib_state, remain_layer_names, streamer=streamer, lm_head_name=lm_head_name)
+            self._lm_head_tune_inputs_(
+                calib_state,
+                remain_layer_names,
+                streamer=streamer,
+                lm_head_name=lm_head_name,
+                pre_captured=_lm_pre_capture if streamer is not None else None,
+            )
             if streamer is not None
             else None
         )
