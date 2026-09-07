@@ -391,6 +391,16 @@ def save_quantized_as_gguf(
             )
         )
 
+    # The per-block walk gate is a pack-time concept: a resumed run adopts
+    # its completed blocks without re-packing them, so
+    # ``last_layer_name_to_block_name`` never empties and the gate would stay
+    # fixed on the last re-packed block - silently dropping every
+    # outside-block tensor (embedding, lm_head, final norm, ...) from the
+    # save-time walk. The ungated walk is safe: adopted blocks are parked on
+    # meta (skipped) and the recorder rejects duplicate names.
+    for gguf_model in gguf_model_instance_global:
+        gguf_model.current_packing_block = None
+
     try:
         for gguf_model in gguf_model_instance_global:
             model_kind = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"

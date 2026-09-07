@@ -389,6 +389,81 @@ class TestStreamGgufBlobE2E:
         assert dtypes["blk.0.ffn_norm.weight"] == gguf.GGMLQuantizationType.F32
         assert manifest["roles"]["text"]["kv_ops"], "metadata must be captured for replay"
 
+    def test_resumed_stream_run_keeps_root_tensors(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """A resumed streaming GGUF run must still write every outside-block tensor.
+
+        Adopted blocks never re-pack, so ``last_layer_name_to_block_name`` never
+        empties and the per-block walk gate never clears on its own; without a
+        save-time reset the assembled file silently drops token_embd/output/
+        output_norm (regression found on a resumed 27B export: 848 block tensors,
+        no roots)."""
+        gguf = pytest.importorskip("gguf")
+        from unittest import mock
+
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.autoround import AutoRound
+        from auto_round.export.export_to_gguf import llama_cpp_conversion as lcc
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+        from auto_round.utils.resume import ResumeState
+
+        lcc.get_conversion(tiny_checkpoint)
+        conversion_llama = importlib.import_module("conversion.llama")
+        monkeypatch.setattr(conversion_llama.LlamaModel, "get_vocab_base_pre", lambda self, tokenizer: "gpt2")
+        monkeypatch.setenv("AR_RESUME_DIR", str(tmp_path / "resume"))
+        # keep the derived export folder inside the test sandbox: on Windows an
+        # absolute checkpoint path defeats the '/'-split leaf derivation and
+        # the assembled file lands next to the checkpoint (sibling-test note)
+        import shutil
+
+        ckpt = str(tmp_path / "ckpt")
+        shutil.copytree(tiny_checkpoint, ckpt)
+
+        def _run(out_dir):
+            # a resumed process starts with fresh conversion state; the first
+            # run died mid-quantize, so the instance global must be cleared
+            # explicitly between in-process runs
+            import auto_round.export.export_to_gguf.export as gguf_export
+
+            gguf_export._clear_gguf_model_instances()
+            GgufBlobStore.reset_singletons()
+            ar = AutoRound(
+                ckpt,
+                scheme="gguf:q4_0",
+                alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
+                stream_quantization=True,
+                stream_prefetch="off",
+                format="gguf:q4_0",
+                disable_model_free=True,
+                device_map="cpu",
+                low_gpu_mem_usage=True,
+                low_cpu_mem_usage=True,
+            )
+            ar.quantize_and_save(out_dir, format="gguf:q4_0")
+            return ar
+
+        original_mark = ResumeState.mark_block_done
+        crashed = []
+
+        def crash_after_first(self, block_name, q_input, input_ids):
+            original_mark(self, block_name, q_input, input_ids)
+            crashed.append(block_name)
+            if len(crashed) == 1:
+                raise RuntimeError("simulated crash")
+
+        with mock.patch.object(ResumeState, "mark_block_done", crash_after_first):
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                _run(str(tmp_path / "out1"))
+        assert crashed, "crash injection never fired"
+
+        _run(str(tmp_path / "out2"))
+
+        manifest_path = max(Path(str(tmp_path)).glob("**/gguf-blobs/manifest.json"), key=lambda p: p.stat().st_mtime)
+        manifest = json.loads(manifest_path.read_text())
+        names = {e["name"] for e in manifest["roles"]["text"]["tensors"]}
+        assert "token_embd.weight" in names, "resumed run dropped the embedding from the assembled GGUF"
+        assert "output_norm.weight" in names, "resumed run dropped the final norm from the assembled GGUF"
+        assert "output.weight" in names, "resumed run dropped lm_head from the assembled GGUF"
+
 
 class TestMtpNextnRemap:
     """Embedded nextn enablement: name remap + tree counting (streaming blob path)."""
