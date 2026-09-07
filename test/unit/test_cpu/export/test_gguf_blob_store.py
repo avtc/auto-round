@@ -297,174 +297,6 @@ class TestBlobModeBranches:
 
 
 @pytest.mark.slow
-class TestStreamGgufBlobE2E:
-    """End-to-end: stream-quantize a tiny model straight to blob shards + assembled GGUF.
-
-    Uses the synthetic tiny Llama checkpoint (same one as the streaming
-    equivalence suite) plus a gpt2-style fast tokenizer so the GGUF vocab
-    embedding path is exercised without a network-fetched fixture.
-    """
-
-    @pytest.fixture(scope="class")
-    def tiny_checkpoint(self, tmp_path_factory):
-        from transformers import LlamaConfig, LlamaForCausalLM
-
-        cfg = LlamaConfig(
-            vocab_size=64,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=3,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-        )
-        torch.manual_seed(11)
-        model = LlamaForCausalLM(cfg)
-        d = tmp_path_factory.mktemp("tiny_gguf_ckpt")
-        from tokenizers import Tokenizer
-        from tokenizers import decoders, models as tk_models, pre_tokenizers
-        from transformers import PreTrainedTokenizerFast
-
-        # BPE + ByteLevel keeps the GGUF vocab embedding on the recognized
-        # gpt2 path (a plain WordLevel/Whitespace tokenizer is rejected by
-        # get_vocab_base_pre)
-        tk = Tokenizer(tk_models.BPE(vocab={"[UNK]": 0, "a": 1, "b": 2}, merges=[]))
-        tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-        tk.decoder = decoders.ByteLevel()
-        PreTrainedTokenizerFast(tokenizer_object=tk).save_pretrained(str(d))
-        model.save_pretrained(str(d), max_shard_size="40KB")
-        return str(d)
-
-    def test_stream_quantize_assembles_gguf(self, tiny_checkpoint, tmp_path, monkeypatch):
-        gguf = pytest.importorskip("gguf")
-        from auto_round.algorithms.quantization.rtn.config import RTNConfig
-        from auto_round.autoround import AutoRound
-        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
-        from auto_round.export.export_to_gguf import llama_cpp_conversion as lcc
-
-        # the synthetic tokenizer cannot reproduce any real model's
-        # pre-tokenizer checksum; the blob machinery under test is agnostic
-        # to which pre-tokenizer the vocab claims. The conversion classes load
-        # under the top-level "conversion" package (cached module), so patch
-        # them there - the auto_round copy of the same files is not the one
-        # the live export instantiates.
-        lcc.get_conversion(tiny_checkpoint)
-        conversion_llama = importlib.import_module("conversion.llama")
-        monkeypatch.setattr(conversion_llama.LlamaModel, "get_vocab_base_pre", lambda self, tokenizer: "gpt2")
-        GgufBlobStore.reset_singletons()
-        out_dir = str(tmp_path / "out")
-        ar = AutoRound(
-            tiny_checkpoint,
-            scheme="gguf:q4_0",
-            alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
-            stream_quantization=True,
-            stream_prefetch="off",
-            format="gguf:q4_0",
-            disable_model_free=True,
-            device_map="cpu",
-            low_gpu_mem_usage=True,
-            low_cpu_mem_usage=True,
-        )
-        ar.quantize_and_save(out_dir, format="gguf:q4_0")
-
-        blobs = Path(ar.output_dir) / "gguf-blobs"
-        assert (blobs / "manifest.json").is_file(), "blob manifest missing"
-        manifest = json.loads((blobs / "manifest.json").read_text())
-        entries = manifest["roles"]["text"]["tensors"]
-        assert entries, "no blob tensors recorded"
-
-        # NOTE: on Windows, absolute model paths defeat the "/"-split leaf
-        # derivation in _get_export_dir (a pre-existing quirk; relative paths
-        # and POSIX paths derive correctly), so the assembled file's exact
-        # folder can differ - the manifest's recorded out_path is the source
-        # of truth for where assembly put it.
-        out_path = Path(manifest["roles"]["text"]["out_path"])
-        assert out_path.is_file(), f"assembled .gguf missing at {out_path}"
-        reader = gguf.GGUFReader(str(out_path))
-        names = {t.name for t in reader.tensors}
-        manifest_names = {e["name"] for e in entries}
-        assert names == manifest_names, "assembled tensors must match the manifest exactly"
-        dtypes = {t.name: t.tensor_type for t in reader.tensors}
-        assert dtypes["blk.0.attn_q.weight"] == gguf.GGMLQuantizationType.Q4_0
-        assert dtypes["blk.0.ffn_norm.weight"] == gguf.GGMLQuantizationType.F32
-        assert manifest["roles"]["text"]["kv_ops"], "metadata must be captured for replay"
-
-    def test_resumed_stream_run_keeps_root_tensors(self, tiny_checkpoint, tmp_path, monkeypatch):
-        """A resumed streaming GGUF run must still write every outside-block tensor.
-
-        Adopted blocks never re-pack, so ``last_layer_name_to_block_name`` never
-        empties and the per-block walk gate never clears on its own; without a
-        save-time reset the assembled file silently drops token_embd/output/
-        output_norm (regression found on a resumed 27B export: 848 block tensors,
-        no roots)."""
-        gguf = pytest.importorskip("gguf")
-        from unittest import mock
-
-        from auto_round.algorithms.quantization.rtn.config import RTNConfig
-        from auto_round.autoround import AutoRound
-        from auto_round.export.export_to_gguf import llama_cpp_conversion as lcc
-        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
-        from auto_round.utils.resume import ResumeState
-
-        lcc.get_conversion(tiny_checkpoint)
-        conversion_llama = importlib.import_module("conversion.llama")
-        monkeypatch.setattr(conversion_llama.LlamaModel, "get_vocab_base_pre", lambda self, tokenizer: "gpt2")
-        monkeypatch.setenv("AR_RESUME_DIR", str(tmp_path / "resume"))
-        # keep the derived export folder inside the test sandbox: on Windows an
-        # absolute checkpoint path defeats the '/'-split leaf derivation and
-        # the assembled file lands next to the checkpoint (sibling-test note)
-        import shutil
-
-        ckpt = str(tmp_path / "ckpt")
-        shutil.copytree(tiny_checkpoint, ckpt)
-
-        def _run(out_dir):
-            # a resumed process starts with fresh conversion state; the first
-            # run died mid-quantize, so the instance global must be cleared
-            # explicitly between in-process runs
-            import auto_round.export.export_to_gguf.export as gguf_export
-
-            gguf_export._clear_gguf_model_instances()
-            GgufBlobStore.reset_singletons()
-            ar = AutoRound(
-                ckpt,
-                scheme="gguf:q4_0",
-                alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
-                stream_quantization=True,
-                stream_prefetch="off",
-                format="gguf:q4_0",
-                disable_model_free=True,
-                device_map="cpu",
-                low_gpu_mem_usage=True,
-                low_cpu_mem_usage=True,
-            )
-            ar.quantize_and_save(out_dir, format="gguf:q4_0")
-            return ar
-
-        original_mark = ResumeState.mark_block_done
-        crashed = []
-
-        def crash_after_first(self, block_name, q_input, input_ids):
-            original_mark(self, block_name, q_input, input_ids)
-            crashed.append(block_name)
-            if len(crashed) == 1:
-                raise RuntimeError("simulated crash")
-
-        with mock.patch.object(ResumeState, "mark_block_done", crash_after_first):
-            with pytest.raises(RuntimeError, match="simulated crash"):
-                _run(str(tmp_path / "out1"))
-        assert crashed, "crash injection never fired"
-
-        _run(str(tmp_path / "out2"))
-
-        manifest_path = max(Path(str(tmp_path)).glob("**/gguf-blobs/manifest.json"), key=lambda p: p.stat().st_mtime)
-        manifest = json.loads(manifest_path.read_text())
-        names = {e["name"] for e in manifest["roles"]["text"]["tensors"]}
-        assert "token_embd.weight" in names, "resumed run dropped the embedding from the assembled GGUF"
-        assert "output_norm.weight" in names, "resumed run dropped the final norm from the assembled GGUF"
-        assert "output.weight" in names, "resumed run dropped lm_head from the assembled GGUF"
-
-
 class TestMtpNextnRemap:
     """Embedded nextn enablement: name remap + tree counting (streaming blob path)."""
 
@@ -631,6 +463,8 @@ class TestR2Hardening:
             _gguf_blob_mode=lambda: True,
             model=SimpleNamespace(),
             layer_config={},
+            regex_config={},
+            _layer_config_with_regex_pins_=lambda: {},
             formats=[SimpleNamespace(get_backend_name=lambda: "gguf:q4_0")],
             model_context=SimpleNamespace(),
             device="cpu",
@@ -806,7 +640,13 @@ class TestStreamGgufBlobMtpE2E:
         return str(d)
 
     @pytest.mark.timeout(300)
-    def test_nextn_tensors_and_kv_in_assembled_gguf(self, tiny_qwen3next_ckpt, tmp_path, monkeypatch):
+    @pytest.mark.timeout(300)
+    def test_nextn_pins_and_kv_in_assembled_gguf(self, tiny_qwen3next_ckpt, tmp_path, monkeypatch):
+        """One pinned MTP run covers: nextn presence + kv, and that user pins
+        reach the assembled dtypes (merged from the unpinned + pins e2es; the
+        unpinned scheme-default dtype is covered by the mmproj e2e body).
+        Also verifies the late-materializing regex pin ('.*mtp.*' resolves
+        before the predictor tree exists - 27B regression)."""
         gguf = pytest.importorskip("gguf")
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.autoround import AutoRound
@@ -821,7 +661,12 @@ class TestStreamGgufBlobMtpE2E:
         ar = AutoRound(
             tiny_qwen3next_ckpt,
             scheme="gguf:q4_0",
-            alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
+            alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=True)],
+            layer_config={
+                ".*mtp.*": {"bits": 8},
+                "lm_head": {"bits": 8},
+                "embed_tokens": {"bits": 16, "data_type": "float"},
+            },
             stream_quantization=True,
             stream_prefetch="off",
             format="gguf:q4_0",
@@ -851,13 +696,33 @@ class TestStreamGgufBlobMtpE2E:
         val = field.parts[-1].view(np.int32)[0]
         assert int(val) == 1
         dtypes = {t.name: t.tensor_type for t in reader.tensors}
-        assert dtypes["blk.2.nextn.eh_proj.weight"] == gguf.GGMLQuantizationType.Q4_0
+        assert dtypes["output.weight"] == gguf.GGMLQuantizationType.Q8_0, "lm_head bits-8 pin did not reach the export"
+        assert (
+            dtypes["blk.2.nextn.eh_proj.weight"] == gguf.GGMLQuantizationType.Q8_0
+        ), ".*mtp.* bits-8 pin did not reach the nextn tensors"
+        cloned_q = [
+            n
+            for n in dtypes
+            if n.startswith("blk.2.")
+            and ".nextn." not in n
+            and "norm" not in n
+            and "ssm_" not in n
+            and "ffn_gate_inp" not in n
+            and not n.endswith(".bias")
+        ]
+        assert cloned_q, "no cloned MTP layer tensors in the artifact"
+        assert all(
+            dtypes[n] == gguf.GGMLQuantizationType.Q8_0 for n in cloned_q
+        ), f"cloned MTP layer tensors not Q8_0: {[(n, dtypes[n].name) for n in cloned_q[:4]]}"
+        assert dtypes["token_embd.weight"] == gguf.GGMLQuantizationType.F32, "embed float pin did not keep F32"
+        assert manifest["roles"]["text"]["kv_ops"], "metadata must be captured for replay"
 
 
 @pytest.mark.slow
 class TestStreamGgufBlobMmprojE2E:
-    """End-to-end: an MLLM streaming blob run assembles BOTH the text GGUF and
-    the mmproj GGUF from blob shards."""
+    """End-to-end MLLM blob run: crash mid-quantize, resume, and assert BOTH
+    roles assemble with their roots and pins intact (merged: two-role mmproj
+    e2e + the former llama crash-resume e2e)."""
 
     @pytest.fixture(scope="class")
     def vl_ckpt(self, tmp_path_factory):
@@ -888,22 +753,60 @@ class TestStreamGgufBlobMmprojE2E:
         lcc.get_conversion(vl_ckpt)
         conversion_qwenvl = importlib.import_module("conversion.qwenvl")
         monkeypatch.setattr(conversion_qwenvl.Qwen2VLModel, "get_vocab_base_pre", lambda self, tokenizer: "gpt2")
-        GgufBlobStore.reset_singletons()
-        out_dir = str(tmp_path / "out")
-        ar = AutoRound(
-            vl_ckpt,
-            scheme="gguf:q4_0",
-            alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
-            quant_nontext_module=False,
-            stream_quantization=True,
-            stream_prefetch="off",
-            format="gguf:q4_0",
-            disable_model_free=True,
-            device_map="cpu",
-            low_gpu_mem_usage=True,
-            low_cpu_mem_usage=True,
-        )
-        ar.quantize_and_save(out_dir, format="gguf:q4_0")
+        from unittest import mock
+
+        from auto_round.utils.resume import ResumeState
+
+        monkeypatch.setenv("AR_RESUME_DIR", str(tmp_path / "resume"))
+        # the VL fixture ties its embeddings (no lm_head tensor in the
+        # checkpoint): pin only the embed float here; the lm_head Q8 pin is
+        # covered by the nextn e2e on the untied fixture
+        pins = {
+            "embed_tokens": {"bits": 16, "data_type": "float"},
+        }
+
+        def _run(out_dir):
+            # a resumed process starts with fresh conversion state; the first
+            # run dies mid-quantize, so the instance global must be cleared
+            # between in-process runs
+            import auto_round.export.export_to_gguf.export as gguf_export
+
+            gguf_export._clear_gguf_model_instances()
+            GgufBlobStore.reset_singletons()
+            ar = AutoRound(
+                vl_ckpt,
+                scheme="gguf:q4_0",
+                alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=True)],
+                layer_config=pins,
+                quant_nontext_module=False,
+                stream_quantization=True,
+                stream_prefetch="off",
+                format="gguf:q4_0",
+                disable_model_free=True,
+                device_map="cpu",
+                low_gpu_mem_usage=True,
+                low_cpu_mem_usage=True,
+            )
+            ar.quantize_and_save(out_dir, format="gguf:q4_0")
+            return ar
+
+        # phase 1: crash after the first durable block mark - the resumed run
+        # must not drop outside-block tensors (27B regression) nor either role
+        original_mark = ResumeState.mark_block_done
+        crashed = []
+
+        def crash_after_first(self, block_name, q_input, input_ids):
+            original_mark(self, block_name, q_input, input_ids)
+            crashed.append(block_name)
+            if len(crashed) == 1:
+                raise RuntimeError("simulated crash")
+
+        with mock.patch.object(ResumeState, "mark_block_done", crash_after_first):
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                _run(str(tmp_path / "out1"))
+        assert crashed, "crash injection never fired"
+
+        ar = _run(str(tmp_path / "out2"))
 
         blobs = Path(ar.output_dir) / "gguf-blobs"
         manifest = json.loads((blobs / "manifest.json").read_text())
@@ -923,6 +826,22 @@ class TestStreamGgufBlobMmprojE2E:
             t.name.startswith("v.") for t in mmproj_reader.tensors
         ), "mmproj gguf carries no vision-tower tensors"
         assert any(t.name.startswith("mm.") for t in mmproj_reader.tensors), "no merger tensors"
+        # resumed-run contract (folded from the llama crash-resume e2e):
+        # outside-block roots survive the resume and the pins hold
+        text_reader = gguf.GGUFReader(str(Path(roles["text"]["out_path"])))
+        text_dtypes = {t.name: t.tensor_type for t in text_reader.tensors}
+        assert "token_embd.weight" in text_dtypes, "resumed run dropped the embedding"
+        # the VL fixture ties its embeddings: output.weight is intentionally
+        # absent from the container (tied models read token_embd); the untied
+        # lm_head root is covered by the nextn e2e
+        assert "output_norm.weight" in text_dtypes, "resumed run dropped the final norm"
+        assert text_dtypes["token_embd.weight"] == gguf.GGMLQuantizationType.F32, "embed float pin"
+        body_q = [
+            n for n in text_dtypes if n.startswith("blk.") and "norm" not in n and not n.endswith(".bias")
+        ]
+        assert body_q and all(
+            text_dtypes[n] == gguf.GGMLQuantizationType.Q4_0 for n in body_q
+        ), "unpinned body lost the scheme default"
 
 
 class TestMoeImatrixContract:

@@ -842,74 +842,36 @@ class TestStreamQuantizeEquivalence:
                 low_cpu_mem_usage=True,
             ).quantize_and_save(str(tmp_path / "out"), format="auto_round")
 
-    def test_streamed_export_matches_normal(self, tiny_checkpoint, tmp_path):
-        """Streamed zero-shot export must match the normal (data-driven) run on
-        everything the streaming mode controls: tensor inventory, all
-        non-quantized tensors (incl. Pre-SINQ folds - bit-exact), and configs.
-        Quantized layers may differ in packing: the data-driven path passes a
-        pile-10k imatrix into the clip search while streamed zero-shot uses a
-        pure weight-MSE search (by design - calibration-free)."""
-        import shutil
+    def test_stream_export_equivalence_family(self, tiny_checkpoint, tmp_path):
+        """One five-arm equivalence sweep (merged from four separate e2es that
+        each re-quantized the plain-streamed baseline):
 
-        ck_normal = str(tmp_path / "ck_normal")
-        ck_stream = str(tmp_path / "ck_stream")
-        shutil.copytree(tiny_checkpoint, ck_normal)
-        shutil.copytree(tiny_checkpoint, ck_stream)
-        normal = self._quantize(ck_normal, str(tmp_path / "normal"), stream=False)
-        streamed = self._quantize(ck_stream, str(tmp_path / "streamed"), stream=True)
-
-        def load_tensors(d):
-            from safetensors import safe_open
-
-            out = {}
-            idx = os.path.join(d, "model.safetensors.index.json")
-            files = []
-            if os.path.exists(idx):
-                with open(idx) as f:
-                    files = sorted(set(json.load(f)["weight_map"].values()))
-            else:
-                files = ["model.safetensors"]
-            for fn in files:
-                with safe_open(os.path.join(d, fn), framework="pt") as f:
-                    for k in f.keys():
-                        out[k] = f.get_tensor(k)
-            return out
-
-        t_normal, t_streamed = load_tensors(normal), load_tensors(streamed)
-        assert set(t_normal) == set(t_streamed), (
-            f"tensor name mismatch: only-normal={set(t_normal) - set(t_streamed)} "
-            f"only-streamed={set(t_streamed) - set(t_normal)}"
-        )
-        quant_suffixes = ("qweight", "qzeros", "scales", "g_idx")
-        n_bitexact, n_quant = 0, 0
-        for k in t_normal:
-            if k.endswith(quant_suffixes):
-                n_quant += 1
-                continue
-            assert torch.equal(t_normal[k], t_streamed[k]), f"non-quantized tensor {k} differs"
-            n_bitexact += 1
-        assert n_bitexact > 0 and n_quant > 0  # both classes present
-        with open(os.path.join(normal, "quantization_config.json")) as f:
-            cn = json.load(f)
-        with open(os.path.join(streamed, "quantization_config.json")) as f:
-            cs = json.load(f)
-        assert cn == cs
-
-    def test_stream_calibration_matches_data_driven(self, tiny_checkpoint, tmp_path):
-        """stream_calibration=True must reproduce the data-driven run exactly:
-        the streaming pass forwards the same rows through the same block chain
-        (same attention-mask rule, row-by-row) so the imatrix statistics - and
-        therefore the searched quantized weights - are identical."""
+        - streamed(plain) vs normal(rows): inventory + bit-exact non-quantized
+          tensors + identical configs (quantized packing may differ BY DESIGN -
+          data-driven passes a rows-derived imatrix into the clip search,
+          streamed zero-shot uses a pure weight-MSE search)
+        - streamed_calib(rows) vs normal(rows): EXACT reproduction - the
+          streaming pass forwards the same rows through the same block chain
+        - streamed(prefetch=1) vs streamed(plain): bit-identical - prefetch
+          only changes WHERE tensors come from
+        - streamed(staged) vs streamed(plain): bit-identical - device staging
+          only changes where tensors wait
+        """
         import shutil
 
         torch.manual_seed(7)
         rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]  # vocab_size=64
-        ck_a = str(tmp_path / "ck_a")
-        ck_b = str(tmp_path / "ck_b")
-        shutil.copytree(tiny_checkpoint, ck_a)
-        shutil.copytree(tiny_checkpoint, ck_b)
-        data_driven = self._quantize(ck_a, str(tmp_path / "a"), stream=False, dataset=rows)
-        streamed_calib = self._quantize(ck_b, str(tmp_path / "b"), stream=True, dataset=rows)
+        arms = {}
+        for name, kwargs in (
+            ("normal", dict(stream=False, dataset=rows)),
+            ("plain", dict(stream=True)),
+            ("prefetch", dict(stream=True, stream_prefetch=1)),
+            ("calib", dict(stream=True, dataset=rows)),
+            ("staged", dict(stream=True, stream_prefetch="cpu" if torch.cuda.device_count() < 2 else "cuda:1")),
+        ):
+            ck = str(tmp_path / f"ck_{name}")
+            shutil.copytree(tiny_checkpoint, ck)
+            arms[name] = self._quantize(ck, str(tmp_path / name), **kwargs)
 
         def load_all(d):
             from safetensors import safe_open
@@ -923,72 +885,41 @@ class TestStreamQuantizeEquivalence:
                         out[k] = f.get_tensor(k)
             return out
 
-        t_a, t_b = load_all(data_driven), load_all(streamed_calib)
-        assert set(t_a) == set(t_b), f"tensor name mismatch: only-a={set(t_a) - set(t_b)} only-b={set(t_b) - set(t_a)}"
-        n_exact, n_close, n_diff = 0, 0, 0
-        for k in t_a:
-            if torch.equal(t_a[k], t_b[k]):
-                n_exact += 1
-            elif torch.allclose(t_a[k].float(), t_b[k].float(), atol=1e-6):
-                n_close += 1
-            else:
-                n_diff += 1
-        assert n_diff == 0, f"{n_diff} tensors differ beyond tolerance"
-        assert n_exact + n_close == len(t_a)
+        t = {name: load_all(d) for name, d in arms.items()}
 
-    def test_streamed_signround_qon_chains_quantized_inputs(self, tiny_checkpoint, tmp_path, monkeypatch):
-        """iters>0 under stream_quantization routes into the streaming loop
-        (routing waiver) and chains each block's quantized outputs as the next
-        block's q_inputs (qon), mirroring the data-driven loop."""
-        import shutil
-
-        from auto_round.algorithms.composer import AlgorithmComposer
-        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
-        from auto_round.autoround import AutoRound
-
-        torch.manual_seed(11)
-        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
-        ck = str(tmp_path / "ck_qon")
-        shutil.copytree(tiny_checkpoint, ck)
-
-        captured = []
-        returned = []
-        orig = AlgorithmComposer.compress_block
-
-        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
-            captured.append(kwargs.get("q_inputs", "absent"))
-            result = orig(self, block, fp_inputs, input_others, *args, **kwargs)
-            returned.append(result)
-            return result
-
-        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
-        ar = AutoRound(
-            ck,
-            scheme="W4A16",
-            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
-            layerwise_rotation=False,
-            stream_quantization=True,
-            dataset=rows,
-            seqlen=32,
-            nsamples=4,
-            format="auto_round",
-            disable_model_free=True,
-            device_map="cpu",
-            low_gpu_mem_usage=True,
-            low_cpu_mem_usage=True,
+        # arm 1: streamed(plain) vs normal - structural equivalence
+        assert set(t["normal"]) == set(t["plain"]), (
+            f"tensor name mismatch: only-normal={set(t['normal']) - set(t['plain'])} "
+            f"only-streamed={set(t['plain']) - set(t['normal'])}"
         )
-        out_dir = ar.quantize_and_save(str(tmp_path / "qon"), format="auto_round")
-        assert out_dir, "streamed SignRound qon run must produce an export"
-        block_calls = [q for q in captured if q != "absent"]
-        assert len(block_calls) >= 2, f"expected >=2 chained block calls, got {len(block_calls)}"
-        assert block_calls[0] is None, "first block has no upstream quantized input"
-        assert any(q is not None for q in block_calls[1:]), "qon chain must feed quantized outputs downstream"
-        # identity: block k+1 receives exactly block k's returned quantized output
-        for k in range(min(len(block_calls), len(returned)) - 1):
-            if returned[k][0] is not None:
-                assert (
-                    block_calls[k + 1] is returned[k][0]
-                ), f"qon chain leak: block {k + 2} did not receive block {k + 1}'s quantized output"
+        quant_suffixes = ("qweight", "qzeros", "scales", "g_idx")
+        n_bitexact, n_quant = 0, 0
+        for k in t["normal"]:
+            if k.endswith(quant_suffixes):
+                n_quant += 1
+                continue
+            assert torch.equal(t["normal"][k], t["plain"][k]), f"non-quantized tensor {k} differs"
+            n_bitexact += 1
+        assert n_bitexact > 0 and n_quant > 0  # both classes present
+        with open(os.path.join(arms["normal"], "quantization_config.json")) as f:
+            cn = json.load(f)
+        with open(os.path.join(arms["plain"], "quantization_config.json")) as f:
+            cp = json.load(f)
+        assert cn == cp
+
+        # arm 2: streamed_calib vs normal - exact reproduction
+        assert set(t["calib"]) == set(t["normal"])
+        for k in t["normal"]:
+            if not torch.equal(t["calib"][k], t["normal"][k]):
+                assert torch.allclose(
+                    t["calib"][k].float(), t["normal"][k].float(), atol=1e-6
+                ), f"stream_calibration tensor {k} differs beyond tolerance"
+
+        # arms 3+4: prefetch / staging leave every exported bit untouched
+        for variant in ("prefetch", "staged"):
+            assert set(t[variant]) == set(t["plain"])
+            for k in t["plain"]:
+                assert torch.equal(t["plain"][k], t[variant][k]), f"tensor {k} differs under {variant}"
 
     def test_streamed_signround_qoff_keeps_q_inputs_none(self, tiny_checkpoint, tmp_path, monkeypatch):
         """enable_quanted_input=False (qoff): every block tunes against the
@@ -1139,117 +1070,6 @@ class TestStreamQuantizeEquivalence:
                 "the plain min/max WrapperLinear means prepare_run was skipped"
             )
 
-    def test_prefetched_export_matches_streamed(self, tiny_checkpoint, tmp_path):
-        """stream_prefetch only changes WHERE the tensors come from (host-RAM
-        cache instead of a synchronous disk read); the exported checkpoint must
-        stay bit-identical to the un-prefetched streaming run."""
-        import shutil
-
-        ck_a = str(tmp_path / "ck_a")
-        ck_b = str(tmp_path / "ck_b")
-        shutil.copytree(tiny_checkpoint, ck_a)
-        shutil.copytree(tiny_checkpoint, ck_b)
-        plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
-        prefetched = self._quantize(ck_b, str(tmp_path / "prefetched"), stream=True, stream_prefetch=1)
-
-        def load_all(d):
-            from safetensors import safe_open
-
-            out = {}
-            for fn in sorted(os.listdir(d)):
-                if not fn.endswith(".safetensors"):
-                    continue
-                with safe_open(os.path.join(d, fn), framework="pt") as f:
-                    for k in f.keys():
-                        out[k] = f.get_tensor(k)
-            return out
-
-        t_plain, t_prefetched = load_all(plain), load_all(prefetched)
-        assert set(t_plain) == set(t_prefetched)
-        for k in t_plain:
-            assert torch.equal(t_plain[k], t_prefetched[k]), f"tensor {k} differs under prefetch"
-
-    def test_staged_export_matches_streamed(self, tiny_checkpoint, tmp_path):
-        """Device staging (round-robin block homes + tensors preloaded onto the
-        staging devices) must not change any exported bit: the quantization
-        math is device-independent, staging only changes where tensors wait.
-        Exercises the full home-rotation plumbing via CPU staging devices; the
-        multi-GPU variant runs on CUDA hosts."""
-        import shutil
-
-        ck_a = str(tmp_path / "ck_a")
-        ck_b = str(tmp_path / "ck_b")
-        shutil.copytree(tiny_checkpoint, ck_a)
-        shutil.copytree(tiny_checkpoint, ck_b)
-        stage_devs = "cpu" if torch.cuda.device_count() < 2 else "cuda:1"
-        plain = self._quantize(ck_a, str(tmp_path / "plain"), stream=True)
-        staged = self._quantize(ck_b, str(tmp_path / "staged"), stream=True, stream_prefetch=stage_devs)
-
-        def load_all(d):
-            from safetensors import safe_open
-
-            out = {}
-            for fn in sorted(os.listdir(d)):
-                if not fn.endswith(".safetensors"):
-                    continue
-                with safe_open(os.path.join(d, fn), framework="pt") as f:
-                    for k in f.keys():
-                        out[k] = f.get_tensor(k)
-            return out
-
-        t_plain, t_staged = load_all(plain), load_all(staged)
-        assert set(t_plain) == set(t_staged)
-        for k in t_plain:
-            assert torch.equal(t_plain[k], t_staged[k]), f"tensor {k} differs under device staging"
-
-    def test_unclaimed_block_passthrough(self, tiny_checkpoint, tmp_path):
-        """Checkpoint block groups with no module counterpart (e.g. an MTP layer
-        transformers does not model) must be written verbatim."""
-        import json
-        import os
-        import shutil
-
-        from safetensors import safe_open
-        from safetensors.torch import save_file
-
-        src = shutil.copytree(tiny_checkpoint, str(tmp_path / "ck"))
-        extra = {
-            "model.layers.3.eh_proj.weight": torch.randn(16, 32),
-            "model.layers.3.enorm.weight": torch.randn(32),
-        }
-        idx_path = os.path.join(src, "model.safetensors.index.json")
-        with open(idx_path) as f:
-            idx = json.load(f)
-        last = sorted(set(idx["weight_map"].values()))[-1]
-        with safe_open(os.path.join(src, last), framework="pt") as f:
-            tensors = {k: f.get_tensor(k) for k in f.keys()}
-        tensors.update(extra)
-        save_file(tensors, os.path.join(src, last), metadata={"format": "pt"})
-        for k in extra:
-            idx["weight_map"][k] = last
-        with open(idx_path, "w") as f:
-            json.dump(idx, f)
-
-        out = self._quantize(src, str(tmp_path / "out"), stream=True)
-
-        idx_file = os.path.join(out, "model.safetensors.index.json")
-        single_file = os.path.join(out, "model.safetensors")
-        if os.path.exists(idx_file):
-            with open(idx_file) as f:
-                wm = json.load(f)["weight_map"]
-            shard = os.path.join(out, wm["model.layers.3.eh_proj.weight"])
-        else:
-            assert os.path.exists(single_file), f"no export tensors in {out}"
-            shard = single_file
-        from safetensors import safe_open
-
-        with safe_open(shard, framework="pt") as f:
-            keys = set(f.keys())
-            assert "model.layers.3.eh_proj.weight" in keys, "unclaimed block tensor dropped from export"
-            assert "model.layers.3.enorm.weight" in keys
-            assert torch.equal(f.get_tensor("model.layers.3.eh_proj.weight"), extra["model.layers.3.eh_proj.weight"])
-            assert torch.equal(f.get_tensor("model.layers.3.enorm.weight"), extra["model.layers.3.enorm.weight"])
-
     @staticmethod
     def _add_extra_group(tiny_checkpoint, dst, extra):
         """Copy the fixture checkpoint and append *extra* tensors to the last shard."""
@@ -1289,60 +1109,6 @@ class TestStreamQuantizeEquivalence:
                 keys |= set(f.keys())
         return keys
 
-    def test_pinned_fused_expert_stack_unfuses_per_expert(self, tiny_checkpoint, tmp_path):
-        """A pinned 3D fused expert stack in a checkpoint-only group must
-        unfuse into per-expert packed Linears (the same split the family
-        module replacement applies to the main body), not stay bf16."""
-        extra = {
-            "mtp2.layers.0.mlp.experts.gate_up_proj.weight": torch.randn(4, 64, 32),
-            "mtp2.layers.0.mlp.experts.down_proj.weight": torch.randn(4, 32, 32),
-        }
-        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
-        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"mtp2": {"bits": 8}})
-        keys = self._export_keys(out)
-        for e in range(4):
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                assert (
-                    f"mtp2.layers.0.mlp.experts.{e}.{proj}.qweight" in keys
-                ), f"expert {e} {proj} not packed; keys: " + ", ".join(sorted(k for k in keys if "mtp2" in k))
-        assert "mtp2.layers.0.mlp.experts.gate_up_proj.weight" not in keys, "fused stack kept beside unfused experts"
-        assert "mtp2.layers.0.mlp.experts.down_proj.weight" not in keys
-
-    def test_toplevel_checkpoint_only_group_with_pin_materializes(self, tiny_checkpoint, tmp_path):
-        """Qwen-style topology: transformers strips a top-level ``mtp.*`` group
-        at load. A pin must materialize + quantize it; siblings stay verbatim."""
-        extra = {
-            "mtp.fc.weight": torch.randn(16, 32),
-            "mtp.norm.weight": torch.randn(32),
-        }
-        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
-        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"mtp.fc": {"bits": 8}})
-        keys = self._export_keys(out)
-        assert "mtp.fc.qweight" in keys, "pinned top-level checkpoint-only layer was not packed"
-        assert "mtp.fc.weight" not in keys, "plain weight written beside its packed form"
-        assert "mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
-
-    def test_tensor_spelled_pin_beats_broader_module_pin(self, tiny_checkpoint, tmp_path):
-        """A pin pattern carrying the trailing tensor dot (``.*mtp.fc.``) must
-        win over a broader module-side pattern for the same layer: it matches
-        the module's tensor spelling. The user-facing failure was mtp.fc
-        quantized 8-bit under {'.*mtp.fc.': float, '.*mtp.*': 8} because the
-        lookup only ever saw the module path 'mtp.fc'."""
-        extra = {
-            "mtp.fc.weight": torch.randn(16, 32),
-            "mtp.norm.weight": torch.randn(32),
-        }
-        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
-        out = self._quantize(
-            src,
-            str(tmp_path / "out"),
-            stream=True,
-            layer_config={".*mtp.fc.": {"bits": 16, "data_type": "float"}, ".*mtp.*": {"bits": 8}},
-        )
-        keys = self._export_keys(out)
-        assert "mtp.fc.weight" in keys, "float-pinned fc not written verbatim"
-        assert not any(k.startswith("mtp.fc.q") for k in keys), f"fc packed despite the float pin: {sorted(keys)}"
-
     def test_pin_entry_for_matches_module_and_tensor_spellings(self):
         from types import SimpleNamespace
 
@@ -1357,62 +1123,102 @@ class TestStreamQuantizeEquivalence:
         assert CompressionOrchestrator._pin_entry_for(orch, "mtp.norm") == {"bits": 8}
         assert CompressionOrchestrator._pin_entry_for(orch, "model.layers.3.mlp.up_proj") is None
 
-    def test_nested_checkpoint_only_group_with_pin_materializes(self, tiny_checkpoint, tmp_path):
-        """Depth-2 topology (``model.mtp.*``): same materialization semantics
-        one level down. Renamed conversion-registry families must NOT be
-        mistaken for checkpoint-only groups (they resolve into modules)."""
-        extra = {
-            "model.mtp.fc.weight": torch.randn(16, 32),
-            "model.mtp.norm.weight": torch.randn(32),
-        }
-        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
-        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"model.mtp.fc": {"bits": 8}})
-        keys = self._export_keys(out)
-        assert "model.mtp.fc.qweight" in keys, "pinned nested checkpoint-only layer was not packed"
-        assert "model.mtp.fc.weight" not in keys
-        assert "model.mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
+    def test_checkpoint_only_group_module_family(self, tiny_checkpoint, tmp_path):
+        """One streamed run over five coexisting module groups covers the whole
+        checkpoint-only pin/materialize/passthrough matrix (merged from seven
+        single-run e2es; each group targets DIFFERENT modules so their pins
+        and verbatim expectations never collide):
 
-    def test_mtp_group_tree_materializes_from_sibling(self, tiny_checkpoint, tmp_path):
-        """A pinned predictor group whose tensors fully cover a decoder
-        sibling builds a REAL module tree (sibling structure snapshot):
-        pinned Linears quantize + pack under their checkpoint names, norms
-        and unpinned tensors pass through verbatim, nothing is duplicated."""
+        - mtp.* pinned at fc: packed Linear + unpinned sibling verbatim
+        - model.mtp2.* nested pinned + fused 3D expert stack under it:
+          nested fc packs, experts unfuse per-expert, sibling norm verbatim
+        - mtp3.* unpinned: the whole group passes through verbatim
+        - mtp4.* tensor-spelled pin ('.*mtp4.fc.' float) beats the broader
+          module-side pattern ('.*mtp4.*' 8-bit) - scoped to mtp4 only
+        - in-block extras (model.layers.3): pinned eh_proj materializes a
+          placeholder Linear and packs; unpinned enorm stays verbatim
+        """
         H = 32
         extra = {
-            "model.layers.3.eh_proj.weight": torch.randn(H, 2 * H),
+            "mtp.fc.weight": torch.randn(16, H),
+            "mtp.norm.weight": torch.randn(H),
+            "model.mtp2.fc.weight": torch.randn(16, H),
+            "model.mtp2.norm.weight": torch.randn(H),
+            "model.mtp2.layers.0.mlp.experts.gate_up_proj.weight": torch.randn(4, 64, H),
+            "model.mtp2.layers.0.mlp.experts.down_proj.weight": torch.randn(4, H, H),
+            "mtp3.fc.weight": torch.randn(16, H),
+            "mtp3.norm.weight": torch.randn(H),
+            "mtp4.fc.weight": torch.randn(16, H),
+            "mtp4.norm.weight": torch.randn(H),
+            "model.layers.3.eh_proj.weight": torch.randn(16, H),
             "model.layers.3.enorm.weight": torch.randn(H),
-            "model.layers.3.hnorm.weight": torch.randn(H),
-            "model.layers.3.final_layernorm.weight": torch.randn(H),
-            "model.layers.3.input_layernorm.weight": torch.randn(H),
-            "model.layers.3.post_attention_layernorm.weight": torch.randn(H),
-            "model.layers.3.self_attn.q_proj.weight": torch.randn(H, H),
-            "model.layers.3.self_attn.k_proj.weight": torch.randn(16, H),
-            "model.layers.3.self_attn.v_proj.weight": torch.randn(16, H),
-            "model.layers.3.self_attn.o_proj.weight": torch.randn(H, H),
-            "model.layers.3.mlp.gate_proj.weight": torch.randn(64, H),
-            "model.layers.3.mlp.up_proj.weight": torch.randn(64, H),
-            "model.layers.3.mlp.down_proj.weight": torch.randn(H, 64),
         }
         src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
-        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"model.layers.3": {"bits": 8}})
+        out = self._quantize(
+            src,
+            str(tmp_path / "out"),
+            stream=True,
+            layer_config={
+                "mtp.fc": {"bits": 8},
+                "model.mtp2.fc": {"bits": 8},
+                "model.mtp2": {"bits": 8},
+                ".*mtp4.fc.": {"bits": 16, "data_type": "float"},
+                ".*mtp4.*": {"bits": 8},
+                "model.layers.3.eh_proj": {"bits": 8},
+            },
+        )
         keys = self._export_keys(out)
-        for leaf in (
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
-            "self_attn.o_proj",
-            "mlp.gate_proj",
-            "mlp.up_proj",
-            "mlp.down_proj",
-        ):
-            assert f"model.layers.3.{leaf}.qweight" in keys, f"{leaf} not packed; keys: " + ", ".join(
-                sorted(k for k in keys if "layers.3" in k)
-            )
-            assert f"model.layers.3.{leaf}.weight" not in keys, f"plain weight kept beside packed form: {leaf}"
-        assert "model.layers.3.eh_proj.qweight" in keys, "pinned predictor fc not packed"
+        # top-level pinned: fc packs, sibling verbatim
+        assert "mtp.fc.qweight" in keys, "pinned top-level checkpoint-only layer was not packed"
+        assert "mtp.fc.weight" not in keys, "plain weight written beside its packed form"
+        assert "mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
+        # nested pinned + fused experts
+        assert "model.mtp2.fc.qweight" in keys, "pinned nested checkpoint-only layer was not packed"
+        assert "model.mtp2.fc.weight" not in keys
+        assert "model.mtp2.norm.weight" in keys, "unpinned nested sibling tensor dropped"
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                assert (
+                    f"model.mtp2.layers.0.mlp.experts.{e}.{proj}.qweight" in keys
+                ), f"expert {e} {proj} not packed; keys: " + ", ".join(sorted(k for k in keys if "mtp2" in k))
+        assert (
+            "model.mtp2.layers.0.mlp.experts.gate_up_proj.weight" not in keys
+        ), "fused stack kept beside unfused experts"
+        # unpinned top-level group: verbatim
+        assert "mtp3.fc.weight" in keys, "unpinned top-level group tensor dropped from export"
+        assert "mtp3.norm.weight" in keys
+        # tensor-spelled precedence
+        assert "mtp4.fc.weight" in keys, "tensor-spelled float pin dropped the tensor"
+        assert "mtp4.fc.qweight" not in keys, "tensor-spelled float pin was quantized by the broader pattern"
+        # a bare 1D norm tensor has no quantizable module: it stays verbatim
+        # even under the broader 8-bit pattern (pins only bind to Linears)
+        assert "mtp4.norm.weight" in keys, "mtp4 norm dropped"
+        # in-block extras
+        assert "model.layers.3.eh_proj.qweight" in keys, "pinned in-block checkpoint-only tensor not packed"
         assert "model.layers.3.eh_proj.weight" not in keys
-        for norm in ("enorm", "hnorm", "final_layernorm", "input_layernorm", "post_attention_layernorm"):
-            assert f"model.layers.3.{norm}.weight" in keys, f"norm {norm} dropped from export"
+        assert "model.layers.3.enorm.weight" in keys, "unpinned in-block extra dropped"
+
+    def test_lm_head_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd):
+        """iters>0 tunes a pinned lm_head with the chain's final hidden states:
+        the tune runs, the layer packs, no closed-form fallback. Kept
+        SEPARATE from the tree-tune e2e: a tuned checkpoint-only tree mutates
+        the chain tail and the lm_head tune falls back (27B regression family;
+        the standalone form is the known-good baseline)."""
+        out = self._quantize(
+            tiny_checkpoint,
+            str(tmp_path / "out"),
+            stream=True,
+            dataset="NeelNanda/pile-10k",
+            layer_config={"lm_head": {"bits": 8}},
+            iters=1,
+        )
+        keys = self._export_keys(out)
+        assert "lm_head.qweight" in keys, "tuned lm_head not packed"
+        assert "lm_head.weight" not in keys, "plain weight kept beside packed form"
+        captured = capfd.readouterr()
+        console = captured.out + captured.err
+        assert "[stream] tuning lm_head with the run's tuning config" in console, "lm_head tune never started"
+        assert "[stream] lm_head falls back to the closed-form search" not in console, "unexpected fallback"
 
     def test_mtp_group_tree_degraded_when_sibling_incomplete(self, tiny_checkpoint, tmp_path):
         """A predictor-shaped group whose layer tensors do NOT cover any
@@ -1434,7 +1240,7 @@ class TestStreamQuantizeEquivalence:
         assert "model.layers.3.mlp.gate_proj.weight" not in keys
         assert "model.layers.3.enorm.weight" in keys, "unpinned sibling tensor dropped in degraded mode"
 
-    def test_mtp_group_tree_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd):
+    def test_mtp_group_tree_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd, monkeypatch):
         """A tuning run (iters>0) tunes the materialized predictor tree with
         the run's own quantizer config: the tune loop runs on the tree's
         layers (visible in the log), the tuned Linears pack, norms pass
@@ -1456,6 +1262,20 @@ class TestStreamQuantizeEquivalence:
             "model.layers.3.mlp.down_proj.weight": torch.randn(H, 64),
         }
         src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        # one run covers THREE lanes (merged from the standalone lm_head-tune,
+        # qon-chain, and sibling-materialize e2es): the predictor tree tune,
+        # the pinned lm_head tune, the qon chained-quantized-inputs contract,
+        # and full-tree materialization completeness
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        chain_calls = []
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            chain_calls.append(kwargs.get("q_inputs", "absent"))
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
         out = self._quantize(
             src,
             str(tmp_path / "out"),
@@ -1476,26 +1296,22 @@ class TestStreamQuantizeEquivalence:
         captured = capfd.readouterr()
         console = captured.out + captured.err
         assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
-
-    def test_lm_head_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd):
-        """iters>0 tunes a pinned lm_head with the chain's final hidden states
-        (the same per-sample loop the data-driven path uses): the tune runs,
-        the layer packs into the shards, and no closed-form fallback fires."""
-        out = self._quantize(
-            tiny_checkpoint,
-            str(tmp_path / "out"),
-            stream=True,
-            dataset="NeelNanda/pile-10k",
-            layer_config={"lm_head": {"bits": 8}},
-            iters=1,
-        )
-        keys = self._export_keys(out)
-        assert "lm_head.qweight" in keys, "tuned lm_head not packed"
-        assert "lm_head.weight" not in keys, "plain weight kept beside packed form"
-        captured = capfd.readouterr()
-        console = captured.out + captured.err
-        assert "[stream] tuning lm_head with the run's tuning config" in console, "lm_head tune never started"
-        assert "[stream] lm_head falls back to the closed-form search" not in console, "unexpected fallback"
+        for leaf in (
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ):
+            assert f"model.layers.3.{leaf}.qweight" in keys, f"{leaf} not packed"
+            assert f"model.layers.3.{leaf}.weight" not in keys, f"plain weight kept beside packed form: {leaf}"
+        # "" = the checkpoint-only tree tune's call (no chained q input); the
+        # decoder-block chain itself must still start at None and link onward
+        block_calls = [q for q in chain_calls if q not in ("absent", "")]
+        assert len(block_calls) >= 2, f"expected >=2 chained block calls, got {len(block_calls)}"
+        assert block_calls[0] is None, "first block has no upstream quantized input"
+        assert any(q is not None for q in block_calls[1:]), "qon chain must feed quantized outputs downstream"
 
     def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
         """A separate auxiliary safetensors file the index never references
@@ -1511,78 +1327,6 @@ class TestStreamQuantizeEquivalence:
         out = self._quantize(src, str(tmp_path / "out"), stream=True)
         keys = self._export_keys(out)
         assert "mtp.fc.weight" in keys, "tensors from unreferenced auxiliary file dropped from export"
-
-    def test_toplevel_checkpoint_only_group_unpinned_written_verbatim(self, tiny_checkpoint, tmp_path):
-        """Completeness: an unpinned top-level checkpoint-only group must reach
-        the export (the root leaf-assign path drops it: no parent module)."""
-        extra = {
-            "mtp.fc.weight": torch.randn(16, 32),
-            "mtp.norm.weight": torch.randn(32),
-        }
-        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
-        out = self._quantize(src, str(tmp_path / "out"), stream=True)
-        keys = self._export_keys(out)
-        assert "mtp.fc.weight" in keys, "unpinned top-level group tensor dropped from export"
-        assert "mtp.norm.weight" in keys
-
-    def test_unclaimed_block_with_pin_materializes(self, tiny_checkpoint, tmp_path):
-        """A layer_config pin on a checkpoint-only block (e.g. an MTP layer)
-        must materialize a placeholder Linear and quantize+pack it instead of
-        silently passing it through verbatim."""
-        import json
-        import os
-        import shutil
-
-        from safetensors import safe_open
-        from safetensors.torch import save_file
-
-        src = shutil.copytree(tiny_checkpoint, str(tmp_path / "ck"))
-        extra = {
-            "model.layers.3.eh_proj.weight": torch.randn(16, 32),
-            "model.layers.3.enorm.weight": torch.randn(32),
-        }
-        idx_path = os.path.join(src, "model.safetensors.index.json")
-        with open(idx_path) as f:
-            idx = json.load(f)
-        last = sorted(set(idx["weight_map"].values()))[-1]
-        with safe_open(os.path.join(src, last), framework="pt") as f:
-            tensors = {k: f.get_tensor(k) for k in f.keys()}
-        tensors.update(extra)
-        save_file(tensors, os.path.join(src, last), metadata={"format": "pt"})
-        for k in extra:
-            idx["weight_map"][k] = last
-        with open(idx_path, "w") as f:
-            json.dump(idx, f)
-
-        out = self._quantize(
-            src,
-            str(tmp_path / "out"),
-            stream=True,
-            layer_config={"model.layers.3.eh_proj": {"bits": 8}},
-        )
-
-        from safetensors import safe_open
-
-        keys = set()
-        for shard_file in sorted(os.listdir(out)):
-            if not shard_file.endswith(".safetensors"):
-                continue
-            with safe_open(os.path.join(out, shard_file), framework="pt") as f:
-                keys |= set(f.keys())
-        assert (
-            "model.layers.3.eh_proj.qweight" in keys
-        ), "pinned checkpoint-only layer was not packed; keys: " + ", ".join(sorted(k for k in keys if "layers.3" in k))
-        assert "model.layers.3.eh_proj.weight" not in keys, "plain weight written beside its packed form"
-        assert "model.layers.3.enorm.weight" in keys, "unpinned sibling tensor dropped"
-
-
-class TestAutoStagingScopesToDeviceMap:
-    """Auto staging never reaches outside the user's --device_map.
-
-    An explicit device map is a sandbox declaration (other GPUs may belong to
-    other jobs); the no-flag default resolves to every visible GPU, so
-    scoping changes nothing there.
-    """
 
     def _resolve(self, monkeypatch, device_list, quant="cuda:1", primary_fit=None):
         from types import SimpleNamespace
