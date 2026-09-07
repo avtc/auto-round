@@ -771,6 +771,27 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "and rerun.".format(rs.resume_index, len(rs.block_names))
                 )
             calib_state["fp_inputs"] = entry
+            _rows_probe = entry.get("hidden_states") if isinstance(entry, dict) else entry
+            if isinstance(_rows_probe, dict):
+                _rows_probe = next(iter(_rows_probe.values()), None)
+            if (
+                not isinstance(_rows_probe, (list, tuple))
+                or not _rows_probe
+                or not isinstance(_rows_probe[0], torch.Tensor)
+            ):
+                _desc = (
+                    f"{type(entry).__name__}"
+                    if not isinstance(_rows_probe, (list, tuple))
+                    else f"rows[{len(_rows_probe)}] first={type(_rows_probe[0]).__name__ if _rows_probe else 'empty'}"
+                )
+                raise RuntimeError(
+                    f"[stream] resume: the saved successor chain entry for group "
+                    f"{rs.block_names[0]}..{rs.block_names[-1]} is not a usable row set "
+                    f"({_desc}); the first resumed block would tune on wrong/no inputs. "
+                    "The bg-finish snapshot may have captured a partially-filled chain - "
+                    "rerun the frontier block with AR_STREAM_BG_PACK=0 or from a fresh "
+                    "resume dir."
+                )
             q_input = rs.load_q_input()
             if self.alg_composer.need_quanted_input():
                 # the quantized-input chain is required (SignRound default):
