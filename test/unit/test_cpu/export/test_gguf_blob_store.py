@@ -20,7 +20,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import pytest
 
 gguf = pytest.importorskip("gguf")
 
