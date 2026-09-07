@@ -168,6 +168,25 @@ def _iter_extra_tensors(cls):
             for tensor_name in tensor_index["weight_map"]:
                 if is_extra_tensor(tensor_name):
                     extra_tensor[tensor_name] = get_tensor_from_file(dir_path, tensor_name)
+            # blob mode only: the streaming loop skips the compressed-tensors
+            # verbatim pass for unreferenced auxiliary safetensors (a family
+            # ships its multi-token-prediction weights as their own file, so
+            # the index never references them); the recorder path must read
+            # them here or the tensors silently vanish from the GGUF
+            from auto_round.export.export_to_gguf.blob_store import RecordingGgufWriter
+
+            if isinstance(getattr(cls, "gguf_writer", None), RecordingGgufWriter):
+                referenced = set(tensor_index["weight_map"].values())
+                for fname in sorted(os.listdir(dir_path)):
+                    if not fname.endswith(".safetensors") or fname in referenced:
+                        continue
+                    with safe_open(os.path.join(dir_path, fname), framework="pt") as aux:
+                        # eager per file (the extras consumer returns values
+                        # as-is); bounded by the aux file's size - typically a
+                        # single predictor block
+                        for tensor_name in list(aux.keys()):
+                            if is_extra_tensor(tensor_name) and tensor_name not in extra_tensor:
+                                extra_tensor[tensor_name] = aux.get_tensor(tensor_name)
         else:
             model_file = os.path.join(dir_path, "model.safetensors")
             if os.path.exists(model_file):

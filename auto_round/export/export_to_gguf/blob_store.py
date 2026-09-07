@@ -172,7 +172,12 @@ class RecordingGgufWriter:
                 )
             shape = list(data.shape)
         if raw_shape is not None:
-            shape = list(raw_shape)
+            # mirror gguf.GGUFWriter: an explicit byte-shape goes through the
+            # same quant-shape conversion when raw_dtype says it is packed
+            if raw_dtype is not None and data.dtype == np.uint8:
+                shape = list(gguf.quant_shape_from_byte_shape(tuple(raw_shape), raw_dtype))
+            else:
+                shape = list(raw_shape)
         self.tensors[0][name] = _BlobTensorInfo(shape, dtype_name, data.nbytes)
         self._store.add_tensor(self._role, name, data, dtype_name, tuple(shape))
 
@@ -428,8 +433,14 @@ def _coerce_gguf_endian(value) -> Any:
 
 
 def _assemble_role(state: dict[str, Any], blob_dir: Path, out_path: Path, progress: bool = False) -> None:
+    # use_temp_file=True spools tensor payloads to a temp file as they are
+    # added instead of holding every blob in memory (a 27B Q4_K payload is
+    # ~15 GB); consumed shards are evicted below on top of that
     writer = gguf.GGUFWriter(
-        path=None, arch=state["arch"], endianess=_coerce_gguf_endian(state.get("endianess", "little"))
+        path=None,
+        arch=state["arch"],
+        endianess=_coerce_gguf_endian(state.get("endianess", "little")),
+        use_temp_file=True,
     )
     replayed = 0
     for op in state.get("kv_ops", []):

@@ -839,7 +839,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         mtp_names = None
         if streamer is not None:
             mtp_names = [n for n in streamer.weight_map if n.startswith(("mtp.", "model.mtp."))]
-        create_model_class(
+        instance = create_model_class(
             save_folder,
             self.model,
             self.layer_config,
@@ -852,6 +852,14 @@ class CompressionOrchestrator(BaseOrchestrator):
             blob_store=store,
             mtp_checkpoint_names=mtp_names,
         )
+        # register as the pack-time global: pack_gguf_layer's lazy creation
+        # would otherwise build a SECOND instance without the MTP hint and
+        # discard this one - and the hint's detection window (before the
+        # checkpoint-only tree materializes) never comes back
+        import auto_round.export.export_to_gguf.export as _gguf_export
+
+        if getattr(_gguf_export, "gguf_model_instance_global", None) is None:
+            _gguf_export.gguf_model_instance_global = [instance]
 
     def _adopt_blob_store_(self) -> None:
         """Adopt a crashed run's blob shards when resuming a streaming GGUF export.

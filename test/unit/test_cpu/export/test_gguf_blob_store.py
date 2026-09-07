@@ -524,3 +524,63 @@ class TestBlobResumeAndRerun:
         assert _remap_mtp_checkpoint_name_(inst, "model.layers.3") == "model.layers.3"
         inst.no_mtp = True
         assert _remap_mtp_checkpoint_name_(inst, "model.mtp.layers.0") == "model.mtp.layers.0"
+
+
+class TestR2Hardening:
+    """R2 review contracts: early-instance registration, fail-fast, parity."""
+
+    def test_ensure_blob_conversion_registers_global(self, monkeypatch, tmp_path):
+        """The MTP-aware early instance must become the pack-time global."""
+        import auto_round.export.export_to_gguf.export as gguf_export
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        created = {}
+
+        def _fake_create(output_dir, model, layer_config, backend, **kwargs):
+            created["kwargs"] = kwargs
+            inst = _FakeConversion(fname_out=str(tmp_path / "m.gguf"))
+            created["instance"] = inst
+            return inst
+
+        import auto_round.compressors.utils as orch_utils
+
+        monkeypatch.setattr(gguf_export, "create_model_class", _fake_create)
+        monkeypatch.setattr(orch_utils, "_get_save_folder_name", lambda fmt, *a, **kw: str(tmp_path / "out"))
+        monkeypatch.setattr(gguf_export, "_clear_gguf_model_instances", lambda: None, raising=False)
+        gguf_export.gguf_model_instance_global = None
+
+        class _Streamer:
+            weight_map = {"mtp.fc.weight": "a.safetensors", "mtp.layers.0.a.weight": "a.safetensors"}
+
+        orch = SimpleNamespace(
+            _gguf_blob_mode=lambda: True,
+            model=SimpleNamespace(),
+            layer_config={},
+            formats=[SimpleNamespace(get_backend_name=lambda: "gguf:q4_0")],
+            model_context=SimpleNamespace(),
+            device="cpu",
+        )
+        try:
+            CompressionOrchestrator._ensure_gguf_blob_conversion_(orch, _Streamer())
+            assert created["kwargs"]["mtp_checkpoint_names"] == list(_Streamer.weight_map)
+            assert gguf_export.gguf_model_instance_global == [
+                created["instance"]
+            ], "the early instance must be registered as the pack-time global"
+            # a second call must not clobber an existing registration
+            other = object()
+            gguf_export.gguf_model_instance_global = [other]
+            CompressionOrchestrator._ensure_gguf_blob_conversion_(orch, None)
+            assert gguf_export.gguf_model_instance_global == [other]
+        finally:
+            gguf_export.gguf_model_instance_global = None
+
+    def test_recorder_raw_shape_matches_real_writer(self, store):
+        rec = store.attach_recorder(_FakeConversion(), "text")
+        data = np.zeros((4, _quant_bytes(256, gguf.GGMLQuantizationType.Q4_K)), np.uint8)
+        rec.add_tensor("blk.0.attn_q.weight", data, raw_shape=(4, 144), raw_dtype=gguf.GGMLQuantizationType.Q4_K)
+        info = rec.tensors[0]["blk.0.attn_q.weight"]
+        real = gguf.GGUFWriter(path=None, arch="llama")
+        real.add_tensor("blk.0.attn_q.weight", data, raw_shape=(4, 144), raw_dtype=gguf.GGMLQuantizationType.Q4_K)
+        real_info = real.tensors[-1]["blk.0.attn_q.weight"] if isinstance(real.tensors[-1], dict) else None
+        if real_info is not None:
+            assert tuple(info.shape) == tuple(real_info.shape)
