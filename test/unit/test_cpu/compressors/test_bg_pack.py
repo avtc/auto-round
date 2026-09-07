@@ -224,6 +224,50 @@ class TestFormatHostBuckets:
         assert _format_host_buckets({}) == ""
 
 
+class TestStreamMemLineFormat:
+    """The [stream-mem] drill-downs ride their parent line, compacted."""
+
+    @staticmethod
+    def _region(rss_bytes, size_bytes, path=""):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(rss=rss_bytes, size=size_bytes, path=path)
+
+    def test_regions_compact_with_basename_and_truncation(self):
+        from auto_round.compressors.orchestrator import _fmt_mem_regions
+
+        GiB = 2**30
+        maps = [
+            self._region(int(4.10 * GiB), int(4.13 * GiB)),  # anon: empty path
+            self._region(int(0.94 * GiB), int(1.96 * GiB), "/m/model-00017-of-00018.safetensors"),
+            self._region(int(0.57 * GiB), int(0.67 * GiB), "[heap]"),
+        ]
+        out = _fmt_mem_regions(maps)
+        assert out == "4.10G/4.13G [anon]; 0.94G/1.96G model-00017-of-00018.safetensors; 0.57G/0.67G [heap]"
+        # cap 4: five mappings -> four listed plus the truncation counter
+        maps.append(self._region(int(0.35 * GiB), int(0.35 * GiB)))
+        maps.append(self._region(int(0.14 * GiB), int(0.14 * GiB)))
+        assert _fmt_mem_regions(maps).endswith("(+1 more)")
+
+    def test_top_tensors_strip_device_prefix_and_truncate(self):
+        from auto_round.compressors.orchestrator import _fmt_mem_top
+
+        GiB = 2**30
+        big = [
+            (int(0.17 * GiB), "cuda:1:model.language_model.layers.61.mlp.up_proj.weight"),
+            (int(0.17 * GiB), "cuda:1:model.language_model.layers.61.mlp.gate_proj.weight"),
+            (int(0.17 * GiB), "cuda:1:model.language_model.layers.61.mlp.down_proj.weight"),
+            (int(0.11 * GiB), "cuda:1:model.language_model.layers.61.self_attn.q_proj.weight"),
+            (int(0.30 * GiB), "cuda:0:chain"),
+        ]
+        out = _fmt_mem_top(big, "cuda:1")
+        assert "cuda:1:" not in out
+        assert out.startswith("0.17G model.language_model.layers.61.mlp.")
+        assert out.endswith("(+1 more)")
+        assert "cuda:0" not in _fmt_mem_top(big, "cuda:0").replace("cuda:0:", "")
+        assert _fmt_mem_top(big, "cuda:9") == ""
+
+
 class TestMainLoopBlockOwnership:
     """With immediate saving the finished block belongs to the pack pipeline,
     never to the main loop: moving it from the loop races the worker's

@@ -94,6 +94,33 @@ def _format_load_breakdown(parts: dict, min_s: float = 0.05) -> str:
     return " (" + ", ".join(f"{k} {v:.1f}s" for k, v in shown) + ")"
 
 
+def _fmt_mem_regions(maps, cap=4):
+    """Compact ``rss/size path`` list of the top host RSS mappings.
+
+    ``[anon]`` covers CUDA pinned pools / torch host caches, ``[heap]`` the
+    allocator, file-backed paths are checkpoint mmaps (basename only).
+    """
+    import os
+
+    parts = []
+    for m in maps[:cap]:
+        name = os.path.basename(m.path or "") or "[anon]"
+        parts.append(f"{m.rss / 2**30:.2f}G/{m.size / 2**30:.2f}G {name}")
+    if len(maps) > cap:
+        parts.append(f"(+{len(maps) - cap} more)")
+    return "; ".join(parts)
+
+
+def _fmt_mem_top(big, dev, cap=3):
+    """Compact ``size name`` list of the largest tensors on one device."""
+    entries = sorted((b for b in big if b[1].startswith(f"{dev}:")), reverse=True)
+    # "cuda:1:name" -> "name" (cpu names carry no index slot)
+    parts = [f"{n / 2**30:.2f}G {name.split(':', 2)[-1]}" for n, name in entries[:cap]]
+    if len(entries) > cap:
+        parts.append(f"(+{len(entries) - cap} more)")
+    return ", ".join(parts)
+
+
 def _format_host_buckets(buckets: dict) -> str:
     """Render host inventory buckets compactly for the [stream-mem] log line.
 
@@ -1339,13 +1366,13 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         seen: set = set()
         per_dev: dict = collections.defaultdict(lambda: collections.defaultdict(int))
-        top_thr = 0.1 * 2**30  # list tensors >= 0.1G alongside the buckets
+        top_the = 0.1 * 2**30  # list tensors >= 0.1G alongside the buckets
         big: list = []  # (nbytes, "dev:name") tuples when the inventory threshold is set
 
         def _add(dev: str, bucket: str, t, name: str = None) -> None:
             nbytes = t.numel() * t.element_size()
             per_dev[dev][bucket] += nbytes
-            if top_thr and nbytes >= top_thr:
+            if top_the and nbytes >= top_the:
                 big.append((nbytes, f"{dev}:{name or bucket}"))
 
         for name, t in list(self.model.named_parameters()) + list(self.model.named_buffers()):
@@ -1407,34 +1434,30 @@ class CompressionOrchestrator(BaseOrchestrator):
             host_buckets = per_dev.get("cpu", {})
             host_parts = _format_host_buckets(host_buckets)
             tracked_gb = sum(v for v in host_buckets.values()) / 2**30
+            # drill-downs ride the summary line (no separate per-drill lines):
+            # top host tensors name the big tracked residents; regions classify
+            # the RESIDUAL (dead memory holds no tensor objects): [heap] =>
+            # allocator fragmentation; anonymous mappings => CUDA pinned pools
+            # / torch host caches; file-backed => checkpoint mmaps
+            trailing = ""
+            if top_the:
+                top_parts = _fmt_mem_top(big, "cpu")
+                if top_parts:
+                    trailing += f" | top: {top_parts}"
+                regions = [m for m in psutil.Process().memory_maps(grouped=False) if m.rss > 0]
+                regions.sort(key=lambda m: -m.rss)
+                region_parts = _fmt_mem_regions(regions)
+                if region_parts:
+                    trailing += f" | regions: {region_parts}"
             logger.debug(
-                "[stream-mem] %s host: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG",
+                "[stream-mem] %s host: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG%s",
                 tag,
                 rss_gb,
                 peak_gb,
                 host_parts or "no tracked cpu tensors",
                 max(0.0, rss_gb - tracked_gb),
+                trailing,
             )
-            if top_thr:
-                top = sorted((b for b in big if b[1].startswith("cpu:")), reverse=True)[:12]
-                if top:
-                    logger.debug(
-                        "[stream-mem] %s host top tensors: %s",
-                        tag,
-                        ", ".join(f"{n / 2**30:.2f}G {name}" for n, name in top),
-                    )
-                # regions classify the RESIDUAL (dead memory holds no tensor
-                # objects): [heap] => allocator fragmentation; anonymous
-                # mappings => CUDA pinned pools / torch host caches;
-                # file-backed => checkpoint mmaps
-                regions = sorted(psutil.Process().memory_maps(grouped=False), key=lambda m: -m.rss)[:8]
-                region_parts = "; ".join(
-                    f"rss {m.rss / 2**30:.2f}G size {m.size / 2**30:.2f}G {m.path or '[anon]'}"
-                    for m in regions
-                    if m.rss > 0
-                )
-                if region_parts:
-                    logger.debug("[stream-mem] %s host regions: %s", tag, region_parts)
         except Exception:  # noqa: BLE001  diagnostics must never break the run
             pass
         for idx in range(torch.cuda.device_count()):
@@ -1448,24 +1471,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # idle GPU (not mapped / nothing staged): all-zero lines are
                 # noise; any nonzero usage still shows below
                 continue
-            if top_thr:
-                top = sorted((b for b in big if b[1].startswith(f"{dev}:")), reverse=True)[:12]
-                if top:
-                    logger.debug(
-                        "[stream-mem] %s %s top tensors: %s",
-                        tag,
-                        dev,
-                        ", ".join(f"{n / 2**30:.2f}G {name.split(':', 1)[1]}" for n, name in top),
-                    )
+            top_parts = _fmt_mem_top(big, dev) if top_the else ""
             other = max(0.0, alloc - tracked / 2**30)
             logger.debug(
-                "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG",
+                "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG%s",
                 tag,
                 dev,
                 alloc,
                 reserved,
                 parts or "no tracked tensors",
                 other,
+                f" | top: {top_parts}" if top_parts else "",
             )
 
     def _tuning_headroom_profile(self):
@@ -1543,7 +1559,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # belong to other jobs), while the default (no --device_map)
             # resolves to every visible GPU, so nothing changes there
             allowed = [torch.device(str(d)) for d in device_manager.device_list if str(d).startswith("cuda")]
-            pool = allowed if allowed else [torch.device("cuda", i) for i in range(n_gpu)]
+            pool = allowed or [torch.device("cuda", i) for i in range(n_gpu)]
             others = [d for d in pool if d != quant_dev]
             if others:
                 devices = [others[0]]
@@ -2398,7 +2414,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if not isinstance(q_rows, (list, tuple)) or len(q_rows) != len(fp_rows):
                 logger.warning(
                     "[stream] lm_head tuning uses FP chain inputs (enable_quanted_input cannot be honored): "
-                    "quantized chain rows are missing or mis-shaped"
+                    "quantized chain rows are missing or malformed"
                 )
                 q_rows = None
         # lm_head consumes POST-final-norm hidden states; the chain tail holds
@@ -2411,7 +2427,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "feeds it (needed to turn chain rows into lm_head inputs)"
             )
             return None
-        # a mis-picked leaf (learned gate, per-head norm) is detectable: the
+        # a wrongly picked leaf (learned gate, per-head norm) is detectable: the
         # real final norm scales the hidden dim lm_head consumes
         in_features = getattr(get_module(self.model, lm_head_name), "in_features", None)
         if in_features is not None and norm_mod.weight.numel() != in_features:
