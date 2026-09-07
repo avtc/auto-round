@@ -2712,3 +2712,149 @@ class TestStreamResumeJumpChainGuard:
         calib = {"fp_inputs": None}
         orch._stream_resume_jump_chain(calib, [rs])
         assert calib["fp_inputs"] is entry
+
+
+class TestFindEmbeddingRenamed:
+    """transformers 5.x VL trees nest the text backbone (model.language_model.*)
+    while checkpoints ship pre-nesting keys; _find_embedding must go through the
+    streamer's rename resolver, not raw weight_map membership."""
+
+    def test_embedding_found_through_rename_resolver(self):
+        import torch
+
+        from auto_round.utils.streaming_calibration import _find_embedding
+
+        class _Streamer:
+            weight_map = {"model.embed_tokens.weight": "model.safetensors"}
+
+            def resolve_checkpoint_name(self, name):
+                if name == "model.language_model.embed_tokens.weight":
+                    return "model.embed_tokens.weight"
+                return name if name in self.weight_map else None
+
+        class _VL:
+            def __init__(self):
+                self.language_model = torch.nn.Module()
+                self.language_model.embed_tokens = torch.nn.Embedding(100, 8)
+                self.visual = torch.nn.Module()
+                self.visual.patch_embed = torch.nn.Module()
+                self.visual.patch_embed.pos_embed = torch.nn.Embedding(16, 8)
+
+            def named_modules(self):
+                yield "", self
+                yield "model.language_model", self.language_model
+                yield "model.language_model.embed_tokens", self.language_model.embed_tokens
+                yield "visual", self.visual
+                yield "visual.patch_embed", self.visual.patch_embed
+                yield "visual.patch_embed.pos_embed", self.visual.patch_embed.pos_embed
+
+        class _Cfg:
+            vocab_size = 100
+
+        vl = _VL()
+        vl.config = _Cfg()
+        name, mod = _find_embedding(vl, _Streamer())
+        assert name == "model.language_model.embed_tokens", f"got {name}"
+        assert mod is vl.language_model.embed_tokens
+
+    def test_embedding_still_found_without_resolver(self):
+        import torch
+
+        from auto_round.utils.streaming_calibration import _find_embedding
+
+        class _Streamer:
+            weight_map = {"model.embed_tokens.weight": "model.safetensors"}
+
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(50, 8)
+        model.config = type("C", (), {"vocab_size": 50})()
+        name, mod = _find_embedding(model, _Streamer())
+        assert name == "model.embed_tokens" and mod is model.model.embed_tokens
+
+
+class TestVlFlatCheckpointRenames:
+    """qwen2-vl-family checkpoints ship flat ``model.*`` text backbones while
+    transformers 5.x nests the tree under ``model.language_model.*``; the
+    streamer must resolve both directions."""
+
+    FLAT_KEYS = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "visual.blocks.0.mlp.fc1.weight",
+    ]
+
+    def test_reverse_name_map_maps_flat_text_backbone(self):
+        from auto_round.utils.checkpoint_streamer import reverse_name_map
+
+        for mt in ("qwen2_vl", "qwen2_5_vl"):
+            rev = reverse_name_map(mt, self.FLAT_KEYS)
+            assert rev["model.language_model.embed_tokens.weight"] == "model.embed_tokens.weight", mt
+            assert rev["model.language_model.layers.0.self_attn.q_proj.weight"] == (
+                "model.layers.0.self_attn.q_proj.weight"
+            ), mt
+            assert "model.language_model.visual.blocks.0.mlp.fc1.weight" not in rev, "vision must not be rewritten"
+
+    def test_reverse_name_map_noop_for_other_families(self):
+        from auto_round.utils.checkpoint_streamer import reverse_name_map
+
+        assert reverse_name_map("llama", self.FLAT_KEYS) == {}
+
+    def test_names_under_resolves_nested_tree_prefix(self, tmp_path):
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        d = tmp_path / "ck"
+        d.mkdir()
+        save_file(
+            {k: torch.zeros(2, 2) for k in self.FLAT_KEYS},
+            str(d / "model.safetensors"),
+            metadata={"format": "pt"},
+        )
+        (d / "config.json").write_text(json.dumps({"model_type": "qwen2_vl"}))
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        s = CheckpointStreamer(str(d))
+        got = s.names_under("model.language_model.layers.0")
+        assert got == ["model.layers.0.self_attn.q_proj.weight"], got
+        assert s.resolve_checkpoint_name("model.language_model.embed_tokens.weight") == "model.embed_tokens.weight"
+        assert s.names_under("visual") == ["visual.blocks.0.mlp.fc1.weight"]
+
+
+class TestProbePositionIds:
+    """mrope families (qwen2-vl lineage) need [3, bs, seq] band ids; plain
+    families keep the [1, seq] arange."""
+
+    def test_mrope_and_plain_forms(self):
+        import torch
+
+        from auto_round.utils.streaming_calibration import _probe_position_ids
+
+        class _MropeCfg:
+            mrope_section = [16, 24, 24]
+
+        class _TextCfg:
+            mrope_section = None
+
+        class _Mrope:
+            config = type("C", (), {"text_config": _MropeCfg()})()
+
+        class _Plain:
+            config = _TextCfg()
+
+        pos = _probe_position_ids(_Mrope, 7, "cpu")
+        assert tuple(pos.shape) == (3, 1, 7), pos.shape
+
+        class _VLRotary:
+            mrope_section = [16, 24, 24]
+
+        # the streaming skeleton exposes only the inner text backbone; the
+        # rotary module's mrope_section must be enough on its own
+        pos = _probe_position_ids(_Plain, 7, "cpu", rotary=_VLRotary())
+        assert tuple(pos.shape) == (3, 1, 7), pos.shape
+        assert torch.equal(pos[0], pos[1]) and torch.equal(pos[1], pos[2]), "text-only bands must be identical"
+        assert tuple(_probe_position_ids(_Plain, 7, "cpu").shape) == (1, 7)

@@ -584,3 +584,282 @@ class TestR2Hardening:
         real_info = real.tensors[-1]["blk.0.attn_q.weight"] if isinstance(real.tensors[-1], dict) else None
         if real_info is not None:
             assert tuple(info.shape) == tuple(real_info.shape)
+
+
+class TestMmprojInstanceUnderEarlyRegistration:
+    """The streaming orchestrator registers the text instance early; the
+    mmproj instance must still be created for MLLM runs at save time."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_global(self):
+        import auto_round.export.export_to_gguf.export as gguf_export
+
+        self.had = "gguf_model_instance_global" in getattr(gguf_export, "__dict__", {})
+        gguf_export.gguf_model_instance_global = None
+        yield
+        if not self.had:
+            gguf_export.__dict__.pop("gguf_model_instance_global", None)
+
+    def _run(self, monkeypatch, tmp_path, pre_registered, mllm):
+        import gguf as gguf_pkg
+
+        import auto_round.export.export_to_gguf.export as gguf_export
+        from auto_round.export.export_to_gguf.config import ModelType
+
+        created = []
+
+        class _FakeInst:
+            def __init__(self, model_type):
+                self.model_arch = gguf_pkg.MODEL_ARCH.MMPROJ if model_type == ModelType.MMPROJ else object()
+                self.fname_out = str(tmp_path / (f"{model_type.name}-out"))
+                self.wrote = False
+
+            def write(self):
+                self.wrote = True
+
+        def _fake_create(output_dir, model, layer_config, backend, **kwargs):
+            inst = _FakeInst(kwargs.get("model_type", ModelType.TEXT))
+            created.append(inst)
+            return inst
+
+        monkeypatch.setattr(gguf_export, "create_model_class", _fake_create)
+        pre = None
+        if pre_registered:
+            pre = _FakeInst(ModelType.TEXT)
+            gguf_export.gguf_model_instance_global = [pre]
+        else:
+            # the real latch is attribute *presence*; delete it for the lazy path
+            gguf_export.__dict__.pop("gguf_model_instance_global", None)
+        # save_quantized_as_gguf clears the global in its finally block
+        gguf_export.save_quantized_as_gguf(
+            str(tmp_path / "out"),
+            model=object(),
+            layer_config={},
+            mllm=mllm,
+            blob_store=None,
+        )
+        return created, pre
+
+    def test_mmproj_created_when_text_pre_registered(self, monkeypatch, tmp_path):
+        """Regression: the mllm append used to live inside the
+        `global not in globals()` guard, so the early-registered streaming
+        instance suppressed mmproj creation entirely."""
+        from auto_round.export.export_to_gguf.config import ModelType
+
+        created, pre = self._run(monkeypatch, tmp_path, pre_registered=True, mllm=True)
+        assert pre.wrote, "the early-registered text instance must still be written"
+        assert any(
+            i.model_arch == gguf.MODEL_ARCH.MMPROJ for i in created
+        ), "mmproj instance must be created even when the text instance was registered early"
+
+    def test_mmproj_not_duplicated_without_mllm(self, monkeypatch, tmp_path):
+        created, _ = self._run(monkeypatch, tmp_path, pre_registered=True, mllm=False)
+        assert not any(i.model_arch == gguf.MODEL_ARCH.MMPROJ for i in created)
+
+    def test_lazy_path_still_creates_both(self, monkeypatch, tmp_path):
+        created, _ = self._run(monkeypatch, tmp_path, pre_registered=False, mllm=True)
+        kinds = [i.model_arch == gguf.MODEL_ARCH.MMPROJ for i in created]
+        assert kinds == [False, True], "lazy path must create text first, then mmproj"
+
+
+class TestStreamGgufBlobMtpE2E:
+    """End-to-end: checkpoint-only MTP tensors survive a streaming blob export
+    as embedded nextn blocks (Qwen3-Next topology)."""
+
+    @pytest.fixture(scope="class")
+    def tiny_qwen3next_ckpt(self, tmp_path_factory):
+        from transformers import Qwen3NextConfig, Qwen3NextForCausalLM
+
+        cfg = Qwen3NextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            head_dim=8,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            num_experts=4,
+            num_experts_per_tok=2,
+        )
+        torch.manual_seed(12)
+        model = Qwen3NextForCausalLM(cfg)
+        d = tmp_path_factory.mktemp("tiny_q3n_ckpt")
+        from tokenizers import Tokenizer
+        from tokenizers import decoders, models as tk_models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        tk = Tokenizer(tk_models.BPE(vocab={"[UNK]": 0, "a": 1, "b": 2}, merges=[]))
+        tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tk.decoder = decoders.ByteLevel()
+        PreTrainedTokenizerFast(tokenizer_object=tk).save_pretrained(str(d))
+        model.save_pretrained(str(d), max_shard_size="40KB")
+
+        # append a checkpoint-only mtp.* group: a full clone of decoder layer 0
+        # plus the fc mixer and the three norms
+        import json
+        import os
+
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        idx_path = os.path.join(str(d), "model.safetensors.index.json")
+        with open(idx_path) as f:
+            idx = json.load(f)
+        last = sorted(set(idx["weight_map"].values()))[-1]
+        sd = {}
+        for shard in sorted(set(idx["weight_map"].values())):
+            with safe_open(os.path.join(str(d), shard), framework="pt") as fh:
+                sd.update({k: fh.get_tensor(k) for k in fh.keys()})
+        h = cfg.hidden_size
+        mtp = {}
+        for k, v in sd.items():
+            if k.startswith("model.layers.0."):
+                mtp["mtp." + k[len("model.") :]] = v.clone()
+        mtp["mtp.fc.weight"] = torch.randn(h, 2 * h)
+        mtp["mtp.pre_fc_norm_embedding.weight"] = torch.randn(h)
+        mtp["mtp.pre_fc_norm_hidden.weight"] = torch.randn(h)
+        mtp["mtp.norm.weight"] = torch.randn(h)
+        with safe_open(os.path.join(str(d), last), framework="pt") as fh:
+            tensors = {k: fh.get_tensor(k) for k in fh.keys()}
+        tensors.update(mtp)
+        save_file(tensors, os.path.join(str(d), last), metadata={"format": "pt"})
+        for k in mtp:
+            idx["weight_map"][k] = last
+        with open(idx_path, "w") as f:
+            json.dump(idx, f)
+        return str(d)
+
+    @pytest.mark.timeout(300)
+    def test_nextn_tensors_and_kv_in_assembled_gguf(self, tiny_qwen3next_ckpt, tmp_path, monkeypatch):
+        gguf = pytest.importorskip("gguf")
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.autoround import AutoRound
+        from auto_round.export.export_to_gguf import llama_cpp_conversion as lcc
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+
+        lcc.get_conversion(tiny_qwen3next_ckpt)
+        conversion_qwen = importlib.import_module("conversion.qwen")
+        monkeypatch.setattr(conversion_qwen.Qwen3NextModel, "get_vocab_base_pre", lambda self, tokenizer: "gpt2")
+        GgufBlobStore.reset_singletons()
+        out_dir = str(tmp_path / "out")
+        ar = AutoRound(
+            tiny_qwen3next_ckpt,
+            scheme="gguf:q4_0",
+            alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
+            stream_quantization=True,
+            stream_prefetch="off",
+            format="gguf:q4_0",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.quantize_and_save(out_dir, format="gguf:q4_0")
+
+        blobs = Path(ar.output_dir) / "gguf-blobs"
+        manifest = json.loads((blobs / "manifest.json").read_text())
+        entries = manifest["roles"]["text"]["tensors"]
+        names = {e["name"] for e in entries}
+        for want in ("blk.2.nextn.eh_proj.weight", "blk.2.nextn.enorm.weight", "blk.2.nextn.hnorm.weight"):
+            assert want in names, f"{want} missing from blob tensors; got {sorted(n for n in names if 'nextn' in n)}"
+        cloned = {n for n in names if n.startswith("blk.2.") and ".nextn." not in n}
+        assert len(cloned) >= 5, f"cloned MTP decoder-layer tensors missing: {sorted(cloned)[:5]}"
+
+        out_path = Path(manifest["roles"]["text"]["out_path"])
+        assert out_path.is_file(), f"assembled .gguf missing at {out_path}"
+        reader = gguf.GGUFReader(str(out_path))
+        kv_names = {str(k) for k in reader.fields}
+        nextn_kv = [k for k in kv_names if "nextn_predict_layers" in k]
+        assert nextn_kv, f"nextn_predict_layers kv missing; fields: {sorted(kv_names)[:8]}"
+        field = reader.fields[nextn_kv[0]]
+        val = field.parts[-1].view(np.int32)[0]
+        assert int(val) == 1
+        dtypes = {t.name: t.tensor_type for t in reader.tensors}
+        assert dtypes["blk.2.nextn.eh_proj.weight"] == gguf.GGMLQuantizationType.Q4_0
+
+
+@pytest.mark.slow
+class TestStreamGgufBlobMmprojE2E:
+    """End-to-end: an MLLM streaming blob run assembles BOTH the text GGUF and
+    the mmproj GGUF from blob shards."""
+
+    @pytest.fixture(scope="class")
+    def vl_ckpt(self, tmp_path_factory):
+        # depth 3: the patch-merger Sequential ends at mlp.2, which needs a
+        # vision block count >= 3 to resolve in the gguf tensor map (real
+        # models have depth >= 27; the shared 2-layer fixture cannot map it)
+        import shutil
+        import sys
+
+        sys.path.insert(0, "test")
+        from helpers import qwen_2_5_vl_name_or_path, save_tiny_model
+
+        d = tmp_path_factory.mktemp("tiny_q25vl_blob")
+        p = save_tiny_model(qwen_2_5_vl_name_or_path, str(d / "model"), num_layers=3, is_mllm=True)
+        yield p
+        shutil.rmtree(p, ignore_errors=True)
+
+    @pytest.mark.timeout(900)
+    def test_stream_quantize_assembles_mmproj(self, vl_ckpt, tmp_path, monkeypatch):
+        # qwen2_vl checkpoints ship flat pre-nesting keys; qwen2_5_vl ships
+        # the same flat layout, so both need the streamer's family rewrite
+        gguf = pytest.importorskip("gguf")
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.autoround import AutoRound
+        from auto_round.export.export_to_gguf import llama_cpp_conversion as lcc
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+
+        lcc.get_conversion(vl_ckpt)
+        conversion_qwenvl = importlib.import_module("conversion.qwenvl")
+        monkeypatch.setattr(conversion_qwenvl.Qwen2VLModel, "get_vocab_base_pre", lambda self, tokenizer: "gpt2")
+        GgufBlobStore.reset_singletons()
+        out_dir = str(tmp_path / "out")
+        ar = AutoRound(
+            vl_ckpt,
+            scheme="gguf:q4_0",
+            alg_configs=[RTNConfig(group_size=32, disable_opt_rtn=False)],
+            quant_nontext_module=False,
+            stream_quantization=True,
+            stream_prefetch="off",
+            format="gguf:q4_0",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.quantize_and_save(out_dir, format="gguf:q4_0")
+
+        blobs = Path(ar.output_dir) / "gguf-blobs"
+        manifest = json.loads((blobs / "manifest.json").read_text())
+        roles = manifest["roles"]
+        assert "mmproj" in roles, f"mmproj role missing from manifest: {sorted(roles)}"
+        assert roles["mmproj"]["tensors"], "mmproj role recorded no tensors"
+        for role in ("text", "mmproj"):
+            out_path = Path(roles[role]["out_path"])
+            assert out_path.is_file(), f"assembled {role} gguf missing at {out_path}"
+            reader = gguf.GGUFReader(str(out_path))
+            manifest_names = {e["name"] for e in roles[role]["tensors"]}
+            reader_names = {t.name for t in reader.tensors}
+            assert reader_names == manifest_names, f"{role}: assembled tensors must match the manifest"
+        mmproj_reader = gguf.GGUFReader(str(Path(roles["mmproj"]["out_path"])))
+        # gguf names vision-tower tensors v.* and merger tensors mm.*
+        assert any(
+            t.name.startswith("v.") for t in mmproj_reader.tensors
+        ), "mmproj gguf carries no vision-tower tensors"
+        assert any(t.name.startswith("mm.") for t in mmproj_reader.tensors), "no merger tensors"
+
+
+class TestMoeImatrixContract:
+    """The per-source imatrix contract only matters for imatrix-aware quants."""
+
+    def test_moe_imatrix_required_by_qtype(self):
+        import gguf as gguf_pkg
+
+        from auto_round.export.export_to_gguf.moe_adapter import moe_imatrix_required
+
+        assert moe_imatrix_required(gguf_pkg.GGMLQuantizationType.IQ4_XS)
+        assert moe_imatrix_required(gguf_pkg.GGMLQuantizationType.IQ2_XXS)
+        assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q4_0)
+        assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q4_K)
+        assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q8_0)

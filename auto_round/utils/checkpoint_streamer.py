@@ -151,11 +151,25 @@ def reverse_name_map(model_type, names) -> dict:
         return rev
     for ckpt_name in names:
         for pattern, replacement in renames:
-            candidate = pattern.sub(lambda _m, r=replacement: r, ckpt_name)
+            m = pattern.match(ckpt_name)
+            if m is None:
+                continue
+            # m.expand honors backreferences but only covers the matched
+            # span; splice the untouched remainder back in (patterns are
+            # start-anchored, so this is the suffix)
+            candidate = ckpt_name[: m.start()] + m.expand(replacement) + ckpt_name[m.end() :]
             if candidate != ckpt_name:
                 rev.setdefault(candidate, ckpt_name)
                 break
     return rev
+
+
+# Families whose shipped checkpoints spell the text backbone flat
+# (``model.*``) while transformers 5.x nests it under
+# ``model.language_model.*``. The conversion registry has no entries for
+# them, so the streamer carries the rewrite itself. Vision towers keep their
+# top-level prefix in both spellings and need no rule.
+_VL_FLAT_TEXT_REWRITES = ((re.compile(r"^model\.(embed_tokens|layers|norm)\."), r"model.language_model.\1."),)
 
 
 @lru_cache(maxsize=None)
@@ -172,10 +186,11 @@ def _name_rewrites_for(model_type):
     """
     if not model_type:
         return ()
+    extra = _VL_FLAT_TEXT_REWRITES if model_type in ("qwen2_vl", "qwen2_5_vl") else ()
     try:
         from transformers.conversion_mapping import WeightRenaming, get_checkpoint_conversion_mapping
     except ImportError:
-        return ()
+        return extra
     pairs = []
     for entry in get_checkpoint_conversion_mapping(model_type) or ():
         if not isinstance(entry, WeightRenaming):
@@ -183,7 +198,7 @@ def _name_rewrites_for(model_type):
         for source in entry.source_patterns:
             for target in entry.target_patterns:
                 pairs.append((re.compile(source), target))
-    return tuple(pairs)
+    return tuple(pairs) + extra
 
 
 class CheckpointStreamer:
@@ -782,8 +797,22 @@ class CheckpointStreamer:
         self._open_order.clear()
 
     def names_under(self, prefix: str) -> list[str]:
-        """Checkpoint tensor names belonging to a module prefix."""
-        return [n for n in self.weight_map if n == prefix or n.startswith(prefix + ".")]
+        """Checkpoint tensor names belonging to a module prefix.
+
+        Handles families whose checkpoint spellings differ from the module
+        tree (e.g. flat ``model.layers.*`` checkpoints loaded into nested
+        ``model.language_model.*`` trees): checkpoint names that rewrite into
+        the prefix count as belonging to it.
+        """
+        exact = [n for n in self.weight_map if n == prefix or n.startswith(prefix + ".")]
+        if exact:
+            return exact
+        rev = self.__dict__.get("_module_to_ckpt")
+        if rev is None:
+            rev = reverse_name_map(self._model_type, self.weight_map)
+            self._module_to_ckpt = rev
+        dot = prefix + "."
+        return [rev[m] for m in rev if m == prefix or m.startswith(dot)]
 
     def _assign_leaf_(self, module: torch.nn.Module, rel_name: str, tensor: torch.Tensor) -> bool:
         """Replace a parameter/buffer leaf (meta-safe: swaps ``_parameters`` /
@@ -864,7 +893,10 @@ class CheckpointStreamer:
                 # checkpoint families whose spellings differ from the modeling
                 # code: apply the registry aliases, never shadowing an exact hit
                 for pattern, replacement in renames:
-                    candidate = pattern.sub(lambda _m, r=replacement: r, name)
+                    m = pattern.match(name)
+                    if m is None:
+                        continue
+                    candidate = name[: m.start()] + m.expand(replacement) + name[m.end() :]
                     if candidate != name:
                         tgt = by_short.get(candidate)
                         if tgt is not None:

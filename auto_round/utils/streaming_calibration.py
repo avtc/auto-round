@@ -241,7 +241,19 @@ def _find_embedding(model, streamer):
 
     best_name, best_mod, best_n = None, None, -1
     for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Embedding) and f"{name}.weight" in streamer.weight_map:
+        if isinstance(module, torch.nn.Embedding):
+            # go through the streamer's rename resolver: transformers 5.x
+            # trees spell VL text backbones ``model.language_model.*`` while
+            # the checkpoints ship the pre-nesting ``model.*`` keys - a raw
+            # weight_map membership test misses every renamed embedding
+            resolve = getattr(streamer, "resolve_checkpoint_name", None)
+            key = (
+                resolve(f"{name}.weight")
+                if resolve is not None
+                else (f"{name}.weight" if f"{name}.weight" in streamer.weight_map else None)
+            )
+            if key is None:
+                continue
             n = module.num_embeddings if hasattr(module, "num_embeddings") else module.weight.shape[0]
             if want is not None and n == want:
                 return name, module
@@ -443,6 +455,31 @@ def _check_ids_in_vocab(rows, vocab):
         )
 
 
+def _probe_position_ids(model, seq, device, rotary=None):
+    """Position ids for the rotary probe, matching the family's rope form.
+
+    mrope checkpoints (qwen2-vl lineage: ``mrope_section`` in the text
+    config) take ``[3, bs, seq]`` band ids - identical bands for text-only
+    calibration; everything else takes the plain ``[1, seq]`` arange.
+    """
+    cfg = getattr(model, "config", None)
+    inner = getattr(cfg, "text_config", None)
+    # mrope_section sits at the top level of VL configs (not the nested text
+    # config), and the streaming skeleton exposes only the inner text
+    # backbone - the rotary module itself is the most reliable tell
+    configs = [c for c in (inner, cfg, getattr(rotary, "config", None)) if c is not None]
+    mrope = any(getattr(c, "mrope_section", None) is not None for c in configs)
+    if rotary is not None and "vlrotary" in type(rotary).__name__.lower():
+        # transformers' VL rotarys (qwen2-vl lineage) unconditionally expand
+        # inv_freq to 3 position bands; some family configs carry no
+        # mrope_section field at all
+        mrope = True
+    pos = torch.arange(seq, device=device)
+    if mrope:
+        return pos.view(1, 1, -1).expand(3, 1, -1)
+    return pos.unsqueeze(0)
+
+
 def prepare_streaming_calibration(
     model, streamer, dataset, device, seqlen, tokenizer=None, first_block=None, nsamples=128
 ):
@@ -503,7 +540,7 @@ def prepare_streaming_calibration(
     # kwargs to supply; every block of a model shares the same layout here
     params = inspect.signature(first_block.forward).parameters if first_block is not None else {}
     if "position_ids" in params:
-        input_others["position_ids"] = [torch.arange(ids.shape[-1]).unsqueeze(0) for ids in rows]
+        input_others["position_ids"] = [_probe_position_ids(model, ids.shape[-1], "cpu", rotary) for ids in rows]
     if "position_embeddings" in params and rotary is not None:
         pe_list = []
         # probe the rotary exactly as the model's own forward does: dummy in
@@ -514,7 +551,7 @@ def prepare_streaming_calibration(
         # block dtype - a mix the attention kernel rejects.
         rotary_dtype = getattr(streamer, "load_dtype", None) or next(model.parameters()).dtype
         for ids in rows:
-            pos = torch.arange(ids.shape[-1], device=device).unsqueeze(0)
+            pos = _probe_position_ids(model, ids.shape[-1], device, rotary)
             cos, sin = rotary(torch.zeros(1, ids.shape[-1], device=device, dtype=rotary_dtype), pos)
             pe_list.append((cos.cpu(), sin.cpu()))
         input_others["position_embeddings"] = pe_list

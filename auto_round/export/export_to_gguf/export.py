@@ -372,20 +372,24 @@ def save_quantized_as_gguf(
                 blob_store=blob_store,
             )
         ]
-        if mllm:
-            gguf_model_instance_global.append(
-                create_model_class(
-                    output_dir,
-                    model,
-                    layer_config,
-                    backend,
-                    model_type=ModelType.MMPROJ,
-                    device=device,
-                    quant_nontext_module=quant_nontext_module,
-                    is_auto_scheme=is_auto_scheme,
-                    blob_store=blob_store,
-                )
+    if mllm and not any(inst.model_arch == gguf.MODEL_ARCH.MMPROJ for inst in gguf_model_instance_global):
+        # the streaming orchestrator registers the text instance early
+        # (_ensure_gguf_blob_conversion_); the mmproj instance must still be
+        # created for MLLM runs, so this lives OUTSIDE the lazy-creation
+        # guard and only appends when no mmproj instance exists yet
+        gguf_model_instance_global.append(
+            create_model_class(
+                output_dir,
+                model,
+                layer_config,
+                backend,
+                model_type=ModelType.MMPROJ,
+                device=device,
+                quant_nontext_module=quant_nontext_module,
+                is_auto_scheme=is_auto_scheme,
+                blob_store=blob_store,
             )
+        )
 
     try:
         for gguf_model in gguf_model_instance_global:

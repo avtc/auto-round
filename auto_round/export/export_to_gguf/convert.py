@@ -49,6 +49,7 @@ from auto_round.export.export_to_gguf.config import ModelType
 from auto_round.export.export_to_gguf.gguf_dtype import GGUFDTypeSelector
 from auto_round.export.export_to_gguf.hf_checkpoint_restorer import HFCheckpointRestorer, RestoredTensor
 from auto_round.export.export_to_gguf.moe_adapter import (
+    moe_imatrix_required,
     pack_moe_output,
     resolve_moe_output,
     validate_moe_imatrices,
@@ -922,9 +923,13 @@ def prepare_tensors(cls):
         if data_torch.dtype not in (torch.float16, torch.float32):
             data_torch = data_torch.to(torch.float32)
 
-        # use the first number-like part of the tensor name as the block id
+        # use the first number-like part of the tensor name as the block id.
+        # Derive it from the FILTERED name: MTP/nextn restore remaps
+        # ``mtp.layers.0.*`` to ``model.layers.{base}.*`` and the MoE expert
+        # stash/merge in modify_tensors builds its lookup names from this id -
+        # a stale pre-remap id would stash and merge under different layers
         bid = None
-        for part in name.split("."):
+        for part in checkpoint_name.split("."):
             if part.isdecimal():
                 bid = int(part)
                 break
@@ -1014,7 +1019,7 @@ def prepare_tensors(cls):
                 )
                 if moe_output is not None:
                     layer_config_names = moe_output.hf_names
-                    validate_moe_source_qtypes(
+                    moe_qtype = validate_moe_source_qtypes(
                         layer_config_names,
                         fallback_qtype,
                         lambda source_name: get_qtype_by_layer_config(
@@ -1022,11 +1027,12 @@ def prepare_tensors(cls):
                         ),
                         f"{checkpoint_name} -> {new_name}",
                     )
-                    validate_moe_imatrices(
-                        layer_config_names,
-                        lambda source_name: get_module(cls.model, source_name.removesuffix(".weight")),
-                        f"{checkpoint_name} -> {new_name}",
-                    )
+                    if moe_imatrix_required(moe_qtype):
+                        validate_moe_imatrices(
+                            layer_config_names,
+                            lambda source_name: get_module(cls.model, source_name.removesuffix(".weight")),
+                            f"{checkpoint_name} -> {new_name}",
+                        )
                 else:
                     # Native fused tensors without source metadata retain the legacy name heuristic.
                     layer_config_names = tuple(get_moe_name(cls, source_name, new_name) for source_name in hf_names)
