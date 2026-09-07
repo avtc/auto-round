@@ -990,6 +990,67 @@ class CompressionOrchestrator(BaseOrchestrator):
         return t
 
     @staticmethod
+    def _resolve_bg_finish_mode(blob_mode: bool, mode: str) -> bool:
+        """Whether the blob-mode finish worker (meta-park + resume snapshot)
+        overlaps on a background thread.
+
+        Blob-mode PACKING must stay serial (the conversion instance carries
+        shared mutable state), but the finish tail touches no instance state
+        and does no GPU math - only D2H copies and file writes - so it needs
+        no second staging device. Only an explicit "off" disables it.
+        """
+        if mode == "off":
+            return False
+        return blob_mode
+
+    def _start_bg_finish_block(
+        self, block, block_name: str, tied_weights_layers: set, rs, q_snap, fp_snap, is_model_last: bool
+    ):
+        """Finish a packed blob block on a background thread.
+
+        Sibling of :func:`_start_bg_pack_block` for the blob path, where the
+        pack (conversion-instance prepare_tensors) has ALREADY run serially in
+        the main loop: the worker only runs the finish tail - meta-park plus
+        the crash-resume snapshot (``mark_block_done`` persists the q/fp chain
+        frontier, ~10 GB D2H + disk per block on a 27B) so that cost overlaps
+        with the next block's tune. ``q_snap``/``fp_snap`` are captured refs to
+        the successor chain rows (the loop replaces dict entries on advance,
+        never mutating the tensors in place - the same contract the pack
+        pipeline relies on). Crash window safety: the blob flush already
+        happened at pack tail, so ``done`` still implies durable shards; a
+        crash before the worker's mark-done simply re-quantizes one block and
+        the blob adoption dedupes its shards.
+        """
+        import threading as _threading
+
+        holder = {"exc": None, "write": 0.0, "snap": 0.0}
+
+        def _worker():
+            import time as _wtime
+
+            try:
+                holder["write"] = (
+                    self._write_finished_block_(
+                        block, block_name, tied_weights_layers, rs, q_snap, fp_snap, is_model_last
+                    )
+                    or 0.0
+                )
+                if envs.AR_PERF_COUNTERS:
+                    logger.info("[stream] bg finish %s: write %.1fs (snapshot)", block_name, holder["write"])
+            except BaseException as e:  # noqa: BLE001 - re-raised at join
+                holder["exc"] = e
+                # same rule as the pack pipeline: no process-wide cache clears
+                # from this thread while the main loop's kernels are in flight
+
+        t = _threading.Thread(target=_worker, daemon=True, name=f"bg-finish-{block_name}")
+        t.autoround_state = holder
+        t.start()
+        # exception-path teardown reaches the worker through the same attr:
+        # at most one background block-pipeline thread exists at any moment
+        self._bg_pack_thread = t
+        return t
+
+    @staticmethod
     def _resolve_bg_pack_mode(mode: str, stage_device_count: int, immediate_packing: bool) -> bool:
         """Resolve AR_STREAM_BG_PACK (auto|1|0) against pipeline support.
 
@@ -2491,6 +2552,22 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.info("[stream] gguf blob mode: packing runs serially in the main loop")
             _bg_pack_eligible = False
         _bg_pack = None
+        _bg_finish = None
+        _bg_finish_eligible = False
+        if self._gguf_blob_mode():
+            # GGUF blob packing runs the conversion instance's prepare_tensors
+            # with shared mutable state (current_packing_block); it is not
+            # safe to overlap with the next block's tune on a worker thread -
+            # in any configuration. The finish tail (meta-park + resume
+            # snapshot) has no such state and does no GPU math, so it still
+            # overlaps on a worker regardless of staging-device count; only
+            # an explicit AR_STREAM_BG_PACK=off serializes everything.
+            _bg_finish_eligible = self._resolve_bg_finish_mode(True, envs.AR_STREAM_BG_PACK)
+            logger.info(
+                "[stream] gguf blob mode: packing runs serially in the main loop%s",
+                "; block finish (resume snapshot) overlaps on a worker" if _bg_finish_eligible else "",
+            )
+            _bg_pack_eligible = False
 
         # Model-level algorithm lifecycle before the block loop, mirroring the
         # data-driven path: SignRoundV2Quantizer.prepare_run binds the optimized
@@ -2648,6 +2725,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self._join_bg_pack(_bg_pack)
                     _bg_pack = None
                     self._bg_pack_thread = None
+                if _bg_finish is not None:
+                    # same ordering contract for the blob finish worker: its
+                    # mark_block_done must land before the next one spawns
+                    # (ResumeState asserts in-order completion)
+                    self._join_bg_pack(_bg_finish)
+                    _bg_finish = None
+                    self._bg_pack_thread = None
                 if _bg_pack_eligible:
                     # pack + write of the FINISHED block move to a background
                     # pipeline thread: they run on this block's (now idle)
@@ -2686,7 +2770,35 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _t_pack = 0.0
 
                 # ── Infrastructure: shard write / device cleanup ──────────
-                if not _bg_pack_eligible and self.compress_context.is_immediate_saving:
+                if _bg_finish_eligible and self.compress_context.is_immediate_saving:
+                    # blob mode: the pack already ran serially above; the
+                    # finish tail (meta-park + resume snapshot) moves to a
+                    # worker and overlaps with the next block's tune. The
+                    # snap refs are captured NOW, before the loop advances.
+                    _is_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
+                    _bg_finish = self._start_bg_finish_block(
+                        block,
+                        block_name,
+                        tied_weights_layers,
+                        rs,
+                        calib_state.get("q_inputs") if calib_state is not None else None,
+                        (None if _is_last else calib_state["fp_inputs"]) if calib_state is not None else None,
+                        _is_last,
+                    )
+                    _t_write = 0.0
+                    _t_snap = 0.0
+                    if envs.AR_PERF_COUNTERS:
+                        logger.info(
+                            "[perf] block %s: load %.1fs%s tune %.1fs pack %.1fs write %.1fs snap %.1fs",
+                            block_name,
+                            _t_load,
+                            _format_load_breakdown(_load_sub),
+                            getattr(block, "_stream_tune_seconds", 0.0),
+                            _t_pack,
+                            _t_write,
+                            _t_snap,
+                        )
+                elif not _bg_pack_eligible and self.compress_context.is_immediate_saving:
                     _t_write = _time.perf_counter()
                     is_model_last = g_idx == len(all_blocks) - 1 and k_idx == len(block_names) - 1
                     self._write_finished_block_(
@@ -2755,6 +2867,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             # last block's pack pipeline must be complete first
             self._join_bg_pack(_bg_pack)
             _bg_pack = None
+            self._bg_pack_thread = None
+        if _bg_finish is not None:
+            # the last block's finish worker owns the resume frontier; it
+            # must land before checkpoint-only groups extend the chain tail
+            self._join_bg_pack(_bg_finish)
+            _bg_finish = None
             self._bg_pack_thread = None
         # Checkpoint-only blocks with a layer_config pin (e.g. an MTP layer
         # the modeling code never instantiates): materialize BEFORE the run

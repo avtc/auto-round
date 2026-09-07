@@ -20,6 +20,8 @@ leaf saves -> write -> flush -> mark_block_done ordering, snapshot args,
 meta release) and failure surfacing at join time.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -201,3 +203,70 @@ class TestMainLoopBlockOwnership:
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
         assert CompressionOrchestrator._main_loop_may_move_block_off_gpu(False) is True
+
+
+class TestBgFinishForBlobMode:
+    """Blob-mode finish worker: packing stays serial, the block finish
+    (meta-park + resume snapshot) overlaps on a background thread."""
+
+    def test_resolve_bg_finish_mode(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator as CO
+
+        # blob mode: the finish worker does no GPU math, so no device-count
+        # requirement; only an explicit "off" disables it
+        assert CO._resolve_bg_finish_mode(True, "auto") is True
+        assert CO._resolve_bg_finish_mode(True, "1") is True
+        assert CO._resolve_bg_finish_mode(True, "off") is False
+        # non-blob formats use the full bg-pack pipeline instead
+        assert CO._resolve_bg_finish_mode(False, "auto") is False
+
+    def test_finish_worker_runs_off_main_and_receives_captured_refs(self):
+        import threading
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator as CO
+
+        calls = []
+
+        def _fake_write(block, block_name, tied, rs, q_snap, fp_snap, is_model_last):
+            calls.append(
+                {
+                    "block_name": block_name,
+                    "thread": threading.current_thread().name,
+                    "is_main": threading.current_thread() is threading.main_thread(),
+                    "q": q_snap,
+                    "fp": fp_snap,
+                    "last": is_model_last,
+                }
+            )
+
+        orch = SimpleNamespace(_write_finished_block_=_fake_write)
+        import auto_round.compressors.orchestrator as orch_mod
+
+        q, fp = object(), object()
+        t = orch_mod.CompressionOrchestrator._start_bg_finish_block(
+            orch, "blk", "model.layers.0", set(), None, q, fp, False
+        )
+        t.join(timeout=10)
+        assert not t.is_alive()
+        assert getattr(t, "autoround_state", {}).get("exc") is None, "worker must not fail"
+        assert len(calls) == 1
+        assert calls[0]["block_name"] == "model.layers.0"
+        assert not calls[0]["is_main"], "finish must run off the main thread"
+        assert calls[0]["q"] is q and calls[0]["fp"] is fp and calls[0]["last"] is False
+
+    def test_finish_worker_failure_surfaces_at_join(self):
+        import threading
+
+        import auto_round.compressors.orchestrator as orch_mod
+
+        def _boom(*a, **kw):
+            raise RuntimeError("snapshot exploded")
+
+        orch = SimpleNamespace(_write_finished_block_=_boom)
+        t = orch_mod.CompressionOrchestrator._start_bg_finish_block(
+            orch, "blk", "model.layers.0", set(), None, None, None, False
+        )
+        t.join(timeout=10)
+        with pytest.raises(RuntimeError, match="refusing to continue"):
+            orch_mod.CompressionOrchestrator._join_bg_pack(t)
+        assert threading.main_thread()  # sanity: back on main
