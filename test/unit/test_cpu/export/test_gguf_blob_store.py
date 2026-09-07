@@ -980,7 +980,7 @@ class TestDiscardShardsAfterAssembly:
 
             def assemble(self, roles, progress=False):
                 calls.append(f"assemble:{roles[0]}")
-                return [Path(self_out) if False else tmp_path / f"{roles[0]}.gguf"]
+                return [tmp_path / f"{roles[0]}.gguf"]
 
             def discard_shards(self):
                 assert calls[-1].startswith("assemble"), calls
