@@ -45,6 +45,12 @@ gguf = LazyImport("gguf")
 
 def _clear_gguf_model_instances():
     globals().pop("gguf_model_instance_global", None)
+    # blob stores are per-run state (recorder kv history + entries); a second
+    # AutoRound run in the same process into the same output dir must start
+    # clean instead of appending to the previous run's recorder
+    from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+
+    GgufBlobStore.reset_singletons()
 
 
 def _clear_gguf_model_instances_on_error(func):
@@ -136,6 +142,7 @@ def create_model_class(
     quant_nontext_module: bool = False,
     is_auto_scheme: bool = False,
     blob_store=None,
+    mtp_checkpoint_names=None,
 ):
     tmp_work_dir = model.name_or_path
     os.makedirs(output_dir, exist_ok=True)
@@ -165,15 +172,36 @@ def create_model_class(
 
         hparams.pop("quantization_config", None)
         # Streaming blob exports keep the embedded MTP/nextn blocks when the
-        # live tree carries them: the conversion class needs the layer count
+        # model carries them: the conversion class needs the layer count
         # up front (its __init__ extends block_count before the tensor map is
-        # built), and configs without mtp_num_hidden_layers (e.g. Qwen3-Next)
-        # get it from the module tree instead of a checkpoint scan.
+        # built). Checkpoint-only MTP trees are invisible in the live module
+        # tree during the block loop (they materialize at group tail), so the
+        # streaming orchestrator passes the checkpoint-side mtp.* tensor
+        # names as a hint; configs without mtp_num_hidden_layers (e.g.
+        # Qwen3-Next) get the count from the tree/hint instead of a
+        # checkpoint scan.
         include_mtp = False
         if blob_store is not None and getattr(model_class, "supports_mtp_export", False):
             n_mtp = _count_mtp_layers(model)
-            has_mtp = n_mtp > 0 or any(
-                n == "mtp" or n == "model.mtp" or n.startswith(("mtp.", "model.mtp.")) for n, _ in model.named_modules()
+            if mtp_checkpoint_names:
+                n_mtp = max(
+                    n_mtp,
+                    max(
+                        (
+                            int(n.split(".layers.", 1)[1].split(".", 1)[0]) + 1
+                            for n in mtp_checkpoint_names
+                            if ".layers." in n and n.split(".layers.", 1)[1].split(".", 1)[0].isdecimal()
+                        ),
+                        default=0,
+                    ),
+                )
+            has_mtp = (
+                n_mtp > 0
+                or any(
+                    n == "mtp" or n == "model.mtp" or n.startswith(("mtp.", "model.mtp."))
+                    for n, _ in model.named_modules()
+                )
+                or bool(mtp_checkpoint_names)
             )
             if has_mtp:
                 hparams.setdefault("mtp_num_hidden_layers", max(n_mtp, 1))
@@ -366,8 +394,12 @@ def save_quantized_as_gguf(
             if blob_store is not None:
                 # blob mode skips every step that would have created the save
                 # folder (shard writes); without it prepare_metadata's
-                # is_dir() fallback assembles the file one level too high
-                os.makedirs(gguf_model.fname_out, exist_ok=True)
+                # is_dir() fallback assembles the file one level too high.
+                # The mmproj instance's fname_out is already a FILE path
+                # (<out>/mmproj-model.gguf) - only mkdir directory-style
+                # outputs.
+                if not str(gguf_model.fname_out).endswith(".gguf"):
+                    os.makedirs(gguf_model.fname_out, exist_ok=True)
             gguf_model.write()
             if blob_store is not None:
                 # blob mode: write() only recorded metadata and spilled tensor

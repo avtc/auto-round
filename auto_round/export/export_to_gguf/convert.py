@@ -179,33 +179,50 @@ def _iter_extra_tensors(cls):
     yield from extra_tensor.items()
 
 
+def _mtp_block_count_(cls) -> int | None:
+    """Base decoder block count for MTP name remapping (instance-bound)."""
+    base = getattr(cls, "_original_block_count", None)
+    if base is not None:
+        return base
+    hparams = {**cls.hparams, **cls.hparams.get("text_config", {})}
+    base = next(
+        (hparams[k] for k in ("n_layers", "num_hidden_layers", "n_layer", "num_layers") if k in hparams),
+        None,
+    )
+    if base is None:
+        return None
+    # cache on the class: filter_tensors (checkpoint path) asserts the same attr
+    type(cls)._original_block_count = base
+    return base
+
+
+def _remap_mtp_checkpoint_name_(cls, name: str) -> str:
+    """Remap an ``mtp.*`` name to the layer-indexed nextn spelling (no-op otherwise).
+
+    Live-model path: the in-memory tree keeps the mtp.* module names while the
+    tensor map only knows the nextn spellings. Bound to the conversion
+    INSTANCE (its ``no_mtp`` flag), so the remap stays consistent with the
+    instance's extended block_count / tensor map.
+    """
+    if getattr(cls, "no_mtp", True) or not name.startswith(("mtp.", "model.mtp.")):
+        return name
+    remap = getattr(cls, "_remap_mtp_name_", None)
+    if remap is None:
+        return name
+    base = _mtp_block_count_(cls)
+    if base is None:
+        logger.warning("%s: cannot remap MTP tensors without a block count; keeping %s", cls, name)
+        return name
+    return remap(name, base)
+
+
 def get_restored_tensors(cls) -> Iterator[RestoredTensor]:
     written_hf_names = getattr(cls, "_gguf_written_hf_names", set())
     written_checkpoint_names = getattr(cls, "_gguf_written_checkpoint_names", set())
     cls.model.tensor_name_list = list(written_hf_names | written_checkpoint_names)
 
-    # Live-model MTP names: the in-memory tree keeps the mtp.* module names
-    # (streaming exports read the state dict directly), while the tensor map
-    # only knows the layer-indexed nextn spellings. Remap the CHECKPOINT name
-    # for mapping/qtype purposes; hf_names keep the real module spellings so
-    # tuned-attribute lookups (get_module) keep working.
-    mtp_remap = getattr(cls, "_remap_mtp_name_", None) if not getattr(cls, "no_mtp", True) else None
-
     def _remap_name(name: str) -> str:
-        if mtp_remap is None or not name.startswith(("mtp.", "model.mtp.")):
-            return name
-        base = getattr(cls, "_original_block_count", None)
-        if base is None:
-            hparams = {**cls.hparams, **cls.hparams.get("text_config", {})}
-            base = next(
-                (hparams[k] for k in ("n_layers", "num_hidden_layers", "n_layer", "num_layers") if k in hparams),
-                None,
-            )
-            if base is None:
-                logger.warning("%s: cannot remap MTP tensors without a block count; keeping %s", cls, name)
-                return name
-            type(cls)._original_block_count = base
-        return mtp_remap(name, base)
+        return _remap_mtp_checkpoint_name_(cls, name)
 
     pending_checkpoint_tensors = {}
     for restored in HFCheckpointRestorer(cls.model, completed_hf_names=written_hf_names).iter_tensors():
@@ -847,7 +864,14 @@ def prepare_tensors(cls):
         ):
             continue
         if hasattr(cls, "current_packing_block") and cls.current_packing_block is not None:  # pylint: disable=E1101
-            current_packing_block_split = cls.current_packing_block.split(".")  # pylint: disable=E1101
+            # remap an mtp-spelled block name the same way tensor names are
+            # remapped, so quantized MTP blocks pack per-block like ordinary
+            # blocks instead of slipping to the (too late) save-time pass
+            # the remap works on tensor names; give the bare module prefix a
+            # tensor-style tail and strip it again after remapping
+            current_packing_block_split = _remap_mtp_checkpoint_name_(
+                cls, cls.current_packing_block + ".weight"  # pylint: disable=E1101
+            )[: -len(".weight")].split(".")
             name_split = name.split(".")
             if (
                 len(name_split) < len(current_packing_block_split)

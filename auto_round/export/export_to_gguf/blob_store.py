@@ -90,10 +90,13 @@ def _decode_value(value: Any) -> Any:
             dtype, item = value["__npscalar__"]
             return np.dtype(dtype).type(item)
         if "__enum__" in value:
-            import importlib
-
             module_name, qualname, member = value["__enum__"]
-            cls = getattr(importlib.import_module(module_name), qualname.rsplit(".", 1)[-1])
+            if module_name.split(".")[0] != "gguf":
+                # the manifest is data, not code: never import arbitrary modules
+                raise ValueError(f"refusing to decode enum from module {module_name!r}")
+            import gguf as _gguf
+
+            cls = getattr(_gguf, qualname.rsplit(".", 1)[-1])
             return cls[member]
         if "__bytes__" in value:
             return base64.b64decode(value["__bytes__"])
@@ -150,6 +153,11 @@ class RecordingGgufWriter:
     ) -> None:
         del tensor_endianess  # single-endianness replay; captured at store level
         data = np.ascontiguousarray(tensor)
+        if name in self.tensors[0]:
+            # mirror gguf.GGUFWriter.add_tensor_info, which raises on
+            # duplicates - a double add is a packing bug, not something to
+            # silently overwrite
+            raise ValueError(f"Duplicated tensor name {name!r} in blob recorder")
         if raw_dtype is not None:
             dtype_name = raw_dtype.name
             if data.dtype == np.uint8:
@@ -249,7 +257,12 @@ class GgufBlobStore:
         _STORE_SINGLETONS.clear()
 
     def adopt_existing(self) -> int:
-        """Load a manifest left by an interrupted run (resume support)."""
+        """Load a manifest left by an interrupted run (resume support).
+
+        Adopted entries are replayed into the role's recorder (tensor-name
+        dedupe + parameter counting) so the save-time metadata pass sees the
+        pre-crash tensors too.
+        """
         manifest = self._read_manifest()
         adopted = 0
         if manifest is not None:
@@ -260,6 +273,10 @@ class GgufBlobStore:
                 shards = [e["shard"] for e in entry["entries"]]
                 entry["shard_counter"] = max((int(s.rsplit("-", 1)[-1].split(".")[0]) for s in shards), default=0)
                 adopted += len(entry["entries"])
+                rec = entry["recorder"]
+                if rec is not None:
+                    for e in state.get("tensors", []):
+                        rec.tensors[0][e["name"]] = _BlobTensorInfo(tuple(e["shape"]), e["dtype"], e["n_bytes"])
         return adopted
 
     # -- per-role state ------------------------------------------------------
@@ -281,6 +298,11 @@ class GgufBlobStore:
         state = self._role_state(role)
         if state["recorder"] is None:
             state["recorder"] = RecordingGgufWriter(self, role)
+            # a resumed run adopts the crashed run's manifest into the store;
+            # replay it into the fresh recorder so dedupe and the parameter
+            # counter account for the pre-crash tensors
+            for e in state["entries"]:
+                state["recorder"].tensors[0][e["name"]] = _BlobTensorInfo(tuple(e["shape"]), e["dtype"], e["n_bytes"])
         conversion_instance.gguf_writer = state["recorder"]
         return state["recorder"]
 
@@ -419,6 +441,9 @@ def _assemble_role(state: dict[str, Any], blob_dir: Path, out_path: Path, progre
         getattr(writer, method)(*args, **kwargs)
         replayed += 1
 
+    from collections import Counter
+
+    remaining_per_shard = Counter(entry["shard"] for entry in state["tensors"])
     loaded_shard: dict[str, dict[str, np.ndarray]] = {}
     for entry in state["tensors"]:
         shard = entry["shard"]
@@ -430,6 +455,12 @@ def _assemble_role(state: dict[str, Any], blob_dir: Path, out_path: Path, progre
             loaded_shard[shard] = tensors
         data = tensors[entry["name"]]
         writer.add_tensor(entry["name"], data, raw_dtype=gguf.GGMLQuantizationType[entry["dtype"]])
+        remaining_per_shard[shard] -= 1
+        if remaining_per_shard[shard] == 0:
+            # entries are contiguous per shard, so this was its last use
+            loaded_shard.pop(shard, None)
+            tensors = None
+            data = None
     logger.info(
         "[gguf-blob] assembling %s: %d tensor(s), %d kv op(s) replayed",
         out_path.name,

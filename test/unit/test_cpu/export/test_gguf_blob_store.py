@@ -66,7 +66,7 @@ def _add_q4_tensor(recorder, name, rows, cols=256, qtype=gguf.GGMLQuantizationTy
     return data
 
 
-def test_recorder_records_kv_ops_and_tensions(store):
+def test_recorder_records_kv_ops_and_tensors(store):
     rec = store.attach_recorder(_FakeConversion(), "text")
     rec.add_uint32("general.block_count", 2)
     rec.add_string("general.architecture", "llama")
@@ -448,3 +448,79 @@ class TestMtpNextnRemap:
         constructed.pop("plain", None)
         _create_conversion_model(_FakePlain, {"a": 1}, include_mtp=True)
         assert constructed["plain"], "non-MTP classes construct directly regardless of the flag"
+
+
+class TestBlobResumeAndRerun:
+    """R1 hardening: crash-resume adoption, in-process reruns, recorder parity."""
+
+    def test_resume_adopts_prior_blobs_and_rebuilds_recorder(self, store, tmp_path):
+        import json as _json
+
+        conv = _FakeConversion(fname_out=str(tmp_path / "m.gguf"))
+        rec = store.attach_recorder(conv, "text")
+        _add_q4_tensor(rec, "blk.0.attn_q.weight", 4)
+        store.flush("text")
+
+        # simulated crash + new process: fresh store adopts the manifest
+        fresh = GgufBlobStore(store.root)
+        assert fresh.adopt_existing() == 1
+        conv2 = _FakeConversion(fname_out=str(tmp_path / "m.gguf"))
+        rec2 = fresh.attach_recorder(conv2, "text")
+        assert "blk.0.attn_q.weight" in rec2.tensors[0], "adopted tensors must replay into the recorder"
+        # the next flush continues at the next shard index - the crashed run's
+        # shard bytes are never overwritten
+        _add_q4_tensor(rec2, "blk.1.attn_q.weight", 4)
+        fresh.flush("text")
+        shards = sorted(p.name for p in fresh.blob_dir.glob("blob-text-*.safetensors"))
+        assert shards == ["blob-text-00001.safetensors", "blob-text-00002.safetensors"]
+        manifest = _json.loads((fresh.blob_dir / "manifest.json").read_text())
+        names = [e["name"] for e in manifest["roles"]["text"]["tensors"]]
+        assert names == ["blk.0.attn_q.weight", "blk.1.attn_q.weight"]
+
+    def test_rerun_resets_via_clear_instances(self, store, tmp_path):
+        from auto_round.export.export_to_gguf.export import _clear_gguf_model_instances
+
+        conv = _FakeConversion(fname_out=str(tmp_path / "m.gguf"))
+        rec = store.attach_recorder(conv, "text")
+        _add_q4_tensor(rec, "blk.0.attn_q.weight", 4)
+        store.flush("text")
+
+        _clear_gguf_model_instances()
+        fresh = GgufBlobStore.get_or_create(store.root)
+        assert fresh._role_state("text")["recorder"] is None
+        assert fresh._role_state("text")["entries"] == []
+
+    def test_recorder_rejects_duplicate_tensor_names(self, store):
+        conv = _FakeConversion()
+        rec = store.attach_recorder(conv, "text")
+        _add_q4_tensor(rec, "blk.0.attn_q.weight", 4)
+        with pytest.raises(ValueError, match="Duplicated tensor name"):
+            _add_q4_tensor(rec, "blk.0.attn_q.weight", 4)
+
+    def test_decode_refuses_foreign_enum_modules(self, store):
+        from auto_round.export.export_to_gguf.blob_store import _decode_value
+
+        with pytest.raises(ValueError, match="refusing to decode"):
+            _decode_value({"__enum__": ["os.path", "SomeEnum", "MEMBER"]})
+
+    def test_mtp_packing_block_name_normalization(self):
+        from auto_round.export.export_to_gguf.convert import _remap_mtp_checkpoint_name_
+
+        class _Inst:
+            no_mtp = False
+            hparams = {"num_hidden_layers": 64}
+            _original_block_count = None
+
+            @classmethod
+            def _remap_mtp_name_(cls, name, base):
+                from auto_round.export.export_to_gguf.conversion.qwen import Qwen3NextModel
+
+                return Qwen3NextModel._remap_mtp_name_(name, base)
+
+        inst = _Inst()
+        # the packing-block filter feeds tensor-style names through the remap
+        assert _remap_mtp_checkpoint_name_(inst, "model.mtp.layers.0.self_attn") == "model.layers.64.self_attn"
+        assert _remap_mtp_checkpoint_name_(inst, "model.mtp.layers.0.weight")[: -len(".weight")] == "model.layers.64"
+        assert _remap_mtp_checkpoint_name_(inst, "model.layers.3") == "model.layers.3"
+        inst.no_mtp = True
+        assert _remap_mtp_checkpoint_name_(inst, "model.mtp.layers.0") == "model.mtp.layers.0"

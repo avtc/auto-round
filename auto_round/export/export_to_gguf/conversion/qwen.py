@@ -357,11 +357,12 @@ class _QwenMtpMixin:
         if (titem := TextModel.filter_tensors(item)) is None:
             return None
         name, gen = titem
+        is_mtp = name.startswith(("mtp.", "model.mtp."))
+        if is_mtp and cls.no_mtp:
+            return None
         if not cls.no_mtp:
             name = cls._remap_mtp_name_(name, cls._original_block_count)
-        elif name.startswith(("mtp.", "model.mtp.")):
-            return None
-        elif cls.mtp_only:
+        if cls.mtp_only and not is_mtp:
             keep = name in (
                 "model.embed_tokens.weight",
                 "model.norm.weight",

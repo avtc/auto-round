@@ -36,7 +36,7 @@ This document presents step-by-step instructions for auto-round llm quantization
     - [Enable multiple gpus calibration in lm_head quantization](#enable-multiple-gpus-calibration-in-lm_head-quantization)
   + [Adjust Hyperparameters](#adjust-hyperparameters)
   + [Streaming Quantization (large models)](#streaming-quantization-large-models)
-   + [Rotation (Research)](#rotation-research)
+  + [Rotation (Research)](#rotation-research)
 * [4 Inference](#4-inference)
   + [CPU](#cpu)
   + [Intel GPU](#intel-gpu)
