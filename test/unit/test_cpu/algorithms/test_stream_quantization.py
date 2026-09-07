@@ -852,10 +852,10 @@ class TestStreamQuantizeEquivalence:
           streamed zero-shot uses a pure weight-MSE search)
         - streamed_calib(rows) vs normal(rows): EXACT reproduction - the
           streaming pass forwards the same rows through the same block chain
-        - streamed(prefetch=1) vs streamed(plain): bit-identical - prefetch
-          only changes WHERE tensors come from
         - streamed(staged) vs streamed(plain): bit-identical - device staging
-          only changes where tensors wait
+          only changes where tensors wait. (The GPU-staging/auto-rotation arm
+          lives in test_cuda: on CPU-only boxes prefetch-auto and staged-cpu
+          both land in host RAM, so it would exercise nothing new here.)
         """
         import shutil
 
@@ -865,7 +865,6 @@ class TestStreamQuantizeEquivalence:
         for name, kwargs in (
             ("normal", dict(stream=False, dataset=rows)),
             ("plain", dict(stream=True)),
-            ("prefetch", dict(stream=True, stream_prefetch=1)),
             ("calib", dict(stream=True, dataset=rows)),
             ("staged", dict(stream=True, stream_prefetch="cpu" if torch.cuda.device_count() < 2 else "cuda:1")),
         ):
@@ -915,8 +914,8 @@ class TestStreamQuantizeEquivalence:
                     t["calib"][k].float(), t["normal"][k].float(), atol=1e-6
                 ), f"stream_calibration tensor {k} differs beyond tolerance"
 
-        # arms 3+4: prefetch / staging leave every exported bit untouched
-        for variant in ("prefetch", "staged"):
+        # staging leaves every exported bit untouched
+        for variant in ("staged",):
             assert set(t[variant]) == set(t["plain"])
             for k in t["plain"]:
                 assert torch.equal(t["plain"][k], t[variant][k]), f"tensor {k} differs under {variant}"
@@ -1651,6 +1650,7 @@ class TestCheckpointOnlyGroupTree:
         from types import MethodType, SimpleNamespace
 
         import torch.nn as nn
+
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
         model = nn.Module()
@@ -1768,8 +1768,9 @@ class TestCheckpointOnlyGroupTree:
         """Building a tree over a fused-3D checkpoint slices each pinned
         per-expert projection out of its stack (real weights, claimed tensor
         names), so the outside-block pass can quantize experts per-module."""
-        import torch.nn as nn
         from types import MethodType, SimpleNamespace
+
+        import torch.nn as nn
 
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
@@ -2157,13 +2158,13 @@ class TestStreamingGlobalBlockIndex:
         import ast
         import inspect
 
-        from auto_round.compressors import orchestrator as orch_mod
-
         # structural (AST) pin: the accumulator update must be a DIRECT
         # statement of the group loop's body (not nested inside the inner
         # per-block loop, not after the loop) - source-substring checks
         # cannot see nesting and let two regressions through
         import textwrap
+
+        from auto_round.compressors import orchestrator as orch_mod
 
         fn = orch_mod.CompressionOrchestrator._quantize_zero_shot
         fn_node = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
@@ -2311,9 +2312,9 @@ class TestZeroShotExceptionTeardown:
         """Legacy API spellings normalize into the single string knob: ints
         (0/depth), None, and bools. True must map to 'auto', not the invalid
         device string 'true'."""
-        from auto_round.compressors.base import BaseCompressor
-
         import inspect
+
+        from auto_round.compressors.base import BaseCompressor
 
         src = inspect.getsource(BaseCompressor.__init__)
         assert "isinstance(_prefetch_raw, bool)" in src, "bool carve-out missing"
