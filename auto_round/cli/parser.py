@@ -339,25 +339,6 @@ def build_eval_parser(*, prog: str = "auto_round eval") -> argparse.ArgumentPars
     return EvalArgumentParser(prog=prog)
 
 
-def build_convert_parser(*, prog: str = "auto_round convert") -> argparse.ArgumentParser:
-    """Offline GGUF conversion from an exported (or plain) checkpoint directory."""
-    parser = argparse.ArgumentParser(
-        prog=prog,
-        description="Convert a saved checkpoint directory to GGUF without loading the model "
-        "(reads shards lazily; supports compressed-tensors packed exports, e.g. "
-        "stream_quantization outputs saved with the auto_round:llm_compressor format).",
-    )
-    parser.add_argument("--model", required=True, help="Local checkpoint directory to convert.")
-    parser.add_argument(
-        "--format",
-        default="gguf:q4_k_m",
-        type=str,
-        help="Target GGUF format, e.g. gguf:q4_0, gguf:q4_k_m, gguf:q8_0, gguf:bf16.",
-    )
-    parser.add_argument("--output_dir", required=True, help="Directory the .gguf file is written to.")
-    return parser
-
-
 def build_root_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auto_round",
@@ -367,7 +348,6 @@ def build_root_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("quantize", help="Quantize a model.", add_help=False)
     subparsers.add_parser("list", help="List supported algorithms or formats.", add_help=False)
     subparsers.add_parser("eval", help="Evaluate a model.", add_help=False)
-    subparsers.add_parser("convert", help="Convert a saved checkpoint to GGUF.", add_help=False)
     help_parser = subparsers.add_parser("help", help="Show help for the CLI or a subcommand.")
-    help_parser.add_argument("topic", nargs="?", choices=["quantize", "list", "eval", "convert"], default=None)
+    help_parser.add_argument("topic", nargs="?", choices=["quantize", "list", "eval"], default=None)
     return parser

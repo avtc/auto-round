@@ -19,7 +19,6 @@ import sys
 from auto_round.cli.algorithms import AlgorithmHandler
 from auto_round.cli.parser import (
     add_common_quantization_arguments,
-    build_convert_parser,
     build_eval_parser,
     build_list_parser,
     build_quantize_parser,
@@ -454,22 +453,6 @@ def tune(args):
 
 
 # ============================================================================
-# convert subcommand
-# ============================================================================
-
-
-def run_convert(argv=None):
-    """Offline GGUF conversion of a saved checkpoint directory."""
-    args = build_convert_parser(prog="auto_round convert").parse_args(argv)
-    from auto_round.export.export_to_gguf.offline_convert import convert_checkpoint_to_gguf
-    from auto_round.logger import logger
-
-    path = convert_checkpoint_to_gguf(args.model, output_dir=args.output_dir, gguf_format=args.format)
-    logger.info("gguf written to %s", path)
-    print(path)
-
-
-# ============================================================================
 # eval subcommand
 # ============================================================================
 
@@ -522,7 +505,7 @@ def run_eval(argv=None):
 
 def _normalize_cli_invocation(argv):
     """Normalize legacy invocation styles to (command, rest_argv)."""
-    if argv and argv[0] in {"quantize", "list", "eval", "convert", "help"}:
+    if argv and argv[0] in {"quantize", "list", "eval", "help"}:
         return argv[0], argv[1:]
     if "--list" in argv:
         normalized = list(argv)
@@ -545,8 +528,6 @@ def _print_help(topic=None):
     if topic == "eval":
         build_eval_parser(prog="auto_round eval").print_help()
         return
-    if topic == "convert":
-        build_convert_parser(prog="auto_round convert").print_help()
         return
     build_root_parser().print_help()
 
@@ -565,9 +546,6 @@ def run():
             return
         if command == "eval":
             run_eval(command_argv)
-            return
-        if command == "convert":
-            run_convert(command_argv)
             return
         start(argv=command_argv)
     except ConfigResolutionError as error:
