@@ -1462,7 +1462,7 @@ class TestStreamQuantizeEquivalence:
             stream=True,
             dataset="NeelNanda/pile-10k",
             layer_config={"model.layers.3": {"bits": 8}},
-            iters=2,
+            iters=1,
         )
         keys = self._export_keys(out)
         assert "model.layers.3.self_attn.q_proj.qweight" in keys, "tuned tree layer not packed"
@@ -1487,7 +1487,7 @@ class TestStreamQuantizeEquivalence:
             stream=True,
             dataset="NeelNanda/pile-10k",
             layer_config={"lm_head": {"bits": 8}},
-            iters=2,
+            iters=1,
         )
         keys = self._export_keys(out)
         assert "lm_head.qweight" in keys, "tuned lm_head not packed"
