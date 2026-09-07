@@ -1137,6 +1137,10 @@ class TestStreamQuantizeEquivalence:
           module-side pattern ('.*mtp4.*' 8-bit) - scoped to mtp4 only
         - in-block extras (model.layers.3): pinned eh_proj materializes a
           placeholder Linear and packs; unpinned enorm stays verbatim
+        - incomplete tree (model.layers.4, no attention): degraded scattered
+          placeholders - pinned tensors still quantize, siblings verbatim
+        - unreferenced auxiliary safetensors file (mtp5.safetensors): its
+          tensors reach the export despite the index never seeing the file
         """
         H = 32
         extra = {
@@ -1152,8 +1156,24 @@ class TestStreamQuantizeEquivalence:
             "mtp4.norm.weight": torch.randn(H),
             "model.layers.3.eh_proj.weight": torch.randn(16, H),
             "model.layers.3.enorm.weight": torch.randn(H),
+            # incomplete predictor-shaped subtree (no attention): must NOT
+            # build a tree, falls back to scattered placeholders (merged from
+            # test_mtp_group_tree_degraded_when_sibling_incomplete)
+            "model.layers.4.eh_proj.weight": torch.randn(H, 2 * H),
+            "model.layers.4.enorm.weight": torch.randn(H),
+            "model.layers.4.hnorm.weight": torch.randn(H),
+            "model.layers.4.mlp.gate_proj.weight": torch.randn(64, H),
         }
         src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        # an auxiliary safetensors file the index never references must still
+        # reach the export (merged from test_unreferenced_safetensors_file_copied_verbatim)
+        from safetensors.torch import save_file
+
+        save_file(
+            {"mtp5.fc.weight": torch.randn(4, 4)},
+            os.path.join(src, "mtp5.safetensors"),
+            metadata={"format": "pt"},
+        )
         out = self._quantize(
             src,
             str(tmp_path / "out"),
@@ -1165,6 +1185,7 @@ class TestStreamQuantizeEquivalence:
                 ".*mtp4.fc.": {"bits": 16, "data_type": "float"},
                 ".*mtp4.*": {"bits": 8},
                 "model.layers.3.eh_proj": {"bits": 8},
+                "model.layers.4": {"bits": 8},
             },
         )
         keys = self._export_keys(out)
@@ -1197,6 +1218,13 @@ class TestStreamQuantizeEquivalence:
         assert "model.layers.3.eh_proj.qweight" in keys, "pinned in-block checkpoint-only tensor not packed"
         assert "model.layers.3.eh_proj.weight" not in keys
         assert "model.layers.3.enorm.weight" in keys, "unpinned in-block extra dropped"
+        # incomplete tree: degraded mode, no tree sibling materialization
+        assert "model.layers.4.mlp.gate_proj.qweight" in keys, "pinned 2D tensor not quantized in degraded mode"
+        assert "model.layers.4.eh_proj.qweight" in keys, "degraded-mode eh_proj not packed"
+        assert "model.layers.4.mlp.gate_proj.weight" not in keys
+        assert "model.layers.4.enorm.weight" in keys, "unpinned sibling dropped in degraded mode"
+        # unreferenced auxiliary file
+        assert "mtp5.fc.weight" in keys, "tensors from unreferenced auxiliary file dropped from export"
 
     def test_lm_head_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd):
         """iters>0 tunes a pinned lm_head with the chain's final hidden states:
@@ -1219,26 +1247,6 @@ class TestStreamQuantizeEquivalence:
         console = captured.out + captured.err
         assert "[stream] tuning lm_head with the run's tuning config" in console, "lm_head tune never started"
         assert "[stream] lm_head falls back to the closed-form search" not in console, "unexpected fallback"
-
-    def test_mtp_group_tree_degraded_when_sibling_incomplete(self, tiny_checkpoint, tmp_path):
-        """A predictor-shaped group whose layer tensors do NOT cover any
-        decoder sibling (missing attention) must not build a tree: it falls
-        back to scattered per-layer placeholders so the pinned tensors still
-        quantize and the rest passes through verbatim."""
-        H = 32
-        extra = {
-            "model.layers.3.eh_proj.weight": torch.randn(H, 2 * H),
-            "model.layers.3.enorm.weight": torch.randn(H),
-            "model.layers.3.hnorm.weight": torch.randn(H),
-            "model.layers.3.mlp.gate_proj.weight": torch.randn(64, H),
-        }
-        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
-        out = self._quantize(src, str(tmp_path / "out"), stream=True, layer_config={"model.layers.3": {"bits": 8}})
-        keys = self._export_keys(out)
-        assert "model.layers.3.mlp.gate_proj.qweight" in keys, "pinned 2D tensor not quantized in degraded mode"
-        assert "model.layers.3.eh_proj.qweight" in keys
-        assert "model.layers.3.mlp.gate_proj.weight" not in keys
-        assert "model.layers.3.enorm.weight" in keys, "unpinned sibling tensor dropped in degraded mode"
 
     def test_mtp_group_tree_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd, monkeypatch):
         """A tuning run (iters>0) tunes the materialized predictor tree with
@@ -1318,21 +1326,6 @@ class TestStreamQuantizeEquivalence:
         assert len(block_calls) >= 2, f"expected >=2 chained block calls, got {len(block_calls)}"
         assert block_calls[0] is None, "first block has no upstream quantized input"
         assert any(q is not None for q in block_calls[1:]), "qon chain must feed quantized outputs downstream"
-
-    def test_unreferenced_safetensors_file_copied_verbatim(self, tiny_checkpoint, tmp_path):
-        """A separate auxiliary safetensors file the index never references
-        (a family shipping MTP weights as their own file) must reach the
-        export; index-based scans cannot see it at all."""
-        import os
-
-        from safetensors.torch import save_file
-
-        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", {})
-        aux = {"mtp.fc.weight": torch.randn(4, 4)}
-        save_file(aux, os.path.join(src, "mtp.safetensors"), metadata={"format": "pt"})
-        out = self._quantize(src, str(tmp_path / "out"), stream=True)
-        keys = self._export_keys(out)
-        assert "mtp.fc.weight" in keys, "tensors from unreferenced auxiliary file dropped from export"
 
     def _resolve(self, monkeypatch, device_list, quant="cuda:1", primary_fit=None):
         from types import SimpleNamespace
