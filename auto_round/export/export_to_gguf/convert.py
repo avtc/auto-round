@@ -610,7 +610,22 @@ def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=F
         if len(embedding_names) == 1:
             name = embedding_names[0]
     if name not in layer_config:
-        return None if explicit_only else data_qtype
+        # regex fallback: pins like '.*mtp.*' match nothing at resolution time
+        # when their modules materialize later (checkpoint-only predictor trees
+        # in streaming runs); the resolver retains such entries as literal
+        # regex keys, so match them here
+        import re
+
+        from auto_round.utils.common import to_standard_regex
+
+        for key, val in layer_config.items():
+            if not isinstance(key, str) or not any(ch in key for ch in (".*", "[", "\\")):
+                continue
+            if re.search(to_standard_regex(key), name):
+                layer_config = {**layer_config, name: val}
+                break
+        else:
+            return None if explicit_only else data_qtype
     if layer_config[name]["bits"] >= 16:
         # a 16-bit (float) pin means "leave this tensor unquantized": honor
         # it instead of applying the file-type default, in the float type

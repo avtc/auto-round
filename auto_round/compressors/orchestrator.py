@@ -771,7 +771,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "and rerun.".format(rs.resume_index, len(rs.block_names))
                 )
             calib_state["fp_inputs"] = entry
-            _rows_probe = entry.get("hidden_states") if isinstance(entry, dict) else entry
+            if isinstance(entry, torch.Tensor):
+                _rows_probe = [entry]  # a plain tensor is a valid simple-chain entry
+            else:
+                _rows_probe = entry.get("hidden_states") if isinstance(entry, dict) else entry
             if isinstance(_rows_probe, dict):
                 _rows_probe = next(iter(_rows_probe.values()), None)
             if (
@@ -863,7 +866,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         instance = create_model_class(
             save_folder,
             self.model,
-            self.layer_config,
+            self._layer_config_with_regex_pins_(),
             self.formats[0].get_backend_name(),
             low_cpu_mem_usage=True,
             model_type=ModelType.TEXT,
@@ -881,6 +884,23 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         if getattr(_gguf_export, "gguf_model_instance_global", None) is None:
             _gguf_export.gguf_model_instance_global = [instance]
+
+    def _layer_config_with_regex_pins_(self):
+        """layer_config plus the resolver-retained regex pin entries.
+
+        Pins like ``'.*mtp.*'`` match nothing at resolution time on streaming
+        runs - the checkpoint-only predictor tree materializes hours later -
+        so the resolver parks them in ``regex_config`` as literal regex keys.
+        Merging them here lets the gguf dtype walk honor them (exact concrete
+        entries still take precedence: they are looked up first)."""
+        merged = dict(self.layer_config)
+        try:
+            regex_pins = self.regex_config or {}
+        except AttributeError:
+            regex_pins = {}
+        for key, val in regex_pins.items():
+            merged.setdefault(key, dict(val) if isinstance(val, dict) else val)
+        return merged
 
     def _adopt_blob_store_(self) -> None:
         """Adopt a crashed run's blob shards when resuming a streaming GGUF export.
