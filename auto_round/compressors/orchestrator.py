@@ -567,10 +567,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             if self._peak_watch is not None:
                 self._peak_watch.set_phase("tune")
 
-            if logger.isEnabledFor(logging.DEBUG):
+            if envs.AR_MEM_COUNTERS:
                 self._log_device_inventory(
                     {"input_others": input_others},
-                    f"block {i}",
+                    "",
                     extra_buckets={
                         "cache-block": input_ids,
                         "cache-remaining": input_others_extra_blocks or {},
@@ -675,17 +675,17 @@ class CompressionOrchestrator(BaseOrchestrator):
             # happened -- so a crash before this point correctly re-does the
             # block on resume instead of skipping it with incomplete/missing
             # output. See auto_round/utils/resume.py.
-            if logger.isEnabledFor(logging.DEBUG):
+            if envs.AR_MEM_COUNTERS:
                 # post-tune sample: the VmHWM delta vs the pre-tune line
                 # measures this block's during-tuning transient peak
                 self._log_device_inventory(
                     None,
-                    f"block {i} post",
+                    "post",
                     extra_buckets={"cache-remaining": input_others_extra_blocks or {}},
                 )
             if self._peak_watch is not None:
                 self._peak_watch.set_phase("write")
-                self._peak_watch.log(f"block {i}")
+                self._peak_watch.log("")
                 self._peak_watch.reset_run_max()
             if resume_state is not None and nblocks == 1:
                 # `input_ids` was already reassigned to `next_input_ids`
@@ -1365,6 +1365,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         import collections
 
         seen: set = set()
+        _tag = f"{tag} " if tag else ""
         per_dev: dict = collections.defaultdict(lambda: collections.defaultdict(int))
         top_the = 0.1 * 2**30  # list tensors >= 0.1G alongside the buckets
         big: list = []  # (nbytes, "dev:name") tuples when the inventory threshold is set
@@ -1449,9 +1450,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 region_parts = _fmt_mem_regions(regions)
                 if region_parts:
                     trailing += f" | regions: {region_parts}"
-            logger.debug(
-                "[stream-mem] %s host: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG%s",
-                tag,
+            logger.info(
+                "[stream-mem] %shost: rss %.2fG (peak %.2fG) | %s | residual(rss-tracked) %.2fG%s",
+                _tag,
                 rss_gb,
                 peak_gb,
                 host_parts or "no tracked cpu tensors",
@@ -1473,9 +1474,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 continue
             top_parts = _fmt_mem_top(big, dev) if top_the else ""
             other = max(0.0, alloc - tracked / 2**30)
-            logger.debug(
-                "[stream-mem] %s %s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG%s",
-                tag,
+            logger.info(
+                "[stream-mem] %s%s: alloc %.2fG / reserved %.2fG | %s | other(alloc-tracked) %.2fG%s",
+                _tag,
                 dev,
                 alloc,
                 reserved,
@@ -2678,7 +2679,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         pbar = tqdm(range(total_block_cnt))
         stream_block_idx = 0
         blocks_before = 0
-        _peak_watch = PeakWatcher() if logger.isEnabledFor(logging.DEBUG) else None
+        _peak_watch = PeakWatcher() if envs.AR_MEM_COUNTERS else None
         if _peak_watch is not None:
             _peak_watch.start()
         for g_idx, block_names in enumerate(all_blocks):
@@ -2952,7 +2953,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 else:
                     clear_memory()
                     self._trim_host_heap()
-                memory_monitor.log_summary()
+                if envs.AR_MEM_COUNTERS:
+                    memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
             # group tail: advance the global-index base by THIS group's block
@@ -3389,7 +3391,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 self._adopt_blob_store_()
 
         _mem_inv = logger.isEnabledFor(logging.DEBUG)
-        _peak_watch = PeakWatcher() if logger.isEnabledFor(logging.DEBUG) else None
+        _peak_watch = PeakWatcher() if envs.AR_MEM_COUNTERS else None
         self._peak_watch = _peak_watch
         if _peak_watch is not None:
             _peak_watch.start()

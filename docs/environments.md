@@ -21,8 +21,17 @@ AutoRound uses a centralized environment variable management system through the 
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_MEM_COUNTERS
+- **Description**: Emit the `[stream-mem]` memory diagnostics (per-block host RSS regions + per-GPU allocation breakdown, pre/post tune, peak-RSS attribution) and the per-block memory-monitor summary in the streaming loop. Informational only.
+- **Default**: `false`
+- **Usage**: Set this to observe streaming memory residency and leaks
+
+```bash
+export AR_MEM_COUNTERS=1
+```
+
 ### AR_PERF_COUNTERS
-- **Description**: Emit per-block `[perf]` timing lines in the streaming loop (load / tune / pack / write / resume snapshot). Informational only.
+- **Description**: Emit per-block `[perf]` timing lines in the streaming loop (load / tune / pack / write / resume snapshot) plus the ggml blob-shard flush cost. Informational only.
 - **Default**: `false`
 - **Usage**: Set this to observe where streaming wall time goes
 

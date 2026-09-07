@@ -33,6 +33,7 @@ import base64
 import enum
 import json
 import os
+import time
 from collections import OrderedDict
 from math import prod
 from pathlib import Path
@@ -41,6 +42,7 @@ from typing import Any
 import numpy as np
 from safetensors.numpy import save_file as _save_safetensors
 
+from auto_round import envs
 from auto_round.logger import logger
 from auto_round.utils import LazyImport
 
@@ -324,13 +326,15 @@ class GgufBlobStore:
         if not state["pending"]:
             return 0
         self.blob_dir.mkdir(parents=True, exist_ok=True)
+        _t0 = time.perf_counter()
         written = 0
+        flushed_bytes = 0
         current: dict[str, np.ndarray] = OrderedDict()
         current_bytes = 0
         current_entries: list[dict[str, Any]] = []
 
         def _emit():
-            nonlocal written, current_bytes
+            nonlocal written, flushed_bytes, current_bytes
             if not current:
                 return
             state["shard_counter"] += 1
@@ -340,6 +344,7 @@ class GgufBlobStore:
                 entry["shard"] = shard_name
                 state["entries"].append(entry)
             written += len(current)
+            flushed_bytes += current_bytes
             current.clear()
             current_entries.clear()
             current_bytes = 0
@@ -356,8 +361,15 @@ class GgufBlobStore:
         _emit()
         state["pending"].clear()
         self._write_manifest()
-        if written:
-            logger.debug("[gguf-blob] flushed %d tensor(s) for role %s (%s)", written, role, reason)
+        if written and envs.AR_PERF_COUNTERS:
+            logger.info(
+                "[gguf-blob] flushed %d tensor(s) (%.2fG) for role %s (%s) in %.1fs",
+                written,
+                flushed_bytes / 2**30,
+                role,
+                reason,
+                time.perf_counter() - _t0,
+            )
         return written
 
     def finalize_role(self, conversion_instance, role: str) -> Path:

@@ -21,6 +21,15 @@ AutoRound 通过 `envs.py` 模块提供统一的环境变量管理系统，支�
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_MEM_COUNTERS
+- **描述**：输出 `[stream-mem]` 内存诊断（每个 block 的宿主内存 RSS 区域明细、逐 GPU 显存占用分布，调优前后各一次、峰值 RSS 归因）以及流式循环中每个 block 的内存监视摘要。仅用于观察。
+- **默认值**：`false`
+- **用法**：设置该变量以观察流式量化的内存驻留与泄漏
+
+```bash
+export AR_MEM_COUNTERS=1
+```
+
 ### AR_PERF_COUNTERS
 - **描述**：在流式循环中输出逐块 `[perf]` 计时（load / tune / pack / write / resume 快照）。仅用于观察。
 - **默认值**：`false`

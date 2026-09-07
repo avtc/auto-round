@@ -48,23 +48,6 @@ class TestMallocTrim:
         assert bool(t.sum() > 0)
 
 
-class TestMemDiagnosticsGatedByDebugLevel:
-    """The streaming memory diagnostics (inventory buckets, top-tensor/
-    region attribution, peak-RSS watcher) have no env switches anymore:
-    they are DEBUG-level log lines, activated by AR_LOG_LEVEL=DEBUG."""
-
-    def test_inventory_and_watcher_gated_on_logger(self):
-        import inspect
-
-        from auto_round.compressors.orchestrator import CompressionOrchestrator
-
-        src = inspect.getsource(CompressionOrchestrator)
-        assert src.count("logger.isEnabledFor(logging.DEBUG)") >= 6  # 4 inventory sites + 2 watcher sites
-        # emissions are debug-level: visible only under AR_LOG_LEVEL=DEBUG
-        assert 'logger.debug(\n                "[stream-mem]' in src
-        assert 'logger.info(\n                "[stream-mem]' not in src
-
-
 class TestConsumedShardClose:
     def _streamer(self, monkeypatch, tmp_path):
         from auto_round.utils.checkpoint_streamer import CheckpointStreamer
