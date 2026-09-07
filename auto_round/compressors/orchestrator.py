@@ -2952,12 +2952,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 else:
                     clear_memory()
                     self._trim_host_heap()
-                # peaks are monotone maxima: log only when the summary moved,
-                # not the same numbers again every block
-                summary = memory_monitor.get_summary()
-                if summary != getattr(self, "_last_mem_summary", None):
-                    logger.info("%s", summary)
-                    self._last_mem_summary = summary
+                memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
             # group tail: advance the global-index base by THIS group's block
