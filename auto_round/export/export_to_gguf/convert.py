@@ -536,7 +536,9 @@ def _quant_data(cls, data_torch, data_qtype, name, modify_name, new_name, bid, d
         layer_name = name
     module = get_module(cls.model, layer_name)
     kwargs = {"scale": None, "zp": None, "d_scale": None, "d_wmin": None, "wmin": None, "imatrix": None}
-    source_qtype = get_qtype_by_layer_config(cls.layer_config, name, data_qtype, explicit_only=True)
+    source_qtype = get_qtype_by_layer_config(
+        cls.layer_config, name, data_qtype, explicit_only=True, source_dtype=data_torch.dtype
+    )
     if use_layer_attrs:
         compatible_stored_qtype = source_qtype == data_qtype
         kwargs = {
@@ -597,7 +599,7 @@ def _pack_spec_moe_output(cls, data_torch, data_qtype, moe_output, modify_name, 
     return pack_moe_output(data_torch, data_qtype, moe_output, quantize_expert, context=context)
 
 
-def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=False):
+def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=False, source_dtype=None):
     name = name[: -len(".weight")]
     if name not in layer_config and name.endswith("embed_tokens"):
         embedding_names = [key for key in layer_config if key.endswith("embed_tokens")]
@@ -610,7 +612,16 @@ def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=F
     if name not in layer_config:
         return None if explicit_only else data_qtype
     if layer_config[name]["bits"] >= 16:
-        return data_qtype
+        # a 16-bit (float) pin means "leave this tensor unquantized": honor
+        # it instead of applying the file-type default, in the float type
+        # that is exact for the source (bf16 -> BF16, fp16 -> F16, fp32 ->
+        # F32). The precision-rank rule then keeps it over every quantized
+        # fallback.
+        if source_dtype == torch.bfloat16:
+            return gguf.GGMLQuantizationType.BF16
+        if source_dtype == torch.float32:
+            return gguf.GGMLQuantizationType.F32
+        return gguf.GGMLQuantizationType.F16
     bits = layer_config[name].get("bits")
     super_bits = layer_config[name].get("super_bits")
     sym = layer_config[name].get("sym")
@@ -705,9 +716,11 @@ def resolve_restored_qtype(
     fallback_qtype,
     diagnostics,
     allow_recipe_fallback=False,
+    source_dtype=None,
 ):
     source_qtypes = [
-        get_qtype_by_layer_config(layer_config, hf_name, fallback_qtype, explicit_only=True) for hf_name in hf_names
+        get_qtype_by_layer_config(layer_config, hf_name, fallback_qtype, explicit_only=True, source_dtype=source_dtype)
+        for hf_name in hf_names
     ]
     matched_qtypes = [qtype for qtype in source_qtypes if qtype is not None]
 
@@ -1048,6 +1061,7 @@ def prepare_tensors(cls):
                         else []
                     ),
                     allow_recipe_fallback=not getattr(cls, "is_auto_scheme", False),
+                    source_dtype=data_torch.dtype,
                 )
                 # # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if layer_config_qtype is not None:

@@ -867,3 +867,73 @@ class TestMoeImatrixContract:
         assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q4_0)
         assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q8_0)
         assert not moe_imatrix_required(gguf_pkg.GGMLQuantizationType.Q8_K)
+
+
+class TestFloatPinKeepsTensorUnquantized:
+    """A 16-bit (float) layer_config pin must keep a GGUF tensor unquantized
+    instead of applying the file-type default, in the float type that is exact
+    for the source dtype (bf16 -> BF16, fp16 -> F16, fp32 -> F32)."""
+
+    def test_float_pin_maps_by_source_dtype(self):
+        import gguf as gguf_pkg
+
+        from auto_round.export.export_to_gguf.convert import get_qtype_by_layer_config
+
+        cfg = {"embed_tokens": {"bits": 16, "data_type": "float"}, "lm_head": {"bits": 8}}
+        for fallback in (gguf_pkg.GGMLQuantizationType.Q4_0, gguf_pkg.GGMLQuantizationType.Q6_K):
+            got = get_qtype_by_layer_config(
+                cfg, "embed_tokens.weight", fallback, explicit_only=True, source_dtype=torch.bfloat16
+            )
+            assert got == gguf_pkg.GGMLQuantizationType.BF16, (fallback, got)
+        assert (
+            get_qtype_by_layer_config(
+                cfg,
+                "embed_tokens.weight",
+                gguf_pkg.GGMLQuantizationType.Q6_K,
+                explicit_only=True,
+                source_dtype=torch.float16,
+            )
+            == gguf_pkg.GGMLQuantizationType.F16
+        )
+        assert (
+            get_qtype_by_layer_config(
+                cfg,
+                "embed_tokens.weight",
+                gguf_pkg.GGMLQuantizationType.Q6_K,
+                explicit_only=True,
+                source_dtype=torch.float32,
+            )
+            == gguf_pkg.GGMLQuantizationType.F32
+        )
+        # unknown dtype stays on llama.cpp's canonical F16
+        assert (
+            get_qtype_by_layer_config(
+                cfg, "embed_tokens.weight", gguf_pkg.GGMLQuantizationType.Q6_K, explicit_only=True
+            )
+            == gguf_pkg.GGMLQuantizationType.F16
+        )
+        assert get_qtype_by_layer_config(cfg, "lm_head.weight", gguf_pkg.GGMLQuantizationType.Q4_0) == (
+            gguf_pkg.GGMLQuantizationType.Q8_0
+        )
+
+    def test_float_pin_wins_through_resolve_restored_qtype(self):
+        import gguf as gguf_pkg
+
+        from auto_round.export.export_to_gguf.convert import resolve_restored_qtype
+
+        cfg = {"model.embed_tokens": {"bits": 16, "data_type": "float"}}
+        for dtype, want in (
+            (torch.bfloat16, gguf_pkg.GGMLQuantizationType.BF16),
+            (None, gguf_pkg.GGMLQuantizationType.F16),
+        ):
+            got = resolve_restored_qtype(
+                cfg,
+                ("model.embed_tokens.weight",),
+                "model.embed_tokens.weight",
+                "token_embd.weight",
+                gguf_pkg.GGMLQuantizationType.Q6_K,  # the large-tensor mix default
+                [],
+                allow_recipe_fallback=True,
+                source_dtype=dtype,
+            )
+            assert got == want, (dtype, got)
