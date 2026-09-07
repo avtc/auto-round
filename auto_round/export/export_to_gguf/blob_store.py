@@ -152,7 +152,10 @@ class RecordingGgufWriter:
         tensor_endianess: Any = None,
     ) -> None:
         del tensor_endianess  # single-endianness replay; captured at store level
-        data = np.ascontiguousarray(tensor)
+        # OWN the bytes: ascontiguousarray keeps a VIEW for contiguous inputs,
+        # and the walked tensor's buffer can be reused (freed model memory
+        # reads back as zeros) before a late role flush serializes it
+        data = np.array(tensor, order="C", copy=True)
         if name in self.tensors[0]:
             # mirror gguf.GGUFWriter.add_tensor_info, which raises on
             # duplicates - a double add is a packing bug, not something to

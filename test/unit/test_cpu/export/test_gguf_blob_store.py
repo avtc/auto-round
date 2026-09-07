@@ -239,6 +239,35 @@ def test_float16_passthrough_and_bytes_kv(store, tmp_path):
     assert bytes(bytearray(np.asarray(pre).view(np.uint8).ravel())) == bytes([0x1, 0x2, 0x3])
 
 
+class TestRecorderOwnsPayloadMemory:
+    """The recorder must OWN the payload bytes it defers to flush.
+
+    np.ascontiguousarray returns a VIEW for contiguous inputs, so a walked
+    tensor's buffer could be reused (freed model memory reads back as zeros)
+    before the late mmproj-role flush - a 27B mmproj shipped all-zero
+    tensors."""
+
+    def test_add_tensor_copies_view_backing_buffer(self, tmp_path):
+        import numpy as np
+
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore, RecordingGgufWriter
+
+        GgufBlobStore.reset_singletons()
+        store = GgufBlobStore.get_or_create(str(tmp_path / "blobs"))
+        rec = RecordingGgufWriter(store, "mmproj")
+        buf = np.ones(8, dtype=np.float32)
+        rec.add_tensor("v.probe.weight", buf)
+        buf[:] = 0.0  # simulate buffer reuse after the walk
+        store.flush("mmproj")
+        manifest = json.loads((tmp_path / "blobs" / "gguf-blobs" / "manifest.json").read_text())
+        shard = manifest["roles"]["mmproj"]["tensors"][0]["shard"]
+        from safetensors import safe_open
+
+        with safe_open(str(tmp_path / "blobs" / "gguf-blobs" / shard), framework="np") as f:
+            got = f.get_tensor("v.probe.weight")
+        assert (got == 1.0).all(), f"payload aliased the walked buffer: {got}"
+
+
 class TestBlobModeBranches:
     def test_gguf_blob_mode_detection(self):
         from auto_round.compressors.orchestrator import CompressionOrchestrator
@@ -826,6 +855,15 @@ class TestStreamGgufBlobMmprojE2E:
             t.name.startswith("v.") for t in mmproj_reader.tensors
         ), "mmproj gguf carries no vision-tower tensors"
         assert any(t.name.startswith("mm.") for t in mmproj_reader.tensors), "no merger tensors"
+        # payloads must be real: a late-flushing role once serialized buffers
+        # that the walk's tensors no longer backed (27B mmproj shipped
+        # all-zero vision tensors and hallucinated)
+        import numpy as np
+
+        nz = sum(1 for t in mmproj_reader.tensors if float(np.abs(t.data).max()) > 0.0)
+        assert nz == len(mmproj_reader.tensors), (
+            f"{len(mmproj_reader.tensors) - nz} all-zero mmproj tensors (lazy mmap closed before the walk?)"
+        )
         # resumed-run contract (folded from the llama crash-resume e2e):
         # outside-block roots survive the resume and the pins hold
         text_reader = gguf.GGUFReader(str(Path(roles["text"]["out_path"])))

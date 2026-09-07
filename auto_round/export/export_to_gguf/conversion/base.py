@@ -390,6 +390,12 @@ class ModelBase:
         else:
             weight_map = {}
 
+        # the lazy tensor generators returned by this method read the shard
+        # mmaps on demand (at walk time, long after this method returns);
+        # closing the contexts here would leave those late reads zero-filled
+        # (a streaming mmproj run shipped an all-zero vision tower this way).
+        # Hold every part context open for the instance's lifetime instead.
+        self._open_index_parts: list[Any] = []
         for part_name in part_names:
             logger.info(f"gguf: indexing model part '{part_name}'")
             ctx: ContextManager[Any]
@@ -400,34 +406,34 @@ class ModelBase:
                     torch.load(str(self.dir_model / part_name), map_location="cpu", mmap=True, weights_only=True)
                 )
 
-            with ctx as model_part:
-                assert model_part is not None
+            model_part = ctx.__enter__()
+            self._open_index_parts.append(ctx)
+            assert model_part is not None
 
-                for name in model_part.keys():
-                    tensor_names_from_parts.add(name)
-                    if is_safetensors:
-                        data: gguf.utility.LocalTensor = model_part[name]
-                        if self.lazy:
-                            data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
-                        else:
-                            dtype = LazyTorchTensor._dtype_str_map[data.dtype]
-                            data_gen = (
-                                lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes())
-                                .view(dtype)
-                                .reshape(data.shape)
-                            )  # noqa: E731
+            for name in model_part.keys():
+                tensor_names_from_parts.add(name)
+                if is_safetensors:
+                    data: gguf.utility.LocalTensor = model_part[name]
+                    if self.lazy:
+                        data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
                     else:
-                        data_torch: Tensor = model_part[name]
-                        if self.lazy:
-                            data_gen = lambda data=data_torch: LazyTorchTensor.from_eager(data)  # noqa: E731
-                        else:
-                            data_gen = lambda data=data_torch: data  # noqa: E731
-                    if titem := self.filter_tensors((name, data_gen)):
-                        tname, tgen = titem
-                        tensors[tname] = tgen
-                        if tname != name:
-                            self._loader_renames[tname] = name
-
+                        dtype = LazyTorchTensor._dtype_str_map[data.dtype]
+                        data_gen = (
+                            lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes())
+                            .view(dtype)
+                            .reshape(data.shape)
+                        )  # noqa: E731
+                else:
+                    data_torch: Tensor = model_part[name]
+                    if self.lazy:
+                        data_gen = lambda data=data_torch: LazyTorchTensor.from_eager(data)  # noqa: E731
+                    else:
+                        data_gen = lambda data=data_torch: data  # noqa: E731
+                if titem := self.filter_tensors((name, data_gen)):
+                    tname, tgen = titem
+                    tensors[tname] = tgen
+                    if tname != name:
+                        self._loader_renames[tname] = name
         # verify tensor name presence and identify potentially missing files
         if len(tensor_names_from_index) > 0:
             if len(tensor_names_from_parts.symmetric_difference(tensor_names_from_index)) > 0:
@@ -815,7 +821,16 @@ class ModelBase:
 
     def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
         for name, gen in self.model_tensors.items():
-            yield name, gen()
+            t = gen()
+            if not hasattr(t, "dtype"):
+                t = t()
+            # meta-backed lazy tensors must materialize EAGERLY here: their
+            # lazy numpy view downstream materializes zero-filled memory, and
+            # a streaming mmproj run shipped an all-zero vision tower that
+            # way (llama.cpp then hallucinated on every image)
+            if isinstance(t, LazyTorchTensor) and t.is_meta:
+                t = LazyTorchTensor.to_eager(t)
+            yield name, t
 
     def format_tensor_name(self, key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight") -> str:
         if key not in gguf.MODEL_TENSORS[self.model_arch]:
