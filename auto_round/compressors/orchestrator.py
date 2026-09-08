@@ -1559,34 +1559,52 @@ class CompressionOrchestrator(BaseOrchestrator):
 
     @staticmethod
     def _pin_stream_mapped_(block, placement: dict) -> None:
-        """Bind a mapped streamed block to its per-leaf devices.
+        """Bind a mapped streamed block to its per-module devices.
 
         Sets ``tuning_device`` from the placement (wrappers prefer it:
         ``wrapper.py self.device = orig_layer.tuning_device or device``) and
-        attaches per-leaf ``AlignDevicesHook(io_same_device=True)`` so chain
-        rows, mask kwargs and activations hop to each module's device during
-        forwards - without this, any block forward (mask-form probe, chain
-        pass, tuning) mixes devices and fails on the first cross-device op.
+        attaches an align hook on EVERY module - leaves AND containers -
+        so each module's interior runs on one defined device, inputs hop to
+        it at entry and outputs return to the caller's device at exit.
+        Container hooks matter as much as leaf hooks: a container's own
+        math (attention SDPA/rotary, residual adds, router softmax) runs on
+        whatever device its children's outputs land on; pinning only leaves
+        lets a mixed leaf split leak one leaf's device into the container
+        output (``residual + hidden_states`` across cuda:0/cuda:1). A
+        container without its own placement entry inherits its first placed
+        descendant's device.
         """
         from auto_round.compressors.utils import attach_stream_align_
 
         multi = len(device_manager.device_list) > 1
+        targets = {}
         for name, mod in block.named_modules():
-            if list(mod.children()):
-                continue
-            if not any(True for _ in mod.parameters(recurse=False)):
-                continue
             dev = placement.get(name)
+            if dev is not None:
+                targets[name] = str(dev)
+        for name, mod in block.named_modules():
+            if not any(True for _ in mod.parameters(recurse=False)) and list(mod.children()):
+                continue
+            dev = targets.get(name)
+            if dev is None:
+                # inherit the first placed descendant's device so container
+                # interiors have a defined home even when only leaves are
+                # placed (flow-derived placements key leaves and atomics)
+                for sub_name, sub_dev in targets.items():
+                    if sub_name.startswith(name + "."):
+                        dev = sub_dev
+                        break
             if dev is None:
                 continue
-            mod.tuning_device = torch.device(dev)
+            if any(True for _ in mod.parameters(recurse=False)):
+                mod.tuning_device = torch.device(dev)
             if multi:
                 # own lightweight align hook: no attach-time tensor moves
                 # (accelerate's init_hook re-moves weights and re-wraps
                 # parameters - a second move set racing the rehome), and
                 # idempotent so the restage re-pin replaces instead of
                 # chaining stale execution devices
-                attach_stream_align_(mod, mod.tuning_device)
+                attach_stream_align_(mod, torch.device(dev))
 
     def _mapped_shared_groups_(self) -> list:
         """Modules kept together on one device while mapping a block.
