@@ -208,6 +208,11 @@ def resolve_chain_mask_form(block, fp_row, key_mask_2d, input_others, preferred=
                 return name
             except Exception as e:  # noqa: BLE001  shape/dtype/type errors are the signal
                 last_err = e
+                # per-form rejection at DEBUG: the final ValueError only
+                # surfaces the LAST candidate's error - the one that matters
+                # (the preferred form failing on a previously-working layout)
+                # would otherwise stay hidden
+                logger.debug("[stream_calibration] mask-form candidate %r rejected: %s", name, e)
                 continue
     raise ValueError(
         "streaming calibration could not determine this model's attention-mask "
