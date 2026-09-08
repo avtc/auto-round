@@ -1556,13 +1556,20 @@ class CompressionOrchestrator(BaseOrchestrator):
         base_map = getattr(device_manager, "device_map", None)
         next_map = getattr(self, "stream_prefetch_device_map", None) or base_map
         fallback = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+        # comma-key layer_config entries are shared-quantization groups (merged
+        # scale/zeros search): keep each whole on one device
+        _shared_groups = [
+            [part.strip() for part in key.split(",") if part.strip()]
+            for key in (self.layer_config or {})
+            if isinstance(key, str) and "," in key
+        ]
         placements = {}
         templates = set()
         for idx, name in enumerate(flat_block_names):
             template = next_map if idx % 2 else base_map
             templates.add(str(template))
             block = get_module(self.model, name)
-            placements[name] = resolve_block_placement(block, template, fallback)
+            placements[name] = resolve_block_placement(block, template, fallback, shared_leaf_groups=_shared_groups)
         logger.info(
             "[stream-mapped] placement engaged: %d block(s), device set(s) %s; rows park on host RAM",
             len(placements),

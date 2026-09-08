@@ -128,6 +128,35 @@ class TestResolvePlacement:
         placement = resolve_block_placement(block, "0", fallback="cpu")
         assert set(placement.values()) == {torch.device("cuda", 0)}
 
+    def test_shared_group_stays_whole_under_device_list(self):
+        block = _MoEBlock()
+        # q/k/v as a shared-quantization group: must never straddle devices
+        placement = resolve_block_placement(
+            block, "0,1", fallback="cpu", shared_leaf_groups=[["q_proj", "k_proj", "v_proj"]]
+        )
+        devs = {
+            placement["self_attn.q_proj"],
+            placement["self_attn.k_proj"],
+            placement["self_attn.v_proj"],
+        }
+        assert len(devs) == 1, f"shared group straddles: {devs}"
+        # balance still holds across the two devices overall
+        assert len({d for d in placement.values()}) == 2
+
+    def test_shared_group_straddle_warns_under_template(self, monkeypatch):
+        import auto_round.utils.stream_placement as sp
+
+        warned = []
+        monkeypatch.setattr(sp.logger, "warning", lambda msg, *a, **k: warned.append(msg % a if a else msg))
+        block = _MoEBlock()
+        resolve_block_placement(
+            block,
+            "self_attn.q_proj:0,self_attn.k_proj:1,self_attn.v_proj:0",
+            fallback="cpu",
+            shared_leaf_groups=[["q_proj", "k_proj", "v_proj"]],
+        )
+        assert any("straddles devices" in w for w in warned)
+
     def test_invalid_pattern_raises(self):
         block = _MoEBlock()
         with pytest.raises(ValueError, match="invalid device_map pattern"):
