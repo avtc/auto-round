@@ -981,10 +981,14 @@ directly and never resolves hub ids); download the model first when starting fro
   is raised when both are set). For multimodal models the vision tower stays unquantized
   (`quant_nontext_module` is rejected under streaming).
 - Algorithms and options: the RTN family (plain and optimized RTN) and SignRound (including `iters > 0`
-  tuning) are supported. Quantizers outside those families -- any algorithm needing calibration forwards
-  on the full model -- are rejected at startup, as is `enable_lfq` (its loss forwards the still-meta
-  `lm_head` on the final block). Diffusion pipelines are rejected too (a pipeline has no per-block decoder
-  list to stream).
+  tuning) are supported. SignRound tuning under streaming consumes the derived calibration chain -- hidden
+  states carried block-to-block, no whole-model forward. Quantizer algorithms whose own calibration step
+  drives the full materialized model (activation-statistics/Hessian gathering, e.g. AWQ- or GPTQ-style
+  quantizers) are rejected at startup: the meta skeleton has one block resident at a time and nothing for
+  such passes to run against. `enable_lfq` is rejected as well (its loss forwards the still-meta `lm_head`
+  on the final block), and so are diffusion pipelines (no per-block decoder list to stream). Note that
+  `auto_gptq`/`auto_awq` as export formats remain supported -- the restriction is on quantizer algorithms,
+  not packing layouts.
 - The model must be passed as a local checkpoint directory path: neither hub ids (HF/ModelScope) nor a
   preloaded model object can be streamed -- the loop reads weight shards straight from disk.
 - `--stream_prefetch off|auto|on|cpu|<device>`: stage the next block's weights on another device while the
