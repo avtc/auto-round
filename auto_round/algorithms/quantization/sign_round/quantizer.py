@@ -38,19 +38,22 @@ from auto_round.utils.device import clear_memory_if_reached_threshold, log_cuda_
 from auto_round.utils.device_manager import device_manager
 
 
-def _torch_sync_tune_devices():
-    """Synchronize every CUDA device so wall-clock perf splits are honest.
+def _sync_tune_devices_():
+    """Synchronize every active device so wall-clock perf splits are honest.
 
     Mapped streamed blocks run pieces of one forward/backward on several
-    GPUs; without a sync, kernels queue asynchronously and the fwd/bwd split
-    measures launch latency, not work.
+    devices; without a sync, kernels queue asynchronously and the fwd/bwd
+    split measures launch latency, not work. Backend-agnostic via the
+    device manager (cuda/xpu/hpu/mps; cpu entries are skipped - the CPU
+    ARDevice synchronize is a no-op anyway).
     """
-    if torch.cuda.is_available():
-        for _d in range(torch.cuda.device_count()):
-            try:
-                torch.cuda.synchronize(_d)
-            except Exception:  # pragma: no cover - defensive: perf only
-                pass
+    for dev in device_manager.device_list:
+        if str(dev).startswith("cpu"):
+            continue
+        try:
+            device_manager.synchronize(getattr(dev, "index", None))
+        except Exception as e:  # pragma: no cover - defensive: perf only
+            logger.warning("[perf] tune device sync failed on %s: %s", dev, e)
 
 
 def _best_params_snap_dev_(block, home, cache_device):
@@ -642,7 +645,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 indices = global_indices[batch_start : batch_start + batch_size]
                 ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
                 if _perf:
-                    _torch_sync_tune_devices()
+                    _sync_tune_devices_()
                     _t0 = time.perf_counter()
                 pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
                 if loss_device is not None:
@@ -659,7 +662,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 num_elm = 1 if num_elm <= 0 else num_elm
                 total_loss += loss.item() / num_elm
                 if _perf:
-                    _torch_sync_tune_devices()
+                    _sync_tune_devices_()
                     _t["fwd"] += time.perf_counter() - _t0
 
                 if mid_iter_mem_check:
@@ -667,11 +670,11 @@ class SignRoundQuantizer(BaseQuantizer):
                     clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
 
                 if _perf:
-                    _torch_sync_tune_devices()
+                    _sync_tune_devices_()
                     _t1 = time.perf_counter()
                 self._scale_loss_and_backward(scaler, loss)
                 if _perf:
-                    _torch_sync_tune_devices()
+                    _sync_tune_devices_()
                     _t["bwd"] += time.perf_counter() - _t1
 
                 if mid_iter_mem_check:
@@ -688,13 +691,13 @@ class SignRoundQuantizer(BaseQuantizer):
                 best_loss = total_loss
                 if not self.not_use_best_mse:
                     if _perf:
-                        _torch_sync_tune_devices()
+                        _sync_tune_devices_()
                         _t2 = time.perf_counter()
                     best_params = collect_best_params(
                         block, _best_params_snap_dev_(block, _home, self.compress_context.cache_device)
                     )
                     if _perf:
-                        _torch_sync_tune_devices()
+                        _sync_tune_devices_()
                         _t["snap"] += time.perf_counter() - _t2
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
