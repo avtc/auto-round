@@ -463,6 +463,7 @@ def block_forward(
         else:
             output = block(**input_others)
     except RuntimeError:
+        global _TRACE_HOPS
         if _TRACE_HOPS is None:
             _TRACE_HOPS = os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
         if _TRACE_HOPS:
