@@ -940,6 +940,11 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" \
 
 - `--stream_quantization`：启用流式路径。与 `AR_DISK_STREAM_MODEL` 互斥（同时设置会报错）。
   多模态模型的视觉塔保持不量化（流式模式下会拒绝 `quant_nontext_module`）。
+- 算法与选项：支持 RTN 系列（普通 RTN 与优化版 RTN）和 SignRound（含 `iters > 0` 调优）。这两个家族之外、
+  需要在完整模型上做校准前向的量化器会在启动时被拒绝；`enable_lfq` 同样被拒绝（其损失需要在最后一个
+  块上前向仍是 meta 状态的 `lm_head`）。扩散模型管道也会被拒绝（管道没有可流式处理的逐块解码器列表）。
+- 模型必须以本地 checkpoint 目录路径传入：hub id（HF/ModelScope）和已加载的模型对象都无法流式
+  处理——循环直接从磁盘读取权重分片。
 - `--stream_prefetch off|auto|on|cpu|<设备>`：在量化当前块的同时，在其他设备上预取下一块的权重。
   `auto` 在另一块 GPU 上预取（当主 GPU 的空闲显存足以容纳最大块时，主 GPU 也会加入轮转；最后回退到
   主机内存）；`cpu` 在主机内存上预取（最慢、容量最大）；单个设备（如 `cuda:1`）在指定设备上预取；
