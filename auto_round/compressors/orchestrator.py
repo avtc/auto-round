@@ -1604,7 +1604,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # parameters - a second move set racing the rehome), and
                 # idempotent so the restage re-pin replaces instead of
                 # chaining stale execution devices
-                attach_stream_align_(mod, torch.device(dev))
+                attach_stream_align_(mod, torch.device(dev), name=name or type(mod).__name__)
 
     def _mapped_shared_groups_(self) -> list:
         """Modules kept together on one device while mapping a block.

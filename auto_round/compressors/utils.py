@@ -180,6 +180,18 @@ def rehome_block_(module: torch.nn.Module, device) -> int:
     return moved
 
 
+_TRACE_HOPS = None  # AR_STREAM_TRACE_DEVICES latch: None=unread, False=off
+
+
+def _trace_align_hop(name, input_device, target) -> None:
+    """Log real cross-device hops when AR_STREAM_TRACE_DEVICES is set."""
+    global _TRACE_HOPS
+    if _TRACE_HOPS is None:
+        _TRACE_HOPS = os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
+    if _TRACE_HOPS and input_device != target:
+        logger.info("[stream-align] %s: input %s -> %s", name, input_device, target)
+
+
 class StreamAlignHook:
     """Per-leaf input/output aligner for mapped streamed blocks.
 
@@ -193,8 +205,9 @@ class StreamAlignHook:
     input arrived from. Idempotent - re-pinning replaces the handles.
     """
 
-    def __init__(self, target: torch.device):
+    def __init__(self, target: torch.device, name: str = ""):
         self.target = target
+        self.name = name
         self.input_device = None
 
     def _pre(self, module, args, kwargs=None):
@@ -206,6 +219,7 @@ class StreamAlignHook:
         from accelerate.utils import find_device, send_to_device
 
         self.input_device = find_device([args, kwargs]) or self.target
+        _trace_align_hop(self.name, self.input_device, self.target)
         moved = send_to_device(args, self.target)
         if kwargs is None:  # legacy manual replay (wrapper.py)
             return moved
@@ -217,10 +231,10 @@ class StreamAlignHook:
         return send_to_device(output, self.input_device)
 
 
-def attach_stream_align_(mod: torch.nn.Module, target) -> None:
-    """Attach (or replace) the align hook on one leaf."""
+def attach_stream_align_(mod: torch.nn.Module, target, name: str = "") -> None:
+    """Attach (or replace) the align hook on one leaf or container."""
     detach_stream_align_(mod)
-    hook = StreamAlignHook(torch.device(target))
+    hook = StreamAlignHook(torch.device(target), name=name)
     handles = [
         mod.register_forward_pre_hook(hook._pre, with_kwargs=True),
         mod.register_forward_hook(hook._post),
@@ -388,6 +402,28 @@ def block_forward(
                     input_others[param_name] = val
         positional_inputs = ()
 
+    if _TRACE_HOPS is True or (
+        _TRACE_HOPS is None and os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
+    ):
+        global _trace_block_fwd_n
+        try:
+            _trace_block_fwd_n += 1
+        except NameError:
+            _trace_block_fwd_n = 1
+        if _trace_block_fwd_n <= 3:
+            devs = {k: str(v.device) for k, v in input_others.items() if isinstance(v, torch.Tensor)}
+            nested = {
+                k: [str(t.device) for t in v if isinstance(t, torch.Tensor)]
+                for k, v in input_others.items()
+                if isinstance(v, (list, tuple))
+            }
+            logger.info(
+                "[stream-align] block %s forward #%d inputs: %s %s",
+                getattr(block, "arc_block_name", "?"),
+                _trace_block_fwd_n,
+                devs,
+                nested,
+            )
     if amp:
         with autocast(device_type=str(device).split(":")[0], dtype=amp_dtype):  # pragma: no cover
             output = block(**input_others)

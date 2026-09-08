@@ -329,3 +329,22 @@ class TestStreamAlignHookProtocols:
         hook.input_device = torch.device("cpu")
         out = hook._post(None, None, {"a": torch.zeros(1)})
         assert isinstance(out, dict)
+
+
+class TestAlignTrace:
+    def test_trace_logs_only_real_hops(self, monkeypatch, caplog):
+        import logging as _logging
+
+        import torch
+
+        import auto_round.compressors.utils as cu
+
+        monkeypatch.setenv("AR_STREAM_TRACE_DEVICES", "1")
+        cu._TRACE_HOPS = None  # re-read the env
+        with caplog.at_level(_logging.INFO, logger="auto_round"):
+            cu._trace_align_hop("self_attn.q_proj", torch.device("cpu"), torch.device("cuda:1"))
+            cu._trace_align_hop("self_attn.k_proj", torch.device("cpu"), torch.device("cpu"))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("self_attn.q_proj" in m and "cuda:1" in m for m in msgs)
+        assert not any("k_proj" in m for m in msgs)
+        cu._TRACE_HOPS = None
