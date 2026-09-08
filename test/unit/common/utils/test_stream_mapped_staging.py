@@ -435,6 +435,13 @@ class TestContainerAndWrapRealign:
         orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
         assert getattr(wrap, "_stream_align_hook", None) is not None
         assert getattr(lin, "_stream_align_hook", None) is None  # detached
+        # stage 3: unwrap restores the bare leaf (the wrapper and its hook
+        # are discarded); re-pin gives the bare layer its hook back
+        block["q"] = lin
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        assert getattr(lin, "_stream_align_hook", None) is not None
+        assert lin._stream_align_hook.target == torch.device("cpu", 1)
+        # (the discarded wrapper keeps a stale attr; it is out of the tree)
 
 
 class TestBestParamsSnapDev:

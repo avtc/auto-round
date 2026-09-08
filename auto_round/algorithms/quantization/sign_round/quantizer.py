@@ -509,10 +509,10 @@ class SignRoundQuantizer(BaseQuantizer):
         # wrappers replaced the pinned leaves; re-pin so each WRAPPER owns
         # its alignment (an orig-layer hook would anchor wrongly: the wrapper
         # moves inputs to the leaf device before replaying orig hooks).
-        # Clear-once, same contract as _stream_restage_after_fp_.
+        # Reusable: called again after unwrapper_block restores the bare
+        # layers - unwrapping discards the wrapper together with its hook.
         _realign = getattr(block, "_stream_realign_after_wrap_", None)
         if callable(_realign):
-            block._stream_realign_after_wrap_ = None
             _realign()
 
         round_params = []
@@ -690,6 +690,11 @@ class SignRoundQuantizer(BaseQuantizer):
             logger.debug(f"Unquantized layers: {unquantized_layer_names}")
         with torch.no_grad():
             unwrapper_block(block, best_params)
+            # the bare restored layers lost their alignment (the hook lived
+            # on the discarded wrapper) - re-pin for the post-tune forwards
+            _realign = getattr(block, "_stream_realign_after_wrap_", None)
+            if callable(_realign):
+                _realign()
 
         if self.config.is_act_nv_fp:
             # enable moe experts act_max automatic generation for WrapperWALayer
