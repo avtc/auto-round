@@ -3310,8 +3310,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 else:
                     clear_memory()
                     self._trim_host_heap()
-                if envs.AR_MEM_COUNTERS:
-                    memory_monitor.log_summary()
+                # upstream-pattern per-block summary: stays unconditional,
+                # matching the data-driven loop. AR_MEM_COUNTERS gates only
+                # the branch-added [stream-mem] drill-down lines, never
+                # upstream calls.
+                memory_monitor.log_summary()
                 stream_block_idx += 1  # consumed a staging slot: rotate the round-robin home
                 pbar.update(1)
             # group tail: advance the global-index base by THIS group's block
