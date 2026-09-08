@@ -1836,7 +1836,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 CompressionOrchestrator._pin_stream_mapped_(block, placement)
                 # the tune path wraps leaves AFTER this pin; wrappers must
                 # own the alignment (they move inputs before replaying
-                # orig-layer hooks, so an orig hook mis-anchors to the leaf
+                # orig-layer hooks, so an orig hook anchors wrongly to the leaf
                 # device). The quantizer calls this once wrapping is done.
                 block._stream_realign_after_wrap_ = lambda: CompressionOrchestrator._pin_stream_mapped_(
                     block, placement
