@@ -1669,7 +1669,11 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, log_level: str 
 
     if device is None:
         device = torch.device("cuda") if torch.cuda.is_available() else None
-    if device is None or getattr(device, "type", "cpu") != "cuda":
+    # callers pass whatever device_list holds - including plain strings
+    # ("cuda:1"); a string has no .type and would silently return here
+    if not isinstance(device, torch.device):
+        device = torch.device(str(device))
+    if device.type != "cuda":
         return
     try:
         free_b, total_b = torch.cuda.mem_get_info(device)
