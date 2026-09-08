@@ -507,7 +507,7 @@ class SignRoundQuantizer(BaseQuantizer):
             device=device,
         )
         # wrappers replaced the pinned leaves; re-pin so each WRAPPER owns
-        # its alignment (an orig-layer hook would mis-anchor: the wrapper
+        # its alignment (an orig-layer hook would anchor wrongly: the wrapper
         # moves inputs to the leaf device before replaying orig hooks).
         # Clear-once, same contract as _stream_restage_after_fp_.
         _realign = getattr(block, "_stream_realign_after_wrap_", None)
