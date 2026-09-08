@@ -84,14 +84,27 @@ def _atomic_groups(leaf_names: list) -> list:
 
     Leaves that live under the same indexed container (MoE experts, layer
     lists) form one atomic unit so a container is never split across
-    devices. Standalone leaves are their own unit.
+    devices. Sibling projections of a shared expert MLP
+    (``shared_experts.*`` / ``shared_mlp.*``) are atomic too: they model one
+    wide MLP, typically share quantization scales, and cost almost nothing
+    to keep together. Standalone leaves are their own unit.
     """
     indexed = re.compile(r"^(.*)\.(\d+)\.[^.]+$")
     groups: dict = {}
     order: list = []
     for name in leaf_names:
         m = indexed.match(name)
-        key = f"{m.group(1)}.{m.group(2)}" if m else name
+        if m:
+            key = f"{m.group(1)}.{m.group(2)}"
+        else:
+            # co-locate every leaf under a shared-expert container with its
+            # siblings: gate/up/down of the shared MLP stay on one device
+            parts = name.split(".")
+            shared_idx = next(
+                (i for i, seg in enumerate(parts[:-1]) if seg in ("shared_experts", "shared_expert", "shared_mlp")),
+                None,
+            )
+            key = ".".join(parts[: shared_idx + 1]) if shared_idx is not None else name
         if key not in groups:
             groups[key] = []
             order.append(key)

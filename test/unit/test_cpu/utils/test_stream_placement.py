@@ -392,3 +392,91 @@ class TestRehomeMapped:
         assert "orphan.orphan_bias" in out.err and "matched no placement entry" in out.err
         # already on the cpu default: counted as a miss, not a move
         assert moved == 0
+
+
+class TestSharedExpertAtomicity:
+    def test_shared_experts_and_shared_mlp_stay_whole(self):
+        from auto_round.utils.stream_placement import _atomic_groups
+
+        leaves = [
+            "self_attn.q_proj",
+            "mlp.shared_experts.gate_proj",
+            "mlp.shared_experts.up_proj",
+            "mlp.shared_experts.down_proj",
+            "mlp.experts.0.gate_proj",
+            "mlp.experts.0.up_proj",
+            "mlp.down_proj",
+            "shared_mlp.gate_proj",
+            "shared_mlp.up_proj",
+        ]
+        groups = dict(_atomic_groups(leaves))
+        assert groups["mlp.shared_experts"] == [
+            "mlp.shared_experts.gate_proj",
+            "mlp.shared_experts.up_proj",
+            "mlp.shared_experts.down_proj",
+        ]
+        assert groups["shared_mlp"] == ["shared_mlp.gate_proj", "shared_mlp.up_proj"]
+        # unrelated dense mlp leaves stay independent units
+        assert groups["mlp.down_proj"] == ["mlp.down_proj"]
+
+    def test_device_list_keeps_shared_experts_on_one_device(self):
+        import torch
+
+        class Sh(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = torch.nn.Linear(4, 4)
+                self.up_proj = torch.nn.Linear(4, 4)
+                self.down_proj = torch.nn.Linear(4, 4)
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared_experts = Sh()
+                self.down_proj = torch.nn.Linear(4, 4)
+
+        placement = resolve_block_placement(M(), "1,2", torch.device("cpu"))
+        devs = {placement[k] for k in placement if k.startswith("shared_experts")}
+        assert len(devs) == 1, placement
+
+
+class TestMappedEngagementPredicate:
+    def _orch(self, prefetch, prefetch_map):
+        from auto_round.compressors import orchestrator as orch
+
+        o = object.__new__(orch.CompressionOrchestrator)
+        o.stream_prefetch = prefetch
+        o.stream_prefetch_device_map = prefetch_map
+        return o
+
+    def _set_map(self, monkeypatch, device_map):
+        import auto_round.compressors.orchestrator as orch
+
+        class _DM:
+            pass
+
+        dm = _DM()
+        dm.device_map = device_map
+        monkeypatch.setattr(orch, "device_manager", dm)
+
+    def test_plain_list_prefetch_off_engages_mapped(self, monkeypatch):
+        self._set_map(monkeypatch, "0,1,2,3")
+        assert self._orch("off", None)._stream_mapped_enabled() is True
+
+    def test_plain_list_prefetch_auto_keeps_rotation(self, monkeypatch):
+        self._set_map(monkeypatch, "0,1,2,3")
+        assert self._orch("auto", None)._stream_mapped_enabled() is False
+
+    def test_plain_list_prefetch_on_keeps_rotation(self, monkeypatch):
+        self._set_map(monkeypatch, "0,1")
+        assert self._orch("on", None)._stream_mapped_enabled() is False
+
+    def test_single_device_prefetch_off_stays_single_home(self, monkeypatch):
+        self._set_map(monkeypatch, "0")
+        assert self._orch("off", None)._stream_mapped_enabled() is False
+
+    def test_template_and_prefetch_map_engage(self, monkeypatch):
+        self._set_map(monkeypatch, "q_proj:0,mlp:1")
+        assert self._orch("off", None)._stream_mapped_enabled() is True
+        self._set_map(monkeypatch, "0,1")
+        assert self._orch("auto", "2,3")._stream_mapped_enabled() is True

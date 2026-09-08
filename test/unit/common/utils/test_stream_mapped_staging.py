@@ -160,8 +160,12 @@ class TestOrchestratorMappedMode:
             device_map = "0,1"  # plain list -> NOT mapped
 
         monkeypatch.setattr(orch, "device_manager", _DM())
-        o = self._shell(stream_prefetch_device_map=None)
+        # plain list keeps the prefetch-rotation semantics while prefetch is on
+        o = self._shell(stream_prefetch="auto", stream_prefetch_device_map=None)
         assert o._stream_mapped_enabled() is False
+        # ... but with prefetch off there is no rotation: multi-device means mapped
+        o = self._shell(stream_prefetch="off", stream_prefetch_device_map=None)
+        assert o._stream_mapped_enabled() is True
 
         monkeypatch.setattr(orch, "device_manager", type("DM2", (), {"device_map": "self_attn.*:0,mlp.*:1"})())
         assert o._stream_mapped_enabled() is True

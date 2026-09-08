@@ -1539,14 +1539,23 @@ class CompressionOrchestrator(BaseOrchestrator):
 
     def _stream_mapped_enabled(self) -> bool:
         """Mapped placement engages when the device map is a module template
-        or an alternate prefetch map is given (opt-in: plain device lists
-        keep today's prefetch-rotation semantics). The alternate map is only
-        legal with stream_prefetch enabled - enforced at startup."""
+        or an alternate prefetch map is given. Plain device lists keep the
+        prefetch-rotation semantics while prefetch is on; with prefetch OFF
+        there is no rotation to keep, and single-homing a large block on the
+        primary would OOM - so a plain multi-device list means mapped
+        placement. The alternate map is only legal with stream_prefetch
+        enabled - enforced at startup."""
         if getattr(self, "stream_prefetch_device_map", None):
             return True
         from auto_round.utils.stream_placement import is_placement_template
 
-        return is_placement_template(getattr(device_manager, "device_map", None))
+        base_map = getattr(device_manager, "device_map", None)
+        if is_placement_template(base_map):
+            return True
+        if str(getattr(self, "stream_prefetch", "off") or "off").strip().lower() not in STREAM_PREFETCH_OFF:
+            return False
+        devices = [d for d in str(base_map or "").split(",") if d.strip()]
+        return len(devices) > 1
 
     @staticmethod
     def _pin_stream_mapped_(block, placement: dict) -> None:
