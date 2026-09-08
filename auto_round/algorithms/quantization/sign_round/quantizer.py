@@ -703,6 +703,13 @@ class SignRoundQuantizer(BaseQuantizer):
                 )
 
         if _perf and _t["iters"]:
+            if not self.not_use_best_mse:
+                if 0 < self.dynamic_max_gap <= i - last_best_iter:
+                    break
+            sync_gradients()
+            self._step(scaler, optimizer, lr_schedule)
+
+        if _perf and _t["iters"]:
             _n = _t["iters"]
             logger.info(
                 "[perf] tune iters=%d: fwd %.1fs (%.2fs/iter) bwd %.1fs (%.2fs/iter) snap %.1fs",
@@ -713,12 +720,6 @@ class SignRoundQuantizer(BaseQuantizer):
                 _t["bwd"] / _n,
                 _t["snap"],
             )
-
-            if not self.not_use_best_mse:
-                if 0 < self.dynamic_max_gap <= i - last_best_iter:
-                    break
-            sync_gradients()
-            self._step(scaler, optimizer, lr_schedule)
 
         last_loss = total_loss
         best_iter = self.iters
