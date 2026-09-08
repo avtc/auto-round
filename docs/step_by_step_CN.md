@@ -958,9 +958,10 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" \
   流式模式下尚不支持旋转类变换：整模型折叠会物化完整模型，且目前尚无变换实现逐块协议，
   因此使用旋转配置会直接报错并给出指引。
 - 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。
-- AutoScheme：打分需要物化权重，因此流式运行无法在进程内打分，除非所有层索引均已缓存，否则会直接报错。请先在不开启
-  流式的情况下运行一次（例如 `AR_DISK_STREAM_MODEL` env 路径，可配合 `AR_ENABLE_AUTO_SCHEME_PARALLEL=1` 并行
-  worker），并设置 `AR_AUTO_SCHEME_CACHE`；之后的流式运行会解析缓存的 scheme 并据此量化。
+- AutoScheme：打分需要物化权重，且尚未接入流式（meta 骨架）运行——除非所有层索引均已缓存，否则会直接报错。
+  请先在不开启流式的情况下运行一次（例如 `AR_DISK_STREAM_MODEL` env 路径，它支持按需物化块进行打分，可配合
+  `AR_ENABLE_AUTO_SCHEME_PARALLEL=1` 并行 worker），并设置 `AR_AUTO_SCHEME_CACHE`；之后的流式运行会解析缓存的
+  scheme 并据此量化。
 - 循环行为：任一时刻仅驻留一个解码器块，并就地量化在它的暂存设备上；当前块调优时，下一块的权重
   会预取到另一个设备。完成块的打包 + 分片写入（以及适用时的 GGUF blob 落盘与崩溃恢复快照）在其
   已空闲的暂存设备上以后台线程执行（`AR_STREAM_BG_PACK`）。

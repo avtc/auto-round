@@ -1004,11 +1004,11 @@ directly and never resolves hub ids); download the model first when starting fro
   fails loud with guidance.
 - Crash resume: `AR_RESUME_DIR` applies to streaming runs; completed blocks are skipped and their
   already-written output shards are adopted as-is.
-- AutoScheme: scoring requires materialized weights, so a streaming run cannot score in-process and fails
-  unless every layer index is already cached. Run once without streaming (for example the
-  `AR_DISK_STREAM_MODEL` env path, optionally with `AR_ENABLE_AUTO_SCHEME_PARALLEL=1` to parallelize the
-  workers) with `AR_AUTO_SCHEME_CACHE` set; the streaming run then resolves the cached scheme and
-  quantizes from it.
+- AutoScheme: scoring needs materialized weights and has not yet been wired into the streaming
+  (meta-skeleton) run -- it fails unless every layer index is already cached. Run once without streaming
+  (for example the `AR_DISK_STREAM_MODEL` env path, which supports scoring with on-demand block
+  materialization, optionally with `AR_ENABLE_AUTO_SCHEME_PARALLEL=1` to parallelize the workers) with
+  `AR_AUTO_SCHEME_CACHE` set; the streaming run then resolves the cached scheme and quantizes from it.
 - How the loop behaves: exactly one decoder block is resident at a time and is quantized in place on its
   staging device; the next block's weights are prefetched to another device while the current one is tuned.
   The finished block's pack + shard write (plus GGUF blob flush and crash-resume snapshot when applicable)
