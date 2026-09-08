@@ -992,6 +992,61 @@ class TestStreamQuantizeEquivalence:
             for k in t["plain"]:
                 assert torch.equal(t["plain"][k], t[variant][k]), f"tensor {k} differs under {variant}"
 
+    def test_mapped_list_placement_derives_and_reuses(self, tiny_checkpoint, tmp_path, capfd):
+        """Device-list mapped placement derives its module order from the
+        block's REFERENCE forward (first full pass), restages the deriving
+        block before tuning state exists, and caches the placement under the
+        block's structure signature so identical layouts reuse it. On CPU the
+        devices coincide with the plain run's home, so the export must stay
+        BIT-IDENTICAL; the derive/restage/reuse log lines prove the wiring."""
+        import shutil
+
+        torch.manual_seed(7)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]  # vocab_size=64
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        arms = {}
+        for name, kwargs in (
+            ("plain", dict(stream=True, dataset=rows, iters=1)),
+            (
+                "mapped",
+                dict(
+                    stream=True,
+                    dataset=rows,
+                    iters=1,
+                    stream_prefetch="auto",
+                    device_map="cpu,cpu",
+                    stream_prefetch_device_map="cpu,cpu",
+                ),
+            ),
+        ):
+            ck = str(tmp_path / f"ck_{name}")
+            shutil.copytree(tiny_checkpoint, ck)
+            arms[name] = self._quantize(ck, str(tmp_path / name), **kwargs)
+
+        captured = capfd.readouterr()
+        assert "derived placement from the reference forward" in captured.out + captured.err
+        assert "restaged model.layers.0 onto its flow-derived placement" in captured.out + captured.err
+        assert "reusing flow-derived placement" in captured.out + captured.err
+
+        t = {name: load_all(d) for name, d in arms.items()}
+        assert set(t["plain"]) == set(t["mapped"])
+        for k in t["plain"]:
+            assert torch.equal(t["plain"][k], t["mapped"][k]), f"tensor {k} differs under mapped placement"
+        with open(os.path.join(arms["plain"], "quantization_config.json")) as f:
+            assert json.load(f) == json.load(open(os.path.join(arms["mapped"], "quantization_config.json")))
+
     def test_mapped_placement_streaming_end_to_end(self, tiny_checkpoint, tmp_path):
         """Mapped placement (--device_map module template / --stream_prefetch_device_map)
         distributes each streamed block's modules onto their template devices

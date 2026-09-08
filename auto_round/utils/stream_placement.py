@@ -256,92 +256,101 @@ def block_signature(block: torch.nn.Module) -> str:
 def partition_flow_order(flow_units: list, devices: list, budgets: Optional[dict] = None) -> dict:
     """Assign flow-ordered units to devices, balancing VRAM.
 
-    ``flow_units`` is a list of ``(names, param_bytes, input_bytes)`` in
-    observed execution order; units flagged in ``atom_units`` (same length
-    boolean list) are placement-atomic (expert projections, shared-quant
-    groups) and are distributed greedily for balance - their routing order
-    is data-dependent, not index-dependent, so order does not matter. The
-    remaining units stay CONTIGUOUS along the flow order and cut at the
-    cheapest boundaries (boundary cost = the next unit's input bytes), so
-    per-forward activation traffic is minimal.
+    ``flow_units`` is a list of ``(names, param_bytes, input_bytes, is_atom)``
+    in observed execution order. Atom units (expert projections,
+    shared-quant groups) are distributed greedily for balance - their
+    routing is data-dependent, so index order carries no execution
+    benefit. The remaining units stay CONTIGUOUS along the flow order and
+    the device boundaries are chosen at the cheapest cuts (boundary cost =
+    the next unit's input activation bytes), minimizing per-forward
+    cross-device traffic while respecting a per-device VRAM ceiling.
 
     Returns ``{name: device}`` for all names in the units.
     """
     if len(devices) == 1:
         return {n: devices[0] for names, _b, _i, _a in flow_units for n in names}
 
-    # normalize to tuples (names, bytes, in_bytes, is_atom)
     units = [(tuple(names), int(p), int(i), bool(a)) for names, p, i, a in flow_units]
     total = sum(b for _n, b, _i, _a in units) or 1
     target = total / len(devices)
     placement: dict = {}
     loads = {d: 0 for d in devices}
 
-    # phase 1: atoms -> least-loaded device (VRAM balance; experts dominate)
-    atom_units = [u for u in units if u[3]]
-    atom_units.sort(key=lambda u: -u[1])
+    # phase 1: atoms -> least-loaded device (experts dominate MoE VRAM)
+    atom_units = sorted([u for u in units if u[3]], key=lambda u: -u[1])
     for names, b, _i, _a in atom_units:
         dev = min(devices, key=lambda d: loads[d])
         placement.update({n: dev for n in names})
         loads[dev] += b
 
     # phase 2: non-atom units -> contiguous along flow order, cheapest cuts
+    # under a per-device ceiling (the VRAM-critical side of balance)
     seq = [u for u in units if not u[3]]
     if seq:
-        budgets = budgets or {}
-        hi = max([target * 1.15] + [max(0.0, budgets.get(str(d), target) * 1.15) for d in devices])
-        lo = target * 0.5
         n = len(seq)
         m = len(devices)
-        # dp[i][k]: min cut cost to split seq[i:] into k segments (each in
-        # [lo, hi]); cuts sit BETWEEN units, cost = next unit's input bytes
-        INF = float("inf")
+        bytes_ = [u[1] for u in seq]
         cut = [seq[j + 1][2] if j + 1 < n else 0 for j in range(n)]
-        dp = [[INF] * (m + 1) for _ in range(n + 1)]
-        choice = [[-1] * (m + 1) for _ in range(n + 1)]
-        dp[n][0] = 0
-        for i in range(n, -1, -1):
-            for k in range(1, m + 1):
-                acc = 0
-                for j in range(i, n):
-                    acc += seq[j][1]
-                    if acc > hi:
-                        break
-                    seg_ok = k == 1 and j == n - 1 or k > 1
-                    if not seg_ok:
-                        continue
-                    if k == 1:
-                        if j == n - 1 and dp[j + 1][0] < INF and acc >= lo * 0.999 or (j == n - 1 and acc < lo):
-                            cand = dp[j + 1][0]
-                            if cand < dp[i][k]:
-                                dp[i][k] = cand
-                                choice[i][k] = j
-                    else:
-                        rest = dp[j + 1][k - 1]
-                        if rest < INF:
-                            cand = cut[j] + rest
-                            if cand < dp[i][k]:
-                                dp[i][k] = cand
-                                choice[i][k] = j
-        # extract segments for m devices; if m infeasible, try fewer
-        k_used = m
-        while k_used > 1 and dp[0][k_used] == INF:
-            k_used -= 1
+        hi = target * 1.15
+        if budgets:
+            hi = max([hi] + [float(v) for v in budgets.values()])
+        INF = float("inf")
         segments = []
-        i, k = 0, k_used
-        while i < n and k > 0:
-            j = choice[i][k]
-            if j < 0:
+        # ceiling escalation: prefer tight VRAM balance, but relax until a
+        # feasible split exists so cheap boundaries stay reachable
+        for slack in (1.15, 1.25, 1.5, 2.0):
+            hi_eff = hi * slack if hi > 0 else hi
+            # best[k][i] = min cut cost to split seq[i:] into exactly k
+            # segments, every segment sum <= hi_eff; back[k][i] = end index j
+            best = [[INF] * (n + 1) for _ in range(m + 1)]
+            back = [[-1] * (n + 1) for _ in range(m + 1)]
+            best[0][n] = 0
+            for k in range(1, m + 1):
+                for i in range(n - 1, -1, -1):
+                    acc = 0
+                    for j in range(i, n):
+                        acc += bytes_[j]
+                        if acc > hi_eff:
+                            break
+                        rest = best[k - 1][j + 1]
+                        if rest == INF:
+                            continue
+                        cost = (cut[j] if j < n - 1 else 0) + rest
+                        if cost < best[k][i]:
+                            best[k][i] = cost
+                            back[k][i] = j
+            k_used = max((k for k in range(1, m + 1) if best[k][0] < INF), default=0)
+            if not k_used:
+                continue
+            i, k = 0, k_used
+            while i < n and k > 0:
+                j = back[k][i]
+                if j < 0:
+                    segments = []
+                    break
+                segments.append(seq[i : j + 1])
+                i, k = j + 1, k - 1
+            if segments:
                 break
-            segments.append(seq[i : j + 1])
-            i, k = j + 1, k - 1
-        # assign segments largest-first to least-loaded devices
-        segments.sort(key=lambda s: -sum(u[1] for u in s))
-        free = sorted(devices, key=lambda d: loads[d])
-        for seg in segments:
-            dev = free.pop(0) if free else devices[-1]
-            placement.update({nm: dev for u in seg for nm in u[0]})
-            loads[dev] += sum(u[1] for u in seg)
+        if not segments:
+            # contiguous fallback sweep (oversized units): keep order, switch
+            # devices when the target load is reached
+            dev_idx = 0
+            acc = 0
+            for u in seq:
+                placement.update({nm: devices[dev_idx] for nm in u[0]})
+                loads[devices[dev_idx]] += u[1]
+                acc += u[1]
+                if acc >= target and dev_idx < len(devices) - 1:
+                    dev_idx += 1
+                    acc = 0
+        else:
+            # largest segment to the least-loaded device
+            segments.sort(key=lambda s: -sum(u[1] for u in s))
+            for seg in segments:
+                dev = min(devices, key=lambda d: loads[d])
+                placement.update({nm: dev for u in seg for nm in u[0]})
+                loads[dev] += sum(u[1] for u in seg)
     return placement
 
 

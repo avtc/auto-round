@@ -16,9 +16,12 @@ import pytest
 import torch
 
 from auto_round.utils.stream_placement import (
+    FlowProbe,
     _atomic_groups,
+    block_signature,
     is_placement_template,
     parse_device_template,
+    partition_flow_order,
     placement_device_of,
     resolve_block_placement,
 )
@@ -28,6 +31,9 @@ class _Leaf(torch.nn.Module):
     def __init__(self, n=4):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(n))
+
+    def forward(self, x):
+        return x + 0.0 * self.weight.sum()
 
 
 class _MoEBlock(torch.nn.Module):
@@ -173,3 +179,102 @@ class TestPlacementDeviceOf:
     def test_unmatched_falls_back(self):
         assert placement_device_of({}, "x.weight", "cuda:0") == "cuda:0"
         assert placement_device_of({"a.b": torch.device("cuda", 2)}, "c.d.bias", "cuda:0") == "cuda:0"
+
+
+class _SwappedExec(torch.nn.Module):
+    """Registration order (mlp first) deliberately differs from execution."""
+
+    def __init__(self):
+        super().__init__()
+        self.mlp = torch.nn.ModuleDict({"gate_proj": _Leaf(8), "down_proj": _Leaf(8)})
+        self.attn = torch.nn.ModuleDict({"q_proj": _Leaf(4), "v_proj": _Leaf(4)})
+        # registration: mlp.*, attn.*; execution below: attn first
+
+    def forward(self, x):
+        x = self.attn["q_proj"](x)
+        x = self.attn["v_proj"](x)
+        x = self.mlp["gate_proj"](x)
+        x = self.mlp["down_proj"](x)
+        return x
+
+
+class TestBlockSignature:
+    def test_digit_indices_are_stripped(self):
+        a, b = _MoEBlock(n_experts=4), _MoEBlock(n_experts=4)
+        assert block_signature(a) == block_signature(b)
+
+    def test_different_layouts_differ(self):
+        assert block_signature(_MoEBlock()) != block_signature(_SwappedExec())
+
+    def test_different_expert_counts_differ(self):
+        assert block_signature(_MoEBlock(n_experts=3)) != block_signature(_MoEBlock(n_experts=4))
+
+
+class TestPartitionFlowOrder:
+    def test_atoms_balance_freely(self):
+        # 4 expert atoms of 4 bytes each + 2 loose leaves of 1 byte; 2 devices.
+        # Atom sizes dominate: balance wants 2+2 experts per device, NOT
+        # 0-1 on dev0 and 2-3 on dev1 bound to flow order.
+        units = []
+        for i in range(4):
+            units.append(([f"moe.experts.{i}.gate_proj", f"moe.experts.{i}.down_proj"], 4, 100, True))
+        units.append((["attn.q_proj"], 1, 10, False))
+        units.append((["attn.v_proj"], 1, 10, False))
+        placement = partition_flow_order(units, [torch.device("cpu", 0), torch.device("cpu", 1)])
+        load = {}
+        for names, b, _i, _a in units:
+            dev = placement[names[0]]
+            load[dev] = load.get(dev, 0) + b
+        # expert atoms whole on one device each
+        for i in range(4):
+            assert placement[f"moe.experts.{i}.gate_proj"] == placement[f"moe.experts.{i}.down_proj"]
+        loads = sorted(load.values())
+        assert loads[1] - loads[0] <= 4, f"unbalanced: {loads}"
+
+    def test_contiguous_units_cut_at_cheapest_boundary(self):
+        # 3 loose units, cut cost = next unit input bytes; the cheap boundary
+        # sits between u1 and u2. With 2 devices, the cut must land there.
+        units = [
+            (["u0"], 5, 0, False),
+            (["u1"], 5, 1000, False),  # boundary u0|u1 expensive
+            (["u2"], 5, 1, False),  # boundary u1|u2 cheap
+        ]
+        placement = partition_flow_order(units, [torch.device("cpu", 0), torch.device("cpu", 1)])
+        assert placement["u0"] == placement["u1"]
+        assert placement["u1"] != placement["u2"]
+
+    def test_single_device_places_everything(self):
+        units = [(["a"], 1, 0, False), (["b"], 1, 0, True)]
+        placement = partition_flow_order(units, [torch.device("cpu")])
+        assert set(placement.values()) == {torch.device("cpu")}
+
+
+class TestFlowProbe:
+    def test_records_execution_order_not_registration(self):
+        block = _SwappedExec()
+        recorded = []
+
+        def on_complete(records):
+            recorded.extend(records)
+
+        FlowProbe(block, on_complete)
+        x = torch.zeros(1, 4)
+        block(x)
+        order = [name for name, _b in recorded]
+        assert order == ["attn.q_proj", "attn.v_proj", "mlp.gate_proj", "mlp.down_proj"]
+
+    def test_hooks_are_one_shot(self):
+        block = _SwappedExec()
+        calls = []
+        FlowProbe(block, lambda records: calls.append(list(records)))
+        x = torch.zeros(1, 4)
+        block(x)
+        block(x)  # second forward must not re-record
+        assert len(calls) == 1
+
+    def test_input_bytes_captured(self):
+        block = _SwappedExec()
+        recorded = []
+        FlowProbe(block, lambda records: recorded.extend(records))
+        block(torch.zeros(2, 4))
+        assert all(b > 0 for _n, b in recorded)

@@ -1543,39 +1543,205 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         return is_placement_template(getattr(device_manager, "device_map", None))
 
-    def _build_stream_mapped_placements(self, flat_block_names: list) -> dict:
-        """Resolve per-block leaf->device placements for the whole run.
-
-        Staged parity alternates templates: even blocks use the base map,
-        odd blocks the ``stream_prefetch_device_map`` map (default: same
-        map - the shared map keeps per-GPU memory lowest while staging
-        overlaps the tune; a disjoint prefetch map isolates the two).
-        """
-        from auto_round.utils.stream_placement import resolve_block_placement
-
-        base_map = getattr(device_manager, "device_map", None)
-        next_map = getattr(self, "stream_prefetch_device_map", None) or base_map
-        fallback = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
-        # comma-key layer_config entries are shared-quantization groups (merged
-        # scale/zeros search): keep each whole on one device
-        _shared_groups = [
+    def _mapped_shared_groups_(self) -> list:
+        """Comma-key layer_config entries = shared-quantization groups."""
+        return [
             [part.strip() for part in key.split(",") if part.strip()]
             for key in (self.layer_config or {})
             if isinstance(key, str) and "," in key
         ]
-        placements = {}
-        templates = set()
-        for idx, name in enumerate(flat_block_names):
-            template = next_map if idx % 2 else base_map
-            templates.add(str(template))
-            block = get_module(self.model, name)
-            placements[name] = resolve_block_placement(block, template, fallback, shared_leaf_groups=_shared_groups)
-        logger.info(
-            "[stream-mapped] placement engaged: %d block(s), device set(s) %s; rows park on host RAM",
-            len(placements),
-            sorted(templates),
+
+    def _make_mapped_resolver(self, flat_block_names: list) -> dict:
+        """Lazy, thread-safe per-block placement resolution for mapped runs.
+
+        Staged parity alternates templates: even blocks use the base map,
+        odd blocks the ``stream_prefetch_device_map`` map (default: same
+        map). Device-list maps additionally derive a placement from the
+        block's reference forward (the first full pass through the real
+        module structure) via a one-shot probe, cache it under the block's
+        structure signature (digit-stripped leaf layout), and re-place the
+        block BEFORE tuning state exists - so identical layouts reuse the
+        flow-ordered placement and even the deriving block tunes under it.
+        Registration order is only the pre-derivation fallback. Both the
+        main loop and the prefetch reader thread resolve, hence the lock.
+        """
+        import threading
+
+        from auto_round.utils.stream_placement import (
+            FlowProbe,
+            _atomic_groups,
+            _leaf_param_bytes,
+            _normalize_device,
+            _shared_atoms,
+            block_signature,
+            is_placement_template,
+            partition_flow_order,
+            resolve_block_placement,
         )
-        return placements
+
+        base_map = getattr(device_manager, "device_map", None)
+        next_map = getattr(self, "stream_prefetch_device_map", None) or base_map
+        fallback = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+        shared_groups = self._mapped_shared_groups_()
+        state = {"lock": threading.RLock(), "placements": {}, "flow_templates": {}, "pending_restage": None}
+        logged = {"engaged": False}
+
+        def _template_for(flat_idx: int):
+            return next_map if flat_idx % 2 else base_map
+
+        def _template_devices(template) -> list:
+            if is_placement_template(template):
+                return []  # hand-written template: placement is the user's
+            devices = [d.strip() for d in str(template).split(",") if d.strip()]
+            return devices or []
+
+        def _resolve(block_name: str) -> dict:
+            with state["lock"]:
+                cached = state["placements"].get(block_name)
+            if cached is not None:
+                return cached
+            flat_idx = flat_block_names.index(block_name)
+            template = _template_for(flat_idx)
+            block = get_module(self.model, block_name)
+            leaf_names = [
+                n
+                for n, m in block.named_modules()
+                if not list(m.children()) and any(True for _ in m.parameters(recurse=False))
+            ]
+            devices = _template_devices(template)
+            sig = block_signature(block)
+            key = (sig, tuple(str(d) for d in devices)) if devices else None
+            flow = state["flow_templates"].get(key) if key else None
+            if flow is not None:
+                placement = {leaf: flow[leaf] for leaf in leaf_names if leaf in flow}
+                for leaf in leaf_names:
+                    placement.setdefault(leaf, fallback)
+                if not logged.get("reused"):
+                    logged["reused"] = True
+                    logger.info(
+                        "[stream-mapped] reusing flow-derived placement (layout %s..., %d devices)",
+                        sig[:24],
+                        len(devices),
+                    )
+            else:
+                placement = resolve_block_placement(block, template, fallback, shared_leaf_groups=shared_groups)
+            if not logged.get("engaged"):
+                logged["engaged"] = True
+                logger.info(
+                    "[stream-mapped] placement engaged: %d block(s); device-list maps derive the "
+                    "placement from each layout's first reference forward; rows park on host RAM",
+                    len(flat_block_names),
+                )
+            with state["lock"]:
+                state["placements"][block_name] = placement
+            return placement
+
+        def _derive(block, records, devices, dev_objs):
+            leaf_names = [
+                n
+                for n, m in block.named_modules()
+                if not list(m.children()) and any(True for _ in m.parameters(recurse=False))
+            ]
+            get_mod = dict(block.named_modules())
+            atom_of = {}
+            for gkey, leaves in _atomic_groups(leaf_names):
+                for leaf in leaves:
+                    atom_of[leaf] = ("c", gkey)
+            for atom in _shared_atoms(leaf_names, shared_groups):
+                for leaf in atom:
+                    atom_of[leaf] = ("s", tuple(sorted(atom)))
+            units = []
+            seen_atoms = set()
+            fired = set()
+            for rel, in_bytes in records:
+                if rel in fired:
+                    continue
+                fired.add(rel)
+                atom = atom_of.get(rel)
+                if atom is not None:
+                    if atom in seen_atoms:
+                        continue
+                    seen_atoms.add(atom)
+                    members = [n for n in leaf_names if atom_of.get(n) == atom]
+                    units.append((members, sum(_leaf_param_bytes(get_mod[n]) for n in members), in_bytes, True))
+                else:
+                    units.append(([rel], _leaf_param_bytes(get_mod[rel]), in_bytes, False))
+            for leaf in leaf_names:  # never executed: place for balance
+                if leaf not in fired:
+                    units.append(([leaf], _leaf_param_bytes(get_mod[leaf]), 0, atom_of.get(leaf) is not None))
+            placement = partition_flow_order(units, dev_objs)
+            key = (block_signature(block), tuple(str(d) for d in devices))
+            with state["lock"]:
+                state["flow_templates"][key] = placement
+            logger.info(
+                "[stream-mapped] derived placement from the reference forward (layout %s..., %d modules, "
+                "%d devices); identical layouts reuse it",
+                key[0][:24],
+                len(placement),
+                len(dev_objs),
+            )
+            return placement
+
+        def _maybe_probe(block, block_name: str, has_forward: bool):
+            """Install the reference-forward probe when derivation applies."""
+            if not has_forward:
+                return None
+            flat_idx = flat_block_names.index(block_name)
+            devices = _template_devices(_template_for(flat_idx))
+            if not devices:
+                return None
+            dev_objs = [_normalize_device(d) for d in devices]
+            key = (block_signature(block), tuple(str(d) for d in devices))
+            with state["lock"]:
+                if key in state["flow_templates"]:
+                    return None
+
+            def _on_complete(records):
+                placement = _derive(block, records, devices, dev_objs)
+                with state["lock"]:
+                    state["pending_restage"] = {"block_id": id(block), "placement": placement}
+
+            return FlowProbe(block, _on_complete)
+
+        def _make_restage(block, block_name: str):
+            """Build the fp->wrapper boundary callback that applies the derived
+            placement to the deriving block itself (weights only - no tuning
+            params or gradients exist at that point)."""
+
+            def _restage():
+                pending = state.get("pending_restage")
+                if pending is None or pending["block_id"] != id(block):
+                    return
+                placement = pending["placement"]
+                from auto_round.compressors.utils import rehome_block_mapped_
+
+                rehome_block_mapped_(block, placement, fallback)
+                from accelerate.hooks import AlignDevicesHook, add_hook_to_module, remove_hook_from_module
+
+                for _n, _mod in block.named_modules():
+                    if list(_mod.children()):
+                        continue
+                    if not any(True for _ in _mod.parameters(recurse=False)):
+                        continue
+                    dev = placement.get(_n)
+                    if dev is None:
+                        continue
+                    _mod.tuning_device = torch.device(dev)
+                    remove_hook_from_module(_mod)
+                    if len(device_manager.device_list) > 1:
+                        add_hook_to_module(_mod, AlignDevicesHook(_mod.tuning_device, io_same_device=True), True)
+                block._stream_mapped = placement
+                with state["lock"]:
+                    state["placements"][block_name] = placement
+                    state["pending_restage"] = None
+                logger.info("[stream-mapped] restaged %s onto its flow-derived placement before tuning", block_name)
+
+            return _restage
+
+        state["resolve"] = _resolve
+        state["maybe_probe"] = _maybe_probe
+        state["make_restage"] = _make_restage
+        return state
 
     def _resolve_stream_stage_devices(self):
         """Resolve the ``stream_prefetch`` mode into the staging-device list.
@@ -2682,18 +2848,18 @@ class CompressionOrchestrator(BaseOrchestrator):
         # block-sized VRAM.
         _prefetch_mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
         prefetch_depth = 0 if _prefetch_mode in STREAM_PREFETCH_OFF else 1
-        _mapped_placements = (
-            self._build_stream_mapped_placements(flat_block_names)
+        _mapped_state = (
+            self._make_mapped_resolver(flat_block_names)
             if (streamer is not None and self._stream_mapped_enabled())
             else None
         )
         stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and prefetch_depth > 0) else None
         _stage_device_of = None
-        if _mapped_placements is not None:
+        if _mapped_state is not None:
             _fallback = str(self.device)
 
-            def _stage_device_of(idx, name, prefix, _p=_mapped_placements, _fb=_fallback):
-                placement = _p.get(prefix)
+            def _stage_device_of(idx, name, prefix, _st=_mapped_state, _fb=_fallback):
+                placement = _st["resolve"](prefix)
                 if not placement:
                     return None
                 rel = name[len(prefix) + 1 :] if prefix and name.startswith(prefix + ".") else name
@@ -2738,7 +2904,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             len(stage_devices) if stage_devices else 0,
             self.compress_context.is_immediate_packing,
         )
-        if _bg_pack_eligible and _mapped_placements is not None:
+        if _bg_pack_eligible and _mapped_state is not None:
             logger.info("[stream-mapped] background packing is not yet wired for mapped placement; packing serially")
             _bg_pack_eligible = False
         if _bg_pack_eligible and self._gguf_blob_mode():
@@ -2810,7 +2976,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _t_seg = _time.perf_counter()
                 if _peak_watch is not None:
                     _peak_watch.set_phase("load")
-                _placement = _mapped_placements.get(block_name) if _mapped_placements is not None else None
+                _placement = _mapped_state["resolve"](block_name) if _mapped_state is not None else None
                 if streamer is not None:
                     if _placement is not None:
                         # mapped placement: fetch every tensor straight to its
@@ -2855,6 +3021,12 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                         _n_moved = rehome_block_mapped_(block, _placement, load_device)
                         block._stream_mapped = _placement
+                        # derivation: probe the reference forward (first full
+                        # pass) and restage onto the derived placement at the
+                        # fp->wrapper boundary, before any tuning state exists
+                        _has_fwd = calib_state is not None and calib_state.get("fp_inputs") is not None
+                        if _mapped_state["maybe_probe"](block, block_name, _has_fwd) is not None:
+                            block._stream_restage_after_fp_ = _mapped_state["make_restage"](block, block_name)
                     else:
                         _n_moved = rehome_block_(block, load_device)
                         block._stream_home_device = torch.device(load_device)
@@ -2944,7 +3116,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         q_inputs=calib_state.get("q_inputs"),
                         input_ids=calib_state.get("token_ids"),
                     )
-                    if _mapped_placements is not None:
+                    if _mapped_state is not None:
                         # mapped contract: rows live on host RAM (the tune
                         # parks them there; keep the advanced chain there too
                         # so the map's GPUs hold only block state)

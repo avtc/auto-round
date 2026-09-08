@@ -480,6 +480,17 @@ class SignRoundQuantizer(BaseQuantizer):
         _rehome_calibration_state(active_inputs, fp_outputs, _park)
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
+        # mapped streaming: the reference forward has completed (fp_outputs is
+        # collected) and no tuning params exist yet - the window to re-place
+        # the block onto its flow-derived devices before wrappers bind
+        _restage = getattr(block, "_stream_restage_after_fp_", None)
+        if callable(_restage):
+            try:
+                block._stream_restage_after_fp_ = None
+                _restage()
+            except Exception as e:  # placement refresh must never kill the tune
+                logger.warning("[stream-mapped] restage after reference pass failed (%s); keeping placement", e)
+
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
             block,
             self.enable_minmax_tuning,
