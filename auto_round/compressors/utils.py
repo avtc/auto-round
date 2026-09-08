@@ -504,6 +504,43 @@ def check_need_act_calibration(
     return False
 
 
+def collect_best_params_sharded(block, devices=None):
+    """Best-params snapshot spread round-robin across accelerator devices.
+
+    A whole-snapshot-on-one-device doubles that device's value memory
+    (OOM on 24G cards for ~4B-param blocks), while pageable host copies
+    cost ~8s per improving iteration. Round-robin device-to-device copies
+    cost ~1s total and add only a slice of the values per device. Falls
+    back to a host snapshot (with a warning) when no accelerator devices
+    are available.
+    """
+    from auto_round.utils.device_manager import device_manager
+
+    devs = [
+        d if isinstance(d, torch.device) else torch.device(d)
+        for d in (devices if devices is not None else device_manager.device_list)
+    ]
+    devs = [d for d in devs if d.type != "cpu"]
+    if not devs:
+        logger.warning("[tune] no accelerator devices for the sharded snapshot; parking on host")
+        return collect_best_params(block, "cpu")
+    params = {}
+    k = 0
+    if hasattr(block, "orig_layer"):
+        for key in block.params.keys():
+            params[key] = block.params[key].data.to(devs[k % len(devs)], copy=True)
+            k += 1
+    else:
+        for n, m in block.named_modules():
+            if hasattr(m, "orig_layer"):
+                dev = devs[k % len(devs)]
+                k += 1
+                params[n] = {}
+                for key in m.params.keys():
+                    params[n][key] = m.params[key].data.to(dev, copy=True)
+    return params
+
+
 def collect_best_params(block, cache_device="cpu"):
     """Collect the best parameters from the block to the specified device."""
     params = {}

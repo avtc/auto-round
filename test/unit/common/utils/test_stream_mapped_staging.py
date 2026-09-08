@@ -471,3 +471,60 @@ class TestBestParamsSnapDev:
 
         block = torch.nn.Linear(2, 2)
         assert _best_params_snap_dev_(block, torch.device("cpu"), "cpu") == "cpu"
+
+
+class TestShardedSnapshot:
+    def _fake_block(self):
+        import torch
+
+        class FakeWrap(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                lin = torch.nn.Linear(2, 2)
+                self.orig_layer = lin
+                self.params = {"v": torch.nn.Parameter(torch.ones(4))}
+
+        import torch.nn as nn
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = FakeWrap()
+                self.b = FakeWrap()
+                self.c = FakeWrap()
+
+        return Blk()
+
+    def test_spreads_round_robin_and_falls_back_to_host(self, monkeypatch, caplog):
+        import logging as _logging
+
+        import torch
+
+        from auto_round.compressors import utils as cu
+
+        blk = self._fake_block()
+
+        # this build normalizes cpu:N to plain 'cpu', so the resulting
+        # devices cannot evidence the spread - verify the ROUND-ROBIN
+        # SEQUENCE of device selection instead (indexes used per wrapper)
+        class SpyList(list):
+            def __init__(self, items):
+                super().__init__(items)
+                self.picked = []
+
+            def __getitem__(self, i):
+                self.picked.append(i)
+                return super().__getitem__(i)
+
+        spy = SpyList([torch.device("cpu", 0), torch.device("cpu", 1)])
+        params = cu.collect_best_params_sharded(blk, spy)
+        assert spy.picked == [0, 1, 0]  # cycled across BOTH devices, not funneled
+        # copies, not aliases (values mutate during tuning)
+        assert params["a"]["v"].data_ptr() != blk.a.params["v"].data_ptr()
+
+        # no accelerator devices -> host fallback with a warning
+        monkeypatch.setattr(cu.logger, "propagate", True)
+        with caplog.at_level(_logging.INFO, logger=cu.logger.name):
+            params = cu.collect_best_params_sharded(blk, [torch.device("cpu")])
+        assert str(params["a"]["v"].device) == "cpu"
+        assert any("sharded snapshot" in r.getMessage() for r in caplog.records)

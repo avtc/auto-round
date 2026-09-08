@@ -51,21 +51,35 @@ def _sync_tune_devices_():
     synchronize_devices_(device_manager.device_list)
 
 
+SHARDED_SNAPSHOT = "sharded"  # marker: spread the snapshot across tune devices
+
+
 def _best_params_snap_dev_(block, home, cache_device):
-    """Device for the best-params snapshot.
+    """Device (or scheme) for the best-params snapshot.
 
     Single-GPU pipelines that already cache on GPU park the snapshot where
     it was produced (cross-device D2D snapshots cost ~0.1s/iter on
     non-primary homes). Stream-MAPPED blocks are the exception: their tune
     params live spread across several GPUs and the snapshot would funnel a
     full copy of every wrapper's values onto ONE device (~2x its value
-    memory) - park on host RAM instead, like the calibration rows.
+    memory), while pageable host copies cost ~8s per improving iteration -
+    spread the copies round-robin across the tune devices instead (D2D,
+    ~1s total, one value-slice of extra memory per device).
     """
     if getattr(block, "_stream_mapped", None):
-        return torch.device("cpu")
+        return SHARDED_SNAPSHOT
     if getattr(cache_device, "type", "") == "cuda" and getattr(home, "type", "") == "cuda":
         return home
     return cache_device
+
+
+def _collect_best_params_(block, scheme):
+    """Snapshot collector handling the SHARDED marker."""
+    if isinstance(scheme, str) and scheme == SHARDED_SNAPSHOT:
+        from auto_round.compressors.utils import collect_best_params_sharded
+
+        return collect_best_params_sharded(block)
+    return collect_best_params(block, scheme)
 
 
 def _rehome_calibration_state(
@@ -688,7 +702,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     if _perf:
                         _sync_tune_devices_()
                         _t2 = time.perf_counter()
-                    best_params = collect_best_params(
+                    best_params = _collect_best_params_(
                         block, _best_params_snap_dev_(block, _home, self.compress_context.cache_device)
                     )
                     if _perf:
@@ -696,7 +710,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         _t["snap"] += time.perf_counter() - _t2
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
-                best_params = collect_best_params(
+                best_params = _collect_best_params_(
                     block, _best_params_snap_dev_(block, _home, self.compress_context.cache_device)
                 )
 
