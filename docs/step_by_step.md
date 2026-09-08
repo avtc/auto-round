@@ -982,13 +982,15 @@ directly and never resolves hub ids); download the model first when starting fro
   (`quant_nontext_module` is rejected under streaming).
 - Algorithms and options: the RTN family (plain and optimized RTN) and SignRound (including `iters > 0`
   tuning) are supported. SignRound tuning under streaming consumes the derived calibration chain -- hidden
-  states carried block-to-block, no whole-model forward. Quantizer algorithms whose own calibration step
-  drives the full materialized model (activation-statistics/Hessian gathering, e.g. AWQ- or GPTQ-style
-  quantizers) are rejected at startup: the meta skeleton has one block resident at a time and nothing for
-  such passes to run against. `enable_lfq` is rejected as well (its loss forwards the still-meta `lm_head`
-  on the final block), and so are diffusion pipelines (no per-block decoder list to stream). Note that
-  `auto_gptq`/`auto_awq` as export formats remain supported -- the restriction is on quantizer algorithms,
-  not packing layouts.
+  states carried block-to-block, no whole-model forward. Quantizers outside those families are rejected at
+  startup: their current implementations capture calibration statistics (activations, Hessians) by driving
+  the fully materialized model and are not yet adapted to the streaming loop's block-replay interface.
+  That is an integration gap rather than an algorithmic limit -- per-layer capture (as in GPTQModel's
+  sequential looper: hook one layer, replay its inputs, feed its outputs forward) fits the same
+  rows-in/rows-out shape the chain already provides, so adaptation is possible future work.
+  `enable_lfq` is rejected as well (its loss forwards the still-meta `lm_head` on the final block), and so
+  are diffusion pipelines (no per-block decoder list to stream). Note that `auto_gptq`/`auto_awq` as export
+  formats remain supported -- the restriction is on quantizer algorithms, not packing layouts.
 - The model must be passed as a local checkpoint directory path: neither hub ids (HF/ModelScope) nor a
   preloaded model object can be streamed -- the loop reads weight shards straight from disk.
 - `--stream_prefetch off|auto|on|cpu|<device>`: stage the next block's weights on another device while the

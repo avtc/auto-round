@@ -582,9 +582,12 @@ class BaseOrchestrator(object):
             if unsupported:
                 raise ValueError(
                     f"stream_quantization supports the RTN and SignRound quantizers, got "
-                    f"{unsupported}. Other quantizers need calibration-data forward passes "
-                    "on the full model, which the streaming loop (meta skeleton, "
-                    "block-at-a-time) cannot provide."
+                    f"{unsupported}: those implementations capture calibration statistics "
+                    "(activations, Hessians) by driving the fully materialized model and "
+                    "are not yet adapted to the streaming loop's block-replay interface. "
+                    "The loop itself is compatible with per-block capture - SignRound's "
+                    "streamed chain already feeds block-local tuning - so adapting other "
+                    "quantizers is future work, not a fundamental restriction."
                 )
 
     def _auto_engage_stream_features(self) -> None:
@@ -2352,8 +2355,9 @@ def _hydrate_meta_from_checkpoint(model, ckpt_dir: str, amp_dtype: Optional[torc
     import json
     import os
 
-    from auto_round.utils.model import check_to_quantized
     from safetensors.torch import safe_open
+
+    from auto_round.utils.model import check_to_quantized
 
     sd = model.state_dict()
     meta_names = [n for n, t in sd.items() if t.device.type == "meta"]

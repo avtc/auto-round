@@ -510,6 +510,42 @@ class TestStreamModeExclusivity:
         # sanity: allowed combination passes
         BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
 
+    def test_stream_quantization_rejects_unadapted_calibration_quantizers(self):
+        """Quantizer configs outside the RTN/SignRound families are rejected:
+        their current implementations capture statistics by driving the fully
+        materialized model and are not yet adapted to the block-replay
+        interface. The error must frame it as an adaptation gap, not an
+        algorithmic impossibility."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from auto_round.algorithms.quantization.config import QuantizationConfig
+        from auto_round.compressors.base import BaseCompressor
+
+        class _UnadaptedQuantizer(QuantizationConfig):
+            pass  # need_calib defaults to True on the base class
+
+        cfg = _UnadaptedQuantizer.__new__(_UnadaptedQuantizer)  # bypass __init__ args
+        stub = SimpleNamespace(stream_quantization=True, _alg_configs=[cfg])
+        with pytest.raises(ValueError, match="not yet adapted") as excinfo:
+            BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
+        assert "future work, not a fundamental restriction" in str(excinfo.value)
+        assert _UnadaptedQuantizer.__name__ in str(excinfo.value)
+
+    def test_stream_quantization_rejects_enable_lfq(self):
+        """enable_lfq forwards the still-meta lm_head on the final block; it
+        must be rejected under streaming."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from auto_round.compressors.base import BaseCompressor
+
+        stub = SimpleNamespace(stream_quantization=True, _alg_configs=[SimpleNamespace(enable_lfq=True)])
+        with pytest.raises(ValueError, match="enable_lfq=True is not supported under stream_quantization"):
+            BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
+
     def test_stream_quantization_with_mllm_and_env_var_still_raises(self, monkeypatch):
         import pytest
 
