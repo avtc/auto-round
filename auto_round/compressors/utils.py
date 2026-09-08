@@ -147,6 +147,9 @@ def strip_stale_device_hooks_(module: torch.nn.Module) -> int:
         return 0
     cleaned = 0
     for m in module.modules():
+        if getattr(m, "_stream_align_handles", None):
+            detach_stream_align_(m)
+            cleaned += 1
         if getattr(m, "_hf_hook", None) is not None:
             remove_hook_from_module(m)
             cleaned += 1
@@ -175,6 +178,56 @@ def rehome_block_(module: torch.nn.Module, device) -> int:
 
     module._apply(_fn)
     return moved
+
+
+class StreamAlignHook:
+    """Per-leaf input/output aligner for mapped streamed blocks.
+
+    Replaces ``accelerate.AlignDevicesHook(io_same_device=True)`` for this
+    path: accelerate's ``init_hook`` moves module tensors to the execution
+    device at ATTACH time (a second move set that races the rehome and
+    re-wraps parameters - ``Parameter(Parameter)`` crashes on some
+    accelerate versions), and re-attaching chains stale execution devices.
+    This hook never touches weights: the pre-hook moves args and kwargs to
+    the leaf's target, the post-hook returns the output to the device the
+    input arrived from. Idempotent - re-pinning replaces the handles.
+    """
+
+    def __init__(self, target: torch.device):
+        self.target = target
+        self.input_device = None
+
+    def _pre(self, module, args, kwargs):
+        from accelerate.utils import find_device, send_to_device
+
+        self.input_device = find_device([args, kwargs]) or self.target
+        return send_to_device(args, self.target), send_to_device(kwargs, self.target)
+
+    def _post(self, module, args, output):
+        from accelerate.utils import send_to_device
+
+        return send_to_device(output, self.input_device)
+
+
+def attach_stream_align_(mod: torch.nn.Module, target) -> None:
+    """Attach (or replace) the align hook on one leaf."""
+    detach_stream_align_(mod)
+    hook = StreamAlignHook(torch.device(target))
+    handles = [
+        mod.register_forward_pre_hook(hook._pre, with_kwargs=True),
+        mod.register_forward_hook(hook._post),
+    ]
+    mod._stream_align_handles = handles
+    mod._stream_align_hook = hook
+
+
+def detach_stream_align_(mod: torch.nn.Module) -> None:
+    handles = getattr(mod, "_stream_align_handles", None)
+    if handles:
+        for h in handles:
+            h.remove()
+    mod._stream_align_handles = None
+    mod._stream_align_hook = None
 
 
 def rehome_block_mapped_(module: torch.nn.Module, placement: dict, fallback) -> int:

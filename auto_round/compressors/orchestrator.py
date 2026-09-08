@@ -1568,7 +1568,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         forwards - without this, any block forward (mask-form probe, chain
         pass, tuning) mixes devices and fails on the first cross-device op.
         """
-        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+        from auto_round.compressors.utils import attach_stream_align_
 
         multi = len(device_manager.device_list) > 1
         for name, mod in block.named_modules():
@@ -1581,7 +1581,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 continue
             mod.tuning_device = torch.device(dev)
             if multi:
-                add_hook_to_module(mod, AlignDevicesHook(mod.tuning_device, io_same_device=True), True)
+                # own lightweight align hook: no attach-time tensor moves
+                # (accelerate's init_hook re-moves weights and re-wraps
+                # parameters - a second move set racing the rehome), and
+                # idempotent so the restage re-pin replaces instead of
+                # chaining stale execution devices
+                attach_stream_align_(mod, mod.tuning_device)
 
     def _mapped_shared_groups_(self) -> list:
         """Modules kept together on one device while mapping a block.
@@ -1783,6 +1788,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # a confusing later OOM
                 clear_memory(device_list=sorted({str(d) for d in placement.values()} | {str(fallback)}))
                 rehome_block_mapped_(block, placement, fallback)
+                # drain the moves before anything touches CUDA again: the
+                # rehome enqueues async cross-device copies, and a fault in
+                # them would otherwise surface at an unrelated later call
+                # (the hook attach) with a misleading stack
+                if torch.cuda.is_available():
+                    for _dv in {str(d) for d in placement.values()} | {str(fallback)}:
+                        if str(_dv).startswith("cuda"):
+                            torch.cuda.synchronize(torch.device(str(_dv)))
                 CompressionOrchestrator._pin_stream_mapped_(block, placement)
                 block._stream_mapped = placement
                 with state["lock"]:

@@ -115,7 +115,13 @@ class TestPinStreamMapped:
         assert block.q_proj.tuning_device == torch.device("cpu", 1)
         assert block.mlp["gate_proj"].tuning_device == torch.device("cpu", 0)
         # cross-device chain hooks attached on multi-device maps
-        assert getattr(block.q_proj, "_hf_hook", None) is not None
+        assert getattr(block.q_proj, "_stream_align_hook", None) is not None
+        # idempotent: re-pinning (restage) replaces the hook handles
+        # instead of stacking a second aligner
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        assert len(block.q_proj._forward_pre_hooks) == 1
+        assert len(block.q_proj._forward_hooks) == 1
+        assert block.q_proj._stream_align_hook.target == torch.device("cpu", 1)
 
     def test_single_device_map_skips_hooks(self, monkeypatch):
         import auto_round.compressors.orchestrator as orch
