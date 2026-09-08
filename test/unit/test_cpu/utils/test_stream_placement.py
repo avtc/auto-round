@@ -549,3 +549,65 @@ class TestTuneStatePricing:
         # effective loads (atoms + reserve) stay balanced within one atom
         eff = [per[d] * 100 + (250 if d == "d0" else 0) for d in devs]
         assert max(eff) - min(eff) <= 100
+
+
+class TestFlowProbeRoutedDetection:
+    def _probe_block(self):
+        import torch
+        import torch.nn as nn
+
+        class Routed(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = nn.Linear(16, 16)  # any child: makes it a container
+
+            def forward(self, hidden, top_k_index, top_k_weights):
+                return hidden
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = Routed()
+
+            def forward(self, h):
+                idx = torch.zeros(4, 8, dtype=torch.long)
+                w = torch.zeros(4, 8)
+                return self.experts(h, idx, w)
+
+        return Blk()
+
+    def test_routed_container_records_marker_with_topk_and_bytes(self):
+        import torch
+
+        from auto_round.utils.stream_placement import FlowProbe
+
+        got = []
+        blk = self._probe_block()
+        probe = FlowProbe(blk, lambda records: got.extend(records))
+        blk(torch.randn(4, 16))
+        routed = [r for r in got if str(r[0]).startswith("__routed__:")]
+        assert routed, f"no routed marker in {got}"
+        name, top_k, hidden_bytes = routed[0]
+        assert name == "__routed__:experts"
+        assert top_k == 8
+        assert hidden_bytes == 4 * 16 * 4  # fp32 default dtype numel x elemsize
+
+    def test_plain_container_records_no_marker(self):
+        import torch
+        import torch.nn as nn
+
+        from auto_round.utils.stream_placement import FlowProbe
+
+        class Plain(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = nn.Linear(8, 8)
+
+            def forward(self, x):
+                return self.inner(x)
+
+        got = []
+        blk = Plain()
+        FlowProbe(blk, lambda records: got.extend(records))
+        blk(torch.randn(4, 8))
+        assert not [r for r in got if str(r[0]).startswith("__routed__:")]

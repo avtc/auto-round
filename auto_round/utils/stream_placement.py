@@ -488,6 +488,26 @@ class FlowProbe:
                     return a.numel() * a.element_size()
             return 0
 
+        def _routed_sig(args):
+            """Model-agnostic routed-dispatch signature, from arg shapes only.
+
+            A routed experts container is called as ``(hidden[*, H],
+            index[*, k], weights[*, k])``: some tensor arg ends in a small
+            last dim (2..64) and covers exactly the hidden's token count.
+            Attribute-name probing is avoided on purpose - routers/experts
+            spell ``top_k``/``num_experts`` differently (or not at all)
+            across architectures. Returns (top_k, hidden_bytes) or None.
+            """
+            tens = [a for a in args if torch.is_tensor(a)]
+            if len(tens) < 2:
+                return None
+            main = tens[0]
+            tokens = main.numel() // max(1, main.shape[-1] if main.dim() else 1)
+            for a in tens[1:]:
+                if a.dim() >= 2 and 2 <= a.shape[-1] <= 64 and a.numel() // a.shape[-1] == tokens:
+                    return int(a.shape[-1]), main.numel() * main.element_size()
+            return None
+
         for rel, leaf in rel_leaves:
 
             def _pre(module, args, _rel=rel):
@@ -496,6 +516,22 @@ class FlowProbe:
                 self.records.append((_rel, _first_bytes(args)))
 
             self._hooks.append(leaf.register_forward_pre_hook(_pre))
+
+        # containers (modules with children) get a one-shot arg-shape probe
+        # purely to detect routed dispatch (top_k); their records carry a
+        # marker prefix so consumers can tell them from leaf records
+        for rel, mod in block.named_modules():
+            if not rel or not list(mod.children()):
+                continue
+
+            def _cpre(module, args, _rel=rel):
+                if self._done:
+                    return
+                sig = _routed_sig(args)
+                if sig:
+                    self.records.append((f"__routed__:{_rel}", sig[0], sig[1]))
+
+            self._hooks.append(mod.register_forward_pre_hook(_cpre))
 
         def _post(module, args, output):
             self.finish()
