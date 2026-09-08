@@ -3141,6 +3141,16 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _n_moved = rehome_block_mapped_(block, _placement, load_device)
                         block._stream_mapped = _placement
                         self._pin_stream_mapped_(block, _placement)
+                        # wrappers created later must own the alignment (an
+                        # orig-layer hook anchors wrongly: the wrapper moves
+                        # inputs to the leaf device before replaying orig
+                        # hooks). Set for EVERY mapped block - the restage
+                        # path sets its own; blocks reusing a cached
+                        # placement never restage. Default-arg binding: the
+                        # loop reassigns _placement per block.
+                        block._stream_realign_after_wrap_ = lambda _b=block, _p=_placement: self._pin_stream_mapped_(
+                            _b, _p
+                        )
                         # derivation: probe the reference forward (first full
                         # pass) and restage onto the derived placement at the
                         # fp->wrapper boundary, before any tuning state exists
