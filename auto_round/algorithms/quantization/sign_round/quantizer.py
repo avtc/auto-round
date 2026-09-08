@@ -702,7 +702,6 @@ class SignRoundQuantizer(BaseQuantizer):
                     block, _best_params_snap_dev_(block, _home, self.compress_context.cache_device)
                 )
 
-        if _perf and _t["iters"]:
             if not self.not_use_best_mse:
                 if 0 < self.dynamic_max_gap <= i - last_best_iter:
                     break
