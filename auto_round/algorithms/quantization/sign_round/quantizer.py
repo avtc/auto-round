@@ -474,6 +474,12 @@ class SignRoundQuantizer(BaseQuantizer):
                 block._stream_restage_after_fp_ = None
                 _restage()
             except Exception as e:  # placement refresh must never kill the tune
+                if isinstance(e, torch.AcceleratorError):
+                    # a CUDA/context fault is unrecoverable: every later op
+                    # would fail with the same sticky error and blame
+                    # unrelated code (the next wrapper's init) - surface the
+                    # true site instead
+                    raise
                 logger.warning("[stream-mapped] restage after reference pass failed (%s); keeping placement", e)
 
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(

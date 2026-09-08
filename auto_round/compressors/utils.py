@@ -208,7 +208,16 @@ def rehome_block_mapped_(module: torch.nn.Module, placement: dict, fallback) -> 
             claimed.add(id(t))
             if t.device != target and t.device.type != "meta":
                 moved += 1
-                return t.to(target)
+                placed = t.to(target)
+                # claim the REPLACEMENT too: the root sweep below would
+                # otherwise see every moved tensor as an unmatched miss and
+                # drag it onto the block default - a second cross-device
+                # copy per tensor with the source freed in between (the
+                # restage's heuristic->derived moves are REAL moves, unlike
+                # prefetch staging which lands tensors on their targets and
+                # makes .to() a claimed no-op)
+                claimed.add(id(placed))
+                return placed
             return t
 
         return _fn

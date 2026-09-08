@@ -3110,7 +3110,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                             load_device,
                         )
                     _t_seg = _mark_load_seg(_load_sub, "rehome", _t_seg)
-                    if logger.isEnabledFor(logging.DEBUG):
+                    if envs.AR_MEM_COUNTERS and logger.isEnabledFor(logging.DEBUG):
                         # diagnostics: accounted separately so the io figure
                         # stays honest about the actual load cost
                         self._log_device_inventory(calib_state, f"block {stream_block_idx}")
@@ -3312,7 +3312,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         if self.compress_context.low_cpu_mem_usage and streamer is None:
                             self._offloader(self.model, block_name)
 
-                if logger.isEnabledFor(logging.DEBUG):
+                if envs.AR_MEM_COUNTERS and logger.isEnabledFor(logging.DEBUG):
                     # post-tune sample: catches the during-tuning transient
                     # peak via VmHWM that the pre-tune snapshot misses
                     self._log_device_inventory(calib_state, f"block {stream_block_idx} post")
@@ -3771,7 +3771,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self.shard_writer.adopt_existing_shards()
                 self._adopt_blob_store_()
 
-        _mem_inv = logger.isEnabledFor(logging.DEBUG)
+        _mem_inv = envs.AR_MEM_COUNTERS and logger.isEnabledFor(logging.DEBUG)
         _peak_watch = PeakWatcher() if envs.AR_MEM_COUNTERS else None
         self._peak_watch = _peak_watch
         if _peak_watch is not None:
