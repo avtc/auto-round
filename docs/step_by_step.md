@@ -517,7 +517,7 @@ ar.quantize_and_save()
 
 `device_map (Optional[str,dict,torch.device])`  only supported in API now, as auto-scheme used more VRAM than auto-round tuning, so you could set a different device_map for it.
 
-`shared_layers (Optional[Iterable[Iterable[str]]])`  only supported in API now
+`shared_layers (Optional[Iterable[Iterable[str]]])`  only supported in API now. Under streaming mapped placement, the declared groups also stay on one device (placement atomicity only; joint scale search remains the layer_config comma-key mechanism).
 
 `batch_size (Optional[int])` could be set to 1 to reduce VRAM but increase time cost
 

@@ -240,6 +240,7 @@ class BaseOrchestrator(object):
         seed: int = 42,
         low_cpu_mem_usage: bool = True,
         layer_config: Optional[dict] = None,
+        shared_layers: Optional[list] = None,
         nsamples: int = None,
         seqlen: int = None,
         scale_dtype: Optional[Union[str, torch.dtype]] = None,
@@ -311,6 +312,11 @@ class BaseOrchestrator(object):
         # ``self.calibration_context`` (seeded above) and exposed via
         # ``@property`` forwarders.
         self.layer_config = layer_config
+        # module groups that must share one quantization scheme (AutoScheme
+        # allocation) - under streaming mapped placement they additionally
+        # stay on one device (placement atomicity only; joint scale search
+        # remains the layer_config comma-key mechanism)
+        self.shared_layers = shared_layers
         self.scale_dtype = scale_dtype
         self.ignore_layers = ignore_layers
         self.quant_lm_head = quant_lm_head

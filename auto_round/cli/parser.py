@@ -223,8 +223,10 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         nargs="+",
         action="append",
         default=None,
-        help="Ensure listed layers share the same quantization data type."
-        " Accepts space-separated (--shared_layers l1 l2) or comma-separated ('l1,l2') per group.",
+        help="Ensure listed layers share the same quantization data type"
+        " (consumed by AutoScheme). Under streaming mapped placement the same"
+        " groups additionally stay on one device. Accepts space-separated"
+        " (--shared_layers l1 l2) or comma-separated ('l1,l2') per group.",
     )
     rt.add_argument(
         "--static_kv_dtype",

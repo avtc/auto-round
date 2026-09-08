@@ -510,7 +510,7 @@ ar.quantize_and_save()
 
 `device_map (Optional[str,dict,torch.device])`：仅支持 API 场景。由于 AutoScheme 会比标准 AutoRound 会占用更多显存，故可通过此参数为其指定不同的设备映射。
 
-`shared_layers (Optional[Iterable[Iterable[str]]])`：仅支持 API 场景，用于定义多个层的分组，这些层将共享相同的量化配置。
+`shared_layers (Optional[Iterable[Iterable[str]]])`：仅支持 API 场景，用于定义多个层的分组，这些层将共享相同的量化配置。在流式映射放置下，这些分组还会保持在同一设备上（仅影响放置；联合 scale 搜索仍由 layer_config 逗号键机制承担）。
 
 `batch_size (Optional[int])`：设为 `1` 可以降低显存占用，但会增加训练时间。
 

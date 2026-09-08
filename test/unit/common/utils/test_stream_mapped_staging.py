@@ -252,3 +252,47 @@ class TestStreamPrefetchDeviceMapGuard:
                 stream_prefetch_device_map="2,3",
                 stream_quantization=True,
             )
+
+
+class TestSharedLayersPlacementGroups:
+    """--shared_layers groups become placement atoms (union with the
+    layer_config comma-key shared-quant groups)."""
+
+    def test_union_of_comma_keys_and_shared_layers(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        o = object.__new__(CompressionOrchestrator)
+        o.layer_config = {"lm_head": {"bits": 8}, "q_proj,k_proj,v_proj": {}}
+        o.shared_layers = [["gate_proj", "up_proj"], ["single"], None, ["a", "b"]]
+        groups = o._mapped_shared_groups_()
+        assert ["q_proj", "k_proj", "v_proj"] in groups
+        assert ["gate_proj", "up_proj"] in groups
+        assert ["a", "b"] in groups
+        # single-member and None entries are dropped
+        assert not any(g == ["single"] for g in groups)
+
+    def test_shared_layers_group_survives_device_list_partition(self):
+        import torch
+
+        from auto_round.utils.stream_placement import _atomic_groups, _shared_atoms
+
+        leaves = [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ]
+        groups = dict(_atomic_groups(leaves))
+        for atom in _shared_atoms(leaves, [["gate_proj", "up_proj"]]):
+            merged = set(atom)
+            rebuilt = []
+            for key, lg in groups.items():
+                if merged & set(lg):
+                    merged |= set(lg)
+                else:
+                    rebuilt.append((key, lg))
+            rebuilt.append(("shared:" + atom[0].rpartition(".")[2], sorted(merged)))
+            groups = dict(rebuilt)
+        assert set(groups["shared:gate_proj"]) >= {"mlp.gate_proj", "mlp.up_proj"}

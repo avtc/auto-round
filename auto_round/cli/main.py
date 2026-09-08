@@ -118,6 +118,10 @@ def _build_entry_compressor_kwargs(args) -> dict:
         "to_quant_block_names": args.to_quant_block_names,
         "stream_quantization": getattr(args, "stream_quantization", False),
         "stream_prefetch": prefetch,
+        # AutoScheme consumes shared_layers for same-scheme allocation; the
+        # compressor reuses the same groups as placement atoms under mapped
+        # streaming placement
+        "shared_layers": getattr(args, "shared_layers", None),
     }
 
 

@@ -1584,12 +1584,24 @@ class CompressionOrchestrator(BaseOrchestrator):
                 add_hook_to_module(mod, AlignDevicesHook(mod.tuning_device, io_same_device=True), True)
 
     def _mapped_shared_groups_(self) -> list:
-        """Comma-key layer_config entries = shared-quantization groups."""
-        return [
+        """Modules kept together on one device while mapping a block.
+
+        Two sources, same placement semantics: comma-key layer_config
+        entries (shared-quantization groups - scales/zeros are searched on
+        the merged tensor, so the group MUST sit on one device) and
+        ``shared_layers`` groups (same-quantization-scheme declarations -
+        keeping them whole is harmless and matches the fused-kernel
+        intent). Matching is by leaf basename per parent, block-wise."""
+        groups = [
             [part.strip() for part in key.split(",") if part.strip()]
             for key in (self.layer_config or {})
             if isinstance(key, str) and "," in key
         ]
+        for group in getattr(self, "shared_layers", None) or []:
+            members = [str(m).strip() for m in (group or []) if str(m).strip()]
+            if len(members) >= 2:
+                groups.append(members)
+        return groups
 
     def _make_mapped_resolver(self, flat_block_names: list) -> dict:
         """Lazy, thread-safe per-block placement resolution for mapped runs.
