@@ -504,82 +504,29 @@ def check_need_act_calibration(
     return False
 
 
-def collect_best_params_sharded(block, devices=None):
-    """Best-params snapshot distributed across accelerators by FREE memory.
+def collect_best_params_local(block):
+    """Best-params snapshot copied on each param's OWN device.
 
-    A whole-snapshot-on-one-device doubles that device's value memory
-    (OOM on 24G cards for ~4B-param blocks), while pageable host copies
-    cost ~8s per improving iteration. Copies are placed largest-first onto
-    the device with the most remaining budget (a safety fraction of its
-    free bytes - the flow-derived placement is execution-balanced, not
-    byte-balanced, so naive round-robin would overload the heavy tune
-    device). Falls back to a host snapshot when no accelerator devices
-    exist or the snapshot fits no device budget.
+    The placement balancer pre-accounts the snapshot slice in its residency
+    pricing (see _leaf_tune_state_bytes), so every device provably has room
+    for its own wrappers' copies: local device-to-device duplicates, no
+    cross-device traffic, no free-memory query, and the unwrap/apply copy
+    back is local too. Falls back to a host snapshot (with a warning) when
+    a local copy fails despite the budgeting.
     """
-    from auto_round.utils.device_manager import device_manager
-
-    devs = [
-        d if isinstance(d, torch.device) else torch.device(d)
-        for d in (devices if devices is not None else device_manager.device_list)
-    ]
-    devs = [d for d in devs if d.type != "cpu"]
-    if not devs:
-        logger.warning("[tune] no accelerator devices for the sharded snapshot; parking on host")
-        return collect_best_params(block, "cpu")
-
-    def _param_bytes(m):
-        return sum(p.data.numel() * p.data.element_size() for p in m.params.values())
-
-    if hasattr(block, "orig_layer"):
-        wrappers = {"": block}
-    else:
-        wrappers = {n: m for n, m in block.named_modules() if hasattr(m, "orig_layer")}
-    targets = shard_targets_({n: _param_bytes(m) for n, m in wrappers.items()}, devs)
-    if targets is None:
-        logger.warning("[tune] snapshot does not fit device free-memory budgets; parking on host")
-        return collect_best_params(block, "cpu")
     params = {}
-    for (name, m), dev in zip(wrappers.items(), targets):
-        params[name] = {key: p.data.to(dev, copy=True) for key, p in m.params.items()}
-    return params
-
-
-def shard_targets_(item_bytes: dict, devs, budget_frac: float = 0.6) -> list:
-    """Assign snapshot items to devices by FREE memory, not round-robin.
-
-    Round-robin blindly adds copies to already-heavy devices (the flow-
-    derived placement is execution-balanced, not byte-balanced - the
-    heaviest tune device can sit within ~1GB of OOM). Each device gets a
-    budget of budget_frac x free bytes (headroom for backward transients);
-    items are placed largest-first onto the device with the most remaining
-    budget. Returns None when the snapshot does not fit any device budget
-    (caller falls back to host).
-    """
-    free = {}
-    for d in devs:
-        try:
-            if d.type == "cuda":
-                free_bytes, _total = torch.cuda.mem_get_info(d.index)
-                free[d] = int(free_bytes * budget_frac)
-            else:
-                free[d] = None  # non-cuda accelerators: no free query here
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[tune] free-memory query failed on %s: %s", d, e)
-            free[d] = None
-    if all(v is None for v in free.values()):
-        # no per-device free-memory signal: fall back to round-robin
-        return [devs[i % len(devs)] for i in range(len(item_bytes))]
-    order = sorted(item_bytes, key=lambda n: -item_bytes[n])
-    budget = {d: (v if v is not None else 0) for d, v in free.items()}
-    out = {}
-    for name in order:
-        need = item_bytes[name]
-        d = max(budget, key=lambda k: budget[k])
-        if budget[d] < need:
-            return None  # does not fit anywhere under the safety budgets
-        budget[d] -= need
-        out[name] = d
-    return [out[n] for n in item_bytes]
+    try:
+        if hasattr(block, "orig_layer"):
+            for key, p in block.params.items():
+                params[key] = p.data.to(p.data.device, copy=True)
+        else:
+            for n, m in block.named_modules():
+                if hasattr(m, "orig_layer"):
+                    params[n] = {key: p.data.to(p.data.device, copy=True) for key, p in m.params.items()}
+        return params
+    except RuntimeError as e:
+        logger.warning("[tune] local snapshot copy failed (%s); parking the snapshot on host", e)
+        return collect_best_params(block, "cpu")
 
 
 def collect_best_params(block, cache_device="cpu"):

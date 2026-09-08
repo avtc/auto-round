@@ -474,9 +474,10 @@ class TestBestParamsSnapDev:
         assert _best_params_snap_dev_(block, torch.device("cpu"), "cpu") == "cpu"
 
 
-class TestShardedSnapshot:
+class TestLocalSnapshot:
     def _fake_block(self):
         import torch
+        import torch.nn as nn
 
         class FakeWrap(torch.nn.Module):
             def __init__(self):
@@ -485,64 +486,23 @@ class TestShardedSnapshot:
                 self.orig_layer = lin
                 self.params = {"v": torch.nn.Parameter(torch.ones(4))}
 
-        import torch.nn as nn
-
         class Blk(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.a = FakeWrap()
                 self.b = FakeWrap()
-                self.c = FakeWrap()
 
         return Blk()
 
-    def test_shard_targets_fit_free_memory(self, monkeypatch):
-        import torch
+    def test_copies_on_own_device_not_aliases(self):
+        from auto_round.compressors.utils import collect_best_params_local
 
-        from auto_round.compressors import utils as cu
+        blk = self._fake_block()
+        params = collect_best_params_local(blk)
+        assert str(params["a"]["v"].device) == str(blk.a.params["v"].device)  # own device
+        assert params["a"]["v"].data_ptr() != blk.a.params["v"].data_ptr()  # copy, not alias
 
-        class FakeDev:
-            def __init__(self, name):
-                self.type = "cuda"
-                self.index = 0
-                self.name = name
-
-            def __repr__(self):
-                return self.name
-
-        d_big, d_small = FakeDev("big"), FakeDev("small")
-        # big has 10GB free (x0.6 budget = 6), small has 3GB (budget 1.8)
-        monkeypatch.setattr(
-            cu.torch.cuda, "mem_get_info", lambda idx: (10 * 2**30, 20 * 2**30) if idx == 0 else (3 * 2**30, 4 * 2**30)
-        )
-        items = {"a": 5 * 2**30, "b": 1 * 2**30, "c": 1 * 2**30}
-        # 'a' (largest) must land on big; small gets only what fits its budget
-        out = cu.shard_targets_(items, [d_big, d_small])
-        assert out[items and list(items).index("a")] is d_big or out[0] is d_big
-
-    def test_shard_targets_round_robin_without_free_query(self):
-        from auto_round.compressors.utils import shard_targets_
-
-        class FakeDev:
-            type = "npu"  # no mem_get_info path
-
-        out = shard_targets_({"a": 1, "b": 2, "c": 3}, [FakeDev(), FakeDev()])
-        assert len(out) == 3
-
-    def test_shard_targets_none_when_nothing_fits(self, monkeypatch):
-        import torch
-
-        from auto_round.compressors import utils as cu
-
-        class FakeDev:
-            type = "cuda"
-            index = 0
-
-        monkeypatch.setattr(cu.torch.cuda, "mem_get_info", lambda idx: (1 * 2**30, 4 * 2**30))
-        out = cu.shard_targets_({"a": 5 * 2**30}, [FakeDev()])
-        assert out is None
-
-    def test_no_accelerator_falls_back_to_host_with_warning(self, monkeypatch, caplog):
+    def test_runtime_error_falls_back_to_host_with_warning(self, monkeypatch, caplog):
         import logging as _logging
 
         import torch
@@ -550,8 +510,18 @@ class TestShardedSnapshot:
         from auto_round.compressors import utils as cu
 
         blk = self._fake_block()
+        real_to = torch.Tensor.to
+
+        def boom(self, *a, **k):
+            # local copies pass a torch.device; the host fallback passes "cpu"
+            if a and isinstance(a[0], torch.device):
+                raise RuntimeError("CUDA out of memory")
+            return real_to(self, *a, **k)
+
+        monkeypatch.setattr(torch.Tensor, "to", boom)
         monkeypatch.setattr(cu.logger, "propagate", True)
         with caplog.at_level(_logging.INFO, logger=cu.logger.name):
-            params = cu.collect_best_params_sharded(blk, [torch.device("cpu")])
+            params = cu.collect_best_params_local(blk)
+        monkeypatch.undo()
         assert str(params["a"]["v"].device) == "cpu"
-        assert any("sharded snapshot" in r.getMessage() for r in caplog.records)
+        assert any("local snapshot" in r.getMessage() for r in caplog.records)

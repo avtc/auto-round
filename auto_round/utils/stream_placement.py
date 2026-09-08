@@ -150,15 +150,19 @@ def _leaf_param_bytes(module: torch.nn.Module) -> int:
 def _leaf_tune_state_bytes(module: torch.nn.Module) -> int:
     """Bytes a leaf RESIDES at on its tune device during iters>0 tuning.
 
-    Quantizable linears (what wrapper_block wraps) hold ~4x their bf16
-    param bytes: the weight (1x) plus the fp32 rounding values (2x - value
-    shape equals weight shape at 4 bytes/elem vs 2) plus the value grads
-    (1x at bf16). Non-wrapped leaves (norms, router scalars) hold only
-    their params. Balancing by raw param bytes under-weights every
-    quantizable leaf fourfold and lets the heavy tune device drift toward
-    the OOM ceiling.
+    Quantizable linears (what wrapper_block wraps) hold ~7x their bf16
+    param bytes: the weight (1x) plus fp32 rounding values (2x - value
+    shape equals weight shape at 4 bytes/elem vs 2), their fp32 grads
+    (2x - autograd matches the value dtype; there is no bf16 sign-cast on
+    the streaming path), and the best-mse snapshot copy (2x, fp32, parked
+    on the weight's own device). Non-wrapped leaves (norms, router
+    scalars) hold only their params. Balancing by raw param bytes
+    under-weights every quantizable leaf sevenfold and lets the heavy
+    tune device drift toward the OOM ceiling; pre-accounting the snapshot
+    copy here means every device provably has room for its own wrappers'
+    copies at snapshot time.
     """
-    factor = 4 if isinstance(module, torch.nn.Linear) else 1
+    factor = 7 if isinstance(module, torch.nn.Linear) else 1
     return _leaf_param_bytes(module) * factor
 
 

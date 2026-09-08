@@ -520,7 +520,7 @@ class TestTuneStatePricing:
         lin = torch.nn.Linear(100, 100)  # 10k params, bf16-sized by dtype of params (fp32 here)
         norm = torch.nn.LayerNorm(100)  # 200 params
         lin_b = sum(p.numel() * p.element_size() for p in lin.parameters())
-        assert _leaf_tune_state_bytes(lin) == 4 * lin_b
+        assert _leaf_tune_state_bytes(lin) == 7 * lin_b
         assert _leaf_tune_state_bytes(norm) == sum(p.numel() * p.element_size() for p in norm.parameters())
 
     def test_partition_balances_resident_cost_with_activation(self):

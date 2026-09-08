@@ -76,9 +76,9 @@ def _best_params_snap_dev_(block, home, cache_device):
 def _collect_best_params_(block, scheme):
     """Snapshot collector handling the SHARDED marker."""
     if isinstance(scheme, str) and scheme == SHARDED_SNAPSHOT:
-        from auto_round.compressors.utils import collect_best_params_sharded
+        from auto_round.compressors.utils import collect_best_params_local
 
-        return collect_best_params_sharded(block)
+        return collect_best_params_local(block)
     return collect_best_params(block, scheme)
 
 
