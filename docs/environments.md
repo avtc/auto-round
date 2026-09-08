@@ -21,7 +21,7 @@ export AR_LOG_LEVEL=DEBUG
 ```
 
 ### AR_MEM_COUNTERS
-- **Description**: Emit per-block `[stream-mem]` memory diagnostics in the streaming loop: host RSS and per-GPU allocation breakdown with attribution of the largest regions/tensors, plus peak-RSS attribution. Informational only; does not change quantization behavior. Gates only these branch-added lines; the upstream per-block `Memory Monitor` summary stays at its upstream behavior regardless of this variable.
+- **Description**: Emit per-block `[stream-mem]` memory diagnostics in the streaming loop: host RSS and per-GPU allocation breakdown with attribution of the largest regions/tensors, plus peak-RSS attribution. Informational only; does not change quantization behavior.
 - **Default**: `false`
 - **Usage**: Set this to observe streaming memory residency and leaks
 
