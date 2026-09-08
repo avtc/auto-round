@@ -489,6 +489,14 @@ class SignRoundQuantizer(BaseQuantizer):
             enable_torch_compile=self.compress_context.enable_torch_compile,
             device=device,
         )
+        # wrappers replaced the pinned leaves; re-pin so each WRAPPER owns
+        # its alignment (an orig-layer hook would mis-anchor: the wrapper
+        # moves inputs to the leaf device before replaying orig hooks).
+        # Clear-once, same contract as _stream_restage_after_fp_.
+        _realign = getattr(block, "_stream_realign_after_wrap_", None)
+        if callable(_realign):
+            block._stream_realign_after_wrap_ = None
+            _realign()
 
         round_params = []
         minmax_params = []

@@ -1600,13 +1600,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                         detach_stream_align_(orig)
                         attach_stream_align_(mod, torch.device(dev), name=name)
                 continue
-            if not any(True for _ in mod.parameters(recurse=False)) and list(mod.children()):
-                continue
             dev = targets.get(name)
             if dev is None:
                 # inherit the first placed descendant's device so container
                 # interiors have a defined home even when only leaves are
-                # placed (flow-derived placements key leaves and atomics)
+                # placed (flow-derived placements key leaves and atomics).
+                # Containers WITHOUT direct parameters still align: their
+                # interior math (attention SDPA/rotary, residual adds, MoE
+                # routing) must run on one defined device, and their output
+                # must return to the caller's device.
                 for sub_name, sub_dev in targets.items():
                     if sub_name.startswith(name + "."):
                         dev = sub_dev
@@ -1832,6 +1834,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                         if str(_dv).startswith("cuda"):
                             torch.cuda.synchronize(torch.device(str(_dv)))
                 CompressionOrchestrator._pin_stream_mapped_(block, placement)
+                # the tune path wraps leaves AFTER this pin; wrappers must
+                # own the alignment (they move inputs before replaying
+                # orig-layer hooks, so an orig hook mis-anchors to the leaf
+                # device). The quantizer calls this once wrapping is done.
+                block._stream_realign_after_wrap_ = lambda: CompressionOrchestrator._pin_stream_mapped_(
+                    block, placement
+                )
                 block._stream_mapped = placement
                 with state["lock"]:
                     state["placements"][block_name] = placement

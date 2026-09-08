@@ -383,3 +383,55 @@ class TestWrapperOwnsAlignment:
         # idempotent re-pin keeps exactly one hook set
         orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
         assert len(wrap._forward_pre_hooks) == 1 and len(wrap._forward_hooks) == 1
+
+
+class TestContainerAndWrapRealign:
+    def test_paramless_container_gets_inherited_hook(self, monkeypatch):
+        import torch
+
+        import auto_round.compressors.orchestrator as orch
+
+        class _DM:
+            device = torch.device("cpu", 0)
+            device_list = [torch.device("cpu", 0), torch.device("cpu", 1)]
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+
+        # paramless container wrapping two leaves on different devices
+        attn = torch.nn.ModuleDict({"q": torch.nn.Linear(2, 2), "o": torch.nn.Linear(2, 2)})
+        block = torch.nn.ModuleDict({"self_attn": attn})
+        placement = {"self_attn.q": "cpu:0", "self_attn.o": "cpu:1"}
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        # the container aligns to its FIRST placed descendant's device
+        assert getattr(attn, "_stream_align_hook", None) is not None
+        assert attn._stream_align_hook.target == torch.device("cpu", 0)
+        assert not hasattr(attn, "tuning_device")  # no direct params
+
+    def test_wrap_realign_moves_hook_from_orig_to_wrapper(self, monkeypatch):
+        import torch
+
+        import auto_round.compressors.orchestrator as orch
+
+        class _DM:
+            device = torch.device("cpu", 0)
+            device_list = [torch.device("cpu", 0), torch.device("cpu", 1)]
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+
+        class FakeWrap(torch.nn.Module):
+            def __init__(self, orig):
+                super().__init__()
+                self.orig_layer = orig
+
+        # stage 1: pre-wrap pin hooks the bare leaf
+        lin = torch.nn.Linear(2, 2)
+        block = torch.nn.ModuleDict({"q": lin})
+        placement = {"q": "cpu:1"}
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        assert getattr(lin, "_stream_align_hook", None) is not None
+        # stage 2: wrapper replaces the leaf; re-pin (as quantize_block does)
+        wrap = FakeWrap(lin)
+        block["q"] = wrap
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        assert getattr(wrap, "_stream_align_hook", None) is not None
+        assert getattr(lin, "_stream_align_hook", None) is None  # detached
