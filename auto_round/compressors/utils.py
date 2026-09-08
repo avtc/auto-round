@@ -180,13 +180,17 @@ def rehome_block_(module: torch.nn.Module, device) -> int:
 def rehome_block_mapped_(module: torch.nn.Module, placement: dict, fallback) -> int:
     """Distribute a streamed block onto its mapped devices.
 
-    Each mapped leaf's tensors move onto the leaf's placement device;
-    every other tensor reachable from ``module`` (setup modules, block-level
-    buffers) lands on ``fallback`` (the primary). Mirrors
+    Each mapped leaf's tensors move onto the leaf's placement device.
+    Tensors that match no placement entry default INSIDE the block's device
+    set (its first placement device) with a loud warning naming them - the
+    primary is the wrong home for a block mapped onto other GPUs. Mirrors
     :func:`rehome_block_` for mapped placement: the block is distributed,
     never gathered onto one home. Returns the number of tensors moved.
     """
+    from auto_round.utils.stream_placement import first_placement_device
+
     fallback = torch.device(fallback)
+    _default = torch.device(first_placement_device(placement, fallback))
     claimed: set = set()
     moved = 0
 
@@ -205,16 +209,36 @@ def rehome_block_mapped_(module: torch.nn.Module, placement: dict, fallback) -> 
         target = placement.get(name)
         if target is None:
             continue
-        leaf._apply(_leaf_fn(torch.device(target)))
+        # container entries (co-located container-direct params, e.g. GDN
+        # A_log) move only their OWN tensors - recursing would drag every
+        # descendant onto one device and destroy the leaf placement
+        leaf._apply(_leaf_fn(torch.device(target)), recurse=not bool(list(leaf.children())))
+
+    _names = {id(t): n for n, t in module.named_parameters(recurse=True)}
+    _names.update({id(t): n for n, t in module.named_buffers(recurse=True)})
+    _missed: list = []
 
     def _rest(t: torch.Tensor) -> torch.Tensor:
         nonlocal moved
-        if id(t) in claimed or t.device == fallback or t.device.type == "meta":
+        if id(t) in claimed or t.device.type == "meta":
+            return t
+        _missed.append(_names.get(id(t), "<unnamed>"))
+        if t.device == _default:
             return t
         moved += 1
-        return t.to(fallback)
+        return t.to(_default)
 
     module._apply(_rest)
+    if _missed:
+        logger.warning(
+            "[stream-mapped] %d tensor(s) in %s matched no placement entry (%s%s); "
+            "defaulted to %s - report this so the owning module can be placed explicitly",
+            len(_missed),
+            type(module).__name__,
+            ", ".join(_missed[:5]),
+            "..." if len(_missed) > 5 else "",
+            _default,
+        )
     return moved
 
 

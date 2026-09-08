@@ -1605,6 +1605,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             _normalize_device,
             _shared_atoms,
             block_signature,
+            complete_container_params,
             is_placement_template,
             partition_flow_order,
             resolve_block_placement,
@@ -1701,6 +1702,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if leaf not in fired:
                     units.append(([leaf], _leaf_param_bytes(get_mod[leaf]), 0, atom_of.get(leaf) is not None))
             placement = partition_flow_order(units, dev_objs)
+            placement = complete_container_params(placement, block)
             key = (block_signature(block), tuple(str(d) for d in devices))
             with state["lock"]:
                 state["flow_templates"][key] = placement
@@ -2890,9 +2892,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if not placement:
                     return None
                 rel = name[len(prefix) + 1 :] if prefix and name.startswith(prefix + ".") else name
-                from auto_round.utils.stream_placement import placement_device_of
+                from auto_round.utils.stream_placement import first_placement_device, placement_device_of
 
-                return placement_device_of(placement, rel, _fb)
+                # tensors that match no entry default INSIDE the block's map
+                # (front of the block), never the global primary
+                _dfb = str(first_placement_device(placement, _fb))
+                return placement_device_of(placement, rel, _dfb)
 
         prefetch_names = flat_block_names
         if resume_states is not None:
@@ -3008,7 +3013,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if _placement is not None:
                         # mapped placement: fetch every tensor straight to its
                         # module's device; the primary stays the fallback home
-                        load_device = str(self.device)
+                        from auto_round.utils.stream_placement import first_placement_device
+
+                        # unmatched tensors load INSIDE the block's device set,
+                        # never onto the global primary (it may host prefetch
+                        # for other blocks)
+                        load_device = str(first_placement_device(_placement, torch.device(str(self.device))))
 
                         def _dev_of(name, _p=_placement, _pre=block_name):
                             rel = name[len(_pre) + 1 :] if _pre and name.startswith(_pre + ".") else name

@@ -278,3 +278,117 @@ class TestFlowProbe:
         FlowProbe(block, lambda records: recorded.extend(records))
         block(torch.zeros(2, 4))
         assert all(b > 0 for _n, b in recorded)
+
+
+class TestContainerParamPlacement:
+    """Container-direct params (e.g. GDN ``linear_attn.A_log``) must not
+    fall to the fallback: the probe, the tune entry and staging all key off
+    the first parameter's device."""
+
+    def _gdn_block(self):
+        class GDN(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.A_log = torch.nn.Parameter(torch.zeros(2))
+                self.in_proj = torch.nn.Linear(4, 8)
+                self.conv = torch.nn.Conv1d(8, 8, 3, groups=8)
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear_attn = GDN()
+                self.mlp = torch.nn.Linear(4, 4)
+
+        return Layer()
+
+    def test_device_list_placement_covers_container_params(self):
+        block = self._gdn_block()
+        placement = resolve_block_placement(block, "1,2", torch.device("cpu"))
+        assert placement["linear_attn"] == placement["linear_attn.in_proj"]
+        # staging resolves the container's direct tensors through the module key
+        from auto_round.utils.stream_placement import placement_device_of
+
+        assert placement_device_of(placement, "linear_attn.A_log", "cpu:9") == str(placement["linear_attn"])
+
+    def test_template_placement_covers_container_params(self):
+        block = self._gdn_block()
+        placement = resolve_block_placement(block, "linear_attn.*:1,mlp:2", torch.device("cpu"))
+        assert placement["linear_attn"] == placement["linear_attn.in_proj"]
+        assert str(placement["mlp"]) == "cuda:2"
+
+    def test_first_placement_device_is_in_map(self):
+        block = self._gdn_block()
+        placement = resolve_block_placement(block, "1,2", torch.device("cpu"))
+        from auto_round.utils.stream_placement import first_placement_device
+
+        assert str(first_placement_device(placement, "cpu:9")) == "cuda:1"
+        assert first_placement_device({}, "cpu:9") == "cpu:9"
+
+    def test_staging_miss_warns_and_uses_fallback(self, capfd):
+        from auto_round.utils.stream_placement import placement_device_of
+
+        placement = {"mlp": "cuda:1"}
+        got = placement_device_of(placement, "zz_probe_only.rope.weight", "cuda:1")
+        assert got == "cuda:1"
+        # project loggers do not propagate: assert on the emitted line
+        out = capfd.readouterr()
+        assert "zz_probe_only.rope.weight" in out.err and "matches no placement entry" in out.err
+        # latched: a second miss of the same leaf does not repeat the warning
+        placement_device_of(placement, "zz_probe_only.rope.bias", "cuda:1")
+        assert capfd.readouterr().err.count("zz_probe_only") == 0
+
+
+class TestRehomeMapped:
+    def test_container_entry_moves_only_direct_tensors(self):
+        from auto_round.compressors.utils import rehome_block_mapped_
+
+        calls = {}
+
+        class Rec(torch.nn.Module):
+            def __init__(self, key):
+                super().__init__()
+                self.key = key
+                calls[key] = []
+                self.w = torch.nn.Parameter(torch.zeros(1))
+
+            def _apply(self, fn, recurse=True):
+                calls[self.key].append(recurse)
+                return self
+
+        class Parent(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.leafmod = Rec("leaf")
+                box = Rec("box")
+                box.kid = Rec("kid")
+                self.box = box
+
+        parent = Parent()
+        rehome_block_mapped_(parent, {"leafmod": torch.device("cpu"), "box": torch.device("cpu")}, torch.device("cpu"))
+        # placement loop: leaves recurse, containers touch direct tensors only
+        assert calls["leaf"][0] is True
+        assert calls["box"][0] is False
+        # the _rest sweep afterwards calls every child once more (the stub's
+        # box._apply does not descend into kid, so kid stays at zero)
+        assert len(calls["leaf"]) == 2 and len(calls["box"]) == 2 and calls["kid"] == []
+
+    def test_unmatched_tensor_warns_with_name(self, capfd):
+        from auto_round.compressors.utils import rehome_block_mapped_
+
+        class Orphan(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.orphan_bias = torch.nn.Parameter(torch.zeros(2))
+
+        class Parent(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.placed = torch.nn.Linear(2, 2)
+                self.orphan = Orphan()
+
+        parent = Parent()
+        moved = rehome_block_mapped_(parent, {"placed": torch.device("cpu")}, torch.device("cpu"))
+        out = capfd.readouterr()
+        assert "orphan.orphan_bias" in out.err and "matched no placement entry" in out.err
+        # already on the cpu default: counted as a miss, not a move
+        assert moved == 0

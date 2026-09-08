@@ -180,7 +180,7 @@ def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.de
                     sorted(atom),
                     sorted(str(d) for d in devs),
                 )
-        return placement
+        return complete_container_params(placement, block)
 
     # device list: contiguous parameter-balanced partition over atomic groups
     devices = [d.strip() for d in str(template).split(",") if d.strip()]
@@ -188,7 +188,7 @@ def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.de
         raise ValueError("device_map placement template is empty")
     devices = [_normalize_device(d) for d in devices]
     if len(devices) == 1:
-        return {leaf: devices[0] for leaf in leaf_names}
+        return complete_container_params({leaf: devices[0] for leaf in leaf_names}, block)
     groups = _atomic_groups(leaf_names)
     # shared-quantization groups are atomic too: merge any container groups
     # they intersect so the merged search never spans devices
@@ -214,7 +214,52 @@ def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.de
         if acc >= target and dev_idx < len(devices) - 1:
             dev_idx += 1
             acc = 0
+    return complete_container_params(placement, block)
+
+
+def complete_container_params(placement: dict, block: torch.nn.Module) -> dict:
+    """Co-locate container-direct params with their first placed descendant leaf.
+
+    Leaf-keyed placements leave a module's OWN params (parameters of a
+    container itself, not of any leaf - e.g. GDN ``linear_attn.A_log``)
+    unplaced; they would land on the rehome fallback (the primary GPU).
+    The mask probe, the tune replay entry and staging all key off the
+    first parameter's device, so a stranded container param starts the
+    whole replay on the wrong GPU and cross-device ops fail (the GDN
+    depthwise conv is called functionally - no hook can rescue it
+    mid-block).
+    """
+    mods = dict(block.named_modules())
+    for name, mod in block.named_modules():
+        if name in placement or not list(mod.children()):
+            continue
+        has_own = any(True for _ in mod.parameters(recurse=False)) or any(True for _ in mod.buffers(recurse=False))
+        if not has_own:
+            continue
+        prefix = name + "."
+        dev = None
+        for sub in mods:
+            if sub.startswith(prefix) and sub in placement:
+                dev = placement[sub]
+                break
+        if dev is not None:
+            placement[name] = dev
     return placement
+
+
+def first_placement_device(placement: dict, fallback):
+    """Front-of-block default for tensors that match no placement entry.
+
+    The primary is the wrong home for a block mapped onto other GPUs
+    (map B lives on cuda:2/3 while the primary is cuda:0); tensors that
+    fall through classification default INSIDE the block's device set.
+    """
+    for d in placement.values():
+        return d
+    return fallback
+
+
+_PLACEMENT_MISS_WARNED: set = set()
 
 
 def placement_device_of(placement: dict, tensor_name: str, fallback) -> str:
@@ -229,6 +274,14 @@ def placement_device_of(placement: dict, tensor_name: str, fallback) -> str:
     leaf = tensor_name.rsplit(".", 1)[0] if "." in tensor_name else tensor_name
     dev = placement.get(leaf)
     if dev is None:
+        if leaf not in _PLACEMENT_MISS_WARNED:
+            _PLACEMENT_MISS_WARNED.add(leaf)
+            logger.warning(
+                "[stream-mapped] checkpoint tensor %r matches no placement entry; "
+                "staging on the block default - report this so the owning module "
+                "can be placed explicitly",
+                tensor_name,
+            )
         return str(fallback)
     return str(dev)
 
