@@ -1552,13 +1552,16 @@ class TestResumeCudaCacheRelease:
 
         import torch as _torch
 
+        # contract: the resume-rebuild debris release delegates to the
+        # backend-agnostic clear_memory (which resolves the run's configured
+        # devices on its own); the census side only reads state
+        import auto_round.compressors.orchestrator as orch
         from auto_round.compressors.orchestrator import CompressionOrchestrator
 
         calls = []
-        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
-        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        monkeypatch.setattr(orch, "clear_memory", lambda *a, **k: calls.append((a, k)))
         CompressionOrchestrator._release_cuda_cache("resume rebuild")
-        assert calls == [1]
+        assert calls == [((), {})]
 
     def test_never_raises_without_cuda(self, monkeypatch):
         import torch as _torch
@@ -1647,6 +1650,7 @@ class TestFragmentationRelease:
 
         cls, stub = self._mk()
         monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(_torch.cuda, "synchronize", lambda *a, **k: None)
         monkeypatch.setattr(_torch.cuda, "memory_reserved", lambda idx: 13 * 2**30)
         monkeypatch.setattr(_torch.cuda, "memory_allocated", lambda idx: 6 * 2**30)
         monkeypatch.setattr(_torch.cuda, "current_device", lambda: 0)

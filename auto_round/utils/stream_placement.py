@@ -400,9 +400,6 @@ class FlowProbe:
             return
         self._done = True
         for h in self._hooks:
-            try:
-                h.remove()
-            except Exception:  # pragma: no cover - hook already gone
-                pass
+            h.remove()
         if self._on_complete is not None:
             self._on_complete(self.records)

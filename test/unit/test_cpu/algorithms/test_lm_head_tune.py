@@ -592,7 +592,7 @@ class TestLmHeadTuneInputs:
         # the diagnostic must name the offending shapes, not just the fallback
         assert "fp_rows=Tensor" in err and "token_ids=1" in err
 
-    def test_mis_shaped_q_rows_tune_on_fp_inputs(self, capfd):
+    def test_miss_shaped_q_rows_tune_on_fp_inputs(self, capfd):
         state = {"fp_inputs": _rows(3), "q_inputs": _rows(2), "token_ids": [torch.zeros(1, 5)] * 3}
         fp, q, _ = _orch(200, ["lm_head"])._lm_head_tune_inputs_(state, ["lm_head"])
         assert fp is not None and q is None
@@ -656,7 +656,7 @@ class TestTuningGradBuffers:
 
     def test_outside_block_loop_releases_cached_blocks(self):
         src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
-        assert "torch.cuda.empty_cache()" in src
+        assert "clear_memory(device_list=[str(outside_qdev)])" in src
 
 
 class TestGradScatterSlice:

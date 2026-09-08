@@ -1202,27 +1202,28 @@ class CompressionOrchestrator(BaseOrchestrator):
 
     @staticmethod
     def _release_cuda_cache(reason: str = "") -> None:
-        """Release reserved-but-unallocated CUDA segments (resume-rebuild debris).
+        """Release reserved-but-unallocated accelerator segments (resume-rebuild debris).
 
         The resume rebuild (chain jump, shard adoption, hydration) frees
-        transient CUDA allocations whose segments stay cached by the
+        transient accelerator allocations whose segments stay cached by the
         allocator; the first post-resume block then OOMs on fragmentation
         even though its live set fits comfortably (measured: ~6.8G reserved
         but unallocated right before an OOM on a block the fresh run had
-        quantized in the same co-located placement).
+        quantized in the same co-located placement). Backend-agnostic via
+        clear_memory (cuda/xpu/hpu/mps); a failure here must surface rather
+        than defer the symptom to a confusing later OOM.
         """
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                if reason:
-                    parts = []
-                    for idx in range(torch.cuda.device_count()):
-                        alloc = torch.cuda.memory_allocated(idx) / 2**30
-                        reserved = torch.cuda.memory_reserved(idx) / 2**30
-                        parts.append(f"cuda:{idx} alloc {alloc:.2f}G reserved {reserved:.2f}G")
-                    logger.debug("[stream] cuda state after %s: %s", reason, "; ".join(parts))
-        except Exception:  # noqa: BLE001  diagnostics only; never break the run
-            pass
+        clear_memory()  # no device_list: resolves to the run's configured devices
+        if reason and logger.isEnabledFor(logging.DEBUG):
+            from auto_round.utils.device_manager import get_current_device_manager
+
+            parts = []
+            dev_mgr = get_current_device_manager()
+            for idx in range(dev_mgr.device_count()):
+                alloc = dev_mgr.memory_allocated(idx) / 2**30
+                reserved = dev_mgr.memory_reserved(idx) / 2**30
+                parts.append(f"{dev_mgr.type}:{idx} alloc {alloc:.2f}G reserved {reserved:.2f}G")
+            logger.debug("[stream] accelerator state after %s: %s", reason, "; ".join(parts))
 
     def _release_cached_segments_if_fragmented(self, device, min_gap_bytes: int = 2 * 2**30) -> bool:
         """Return provably-free cached segments on ``device`` at a phase boundary.
@@ -1235,16 +1236,20 @@ class CompressionOrchestrator(BaseOrchestrator):
         hygiene - no live tensor is touched.
         """
         try:
-            if not torch.cuda.is_available():
-                return False
             dev = torch.device(device) if not isinstance(device, torch.device) else device
-            if dev.type != "cuda":
+            if dev.type == "cpu":
                 return False
-            idx = dev.index if dev.index is not None else torch.cuda.current_device()
-            gap = torch.cuda.memory_reserved(idx) - torch.cuda.memory_allocated(idx)
+            from auto_round.utils.device_manager import get_ar_device
+
+            dev_mgr = get_ar_device(dev.type)
+            if not dev_mgr.is_available():
+                return False
+            idx = dev.index if dev.index is not None else dev_mgr.current_device()
+            gap = dev_mgr.memory_reserved(idx) - dev_mgr.memory_allocated(idx)
             if gap < min_gap_bytes:
                 return False
-            torch.cuda.empty_cache()
+            dev_mgr.synchronize(idx)
+            dev_mgr.empty_cache()
             return True
         except Exception:  # noqa: BLE001  diagnostics only; never break the run
             return False
@@ -1718,14 +1723,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # release the reference forward's activation pools first: the
                 # moves allocate new blocks on the target devices while the
                 # source copies free only after each rebind, so every byte of
-                # reclaimable cache directly widens the transient headroom
-                for _dev in {str(d) for d in placement.values()} | {str(fallback)}:
-                    if _dev.startswith("cuda"):
-                        try:
-                            with torch.cuda.device(_dev):
-                                torch.cuda.empty_cache()
-                        except Exception:  # pragma: no cover - best effort
-                            pass
+                # reclaimable cache directly widens the transient headroom.
+                # clear_memory is backend-agnostic (cuda/xpu/hpu/mps; cpu
+                # entries are skipped). No swallow: a failure here (e.g. an
+                # invalid device in the placement) must surface, not defer to
+                # a confusing later OOM
+                clear_memory(device_list=sorted({str(d) for d in placement.values()} | {str(fallback)}))
                 rehome_block_mapped_(block, placement, fallback)
                 from accelerate.hooks import AlignDevicesHook, add_hook_to_module, remove_hook_from_module
 
@@ -3378,8 +3381,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             # buffers; returning them to the driver keeps the allocator pool
             # compact before the (potentially huge) outside-block wrappers are
             # built, instead of reserving fragmented segments nobody can use
-            if torch.cuda.is_available() and str(outside_qdev).startswith("cuda"):
-                torch.cuda.empty_cache()
+            # (backend-agnostic; cpu entries are skipped by clear_memory)
+            clear_memory(device_list=[str(outside_qdev)])
             log_cuda_memory_census(f"outside-block loop entry {name}", outside_qdev)
             if streamer is not None:
                 # load the layer itself; streaming its parent prefix would
