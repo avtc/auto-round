@@ -287,6 +287,16 @@ def placement_device_of(placement: dict, tensor_name: str, fallback) -> str:
     leaf = tensor_name.rsplit(".", 1)[0] if "." in tensor_name else tensor_name
     dev = placement.get(leaf)
     if dev is None:
+        # custom archs keep sibling tensors as DIRECT parameters of one
+        # module (e.g. mlp.shared_mlp holding gate_proj/up_proj/down_proj,
+        # or a container buffer like e_score_correction_bias): the tensor
+        # path names the parameter, not a submodule. Walk the parent chain
+        # until a placed module owns it.
+        probe = leaf
+        while dev is None and "." in probe:
+            probe = probe.rsplit(".", 1)[0]
+            dev = placement.get(probe)
+    if dev is None:
         if leaf not in _PLACEMENT_MISS_WARNED:
             _PLACEMENT_MISS_WARNED.add(leaf)
             logger.warning(

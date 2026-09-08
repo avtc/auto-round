@@ -480,3 +480,32 @@ class TestMappedEngagementPredicate:
         assert self._orch("off", None)._stream_mapped_enabled() is True
         self._set_map(monkeypatch, "0,1")
         assert self._orch("auto", "2,3")._stream_mapped_enabled() is True
+
+
+class TestPlacementDeviceOfPrefixFallback:
+    """Direct-parameter containers (custom archs keep sibling tensors as
+    direct params of one module) resolve through the parent chain."""
+
+    def test_direct_param_container_hits_parent(self):
+        from auto_round.utils.stream_placement import placement_device_of
+
+        placement = {"mlp.shared_mlp": "cuda:1", "mlp": "cuda:2"}
+        assert placement_device_of(placement, "mlp.shared_mlp.gate_proj.weight", "cpu") == "cuda:1"
+        assert placement_device_of(placement, "mlp.shared_mlp.up_proj.weight", "cpu") == "cuda:1"
+        # container-level buffer reaches the container key
+        assert placement_device_of(placement, "mlp.e_score_correction_bias", "cpu") == "cuda:2"
+
+    def test_total_miss_still_warns_and_falls_back(self, capfd):
+        from auto_round.utils.stream_placement import placement_device_of
+
+        got = placement_device_of({"mlp": "cuda:1"}, "zz_direct_only.rope.weight", "cuda:1")
+        assert got == "cuda:1"
+        out = capfd.readouterr()
+        assert "zz_direct_only.rope.weight" in out.err and "matches no placement entry" in out.err
+
+
+class TestSharedLayersEntryRouting:
+    def test_shared_layers_routed_to_compressor(self):
+        from auto_round.autoround import _ENTRY_KWARG_OWNERS
+
+        assert _ENTRY_KWARG_OWNERS.get("shared_layers") == "compressor"

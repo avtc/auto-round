@@ -191,6 +191,14 @@ def rehome_block_mapped_(module: torch.nn.Module, placement: dict, fallback) -> 
 
     fallback = torch.device(fallback)
     _default = torch.device(first_placement_device(placement, fallback))
+    # async kernels from the forward that just finished (reference pass,
+    # tune replay) may still be reading these buffers: moving them now
+    # races into an illegal access that only surfaces at the NEXT kernel
+    # (cudaErrorLaunchFailure attributed to unrelated code). Drain the
+    # involved devices before any tensor moves.
+    for _dv in {str(_default), str(fallback), *(str(v) for v in placement.values())}:
+        if _dv.startswith("cuda"):
+            torch.cuda.synchronize(torch.device(_dv))
     claimed: set = set()
     moved = 0
 
