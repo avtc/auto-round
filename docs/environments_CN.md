@@ -251,6 +251,10 @@ export AR_DISK_STREAM_MODEL=1
 
 注意：`AR_DISK_STREAM_MODEL` 与 `--stream_quantization` 互斥——同时设置会在启动时报错。
 
+算法覆盖：env 路径运行的是普通的数据驱动校准，offloader 会在前向传播期间按需物化各个块，因此
+依赖校准前向的量化器（AWQ 激活统计、SVDQuant 平滑等）可与 RTN、SignRound 一样直接使用——受限于
+RTN/SignRound 家族的是 `--stream_quantization` 模式。
+
 磁盘/内存行为：当量化块可以渐进式保存时（整数格式且开启 `low_cpu_mem_usage`），每个处理完的块会直接写入输出分片并释放回 meta——除输出外无需额外暂存空间，峰值内存约为一个块。其他配置会失去这一特性：导出格式为 GGUF（且未使用 `--stream_quantization`）、块外层被量化（如 `--quant_lm_head`）同时 `iters > 0` 调优、或存在绑定的 embedding 权重时，`low_cpu_mem_usage` 会被重置，处理完的块不再释放——模型会逐渐在内存中累积。无法逐块打包的格式或数据类型则会把每个处理完的块状态溢写到 `<AR_WORK_SPACE>/offload`（约需 1 倍模型大小的磁盘空间），直到最终保存。
 
 ### AR_RESUME_DIR

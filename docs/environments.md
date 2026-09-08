@@ -251,6 +251,11 @@ export AR_DISK_STREAM_MODEL=1
 
 Note: `AR_DISK_STREAM_MODEL` and `--stream_quantization` are mutually exclusive -- setting both raises an error at startup.
 
+Algorithm coverage: the env path runs the ordinary data-driven calibration, with the offloader
+materializing each block on demand during forward passes. Calibration-driven quantizers therefore work
+unchanged (AWQ activation capture, SVDQuant smoothing, ...) alongside RTN and SignRound --
+`--stream_quantization` is the mode restricted to the RTN/SignRound families.
+
 Disk/RAM behavior: while quantized blocks can be saved progressively (integer formats with `low_cpu_mem_usage`), each processed block is written straight to the output shards and freed back to meta -- no scratch beyond the output, peak RAM roughly one block. Other configurations lose that property: with GGUF as the export format (without `--stream_quantization`), with quantized layers outside the decoder blocks (e.g. `--quant_lm_head`) while tuning with `iters > 0`, or with tied embedding weights, `low_cpu_mem_usage` is reset and processed blocks are no longer freed -- the model accumulates in RAM. Formats or dtypes that cannot pack per-block instead spill each processed block's state to `<AR_WORK_SPACE>/offload` (budget about 1x the model size) until the final save.
 
 ### AR_RESUME_DIR
