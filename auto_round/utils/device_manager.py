@@ -886,6 +886,27 @@ class DeviceManager:
 
 
 # Process-wide singleton manager.
+def synchronize_devices_(devices) -> None:
+    """Synchronize the given devices (backend-agnostic), warning on failure.
+
+    Used at cross-device boundaries: before rehome moves (async kernels may
+    still read the buffers) and at perf-timing splits (without a sync the
+    split measures launch latency, not work). cpu entries are skipped; each
+    device is synced once. A failed sync logs a WARNING instead of passing
+    silently - a broken device state must be visible.
+    """
+    seen = set()
+    for dev in devices or []:
+        d = dev if isinstance(dev, torch.device) else torch.device(str(dev))
+        if d.type == "cpu" or str(d) in seen:
+            continue
+        seen.add(str(d))
+        try:
+            device_manager.synchronize(d.index)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("device sync failed on %s: %s", d, e)
+
+
 device_manager = DeviceManager()
 
 

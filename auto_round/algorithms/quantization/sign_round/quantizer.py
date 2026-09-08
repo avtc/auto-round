@@ -43,17 +43,12 @@ def _sync_tune_devices_():
 
     Mapped streamed blocks run pieces of one forward/backward on several
     devices; without a sync, kernels queue asynchronously and the fwd/bwd
-    split measures launch latency, not work. Backend-agnostic via the
-    device manager (cuda/xpu/hpu/mps; cpu entries are skipped - the CPU
-    ARDevice synchronize is a no-op anyway).
+    split measures launch latency, not work. Delegates to the shared
+    backend-agnostic synchronize_devices_.
     """
-    for dev in device_manager.device_list:
-        if str(dev).startswith("cpu"):
-            continue
-        try:
-            device_manager.synchronize(getattr(dev, "index", None))
-        except Exception as e:  # pragma: no cover - defensive: perf only
-            logger.warning("[perf] tune device sync failed on %s: %s", dev, e)
+    from auto_round.utils.device_manager import synchronize_devices_
+
+    synchronize_devices_(device_manager.device_list)
 
 
 def _best_params_snap_dev_(block, home, cache_device):

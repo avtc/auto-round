@@ -1679,6 +1679,7 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
     reserved_b = torch.cuda.memory_reserved(device)
     groups = {}
     storages = {}
+    _skipped = [0]  # objects the census could not size - surfaced in the output
     for obj in gc.get_objects():  # noqa: C417  pylint: disable=too-many-nested-blocks
         try:
             if torch.is_tensor(obj) and obj.device == device:
@@ -1692,6 +1693,7 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
                 if ptr not in storages:
                     storages[ptr] = obj.untyped_storage().nbytes()
         except Exception:  # pylint: disable=broad-except
+            _skipped[0] += 1
             continue
     lines = [
         "[vram] %s: free %.2fGiB / total %.2fGiB | torch allocated %.2fGiB reserved %.2fGiB | "
@@ -1705,6 +1707,8 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
         sum(storages.values()) / 2**30,
         len(groups),
     ]
+    if _skipped[0]:
+        logger.debug("[vram]   (+%d object(s) could not be sized)", _skipped[0])
     logger.debug(*lines)
     for (shape, dtype), (count, nbytes) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]:
         logger.debug("[vram]   %6.3fGiB x%-3d %s %s", nbytes / 2**30, count, dtype, shape)

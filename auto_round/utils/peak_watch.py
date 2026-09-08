@@ -68,11 +68,15 @@ class PeakWatcher:
     def _run(self):
         import psutil
 
+        self._rss_fail_logged = False
         proc = psutil.Process()
         while not self._stop.wait(self._interval):
             try:
                 rss_gb = proc.memory_info().rss / 2**30
-            except Exception:  # noqa: BLE001  diagnostics only
+            except Exception as e:  # noqa: BLE001  diagnostics only
+                if not self._rss_fail_logged:
+                    self._rss_fail_logged = True
+                    logger.warning("[peak-watch] rss sampling failed; peak_rss stops updating: %s", e)
                 continue
             with self._lock:
                 if rss_gb <= self.peak_rss_gb + 1e-6:

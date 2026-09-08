@@ -621,13 +621,19 @@ class CheckpointStreamer:
         with self._prefetch_cond:
             return self._prefetch_cache.pop(name, None)
 
+    @staticmethod
+    def _close_handle_(handle, where: str) -> None:
+        """Best-effort shard-handle close - a failure is a leak (fd / mapped
+        pages), never corruption, but it must be visible, not silent."""
+        if hasattr(handle, "__exit__"):
+            try:
+                handle.__exit__(None, None, None)
+            except Exception as e:  # pragma: no cover - best effort
+                logger.warning("[stream] shard-handle close failed (%s): %s", where, e)
+
     def _close_prefetch_handles(self) -> None:
         for handle in self._prefetch_handles.values():
-            if hasattr(handle, "__exit__"):
-                try:
-                    handle.__exit__(None, None, None)
-                except Exception:  # pragma: no cover - best effort
-                    pass
+            self._close_handle_(handle, "prefetch teardown")
         self._prefetch_handles.clear()
         self._prefetch_handle_order.clear()
 
@@ -725,11 +731,7 @@ class CheckpointStreamer:
             for key in (shard, f"__bin__{shard}"):
                 handle = pool_handles.pop(key, None)
                 if handle is not None:
-                    if hasattr(handle, "__exit__"):
-                        try:
-                            handle.__exit__(None, None, None)
-                        except Exception:  # pragma: no cover - best effort
-                            pass
+                    self._close_handle_(handle, "pool release")
                     closed = True
                 if key in pool_order:
                     pool_order.remove(key)
@@ -750,11 +752,7 @@ class CheckpointStreamer:
             if not handles:
                 continue
             for shard, handle in list(handles.items()):
-                if hasattr(handle, "__exit__"):
-                    try:
-                        handle.__exit__(None, None, None)
-                    except Exception:  # pragma: no cover - best effort
-                        pass
+                self._close_handle_(handle, "startup release")
             handles.clear()
             order.clear()
 
@@ -795,11 +793,7 @@ class CheckpointStreamer:
                     h = pool_handles.pop(key, None)
                     handle = handle or h
                 if handle is not None:
-                    if hasattr(handle, "__exit__"):
-                        try:
-                            handle.__exit__(None, None, None)
-                        except Exception:  # pragma: no cover - best effort
-                            pass
+                    self._close_handle_(handle, "planned-read release")
                     closed = True
                 if shard in pool_order:
                     pool_order.remove(shard)
@@ -818,11 +812,7 @@ class CheckpointStreamer:
         if not self._open_handles:
             return
         for shard, handle in list(self._open_handles.items()):
-            if hasattr(handle, "__exit__"):
-                try:
-                    handle.__exit__(None, None, None)
-                except Exception:  # pragma: no cover - best effort
-                    pass
+            self._close_handle_(handle, "main pool close")
         self._open_handles.clear()
         self._open_order.clear()
 
@@ -973,10 +963,6 @@ class CheckpointStreamer:
     def close(self) -> None:
         self.stop_prefetch()
         for shard_name, handle in self._open_handles.items():
-            if hasattr(handle, "__exit__"):
-                try:
-                    handle.__exit__(None, None, None)
-                except Exception:  # pragma: no cover - best effort
-                    pass
+            self._close_handle_(handle, "final close")
         self._open_handles.clear()
         self._open_order.clear()

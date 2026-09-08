@@ -1478,8 +1478,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 max(0.0, rss_gb - tracked_gb),
                 trailing,
             )
-        except Exception:  # noqa: BLE001  diagnostics must never break the run
-            pass
+        except Exception as e:  # noqa: BLE001  diagnostics must never break the run
+            logger.warning_once("[stream-mem] memory-rollup diagnostics failed: %s", e)
         for idx in range(torch.cuda.device_count()):
             dev = f"cuda:{idx}"
             alloc = torch.cuda.memory_allocated(idx) / 2**30
@@ -1829,10 +1829,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # rehome enqueues async cross-device copies, and a fault in
                 # them would otherwise surface at an unrelated later call
                 # (the hook attach) with a misleading stack
-                if torch.cuda.is_available():
-                    for _dv in {str(d) for d in placement.values()} | {str(fallback)}:
-                        if str(_dv).startswith("cuda"):
-                            torch.cuda.synchronize(torch.device(str(_dv)))
+                from auto_round.utils.device_manager import synchronize_devices_
+
+                synchronize_devices_({*placement.values(), fallback})
                 CompressionOrchestrator._pin_stream_mapped_(block, placement)
                 # the tune path wraps leaves AFTER this pin; wrappers must
                 # own the alignment (they move inputs before replaying
@@ -2018,6 +2017,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if any(re.search(rx, c) for c in candidates):
                     return val
             except re.error:  # pragma: no cover - malformed user pattern
+                logger.warning_once("ignoring malformed regex layer_config pattern %r (does not compile)", pattern)
                 continue
         return None
 
