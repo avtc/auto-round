@@ -1715,6 +1715,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                 placement = pending["placement"]
                 from auto_round.compressors.utils import rehome_block_mapped_
 
+                # release the reference forward's activation pools first: the
+                # moves allocate new blocks on the target devices while the
+                # source copies free only after each rebind, so every byte of
+                # reclaimable cache directly widens the transient headroom
+                for _dev in {str(d) for d in placement.values()} | {str(fallback)}:
+                    if _dev.startswith("cuda"):
+                        try:
+                            with torch.cuda.device(_dev):
+                                torch.cuda.empty_cache()
+                        except Exception:  # pragma: no cover - best effort
+                            pass
                 rehome_block_mapped_(block, placement, fallback)
                 from accelerate.hooks import AlignDevicesHook, add_hook_to_module, remove_hook_from_module
 
