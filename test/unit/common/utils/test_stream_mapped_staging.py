@@ -302,3 +302,30 @@ class TestSharedLayersPlacementGroups:
             rebuilt.append(("shared:" + atom[0].rpartition(".")[2], sorted(merged)))
             groups = dict(rebuilt)
         assert set(groups["shared:gate_proj"]) >= {"mlp.gate_proj", "mlp.up_proj"}
+
+
+class TestStreamAlignHookProtocols:
+    def test_both_call_conventions(self):
+        import torch
+
+        from auto_round.compressors.utils import StreamAlignHook
+
+        lin = torch.nn.Linear(2, 2)
+        hook = StreamAlignHook(torch.device("cpu"))
+        # torch convention: (module, args, kwargs) -> (args, kwargs)
+        args, kwargs = hook._pre(lin, (torch.zeros(1, 2),), {"attention_mask": torch.zeros(1, 2)})
+        assert isinstance(args, tuple) and "attention_mask" in kwargs
+        assert hook.input_device is not None
+        # legacy manual replay (wrapper.py): (module, args) -> moved args
+        out = hook._pre(lin, (torch.zeros(1, 2),))
+        assert isinstance(out, tuple) and not isinstance(out[0], dict)
+
+    def test_post_returns_output(self):
+        import torch
+
+        from auto_round.compressors.utils import StreamAlignHook
+
+        hook = StreamAlignHook(torch.device("cpu"))
+        hook.input_device = torch.device("cpu")
+        out = hook._post(None, None, {"a": torch.zeros(1)})
+        assert isinstance(out, dict)

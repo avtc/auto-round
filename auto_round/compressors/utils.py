@@ -197,11 +197,19 @@ class StreamAlignHook:
         self.target = target
         self.input_device = None
 
-    def _pre(self, module, args, kwargs):
+    def _pre(self, module, args, kwargs=None):
+        """Dual-protocol: torch's register_forward_pre_hook(with_kwargs)
+        calls (module, args, kwargs) and expects (args, kwargs); the
+        quantizer wrapper replays pre-hooks manually in the legacy
+        accelerate style hook(module, args) and expects the moved args.
+        """
         from accelerate.utils import find_device, send_to_device
 
         self.input_device = find_device([args, kwargs]) or self.target
-        return send_to_device(args, self.target), send_to_device(kwargs, self.target)
+        moved = send_to_device(args, self.target)
+        if kwargs is None:  # legacy manual replay (wrapper.py)
+            return moved
+        return moved, send_to_device(kwargs, self.target)
 
     def _post(self, module, args, output):
         from accelerate.utils import send_to_device
