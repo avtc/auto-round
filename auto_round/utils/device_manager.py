@@ -902,7 +902,7 @@ def synchronize_devices_(devices) -> None:
             continue
         seen.add(str(d))
         try:
-            device_manager.synchronize(d.index)
+            device_manager.get_ar_device(d).synchronize(d.index)
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("device sync failed on %s: %s", d, e)
 

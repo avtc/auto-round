@@ -535,3 +535,17 @@ class TestTuneStatePricing:
         dev_a = place["a"]
         other = [n for n, d in place.items() if d == dev_a]
         assert sum(1 for n in other if n in ("b", "c")) <= 1  # at most one heavy unit alongside
+
+    def test_reserve_pushes_atoms_off_reserved_device(self):
+        from auto_round.utils.stream_placement import partition_flow_order
+
+        devs = ["d0", "d1", "d2", "d3"]
+        units = [([f"e{i}"], 100, 1, True) for i in range(40)]  # uniform atoms
+        place = partition_flow_order(units, devs, reserves={"d0": 250})
+        per = {d: sum(1 for n, dd in place.items() if dd == d) for d in devs}
+        assert per["d0"] < per["d1"] and per["d0"] < per["d3"]  # pushed off the reserved device
+        others = [per["d1"], per["d2"], per["d3"]]
+        assert max(others) - min(others) <= 1  # indivisible atoms: +-1
+        # effective loads (atoms + reserve) stay balanced within one atom
+        eff = [per[d] * 100 + (250 if d == "d0" else 0) for d in devs]
+        assert max(eff) - min(eff) <= 100

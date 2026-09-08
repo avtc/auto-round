@@ -348,7 +348,9 @@ def block_signature(block: torch.nn.Module) -> str:
     return "|".join(parts)
 
 
-def partition_flow_order(flow_units: list, devices: list, budgets: Optional[dict] = None) -> dict:
+def partition_flow_order(
+    flow_units: list, devices: list, budgets: Optional[dict] = None, reserves: Optional[dict] = None
+) -> dict:
     """Assign flow-ordered units to devices, balancing VRAM.
 
     ``flow_units`` is a list of ``(names, resident_bytes, input_bytes, is_atom)``
@@ -371,9 +373,15 @@ def partition_flow_order(flow_units: list, devices: list, budgets: Optional[dict
 
     units = [(tuple(names), int(p), int(i), bool(a)) for names, p, i, a in flow_units]
     total = sum(b for _n, b, _i, _a in units) or 1
-    target = total / len(devices)
+    # ``reserves`` = bytes already spoken for on a device before any unit
+    # lands (e.g. the tune I/O the primary carries: row-cache slices,
+    # reference outputs, loss). Seeding the loads with them keeps BOTH the
+    # phase-1 greedy and the phase-2 least-loaded segment assignment away
+    # from the reserved device, and lifts every ceiling accordingly.
+    reserves = {d: float(reserves.get(d, 0)) for d in devices} if reserves else {d: 0.0 for d in devices}
+    target = (total + sum(reserves.values())) / len(devices)
     placement: dict = {}
-    loads = {d: 0 for d in devices}
+    loads = {d: reserves[d] for d in devices}
 
     # phase 1: atoms -> least-loaded device (experts dominate MoE VRAM)
     atom_units = sorted([u for u in units if u[3]], key=lambda u: -u[1])

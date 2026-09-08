@@ -1774,7 +1774,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             for leaf in leaf_names:  # never executed: place for balance
                 if leaf not in fired:
                     units.append(([leaf], _leaf_tune_state_bytes(get_mod[leaf]), 0, atom_of.get(leaf) is not None))
-            placement = partition_flow_order(units, dev_objs)
+            # the FIRST device of the template is the tune primary (loss /
+            # row-cache staging land there): reserve its tune-I/O footprint
+            # (the block input set the probe recorded) so the balanced
+            # block state does not stack on top of it - block 2 of the hy3
+            # 80-block run OOMed exactly there (13G state + ~7G I/O on a
+            # 23.5G card). Capped at half the state total so a huge input
+            # cannot starve the primary entirely.
+            io_reserve = records[0][1] if records else 0
+            io_reserve = min(int(io_reserve), int(0.5 * sum(b for _n, b, _i, _a in units)))
+            placement = partition_flow_order(units, dev_objs, reserves={dev_objs[0]: io_reserve})
             placement = complete_container_params(placement, block)
             key = (block_signature(block), tuple(str(d) for d in devices))
             with state["lock"]:
