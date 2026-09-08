@@ -435,3 +435,32 @@ class TestContainerAndWrapRealign:
         orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
         assert getattr(wrap, "_stream_align_hook", None) is not None
         assert getattr(lin, "_stream_align_hook", None) is None  # detached
+
+
+class TestBestParamsSnapDev:
+    def test_mapped_block_parks_snapshot_on_cpu(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import _best_params_snap_dev_
+
+        block = torch.nn.ModuleDict({"q": torch.nn.Linear(2, 2)})
+        block._stream_mapped = {"q": "cuda:1"}
+        # even with GPU caching and a GPU home, mapped blocks must not funnel
+        # the full value snapshot onto one device
+        assert _best_params_snap_dev_(block, torch.device("cuda:0"), torch.device("cuda:0")) == torch.device("cpu")
+
+    def test_unmapped_gpu_pipeline_keeps_gpu_home(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import _best_params_snap_dev_
+
+        block = torch.nn.Linear(2, 2)
+        assert _best_params_snap_dev_(block, torch.device("cuda:1"), torch.device("cuda:0")) == torch.device("cuda:1")
+
+    def test_cpu_pipeline_uses_cache_device(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import _best_params_snap_dev_
+
+        block = torch.nn.Linear(2, 2)
+        assert _best_params_snap_dev_(block, torch.device("cpu"), "cpu") == "cpu"

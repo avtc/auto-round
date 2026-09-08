@@ -38,6 +38,23 @@ from auto_round.utils.device import clear_memory_if_reached_threshold, log_cuda_
 from auto_round.utils.device_manager import device_manager
 
 
+def _best_params_snap_dev_(block, home, cache_device):
+    """Device for the best-params snapshot.
+
+    Single-GPU pipelines that already cache on GPU park the snapshot where
+    it was produced (cross-device D2D snapshots cost ~0.1s/iter on
+    non-primary homes). Stream-MAPPED blocks are the exception: their tune
+    params live spread across several GPUs and the snapshot would funnel a
+    full copy of every wrapper's values onto ONE device (~2x its value
+    memory) - park on host RAM instead, like the calibration rows.
+    """
+    if getattr(block, "_stream_mapped", None):
+        return torch.device("cpu")
+    if getattr(cache_device, "type", "") == "cuda" and getattr(home, "type", "") == "cuda":
+        return home
+    return cache_device
+
+
 def _rehome_calibration_state(
     active_inputs,
     fp_outputs,
@@ -637,18 +654,14 @@ class SignRoundQuantizer(BaseQuantizer):
             if total_loss < best_loss:
                 best_loss = total_loss
                 if not self.not_use_best_mse:
-                    # park the snapshot where it was produced when the pipeline
-                    # already caches on GPU: cross-device D2D snapshots cost
-                    # ~0.1s/iter on non-primary homes
-                    _snap_dev = (
-                        _home
-                        if getattr(self.compress_context.cache_device, "type", "") == "cuda" and _home.type == "cuda"
-                        else self.compress_context.cache_device
+                    best_params = collect_best_params(
+                        block, _best_params_snap_dev_(block, _home, self.compress_context.cache_device)
                     )
-                    best_params = collect_best_params(block, _snap_dev)
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
-                best_params = collect_best_params(block, self.compress_context.cache_device)
+                best_params = collect_best_params(
+                    block, _best_params_snap_dev_(block, _home, self.compress_context.cache_device)
+                )
 
             if not self.not_use_best_mse:
                 if 0 < self.dynamic_max_gap <= i - last_best_iter:
