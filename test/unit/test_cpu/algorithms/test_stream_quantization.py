@@ -441,7 +441,7 @@ class TestStreamModeExclusivity:
     """stream_quantization is mutually exclusive with AR_DISK_STREAM_MODEL
     (hard error), and quant_nontext_module is rejected under streaming."""
 
-    def _make_context(self, monkeypatch, *, env_disk_stream=False, mllm=False):
+    def _make_context(self, monkeypatch, *, env_disk_stream=False, mllm=False, model="dummy-model"):
         from auto_round import envs
         from auto_round.context.model import ModelContext
 
@@ -456,7 +456,7 @@ class TestStreamModeExclusivity:
         # ModelContext and never leaks the instance to later tests.
         ModelContext.reset_context()
         try:
-            return ModelContext("dummy-model", stream_quantization=True)
+            return ModelContext(model, stream_quantization=True)
         finally:
             ModelContext.reset_context()
 
@@ -466,7 +466,7 @@ class TestStreamModeExclusivity:
         with pytest.raises(ValueError, match="mutually exclusive"):
             self._make_context(monkeypatch, env_disk_stream=True)
 
-    def test_stream_quantization_with_mllm_routes_to_meta_loader(self, monkeypatch):
+    def test_stream_quantization_with_mllm_routes_to_meta_loader(self, monkeypatch, tmp_path):
         """Multimodal + streaming no longer errors: the mllm branch routes into
         _load_model_on_meta (arch-resolved skeleton + processor stack; vision
         tower stays meta for the export pass-through)."""
@@ -490,7 +490,7 @@ class TestStreamModeExclusivity:
             self.tokenizer = None
 
         monkeypatch.setattr(ModelContext, "_load_model_on_meta", _fake_meta)
-        ctx = self._make_context(monkeypatch, mllm=True)
+        ctx = self._make_context(monkeypatch, mllm=True, model=str(tmp_path))
         assert called["meta"] == 1, "mllm + stream_quantization must use the streaming loader"
         assert ctx.is_mllm is True
 
@@ -516,16 +516,37 @@ class TestStreamModeExclusivity:
         with pytest.raises(ValueError, match="mutually exclusive"):
             self._make_context(monkeypatch, mllm=True, env_disk_stream=True)
 
-    def test_text_path_without_env_proceeds_to_meta_load(self, monkeypatch):
+    def test_text_path_without_env_proceeds_to_meta_load(self, monkeypatch, tmp_path):
         """Sanity: the guards must not fire on the normal text streaming path
-        (the meta loader then fails on the dummy checkpoint -- any other
-        error than the two guards is acceptable progress)."""
+        with a real local directory (the meta loader then fails on the empty
+        fixture -- any error other than the guards is acceptable progress)."""
         import pytest
 
         with pytest.raises(Exception) as excinfo:
-            self._make_context(monkeypatch)
+            self._make_context(monkeypatch, model=str(tmp_path))
         assert "mutually exclusive" not in str(excinfo.value)
         assert "multimodal" not in str(excinfo.value)
+        assert "local checkpoint directory" not in str(excinfo.value)
+
+    def test_stream_quantization_hub_id_fails_with_guidance(self, monkeypatch):
+        """Hub ids (HF or ModelScope) are not resolvable under streaming: the
+        loop streams weight shards straight from a local directory. A hub id
+        must fail loud at startup with download guidance instead of the bare
+        streamer FileNotFoundError."""
+        import pytest
+
+        with pytest.raises(ValueError, match="local checkpoint directory") as excinfo:
+            self._make_context(monkeypatch, model="Qwen/Qwen3.8-27B")
+        assert "hf download" in str(excinfo.value)
+        assert "modelscope download" in str(excinfo.value)
+
+    def test_stream_quantization_single_file_path_fails_with_guidance(self, monkeypatch):
+        """A path to a single file (not a checkpoint directory) fails with the
+        same guidance -- the streamer needs the directory with the shards."""
+        import pytest
+
+        with pytest.raises(ValueError, match="local checkpoint directory"):
+            self._make_context(monkeypatch, model="/tmp/model.safetensors")
 
 
 class TestStreamRowsCap:

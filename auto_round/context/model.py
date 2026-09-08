@@ -264,6 +264,17 @@ class ModelContext(BaseContext):
                 model_dtype=self.model_dtype,
                 default_torch_dtype=default_torch_dtype,
             )
+        if self.stream_quantization and not os.path.isdir(self.model):
+            # Fail loud with actionable guidance instead of the bare streamer
+            # FileNotFoundError: hub ids are never resolved for the weights
+            # (only config/tokenizer via from_pretrained), so a hub id would
+            # otherwise download the small files and then die at the streamer.
+            raise ValueError(
+                "--stream_quantization requires a local checkpoint directory: weight shards are "
+                f"streamed straight from disk and hub ids are never resolved (got {str(self.model)!r}). "
+                "Download the checkpoint first (e.g. `hf download <repo-id>`, or "
+                "`modelscope download <repo-id>` when using ModelScope) and pass the local path."
+            )
         elif is_mllm_model(self.model, platform=self.platform):
             self.is_mllm = True
             if self.stream_quantization:
