@@ -965,6 +965,13 @@ intermediate copies. All blockwise algorithms (RTN-family, SignRound with `iters
 auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantization --stream_prefetch auto
 ```
 
+For long runs, make the job crash-resumable -- completed blocks are skipped and their already-written output
+shards are adopted as-is on restart (the same `AR_RESUME_DIR` contract as the ordinary path):
+
+```bash
+AR_RESUME_DIR=/home/<user>/auto_round/resume auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16"   --stream_quantization --stream_prefetch auto
+```
+
 `--stream_quantization` reads the checkpoint from a local directory (it streams shards
 directly and never resolves hub ids); download the model first when starting from a hub id.
 
@@ -994,7 +1001,8 @@ directly and never resolves hub ids); download the model first when starting fro
 - MTP/nextn blocks: when a `layer_config` pin covers them they are materialized and quantized at the pinned
   bits (and tuned like any other block when `iters > 0`); when unpinned, text-format exports pass their
   tensors through verbatim, while GGUF exports quantize them at the run's default qtype like any other
-  body tensor.
+  body tensor. For GGUF, pinning higher bits for the MTP layer (e.g. `"bits": 8`) yields a
+  higher-quality draft head, the pairing recommended for best speculative-decoding acceptance.
 - GGUF disk usage: a streaming GGUF run spills per-block packed payloads to `gguf-blobs/` shards (about 1x
   the final model size, next to the output) and assembles the final `.gguf` from those bytes at save time --
   expect about 2x the final model size on disk during the run, plus a transient payload spool in the system

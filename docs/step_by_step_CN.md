@@ -926,6 +926,13 @@ auto-round --model_name Qwen/Qwen3-0.6B  --scheme "W4A16" --quant_lm_head --form
 auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantization --stream_prefetch auto
 ```
 
+对于长时间运行的任务，可以开启断点续跑——重启后已完成的块会被跳过，其已写出的输出分片会被直接
+采用（与普通路径相同的 `AR_RESUME_DIR` 约定）：
+
+```bash
+AR_RESUME_DIR=/home/<用户名>/auto_round/resume auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16"   --stream_quantization --stream_prefetch auto
+```
+
 `--stream_quantization` 从本地目录读取 checkpoint（直接流式读取分片，不解析 hub id）；
 如果起点是 hub id，请先下载模型。
 
@@ -947,7 +954,8 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantizati
   已空闲的暂存设备上以后台线程执行（`AR_STREAM_BG_PACK`）。
 - MTP/nextn 块：当 `layer_config` pin 覆盖到它们时，会被物化并按 pin 的位宽量化（`iters > 0` 时与其他
   块一样参与调优）；未 pin 时，文本格式导出会原样透传其张量，而 GGUF 导出会按本次运行的默认量化
-  类型像普通主体张量一样量化它们。
+  类型像普通主体张量一样量化它们。对 GGUF 而言，为 MTP 层 pin 更高的位宽（如 `"bits": 8`）可以得到
+  更高质量的 draft 头，这是为获得最佳投机解码接受率的推荐搭配。
 - GGUF 磁盘占用：流式 GGUF 运行会把逐块打包的载荷写入 `gguf-blobs/` 分片（约为最终模型大小的 1 倍，
   位于输出目录旁），保存时再从这些字节组装出最终 `.gguf`——运行期间预计需要约 2 倍最终模型大小的
   磁盘空间，组装期间系统临时目录还会有一份瞬时载荷缓冲。组装过程内存占用很低（一次只开一个分片
