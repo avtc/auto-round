@@ -1294,7 +1294,7 @@ def prepare_tensors(cls):
             shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
 
             # n_dims is implicit in the shape
-            logger.debug(
+            logger.info(
                 f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype}" f" --> {data_qtype.name}, shape = {shape_str}"
             )
             if not (hasattr(cls, "current_packing_block") and cls.current_packing_block is not None):
