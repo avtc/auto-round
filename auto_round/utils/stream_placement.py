@@ -147,6 +147,21 @@ def _leaf_param_bytes(module: torch.nn.Module) -> int:
     return total
 
 
+def _leaf_tune_state_bytes(module: torch.nn.Module) -> int:
+    """Bytes a leaf RESIDES at on its tune device during iters>0 tuning.
+
+    Quantizable linears (what wrapper_block wraps) hold ~4x their bf16
+    param bytes: the weight (1x) plus the fp32 rounding values (2x - value
+    shape equals weight shape at 4 bytes/elem vs 2) plus the value grads
+    (1x at bf16). Non-wrapped leaves (norms, router scalars) hold only
+    their params. Balancing by raw param bytes under-weights every
+    quantizable leaf fourfold and lets the heavy tune device drift toward
+    the OOM ceiling.
+    """
+    factor = 4 if isinstance(module, torch.nn.Linear) else 1
+    return _leaf_param_bytes(module) * factor
+
+
 def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.device, shared_leaf_groups=None) -> dict:
     """Resolve ``template`` into ``{leaf_name: device}`` for one block.
 
@@ -215,7 +230,7 @@ def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.de
                 rebuilt.append((key, leaves))
         rebuilt.append(("shared:" + atom[0].rpartition(".")[2], sorted(merged)))
         groups = rebuilt
-    weights = [sum(_leaf_param_bytes(get_mod[leaf]) for leaf in leaves) for _, leaves in groups]
+    weights = [sum(_leaf_tune_state_bytes(get_mod[leaf]) for leaf in leaves) for _, leaves in groups]
     total = sum(weights) or 1
     target = total / len(devices)
     placement = {}
@@ -332,14 +347,18 @@ def block_signature(block: torch.nn.Module) -> str:
 def partition_flow_order(flow_units: list, devices: list, budgets: Optional[dict] = None) -> dict:
     """Assign flow-ordered units to devices, balancing VRAM.
 
-    ``flow_units`` is a list of ``(names, param_bytes, input_bytes, is_atom)``
-    in observed execution order. Atom units (expert projections,
-    shared-quant groups) are distributed greedily for balance - their
-    routing is data-dependent, so index order carries no execution
-    benefit. The remaining units stay CONTIGUOUS along the flow order and
-    the device boundaries are chosen at the cheapest cuts (boundary cost =
-    the next unit's input activation bytes), minimizing per-forward
-    cross-device traffic while respecting a per-device VRAM ceiling.
+    ``flow_units`` is a list of ``(names, resident_bytes, input_bytes, is_atom)``
+    in observed execution order, where ``resident_bytes`` is the unit's
+    steady VRAM cost during tuning (tune-state bytes plus its input
+    activation - the align-hook copy and its autograd retention live on
+    the unit's own device for the whole forward/backward). Atom units
+    (expert projections, shared-quant groups) are distributed greedily for
+    balance - their routing is data-dependent, so index order carries no
+    execution benefit. The remaining units stay CONTIGUOUS along the flow
+    order and the device boundaries are chosen at the cheapest cuts
+    (boundary cost = the next unit's input activation bytes), minimizing
+    per-forward cross-device traffic while respecting a per-device VRAM
+    ceiling.
 
     Returns ``{name: device}`` for all names in the units.
     """

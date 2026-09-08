@@ -1665,6 +1665,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             FlowProbe,
             _atomic_groups,
             _leaf_param_bytes,
+            _leaf_tune_state_bytes,
             _normalize_device,
             _shared_atoms,
             block_signature,
@@ -1757,17 +1758,22 @@ class CompressionOrchestrator(BaseOrchestrator):
                     continue
                 fired.add(rel)
                 atom = atom_of.get(rel)
+                state_of = lambda n: _leaf_tune_state_bytes(get_mod[n])  # noqa: E731
                 if atom is not None:
                     if atom in seen_atoms:
                         continue
                     seen_atoms.add(atom)
                     members = [n for n in leaf_names if atom_of.get(n) == atom]
-                    units.append((members, sum(_leaf_param_bytes(get_mod[n]) for n in members), in_bytes, True))
+                    # resident = tune state + the unit's input activation:
+                    # the align-hook copy and its autograd retention live on
+                    # the unit's device for the whole forward/backward (a
+                    # full-hidden mlp input is GBs, not a rounding error)
+                    units.append((members, sum(state_of(n) for n in members) + in_bytes, in_bytes, True))
                 else:
-                    units.append(([rel], _leaf_param_bytes(get_mod[rel]), in_bytes, False))
+                    units.append(([rel], state_of(rel) + in_bytes, in_bytes, False))
             for leaf in leaf_names:  # never executed: place for balance
                 if leaf not in fired:
-                    units.append(([leaf], _leaf_param_bytes(get_mod[leaf]), 0, atom_of.get(leaf) is not None))
+                    units.append(([leaf], _leaf_tune_state_bytes(get_mod[leaf]), 0, atom_of.get(leaf) is not None))
             placement = partition_flow_order(units, dev_objs)
             placement = complete_container_params(placement, block)
             key = (block_signature(block), tuple(str(d) for d in devices))

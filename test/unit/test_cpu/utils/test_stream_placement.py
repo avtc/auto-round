@@ -509,3 +509,29 @@ class TestSharedLayersEntryRouting:
         from auto_round.autoround import _ENTRY_KWARG_OWNERS
 
         assert _ENTRY_KWARG_OWNERS.get("shared_layers") == "compressor"
+
+
+class TestTuneStatePricing:
+    def test_linear_costs_four_times_norm(self):
+        import torch
+
+        from auto_round.utils.stream_placement import _leaf_tune_state_bytes
+
+        lin = torch.nn.Linear(100, 100)  # 10k params, bf16-sized by dtype of params (fp32 here)
+        norm = torch.nn.LayerNorm(100)  # 200 params
+        lin_b = sum(p.numel() * p.element_size() for p in lin.parameters())
+        assert _leaf_tune_state_bytes(lin) == 4 * lin_b
+        assert _leaf_tune_state_bytes(norm) == sum(p.numel() * p.element_size() for p in norm.parameters())
+
+    def test_partition_balances_resident_cost_with_activation(self):
+        from auto_round.utils.stream_placement import partition_flow_order
+
+        devs = ["d0", "d1"]
+        # unit A: tiny params but a HUGE input activation (the mlp-container
+        # case: full-hidden copy resides on its device); unit B: big state, no input
+        units = [(["a"], 1, 1000, False), (["b"], 500, 0, False), (["c"], 500, 0, False)]
+        place = partition_flow_order(units, devs)
+        # 'a' (resident 1001) must not share its device with the bulk of b+c
+        dev_a = place["a"]
+        other = [n for n, d in place.items() if d == dev_a]
+        assert sum(1 for n in other if n in ("b", "c")) <= 1  # at most one heavy unit alongside
