@@ -505,14 +505,16 @@ def check_need_act_calibration(
 
 
 def collect_best_params_sharded(block, devices=None):
-    """Best-params snapshot spread round-robin across accelerator devices.
+    """Best-params snapshot distributed across accelerators by FREE memory.
 
     A whole-snapshot-on-one-device doubles that device's value memory
     (OOM on 24G cards for ~4B-param blocks), while pageable host copies
-    cost ~8s per improving iteration. Round-robin device-to-device copies
-    cost ~1s total and add only a slice of the values per device. Falls
-    back to a host snapshot (with a warning) when no accelerator devices
-    are available.
+    cost ~8s per improving iteration. Copies are placed largest-first onto
+    the device with the most remaining budget (a safety fraction of its
+    free bytes - the flow-derived placement is execution-balanced, not
+    byte-balanced, so naive round-robin would overload the heavy tune
+    device). Falls back to a host snapshot when no accelerator devices
+    exist or the snapshot fits no device budget.
     """
     from auto_round.utils.device_manager import device_manager
 
@@ -524,21 +526,60 @@ def collect_best_params_sharded(block, devices=None):
     if not devs:
         logger.warning("[tune] no accelerator devices for the sharded snapshot; parking on host")
         return collect_best_params(block, "cpu")
+
+    def _param_bytes(m):
+        return sum(p.data.numel() * p.data.element_size() for p in m.params.values())
+
     if hasattr(block, "orig_layer"):
-        targets = shard_targets_(len(block.params.keys()), devs)
-        return {key: block.params[key].data.to(dev, copy=True) for key, dev in zip(block.params.keys(), targets)}
-    names = [n for n, m in block.named_modules() if hasattr(m, "orig_layer")]
-    targets = shard_targets_(len(names), devs)
+        wrappers = {"": block}
+    else:
+        wrappers = {n: m for n, m in block.named_modules() if hasattr(m, "orig_layer")}
+    targets = shard_targets_({n: _param_bytes(m) for n, m in wrappers.items()}, devs)
+    if targets is None:
+        logger.warning("[tune] snapshot does not fit device free-memory budgets; parking on host")
+        return collect_best_params(block, "cpu")
     params = {}
-    for n, dev in zip(names, targets):
-        m = block.get_submodule(n)
-        params[n] = {key: m.params[key].data.to(dev, copy=True) for key in m.params}
+    for (name, m), dev in zip(wrappers.items(), targets):
+        params[name] = {key: p.data.to(dev, copy=True) for key, p in m.params.items()}
     return params
 
 
-def shard_targets_(count: int, devs) -> list:
-    """Round-robin target devices for ``count`` snapshot items (pure, testable)."""
-    return [devs[i % len(devs)] for i in range(count)]
+def shard_targets_(item_bytes: dict, devs, budget_frac: float = 0.6) -> list:
+    """Assign snapshot items to devices by FREE memory, not round-robin.
+
+    Round-robin blindly adds copies to already-heavy devices (the flow-
+    derived placement is execution-balanced, not byte-balanced - the
+    heaviest tune device can sit within ~1GB of OOM). Each device gets a
+    budget of budget_frac x free bytes (headroom for backward transients);
+    items are placed largest-first onto the device with the most remaining
+    budget. Returns None when the snapshot does not fit any device budget
+    (caller falls back to host).
+    """
+    free = {}
+    for d in devs:
+        try:
+            if d.type == "cuda":
+                free_bytes, _total = torch.cuda.mem_get_info(d.index)
+                free[d] = int(free_bytes * budget_frac)
+            else:
+                free[d] = None  # non-cuda accelerators: no free query here
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[tune] free-memory query failed on %s: %s", d, e)
+            free[d] = None
+    if all(v is None for v in free.values()):
+        # no per-device free-memory signal: fall back to round-robin
+        return [devs[i % len(devs)] for i in range(len(item_bytes))]
+    order = sorted(item_bytes, key=lambda n: -item_bytes[n])
+    budget = {d: (v if v is not None else 0) for d, v in free.items()}
+    out = {}
+    for name in order:
+        need = item_bytes[name]
+        d = max(budget, key=lambda k: budget[k])
+        if budget[d] < need:
+            return None  # does not fit anywhere under the safety budgets
+        budget[d] -= need
+        out[name] = d
+    return [out[n] for n in item_bytes]
 
 
 def collect_best_params(block, cache_device="cpu"):

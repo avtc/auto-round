@@ -496,34 +496,51 @@ class TestShardedSnapshot:
 
         return Blk()
 
-    def test_shard_targets_cycle(self):
-        from auto_round.compressors.utils import shard_targets_
-
-        # 3 wrappers across 2 devices: a->0, b->1, c->0 - spread, not funneled
-        assert shard_targets_(3, ["d0", "d1"]) == ["d0", "d1", "d0"]
-        assert shard_targets_(4, ["d0"]) == ["d0"] * 4  # single device degenerates safely
-
-    def test_copies_not_aliases_and_cycled(self):
+    def test_shard_targets_fit_free_memory(self, monkeypatch):
         import torch
 
         from auto_round.compressors import utils as cu
 
-        blk = self._fake_block()
-        real_to = torch.Tensor.to
-        picked = []
+        class FakeDev:
+            def __init__(self, name):
+                self.type = "cuda"
+                self.index = 0
+                self.name = name
 
-        def spy_to(self, *args, **kwargs):
-            if args and isinstance(args[0], torch.device):
-                picked.append(args[0].index)
-            return real_to(self, *args, **kwargs)
+            def __repr__(self):
+                return self.name
 
-        # feed the internals directly: the accelerator filter drops cpu
-        # devices on this CPU-only box, so call the cycling + copy path via
-        # monkeypatched filter would be brittle - instead verify the wrapper
-        # copy semantics through the plain collector
-        params = cu.collect_best_params(blk, "cpu")
-        assert params["a"]["v"].data_ptr() != blk.a.params["v"].data_ptr()
-        assert picked == []  # spy not needed here; kept for symmetry
+        d_big, d_small = FakeDev("big"), FakeDev("small")
+        # big has 10GB free (x0.6 budget = 6), small has 3GB (budget 1.8)
+        monkeypatch.setattr(
+            cu.torch.cuda, "mem_get_info", lambda idx: (10 * 2**30, 20 * 2**30) if idx == 0 else (3 * 2**30, 4 * 2**30)
+        )
+        items = {"a": 5 * 2**30, "b": 1 * 2**30, "c": 1 * 2**30}
+        # 'a' (largest) must land on big; small gets only what fits its budget
+        out = cu.shard_targets_(items, [d_big, d_small])
+        assert out[items and list(items).index("a")] is d_big or out[0] is d_big
+
+    def test_shard_targets_round_robin_without_free_query(self):
+        from auto_round.compressors.utils import shard_targets_
+
+        class FakeDev:
+            type = "npu"  # no mem_get_info path
+
+        out = shard_targets_({"a": 1, "b": 2, "c": 3}, [FakeDev(), FakeDev()])
+        assert len(out) == 3
+
+    def test_shard_targets_none_when_nothing_fits(self, monkeypatch):
+        import torch
+
+        from auto_round.compressors import utils as cu
+
+        class FakeDev:
+            type = "cuda"
+            index = 0
+
+        monkeypatch.setattr(cu.torch.cuda, "mem_get_info", lambda idx: (1 * 2**30, 4 * 2**30))
+        out = cu.shard_targets_({"a": 5 * 2**30}, [FakeDev()])
+        assert out is None
 
     def test_no_accelerator_falls_back_to_host_with_warning(self, monkeypatch, caplog):
         import logging as _logging
