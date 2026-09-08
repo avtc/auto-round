@@ -1648,6 +1648,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 placement = {leaf: flow[leaf] for leaf in leaf_names if leaf in flow}
                 for leaf in leaf_names:
                     placement.setdefault(leaf, fallback)
+                # the leaf filter above drops the template's container keys
+                # (co-located container-direct params, e.g. GDN A_log) -
+                # re-derive them for THIS block's module tree
+                placement = complete_container_params(placement, block)
                 if not logged.get("reused"):
                     logged["reused"] = True
                     logger.info(
