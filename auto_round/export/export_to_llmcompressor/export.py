@@ -228,6 +228,13 @@ def pack_layer(name, model, device=None):
     # explicitly obtain the underlying device to prevent RuntimeError mismatched tensors
     weight_device = layer.weight.device
 
+    if not hasattr(layer, "scale"):
+        raise AttributeError(
+            f"layer '{name}' is marked for quantization (bits={getattr(layer, 'bits', None)}) but carries no "
+            "scale/zero-point: its quantization never ran. This usually means the module was never visited "
+            "by the block loop or the outside-block quantization pass (e.g. it sits in a subtree the "
+            "streaming setup left untouched)."
+        )
     scheme = construct_ct_scheme(layer)
     setattr(layer, "quantization_scheme", scheme)
     setattr(layer, "weight_scale", torch.nn.Parameter(layer.scale.to(weight_device)))
@@ -306,6 +313,93 @@ def pack_layer(name, model, device=None):
 
 
 @torch.no_grad()
+def _restore_packed_modules_from_shards(model, output_dir: str, metadata_only: bool = False, name_resolver=None) -> int:
+    """Rebuild packed-module state from already-written output shards.
+
+    A resumed streaming session skips blocks a previous run already packed
+    and wrote: their modules stay fresh (bits set, but no scale or compressed
+    state) because the packed tensors live in the output shards, not in
+    memory. Re-attach the packed attributes and mark the modules compressed
+    so packing is a no-op and the quantization config derives exactly as it
+    would in the session that did the work.
+
+    ``metadata_only`` (immediate-saving runs, whose weights stay in the
+    shards) restores just the scheme and status: the packed tensors
+    themselves would never be consumed downstream - loading them would
+    materialize the whole model's packed weights in host RAM for nothing.
+    """
+    import json
+    import os
+
+    from compressed_tensors.quantization import QuantizationStatus  # pylint: disable=E0401
+    from safetensors import safe_open
+
+    # Prefer the shard index (pure JSON): scanning headers mmaps every shard
+    # transiently, which on memory-tight hosts can fail outright.
+    shards = {}
+    index_path = os.path.join(output_dir or "", "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = (json.load(f) or {}).get("weight_map", {})
+        shards = {k: os.path.join(output_dir, v) for k, v in weight_map.items()}
+    if not shards:
+        for fn in os.listdir(output_dir or ""):
+            if not fn.endswith(".safetensors"):
+                continue
+            path = os.path.join(output_dir, fn)
+            with safe_open(path, framework="pt") as h:
+                for k in h.keys():
+                    shards.setdefault(k, path)
+    if not shards:
+        return 0
+
+    restored = 0
+    for name, layer in model.named_modules():
+        if not check_to_quantized(layer):
+            continue
+        if getattr(layer, "quantization_status", None) is not None or hasattr(layer, "scale"):
+            continue
+        # the shards may carry checkpoint-side names (conversion-registry
+        # aliases, e.g. shared_mlp vs shared_experts): resolve before the
+        # packed-key lookup so renamed modules still get marked
+        key = name
+        if f"{key}.weight_packed" not in shards and name_resolver is not None:
+            resolved = name_resolver(name)
+            if resolved is not None and f"{resolved}.weight_packed" in shards:
+                key = resolved
+        if f"{key}.weight_packed" not in shards:
+            continue
+        if metadata_only:
+            layer.quantization_scheme = construct_ct_scheme(layer)
+            layer.quantization_status = QuantizationStatus.COMPRESSED
+            restored += 1
+            continue
+        attrs = {}
+        for suffix in ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point"):
+            path = shards.get(f"{key}.{suffix}")
+            if path is None:
+                continue
+            with safe_open(path, framework="pt") as h:
+                attrs[suffix] = h.get_tensor(f"{key}.{suffix}")
+        if "weight_scale" not in attrs:
+            continue
+        layer.quantization_scheme = construct_ct_scheme(layer)
+        layer.quantization_status = QuantizationStatus.COMPRESSED
+        for suffix, tensor in attrs.items():
+            if suffix == "weight_scale":
+                layer.weight_scale = torch.nn.Parameter(tensor, requires_grad=False)
+            else:
+                setattr(layer, suffix, tensor)
+        restored += 1
+    if restored:
+        logger.info(
+            "restored packed state for %d module(s) from existing output shards%s",
+            restored,
+            " (metadata only)" if metadata_only else " (resumed blocks)",
+        )
+    return restored
+
+
 def save_quantized_as_llmcompressor(
     output_dir: str,
     model: torch.nn.Module = None,
@@ -354,6 +448,22 @@ def save_quantized_as_llmcompressor(
     if output_dir is not None and processor is not None:
         processor.save_pretrained(output_dir)
 
+    # a resumed streaming session skipped blocks already packed and written
+    # by an earlier run; rebuild their packed-module state from the shards
+    # (metadata only: the weights stay durably in the shards under immediate
+    # saving and would never be consumed from memory). The streamer provides
+    # checkpoint-name resolution so modules whose shard tensors live under
+    # conversion-registry aliases still get marked.
+    from auto_round.context.model import ModelContext
+
+    streamer = getattr(ModelContext.get_context(), "checkpoint_streamer", None)
+    _restore_packed_modules_from_shards(
+        model,
+        output_dir,
+        metadata_only=immediate_saving,
+        name_resolver=getattr(streamer, "resolve_checkpoint_name", None),
+    )
+
     # generate q_weight
     device = get_major_device(device)
     if not unsupported_meta_device(model):
@@ -362,6 +472,13 @@ def save_quantized_as_llmcompressor(
 
     quant_format = _get_quant_format(model)
     quantization_config = QuantizationConfig.from_pretrained(model, format=quant_format)
+    if quantization_config is None:
+        meta_names = [n for n, p in model.state_dict().items() if p.device.type == "meta"]
+        raise RuntimeError(
+            "no quantization config could be derived from the model after packing: no layer ended up "
+            "compressed. Remaining meta tensors: "
+            f"{meta_names[:10] if meta_names else 'none'}"
+        )
     quantization_config_dict = quantization_config.to_dict()
     # from_pretrained groups layers by scheme correctly, but every group inherits
     # the placeholder targets=["Linear"] from construct_ct_scheme. For mixed

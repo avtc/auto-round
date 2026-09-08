@@ -78,7 +78,7 @@ def _check_divisible_by_32(scheme: QuantizationScheme, model, layer_config: dict
                 if m.weight.shape[0] % 32 or m.weight.shape[1] % 32:
                     if layer_config is None:
                         layer_config = {}
-                    if layer_config.get(n) is not None and layer_config[n]["bits"] >= 16:
+                    if layer_config.get(n) is not None and layer_config[n].get("bits", default_dict["bits"]) >= 16:
                         continue
                     layer_config.setdefault(n, copy.deepcopy(default_dict))
                     layer_config[n].update({"bits": 16, "data_type": "fp", "fixed_by_user": True})

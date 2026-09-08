@@ -141,6 +141,27 @@ class GGUFFormat(OutputFormat):
             ctx.quant_block_list = find_matching_blocks(ctx.model, all_blocks, None)
         return super().check_and_reset_format(scheme, ctx)
 
+    def _stream_blob_store(self):
+        """Blob store for streaming GGUF runs, or ``None`` outside blob mode.
+
+        Streaming quantization cannot write the GGUF single-file container
+        progressively, so under ``--stream_quantization`` the per-block packed
+        ggml payloads spill into blob shards and the container is assembled
+        from them at save time (byte-identical to the interactive path).
+        """
+        from auto_round.compressors.utils import _get_save_folder_name
+        from auto_round.context.model import ModelContext
+
+        try:
+            model_context = ModelContext.get_context()
+        except Exception:
+            return None
+        if not getattr(model_context, "stream_quantization", False):
+            return None
+        from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+
+        return GgufBlobStore.get_or_create(_get_save_folder_name(self))
+
     def pack_layer(
         self,
         name,
@@ -170,6 +191,7 @@ class GGUFFormat(OutputFormat):
             device,
             quant_nontext_module,
             is_auto_scheme=self.is_auto_scheme,
+            blob_store=self._stream_blob_store(),
         )
 
     def save_quantized(
@@ -195,6 +217,7 @@ class GGUFFormat(OutputFormat):
             device=device,
             serialization_dict=serialization_dict,
             is_auto_scheme=self.is_auto_scheme,
+            blob_store=self._stream_blob_store(),
             **kwargs,
         )
 

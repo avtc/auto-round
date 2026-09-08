@@ -21,6 +21,7 @@ from typing import Any, Optional, Union
 import torch
 from transformers import AutoConfig, set_seed
 
+from auto_round import envs
 from auto_round.algorithms.quantization import BaseQuantizer, QuantizationConfig
 from auto_round.algorithms.transforms import (
     BaseRotationConfig,
@@ -299,6 +300,12 @@ class BaseOrchestrator(object):
                 self.rotation_configs.append(_cfg)
         assert self.quantize_config is not None, "QuantizationConfig is required for Compressor"
 
+        # Layer-wise (block-wise) rotation: when True, rotation transforms that
+        # support it prepare their matrices up-front and rotate each block inside
+        # the block loop instead of a full-model pass (required for streamed
+        # models whose weights are never all resident).
+        self.layerwise_rotation = kwargs.pop("layerwise_rotation", None)
+
         # Compressor-level layer params (do not live in QuantizationConfig).
         # Calibration params (nsamples/seqlen/batch_size) are owned by
         # ``self.calibration_context`` (seeded above) and exposed via
@@ -333,12 +340,59 @@ class BaseOrchestrator(object):
         nblocks = kwargs.pop("nblocks", 1)
         enable_deterministic_algorithms = kwargs.pop("enable_deterministic_algorithms", False)
 
-        self._offloader = OffloadManager(enabled=low_cpu_mem_usage, mode="offload", offload_dir_prefix="compressor")
+        # Stream the checkpoint per block instead of materializing the whole
+        # model (meta-device load + per-block tensor streaming + immediate
+        # saving). For models far larger than host RAM.
+        self.stream_quantization = kwargs.pop("stream_quantization", False)
+        # Background block staging for the streaming loop (stream_quantization
+        # only), one string knob: "off" (default) disables it; "auto" stages on
+        # one other CUDA device (the quant device joins the rotation when its
+        # free VRAM fits the largest block; host RAM as a last resort);
+        # "on" is the same chain guaranteed enabled (host RAM at minimum);
+        # "cpu" stages in host RAM; a single device string ("cuda:1") stages
+        # there. Lookahead is always ONE block: quantize time per block dwarfs
+        # its load time, so extra staging devices would only spread block
+        # VRAM around. Legacy forms tolerated: 0 -> "off", any other int or
+        # None -> "auto".
+        _prefetch_raw = kwargs.pop("stream_prefetch", "off")
+        if _prefetch_raw is None:
+            _prefetch_raw = "auto"
+        elif isinstance(_prefetch_raw, bool):
+            _prefetch_raw = "auto" if _prefetch_raw else "off"
+        elif isinstance(_prefetch_raw, int):
+            _prefetch_raw = "auto" if _prefetch_raw else "off"
+        self.stream_prefetch = str(_prefetch_raw).strip().lower() or "off"
+        if self.stream_prefetch not in ("off",) and not self.stream_quantization:
+            logger.warning(
+                "stream_prefetch=%s set without stream_quantization: block staging only applies to the "
+                "streaming quantization loop; ignoring it",
+                self.stream_prefetch,
+            )
+        # Collect imatrix activation statistics with a streaming forward pass
+        # before the zero-shot loop (stream_quantization only): one block at a
+        # time is materialized, all calibration rows are pushed through, and
+        # per-module statistics land on the modules for the clip search.
+        # Matches the data-driven imatrix exactly for identical rows.
+        # Derived, not a knob: the chain engages iff the streaming loop needs
+        # activations (iters > 0 tuning or an enabled imatrix) -- see
+        # _auto_engage_stream_features.
+        self.stream_calibration = False
+        self._auto_engage_stream_features()
+
+        # ``stream_quantization`` handles its own block lifecycle (meta -> stream
+        # -> quantize -> write -> meta), so the accelerate-style offloader
+        # must not interfere.
+        self._offloader = OffloadManager(
+            enabled=low_cpu_mem_usage and not self.stream_quantization,
+            mode="offload",
+            offload_dir_prefix="compressor",
+        )
 
         # Model related
         model_dtype = kwargs.pop("model_dtype", None)
         trust_remote_code = kwargs.pop("trust_remote_code") if "trust_remote_code" in kwargs else True
         quant_nontext_module = kwargs.pop("quant_nontext_module", False)
+        self._validate_stream_options(quant_nontext_module)
         device = kwargs.pop("device", None)
         if device is not None:
             logger.warning("`device` is deprecated, please use `device_map` instead")
@@ -439,6 +493,7 @@ class BaseOrchestrator(object):
             formats=self.formats,
             is_act_quantize=self.quantize_config.is_act_quantize,
             quant_nontext_module=quant_nontext_module,
+            stream_quantization=self.stream_quantization,
         )
         # Reset the singleton so each new orchestrator gets a fresh CompressContext.
         # CompressContext uses AutoSkipInitMeta (singleton), so without a reset the
@@ -528,6 +583,87 @@ class BaseOrchestrator(object):
             return True
         return self._needs_calibration_data()
 
+    def _validate_stream_options(self, quant_nontext_module: bool) -> None:
+        """Reject option combinations the streaming loop cannot honor."""
+        if quant_nontext_module and self.stream_quantization:
+            raise ValueError(
+                "quant_nontext_module=True is not supported under stream_quantization: "
+                "the streaming loop feeds text hidden states block-to-block, which "
+                "cannot drive vision/non-text blocks (their statistics would be "
+                "garbage), and the path is unvalidated. Non-text layers pass "
+                "through at full precision under streaming; to quantize them use "
+                "the ordinary (non-streaming) path."
+            )
+        if self.stream_quantization:
+            if any(getattr(c, "enable_lfq", False) for c in getattr(self, "_alg_configs", None) or []):
+                raise ValueError(
+                    "enable_lfq=True is not supported under stream_quantization: the LFQ loss "
+                    "forwards the still-meta lm_head on the final block. Leave enable_lfq off "
+                    "for streaming runs."
+                )
+            from auto_round.algorithms.quantization.config import QuantizationConfig
+            from auto_round.algorithms.quantization.rtn.config import RTNConfig
+            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+            unsupported = [
+                type(c).__name__
+                for c in getattr(self, "_alg_configs", None) or []
+                if isinstance(c, QuantizationConfig)
+                and getattr(c, "need_calib", True)
+                and not isinstance(c, (RTNConfig, SignRoundConfig))
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"stream_quantization supports the RTN and SignRound quantizers, got "
+                    f"{unsupported}: those implementations capture calibration statistics "
+                    "(activations, Hessians) by driving the fully materialized model and "
+                    "are not yet adapted to the streaming loop's block-replay interface. "
+                    "The loop itself is compatible with per-block capture - SignRound's "
+                    "streamed chain already feeds block-local tuning - so adapting other "
+                    "quantizers is future work, not a fundamental restriction."
+                )
+
+    def _auto_engage_stream_features(self) -> None:
+        """Resolve streaming-mode conveniences right after kwargs are popped.
+
+        1. Rotation transforms under stream_quantization can only run
+           layer-wise (whole-model rotation would materialize the model), so
+           layerwise_rotation auto-enables whenever a rotation config is
+           present. An explicit True/False from the caller wins.
+        2. The activation chain engages automatically when the streaming loop
+           needs activations -- iters > 0 tuning (SignRound) or an enabled
+           imatrix (scheme rules). Weight-only runs
+           (imatrix off / forced false, iters=0) never consume activations and
+           stay chain-free.
+        """
+        if self.layerwise_rotation is None:
+            from auto_round.algorithms.transforms.base import BaseRotationConfig
+
+            has_rotations = any(isinstance(c, BaseRotationConfig) for c in self._alg_configs)
+            # Both streaming modes build a meta skeleton: the never-materialize
+            # loop (--stream_quantization) and the data-driven offloader
+            # (AR_DISK_STREAM_MODEL). Whole-model rotation would materialize
+            # the model in either, so defer layer-wise wherever rotations exist.
+            streaming_mode = self.stream_quantization or bool(envs.AR_DISK_STREAM_MODEL)
+            self.layerwise_rotation = bool(streaming_mode and has_rotations)
+            if self.layerwise_rotation:
+                mode = "stream_quantization" if self.stream_quantization else "AR_DISK_STREAM_MODEL"
+                logger.info(f"[{mode}] layerwise_rotation auto-enabled (rotation transforms present)")
+        else:
+            self.layerwise_rotation = bool(self.layerwise_rotation)
+        if self.stream_quantization and not self.stream_calibration:
+            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+            needs_chain = any(
+                isinstance(c, SignRoundConfig) or getattr(c, "enable_imatrix", False) for c in self._alg_configs
+            )
+            if needs_chain:
+                self.stream_calibration = True
+        # API parity with the CLI: unset (None) enables the auto-engage above;
+        # coerce the final value to bool either way
+        if self.layerwise_rotation is None:
+            self.layerwise_rotation = False
+
     def _needs_calibration_data(self) -> bool:
         """Determine whether calibration data is truly required.
 
@@ -540,11 +676,35 @@ class BaseOrchestrator(object):
         """
         from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
 
-        if any(getattr(config, "need_calib", True) for config in self._alg_configs):
-            return True
+        demanding = [c for c in self._alg_configs if getattr(c, "need_calib", True)]
+        if demanding:
+            # stream_quantization cannot provide cached block inputs (no full-model
+            # forward exists). The RTN family (incl. optimized RTN) is weight-only:
+            # its clip search never consumes activations, so the demand is waived
+            # and the zero-shot block loop runs instead. SignRound (iters > 0)
+            # tuning can also run in the streaming loop, but only when
+            # stream_calibration chains real activations block-to-block.
+            from auto_round.algorithms.quantization.rtn.config import RTNConfig as _RTN
+            from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig as _SignRound
 
-        # AutoScheme needs data for delta-loss scheme selection
-        if isinstance(self.scheme, AutoScheme):
+            if not getattr(self, "stream_quantization", False):
+                return True
+            if not all(isinstance(c, (_RTN, _SignRound)) for c in demanding):
+                return True
+            if not getattr(self, "stream_calibration", False):
+                # Normally auto-engaged in __init__ (_auto_engage_stream_features).
+                # If configs demanding activations slipped in afterwards, take
+                # the ordinary data-driven path rather than silently tuning
+                # weight-only under streaming.
+                if any(isinstance(c, _SignRound) for c in demanding):
+                    return True
+
+        # AutoScheme needs data for delta-loss scheme selection -- unless the
+        # run streams: scoring happens in disk-stream workers / from the scheme
+        # cache and the parent never forwards, so under stream_quantization the
+        # streaming loop governs quantization and the scheme itself adds no
+        # calibration demand.
+        if isinstance(self.scheme, AutoScheme) and not self.stream_quantization:
             return True
 
         # Check if activation calibration is needed
@@ -566,12 +726,25 @@ class BaseOrchestrator(object):
             static_kv_dtype=self.static_kv_dtype,
             static_attention_dtype=self.static_attention_dtype,
         ):
+            if getattr(self, "stream_quantization", False):
+                raise ValueError(
+                    "Static activation quantization is not supported under stream_quantization: "
+                    "collecting activation statistics requires full-model forward passes, which "
+                    "the streaming loop (meta skeleton, block-at-a-time) cannot provide. Use a "
+                    "weight-only scheme (e.g. W4A16) or the ordinary (non-streaming) path."
+                )
             return True
 
         # Layer-level scheme overrides can request static-activation paths
         # (e.g., global MXFP8 + local NVFP4 experts). Those still need
         # calibration data even when top-level scheme looks dynamic.
         if self._layer_config_needs_calibration(check_need_act_calibration):
+            if getattr(self, "stream_quantization", False):
+                raise ValueError(
+                    "Layer-level static activation quantization is not supported under "
+                    "stream_quantization (full-model forward passes are unavailable). Use "
+                    "weight-only layer schemes or the ordinary (non-streaming) path."
+                )
             return True
 
         return False
@@ -1387,7 +1560,6 @@ class BaseOrchestrator(object):
         self._resolve_formats()
         self._patch_model()
         self._build_layer_config()
-        self._apply_rotations()
 
         # Reclaim temporaries from Phases 1-4 (scheme resolution, format
         # parsing, model patching, layer-config walk) before Phase 5
@@ -1401,6 +1573,13 @@ class BaseOrchestrator(object):
         # BlockForwardRunner is now created inside AlgorithmComposer.__init__,
         # so _build_composer must run first.
         self._build_composer()
+
+        # Model-level pre-quantisation transforms (rotation). The composer
+        # owns the full rotation lifecycle: full-model rotation happens here,
+        # while layer-wise rotation only prepares matrices and defers the
+        # per-block work to ``compress_block`` (required for streamed models
+        # whose weights are never all resident).
+        self._apply_rotations()
 
         # Set block_forward torch compile for block forward
         # Final trim after all init phases.
@@ -1636,13 +1815,11 @@ class BaseOrchestrator(object):
         """
         if not self.rotation_configs:
             return
-        logger.info("Applying Hadamard transform to the model.")
-        for rotation_cfg in self.rotation_configs:
-            self.model_context.model = apply_rotation(
-                self.model_context.model,
-                rotation_cfg,
-                data_type=self.quantize_config.data_type,
-            )
+        # The composer owns the full rotation lifecycle: full-model rotation
+        # happens here, while layer-wise rotation only prepares matrices and
+        # defers the per-block work to ``compress_block`` (required when the
+        # model is streamed and never fully resident).
+        self.model_context.model = self.alg_composer.apply_model_transforms(self.model_context.model)
 
     def _patch_model(self) -> None:
         """Phase 3 – Model structure patching.
@@ -1718,15 +1895,14 @@ class BaseOrchestrator(object):
 
         # Disable inplace when quantized layers live outside transformer blocks.
         # gguf lm-head used rtn in version>=0.13
-        if (
-            self.has_qlayer_outside_block
-            and self.need_calib
-            and (
-                self.compress_context.formats is None
-                or "gguf" not in self.compress_context.formats[0].__class__.__name__.lower()
-            )
-        ):
-            self.inplace = False
+        # NOTE: upstream used to disable ``self.inplace`` here when quantized
+        # layers lived outside the decoder blocks (e.g. a pinned lm_head) on
+        # the data-driven path. ``inplace``'s only consumer is the packing
+        # gate in :meth:`_adjust_immediate_packing_and_saving`; with the
+        # blockwise pack path those layers quantize after the block loop and
+        # pack at export, so the rule is obsolete and removed for streaming
+        # and non-streaming runs alike (behavior change, covered by
+        # test_immediate_saving_rules.py).
 
         if not hasattr(self, "formats"):
             logger.warning("this API is deprecated, please use `quantize_and_save` instead")
@@ -1830,8 +2006,6 @@ class BaseOrchestrator(object):
         ):
             self.compress_context.is_immediate_packing = True
 
-        if self.has_qlayer_outside_block and self.need_calib and not has_single_gguf_format:
-            self.compress_context.is_immediate_packing = False
         if not ("causallm" in self.model_context.model.__class__.__name__.lower() and not self.model_context.is_mllm):
             # TODO For tied keys, there may some issues, we haven't not verified this
             tied_weight_keys = getattr(self.model_context.model, "_tied_weight_keys", {})
@@ -1853,12 +2027,21 @@ class BaseOrchestrator(object):
 
         if self.compress_context.low_cpu_mem_usage and self.compress_context.is_immediate_packing:
             if formats[0].is_gguf():
-                logger.warning(
-                    "`low_cpu_mem_usage` is not fully supported for gguf format. "
-                    "Setting `low_cpu_mem_usage` to False."
-                )
-                self.compress_context.low_cpu_mem_usage = False
-                self.compress_context.is_immediate_saving = False
+                if len(formats) == 1 and getattr(self, "stream_quantization", False):
+                    # Streaming GGUF runs write per-block ggml payloads into
+                    # blob shards and assemble the container at save time, so
+                    # progressive saving is supported after all.
+                    logger.info(
+                        "streaming gguf export: per-block ggml payloads spill to blob shards; "
+                        "the container is assembled from them at save time"
+                    )
+                else:
+                    logger.warning(
+                        "`low_cpu_mem_usage` is not fully supported for gguf format. "
+                        "Setting `low_cpu_mem_usage` to False."
+                    )
+                    self.compress_context.low_cpu_mem_usage = False
+                    self.compress_context.is_immediate_saving = False
             elif (
                 self.has_qlayer_outside_block
                 and getattr(self, "disable_opt_rtn", None)
@@ -1868,11 +2051,22 @@ class BaseOrchestrator(object):
                     "Keeping `low_cpu_mem_usage` enabled in RTN mode (iters=0): "
                     "RTN path uses blockwise quantization and supports per-block offloading."
                 )
-            elif self.has_qlayer_outside_block and not isinstance(self.quantize_config, RTNConfig):
+            elif (
+                self.has_qlayer_outside_block
+                and not isinstance(self.quantize_config, RTNConfig)
+                and not self.stream_quantization
+            ):
+                # Non-RTN quantizer (SignRound, iters>0) with quantized layers
+                # outside blocks: the legacy full-materialize path downgrades
+                # low_cpu_mem_usage. stream_quantization runs are exempt --
+                # they REQUIRE low_cpu_mem_usage for progressive shard writes
+                # (immediate saving); downgrading here would trip the
+                # streaming immediate-saving guard before the first block.
                 logger.warning(
                     "`low_cpu_mem_usage` is not fully supported "
-                    "when there are quantized layers outside blocks and optimized RTN is disabled. "
-                    "Setting low_cpu_mem_usage to False."
+                    "when there are quantized layers outside blocks and the quantizer is not "
+                    "RTN (SignRound tuning path). Setting low_cpu_mem_usage to False. "
+                    "(stream_quantization runs are exempt: they require it for progressive saving.)"
                 )
                 self.compress_context.low_cpu_mem_usage = False
                 self.compress_context.is_immediate_saving = False
@@ -1993,6 +2187,21 @@ class BaseOrchestrator(object):
                         original_block_name, reverted_block_name
                     )
 
+            if getattr(self.model_context, "processor", None) is not None:
+                kwargs.setdefault("processor", self.model_context.processor)
+            if getattr(self.model_context, "image_processor", None) is not None:
+                kwargs.setdefault("image_processor", self.model_context.image_processor)
+            missing = _hydrate_meta_from_checkpoint(
+                self.model_context.model,
+                getattr(self.model_context, "model_path", None),
+                amp_dtype=getattr(self, "amp_dtype", None),
+            )
+            if missing:
+                logger.warning(
+                    "%d tensor(s) remained meta at export (not in the checkpoint): %s",
+                    len(missing),
+                    missing[:10],
+                )
             compressed_model = format.save_quantized(
                 save_folder,
                 model=self.model_context.model,
@@ -2203,6 +2412,105 @@ class BaseOrchestrator(object):
             self._resume_states = None
 
         return model, folders
+
+
+def _hydrate_meta_from_checkpoint(model, ckpt_dir: str, amp_dtype: Optional[torch.dtype] = None) -> list[str]:
+    """Load still-meta tensors straight from the model checkpoint files.
+
+    Export reads the in-memory model. Some tensors (e.g. a vision tower in a
+    multimodal wrapper) are never materialized by the quantization paths -
+    the streaming skeleton leaves them meta and no pass-through covers them.
+    meta parameters cannot absorb ``copy_`` (it silently no-ops), so the
+    objects themselves are replaced on their parent modules. Returns the
+    names that could not be hydrated (absent from the checkpoint or unowned,
+    e.g. computed buffers).
+    """
+    import json
+    import os
+
+    from safetensors.torch import safe_open
+
+    from auto_round.utils.model import check_to_quantized
+
+    sd = model.state_dict()
+    meta_names = [n for n, t in sd.items() if t.device.type == "meta"]
+    if not meta_names or not ckpt_dir or not os.path.isdir(ckpt_dir):
+        return meta_names
+
+    index = os.path.join(ckpt_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index, encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+    else:
+        single = os.path.join(ckpt_dir, "model.safetensors")
+        if not os.path.exists(single):
+            return meta_names
+        with safe_open(single, framework="pt") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
+
+    # map every leaf tensor name to (parent module, kind, attribute name);
+    # state_dict aliases (tied weights) resolve to the same owner
+    owners: dict[str, tuple[torch.nn.Module, str, str]] = {}
+    for mod_name, mod in model.named_modules():
+        for leaf in mod._parameters:
+            owners[f"{mod_name}.{leaf}" if mod_name else leaf] = (mod, "param", leaf)
+        for leaf in mod._buffers:
+            owners[f"{mod_name}.{leaf}" if mod_name else leaf] = (mod, "buffer", leaf)
+
+    # never hydrate a quantized module's weight: its packed state already
+    # lives in the output shards and format packers skip meta modules for
+    # exactly this reason - making the weight real would re-enter the pack
+    # path without scale/zero-point
+    quantized_prefixes = tuple(
+        f"{mod_name}." for mod_name, mod in model.named_modules() if check_to_quantized(mod) and not any(mod.children())
+    )
+
+    missing, replaced = [], 0
+    renames_rev = {}
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type:
+        from auto_round.utils.checkpoint_streamer import reverse_name_map
+
+        renames_rev = reverse_name_map(model_type, weight_map)
+    # resolve first (owner + shard), then read one shard at a time: a vision
+    # tower spreads hundreds of tensors over a handful of shards, and
+    # reopening the same file per tensor re-parses its header every time
+    jobs = []
+    for n in meta_names:
+        if quantized_prefixes and n.startswith(quantized_prefixes):
+            # packed in shards already; packers must see it meta. These are
+            # also no "missing" tensors: their meta placeholders (packed
+            # attrs included) are the designed post-pack state.
+            continue
+        key = n if n in weight_map else renames_rev.get(n)
+        owner = owners.get(n)
+        if key is None or owner is None:
+            missing.append(n)
+            continue
+        jobs.append((weight_map[key], key, owner))
+    by_shard = {}
+    for shard, key, owner in jobs:
+        by_shard.setdefault(shard, []).append((key, owner))
+    # the run's amp dtype policy: every other streaming read path casts to it
+    # (CheckpointStreamer.load_dtype / the root pass-through); export-side
+    # hydration must not ship raw checkpoint precision beside policy-cast
+    # tensors (a bf16 checkpoint under an fp16 run exports a mixed model)
+    target_dtype = amp_dtype if isinstance(amp_dtype, torch.dtype) else None
+    for shard, entries in by_shard.items():
+        with safe_open(os.path.join(ckpt_dir, shard), framework="pt") as f:
+            for key, (mod, kind, leaf) in entries:
+                t = f.get_tensor(key)
+                if target_dtype is not None and t.is_floating_point() and t.dtype != target_dtype:
+                    t = t.to(target_dtype)
+                old = mod._parameters[leaf] if kind == "param" else mod._buffers[leaf]
+                if kind == "param":
+                    mod._parameters[leaf] = torch.nn.Parameter(t, requires_grad=bool(old.requires_grad))
+                else:
+                    mod._buffers[leaf] = t
+                replaced += 1
+    if replaced:
+        logger.info("hydrated %d meta tensor(s) from checkpoint for export", replaced)
+    return missing
 
 
 #: Backward-compatible alias — prefer ``BaseOrchestrator`` in new code.

@@ -35,6 +35,7 @@ This document presents step-by-step instructions for auto-round llm quantization
   + [Device/Multi-GPU setting in Quantization](#devicemulti-gpu-setting-in-quantization)
     - [Enable multiple gpus calibration in lm_head quantization](#enable-multiple-gpus-calibration-in-lm_head-quantization)
   + [Adjust Hyperparameters](#adjust-hyperparameters)
+  + [Streaming Quantization](#streaming-quantization)
   + [Rotation (Research)](#rotation-research)
 * [4 Inference](#4-inference)
   + [CPU](#cpu)
@@ -935,6 +936,8 @@ autoround.save_quantized(format="auto_awq", output_dir="tmp_autoround")
 - **Reduced CPU Memory Usage :**
     - Enable `low_cpu_mem_usage` (experimental): Only one export format is supported. The quantized model is saved immediately after each block is packed, reducing peak CPU memory usage.
 
+    - To avoid loading the model into memory entirely, see [Streaming Quantization](#streaming-quantization).
+
     - Trigger immediate packing: Packing will be triggered immediately when using the command-line interface or the
       quantize_and_save API, as long as only one export format is specified.
 
@@ -967,6 +970,35 @@ autoround.save_quantized(format="auto_awq", output_dir="tmp_autoround")
 
   Include the flag `--adam`. Note that AdamW is less effective than sign gradient descent in many scenarios we tested.
 
+
+### Streaming Quantization
+
+Experimental feature (validated on a limited set of models).
+
+`--stream_quantization` streams the model through quantization one decoder block at a time: each block is read from disk, materialized whole on one device, quantized, and written to its output shard. The checkpoint stays on disk throughout -- peak memory is roughly one decoder block plus calibration state, whatever the model size. Block placement is explicit, and the loop pipelines block loads, quantization, and packing across devices (see `--stream_prefetch`), slightly reducing total quantization time.
+
+`AR_DISK_STREAM_MODEL=1` and `--stream_quantization` both read decoder blocks from the checkpoint on demand, so the model needs room on disk rather than in memory -- in the default flow the weights are loaded into CPU RAM and GPU VRAM (spread over GPUs with `device_map`) and stay resident for the whole run. Between the two on-demand modes, the env path keeps the ordinary calibration flow with every quantizer available; placement is configured through `device_map`, which can also split a single block across GPUs, and some configurations write an additional offloaded source model copy on disk. `--stream_quantization` covers RTN/OptRTN and SignRound; block loads, tuning, and packing are pipelined across GPUs (`--stream_prefetch`, single block per GPU), with no offloaded copy.
+
+```bash
+auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantization --stream_prefetch auto
+```
+
+Long runs can be made crash-resumable: completed blocks are skipped and their already-written output shards are adopted as-is on restart (see [AR_RESUME_DIR](./environments.md#ar_resume_dir)).
+
+```bash
+AR_RESUME_DIR=/path/to/resume/state auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16"   --stream_quantization --stream_prefetch auto
+```
+
+Notes:
+
+- The model must be a local checkpoint directory; hub ids are not resolved -- download the model first.
+- Supported algorithms are RTN/OptRTN and SignRound (`iters > 0`). Other quantizers, rotation, `enable_lfq`, and diffusion pipelines are not yet supported under streaming and are rejected at startup with guidance. Export formats work as usual (`auto_round`, `auto_round:llm_compressor`, `auto_round:auto_gptq`, `auto_round:auto_awq`, `gguf:<qtype>`); for multimodal models the vision tower is exported unquantized.
+- `--stream_prefetch off|auto|on|cpu|<device>` (default `off`) stages the next block's weights on another GPU or host RAM while the current block is quantized, slightly reducing total time -- the finished block's pack and shard write also overlap with the next block's tuning.
+- MTP/nextn tensors are passed through unquantized unless a `layer_config` pin covers them; GGUF exports quantize them at the run's qtype like other body tensors. Pinning higher bits for the MTP layers (e.g. `".*mtp.*": {"bits": 8}`) gives a higher-quality draft head for speculative decoding.
+- GGUF runs spill per-block payloads to `gguf-blobs/` shards and assemble the final `.gguf` at save time -- expect about 2x the final model size on disk during the run; the shards are deleted after a successful assembly. Multimodal projectors are written to a separate `mmproj-model.gguf`.
+- AutoScheme needs one scoring run without `--stream_quantization` first: set `AR_AUTO_SCHEME_CACHE` and run once (e.g. with `AR_DISK_STREAM_MODEL=1`), then the streaming run resolves the cached scheme.
+- `--low_gpu_mem_usage` keeps the calibration rows in host RAM instead of on the block's home GPU (lower VRAM at some wall-clock cost).
+- Mutually exclusive with the `AR_DISK_STREAM_MODEL` environment variable (see [Environment Variables](./environments.md#ar_disk_stream_model)), which also avoids keeping the full model in memory but writes an additional offload copy (~1x model size) in configurations that cannot save per-block progressively (e.g. GGUF export or `--quant_lm_head` with tuning); streaming writes no such copy.
 
 ### Rotation (Research)
 

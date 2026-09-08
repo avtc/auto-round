@@ -16,8 +16,27 @@ AutoRound 通过 `envs.py` 模块提供统一的环境变量管理系统，支�
 - **有效值**：`"TRACE"`、`"DEBUG"`、`"INFO"`、`"WARNING"`、`"ERROR"`、`"CRITICAL"`
 - **用途**：通过设置该变量控制 AutoRound 的日志详细程度
 
+
 ```bash
 export AR_LOG_LEVEL=DEBUG
+```
+
+### AR_MEM_COUNTERS
+- **描述**：在流式循环中输出逐块 `[stream-mem]` 内存诊断：宿主内存 RSS 与逐 GPU 显存占用分布，并归因最大的内存区域/张量，同时给出峰值 RSS 归因。仅用于观察，不影响量化行为。
+- **默认值**：`false`
+- **用法**：设置该变量以观察流式量化的内存驻留与泄漏
+
+```bash
+export AR_MEM_COUNTERS=1
+```
+
+### AR_PERF_COUNTERS
+- **描述**：在流式循环中输出逐块 `[perf]` 计时（load、tune、pack、write、resume 快照）以及 GGUF blob 分片落盘耗时。仅用于观察。
+- **默认值**：`false`
+- **用法**：设置该项以观察流式耗时分布
+
+```bash
+export AR_PERF_COUNTERS=1
 ```
 
 ### AR_ENABLE_COMPILE_PACKING
@@ -211,6 +230,15 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 export AR_SCHEME_MEM_INVENTORY=1
 ```
 
+### AR_STREAM_BG_PACK
+
+- **类型**: 字符串（`auto` / `on` / `off`；`1`/`0` 为别名；默认 `auto`）
+- **描述**: 仅作用于流式量化。调优完成的 block 的打包与分片写出会在后台线程中执行，主循环同时调优下一个 block。`auto` 在受支持时自动启用；`1` 强制要求，不支持时立即报错；`0` 将打包串行化到主循环中。
+- **用途**: 排查打包问题或内存受限主机上不希望后台线程产生瞬态缓冲时设为 `0`。
+
+```bash
+export AR_STREAM_BG_PACK=0
+```
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **描述**：控制 `NVFP4E5M3QuantLinear` 是否在首次前向后缓存解量化得到的高精度权重，而不是每次调用都从打包的 FP4 权重重新解量化。
 - **默认值**：`False`（等价于 `"0"`）
@@ -229,6 +257,19 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 
 ```bash
 export AR_DISK_STREAM_MODEL=1
+```
+
+注意：`AR_DISK_STREAM_MODEL` 与 `--stream_quantization` 互斥——同时设置会在启动时报错。
+
+### AR_GGUF_MTP_ONLY
+- **描述**：仅用于 GGUF 导出。只导出 MTP/nextn 预测器张量，生成独立的 `mtp-*.gguf` draft 文件（丢弃主体解码器张量），用于多份主体量化共享同一 draft 的投机解码场景。`layer_config` pin 对 draft 张量同样生效（如 pin `".*mtp.*": {"bits": 8}`）。与 `AR_DISABLE_GGUF_MTP_EXPORT` 互斥。
+- **默认值**：`0`（关闭）
+- **有效值**：`0` / `1`
+- **用法**：先产出共享的 draft 文件，再用 `AR_DISABLE_GGUF_MTP_EXPORT=1` 生成纯主体量化。
+
+```bash
+AR_GGUF_MTP_ONLY=1 auto-round --model /path/to/Qwen3-Next --scheme "gguf:q8_0" ...
+AR_DISABLE_GGUF_MTP_EXPORT=1 auto-round --model /path/to/Qwen3-Next --scheme "gguf:q4_0" ...
 ```
 
 ### AR_ALLOW_W8_ASYM
@@ -250,6 +291,8 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 ```bash
 export AR_RESUME_DIR=/path/to/resume/state
 ```
+
+适用于流式（`--stream_quantization`）、`AR_DISK_STREAM_MODEL` 以及普通量化运行（普通路径需要 immediate saving 或 `low_cpu_mem_usage`，否则会给出警告）。Model-free 模式不支持断点续跑。
 
 ## 使用示例
 

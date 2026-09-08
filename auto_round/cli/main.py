@@ -81,12 +81,42 @@ def _build_entry_route_kwargs(args) -> dict:
     }
 
 
+def _parse_stream_prefetch(value):
+    """Parse the --stream_prefetch flag into its single-string form.
+
+    'off' (default) disables staging; 'auto' resolves one staging GPU (one
+    other GPU first; the quant device itself when it is the only GPU and the
+    next block fits its free VRAM; host RAM as a last resort); 'on' is the
+    same chain guaranteed enabled (host RAM at minimum); 'cpu' stages in
+    host RAM; a single device ('1' or 'cuda:1') stages on that device.
+    Lists are not accepted: lookahead is always one block, so more than one
+    additional device would only spread block VRAM around.
+    """
+    from auto_round.compressors.orchestrator import STREAM_PREFETCH_OFF
+
+    text = (value or "off").strip()
+    lowered = text.lower()
+    if lowered in STREAM_PREFETCH_OFF:
+        return "off"
+    if lowered in ("auto", "on", "cpu"):
+        return lowered
+    if "," in text:
+        raise ValueError(
+            "--stream_prefetch accepts a single staging device (e.g. '1' or 'cuda:1'), not a list: "
+            "lookahead is always one block, so extra devices would only spread block VRAM around"
+        )
+    return f"cuda:{lowered}" if lowered.isdigit() else lowered
+
+
 def _build_entry_compressor_kwargs(args) -> dict:
+    prefetch = _parse_stream_prefetch(getattr(args, "stream_prefetch", "off"))
     return {
         "scale_dtype": args.scale_dtype,
         "ignore_layers": args.ignore_layers,
         "quant_lm_head": args.quant_lm_head,
         "to_quant_block_names": args.to_quant_block_names,
+        "stream_quantization": getattr(args, "stream_quantization", False),
+        "stream_prefetch": prefetch,
     }
 
 
@@ -498,6 +528,7 @@ def _print_help(topic=None):
         return
     if topic == "eval":
         build_eval_parser(prog="auto_round eval").print_help()
+        return
         return
     build_root_parser().print_help()
 

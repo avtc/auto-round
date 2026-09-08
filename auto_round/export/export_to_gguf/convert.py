@@ -47,8 +47,13 @@ from transformers import AutoConfig
 
 from auto_round.export.export_to_gguf.config import ModelType
 from auto_round.export.export_to_gguf.gguf_dtype import GGUFDTypeSelector
-from auto_round.export.export_to_gguf.hf_checkpoint_restorer import HFCheckpointRestorer, RestoredTensor
+from auto_round.export.export_to_gguf.hf_checkpoint_restorer import (
+    HFCheckpointRestorer,
+    RestoredTensor,
+    iter_moe_fusion_views,
+)
 from auto_round.export.export_to_gguf.moe_adapter import (
+    moe_imatrix_required,
     pack_moe_output,
     resolve_moe_output,
     validate_moe_imatrices,
@@ -168,6 +173,25 @@ def _iter_extra_tensors(cls):
             for tensor_name in tensor_index["weight_map"]:
                 if is_extra_tensor(tensor_name):
                     extra_tensor[tensor_name] = get_tensor_from_file(dir_path, tensor_name)
+            # blob mode only: the streaming loop skips the compressed-tensors
+            # verbatim pass for unreferenced auxiliary safetensors (a family
+            # ships its multi-token-prediction weights as their own file, so
+            # the index never references them); the recorder path must read
+            # them here or the tensors silently vanish from the GGUF
+            from auto_round.export.export_to_gguf.blob_store import RecordingGgufWriter
+
+            if isinstance(getattr(cls, "gguf_writer", None), RecordingGgufWriter):
+                referenced = set(tensor_index["weight_map"].values())
+                for fname in sorted(os.listdir(dir_path)):
+                    if not fname.endswith(".safetensors") or fname in referenced:
+                        continue
+                    with safe_open(os.path.join(dir_path, fname), framework="pt") as aux:
+                        # eager per file (the extras consumer returns values
+                        # as-is); bounded by the aux file's size - typically a
+                        # single predictor block
+                        for tensor_name in list(aux.keys()):
+                            if is_extra_tensor(tensor_name) and tensor_name not in extra_tensor:
+                                extra_tensor[tensor_name] = aux.get_tensor(tensor_name)
         else:
             model_file = os.path.join(dir_path, "model.safetensors")
             if os.path.exists(model_file):
@@ -179,22 +203,91 @@ def _iter_extra_tensors(cls):
     yield from extra_tensor.items()
 
 
+def _mtp_block_count_(cls) -> int | None:
+    """Base decoder block count for MTP name remapping (instance-bound)."""
+    base = getattr(cls, "_original_block_count", None)
+    if base is not None:
+        return base
+    hparams = {**cls.hparams, **cls.hparams.get("text_config", {})}
+    base = next(
+        (hparams[k] for k in ("n_layers", "num_hidden_layers", "n_layer", "num_layers") if k in hparams),
+        None,
+    )
+    if base is None:
+        return None
+    # cache on the class: filter_tensors (checkpoint path) asserts the same attr
+    type(cls)._original_block_count = base
+    return base
+
+
+def _remap_mtp_checkpoint_name_(cls, name: str) -> str:
+    """Remap an ``mtp.*`` name to the layer-indexed nextn spelling (no-op otherwise).
+
+    Live-model path: the in-memory tree keeps the mtp.* module names while the
+    tensor map only knows the nextn spellings. Bound to the conversion
+    INSTANCE (its ``no_mtp`` flag), so the remap stays consistent with the
+    instance's extended block_count / tensor map.
+    """
+    if getattr(cls, "no_mtp", True) or not name.startswith(("mtp.", "model.mtp.")):
+        return name
+    remap = getattr(cls, "_remap_mtp_name_", None)
+    if remap is None:
+        return name
+    base = _mtp_block_count_(cls)
+    if base is None:
+        logger.warning("%s: cannot remap MTP tensors without a block count; keeping %s", cls, name)
+        return name
+    return remap(name, base)
+
+
 def get_restored_tensors(cls) -> Iterator[RestoredTensor]:
     written_hf_names = getattr(cls, "_gguf_written_hf_names", set())
     written_checkpoint_names = getattr(cls, "_gguf_written_checkpoint_names", set())
+    if getattr(cls, "mtp_only", False):
+        # The mtp-only draft container intentionally filters body payloads
+        # out, but their modules were still streamed, quantized, and parked
+        # by the block loop. Mark every non-MTP name as already completed so
+        # the restorer skips body (re)fusion instead of demanding sources
+        # that were freed after packing.
+        draft_keep = {
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "embed_tokens.weight",
+            "norm.weight",
+        }
+
+        def _draft_relevant(name: str) -> bool:
+            stripped = name.removeprefix("model.")
+            return name in draft_keep or stripped in draft_keep or stripped.startswith("mtp.")
+
+        seed = {n for n in cls.model.state_dict() if not _draft_relevant(n)}
+        for view in iter_moe_fusion_views(cls.model):
+            sources = [n for s in view.sources for n in s.hf_names]
+            if not any(_draft_relevant(n) for n in sources):
+                seed.update(sources)
+        written_hf_names = set(written_hf_names) | seed
     cls.model.tensor_name_list = list(written_hf_names | written_checkpoint_names)
+
+    def _remap_name(name: str) -> str:
+        return _remap_mtp_checkpoint_name_(cls, name)
 
     pending_checkpoint_tensors = {}
     for restored in HFCheckpointRestorer(cls.model, completed_hf_names=written_hf_names).iter_tensors():
         tensor = restored.tensor_fn()
+        checkpoint_name = _remap_name(restored.checkpoint_name)
+        # hf_names deliberately keep the real module spellings (mtp.*):
+        # layer_config pins and get_module attribute lookups key on them
         if tensor is None or tensor.numel() == 0:
-            pending_checkpoint_tensors[restored.checkpoint_name] = restored
+            pending_checkpoint_tensors[checkpoint_name] = RestoredTensor(
+                checkpoint_name, restored.tensor_fn, restored.hf_names, restored.transform_kind, restored.moe_sources
+            )
             continue
-        for tensor_name in (restored.checkpoint_name, *restored.hf_names):
+        for tensor_name in (checkpoint_name, *restored.hf_names):
             if tensor_name not in cls.model.tensor_name_list:
                 cls.model.tensor_name_list.append(tensor_name)
         yield RestoredTensor(
-            restored.checkpoint_name,
+            checkpoint_name,
             lambda tensor=tensor: tensor,
             restored.hf_names,
             restored.transform_kind,
@@ -227,7 +320,16 @@ _MOE_EXP_SUFFIX_TO_HF_WNAME = {
 
 
 def _quant_data_with_args(
-    data_torch, data_qtype, scale, zp, d_scale=None, wmin=None, d_wmin=None, imatrix=None, device=None
+    data_torch,
+    data_qtype,
+    scale,
+    zp,
+    d_scale=None,
+    wmin=None,
+    d_wmin=None,
+    imatrix=None,
+    device=None,
+    source_dtype=None,
 ):
     device = data_torch.device if device is None else device
     data_torch = data_torch.to(torch.float32)
@@ -449,7 +551,18 @@ def _validate_quant_attr_shapes(data_torch, data_qtype, kwargs, name, new_name):
             )
 
 
-def _quant_data(cls, data_torch, data_qtype, name, modify_name, new_name, bid, device=None, use_layer_attrs=True):
+def _quant_data(
+    cls,
+    data_torch,
+    data_qtype,
+    name,
+    modify_name,
+    new_name,
+    bid,
+    device=None,
+    use_layer_attrs=True,
+    source_dtype=None,
+):
     """
 
     Args:
@@ -471,7 +584,13 @@ def _quant_data(cls, data_torch, data_qtype, name, modify_name, new_name, bid, d
         layer_name = name
     module = get_module(cls.model, layer_name)
     kwargs = {"scale": None, "zp": None, "d_scale": None, "d_wmin": None, "wmin": None, "imatrix": None}
-    source_qtype = get_qtype_by_layer_config(cls.layer_config, name, data_qtype, explicit_only=True)
+    source_qtype = get_qtype_by_layer_config(
+        cls.layer_config,
+        name,
+        data_qtype,
+        explicit_only=True,
+        source_dtype=source_dtype if source_dtype is not None else data_torch.dtype,
+    )
     if use_layer_attrs:
         compatible_stored_qtype = source_qtype == data_qtype
         kwargs = {
@@ -532,7 +651,7 @@ def _pack_spec_moe_output(cls, data_torch, data_qtype, moe_output, modify_name, 
     return pack_moe_output(data_torch, data_qtype, moe_output, quantize_expert, context=context)
 
 
-def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=False):
+def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=False, source_dtype=None):
     name = name[: -len(".weight")]
     if name not in layer_config and name.endswith("embed_tokens"):
         embedding_names = [key for key in layer_config if key.endswith("embed_tokens")]
@@ -543,9 +662,33 @@ def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=F
         if len(embedding_names) == 1:
             name = embedding_names[0]
     if name not in layer_config:
-        return None if explicit_only else data_qtype
+        # regex fallback: pins like '.*mtp.*' match nothing at resolution time
+        # when their modules materialize later (checkpoint-only predictor trees
+        # in streaming runs); the resolver retains such entries as literal
+        # regex keys, so match them here
+        import re
+
+        from auto_round.utils.common import to_standard_regex
+
+        for key, val in layer_config.items():
+            if not isinstance(key, str) or not any(ch in key for ch in (".*", "[", "\\")):
+                continue
+            if re.search(to_standard_regex(key), name):
+                layer_config = {**layer_config, name: val}
+                break
+        else:
+            return None if explicit_only else data_qtype
     if layer_config[name]["bits"] >= 16:
-        return data_qtype
+        # a 16-bit (float) pin means "leave this tensor unquantized": honor
+        # it instead of applying the file-type default, in the float type
+        # that is exact for the source (bf16 -> BF16, fp16 -> F16, fp32 ->
+        # F32). The precision-rank rule then keeps it over every quantized
+        # fallback.
+        if source_dtype == torch.bfloat16:
+            return gguf.GGMLQuantizationType.BF16
+        if source_dtype == torch.float32:
+            return gguf.GGMLQuantizationType.F32
+        return gguf.GGMLQuantizationType.F16
     bits = layer_config[name].get("bits")
     super_bits = layer_config[name].get("super_bits")
     sym = layer_config[name].get("sym")
@@ -629,7 +772,14 @@ def _should_keep_recipe_qtype(layer_config_qtype, fallback_qtype, allow_recipe_f
     """Keep llama.cpp fixed-format recipe upgrades unless AutoScheme owns dtype selection."""
     if not allow_recipe_fallback or layer_config_qtype is None:
         return False
-    return _qtype_precision_rank(fallback_qtype) > _qtype_precision_rank(layer_config_qtype)
+    if _qtype_precision_rank(fallback_qtype) <= _qtype_precision_rank(layer_config_qtype):
+        return False
+    # a float pin storing the SOURCE-EXACT float type is not a precision
+    # downgrade: F32-over-BF16 is a lossless upcast of already-bf16 data
+    # (2x the bytes for nothing); the pin must win over a float fallback
+    if _qtype_precision_rank(layer_config_qtype) >= 16 and _qtype_precision_rank(fallback_qtype) >= 16:
+        return False
+    return True
 
 
 def resolve_restored_qtype(
@@ -640,9 +790,11 @@ def resolve_restored_qtype(
     fallback_qtype,
     diagnostics,
     allow_recipe_fallback=False,
+    source_dtype=None,
 ):
     source_qtypes = [
-        get_qtype_by_layer_config(layer_config, hf_name, fallback_qtype, explicit_only=True) for hf_name in hf_names
+        get_qtype_by_layer_config(layer_config, hf_name, fallback_qtype, explicit_only=True, source_dtype=source_dtype)
+        for hf_name in hf_names
     ]
     matched_qtypes = [qtype for qtype in source_qtypes if qtype is not None]
 
@@ -819,7 +971,14 @@ def prepare_tensors(cls):
         ):
             continue
         if hasattr(cls, "current_packing_block") and cls.current_packing_block is not None:  # pylint: disable=E1101
-            current_packing_block_split = cls.current_packing_block.split(".")  # pylint: disable=E1101
+            # remap an mtp-spelled block name the same way tensor names are
+            # remapped, so quantized MTP blocks pack per-block like ordinary
+            # blocks instead of slipping to the (too late) save-time pass
+            # the remap works on tensor names; give the bare module prefix a
+            # tensor-style tail and strip it again after remapping
+            current_packing_block_split = _remap_mtp_checkpoint_name_(
+                cls, cls.current_packing_block + ".weight"  # pylint: disable=E1101
+            )[: -len(".weight")].split(".")
             name_split = name.split(".")
             if (
                 len(name_split) < len(current_packing_block_split)
@@ -828,6 +987,12 @@ def prepare_tensors(cls):
                 continue
         data_torch = restored.tensor_fn()
         if data_torch is None or data_torch.numel() == 0:
+            continue
+        if data_torch.device.type == "meta":
+            # streaming runs park already-packed blocks on the meta device;
+            # their ggml payloads are durably in the blob shards, and the
+            # interactive path never sees meta tensors, so skipping here is a
+            # no-op for it
             continue
         # we don't need these
         if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
@@ -845,9 +1010,13 @@ def prepare_tensors(cls):
         if data_torch.dtype not in (torch.float16, torch.float32):
             data_torch = data_torch.to(torch.float32)
 
-        # use the first number-like part of the tensor name as the block id
+        # use the first number-like part of the tensor name as the block id.
+        # Derive it from the FILTERED name: MTP/nextn restore remaps
+        # ``mtp.layers.0.*`` to ``model.layers.{base}.*`` and the MoE expert
+        # stash/merge in modify_tensors builds its lookup names from this id -
+        # a stale pre-remap id would stash and merge under different layers
         bid = None
-        for part in name.split("."):
+        for part in checkpoint_name.split("."):
             if part.isdecimal():
                 bid = int(part)
                 break
@@ -937,7 +1106,7 @@ def prepare_tensors(cls):
                 )
                 if moe_output is not None:
                     layer_config_names = moe_output.hf_names
-                    validate_moe_source_qtypes(
+                    moe_qtype = validate_moe_source_qtypes(
                         layer_config_names,
                         fallback_qtype,
                         lambda source_name: get_qtype_by_layer_config(
@@ -945,11 +1114,12 @@ def prepare_tensors(cls):
                         ),
                         f"{checkpoint_name} -> {new_name}",
                     )
-                    validate_moe_imatrices(
-                        layer_config_names,
-                        lambda source_name: get_module(cls.model, source_name.removesuffix(".weight")),
-                        f"{checkpoint_name} -> {new_name}",
-                    )
+                    if moe_imatrix_required(moe_qtype):
+                        validate_moe_imatrices(
+                            layer_config_names,
+                            lambda source_name: get_module(cls.model, source_name.removesuffix(".weight")),
+                            f"{checkpoint_name} -> {new_name}",
+                        )
                 else:
                     # Native fused tensors without source metadata retain the legacy name heuristic.
                     layer_config_names = tuple(get_moe_name(cls, source_name, new_name) for source_name in hf_names)
@@ -965,6 +1135,10 @@ def prepare_tensors(cls):
                         else []
                     ),
                     allow_recipe_fallback=not getattr(cls, "is_auto_scheme", False),
+                    # the ORIGINAL source dtype, before the walk's bf16->fp32
+                    # upcast: a float pin must store the type that is exact
+                    # for the checkpoint source (bf16 -> BF16, not F32)
+                    source_dtype=old_dtype,
                 )
                 # # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if layer_config_qtype is not None:
@@ -1095,7 +1269,9 @@ def prepare_tensors(cls):
                     # by lora-rank) would no longer apply to the right axis and must be dropped too.
                     imatrix = getattr(module, "imatrix", None)
                     attr_list["imatrix"] = imatrix if (not is_k_b and isinstance(imatrix, torch.Tensor)) else None
-                    data = _quant_data_with_args(data_torch, data_qtype, device=device, **attr_list)
+                    data = _quant_data_with_args(
+                        data_torch, data_qtype, device=device, source_dtype=old_dtype, **attr_list
+                    )
 
                 # for MOE model
                 # Spec-backed models must not enter this native-fused fallback.
@@ -1136,6 +1312,7 @@ def prepare_tensors(cls):
                         new_name,
                         bid,
                         device=device,
+                        source_dtype=old_dtype,
                         use_layer_attrs=len(hf_names) == 1,
                     )
 

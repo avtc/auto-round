@@ -19,11 +19,14 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     AR_LOG_LEVEL: str = "INFO"
+    AR_PERF_COUNTERS: bool = False
+    AR_MEM_COUNTERS: bool = False
     AR_USE_MODELSCOPE: bool = "False"
     AR_MODEL_FREE_SHARD_PARALLELISM: Optional[int] = None
     AUTO_ROUND_CACHE: Optional[str] = None
     AUTO_ROUND_GGUF_AUTO_UPDATE: bool = False
     AR_DISABLE_GGUF_MTP_EXPORT: bool = False
+    AR_GGUF_MTP_ONLY: bool = False
     LLAMA_CPP_ROOT: Optional[str] = None
     AR_AUTO_SCHEME_NSAMPLES: Optional[int] = None
     AR_AUTO_SCHEME_BATCH_SIZE: Optional[int] = None
@@ -37,6 +40,15 @@ if TYPE_CHECKING:
     AR_FORCE_MOE_ROUTING_ALL_EXPERTS: bool = False
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
     AR_ALLOW_W8_ASYM: bool = False
+
+
+def _get_choice_env(name: str, default: str, choices, aliases=None) -> str:
+    """Read an env var that must be one of a fixed choice set (case-insensitive)."""
+    raw = os.getenv(name, default).strip().lower()
+    raw = (aliases or {}).get(raw, raw)
+    if raw not in choices:
+        raise ValueError(f"{name} must be one of {sorted(choices)}, got {raw!r}")
+    return raw
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -57,6 +69,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this is used for configuring the default logging level
     "AR_LOG_LEVEL": lambda: os.getenv("AR_LOG_LEVEL", "INFO").upper(),
     "AR_ENABLE_COMPILE_PACKING": lambda: os.getenv("AR_ENABLE_COMPILE_PACKING", "0").lower() in ("1", "true", "yes"),
+    "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "0").lower() in ("1", "true", "yes"),
+    "AR_MEM_COUNTERS": lambda: os.getenv("AR_MEM_COUNTERS", "0").lower() in ("1", "true", "yes"),
     "AR_USE_MODELSCOPE": lambda: os.getenv("AR_USE_MODELSCOPE", "False").lower() in ["1", "true"],
     "AR_WORK_SPACE": lambda: os.getenv("AR_WORK_SPACE", "ar_work_space").lower(),
     "AR_ENABLE_UNIFY_MOE_INPUT_SCALE": lambda: os.getenv("AR_ENABLE_UNIFY_MOE_INPUT_SCALE", "False").lower()
@@ -81,12 +95,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_SEARCH_SCALE_RATIO": lambda: (
         float(os.getenv("AR_SEARCH_SCALE_RATIO")) if os.getenv("AR_SEARCH_SCALE_RATIO") is not None else None
     ),
-    # Minimum value to which torch._dynamo cache_size_limit /
-    # accumulated_cache_size_limit / recompile_limit are bumped when
-    # ``enable_torch_compile`` is used. The default of 16 is enough to cover
-    # all distinct linear-weight shapes inside one transformer block (q/k/v/
-    # o_proj, gate/up/down_proj, ...) so that per-layer static recompiles do
-    # not exceed dynamo's default limit (8) and fall back to eager.
+    # Streaming loop: background pack pipeline. "auto" (default) enables it
+    # whenever eligible (streaming with >=2 staging devices + immediate
+    # packing); "1" requires it and fails loudly when ineligible; "0"
+    # serializes the pack into the main loop.
+    "AR_STREAM_BG_PACK": lambda: _get_choice_env(
+        "AR_STREAM_BG_PACK", "auto", ("auto", "on", "off"), {"1": "on", "0": "off"}
+    ),
+    # torch.compile cache size cap (recompile_limit); streaming block shapes
+    # vary, a higher cap avoids spurious eager fallbacks.
     "AR_DYNAMO_CACHE_SIZE_LIMIT": lambda: int(os.getenv("AR_DYNAMO_CACHE_SIZE_LIMIT", "16")),
     "AR_MODEL_FREE_SHARD_PARALLELISM": lambda: _get_optional_positive_int_env("AR_MODEL_FREE_SHARD_PARALLELISM"),
     "AUTO_ROUND_CACHE": lambda: os.getenv("AUTO_ROUND_CACHE", None),
@@ -94,6 +111,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     in ("1", "true", "yes", "on"),
     "AR_DISABLE_GGUF_MTP_EXPORT": lambda: os.getenv("AR_DISABLE_GGUF_MTP_EXPORT", "0").lower()
     in ("1", "true", "yes", "on"),
+    "AR_GGUF_MTP_ONLY": lambda: os.getenv("AR_GGUF_MTP_ONLY", "0").lower() in ("1", "true", "yes"),
     "LLAMA_CPP_ROOT": lambda: os.getenv("LLAMA_CPP_ROOT", None),
     # Controls the default number of calibration samples used by AutoScheme scoring
     # when ``AutoScheme.nsamples`` is not explicitly set.

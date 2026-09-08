@@ -15,6 +15,7 @@
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from auto_round.compressors.shard_writer import ShardWriter
@@ -197,3 +198,154 @@ def test_oversized_tensor_does_not_leave_tiny_preceding_shard(tmp_path, monkeypa
 
     assert writer.shard_counter == 1
     assert set(writer.current_shard_tensors) == set()
+
+
+class TestAdoptExistingShards:
+    """Resume support: a fresh writer must adopt shards a crashed run already wrote.
+
+    Without adoption the resumed writer starts at shard_counter=0 and its first
+    flush silently overwrites model-shard-00001.safetensors, destroying the
+    crashed run's tensors and dropping them from the final index.
+    """
+
+    def _writer(self, output_dir, monkeypatch):
+        ShardWriter.reset()
+        compress_context = SimpleNamespace(formats=[_FormatStub()], output_dir=output_dir)
+        model_context = SimpleNamespace(is_diffusion=False)
+        monkeypatch.setattr(CompressContext, "get_context", classmethod(lambda cls: compress_context))
+        monkeypatch.setattr(ModelContext, "get_context", classmethod(lambda cls: model_context))
+        return ShardWriter(torch.nn.Module(), bits=4, max_shard_size="1MB", safe_serialization=True)
+
+    def test_adopt_continues_numbering_and_index_covers_all(self, tmp_path, monkeypatch):
+        from safetensors.torch import load_file
+
+        out = str(tmp_path)
+        t0 = torch.randn(4, 4)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", t0)
+        w1._flush_shard()
+        # crash: no finalize, singleton reset
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 1
+        assert "blk.0.w" in w2._all_saved
+        assert w2.shard_counter == 1
+        t1 = torch.randn(4, 4)
+        w2.save_tensor("blk.1.w", t1)
+        w2.finalize()
+
+        import json
+
+        index = json.loads(open(os.path.join(out, "model.safetensors.index.json"), encoding="utf-8").read())
+        assert index["metadata"]["total_shards"] == 2
+        assert "blk.0.w" in index["weight_map"]
+        assert "blk.1.w" in index["weight_map"]
+        # the crashed run's shard must survive byte-identical (no overwrite)
+        shard0 = os.path.join(out, "model-00001-of-00002.safetensors")
+        assert torch.equal(load_file(shard0)["blk.0.w"], t0)
+        shard1 = os.path.join(out, "model-00002-of-00002.safetensors")
+        assert torch.equal(load_file(shard1)["blk.1.w"], t1)
+
+    def test_adopt_deletes_incomplete_tail_shard(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", torch.randn(4, 4))
+        w1._flush_shard()
+        w1.save_tensor("blk.1.w", torch.randn(4, 4))
+        w1._flush_shard()
+        # crash mid-flush of a third shard: truncated file on disk
+        tail = os.path.join(out, "model-shard-00003.safetensors")
+        with open(tail, "wb") as f:
+            f.write(b"\x00" * 17)  # header length + partial json
+
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 2
+        assert not os.path.exists(tail), "incomplete tail shard must be deleted"
+        assert w2.shard_counter == 2
+
+    def test_adopt_deletes_truncated_data_tail_shard(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", torch.randn(4, 4))
+        w1._flush_shard()
+        # crash AFTER the header flushed but DURING the data write: the tail
+        # shard parses as valid safetensors but its declared data is truncated
+        import struct as _struct
+
+        from safetensors.torch import save_file
+
+        full = os.path.join(out, "model-shard-00002.safetensors")
+        save_file({"blk.1.w": torch.randn(8, 8)}, full)
+        with open(full, "r+b") as f:
+            header_len = _struct.unpack("<Q", f.read(8))[0]
+            f.truncate(8 + header_len + 16)  # cut inside the tensor data
+
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 1
+        assert not os.path.exists(full), "header-valid but truncated tail shard must be deleted"
+        # counter = max adopted index; the next flush continues after it
+        assert w2.shard_counter == 1
+
+    def test_adopt_raises_on_corrupt_non_tail_shard(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        w1 = self._writer(out, monkeypatch)
+        w1.save_tensor("blk.0.w", torch.randn(4, 4))
+        w1._flush_shard()
+        w1.save_tensor("blk.1.w", torch.randn(4, 4))
+        w1._flush_shard()
+        # corrupt the FIRST shard (not the tail): real corruption
+        with open(os.path.join(out, "model-shard-00001.safetensors"), "r+b") as f:
+            f.write(b"\xff\xff\xff\xff\xff\xff\xff\xff")
+
+        w2 = self._writer(out, monkeypatch)
+        with pytest.raises(RuntimeError, match="corrupt"):
+            w2.adopt_existing_shards()
+
+    def test_adopt_refuses_bin_shards(self, tmp_path, monkeypatch):
+        out = str(tmp_path)
+        with open(os.path.join(out, "model-shard-00001.bin"), "wb") as f:
+            f.write(b"junk")
+        w = self._writer(out, monkeypatch)
+        with pytest.raises(RuntimeError, match="safetensors"):
+            w.adopt_existing_shards()
+
+    def test_adopt_temp_and_final_same_ordinal_keeps_temp(self, tmp_path, monkeypatch):
+        """A reused output dir can hold a stale finalized shard from a previous
+        lineage next to the current lineage's temp shard at the same ordinal:
+        the temp (resumable artifact) must win regardless of listdir order and
+        the stale final must be named, not silently dropped."""
+        from safetensors.torch import load_file, save_file
+
+        out = str(tmp_path)
+        stale = torch.randn(4, 4) + 100.0
+        save_file({"stale.w": stale}, os.path.join(out, "model-00001-of-00009.safetensors"))
+        w1 = self._writer(out, monkeypatch)
+        t0 = torch.randn(4, 4)
+        w1.save_tensor("blk.0.w", t0)
+        w1._flush_shard()  # leaves model-shard-00001.safetensors
+        w2 = self._writer(out, monkeypatch)
+        adopted = w2.adopt_existing_shards()
+        assert adopted == 1
+        assert "blk.0.w" in w2._all_saved
+        assert "stale.w" not in w2._all_saved
+        t1 = torch.randn(4, 4)
+        w2.save_tensor("blk.1.w", t1)
+        w2.finalize()
+        import json
+
+        index = json.loads(open(os.path.join(out, "model.safetensors.index.json"), encoding="utf-8").read())
+        assert "blk.0.w" in index["weight_map"] and "blk.1.w" in index["weight_map"]
+        assert "stale.w" not in index["weight_map"]
+        assert torch.equal(load_file(os.path.join(out, "model-00001-of-00002.safetensors"))["blk.0.w"], t0)
+
+    def test_add_tensor_dedups_across_conversion_spellings(self, tmp_path, monkeypatch):
+        """The duplicate guard normalizes to the checkpoint-side spelling first:
+        a renamed-family tensor offered under both spellings is written once."""
+        w = self._writer(str(tmp_path), monkeypatch)
+        w.reverse_checkpoint_conversion_mapping = {"mlp.gate": "mlp.router.gate"}
+        t = torch.randn(4, 4)
+        w.save_tensor("model.layers.0.mlp.router.gate.weight", t)  # checkpoint-side
+        w.save_tensor("model.layers.0.mlp.gate.weight", t.clone())  # module-side alias
+        assert w.total_param_elems == t.numel(), "the aliased spelling was written a second time"

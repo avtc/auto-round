@@ -20,6 +20,24 @@ AutoRound uses a centralized environment variable management system through the 
 export AR_LOG_LEVEL=DEBUG
 ```
 
+### AR_MEM_COUNTERS
+- **Description**: Emit per-block `[stream-mem]` memory diagnostics in the streaming loop: host RSS and per-GPU allocation breakdown with attribution of the largest regions/tensors, plus peak-RSS attribution. Informational only; does not change quantization behavior.
+- **Default**: `false`
+- **Usage**: Set this to observe streaming memory residency and leaks
+
+```bash
+export AR_MEM_COUNTERS=1
+```
+
+### AR_PERF_COUNTERS
+- **Description**: Emit per-block `[perf]` timing lines in the streaming loop (load, tune, pack, write, resume snapshot) and the GGUF blob-shard flush cost. Informational only.
+- **Default**: `false`
+- **Usage**: Set this to observe where streaming wall time goes
+
+```bash
+export AR_PERF_COUNTERS=1
+```
+
 ### AR_ENABLE_COMPILE_PACKING
 - **Description**: Enables compile packing optimization
 - **Default**: `False` (equivalent to `"0"`)
@@ -211,6 +229,15 @@ export AR_ENABLE_AUTO_SCHEME_PARALLEL=0
 export AR_SCHEME_MEM_INVENTORY=1
 ```
 
+### AR_STREAM_BG_PACK
+
+- **Type**: str (`auto` / `on` / `off`; `1`/`0` aliases; default `auto`)
+- **Description**: Streaming-quantization only. Runs the finished block's pack + shard write in a background thread while the loop tunes the next block. `auto` enables it whenever supported; `1` requires it and fails loudly when unsupported; `0` serializes packing into the main loop.
+- **Usage**: Set to `0` when diagnosing packing issues or on memory-constrained hosts where the worker's transient buffers are unwanted.
+
+```bash
+export AR_STREAM_BG_PACK=0
+```
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **Description**: Controls whether `NVFP4E5M3QuantLinear` caches a dequantized high-precision weight after the first forward pass, instead of dequantizing the packed FP4 weight on every call.
 - **Default**: `False` (equivalent to `"0"`)
@@ -229,6 +256,19 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 
 ```bash
 export AR_DISK_STREAM_MODEL=1
+```
+
+Note: `AR_DISK_STREAM_MODEL` and `--stream_quantization` are mutually exclusive -- setting both raises an error at startup.
+
+### AR_GGUF_MTP_ONLY
+- **Description**: GGUF export only. Exports only the MTP/nextn predictor tensors as a separate `mtp-*.gguf` draft file (body decoder tensors are dropped), for speculative-decoding setups where several body quantizations share one draft. `layer_config` pins still apply to the draft tensors (e.g. pin `".*mtp.*": {"bits": 8}`). Mutually exclusive with `AR_DISABLE_GGUF_MTP_EXPORT`.
+- **Default**: `0` (disabled)
+- **Valid Values**: `0` / `1`
+- **Usage**: Produce the shared draft file once, then body-only quantizations with `AR_DISABLE_GGUF_MTP_EXPORT=1`.
+
+```bash
+AR_GGUF_MTP_ONLY=1 auto-round --model /path/to/Qwen3-Next --scheme "gguf:q8_0" ...
+AR_DISABLE_GGUF_MTP_EXPORT=1 auto-round --model /path/to/Qwen3-Next --scheme "gguf:q4_0" ...
 ```
 
 ### AR_ALLOW_W8_ASYM
@@ -250,6 +290,8 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 ```bash
 export AR_RESUME_DIR=/path/to/resume/state
 ```
+
+Applies to streaming (`--stream_quantization`), `AR_DISK_STREAM_MODEL`, and ordinary quantization runs (the latter needs immediate saving or `low_cpu_mem_usage`; a warning is logged otherwise). Model-free runs are not resumable.
 
 ## Usage Examples
 

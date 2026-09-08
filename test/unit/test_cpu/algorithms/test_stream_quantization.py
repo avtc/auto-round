@@ -1,0 +1,2664 @@
+# Copyright (c) 2026 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for stream_quantization: meta-device model + per-block tensor streaming."""
+
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+
+def _make_sharded_checkpoint(tmpdir, tensors_by_shard):
+    """Write safetensors shards + index; returns the directory path."""
+    weight_map = {}
+    for i, (shard_name, tensors) in enumerate(tensors_by_shard.items()):
+        save_file(tensors, os.path.join(tmpdir, shard_name), metadata={"format": "pt"})
+        for k in tensors:
+            weight_map[k] = shard_name
+    with open(os.path.join(tmpdir, "model.safetensors.index.json"), "w") as f:
+        json.dump({"weight_map": weight_map}, f)
+    return str(tmpdir)
+
+
+class TestCheckpointStreamer:
+    def test_fetch_and_load_module(self, tmp_path):
+        torch.manual_seed(0)
+        a = torch.randn(4, 8)
+        b = torch.randn(4, 4)
+        c = torch.randn(8, 2)
+        path = _make_sharded_checkpoint(
+            tmp_path,
+            {
+                "model-00001-of-00002.safetensors": {"blk.a.weight": a, "blk.b.weight": b},
+                "model-00002-of-00002.safetensors": {"blk.c.weight": c},
+            },
+        )
+        streamer = CheckpointStreamer(path)
+        assert set(streamer.tensor_names) == {"blk.a.weight", "blk.b.weight", "blk.c.weight"}
+        assert streamer.names_under("blk") == ["blk.a.weight", "blk.b.weight", "blk.c.weight"]
+        assert streamer.names_under("blk.a") == ["blk.a.weight"]
+        assert torch.equal(streamer.fetch("blk.c.weight"), c)
+
+        import torch.nn as nn
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 4, bias=False)
+                self.b = nn.Linear(4, 4, bias=False)
+                self.c = nn.Linear(2, 8, bias=False)
+
+        with torch.device("meta"):
+            blk = Blk()
+        loaded = streamer.load_module_(blk, "blk")
+        assert set(loaded) == {"blk.a.weight", "blk.b.weight", "blk.c.weight"}
+        assert torch.equal(blk.a.weight.data, a) and blk.a.weight.device.type == "cpu"
+
+    def test_single_file_checkpoint(self, tmp_path):
+        t = {"x.weight": torch.ones(2, 2)}
+        save_file(t, os.path.join(tmp_path, "model.safetensors"), metadata={"format": "pt"})
+        streamer = CheckpointStreamer(str(tmp_path))
+        assert torch.equal(streamer.fetch("x.weight"), t["x.weight"])
+
+    def test_prefetch_stages_to_devices(self, tmp_path):
+        """With stage_devices the reader lands each prefix on its assigned
+        device (round-robin by prefix index) and fetch() moves tensors back to
+        whatever device the consumer asks for."""
+        torch.manual_seed(4)
+        tensors = {f"b{i}.w.weight": torch.randn(3, 3) for i in range(4)}
+        shards = {f"model-{i:05d}.safetensors": {f"b{i}.w.weight": tensors[f"b{i}.w.weight"]} for i in range(4)}
+        path = _make_sharded_checkpoint(tmp_path, shards)
+        stage = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=4, stage_devices=[stage])
+        try:
+            deadline = time.monotonic() + 10.0
+            while (
+                len(streamer._prefetch_staged) < 4 and streamer.prefetch_error() is None and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            assert len(streamer._prefetch_staged) == 4, streamer._prefetch_staged
+            for name in list(streamer._prefetch_cache):
+                assert streamer._prefetch_cache[name].device == stage
+            # consumer on a different device gets a move, not an error
+            target = torch.device("cpu") if stage.type == "cuda" else None
+            for name, ref in tensors.items():
+                got = streamer.fetch(name, device=target)
+                assert got.device == (target or stage)
+                assert torch.equal(got.to("cpu"), ref)
+        finally:
+            streamer.stop_prefetch()
+
+    def test_prefetch_invalid_stage_device_raises(self, tmp_path):
+        """Meta staging devices are rejected eagerly: staging to meta would
+        silently produce empty tensors instead of an error."""
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
+        streamer = CheckpointStreamer(path)
+        with pytest.raises(ValueError, match="meta"):
+            streamer.start_prefetch(["m"], depth=1, stage_devices=[torch.device("meta")])
+        # no reader thread left behind
+        assert streamer._prefetch_thread is None
+
+    def test_load_module_device_and_errors(self, tmp_path):
+        torch.manual_seed(1)
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(3, 3)}})
+        streamer = CheckpointStreamer(path)
+        import torch.nn as nn
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Linear(3, 3, bias=False)
+
+        with torch.device("meta"):
+            m = M()
+        streamer.load_module_(m, "m")
+        with pytest.raises(ValueError):  # nothing matches
+            streamer.load_module_(m, "nonexistent.prefix")
+        with pytest.raises(KeyError):
+            streamer.fetch("not.a.tensor")
+
+        class Wrong(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Linear(4, 4, bias=False)
+
+        with torch.device("meta"):
+            wrong = Wrong()
+        streamer2 = CheckpointStreamer(path)
+        with pytest.raises(ValueError):  # shape mismatch
+            streamer2.load_module_(wrong, "m")
+
+    def test_prefetch_serves_cached_tensors(self, tmp_path):
+        """Prefetched tensors are served from the host-RAM cache and match disk."""
+        torch.manual_seed(2)
+        tensors = {
+            "blk.a.weight": torch.randn(4, 8),
+            "blk.b.weight": torch.randn(4, 4),
+            "blk.c.weight": torch.randn(8, 2),
+        }
+        path = _make_sharded_checkpoint(
+            tmp_path,
+            {
+                "model-00001-of-00002.safetensors": {
+                    "blk.a.weight": tensors["blk.a.weight"],
+                    "blk.b.weight": tensors["blk.b.weight"],
+                },
+                "model-00002-of-00002.safetensors": {"blk.c.weight": tensors["blk.c.weight"]},
+            },
+        )
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["blk"], depth=1)
+        try:
+            deadline = time.monotonic() + 10.0
+            while streamer.prefetch_pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not streamer.prefetch_pending(), "prefetch did not finish"
+            for name, ref in tensors.items():
+                assert torch.equal(streamer.fetch(name), ref)
+            assert not streamer._prefetch_cache  # fully consumed
+        finally:
+            streamer.stop_prefetch()
+        # after stop, plain disk reads still work
+        assert torch.equal(streamer.fetch("blk.a.weight"), tensors["blk.a.weight"])
+
+    def test_pick_stage_device_headroom(self, tmp_path, monkeypatch):
+        """Staging needs block bytes + search headroom free; picks the first
+        round-robin GPU that qualifies, None when none does (caller waits)."""
+        import auto_round.utils.checkpoint_streamer as cs
+
+        gpu0, gpu1 = torch.device("cuda:0"), torch.device("cuda:1")
+        fake_free = {gpu0: 4 << 30, gpu1: 14 << 30}
+        monkeypatch.setattr(cs, "device_free_bytes", lambda d: fake_free.get(torch.device(d)))
+
+        headroom = 4 << 30
+        # an 8.5 GiB block needs 12.5 GiB: gpu0 (4) skipped, gpu1 (14) taken
+        assert cs.pick_stage_device([gpu0, gpu1], 0, 8 * 1024**3 + (512 << 20), headroom) == gpu1
+        # a small block fits gpu0 directly (4 GiB free >= 0 + 4 GiB headroom)
+        assert cs.pick_stage_device([gpu0, gpu1], 0, 0, headroom) == gpu0
+        # non-CUDA devices report unknown free and are always eligible
+        cpu = torch.device("cpu")
+        assert cs.pick_stage_device([cpu], 0, 8 << 30, headroom) == cpu
+        # all GPUs below block+headroom -> None (no CPU fallback here)
+        fake_free[gpu1] = 1 << 30
+        assert cs.pick_stage_device([gpu0, gpu1], 0, 8 << 30, headroom) is None
+
+    def test_prefetch_rescue_buffer_capped_at_one(self, tmp_path, monkeypatch):
+        """With every GPU below the headroom the reader stages exactly ONE
+        block into host RAM (rescue buffer) and waits for VRAM for the rest;
+        no OOM, no unbounded RAM staging."""
+        import time
+
+        import auto_round.utils.checkpoint_streamer as cs
+
+        torch.manual_seed(3)
+        tensors = {"blk.a.weight": torch.randn(4, 4), "blk.b.weight": torch.randn(4, 4)}
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": tensors})
+        streamer = CheckpointStreamer(path)
+
+        gpu = torch.device("cuda:0")
+        state = {"free": 1 << 30}
+        monkeypatch.setattr(cs, "device_free_bytes", lambda d: state["free"])
+        monkeypatch.setattr(cs.CheckpointStreamer, "_staging_search_headroom", 4 << 30)
+        # no CUDA locally: the device CHOICE is what matters, not the transfer
+        monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: self)
+
+        streamer.start_prefetch(["blk.a", "blk.b"], depth=2, stage_devices=[gpu])
+        try:
+            deadline = time.monotonic() + 5
+            while streamer._prefetch_staged != ["blk.a"] and time.monotonic() < deadline:
+                time.sleep(0.05)
+            # blk.a took the rescue slot (host RAM); blk.b must wait for VRAM
+            time.sleep(1.0)
+            assert streamer._prefetch_staged == ["blk.a"]
+            assert streamer.prefetch_error() is None
+
+            state["free"] = 20 << 30  # VRAM frees up
+            deadline = time.monotonic() + 5
+            while streamer._prefetch_staged != ["blk.a", "blk.b"] and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert streamer.prefetch_error() is None
+        finally:
+            streamer.stop_prefetch()
+
+    def test_prefetch_depth_and_consumption(self, tmp_path):
+        """The reader keeps at most ``depth`` prefixes staged ahead and releases
+        a slot only after the consumer reports the prefix consumed."""
+        torch.manual_seed(3)
+        shards = {}
+        for i in range(4):
+            shards[f"model-{i:05d}.safetensors"] = {f"b{i}.w.weight": torch.randn(2, 2)}
+        path = _make_sharded_checkpoint(tmp_path, shards)
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["b0", "b1", "b2", "b3"], depth=1)
+
+        def wait_staged(prefix):
+            deadline = time.monotonic() + 10.0
+            while prefix not in streamer._prefetch_staged and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert prefix in streamer._prefetch_staged, f"{prefix} never staged"
+
+        try:
+            wait_staged("b0")
+            time.sleep(0.2)  # a wrongly-unbounded reader would stage b1..b3 now
+            assert streamer._prefetch_staged == ["b0"], streamer._prefetch_staged
+            assert torch.equal(streamer.fetch("b0.w.weight"), shards["model-00000.safetensors"]["b0.w.weight"])
+            streamer.prefetch_consumed("b0")
+            for p in ("b1", "b2", "b3"):
+                wait_staged(p)
+                streamer.prefetch_consumed(p)
+            assert not streamer._prefetch_remaining and not streamer._prefetch_staged
+            assert not streamer._prefetch_cache
+        finally:
+            streamer.stop_prefetch()
+
+    def test_prefetch_error_surfaces(self, tmp_path):
+        """A reader failure is re-raised at the next fetch."""
+        path = _make_sharded_checkpoint(tmp_path, {"model.safetensors": {"m.w.weight": torch.randn(2, 2)}})
+        streamer = CheckpointStreamer(path)
+        streamer.start_prefetch(["missing"], depth=1)
+        try:
+            deadline = time.monotonic() + 10.0
+            while streamer.prefetch_error() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert streamer.prefetch_error() is not None, "reader failure not recorded"
+            with pytest.raises(RuntimeError, match="prefetch"):
+                streamer.fetch("m.w.weight")
+        finally:
+            streamer.stop_prefetch()
+
+    def test_check_ids_in_vocab(self):
+        from auto_round.utils.streaming_calibration import _check_ids_in_vocab
+
+        rows = [torch.tensor([[1, 2, 3]]), torch.tensor([[0, 5, 63]])]
+        _check_ids_in_vocab(rows, 64)  # in range: no raise
+        bad = [torch.tensor([[1, 2, 150000]])]  # ids from a different model's tokenizer
+        with pytest.raises(ValueError, match="different model's tokenizer"):
+            _check_ids_in_vocab(bad, 120832)
+
+
+class TestStageDeviceResolution:
+    """The single stream_prefetch knob resolves to at most one additional
+    staging device (two rotating homes under auto), host RAM, or None."""
+
+    def _resolve(self, **attrs):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        fields = dict(stream_prefetch="auto", device="cpu")
+        fields.update(attrs)
+        stub = SimpleNamespace(**fields)
+        return CompressionOrchestrator._resolve_stream_stage_devices(stub)
+
+    def test_off_and_cpu_mean_host_ram(self):
+        assert self._resolve(stream_prefetch="off") is None
+        assert self._resolve(stream_prefetch="cpu") is None
+
+    def test_explicit_cuda_device_with_cpu_quant_falls_back_to_ram(self):
+        # GPU staging with a CPU quant device buys nothing: blocks would
+        # quantize on CPU
+        assert self._resolve(stream_prefetch="cuda:1") is None
+
+    def test_explicit_device_resolves_to_itself(self):
+        devices = self._resolve(stream_prefetch="cuda:1", device="cuda:0")
+        assert [str(d) for d in devices] == ["cuda:1"]
+
+    def test_explicit_meta_device_rejected(self):
+        with pytest.raises(ValueError, match="meta tensors hold no data"):
+            self._resolve(stream_prefetch="meta", device="cuda:0")
+
+    def test_invalid_device_string_raises_actionably(self):
+        with pytest.raises(ValueError, match="not a valid device"):
+            self._resolve(stream_prefetch="not-a-device", device="cuda:0")
+
+    def test_parse_single_device_forms(self):
+        from auto_round.cli.main import _parse_stream_prefetch
+
+        assert _parse_stream_prefetch("on") == "on"
+        assert _parse_stream_prefetch("off") == "off"
+        assert _parse_stream_prefetch("auto") == "auto"
+        assert _parse_stream_prefetch("cpu") == "cpu"
+        assert _parse_stream_prefetch("1") == "cuda:1"
+        assert _parse_stream_prefetch("cuda:3") == "cuda:3"
+
+    def test_parse_device_list_rejected(self):
+        from auto_round.cli.main import _parse_stream_prefetch
+
+        with pytest.raises(ValueError, match="single staging device"):
+            _parse_stream_prefetch("1,2")
+
+    def test_on_with_cpu_quant_stays_enabled_as_ram(self):
+        # 'on' never silently disables: with a CPU quant device the chain
+        # lands on host-RAM staging (devices None) without a warning-only bail
+        assert self._resolve(stream_prefetch="on") is None
+
+    def test_auto_with_cpu_quant_is_none(self):
+        assert self._resolve(stream_prefetch="auto") is None
+
+
+class TestStreamingRoutingWaiver:
+    """Calibration-demand resolution under stream_quantization: RTN stays waived
+    (weight-only); SignRound (iters>0) is admitted when the chained calibration
+    is active (auto-engaged) and falls back to the data-driven path without it."""
+
+    def _needs(self, configs, **attrs):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.base import BaseCompressor
+
+        fields = dict(
+            quantize_config=object(),
+            _alg_configs=configs,
+            stream_quantization=False,
+            stream_calibration=False,
+            scheme="W4A16",
+            static_kv_dtype=None,
+            static_attention_dtype=None,
+            layer_config=None,
+        )
+        fields["_layer_config_needs_calibration"] = lambda check: False
+        fields.update(attrs)
+        return BaseCompressor._needs_calibration_data(SimpleNamespace(**fields))
+
+    def test_auto_scheme_streamed_does_not_force_calib(self):
+        """AutoScheme scoring runs in workers / from cache -- the streaming
+        parent never forwards, so under stream_quantization the scheme itself
+        must not force the data-driven path (streaming governs quantization)."""
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+
+        scheme = AutoScheme(avg_bits=3.5, options="W3A16,W4A16")
+        assert self._needs([], scheme=scheme, stream_quantization=True) is False
+
+    def test_auto_scheme_non_streamed_still_forces_calib(self):
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+
+        scheme = AutoScheme(avg_bits=3.5, options="W3A16,W4A16")
+        assert self._needs([], scheme=scheme, stream_quantization=False) is True
+
+    def test_optimized_rtn_streamed_waived_without_calibration(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_quantization=True) is False
+
+    def test_signround_streamed_with_calibration_waived(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        stub = SignRoundConfig(group_size=16, iters=1)
+        assert self._needs([stub], stream_quantization=True, stream_calibration=True) is False
+
+    def test_mixed_rtn_signround_streamed_with_calibration_waived(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        configs = [OptimizedRTNConfig(group_size=16), SignRoundConfig(group_size=16, iters=1)]
+        assert self._needs(configs, stream_quantization=True, stream_calibration=True) is False
+
+    def test_signround_streamed_without_chain_falls_back_to_data_driven(self):
+        """Auto-engage normally handles this in __init__; if a SignRound config
+        slips in later without the chain, the safe route is the data-driven
+        path -- never silent weight-only tuning under streaming."""
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        assert self._needs([SignRoundConfig(group_size=16, iters=1)], stream_quantization=True) is True
+
+    def test_signround_unstreamed_stays_data_driven(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        assert self._needs([SignRoundConfig(group_size=16, iters=1)]) is True
+
+    def test_unsupported_quantizer_streamed_stays_data_driven(self):
+        from auto_round.algorithms.transforms.awq.config import AWQConfig
+
+        assert self._needs([AWQConfig(group_size=16)], stream_quantization=True, stream_calibration=True) is True
+
+    def test_rule_enabled_imatrix_streamed_stays_waived_silently(self):
+        """imatrix on by scheme rules (no flag): the pre-existing weight-only
+        waiver applies -- no error, imatrix simply not collected."""
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        assert self._needs([OptimizedRTNConfig(group_size=16)], stream_quantization=True) is False
+
+
+class TestStreamModeExclusivity:
+    """stream_quantization is mutually exclusive with AR_DISK_STREAM_MODEL
+    (hard error), and quant_nontext_module is rejected under streaming."""
+
+    def _make_context(self, monkeypatch, *, env_disk_stream=False, mllm=False, model="dummy-model"):
+        from auto_round import envs
+        from auto_round.context.model import ModelContext
+
+        if env_disk_stream:
+            monkeypatch.setenv("AR_DISK_STREAM_MODEL", "1")
+        else:
+            monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        monkeypatch.setattr("auto_round.context.model.is_mllm_model", lambda *a, **k: mllm)
+        monkeypatch.setattr("auto_round.context.model.is_diffusion_model", lambda *a, **k: False)
+        # BaseContext memoizes instances and skips __init__ on re-construction:
+        # reset around the construction so this test builds a fresh
+        # ModelContext and never leaks the instance to later tests.
+        ModelContext.reset_context()
+        try:
+            return ModelContext(model, stream_quantization=True)
+        finally:
+            ModelContext.reset_context()
+
+    def test_disk_stream_env_plus_stream_quantization_raises(self, monkeypatch):
+        import pytest
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._make_context(monkeypatch, env_disk_stream=True)
+
+    def test_stream_quantization_with_mllm_routes_to_meta_loader(self, monkeypatch, tmp_path):
+        """Multimodal + streaming no longer errors: the mllm branch routes into
+        _load_model_on_meta (arch-resolved skeleton + processor stack; vision
+        tower stays meta for the export pass-through)."""
+        import torch.nn as nn
+
+        from auto_round.context.model import ModelContext
+
+        called = {"meta": 0}
+
+        class _TinyModule(nn.Module):
+            dtype = torch.float32  # _set_amp_dtype reads it
+            config = None
+
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 4)
+
+        def _fake_meta(self):
+            called["meta"] += 1
+            self.model = _TinyModule()  # minimal module so the __init__ tail survives
+            self.tokenizer = None
+
+        monkeypatch.setattr(ModelContext, "_load_model_on_meta", _fake_meta)
+        ctx = self._make_context(monkeypatch, mllm=True, model=str(tmp_path))
+        assert called["meta"] == 1, "mllm + stream_quantization must use the streaming loader"
+        assert ctx.is_mllm is True
+
+    def test_quant_nontext_module_under_streaming_raises(self, monkeypatch):
+        """quant_nontext_module + streaming must fail fast: the streaming chain
+        feeds text hidden states block-to-block and cannot drive vision blocks
+        (silently including them would quantize on garbage statistics)."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from auto_round.compressors.base import BaseCompressor
+
+        stub = SimpleNamespace(stream_quantization=True)
+        with pytest.raises(ValueError, match="quant_nontext_module=True is not supported under stream_quantization"):
+            BaseCompressor._validate_stream_options(stub, quant_nontext_module=True)
+        # sanity: allowed combination passes
+        BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
+
+    def test_stream_quantization_rejects_unadapted_calibration_quantizers(self):
+        """Quantizer configs outside the RTN/SignRound families are rejected:
+        their current implementations capture statistics by driving the fully
+        materialized model and are not yet adapted to the block-replay
+        interface. The error must frame it as an adaptation gap, not an
+        algorithmic impossibility."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from auto_round.algorithms.quantization.config import QuantizationConfig
+        from auto_round.compressors.base import BaseCompressor
+
+        class _UnadaptedQuantizer(QuantizationConfig):
+            pass  # need_calib defaults to True on the base class
+
+        cfg = _UnadaptedQuantizer.__new__(_UnadaptedQuantizer)  # bypass __init__ args
+        stub = SimpleNamespace(stream_quantization=True, _alg_configs=[cfg])
+        with pytest.raises(ValueError, match="not yet adapted") as excinfo:
+            BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
+        assert "future work, not a fundamental restriction" in str(excinfo.value)
+        assert _UnadaptedQuantizer.__name__ in str(excinfo.value)
+
+    def test_stream_quantization_rejects_enable_lfq(self):
+        """enable_lfq forwards the still-meta lm_head on the final block; it
+        must be rejected under streaming."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from auto_round.compressors.base import BaseCompressor
+
+        stub = SimpleNamespace(stream_quantization=True, _alg_configs=[SimpleNamespace(enable_lfq=True)])
+        with pytest.raises(ValueError, match="enable_lfq=True is not supported under stream_quantization"):
+            BaseCompressor._validate_stream_options(stub, quant_nontext_module=False)
+
+    def test_stream_quantization_with_mllm_and_env_var_still_raises(self, monkeypatch):
+        import pytest
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._make_context(monkeypatch, mllm=True, env_disk_stream=True)
+
+    def test_text_path_without_env_proceeds_to_meta_load(self, monkeypatch, tmp_path):
+        """Sanity: the guards must not fire on the normal text streaming path
+        with a real local directory (the meta loader then fails on the empty
+        fixture -- any error other than the guards is acceptable progress)."""
+        import pytest
+
+        with pytest.raises(Exception) as excinfo:
+            self._make_context(monkeypatch, model=str(tmp_path))
+        assert "mutually exclusive" not in str(excinfo.value)
+        assert "multimodal" not in str(excinfo.value)
+        assert "local checkpoint directory" not in str(excinfo.value)
+
+    def test_stream_quantization_hub_id_fails_with_guidance(self, monkeypatch):
+        """Hub ids (HF or ModelScope) are not resolvable under streaming: the
+        loop streams weight shards straight from a local directory. A hub id
+        must fail loud at startup with download guidance instead of the bare
+        streamer FileNotFoundError."""
+        import pytest
+
+        with pytest.raises(ValueError, match="local checkpoint directory") as excinfo:
+            self._make_context(monkeypatch, model="Qwen/Qwen3.8-27B")
+        assert "hf download" in str(excinfo.value)
+        assert "modelscope download" in str(excinfo.value)
+
+    def test_stream_quantization_single_file_path_fails_with_guidance(self, monkeypatch):
+        """A path to a single file (not a checkpoint directory) fails with the
+        same guidance -- the streamer needs the directory with the shards."""
+        import pytest
+
+        with pytest.raises(ValueError, match="local checkpoint directory"):
+            self._make_context(monkeypatch, model="/tmp/model.safetensors")
+
+
+class TestStreamRowsCap:
+    """nsamples caps chained rows for every dataset type (list datasets were
+    previously forwarded in full -- inconsistent with the data-driven
+    calibrator, which stops at nsamples for any dataset)."""
+
+    def test_list_dataset_capped_at_nsamples(self):
+        from auto_round.utils.streaming_calibration import _normalize_rows
+
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]
+        out = _normalize_rows(rows, tokenizer=None, seqlen=32, nsamples=3)
+        assert len(out) == 3
+
+    def test_list_dataset_shorter_than_nsamples_untouched(self):
+        from auto_round.utils.streaming_calibration import _normalize_rows
+
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(2)]
+        out = _normalize_rows(rows, tokenizer=None, seqlen=32, nsamples=8)
+        assert len(out) == 2
+
+    def test_short_rows_dropped_by_skip_rule(self):
+        from auto_round.utils.streaming_calibration import _normalize_rows
+
+        rows = [torch.randint(0, 64, (1, 8)), torch.randint(0, 64, (1, 32))]  # first < seqlen
+        out = _normalize_rows(rows, tokenizer=None, seqlen=32, nsamples=8)
+        assert len(out) == 1
+
+
+class TestOffloadAfterPackDecision:
+    """Per-block offload writes must be skipped once the block is already
+    flushed to output shards (is_immediate_saving): the file would be dead
+    weight until process exit (a large MoE easily writes hundreds of GB)."""
+
+    def _should_offload(self, low_cpu_mem_usage, is_immediate_saving):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        ctx = SimpleNamespace(low_cpu_mem_usage=low_cpu_mem_usage, is_immediate_saving=is_immediate_saving)
+        return CompressionOrchestrator._should_offload_after_pack(ctx)
+
+    def test_offloads_when_not_immediate_saving(self):
+        assert self._should_offload(low_cpu_mem_usage=True, is_immediate_saving=False) is True
+
+    def test_skips_when_immediate_saving_flushed_the_block(self):
+        assert self._should_offload(low_cpu_mem_usage=True, is_immediate_saving=True) is False
+
+    def test_skips_when_low_cpu_mem_usage_off(self):
+        assert self._should_offload(low_cpu_mem_usage=False, is_immediate_saving=False) is False
+
+
+class TestDiskStreamEnvRotationGuard:
+    """_assert_model_foldable_in_place must also refuse whole-model rotation
+    under AR_DISK_STREAM_MODEL (env-var offloader path builds the same meta
+    skeleton; the guard used to key on the --stream_quantization flag only)."""
+
+    def _composer(self, monkeypatch, env_value):
+        from types import SimpleNamespace
+
+        from auto_round import envs
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        if env_value:
+            monkeypatch.setenv("AR_DISK_STREAM_MODEL", "1")
+        else:
+            monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        orch = SimpleNamespace(
+            layerwise_rotation=False, stream_quantization=False, model_context=None, compress_context=None
+        )
+        return AlgorithmComposer([RTNConfig(group_size=16)], orchestrator=orch)
+
+    def test_env_var_eager_rotation_raises(self, monkeypatch):
+        import pytest
+        import torch.nn as nn
+
+        composer = self._composer(monkeypatch, True)
+        with pytest.raises(ValueError, match="can only run layer-wise"):
+            composer._assert_model_foldable_in_place(nn.Linear(4, 4))
+
+    def test_flag_path_still_raises(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import pytest
+        import torch.nn as nn
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        composer = AlgorithmComposer(
+            [RTNConfig(group_size=16)],
+            orchestrator=SimpleNamespace(
+                layerwise_rotation=False, stream_quantization=True, model_context=None, compress_context=None
+            ),
+        )
+        with pytest.raises(ValueError, match="can only run layer-wise"):
+            composer._assert_model_foldable_in_place(nn.Linear(4, 4))
+
+    def test_no_streaming_no_meta_raises_nothing(self, monkeypatch):
+        import torch.nn as nn
+
+        composer = self._composer(monkeypatch, False)
+        composer._assert_model_foldable_in_place(nn.Linear(4, 4))  # must not raise
+
+
+class TestStreamFeatureAutoEngage:
+    """_auto_engage_stream_features: layerwise rotation + calibration chain
+    engage by themselves under stream_quantization when the run needs them."""
+
+    @staticmethod
+    def _engage(configs, **attrs):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.base import BaseCompressor
+
+        fields = dict(
+            layerwise_rotation=None,
+            stream_quantization=False,
+            stream_calibration=False,
+            _alg_configs=configs,
+        )
+        fields.update(attrs)
+        stub = SimpleNamespace(**fields)
+        BaseCompressor._auto_engage_stream_features(stub)
+        return stub
+
+    def test_layerwise_stays_off_without_rotations(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        stub = self._engage([RTNConfig(group_size=16)], stream_quantization=True)
+        assert stub.layerwise_rotation is False
+
+    def test_calibration_auto_engages_for_signround(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        stub = self._engage([SignRoundConfig(group_size=16, iters=1)], stream_quantization=True)
+        assert stub.stream_calibration is True
+
+    def test_calibration_not_engaged_for_weight_only(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        stub = self._engage([RTNConfig(group_size=16)], stream_quantization=True)
+        assert stub.stream_calibration is False
+
+    def test_calibration_auto_engages_for_rule_enabled_imatrix(self):
+        from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig
+
+        cfg = OptimizedRTNConfig(group_size=16)  # sym int4: imatrix on by scheme rules
+        cfg.enable_imatrix = True
+        stub = self._engage([cfg], stream_quantization=True)
+        assert stub.stream_calibration is True
+
+    def test_calibration_not_engaged_for_imatrix_off(self):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+
+        stub = self._engage([RTNConfig(group_size=16)], stream_quantization=True)
+        assert stub.stream_calibration is False
+
+    def test_calibration_not_engaged_without_streaming(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        stub = self._engage([SignRoundConfig(group_size=16, iters=1)])
+        assert stub.stream_calibration is False
+
+
+@pytest.mark.slow
+class TestStreamQuantizeEquivalence:
+    """stream_quantization=True must produce the same export as the normal flow."""
+
+    @pytest.fixture(scope="class")
+    def tiny_checkpoint(self, tmp_path_factory):
+        """Tiny local causal LM checkpoint, sharded (no network access)."""
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        cfg = LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+        )
+        torch.manual_seed(7)
+        model = LlamaForCausalLM(cfg)
+        # fat-tailed weights: guarantees the opt-RTN clip search moves scales
+        # away from the min/max default (near-uniform weights would not)
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if p.dim() >= 2:
+                    outlier_mask = torch.rand_like(p) < 0.02
+                    p.mul_(0.1).add_(outlier_mask.float() * torch.randn_like(p))
+        d = tmp_path_factory.mktemp("tiny_ckpt")
+        # minimal fast tokenizer (no sentencepiece dependency)
+        from tokenizers import Tokenizer
+        from tokenizers import models as tk_models
+        from tokenizers import pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        tk = Tokenizer(tk_models.WordLevel(vocab={"[UNK]": 0, "a": 1, "b": 2}, unk_token="[UNK]"))
+        tk.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok = PreTrainedTokenizerFast(tokenizer_object=tk)
+        tok.save_pretrained(str(d))
+        # max_shard_size forces multiple shards + an index file
+        model.save_pretrained(str(d), max_shard_size="40KB")
+        return str(d)
+
+    @staticmethod
+    def _quantize(
+        model_path,
+        out_dir,
+        stream,
+        stream_prefetch="off",
+        dataset=None,
+        layer_config=None,
+        iters=0,
+    ):
+        from auto_round.algorithms.quantization.rtn.config import RTNConfig
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.autoround import AutoRound
+
+        kwargs = {}
+        if dataset is not None:
+            kwargs["dataset"] = dataset
+            kwargs["seqlen"] = 32
+            kwargs["nsamples"] = 8
+        if layer_config is not None:
+            kwargs["layer_config"] = layer_config
+        if iters:
+            alg = [SignRoundConfig(group_size=16, iters=iters, lr=5e-3)]
+        else:
+            alg = [RTNConfig(group_size=16, disable_opt_rtn=False)]
+        ar = AutoRound(
+            model_path,
+            scheme="W4A16",
+            alg_configs=alg,
+            stream_quantization=stream,
+            stream_prefetch=stream_prefetch,
+            **kwargs,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.quantize_and_save(out_dir, format="auto_round")
+        return ar.output_dir  # resolved export dir (may add a name/scheme suffix)
+
+    def test_auto_scheme_with_streaming(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """AutoScheme + stream_quantization: scoring never needs the streaming
+        parent (pass 1 fills the AR_AUTO_SCHEME_CACHE without streaming; pass 2
+        resolves from cache) and the quantization itself runs in the zero-shot
+        streaming loop -- streaming governs quantization, not the scheme."""
+        import shutil
+
+        from auto_round import envs
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.autoround import AutoRound
+
+        cache_dir = str(tmp_path / "as_cache")
+        monkeypatch.setenv("AR_AUTO_SCHEME_CACHE", str(cache_dir))
+        # fp16 embed/lm_head inflate the achievable floor; W2+W4 span it
+        scheme = AutoScheme(avg_bits=5.0, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
+
+        def _run(ckpt, out_dir, stream):
+            return AutoRound(
+                ckpt,
+                scheme=scheme,
+                iters=0,
+                nsamples=1,
+                seqlen=32,
+                stream_quantization=stream,
+                format="auto_round",
+                disable_model_free=True,
+                device_map="cpu",
+                low_gpu_mem_usage=True,
+                low_cpu_mem_usage=True,
+            ).quantize_and_save(out_dir, format="auto_round")
+
+        # same model path both passes: the scheme cache is keyed on it (quantization
+        # happens in memory; the on-disk checkpoint stays pristine)
+        _run(tiny_checkpoint, str(tmp_path / "pass1"), stream=False)
+        assert any(p.name.endswith(".json") for p in Path(cache_dir).glob("*")), "pass 1 must fill the AutoScheme cache"
+        _, out_dir = _run(tiny_checkpoint, str(tmp_path / "pass2"), stream=True)
+        with open(os.path.join(out_dir, "config.json")) as f:
+            qconf = json.load(f)["quantization_config"]
+        assert qconf["quant_method"] == "auto-round"
+
+    def test_auto_scheme_streaming_uncached_no_workers_raises(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """Single-run streaming + uncached schemes on a box with no CUDA scoring
+        workers: must fail with an actionable error, never attempt in-process
+        scoring on the meta skeleton (meta tensor copy)."""
+        from auto_round import envs
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
+        from auto_round.autoround import AutoRound
+
+        monkeypatch.setenv("AR_AUTO_SCHEME_CACHE", str(tmp_path / "empty_cache"))
+        scheme = AutoScheme(avg_bits=5.0, options=("W2A16", "W4A16"), nsamples=1, ignore_scale_zp_bits=True)
+
+        with pytest.raises(RuntimeError, match="AutoScheme scoring cannot run in-process"):
+            AutoRound(
+                tiny_checkpoint,
+                scheme=scheme,
+                iters=0,
+                nsamples=1,
+                seqlen=32,
+                stream_quantization=True,
+                format="auto_round",
+                disable_model_free=True,
+                device_map="cpu",
+                low_gpu_mem_usage=True,
+                low_cpu_mem_usage=True,
+            ).quantize_and_save(str(tmp_path / "out"), format="auto_round")
+
+    def test_stream_export_equivalence_family(self, tiny_checkpoint, tmp_path):
+        """One five-arm equivalence sweep (merged from four separate e2es that
+        each re-quantized the plain-streamed baseline):
+
+        - streamed(plain) vs normal(rows): inventory + bit-exact non-quantized
+          tensors + identical configs (quantized packing may differ BY DESIGN -
+          data-driven passes a rows-derived imatrix into the clip search,
+          streamed zero-shot uses a pure weight-MSE search)
+        - streamed_calib(rows) vs normal(rows): EXACT reproduction - the
+          streaming pass forwards the same rows through the same block chain
+        - streamed(staged) vs streamed(plain): bit-identical - device staging
+          only changes where tensors wait. (The GPU-staging/auto-rotation arm
+          lives in test_cuda: on CPU-only boxes prefetch-auto and staged-cpu
+          both land in host RAM, so it would exercise nothing new here.)
+        """
+        import shutil
+
+        torch.manual_seed(7)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]  # vocab_size=64
+        arms = {}
+        for name, kwargs in (
+            ("normal", dict(stream=False, dataset=rows)),
+            ("plain", dict(stream=True)),
+            ("calib", dict(stream=True, dataset=rows)),
+            ("staged", dict(stream=True, stream_prefetch="cpu" if torch.cuda.device_count() < 2 else "cuda:1")),
+        ):
+            ck = str(tmp_path / f"ck_{name}")
+            shutil.copytree(tiny_checkpoint, ck)
+            arms[name] = self._quantize(ck, str(tmp_path / name), **kwargs)
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        t = {name: load_all(d) for name, d in arms.items()}
+
+        # arm 1: streamed(plain) vs normal - structural equivalence
+        assert set(t["normal"]) == set(t["plain"]), (
+            f"tensor name mismatch: only-normal={set(t['normal']) - set(t['plain'])} "
+            f"only-streamed={set(t['plain']) - set(t['normal'])}"
+        )
+        quant_suffixes = ("qweight", "qzeros", "scales", "g_idx")
+        n_bitexact, n_quant = 0, 0
+        for k in t["normal"]:
+            if k.endswith(quant_suffixes):
+                n_quant += 1
+                continue
+            assert torch.equal(t["normal"][k], t["plain"][k]), f"non-quantized tensor {k} differs"
+            n_bitexact += 1
+        assert n_bitexact > 0 and n_quant > 0  # both classes present
+        with open(os.path.join(arms["normal"], "quantization_config.json")) as f:
+            cn = json.load(f)
+        with open(os.path.join(arms["plain"], "quantization_config.json")) as f:
+            cp = json.load(f)
+        assert cn == cp
+
+        # arm 2: streamed_calib vs normal - exact reproduction
+        assert set(t["calib"]) == set(t["normal"])
+        for k in t["normal"]:
+            if not torch.equal(t["calib"][k], t["normal"][k]):
+                assert torch.allclose(
+                    t["calib"][k].float(), t["normal"][k].float(), atol=1e-6
+                ), f"stream_calibration tensor {k} differs beyond tolerance"
+
+        # staging leaves every exported bit untouched
+        for variant in ("staged",):
+            assert set(t[variant]) == set(t["plain"])
+            for k in t["plain"]:
+                assert torch.equal(t["plain"][k], t[variant][k]), f"tensor {k} differs under {variant}"
+
+    def test_streamed_signround_qoff_keeps_q_inputs_none(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """enable_quanted_input=False (qoff): every block tunes against the
+        fp reference chain only; q_inputs must stay None block-to-block."""
+        import shutil
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.autoround import AutoRound
+
+        torch.manual_seed(11)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
+        ck = str(tmp_path / "ck_qoff")
+        shutil.copytree(tiny_checkpoint, ck)
+
+        captured = []
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            captured.append(kwargs.get("q_inputs", "absent"))
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
+            layerwise_rotation=False,
+            stream_quantization=True,
+            enable_quanted_input=False,
+            dataset=rows,
+            seqlen=32,
+            nsamples=4,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        ar.quantize_and_save(str(tmp_path / "qoff"), format="auto_round")
+        block_calls = [q for q in captured if q != "absent"]
+        assert len(block_calls) >= 2
+        assert all(q is None for q in block_calls), "qoff must not chain quantized inputs"
+
+    def test_streamed_signround_auto_engages_calibration(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """stream_quantization + iters>0 with stream_calibration unset: the
+        activation chain auto-engages -- the run completes with real chained
+        tuning inputs instead of silently skipping the tuning data."""
+        import shutil
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.autoround import AutoRound
+
+        torch.manual_seed(11)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
+        ck = str(tmp_path / "ck_nocal")
+        shutil.copytree(tiny_checkpoint, ck)
+
+        chained = {"calls": 0}
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            if fp_inputs is not None:
+                chained["calls"] += 1
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4)],
+            stream_quantization=True,
+            dataset=rows,
+            seqlen=32,
+            nsamples=4,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        assert ar.stream_calibration is True, "chain must auto-engage for iters>0 under streaming"
+        out_dir = ar.quantize_and_save(str(tmp_path / "nocal"), format="auto_round")
+        assert out_dir
+        assert chained["calls"] >= 2, "auto-engaged chain must feed every block"
+
+    def test_streamed_signround_runs_prepare_run_and_alg_ext_wrapper(self, tiny_checkpoint, tmp_path, monkeypatch):
+        """The streaming zero-shot loop must run the model-level lifecycle
+        before its block loop: SignRoundV2Quantizer.prepare_run binds the
+        optimized wrapper (SignRoundOptimizedWrapperLinear). Skipping it left
+        V2 tuning silently on the plain min/max wrapper (worse init, worse KL).
+        """
+        import shutil
+        from functools import partial
+
+        from auto_round.algorithms.composer import AlgorithmComposer
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        from auto_round.algorithms.quantization.sign_roundv2.quantizer import SignRoundOptimizedWrapperLinear
+        from auto_round.autoround import AutoRound
+        from auto_round.wrapper import wrapper_block
+
+        torch.manual_seed(11)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(4)]
+        ck = str(tmp_path / "ck_ext")
+        shutil.copytree(tiny_checkpoint, ck)
+
+        prepared = {"calls": 0}
+        orig_prepare = AlgorithmComposer.prepare_run
+
+        def prepare_spy(self, composer=None):
+            prepared["calls"] += 1
+            return orig_prepare(self, composer=composer)
+
+        wrapper_at_compress = []
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            wrapper_at_compress.append(self.block_quantizer.wrapper_block)
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "prepare_run", prepare_spy)
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        ar = AutoRound(
+            ck,
+            scheme="W4A16",
+            alg_configs=[SignRoundConfig(group_size=16, iters=1, lr=1e-4, enable_alg_ext=True)],
+            layerwise_rotation=False,
+            stream_quantization=True,
+            dataset=rows,
+            seqlen=32,
+            nsamples=4,
+            format="auto_round",
+            disable_model_free=True,
+            device_map="cpu",
+            low_gpu_mem_usage=True,
+            low_cpu_mem_usage=True,
+        )
+        out_dir = ar.quantize_and_save(str(tmp_path / "ext"), format="auto_round")
+        assert out_dir, "streamed SignRound alg-ext run must produce an export"
+        assert prepared["calls"] >= 1, "streaming zero-shot loop never called alg_composer.prepare_run"
+        assert wrapper_at_compress, "no compress_block calls observed"
+        expected = partial(wrapper_block, wrapper_cls=SignRoundOptimizedWrapperLinear)
+        for w in wrapper_at_compress:
+            assert w.func is wrapper_block, "wrapper_block must stay the shared wrapper function"
+            assert w.keywords.get("wrapper_cls") is SignRoundOptimizedWrapperLinear, (
+                "alg-ext tuning under streaming must use the optimized wrapper; "
+                "the plain min/max WrapperLinear means prepare_run was skipped"
+            )
+
+    @staticmethod
+    def _add_extra_group(tiny_checkpoint, dst, extra):
+        """Copy the fixture checkpoint and append *extra* tensors to the last shard."""
+        import json
+        import os
+        import shutil
+
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        src = shutil.copytree(tiny_checkpoint, str(dst))
+        idx_path = os.path.join(src, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            idx = json.load(f)
+        last = sorted(set(idx["weight_map"].values()))[-1]
+        with safe_open(os.path.join(src, last), framework="pt") as f:
+            tensors = {k: f.get_tensor(k) for k in f.keys()}
+        tensors.update(extra)
+        save_file(tensors, os.path.join(src, last), metadata={"format": "pt"})
+        for k in extra:
+            idx["weight_map"][k] = last
+        with open(idx_path, "w") as f:
+            json.dump(idx, f)
+        return src
+
+    @staticmethod
+    def _export_keys(out):
+        import os
+
+        from safetensors import safe_open
+
+        keys = set()
+        for shard_file in sorted(os.listdir(out)):
+            if not shard_file.endswith(".safetensors"):
+                continue
+            with safe_open(os.path.join(out, shard_file), framework="pt") as f:
+                keys |= set(f.keys())
+        return keys
+
+    def test_pin_entry_for_matches_module_and_tensor_spellings(self):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = SimpleNamespace(
+            layer_config={},
+            regex_config={".*mtp.fc.": {"bits": 16, "data_type": "float"}, ".*mtp.*": {"bits": 8}},
+        )
+        entry = CompressionOrchestrator._pin_entry_for(orch, "mtp.fc")
+        assert entry == {"bits": 16, "data_type": "float"}, f"first pattern lost to the broader pin: {entry}"
+        assert CompressionOrchestrator._pin_entry_for(orch, "mtp.norm") == {"bits": 8}
+        assert CompressionOrchestrator._pin_entry_for(orch, "model.layers.3.mlp.up_proj") is None
+
+    def test_checkpoint_only_group_module_family(self, tiny_checkpoint, tmp_path):
+        """One streamed run over five coexisting module groups covers the whole
+        checkpoint-only pin/materialize/passthrough matrix (merged from seven
+        single-run e2es; each group targets DIFFERENT modules so their pins
+        and verbatim expectations never collide):
+
+        - mtp.* pinned at fc: packed Linear + unpinned sibling verbatim
+        - model.mtp2.* nested pinned + fused 3D expert stack under it:
+          nested fc packs, experts unfuse per-expert, sibling norm verbatim
+        - mtp3.* unpinned: the whole group passes through verbatim
+        - mtp4.* tensor-spelled pin ('.*mtp4.fc.' float) beats the broader
+          module-side pattern ('.*mtp4.*' 8-bit) - scoped to mtp4 only
+        - in-block extras (model.layers.3): pinned eh_proj materializes a
+          placeholder Linear and packs; unpinned enorm stays verbatim
+        - incomplete tree (model.layers.4, no attention): degraded scattered
+          placeholders - pinned tensors still quantize, siblings verbatim
+        - unreferenced auxiliary safetensors file (mtp5.safetensors): its
+          tensors reach the export despite the index never seeing the file
+        """
+        H = 32
+        extra = {
+            "mtp.fc.weight": torch.randn(16, H),
+            "mtp.norm.weight": torch.randn(H),
+            "model.mtp2.fc.weight": torch.randn(16, H),
+            "model.mtp2.norm.weight": torch.randn(H),
+            "model.mtp2.layers.0.mlp.experts.gate_up_proj.weight": torch.randn(4, 64, H),
+            "model.mtp2.layers.0.mlp.experts.down_proj.weight": torch.randn(4, H, H),
+            "mtp3.fc.weight": torch.randn(16, H),
+            "mtp3.norm.weight": torch.randn(H),
+            "mtp4.fc.weight": torch.randn(16, H),
+            "mtp4.norm.weight": torch.randn(H),
+            "model.layers.3.eh_proj.weight": torch.randn(16, H),
+            "model.layers.3.enorm.weight": torch.randn(H),
+            # incomplete predictor-shaped subtree (no attention): must NOT
+            # build a tree, falls back to scattered placeholders (merged from
+            # test_mtp_group_tree_degraded_when_sibling_incomplete)
+            "model.layers.4.eh_proj.weight": torch.randn(H, 2 * H),
+            "model.layers.4.enorm.weight": torch.randn(H),
+            "model.layers.4.hnorm.weight": torch.randn(H),
+            "model.layers.4.mlp.gate_proj.weight": torch.randn(64, H),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        # an auxiliary safetensors file the index never references must still
+        # reach the export (merged from test_unreferenced_safetensors_file_copied_verbatim)
+        from safetensors.torch import save_file
+
+        save_file(
+            {"mtp5.fc.weight": torch.randn(4, 4)},
+            os.path.join(src, "mtp5.safetensors"),
+            metadata={"format": "pt"},
+        )
+        out = self._quantize(
+            src,
+            str(tmp_path / "out"),
+            stream=True,
+            layer_config={
+                "mtp.fc": {"bits": 8},
+                "model.mtp2.fc": {"bits": 8},
+                "model.mtp2": {"bits": 8},
+                ".*mtp4.fc.": {"bits": 16, "data_type": "float"},
+                ".*mtp4.*": {"bits": 8},
+                "model.layers.3.eh_proj": {"bits": 8},
+                "model.layers.4": {"bits": 8},
+            },
+        )
+        keys = self._export_keys(out)
+        # top-level pinned: fc packs, sibling verbatim
+        assert "mtp.fc.qweight" in keys, "pinned top-level checkpoint-only layer was not packed"
+        assert "mtp.fc.weight" not in keys, "plain weight written beside its packed form"
+        assert "mtp.norm.weight" in keys, "unpinned sibling tensor dropped"
+        # nested pinned + fused experts
+        assert "model.mtp2.fc.qweight" in keys, "pinned nested checkpoint-only layer was not packed"
+        assert "model.mtp2.fc.weight" not in keys
+        assert "model.mtp2.norm.weight" in keys, "unpinned nested sibling tensor dropped"
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                assert (
+                    f"model.mtp2.layers.0.mlp.experts.{e}.{proj}.qweight" in keys
+                ), f"expert {e} {proj} not packed; keys: " + ", ".join(sorted(k for k in keys if "mtp2" in k))
+        assert (
+            "model.mtp2.layers.0.mlp.experts.gate_up_proj.weight" not in keys
+        ), "fused stack kept beside unfused experts"
+        # unpinned top-level group: verbatim
+        assert "mtp3.fc.weight" in keys, "unpinned top-level group tensor dropped from export"
+        assert "mtp3.norm.weight" in keys
+        # tensor-spelled precedence
+        assert "mtp4.fc.weight" in keys, "tensor-spelled float pin dropped the tensor"
+        assert "mtp4.fc.qweight" not in keys, "tensor-spelled float pin was quantized by the broader pattern"
+        # a bare 1D norm tensor has no quantizable module: it stays verbatim
+        # even under the broader 8-bit pattern (pins only bind to Linears)
+        assert "mtp4.norm.weight" in keys, "mtp4 norm dropped"
+        # in-block extras
+        assert "model.layers.3.eh_proj.qweight" in keys, "pinned in-block checkpoint-only tensor not packed"
+        assert "model.layers.3.eh_proj.weight" not in keys
+        assert "model.layers.3.enorm.weight" in keys, "unpinned in-block extra dropped"
+        # incomplete tree: degraded mode, no tree sibling materialization
+        assert "model.layers.4.mlp.gate_proj.qweight" in keys, "pinned 2D tensor not quantized in degraded mode"
+        assert "model.layers.4.eh_proj.qweight" in keys, "degraded-mode eh_proj not packed"
+        assert "model.layers.4.mlp.gate_proj.weight" not in keys
+        assert "model.layers.4.enorm.weight" in keys, "unpinned sibling dropped in degraded mode"
+        # unreferenced auxiliary file
+        assert "mtp5.fc.weight" in keys, "tensors from unreferenced auxiliary file dropped from export"
+
+    def test_lm_head_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd):
+        """iters>0 tunes a pinned lm_head with the chain's final hidden states:
+        the tune runs, the layer packs, no closed-form fallback. Kept
+        SEPARATE from the tree-tune e2e: a tuned checkpoint-only tree mutates
+        the chain tail and the lm_head tune falls back (27B regression family;
+        the standalone form is the known-good baseline)."""
+        out = self._quantize(
+            tiny_checkpoint,
+            str(tmp_path / "out"),
+            stream=True,
+            dataset="NeelNanda/pile-10k",
+            layer_config={"lm_head": {"bits": 8}},
+            iters=1,
+        )
+        keys = self._export_keys(out)
+        assert "lm_head.qweight" in keys, "tuned lm_head not packed"
+        assert "lm_head.weight" not in keys, "plain weight kept beside packed form"
+        captured = capfd.readouterr()
+        console = captured.out + captured.err
+        assert "[stream] tuning lm_head with the run's tuning config" in console, "lm_head tune never started"
+        assert "[stream] lm_head falls back to the closed-form search" not in console, "unexpected fallback"
+
+    def test_mtp_group_tree_tunes_with_sign_round(self, tiny_checkpoint, tmp_path, capfd, monkeypatch):
+        """A tuning run (iters>0) tunes the materialized predictor tree with
+        the run's own quantizer config: the tune loop runs on the tree's
+        layers (visible in the log), the tuned Linears pack, norms pass
+        through, and the export stays complete."""
+        H = 32
+        extra = {
+            "model.layers.3.eh_proj.weight": torch.randn(H, 2 * H),
+            "model.layers.3.enorm.weight": torch.randn(H),
+            "model.layers.3.hnorm.weight": torch.randn(H),
+            "model.layers.3.final_layernorm.weight": torch.randn(H),
+            "model.layers.3.input_layernorm.weight": torch.randn(H),
+            "model.layers.3.post_attention_layernorm.weight": torch.randn(H),
+            "model.layers.3.self_attn.q_proj.weight": torch.randn(H, H),
+            "model.layers.3.self_attn.k_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.v_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.o_proj.weight": torch.randn(H, H),
+            "model.layers.3.mlp.gate_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.up_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.down_proj.weight": torch.randn(H, 64),
+        }
+        src = self._add_extra_group(tiny_checkpoint, tmp_path / "ck", extra)
+        # one run covers THREE lanes (merged from the standalone lm_head-tune,
+        # qon-chain, and sibling-materialize e2es): the predictor tree tune,
+        # the pinned lm_head tune, the qon chained-quantized-inputs contract,
+        # and full-tree materialization completeness
+        from auto_round.algorithms.composer import AlgorithmComposer
+
+        chain_calls = []
+        orig = AlgorithmComposer.compress_block
+
+        def spy(self, block, fp_inputs, input_others, *args, **kwargs):
+            chain_calls.append(kwargs.get("q_inputs", "absent"))
+            return orig(self, block, fp_inputs, input_others, *args, **kwargs)
+
+        monkeypatch.setattr(AlgorithmComposer, "compress_block", spy)
+        out = self._quantize(
+            src,
+            str(tmp_path / "out"),
+            stream=True,
+            dataset="NeelNanda/pile-10k",
+            layer_config={"model.layers.3": {"bits": 8}, "lm_head": {"bits": 8}},
+            iters=1,
+        )
+        keys = self._export_keys(out)
+        assert "model.layers.3.self_attn.q_proj.qweight" in keys, "tuned tree layer not packed"
+        assert "model.layers.3.self_attn.q_proj.weight" not in keys, "plain weight kept beside packed form"
+        assert "model.layers.3.eh_proj.qweight" in keys
+        for norm in ("enorm", "hnorm", "final_layernorm", "input_layernorm", "post_attention_layernorm"):
+            assert f"model.layers.3.{norm}.weight" in keys, f"norm {norm} dropped from export"
+        # the tune loop must actually run on the tree (caplog cannot see the
+        # project logger: propagate=False, and its stream handler predates
+        # pytest's sys redirects) - capture at the file-descriptor level
+        captured = capfd.readouterr()
+        console = captured.out + captured.err
+        assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
+        assert (
+            "[stream] tuning lm_head with the run's tuning config" in console
+        ), "lm_head tune never started (tree tune consumed the chain tail)"
+        assert "[stream] lm_head falls back to the closed-form search" not in console, "unexpected fallback"
+        assert "lm_head.qweight" in keys, "tuned lm_head not packed"
+        assert "lm_head.weight" not in keys, "plain lm_head kept beside packed form"
+        for leaf in (
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ):
+            assert f"model.layers.3.{leaf}.qweight" in keys, f"{leaf} not packed"
+            assert f"model.layers.3.{leaf}.weight" not in keys, f"plain weight kept beside packed form: {leaf}"
+        # "" = the checkpoint-only tree tune's call (no chained q input); the
+        # decoder-block chain itself must still start at None and link onward
+        block_calls = [q for q in chain_calls if q not in ("absent", "")]
+        assert len(block_calls) >= 2, f"expected >=2 chained block calls, got {len(block_calls)}"
+        assert block_calls[0] is None, "first block has no upstream quantized input"
+        assert any(q is not None for q in block_calls[1:]), "qon chain must feed quantized outputs downstream"
+
+    def _resolve(self, monkeypatch, device_list, quant="cuda:1", primary_fit=None):
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "device_count", lambda: 4)
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        stub = SimpleNamespace(
+            stream_prefetch="auto",
+            device=quant,
+            _primary_fits_largest_block=lambda dev: primary_fit,
+        )
+        monkeypatch.setattr(
+            "auto_round.compressors.orchestrator.device_manager",
+            SimpleNamespace(device_list=device_list),
+        )
+        return CompressionOrchestrator._resolve_stream_stage_devices(stub)
+
+    def test_auto_excludes_gpus_outside_device_map(self, monkeypatch):
+        devices = self._resolve(monkeypatch, device_list=["cuda:1", "cuda:2"])
+        # cuda:0 and cuda:3 are visible but not in the map: never staged;
+        # exactly ONE other device is picked (pool order)
+        assert [str(d) for d in devices] == ["cuda:2"]
+
+    def test_auto_primary_joins_only_within_device_map(self, monkeypatch):
+        devices = self._resolve(monkeypatch, device_list=["cuda:1", "cuda:2"], primary_fit=(6.9, 22.3))
+        assert sorted(str(d) for d in devices) == ["cuda:1", "cuda:2"]
+
+    def test_auto_capped_to_one_other_device(self, monkeypatch):
+        # many visible GPUs: still quant + ONE other home; lookahead is one
+        # block, so extra homes would only spread block VRAM around
+        devices = self._resolve(monkeypatch, device_list=[f"cuda:{i}" for i in range(4)], primary_fit=None)
+        assert [str(d) for d in devices] == ["cuda:0"]
+
+    def test_auto_sole_gpu_in_map_without_fit_falls_back_to_ram(self, monkeypatch):
+        assert self._resolve(monkeypatch, device_list=["cuda:1"], primary_fit=None) is None
+
+
+class TestResumeCudaCacheRelease:
+    def test_releases_reserved_segments_when_cuda_available(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        CompressionOrchestrator._release_cuda_cache("resume rebuild")
+        assert calls == [1]
+
+    def test_never_raises_without_cuda(self, monkeypatch):
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: False)
+        CompressionOrchestrator._release_cuda_cache("resume rebuild")
+
+
+class TestLoadBreakdown:
+    """AR_PERF_COUNTERS load sub-phase breakdown for the [perf] line."""
+
+    def test_empty_when_no_parts(self):
+        from auto_round.compressors.orchestrator import _format_load_breakdown
+
+        assert _format_load_breakdown({}) == ""
+        assert _format_load_breakdown(None) == ""
+
+    def test_subresolution_segments_fold_away(self):
+        from auto_round.compressors.orchestrator import _format_load_breakdown
+
+        assert _format_load_breakdown({"io": 0.01, "close": 0.02}) == ""
+
+    def test_breakdown_lists_significant_segments(self):
+        from auto_round.compressors.orchestrator import _format_load_breakdown
+
+        out = _format_load_breakdown({"io": 6.9, "close": 0.06, "inv": 2.0})
+        assert out == " (io 6.9s, close 0.1s, inv 2.0s)"
+
+    def test_streamer_reports_fetch_segments(self, tmp_path, monkeypatch):
+        import logging
+
+        monkeypatch.setenv("AR_PERF_COUNTERS", "1")
+        records = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        from auto_round.utils import checkpoint_streamer as cs_mod
+
+        handler = _Cap()
+        cs_mod.logger.addHandler(handler)
+        try:
+            streamer, block = self._tiny_fixture(tmp_path)
+            streamer.load_module_(block, "blk", device=None)
+        finally:
+            cs_mod.logger.removeHandler(handler)
+        # no standalone line: the segs are handed to the caller, which folds
+        # them into its single [perf] block rollup
+        assert not [r for r in records if r.startswith("[perf] streamer")]
+        assert streamer._perf_segs and streamer._perf_segs["tensors"] >= 1
+        assert "read" in streamer._perf_segs
+
+    @staticmethod
+    def _tiny_fixture(tmp_path):
+        import torch.nn as nn
+
+        streamer = CheckpointStreamer(
+            _make_sharded_checkpoint(tmp_path, {"single.safetensors": {"blk.a.weight": torch.randn(4, 8)}})
+        )
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 4, bias=False)
+
+        with torch.device("meta"):
+            blk = Blk()
+        return streamer, blk
+
+
+class TestFragmentationRelease:
+    """Phase-boundary release of provably-free cached segments before tuning."""
+
+    def _mk(self):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        return CompressionOrchestrator, SimpleNamespace()
+
+    def test_releases_when_gap_exceeds_threshold(self, monkeypatch):
+        import torch as _torch
+
+        cls, stub = self._mk()
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(_torch.cuda, "memory_reserved", lambda idx: 13 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "memory_allocated", lambda idx: 6 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "current_device", lambda: 0)
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        assert cls._release_cached_segments_if_fragmented(stub, "cuda:0") is True
+        assert calls == [1]
+
+    def test_noop_when_gap_small(self, monkeypatch):
+        import torch as _torch
+
+        cls, stub = self._mk()
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(_torch.cuda, "memory_reserved", lambda idx: 7 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "memory_allocated", lambda idx: 6 * 2**30)
+        monkeypatch.setattr(_torch.cuda, "current_device", lambda: 0)
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        assert cls._release_cached_segments_if_fragmented(stub, "cuda:0") is False
+        assert calls == []
+
+    def test_cpu_device_never_releases(self, monkeypatch):
+        import torch as _torch
+
+        cls, stub = self._mk()
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        calls = []
+        monkeypatch.setattr(_torch.cuda, "empty_cache", lambda: calls.append(1))
+        assert cls._release_cached_segments_if_fragmented(stub, "cpu") is False
+        assert calls == []
+
+
+class TestPrefetchConsumerWaits:
+    """load_module_ must wait out an in-flight prefetch of the same prefix.
+
+    Without the wait the consumer falls back to its own disk read while the
+    reader keeps staging the same block - two full copies on the staging
+    device, one freed only afterwards (block-sized reserved-but-unallocated
+    gap, first-forward OOMs on tightly-fitting GPUs).
+    """
+
+    def test_consumer_waits_for_inflight_staging(self, tmp_path, monkeypatch):
+        import threading
+        import time as _time
+
+        torch.manual_seed(0)
+        w = torch.randn(4, 8)
+        path = _make_sharded_checkpoint(tmp_path, {"single.safetensors": {"blk.a.weight": w}})
+        streamer = CheckpointStreamer(path)
+
+        import torch.nn as nn
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 4, bias=False)
+
+        with torch.device("meta"):
+            blk = Blk()
+
+        read_threads = []
+        real_read = streamer._read_tensor
+
+        def _slow_read(name, handles, order):
+            read_threads.append(threading.get_ident())
+            _time.sleep(0.05)
+            return real_read(name, handles, order)
+
+        monkeypatch.setattr(streamer, "_read_tensor", _slow_read)
+        streamer.start_prefetch(["blk"], depth=1, stage_devices=None)
+        try:
+            streamer.load_module_(blk, "blk", device=None)
+        finally:
+            streamer.stop_prefetch()
+        # every tensor came from the reader's staging, never the main thread
+        assert read_threads and set(read_threads) != {threading.get_ident()}
+        assert torch.equal(blk.a.weight.data, w)
+
+    def test_non_enqueued_prefix_does_not_wait(self, tmp_path, monkeypatch):
+        import threading
+        import time as _time
+
+        w = torch.randn(4, 8)
+        e = torch.randn(8, 4)
+        path = _make_sharded_checkpoint(tmp_path, {"single.safetensors": {"blk.a.weight": w, "embed.weight": e}})
+        streamer = CheckpointStreamer(path)
+
+        import torch.nn as nn
+
+        class Blk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 4, bias=False)
+
+        class Emb(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.zeros(8, 4, dtype=torch.float32).to("meta"))
+
+        started = threading.Event()
+        release = threading.Event()
+
+        real_read = streamer._read_tensor
+
+        def _gated_read(name, handles, order):
+            if name.startswith("blk."):
+                started.set()
+                release.wait(timeout=10)
+            return real_read(name, handles, order)
+
+        monkeypatch.setattr(streamer, "_read_tensor", _gated_read)
+        streamer.start_prefetch(["blk"], depth=1, stage_devices=None)
+        try:
+            assert started.wait(timeout=10)  # reader is mid-staging blk
+            with torch.device("meta"):
+                emb = Emb()
+            streamer.load_module_(emb, "embed", device=None)  # not enqueued: must not block
+            assert torch.equal(emb.weight.data, e)
+        finally:
+            release.set()
+            streamer.stop_prefetch()
+
+
+class TestOutsideBlockQuantDevice:
+    """Outside-block layers quantize on the accelerator when the run has one
+    (the block loop is done, GPUs idle; checkpoint-only groups can hold
+    hundreds of expert Linears); CPU otherwise."""
+
+    def _dev(self, device):
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        stub = SimpleNamespace(model_context=SimpleNamespace(device=device))
+        return CompressionOrchestrator._outside_block_quant_device(stub)
+
+    def test_cpu_run_stays_cpu(self):
+        assert self._dev("cpu").type == "cpu"
+
+    def test_gpu_run_uses_quant_device(self):
+        assert self._dev("cuda:0").type == "cuda"
+
+    def test_missing_context_falls_back(self):
+        assert self._dev("not-a-device").type == "cpu"
+
+    def test_loop_wires_the_device(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
+        assert "_outside_block_quant_device()" in src
+        assert "device=str(outside_qdev)" in src
+
+
+class TestOutsideBlockPackUnderStreaming:
+    """Outside-block layers (lm_head) must pack + shard-write during the run:
+    the export pack loop is skipped under the streaming meta skeleton, so the
+    shards are the only durable home for their packed state."""
+
+    def test_outside_block_pack_and_write_wired(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
+        i = src.index("Quantizing remaining layer")
+        window = src[i : i + 2600]  # lm_head tune wiring sits between the log line and the pack tail
+        assert "immediate_pack" in window, "outside-block pass does not pack under streaming"
+        assert "shard_writer.write(name=name)" in window, "outside-block pass does not write to shards"
+        assert "is_immediate_saving" in window, "pack+write must be gated on immediate saving"
+
+
+class TestCheckpointOnlyGroupTree:
+    """Unit coverage for the checkpoint-only group analyzer and the fused
+    expert-stack resolution used when building a real module tree from a
+    sibling structure snapshot."""
+
+    @staticmethod
+    def _stub(tensors, shapes):
+        from types import MethodType, SimpleNamespace
+
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        model = nn.Module()
+        outer = nn.Module()
+        layers = nn.Module()
+        for i in range(2):
+            blk = nn.Module()
+            blk.self_attn = nn.Module()
+            blk.self_attn.q_proj = nn.Linear(8, 8, bias=False)
+            blk.mlp = nn.Module()
+            blk.mlp.gate_proj = nn.Linear(8, 8, bias=False)
+            blk.input_layernorm = nn.Module()
+            layers.add_module(str(i), blk)
+        outer.add_module("layers", layers)
+        model.add_module("model", outer)
+        model.config = SimpleNamespace(hidden_size=8)
+
+        class Streamer:
+            tensor_names = list(tensors)
+            weight_map = {n: "shard0" for n in tensors}
+
+            def names_under(self, prefix):
+                return [n for n in tensors if n.startswith(prefix + ".")]
+
+            def tensor_meta(self, name):
+                meta = shapes.get(name)
+                return (meta, "BF16") if meta else None
+
+            def resolve_checkpoint_name(self, name):
+                return name if name in tensors else None
+
+        stub = SimpleNamespace(model=model, layer_config={}, regex_config={})
+        for m in (
+            "_analyze_checkpoint_only_group_",
+            "_resolve_group_param_source_",
+            "_pin_entry_for",
+            "_text_config",
+        ):
+            stub.__setattr__(m, MethodType(getattr(CompressionOrchestrator, m), stub))
+        return stub, Streamer(), model
+
+    def test_analyze_digit_block_group(self):
+        H = 8
+        tensors = [
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.3.eh_proj.weight",
+            "model.layers.3.enorm.weight",
+            "model.layers.3.hnorm.weight",
+            "model.layers.3.self_attn.q_proj.weight",
+            "model.layers.3.mlp.gate_proj.weight",
+        ]
+        shapes = {
+            "model.layers.3.eh_proj.weight": (H, 2 * H),
+            "model.layers.3.enorm.weight": (H,),
+            "model.layers.3.hnorm.weight": (H,),
+        }
+        stub, streamer, _ = self._stub(tensors, shapes)
+        info = stub._analyze_checkpoint_only_group_(streamer, "model.layers.3")
+        assert info is not None
+        assert info["fc"] == "model.layers.3.eh_proj.weight"
+        assert info["norm_e"] == "model.layers.3.enorm.weight"
+        assert info["norm_h"] == "model.layers.3.hnorm.weight"
+        assert info["layer_root"] == "model.layers.3"
+
+    def test_analyze_nested_layer_root(self):
+        H = 8
+        tensors = [
+            "mtp.fc.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.norm.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+        ]
+        shapes = {
+            "mtp.fc.weight": (H, 2 * H),
+            "mtp.pre_fc_norm_embedding.weight": (H,),
+            "mtp.pre_fc_norm_hidden.weight": (H,),
+            "mtp.norm.weight": (H,),
+        }
+        stub, streamer, _ = self._stub(tensors, shapes)
+        info = stub._analyze_checkpoint_only_group_(streamer, "mtp")
+        assert info is not None
+        assert info["fc"] == "mtp.fc.weight"
+        assert info["norm_e"].endswith("pre_fc_norm_embedding.weight")
+        assert info["norm_h"].endswith("pre_fc_norm_hidden.weight")
+        assert info["final_norm"].endswith("mtp.norm.weight")
+        assert info["layer_root"] == "mtp.layers.0"
+
+    def test_analyze_rejects_group_without_prologue(self):
+        tensors = ["mtp.layers.0.self_attn.q_proj.weight", "mtp.layers.0.mlp.gate_proj.weight"]
+        stub, streamer, _ = self._stub(tensors, {})
+        assert stub._analyze_checkpoint_only_group_(streamer, "mtp") is None
+
+    def test_fused_expert_stack_resolution(self):
+        tensors = [
+            "model.layers.3.mlp.experts.gate_up_proj.weight",
+            "model.layers.3.mlp.experts.down_proj.weight",
+            "model.layers.3.mlp.experts.0.gate_proj.weight",  # never both layouts; resolution must prefer exact
+        ]
+        stub, streamer, _ = self._stub(tensors, {})
+        src = stub._resolve_group_param_source_(
+            streamer, "model.layers.1", "model.layers.3", "mlp.experts.2.gate_proj.weight"
+        )
+        assert src is not None and src[0] == "fused"
+        assert src[1] == "model.layers.3.mlp.experts.gate_up_proj.weight"
+        assert src[2] == 2 and src[3] == "gate_proj"
+        down = stub._resolve_group_param_source_(
+            streamer, "model.layers.1", "model.layers.3", "mlp.experts.5.down_proj.weight"
+        )
+        assert down is not None and down[0] == "fused"
+        assert down[1] == "model.layers.3.mlp.experts.down_proj.weight"
+
+    def test_tree_attach_slices_fused_expert_stacks(self):
+        """Building a tree over a fused-3D checkpoint slices each pinned
+        per-expert projection out of its stack (real weights, claimed tensor
+        names), so the outside-block pass can quantize experts per-module."""
+        from types import MethodType, SimpleNamespace
+
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        H, E, I = 8, 3, 4
+        model = nn.Module()
+        outer = nn.Module()
+        layers = nn.Module()
+        blk = nn.Module()
+        blk.self_attn = nn.Module()
+        with torch.device("meta"):
+            blk.self_attn.q_proj = nn.Linear(H, H, bias=False)
+        blk.mlp = nn.Module()
+        experts = nn.ModuleList()
+        for e in range(E):
+            m = nn.Module()
+            with torch.device("meta"):
+                m.gate_proj = nn.Linear(H, I, bias=False)
+                m.up_proj = nn.Linear(H, I, bias=False)
+                m.down_proj = nn.Linear(I, H, bias=False)
+            experts.add_module(str(e), m)
+        blk.mlp.experts = experts
+        blk.input_layernorm = nn.Module()
+        layers.add_module("0", blk)
+        outer.add_module("layers", layers)
+        model.add_module("model", outer)
+        model.config = SimpleNamespace(hidden_size=H)
+
+        tensors = [
+            "mtp.fc.weight",
+            "mtp.enorm.weight",
+            "mtp.hnorm.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight",
+            "mtp.layers.0.mlp.experts.down_proj.weight",
+        ]
+        shapes = {
+            "mtp.fc.weight": (H, 2 * H),
+            "mtp.enorm.weight": (H,),
+            "mtp.hnorm.weight": (H,),
+        }
+        weights = {
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight": torch.randn(E, 2 * I, H),
+            "mtp.layers.0.mlp.experts.down_proj.weight": torch.randn(E, H, I),
+        }
+
+        class Streamer:
+            tensor_names = tensors
+            weight_map = {n: "s0" for n in tensors}
+
+            def names_under(self, prefix):
+                return [n for n in tensors if n.startswith(prefix + ".")]
+
+            def tensor_meta(self, name):
+                meta = shapes.get(name) or (tuple(weights[name].shape) if name in weights else None)
+                return (meta, "BF16") if meta else None
+
+            def resolve_checkpoint_name(self, name):
+                return name if name in tensors else None
+
+            def fetch(self, name, device=None, raw=False):
+                assert name in weights, name
+                return weights[name].clone()
+
+            def _assign_leaf_(self, module, rel_name, tensor):
+                parts = rel_name.split(".")
+                parent = module.get_submodule(".".join(parts[:-1]))
+                leaf = parts[-1]
+                assert leaf in parent._parameters, rel_name
+                parent._parameters[leaf] = torch.nn.Parameter(tensor, requires_grad=False)
+                return True
+
+        stub = SimpleNamespace(
+            model=model,
+            layer_config={"mtp.fc": {"bits": 8}},
+            regex_config={"mtp": {"bits": 8}},  # prefix pin, normalized like real runs
+        )
+        for m in (
+            "_analyze_checkpoint_only_group_",
+            "_resolve_group_param_source_",
+            "_pick_sibling_layer_",
+            "_attach_checkpoint_only_group_tree_",
+            "_pin_entry_for",
+            "_text_config",
+        ):
+            stub.__setattr__(m, MethodType(getattr(CompressionOrchestrator, m), stub))
+        streamer = Streamer()
+        info = stub._analyze_checkpoint_only_group_(streamer, "mtp")
+        assert info is not None and info["layer_root"] == "mtp.layers.0"
+        sibling = stub._pick_sibling_layer_(streamer, info, [["model.layers.0"]])
+        assert sibling is not None, "per-expert sibling must cover via the fused bridge"
+        claimed = stub._attach_checkpoint_only_group_tree_(streamer, info, sibling[1], sibling[2])
+        assert "mtp.layers.0.mlp.experts.gate_up_proj.weight" in claimed
+        assert "mtp.layers.0.mlp.experts.down_proj.weight" in claimed
+        tree = model.get_submodule("mtp.layers.0")
+        e1 = tree.mlp.experts[1]
+        assert e1.gate_proj.weight.device.type != "meta"
+        assert torch.equal(e1.gate_proj.weight.data, weights["mtp.layers.0.mlp.experts.gate_up_proj.weight"][1, :I])
+        assert torch.equal(e1.down_proj.weight.data, weights["mtp.layers.0.mlp.experts.down_proj.weight"][1])
+        assert getattr(e1.gate_proj, "bits", None) == 8
+        fc = model.get_submodule("mtp.fc")
+        assert isinstance(fc, nn.Linear) and fc.in_features == 2 * H and getattr(fc, "bits", None) == 8
+
+    def test_group_rmsnorm_numerics(self):
+        import torch
+
+        from auto_round.compressors.orchestrator import CheckpointOnlyRMSNorm
+
+        norm = CheckpointOnlyRMSNorm(8, eps=1e-6)
+        norm.weight = torch.nn.Parameter(torch.randn(8), requires_grad=False)  # streamed in, like production
+        x = torch.randn(2, 8, dtype=torch.bfloat16)
+        ref = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6) * norm.weight.float()).to(
+            torch.bfloat16
+        )
+        assert torch.equal(norm(x), ref)
+
+
+class TestCheckpointOnlyPredictorForward:
+    """The generic predictor forward and e-first input synthesis."""
+
+    def test_predictor_e_from_token_ids(self):
+        import torch
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import synthesize_predictor_e
+
+        embed = nn.Embedding(10, 4)
+        ids = torch.tensor([[5, 9, 3, 7]])
+        e = synthesize_predictor_e(ids, embed=embed)
+        assert torch.equal(e, embed(torch.tensor([[9, 3, 7, 7]]))), "position t must consume token t+1"
+
+    def test_predictor_e_from_embedded_rows(self):
+        import torch
+
+        from auto_round.compressors.orchestrator import synthesize_predictor_e
+
+        rows = torch.randn(2, 5, 4)
+        e = synthesize_predictor_e(rows)
+        assert e.shape == rows.shape
+        assert torch.equal(e[:, :-1], rows[:, 1:]) and torch.equal(e[:, -1], rows[:, -1])
+
+    @staticmethod
+    def _bound_shell():
+        import torch
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import (
+            CheckpointOnlyRMSNorm,
+            bind_checkpoint_only_predictor,
+        )
+
+        H = 8
+        torch.manual_seed(3)
+        shell = nn.Module()
+        norm_e = CheckpointOnlyRMSNorm(H, eps=1e-6)
+        norm_h = CheckpointOnlyRMSNorm(H, eps=1e-6)
+        final_norm = CheckpointOnlyRMSNorm(H, eps=1e-6)
+        norm_e.weight = torch.nn.Parameter(torch.randn(H), requires_grad=False)
+        norm_h.weight = torch.nn.Parameter(torch.randn(H), requires_grad=False)
+        final_norm.weight = torch.nn.Parameter(torch.randn(H), requires_grad=False)
+        fc = nn.Linear(2 * H, H, bias=False)
+
+        class Layer(nn.Module):
+            def forward(self, x, position_ids=None):
+                self.seen_position_ids = position_ids
+                return (x * 1.0 + 0.0,)
+
+        layer = Layer()
+        e = torch.randn(1, 6, H)
+        h = torch.randn(1, 6, H)
+        bind_checkpoint_only_predictor(
+            shell, {"norm_e": norm_e, "norm_h": norm_h, "fc": fc, "layer": layer, "final_norm": final_norm}, e=e
+        )
+        return shell, e, h, norm_e, norm_h, fc, layer, final_norm
+
+    def test_forward_math_e_first(self):
+        import torch
+
+        shell, e, h, norm_e, norm_h, fc, layer, final_norm = self._bound_shell()
+        pos = torch.arange(6).unsqueeze(0)
+        out = shell(h, position_ids=pos)
+        assert torch.equal(layer.seen_position_ids, pos), "keyword inputs must pass through to the layer"
+        ref = final_norm(fc(torch.cat([norm_e(e), norm_h(h)], dim=-1)))
+        assert torch.allclose(out, ref, atol=1e-5), "e-first concat order broken"
+        wrong = final_norm(fc(torch.cat([norm_h(h), norm_e(e)], dim=-1)))
+        assert not torch.allclose(out, wrong), "h-first concat would also pass the check"
+
+    def test_forward_requires_bound_e(self):
+        import torch
+
+        from auto_round.compressors.orchestrator import bind_checkpoint_only_predictor
+
+        shell, _, h, *_ = self._bound_shell()
+        shell._predictor_e = None
+        try:
+            shell(h)
+            raise AssertionError("unbound e must raise")
+        except RuntimeError:
+            pass
+
+    def test_binding_does_not_duplicate_modules(self):
+        before = [n for n, _ in self._bound_shell()[0].named_modules()]
+        assert before == [""]  # refs live in a plain dict, never registered
+
+
+class TestCheckpointOnlyGroupVisibility:
+    """Silent skips must be visible: iters>0 keeps groups verbatim with a
+    warning, and pinned non-2D tensors (fused expert stacks) report that they
+    stay unquantized."""
+
+    def test_skip_paths_log(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._materialize_pinned_checkpoint_only_blocks_)
+        # pinned groups quantize in BOTH regimes now (no env-gated verbatim
+        # skip); the remaining visible skips are the non-quantizable pin and
+        # the non-2D tail
+        assert "stays verbatim: its pin matched no quantizable" in src  # message spans source lines
+        assert "not 2D weights" in src and "skipped_non_2d" in src
+        # per-group decision visibility: recognized pattern vs degraded
+        assert "no decoder sibling" in src and "covers its tensors" in src
+        tune_src = inspect.getsource(CompressionOrchestrator._tune_checkpoint_only_groups_)
+        assert "tuning checkpoint-only group" in tune_src
+        assert "fall back to the closed-form search" in tune_src
+
+
+class TestTreeFusedStackWrite:
+    """Fused expert stacks inside materialized predictor trees: the stack is
+    superseded (dropped from the export) only when EVERY per-expert slice
+    quantized; a partially pinned stack stays the verbatim checkpoint copy -
+    it is the durable home of the unpinned experts. Unpinned slices must
+    carry real weights through the tuning forward (never popped meta)."""
+
+    class _FakeQuantLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bits = 4
+            self.group_size = 32
+            self.act_bits = 16
+
+    class _FakeLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(4, 4))
+
+    class _FakeStreamer:
+        def __init__(self, names, tensors):
+            self._names = names
+            self._tensors = tensors
+
+        def names_under(self, prefix):
+            return [n for n in self._names if n.startswith(prefix + ".")]
+
+        def tensor_meta(self, name):
+            t = self._tensors.get(name)
+            return (tuple(t.shape), t.dtype) if t is not None else None
+
+        def fetch(self, name, raw=False):
+            return self._tensors[name]
+
+    class _FakeWriter:
+        def __init__(self):
+            self.saved = []
+            self._all_saved = set()
+
+        def save_tensor(self, name, tensor):
+            self.saved.append(name)
+            self._all_saved.add(name)
+
+    def _run_writer(self, expert_modules, stack_bytes):
+        """expert_modules: {path: module}; returns saved tensor names."""
+        from types import SimpleNamespace
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = object.__new__(CompressionOrchestrator)
+        stack_gu = torch.randn(4, 8, 16)
+        stack_dn = torch.randn(4, 16, 8)
+        tensors = {
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight": stack_gu,
+            "mtp.layers.0.mlp.experts.down_proj.weight": stack_dn,
+        }
+        model = torch.nn.Module()
+        model.__dict__["globals"] = None
+        # attach modules at their paths on a plain container
+        holder = torch.nn.Module()
+        model.add_module("holder", holder)
+        for path, mod in expert_modules.items():
+            parts = path.split(".")
+            cur = model
+            for p in parts[:-1]:
+                if not hasattr(cur, p):
+                    cur.add_module(p, torch.nn.Module())
+                cur = getattr(cur, p)
+            cur.add_module(parts[-1], mod)
+        orch.model = model
+        orch.shard_writer = self._FakeWriter()
+        streamer = self._FakeStreamer(
+            ["mtp.layers.0.mlp.experts.gate_up_proj.weight", "mtp.layers.0.mlp.experts.down_proj.weight"], tensors
+        )
+        orch._write_unpacked_group_tensors_(streamer, ["mtp"])
+        return orch.shard_writer.saved
+
+    def test_fully_packed_stack_is_dropped(self):
+        mods = {}
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                mods[f"mtp.layers.0.mlp.experts.{e}.{proj}"] = self._FakeQuantLinear()
+        saved = self._run_writer(mods, None)
+        assert saved == [], f"fully packed stack still shipped verbatim: {saved}"
+
+    def test_partially_packed_stack_stays_verbatim(self):
+        mods = {}
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                # expert 3 stays unquantized
+                mods[f"mtp.layers.0.mlp.experts.{e}.{proj}"] = self._FakeQuantLinear() if e < 3 else self._FakeLinear()
+        saved = self._run_writer(mods, None)
+        assert "mtp.layers.0.mlp.experts.gate_up_proj.weight" in saved
+        assert "mtp.layers.0.mlp.experts.down_proj.weight" in saved
+
+    def test_attach_never_pops_unpinned_expert_params(self):
+        import inspect
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        src = inspect.getsource(CompressionOrchestrator._attach_checkpoint_only_group_tree_)
+        assert "_parameters.pop" not in src, "unpinned expert params must stay real for the tuning forward"
+        assert "partial_fused" in src and "claimed_fused -= partial_fused" in src
+
+
+class TestPredictorESynthesis:
+    """Unit coverage for the e-first input synthesis and the generic
+    predictor forward's batched-e handling."""
+
+    def test_token_ids_without_embed_raise(self):
+        from auto_round.compressors.orchestrator import synthesize_predictor_e
+
+        ids = torch.randint(0, 100, (2, 8))
+        with pytest.raises(ValueError, match="need the embedding module"):
+            synthesize_predictor_e(ids, embed=None)
+
+    def test_predictor_forward_accepts_batched_e_list(self):
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import forward_checkpoint_only_predictor
+
+        class Shell(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(8, 4)
+                self._layer_ran = False
+
+            def layer(self, *a, **kw):
+                self._layer_ran = True
+                return a[0] if a else kw.get("hidden_states")
+
+        shell = Shell()
+        from auto_round.compressors.orchestrator import bind_checkpoint_only_predictor
+
+        bind_checkpoint_only_predictor(
+            shell,
+            {
+                "norm_e": nn.Identity(),
+                "norm_h": nn.Identity(),
+                "fc": shell.fc,
+                "layer": shell.layer,
+                "final_norm": None,
+            },
+        )
+        h = torch.randn(2, 5, 4)
+        e = torch.randn(2, 5, 4)
+        out = forward_checkpoint_only_predictor(shell, h, _predictor_e=[e])
+        assert out is not None and shell._layer_ran
+
+
+class TestStreamingGlobalBlockIndex:
+    """BlockContext.block_index is the position in the FULL block list (the
+    data-driven parity contract); a multi-group quant_block_list must see
+    monotonically advancing indices across groups, not group-local ones."""
+
+    def test_blocks_before_update_nests_at_group_tail(self):
+        import ast
+        import inspect
+
+        # structural (AST) pin: the accumulator update must be a DIRECT
+        # statement of the group loop's body (not nested inside the inner
+        # per-block loop, not after the loop) - source-substring checks
+        # cannot see nesting and let two regressions through
+        import textwrap
+
+        from auto_round.compressors import orchestrator as orch_mod
+
+        fn = orch_mod.CompressionOrchestrator._quantize_zero_shot
+        fn_node = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+        group_loop = next(
+            n
+            for n in ast.walk(fn_node)
+            if isinstance(n, ast.For)
+            and isinstance(n.iter, ast.Call)
+            and getattr(n.iter.func, "id", getattr(n.iter.func, "attr", None)) == "enumerate"
+        )
+        inner_loop = next(
+            n
+            for n in ast.walk(group_loop)
+            if n is not group_loop and isinstance(n, ast.For) and n.lineno > group_loop.lineno
+        )
+        direct_updates = [
+            s
+            for s in group_loop.body
+            if isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name) and s.target.id == "blocks_before"
+        ]
+        assert direct_updates, "blocks_before update drifted out of the group loop"
+        assert direct_updates[0].lineno > inner_loop.end_lineno, "blocks_before update nested inside the per-block loop"
+
+    def test_stream_quantization_with_diffusion_raises(self, monkeypatch):
+        """A diffusion pipeline cannot stream decoder blocks; the flag must
+        fail loud instead of silently materializing the pipeline."""
+        import pytest
+
+        from auto_round import envs
+        from auto_round.context.model import ModelContext
+
+        monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        monkeypatch.setattr("auto_round.context.model.is_mllm_model", lambda *a, **k: False)
+        monkeypatch.setattr("auto_round.context.model.is_diffusion_model", lambda *a, **k: True)
+        ModelContext.reset_context()
+        try:
+            with pytest.raises(ValueError, match="diffusion"):
+                ModelContext("dummy-model", stream_quantization=True)
+        finally:
+            ModelContext.reset_context()
+
+    def test_untuned_tree_shells_parked_after_write(self):
+        """Zero-shot/fallback tree groups must park to meta after the
+        verbatim write: real per-expert slices left in the tree would be
+        duplicated by the finalize capture loop under module names no
+        checkpoint carries."""
+        import torch.nn as nn
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = object.__new__(CompressionOrchestrator)
+        orch.model = nn.Module()
+        tuned = nn.Module()
+        untuned = nn.Module()
+        untuned.experts = nn.Module()
+        untuned.experts.fc = nn.Linear(4, 4)
+        orch.model.add_module("tuned", tuned)
+        orch.model.add_module("untreed", nn.Module())  # control: never touched
+        orch.model.add_module("untuned", untuned)
+        orch._park_untuned_tree_shells_(["tuned", "untuned"], {"tuned"})
+        assert all(p.is_meta for p in untuned.parameters()), "untuned tree shell stayed real"
+        assert not any(p.is_meta for p in tuned.parameters()), "tuned group must not be re-parked"
+
+
+class TestZeroShotExceptionTeardown:
+    """A failed zero-shot run must stop the prefetch reader and close the
+    streamer before the exception escapes: otherwise a library user catching
+    the exception and retrying in-process starts with a daemon thread pinning
+    depth+1 staged blocks of VRAM it can never release."""
+
+    def test_exception_stops_prefetch_and_closes(self, monkeypatch):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        calls = []
+
+        class _Streamer:
+            def stop_prefetch(self):
+                calls.append("stop")
+
+            def close(self):
+                calls.append("close")
+
+        orch = object.__new__(CompressionOrchestrator)
+
+        def _boom(self):
+            raise RuntimeError("tune exploded")
+
+        monkeypatch.setattr(CompressionOrchestrator, "_quantize_zero_shot", _boom)
+        orch.need_calib = False
+        orch._post_init_done = True  # skip post_init's calibrator construction
+        orch.amp_dtype = torch.float32
+        orch.model_context = type("MC", (), {"checkpoint_streamer": _Streamer()})()
+        import pytest
+
+        with pytest.raises(RuntimeError, match="tune exploded"):
+            orch.quantize()
+        assert calls == ["stop", "close"], f"teardown did not run (or ran partially): {calls}"
+
+    def test_auto_sole_gpu_with_fit_stages_on_primary(self, monkeypatch):
+        """Sole GPU whose free VRAM fits the largest block: the primary joins
+        as its own staging home (same-device staging), not host RAM."""
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        stub = SimpleNamespace(
+            stream_prefetch="auto",
+            device="cuda:0",
+            _primary_fits_largest_block=lambda dev: (6.9, 22.3),
+        )
+        monkeypatch.setattr(
+            "auto_round.compressors.orchestrator.device_manager",
+            SimpleNamespace(device_list=["cuda:0"]),
+        )
+        devices = CompressionOrchestrator._resolve_stream_stage_devices(stub)
+        assert [str(d) for d in devices] == ["cuda:0"]
+
+    def test_on_sole_gpu_without_fit_stays_enabled_as_ram(self, monkeypatch):
+        """'on' never silently disables: sole GPU without fit lands on host
+        RAM (devices None) via the info-log fallback, not a warning bail."""
+        from types import SimpleNamespace
+
+        import torch as _torch
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        monkeypatch.setattr(_torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(_torch.cuda, "is_available", lambda: True)
+        stub = SimpleNamespace(
+            stream_prefetch="on",
+            device="cuda:0",
+            _primary_fits_largest_block=lambda dev: None,
+        )
+        monkeypatch.setattr(
+            "auto_round.compressors.orchestrator.device_manager",
+            SimpleNamespace(device_list=["cuda:0"]),
+        )
+        assert CompressionOrchestrator._resolve_stream_stage_devices(stub) is None
+
+    def test_legacy_prefetch_forms_normalize(self):
+        """Legacy API spellings normalize into the single string knob: ints
+        (0/depth), None, and bools. True must map to 'auto', not the invalid
+        device string 'true'."""
+        import inspect
+
+        from auto_round.compressors.base import BaseCompressor
+
+        src = inspect.getsource(BaseCompressor.__init__)
+        assert "isinstance(_prefetch_raw, bool)" in src, "bool carve-out missing"
+        # behavioral check of the exact normalization expressions
+        for raw, want in [(0, "off"), (2, "auto"), (None, "auto"), (True, "auto"), (False, "off"), ("off", "off")]:
+            _prefetch_raw = raw
+            if _prefetch_raw is None:
+                _prefetch_raw = "auto"
+            elif isinstance(_prefetch_raw, bool):
+                _prefetch_raw = "auto" if _prefetch_raw else "off"
+            elif isinstance(_prefetch_raw, int):
+                _prefetch_raw = "auto" if _prefetch_raw else "off"
+            got = str(_prefetch_raw).strip().lower() or "off"
+            assert got == want, (raw, got, want)
+
+    def test_teardown_joins_inflight_bg_pack_worker(self, monkeypatch):
+        """The exception teardown must join a live bg-pack worker before
+        returning: an orphan keeps writing shards and a same-object
+        catch-and-rerun would race the lock-free writer."""
+        import threading
+        import time
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (time.sleep(0.05), done.set()), daemon=True)
+        t.start()
+
+        class _Streamer:
+            def stop_prefetch(self):
+                pass
+
+            def close(self):
+                pass
+
+        def _boom(self):
+            raise RuntimeError("tune exploded")
+
+        monkeypatch.setattr(CompressionOrchestrator, "_quantize_zero_shot", _boom)
+        orch = object.__new__(CompressionOrchestrator)
+        orch.need_calib = False
+        orch._post_init_done = True
+        orch.amp_dtype = torch.float32
+        orch._bg_pack_thread = t
+        orch.model_context = type("MC", (), {"checkpoint_streamer": _Streamer()})()
+        import pytest
+
+        with pytest.raises(RuntimeError, match="tune exploded"):
+            orch.quantize()
+        assert not t.is_alive(), "teardown returned before the bg-pack worker joined"
+        assert orch._bg_pack_thread is None
+
+
+class TestStreamResumeJumpChainGuard:
+    """A partially-done group whose successor chain entry is missing or
+    crash-window-rejected must fail loud: silently continuing would skip
+    manifest-done blocks while the chain stays at raw embedding outputs."""
+
+    def _orch(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        orch = object.__new__(CompressionOrchestrator)
+        # alg_composer is a read-only property: stash the stub where the
+        # method reads it
+        object.__setattr__(orch, "_alg_composer", type("AC", (), {"need_quanted_input": lambda self: False})())
+        return orch
+
+    def test_pending_group_without_entry_raises(self):
+        import pytest
+
+        orch = self._orch()
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 3,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: None,
+                "load_q_input": lambda self: None,
+            },
+        )()
+        with pytest.raises(RuntimeError, match="inconsistent"):
+            orch._stream_resume_jump_chain({"fp_inputs": None}, [rs])
+
+    def test_fully_done_group_without_entry_is_skipped(self):
+        orch = self._orch()
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 5,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: None,  # final-block unlink
+                "load_q_input": lambda self: None,
+            },
+        )()
+        calib = {"fp_inputs": None}
+        orch._stream_resume_jump_chain(calib, [rs])  # must not raise
+        assert calib["fp_inputs"] is None
+
+    def test_missing_q_input_with_quanted_chain_raises(self):
+        import pytest
+
+        orch = self._orch()
+        object.__setattr__(
+            orch,
+            "_alg_composer",
+            type("AC", (), {"need_quanted_input": lambda self: True})(),
+        )
+        entry = torch.zeros(1, 4, 8)
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 2,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: entry,
+                "load_q_input": lambda self: None,  # crash-window rejected / removed
+            },
+        )()
+        with pytest.raises(RuntimeError, match="quantized-input entry"):
+            orch._stream_resume_jump_chain({"fp_inputs": None}, [rs])
+
+    def test_valid_entry_still_jumps(self):
+        import torch
+
+        orch = self._orch()
+        entry = torch.zeros(1, 4, 8)
+        rs = type(
+            "RS",
+            (),
+            {
+                "resume_index": 2,
+                "block_names": [f"b{i}" for i in range(5)],
+                "load_input_ids": lambda self: entry,
+                "load_q_input": lambda self: None,
+            },
+        )()
+        calib = {"fp_inputs": None}
+        orch._stream_resume_jump_chain(calib, [rs])
+        assert calib["fp_inputs"] is entry
+
+
+class TestFindEmbeddingRenamed:
+    """transformers 5.x VL trees nest the text backbone (model.language_model.*)
+    while checkpoints ship pre-nesting keys; _find_embedding must go through the
+    streamer's rename resolver, not raw weight_map membership."""
+
+    def test_embedding_found_through_rename_resolver(self):
+        import torch
+
+        from auto_round.utils.streaming_calibration import _find_embedding
+
+        class _Streamer:
+            weight_map = {"model.embed_tokens.weight": "model.safetensors"}
+
+            def resolve_checkpoint_name(self, name):
+                if name == "model.language_model.embed_tokens.weight":
+                    return "model.embed_tokens.weight"
+                return name if name in self.weight_map else None
+
+        class _VL:
+            def __init__(self):
+                self.language_model = torch.nn.Module()
+                self.language_model.embed_tokens = torch.nn.Embedding(100, 8)
+                self.visual = torch.nn.Module()
+                self.visual.patch_embed = torch.nn.Module()
+                self.visual.patch_embed.pos_embed = torch.nn.Embedding(16, 8)
+
+            def named_modules(self):
+                yield "", self
+                yield "model.language_model", self.language_model
+                yield "model.language_model.embed_tokens", self.language_model.embed_tokens
+                yield "visual", self.visual
+                yield "visual.patch_embed", self.visual.patch_embed
+                yield "visual.patch_embed.pos_embed", self.visual.patch_embed.pos_embed
+
+        class _Cfg:
+            vocab_size = 100
+
+        vl = _VL()
+        vl.config = _Cfg()
+        name, mod = _find_embedding(vl, _Streamer())
+        assert name == "model.language_model.embed_tokens", f"got {name}"
+        assert mod is vl.language_model.embed_tokens
+
+    def test_embedding_still_found_without_resolver(self):
+        import torch
+
+        from auto_round.utils.streaming_calibration import _find_embedding
+
+        class _Streamer:
+            weight_map = {"model.embed_tokens.weight": "model.safetensors"}
+
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(50, 8)
+        model.config = type("C", (), {"vocab_size": 50})()
+        name, mod = _find_embedding(model, _Streamer())
+        assert name == "model.embed_tokens" and mod is model.model.embed_tokens
+
+
+class TestVlFlatCheckpointRenames:
+    """qwen2-vl-family checkpoints ship flat ``model.*`` text backbones while
+    transformers 5.x nests the tree under ``model.language_model.*``; the
+    streamer must resolve both directions."""
+
+    FLAT_KEYS = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "visual.blocks.0.mlp.fc1.weight",
+    ]
+
+    def test_reverse_name_map_maps_flat_text_backbone(self):
+        from auto_round.utils.checkpoint_streamer import reverse_name_map
+
+        for mt in ("qwen2_vl", "qwen2_5_vl"):
+            rev = reverse_name_map(mt, self.FLAT_KEYS)
+            assert rev["model.language_model.embed_tokens.weight"] == "model.embed_tokens.weight", mt
+            assert rev["model.language_model.layers.0.self_attn.q_proj.weight"] == (
+                "model.layers.0.self_attn.q_proj.weight"
+            ), mt
+            assert (
+                rev["model.visual.blocks.0.mlp.fc1.weight"] == "visual.blocks.0.mlp.fc1.weight"
+            ), "vision must rewrite to the nested model.visual.* spelling"
+
+    def test_reverse_name_map_noop_for_other_families(self):
+        from auto_round.utils.checkpoint_streamer import reverse_name_map
+
+        assert reverse_name_map("llama", self.FLAT_KEYS) == {}
+
+    def test_names_under_resolves_nested_tree_prefix(self, tmp_path):
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        d = tmp_path / "ck"
+        d.mkdir()
+        save_file(
+            {k: torch.zeros(2, 2) for k in self.FLAT_KEYS},
+            str(d / "model.safetensors"),
+            metadata={"format": "pt"},
+        )
+        (d / "config.json").write_text(json.dumps({"model_type": "qwen2_vl"}))
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        s = CheckpointStreamer(str(d))
+        got = s.names_under("model.language_model.layers.0")
+        assert got == ["model.layers.0.self_attn.q_proj.weight"], got
+        assert s.resolve_checkpoint_name("model.language_model.embed_tokens.weight") == "model.embed_tokens.weight"
+        assert s.names_under("model.visual") == ["visual.blocks.0.mlp.fc1.weight"]
+        assert s.resolve_checkpoint_name("model.visual.blocks.0.mlp.fc1.weight") == "visual.blocks.0.mlp.fc1.weight"
+
+
+class TestProbePositionIds:
+    """mrope families (qwen2-vl lineage) need [3, bs, seq] band ids; plain
+    families keep the [1, seq] arange."""
+
+    def test_mrope_and_plain_forms(self):
+        import torch
+
+        from auto_round.utils.streaming_calibration import _probe_position_ids
+
+        class _MropeCfg:
+            mrope_section = [16, 24, 24]
+
+        class _TextCfg:
+            mrope_section = None
+
+        class _Mrope:
+            config = type("C", (), {"text_config": _MropeCfg()})()
+
+        class _Plain:
+            config = _TextCfg()
+
+        pos = _probe_position_ids(_Mrope, 7, "cpu")
+        assert tuple(pos.shape) == (3, 1, 7), pos.shape
+
+        class _VLRotary:
+            mrope_section = [16, 24, 24]
+
+        # the streaming skeleton exposes only the inner text backbone; the
+        # rotary module's mrope_section must be enough on its own
+        pos = _probe_position_ids(_Plain, 7, "cpu", rotary=_VLRotary())
+        assert tuple(pos.shape) == (3, 1, 7), pos.shape
+        assert torch.equal(pos[0], pos[1]) and torch.equal(pos[1], pos[2]), "text-only bands must be identical"
+        assert tuple(_probe_position_ids(_Plain, 7, "cpu").shape) == (1, 7)

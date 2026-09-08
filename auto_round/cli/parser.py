@@ -135,6 +135,36 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         type=str,
         help="Comma-separated algorithms such as 'awq' or 'awq,auto_round'.",
     )
+    rt.add_argument(
+        "--stream_quantization",
+        dest="stream_quantization",
+        default=False,
+        action="store_true",
+        help=(
+            "Quantize without ever materializing the model: block weights stream "
+            "from the source checkpoint on demand (meta skeleton, one resident "
+            "block at a time) and pack/save progressively; for models larger than "
+            "host RAM. The activation chain and layerwise rotation auto-engage "
+            "when the run needs them (iters>0, imatrix on, rotations)."
+        ),
+    )
+    rt.add_argument(
+        "--stream_prefetch",
+        dest="stream_prefetch",
+        default="off",
+        type=str,
+        help=(
+            "Background block staging for the streaming loop: 'off' (default), "
+            "'auto' (stage on one other GPU; the quant device itself when it is "
+            "the only GPU and the next block fits its free VRAM; host RAM as a "
+            "last resort), 'on' (same chain, guaranteed enabled - host RAM at "
+            "minimum), 'cpu' (host RAM), or a single staging device ('1' or "
+            "'cuda:1'; a bare number is a DEVICE INDEX, not a lookahead depth). "
+            "Lookahead is always one block: quantize time dwarfs load time, so "
+            "device lists are not accepted. Staged blocks are quantized in "
+            "place on their staging home."
+        ),
+    )
     rt.add_argument("--output_dir", default="./tmp_autoround", type=str, help="Directory to save quantized artifacts.")
     rt.add_argument("--avg_bits", "--target_bits", default=None, type=float, help="Average target bits for AutoScheme.")
     rt.add_argument(

@@ -14,13 +14,12 @@
 
 import json
 import os
-import re
+import struct
 from collections import OrderedDict
 from typing import Optional, Union
 
 import torch
 
-from auto_round import envs
 from auto_round.compressors.utils import _get_save_folder_name
 from auto_round.context.compress import CompressContext
 from auto_round.context.model import ModelContext
@@ -86,76 +85,7 @@ class ShardWriter:
         self.total_param_size_bytes = 0
         self.skipped_meta_tensors = []
 
-        # When resumability is active
-        # (AR_RESUME_DIR set), a fresh process's ShardWriter otherwise has no
-        # idea a previous, crashed process already flushed some shards to
-        # output_dir -- it would restart shard_counter at 0 and overwrite
-        # `model-shard-00001...`, and finalize()'s index would only cover the
-        # tensors written by *this* process, producing a corrupt/incomplete
-        # checkpoint. Gated on AR_RESUME_DIR so normal (non-resuming) runs
-        # never change behavior even if output_dir happens to be reused.
-        #
-        # Deliberately NOT run here in __init__: at construction time (from
-        # post_init(), inside quantize_and_save()) `self.output_dir` still
-        # reflects the pre-`_get_export_dir()` path -- the final subfolder
-        # (e.g. `<model>-w4g128/`) hasn't been appended yet, so discovery
-        # would silently look in the wrong directory and find nothing
-        # (confirmed empirically: this exact ordering bug let a resumed run's
-        # blocks 0-2 through tuning correctly, then still lose their output,
-        # since `_flush_shard`/`finalize` never learned about the crashed
-        # run's shards). Deferred to the first real `_flush_shard()` call
-        # instead, by which point `output_dir` is always the final path.
-        self._existing_shards_discovered = False
-
         ShardWriter._initialized = True
-
-    def _discover_existing_shards(self) -> None:
-        """Recover shard-writer state from shard files a previous (crashed)
-        process already flushed to ``output_dir``, so this process continues
-        shard numbering instead of colliding with them, and ``finalize()``'s
-        index covers tensors from both processes.
-
-        Only files still in the pre-``finalize()`` temp naming
-        (``model-shard-NNNNN.<ext>``) are considered: once ``finalize()`` runs
-        it renames everything to the final HF layout, so a directory with no
-        such temp files means either nothing has been flushed yet, or a prior
-        run already finished -- neither should be treated as in-progress
-        shards to adopt.
-        """
-        output_dir = self.output_dir
-        if not os.path.isdir(output_dir):
-            return
-        pattern = re.compile(rf"^model-shard-(\d+)\.{re.escape(self.shard_suffix)}$")
-        found = []
-        for fname in os.listdir(output_dir):
-            m = pattern.match(fname)
-            if m:
-                found.append((int(m.group(1)), fname))
-        if not found:
-            return
-        found.sort()
-        for _, fname in found:
-            path = os.path.join(output_dir, fname)
-            params = self._read_shard_tensor_names(path)
-            self.shard_meta.append({"tmp_file": fname, "params": params, "dir": output_dir})
-            self._all_saved.update(params)
-        self.shard_counter = found[-1][0]
-        logger.info(
-            f"ShardWriter: discovered {len(found)} already-flushed shard(s) in {output_dir} "
-            f"from a previous run; resuming shard numbering from {self.shard_counter}."
-        )
-
-    def _read_shard_tensor_names(self, path: str) -> list[str]:
-        """Read only the tensor-name header of an already-flushed shard file,
-        without materializing any tensor data."""
-        if self.use_safetensors:
-            from safetensors import safe_open
-
-            with safe_open(path, framework="pt") as f:
-                return list(f.keys())
-        else:
-            sd = torch.load(path, map_location="meta")
-            return list(sd.keys())
 
     @property
     def output_dir(self) -> str:
@@ -179,6 +109,192 @@ class ShardWriter:
         """Reset the singleton state so the next instantiation creates a fresh ShardWriter."""
         cls._initialized = False
         cls._instance = None
+
+    @staticmethod
+    def _read_safetensors_header(path: str) -> Optional[dict]:
+        """Parse a safetensors header (tensor_name -> dtype/shape) without loading data."""
+        try:
+            with open(path, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                # a corrupt declared length must not preempt the caller's
+                # corrupt/tail handling with a raw MemoryError: headers are a
+                # small fraction of any shard, so anything beyond the file
+                # itself is corruption by definition
+                f.seek(0, 2)
+                if n > f.tell():
+                    return None
+                f.seek(8)
+                header = json.loads(f.read(n))
+            header.pop("__metadata__", None)
+            return header
+        except (OSError, ValueError, struct.error, OverflowError, MemoryError):
+            return None
+
+    def adopt_existing_shards(self) -> int:
+        """Adopt shard files a previous (crashed) run already wrote to the output dir.
+
+        Resume support: the manifest marks a block done only after its tensors are
+        durably flushed, so a resumed process must not re-write those tensors -- but
+        a fresh ShardWriter starts at ``shard_counter = 0`` and would silently
+        OVERWRITE ``model-shard-00001`` on its first flush, destroying the crashed
+        run's data and dropping its tensors from the final index. Adoption
+        reconstructs the writer's bookkeeping (shard_meta / _all_saved / counters /
+        size stats) from the safetensors headers on disk.
+
+        Rules:
+        - only the highest-numbered shard may be unparseable (a crash mid-flush):
+          it is deleted, its tensors belong to the un-marked in-flight block and
+          will be re-written by the resumed run;
+        - an unparseable non-tail shard is corruption: hard error (never silent
+          data loss);
+        - ``.bin`` shards cannot be adopted (no cheap header): hard error telling
+          the user resume requires safe_serialization.
+
+        Returns the number of adopted shards.
+        """
+        import re
+
+        output_dir = self.output_dir
+        if not os.path.isdir(output_dir):
+            return 0
+
+        # shard sources, keyed by their ordinal position in the sequence:
+        # - temp files (``model-shard-NNN``): a crash during the block loop
+        # - finalized files (``model-000NN-of-000MM`` / single ``model.safetensors``):
+        #   a crash AFTER the writer finalized (e.g. in the export stage that
+        #   follows) - without adopting these, a fresh writer restarts at
+        #   counter 0, rewrites tensors and its finalize clobbers the index,
+        #   orphaning every previously written shard
+        temp_pattern = re.compile(r"^model-shard-(\d+)\.safetensors$")
+        final_pattern = re.compile(r"^model-(\d{5})-of-\d{5}\.safetensors$")
+        seq = {}  # ordinal -> (fname, is_final)
+        single_file = None
+        for fname in os.listdir(output_dir):
+            mobj = temp_pattern.match(fname)
+            if mobj:
+                num = int(mobj.group(1))
+                prior = seq.get(num)
+                if prior is not None and prior[1]:
+                    # a temp and a finalized file claim one ordinal: leftovers
+                    # of a previous lineage in a reused output dir. The temp
+                    # is the resumable artifact of the CURRENT lineage - keep
+                    # it and name the stale final so nothing silently drops
+                    logger.warning(
+                        "ShardWriter resume: ignoring stale finalized shard %s (ordinal %d also claimed by "
+                        "temp shard %s); use a fresh --output_dir to avoid mixed lineages",
+                        prior[0],
+                        num,
+                        fname,
+                    )
+                seq[num] = (fname, False)
+                continue
+            mobj = final_pattern.match(fname)
+            if mobj:
+                num = int(mobj.group(1))
+                if num in seq and not seq[num][1]:
+                    continue  # the temp shard of the current lineage owns this ordinal
+                seq[num] = (fname, True)
+                continue
+            if fname == "model.safetensors":
+                single_file = fname
+        found = {num: fname for num, (fname, _is_final) in seq.items() if not _is_final}
+        if not seq and single_file is not None:
+            seq[1] = (single_file, True)
+        if not seq:
+            bin_shards = [f for f in os.listdir(output_dir) if re.match(r"^model-shard-\d+\.bin$", f)]
+            if bin_shards:
+                raise RuntimeError(
+                    f"ShardWriter resume: found torch .bin shards in {output_dir} but adoption requires "
+                    "safetensors headers (safe_serialization). Use a fresh --output_dir or enable safetensors."
+                )
+            return 0
+
+        from auto_round.utils.checkpoint_streamer import _DTYPE_BYTES
+
+        dtype_sizes = _DTYPE_BYTES
+        numbers = sorted(seq)
+        for num in numbers:
+            path = os.path.join(output_dir, seq[num][0])
+            header = self._read_safetensors_header(path)
+            if header is None:
+                if seq[num][1]:
+                    # finalized files are renamed only after a successful full
+                    # flush; an unparseable header means external corruption -
+                    # silently skipping it would finalize an index without its
+                    # tensors
+                    raise RuntimeError(
+                        f"ShardWriter resume: finalized shard {seq[num][0]} in {output_dir} has an "
+                        "unparseable header (externally corrupted?). Use a fresh --output_dir."
+                    )
+                if num == numbers[-1]:
+                    logger.warning(
+                        "ShardWriter resume: tail shard %s is incomplete (crash mid-flush); deleting it -- "
+                        "its block was not marked done and will be re-done",
+                        found[num],
+                    )
+                    os.remove(path)
+                    continue
+                raise RuntimeError(
+                    f"ShardWriter resume: shard {found[num]} in {output_dir} is corrupt (only the tail "
+                    "shard of a crashed run may be incomplete). Use a fresh --output_dir."
+                )
+            # a crash DURING the data write (after the header flushed) leaves
+            # a header-valid but truncated file: verify the declared data end
+            # fits inside the actual file size before adopting
+            with open(path, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                f.seek(0, 2)
+                file_size = f.tell()
+            max_end = 0
+            for spec in header.values():
+                try:
+                    max_end = max(max_end, int(spec["data_offsets"][1]))
+                except (KeyError, TypeError, ValueError, IndexError):
+                    max_end = file_size  # unexpected spec: fall through to the size check
+                    break
+            if 8 + header_len + max_end > file_size:
+                if not seq[num][1]:
+                    if num == numbers[-1]:
+                        logger.warning(
+                            "ShardWriter resume: tail shard %s is truncated (crash mid-data-write); deleting it "
+                            "-- its block was not marked done and will be re-done",
+                            found[num],
+                        )
+                        os.remove(path)
+                        continue
+                    raise RuntimeError(
+                        f"ShardWriter resume: shard {found[num]} in {output_dir} is truncated (only the tail "
+                        "shard of a crashed run may be incomplete). Use a fresh --output_dir."
+                    )
+                # a finalized shard's blocks are durably done per the manifest;
+                # its tensors cannot be re-made - only a fresh output dir can
+                # recover from external truncation
+                raise RuntimeError(
+                    f"ShardWriter resume: finalized shard {seq[num][0]} in {output_dir} is truncated "
+                    "(externally corrupted?); its tensors are marked done and cannot be re-made. "
+                    "Use a fresh --output_dir."
+                )
+            params = list(header.keys())
+            fname, _is_final = seq[num]
+            self.shard_meta.append({"tmp_file": fname, "params": params, "dir": output_dir})
+            self._all_saved.update(params)
+            for name, meta in header.items():
+                numel = 1
+                for dim in meta.get("shape", []):
+                    numel *= dim
+                self.total_param_elems += numel
+                self.total_param_size_bytes += numel * dtype_sizes.get(meta.get("dtype", "F32"), 4)
+            self.shard_counter = max(self.shard_counter, num)
+
+        if self.shard_meta:
+            logger.info(
+                "ShardWriter resume: adopted %d existing shard(s) from %s (%d tensors); new shards continue at %05d",
+                len(self.shard_meta),
+                output_dir,
+                len(self._all_saved),
+                self.shard_counter + 1,
+            )
+        return len(self.shard_meta)
 
     @classmethod
     def get_shard_writer(cls, *args, **kwargs) -> Optional["ShardWriter"]:
@@ -222,6 +338,10 @@ class ShardWriter:
             param_name = f"{prefix}.{k}"
             self._add_tensor(param_name, v)
 
+    def save_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        """Accumulate a single raw (checkpoint-spelled) tensor for saving."""
+        self._add_tensor(name, tensor)
+
     def _expand_fused_experts(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]] | None:
         """Expand a fused 3D expert parameter into per-expert 2D weight tensors.
 
@@ -260,27 +380,33 @@ class ShardWriter:
     def _add_tensor(self, name: str, tensor: torch.Tensor):
         if is_attention_calibration_tensor_name(name):
             return
-
         if isinstance(tensor, torch.Tensor) and tensor.device.type == "meta":
             self.skipped_meta_tensors.append(name)
             return
 
+        # The duplicate guard must see the canonical (checkpoint-side)
+        # spelling: a conversion-renamed family reaches the writer under both
+        # spellings (module-side from the live tree, checkpoint-side from
+        # adopted shard headers), and a guard on the caller's spelling would
+        # let the same tensor be written twice under two keys. The fused
+        # expert expansion below, however, must keep the ORIGINAL name (its
+        # per-expert split keys off the pre-revert spelling).
+        canonical = revert_checkpoint_conversion_mapping(name, self.reverse_checkpoint_conversion_mapping)
+
         # Guard against duplicate saving of the same parameter
-        if name in self._all_saved or name in self.current_shard_tensors:
+        if canonical in self._all_saved or canonical in self.current_shard_tensors:
             return
 
         # Expand fused 3D expert parameters into per-expert 2D tensors if necessary
         if tensor.dim() == 3:
             expanded = self._expand_fused_experts(name, tensor)
             if expanded is not None:
-                self._all_saved.add(name)
+                self._all_saved.add(canonical)
                 for sub_name, sub_tensor in expanded:
                     self._add_tensor(sub_name, sub_tensor)
                 return
 
-        # transformers will handle _checkpoint_conversion_mapping automatically if is_immediate_saving=False
-        name = revert_checkpoint_conversion_mapping(name, self.reverse_checkpoint_conversion_mapping)
-
+        name = canonical
         t_size = tensor.nbytes
         self.total_param_elems += tensor.numel()
         self.total_param_size_bytes += t_size
@@ -322,10 +448,6 @@ class ShardWriter:
     def _flush_shard(self):
         if not self.current_shard_tensors:
             return
-
-        if envs.AR_RESUME_DIR and not self._existing_shards_discovered:
-            self._discover_existing_shards()
-            self._existing_shards_discovered = True
 
         self.shard_counter += 1
         output_dir = self.output_dir
@@ -412,7 +534,7 @@ class ShardWriter:
                 else f"model-{idx:05d}-of-{self.shard_counter:05d}.{self.shard_suffix}"
             )
             new_path = os.path.join(shard_dir, new_name)
-            os.rename(old_path, new_path)
+            os.replace(old_path, new_path)
             for p in meta["params"]:
                 self.global_weight_map[p] = new_name
 

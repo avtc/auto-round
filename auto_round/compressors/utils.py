@@ -30,6 +30,7 @@ from auto_round.export.formats.backends.gguf import (
     get_layer_config_by_gguf_format,
     gguf_type_fallback,
 )
+from auto_round.logger import logger
 from auto_round.schemes import BackendDataType  # re-exported: qlinear_fp/qlinear_int import it from here
 from auto_round.schemes import (
     QuantizationScheme,
@@ -115,6 +116,67 @@ def is_block_wfp8(ar_or_format):
     return _as_scheme(ar_or_format).is_block_wfp8()
 
 
+def resolve_block_replay_device(block_device, requested_device):
+    """Where a block replay should run.
+
+    A block resident on a CUDA device (e.g. a round-robin home GPU under
+    streaming) keeps its home: the (small) inputs move to the block rather
+    than the (multi-GB) block to the inputs. CPU-resident blocks defer to the
+    caller's device.
+    """
+    if block_device is not None and block_device.type == "cuda" and block_device != torch.device(requested_device):
+        return block_device
+    return torch.device(requested_device)
+
+
+def strip_stale_device_hooks_(module: torch.nn.Module) -> int:
+    """Remove accelerate dispatch hooks that remember pre-streaming devices.
+
+    Under ``--device_map`` the streaming skeleton is accelerate-built: every
+    module carries a pre-forward hook that moves args to its dispatch-time
+    device. When the streamer loads a block onto its round-robin home (or the
+    primary), those hooks fight the runner's explicit input placement - e.g.
+    weights streamed to cuda:1 while the hook drags inputs back to cuda:0.
+    Only called for streamed blocks; the data-driven path keeps its hooks.
+
+    Returns the number of modules cleaned.
+    """
+    try:
+        from accelerate.hooks import remove_hook_from_module
+    except ImportError:  # pragma: no cover - accelerate ships with transformers
+        return 0
+    cleaned = 0
+    for m in module.modules():
+        if getattr(m, "_hf_hook", None) is not None:
+            remove_hook_from_module(m)
+            cleaned += 1
+    return cleaned
+
+
+def rehome_block_(module: torch.nn.Module, device) -> int:
+    """Move every non-meta tensor reachable from ``module`` onto ``device``.
+
+    Streams load only checkpoint-backed tensors under the block prefix onto the
+    round-robin home; modules created at setup OUTSIDE the checkpoint layout
+    (e.g. merged shared-layer projections living on the primary) are reachable
+    from the block but never re-homed - a block forward then mixes homes
+    (shared in_proj on cuda:0 x conv1d weight on cuda:1). Meta placeholders
+    are left for the streamer. Returns the number of tensors moved.
+    """
+    target = torch.device(device)
+    moved = 0
+
+    def _fn(t: torch.Tensor) -> torch.Tensor:
+        nonlocal moved
+        if t.device != target and t.device.type != "meta":
+            moved += 1
+            return t.to(target)
+        return t
+
+    module._apply(_fn)
+    return moved
+
+
 def block_forward(
     block: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -140,9 +202,19 @@ def block_forward(
     """
     from auto_round.utils.model import to_device
 
+    # A block replaying on its own device (e.g. a round-robin home GPU under
+    # streaming) must receive its inputs there; moving the weights instead
+    # would defeat in-place quantization.
+    block_param = next(block.parameters(), None)
+    device = resolve_block_replay_device(block_param.device if block_param is not None else None, device)
     if input_ids.device != device:
         input_ids = to_device(input_ids, device)
-        input_others = to_device(input_others, device)
+    # input_others move is NOT gated on input_ids: the streaming chain parks
+    # kwargs separately from the hidden states (e.g. (cos.cpu(), sin.cpu())
+    # position-embedding tuples), so the hidden states can already sit on the
+    # replay device while rope tables are still on host RAM. to_device is an
+    # identity for already-placed tensors, so this is free when placed.
+    input_others = to_device(input_others, device)
     input_tuple = input_others.pop("positional_inputs", None)
     if "alibi" in input_others.keys() and input_others["alibi"] is not None:
         alibi = input_others["alibi"]
@@ -529,7 +601,53 @@ def _get_save_folder_name(format, *args, **kwargs) -> str:
     return compress_context.output_dir
 
 
-def immediate_pack(name: str, layer_config: dict):
+_PACK_DEVICE_LOGGED = False
+
+
+def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: int = 1, device=None):
+    """Immediate-pack every quantizable module of one block.
+
+    Modules stay on the caller's device (the streaming loop's block home), so
+    packing happens in place without a per-module round trip to the primary
+    device.
+    """
+    names = []
+    for _n, _mod in block.named_modules():
+        if hasattr(_mod, "bits") and check_to_quantized(_mod):
+            module_name = getattr(_mod, "global_name", None)
+            if module_name is None and nblocks == 1 and _n:
+                module_name = f"{block.global_name}.{_n}"
+            if module_name is None:
+                continue
+            names.append(module_name)
+    if not names:
+        return  # nothing to pack: do not even touch the context singletons
+
+    from auto_round.context.compress import CompressContext
+    from auto_round.utils.device_manager import device_manager
+
+    compress_context = CompressContext.get_context()
+    if not compress_context.is_immediate_packing:
+        return
+    from auto_round.utils.device_manager import get_packing_device
+
+    # default to the caller's block home: weights/scales/zp already sit there,
+    # so packing in place avoids a per-module round trip to the primary
+    pack_device = get_packing_device(device if device is not None else device_manager.device)
+    global _PACK_DEVICE_LOGGED
+    # once per run: a per-block line collides with the tqdm redraws and
+    # garbles the log
+    if not _PACK_DEVICE_LOGGED:
+        _PACK_DEVICE_LOGGED = True
+        logger.debug("immediate_pack_block: packing on %s", pack_device)
+    for module_name in names:
+        immediate_pack(module_name, layer_config, device=pack_device)
+
+
+def immediate_pack(name: str, layer_config: dict, device=None):
+    """Pack one module immediately. ``device`` overrides the pack target (the
+    streaming loop passes the block's home device so packed modules do not
+    round-trip to the primary GPU); None keeps the global default."""
     from auto_round.context.compress import CompressContext
     from auto_round.context.model import ModelContext
 
@@ -541,7 +659,7 @@ def immediate_pack(name: str, layer_config: dict):
     compress_context.formats[0].immediate_pack(
         name=name,
         model=model_context.model,
-        device=device_manager.device,
+        device=device if device is not None else device_manager.device,
         output_dir=_get_save_folder_name(compress_context.formats[0]),
         layer_config=layer_config,
         tokenizer=model_context.tokenizer,

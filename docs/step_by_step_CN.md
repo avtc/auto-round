@@ -36,6 +36,7 @@
     - [lm_head 量化中开启多 GPU 标定](#lm_head-量化中开启多-gpu-标定)
     - [手动配置设备映射](#手动配置设备映射)
   + [超参数调整](#超参数调整)
+  + [流式量化](#流式量化)
   + [旋转（Rotation）（研究性）](#旋转rotation研究性)
 * [4 推理部署](#4-推理部署)
   + [CPU](#cpu)
@@ -906,6 +907,7 @@ autoround.save_quantized(format="auto_awq", output_dir="tmp_autoround")
 
 #### 降低 CPU 内存占用
 - 开启 `low_cpu_mem_usage`（实验性功能）：仅支持**导出指定一种格式**。每个 block 量化封装完成后会立即保存，从而降低峰值内存占用。
+- 若要完全避免将模型加载进内存，请参见[流式量化](#流式量化)。
 - 触发立即封装：使用命令行或 `quantize_and_save` API 时，只要指定**单一导出格式**，就会自动触发即时打包，无需额外配置。
 
 #### 提升训练速度
@@ -927,6 +929,35 @@ auto-round --model_name Qwen/Qwen3-0.6B  --scheme "W4A16" --quant_lm_head --form
 
 #### 使用 AdamW 优化器
 添加 `--adam` 参数即可启用；**注意**：在我们的多项测试场景中，AdamW 优化器的效果均不如符号梯度下降（sign gradient descent）。
+
+### 流式量化
+
+实验性功能（仅在有限的模型集上验证过）。
+
+`--stream_quantization` 以逐个解码器块的方式流式完成量化：每块从磁盘读入、完整物化在单个设备上、量化并写入其输出分片。checkpoint 全程保留在磁盘上——峰值内存约为一个解码器块加校准状态，与模型规模无关。块放置显式可控，且循环会在多设备间流水线化地安排块加载、量化与打包（见 `--stream_prefetch`），略微缩短总量化时间。
+
+`AR_DISK_STREAM_MODEL=1` 与 `--stream_quantization` 都按需从 checkpoint 读取解码器块，因此模型只需要磁盘空间而无须整体驻留内存——默认流程中，权重会被加载进 CPU 内存与 GPU 显存（经 `device_map` 分布到多卡）并全程保持驻留。在两种按需读取的模式之间：env 路径保留原有校准流程、全部量化器可用；块放置通过 `device_map` 配置（单个块也可以拆分到多块 GPU 上），部分配置还会在磁盘上额外写一份 offload 的源模型拷贝。`--stream_quantization` 覆盖 RTN/OptRTN 与 SignRound；块加载、调优、打包跨 GPU 流水线化（`--stream_prefetch`，每块 GPU 单个块），也没有 offload 拷贝。
+
+```bash
+auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantization --stream_prefetch auto
+```
+
+长时间运行可开启断点续跑：重启后已完成的块会被跳过，其已写出的输出分片会被直接采用（参见 [AR_RESUME_DIR](./environments_CN.md#ar_resume_dir)）。
+
+```bash
+AR_RESUME_DIR=/path/to/resume/state auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16"   --stream_quantization --stream_prefetch auto
+```
+
+说明：
+
+- 模型必须以本地 checkpoint 目录传入；hub id 不会被解析——请先下载模型。
+- 支持的算法为 RTN/OptRTN 与 SignRound（`iters > 0`）。其余量化器、旋转、`enable_lfq` 与扩散模型管线尚不支持流式模式，会在启动时报错并给出指引。导出格式照常支持（`auto_round`、`auto_round:llm_compressor`、`auto_round:auto_gptq`、`auto_round:auto_awq`、`gguf:<qtype>`）；多模态模型的视觉塔以未量化形式导出。
+- `--stream_prefetch off|auto|on|cpu|<设备>`（默认 `off`）在量化当前块的同时，把下一块的权重预取到另一块 GPU 或主机内存，略微缩短总耗时——已完成块的打包与分片写入也会与下一块的调优重叠执行。
+- MTP/nextn 张量在未被 `layer_config` pin 覆盖时原样透传；GGUF 导出按本次运行的量化类型像普通主体张量一样量化它们。为 MTP 层 pin 更高的位宽（如 `".*mtp.*": {"bits": 8}`）可获得更高质量的投机解码 draft 头。
+- GGUF 运行会把逐块打包的载荷写入 `gguf-blobs/` 分片，保存时组装出最终 `.gguf`——运行期间磁盘占用约为最终模型大小的 2 倍；组装成功后分片会被自动删除。多模态投影器写入单独的 `mmproj-model.gguf`。
+- AutoScheme 需要先跑一次不带 `--stream_quantization` 的打分运行：设置 `AR_AUTO_SCHEME_CACHE` 并运行一次（例如配合 `AR_DISK_STREAM_MODEL=1`），随后的流式运行会解析缓存的 scheme。
+- `--low_gpu_mem_usage` 让校准行驻留在主机内存而非块所在 GPU（显存更低，耗时略增）。
+- 与 `AR_DISK_STREAM_MODEL` 环境变量互斥（参见[环境变量](./environments_CN.md#ar_disk_stream_model)）：该模式同样让模型整体驻留内存成为不必要，但在无法逐块渐进保存的配置（如 GGUF 导出或带调优的 `--quant_lm_head`）下会额外写入约一份模型大小的 offload 拷贝；流式模式全程只写输出本身。
 
 ### 旋转（Rotation）（研究性）
 

@@ -46,6 +46,12 @@ gguf = LazyImport("gguf")
 
 def _clear_gguf_model_instances():
     globals().pop("gguf_model_instance_global", None)
+    # blob stores are per-run state (recorder kv history + entries); a second
+    # AutoRound run in the same process into the same output dir must start
+    # clean instead of appending to the previous run's recorder
+    from auto_round.export.export_to_gguf.blob_store import GgufBlobStore
+
+    GgufBlobStore.reset_singletons()
 
 
 def _clear_gguf_model_instances_on_error(func):
@@ -93,6 +99,58 @@ def _set_mmproj_output_path(model_instance):
     return model_instance
 
 
+def _count_mtp_layers(model) -> int:
+    """MTP layer count from the live module tree (``mtp.layers.N``)."""
+    n_mtp = 0
+    for name, _ in model.named_modules():
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+        if not name.startswith("mtp.layers."):
+            continue
+        tail = name[len("mtp.layers.") :].split(".", 1)[0]
+        if tail.isdecimal():
+            n_mtp = max(n_mtp, int(tail) + 1)
+    return n_mtp
+
+
+def _validate_gguf_mtp_envs() -> None:
+    """The two MTP-export envs are contradictory; fail loud before any work."""
+    if envs.AR_DISABLE_GGUF_MTP_EXPORT and envs.AR_GGUF_MTP_ONLY:
+        raise ValueError(
+            "AR_DISABLE_GGUF_MTP_EXPORT and AR_GGUF_MTP_ONLY are contradictory: "
+            "one drops the MTP/nextn tensors, the other exports only them. "
+            "Set at most one."
+        )
+
+
+def _model_carries_mtp(model) -> bool:
+    """True when the live module tree or config indicates an MTP predictor."""
+    for name, _ in model.named_modules():
+        if name == "mtp" or name == "model.mtp" or name.startswith(("mtp.", "model.mtp.")):
+            return True
+    config = getattr(model, "config", None)
+    config = getattr(config, "text_config", config)
+    return bool(getattr(config, "mtp_num_hidden_layers", 0))
+
+
+def _create_conversion_model(model_class, hparams, include_mtp=False, **kwargs):
+    if not getattr(model_class, "supports_mtp_export", False):
+        return model_class(hparams=hparams, **kwargs)
+
+    # The model is exported whole by default; include_mtp=True (streaming blob
+    # exports) keeps the embedded nextn blocks for speculative decoding.
+    # Conversion filters read this flag from the concrete class, so restore it
+    # immediately after constructing the instance.
+    original_no_mtp = model_class.no_mtp
+    try:
+        model_class.no_mtp = not include_mtp
+        model_instance = model_class(hparams=hparams, **kwargs)
+        model_instance.no_mtp = not include_mtp
+        return model_instance
+    finally:
+        model_class.no_mtp = original_no_mtp
+
+
 def create_model_class(
     output_dir,
     model,
@@ -103,6 +161,8 @@ def create_model_class(
     device="cpu",
     quant_nontext_module: bool = False,
     is_auto_scheme: bool = False,
+    blob_store=None,
+    mtp_checkpoint_names=None,
 ):
     tmp_work_dir = model.name_or_path
     os.makedirs(output_dir, exist_ok=True)
@@ -118,11 +178,13 @@ def create_model_class(
         except NotImplementedError:
             logger.error(f"Model {model_architecture} is not supported to export gguf format.")
             sys.exit(1)
-        model_name = model.name_or_path.split("/")
-        if len(model_name[-1]) == 0:
-            model_name = model_name[-2]
-        else:
-            model_name = model_name[-1]
+        # path-portable basename (Windows backslashes defeat the plain
+        # split("/")); an empty tail means the path ended with a separator,
+        # so fall back to the parent like the original logic
+        from pathlib import PurePath
+
+        _np = PurePath(str(model.name_or_path))
+        model_name = _np.name or _np.parent.name or _np.stem
 
         native_nontext_export = _use_native_nontext_gguf_export(model_type, quant_nontext_module)
         output_type = "f32" if native_nontext_export else backend.split(":")[-1]
@@ -131,13 +193,70 @@ def create_model_class(
         output_type = FTYPE_MAP.get(output_type.lower())
 
         hparams.pop("quantization_config", None)
+        # Streaming blob exports keep the embedded MTP/nextn blocks when the
+        # model carries them: the conversion class needs the layer count
+        # up front (its __init__ extends block_count before the tensor map is
+        # built). Checkpoint-only MTP trees are invisible in the live module
+        # tree during the block loop (they materialize at group tail), so the
+        # streaming orchestrator passes the checkpoint-side mtp.* tensor
+        # names as a hint; configs without mtp_num_hidden_layers (e.g.
+        # Qwen3-Next) get the count from the tree/hint instead of a
+        # checkpoint scan.
+        include_mtp = False
+        if blob_store is not None and getattr(model_class, "supports_mtp_export", False):
+            n_mtp = _count_mtp_layers(model)
+            if mtp_checkpoint_names:
+                n_mtp = max(
+                    n_mtp,
+                    max(
+                        (
+                            int(n.split(".layers.", 1)[1].split(".", 1)[0]) + 1
+                            for n in mtp_checkpoint_names
+                            if ".layers." in n and n.split(".layers.", 1)[1].split(".", 1)[0].isdecimal()
+                        ),
+                        default=0,
+                    ),
+                )
+            has_mtp = (
+                n_mtp > 0
+                or any(
+                    n == "mtp" or n == "model.mtp" or n.startswith(("mtp.", "model.mtp."))
+                    for n, _ in model.named_modules()
+                )
+                or bool(mtp_checkpoint_names)
+            )
+            if has_mtp:
+                hparams.setdefault("mtp_num_hidden_layers", max(n_mtp, 1))
+                include_mtp = True
+        # AR_DISABLE_GGUF_MTP_EXPORT suppresses the MTP/nextn tensors from the
+        # export entirely (upstream #2297): disable our streaming include_mtp
+        # detection as well and pin the conversion class to no_mtp.
+        # AR_GGUF_MTP_ONLY is the complementary workflow: export ONLY the
+        # MTP/nextn predictor tensors as a separate mtp-*.gguf draft file
+        # (served with llama.cpp --model-draft), so N body quants can share
+        # one MTP draft.
+        _validate_gguf_mtp_envs()
         if envs.AR_DISABLE_GGUF_MTP_EXPORT and getattr(model_class, "supports_mtp_export", False):
+            include_mtp = False
             model_class = type(
                 f"AutoRound{model_class.__name__}",
                 (model_class,),
                 {"model_arch": model_class.model_arch, "no_mtp": True},
             )
-        model_instance = model_class(
+        elif envs.AR_GGUF_MTP_ONLY and getattr(model_class, "supports_mtp_export", False):
+            # the draft file needs the nextn tensors present; keep (or force)
+            # the streaming include_mtp detection when the model carries an
+            # MTP block
+            if not include_mtp and (blob_store is not None or _model_carries_mtp(model)):
+                include_mtp = True
+            model_class = type(
+                f"AutoRound{model_class.__name__}",
+                (model_class,),
+                {"model_arch": model_class.model_arch, "mtp_only": True},
+            )
+        model_instance = _create_conversion_model(
+            model_class,
+            include_mtp=include_mtp,
             dir_model=Path(tmp_work_dir),
             ftype=output_type,
             fname_out=Path(output_dir),
@@ -163,6 +282,9 @@ def create_model_class(
                 is_auto_scheme=is_auto_scheme,
             )
         model_instance = handle_special_model(model_instance, model_architecture)
+    if blob_store is not None:
+        role = "mmproj" if model_type == ModelType.MMPROJ else "text"
+        blob_store.attach_recorder(model_instance, role)
     return model_instance
 
 
@@ -181,6 +303,7 @@ def pack_gguf_layer(
     device="cpu",
     quant_nontext_module=False,
     is_auto_scheme=False,
+    blob_store=None,
 ):
     """Export the model to gguf format."""
     global gguf_model_instance_global
@@ -196,6 +319,7 @@ def pack_gguf_layer(
                 device=device,
                 quant_nontext_module=quant_nontext_module,
                 is_auto_scheme=is_auto_scheme,
+                blob_store=blob_store,
             )
         ]
         if model_type == ModelType.MMPROJ:
@@ -210,6 +334,7 @@ def pack_gguf_layer(
                     device=device,
                     quant_nontext_module=quant_nontext_module,
                     is_auto_scheme=is_auto_scheme,
+                    blob_store=blob_store,
                 )
             )
 
@@ -247,6 +372,12 @@ def pack_gguf_layer(
             gguf_model.current_packing_block = model.last_layer_name_to_block_name[name]
             gguf_model.prepare_tensors()
 
+        if blob_store is not None:
+            # durability contract: blobs of this block reach the shard files
+            # before the caller marks the block done in its resume manifest
+            for gguf_model in gguf_model_instance_global:
+                role = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"
+                blob_store.flush(role)
         for n, m in block.named_modules():
             if hasattr(m, "weight"):
                 m.weight = None
@@ -268,6 +399,7 @@ def save_quantized_as_gguf(
     device="cpu",
     quant_nontext_module=False,
     is_auto_scheme=False,
+    blob_store=None,
     **kwargs,
 ):
     """Export the model to gguf format."""
@@ -285,29 +417,66 @@ def save_quantized_as_gguf(
                 device=device,
                 quant_nontext_module=quant_nontext_module,
                 is_auto_scheme=is_auto_scheme,
+                blob_store=blob_store,
             )
         ]
-        if mllm:
-            gguf_model_instance_global.append(
-                create_model_class(
-                    output_dir,
-                    model,
-                    layer_config,
-                    backend,
-                    model_type=ModelType.MMPROJ,
-                    device=device,
-                    quant_nontext_module=quant_nontext_module,
-                    is_auto_scheme=is_auto_scheme,
-                )
+    if mllm and not any(inst.model_arch == gguf.MODEL_ARCH.MMPROJ for inst in gguf_model_instance_global):
+        # the streaming orchestrator registers the text instance early
+        # (_ensure_gguf_blob_conversion_); the mmproj instance must still be
+        # created for MLLM runs, so this lives OUTSIDE the lazy-creation
+        # guard and only appends when no mmproj instance exists yet
+        gguf_model_instance_global.append(
+            create_model_class(
+                output_dir,
+                model,
+                layer_config,
+                backend,
+                model_type=ModelType.MMPROJ,
+                device=device,
+                quant_nontext_module=quant_nontext_module,
+                is_auto_scheme=is_auto_scheme,
+                blob_store=blob_store,
             )
+        )
+
+    # The per-block walk gate is a pack-time concept: a resumed run adopts
+    # its completed blocks without re-packing them, so
+    # ``last_layer_name_to_block_name`` never empties and the gate would stay
+    # fixed on the last re-packed block - silently dropping every
+    # outside-block tensor (embedding, lm_head, final norm, ...) from the
+    # save-time walk. The ungated walk is safe: adopted blocks are parked on
+    # meta (skipped) and the recorder rejects duplicate names.
+    for gguf_model in gguf_model_instance_global:
+        gguf_model.current_packing_block = None
 
     try:
         for gguf_model in gguf_model_instance_global:
             model_kind = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"
             logger.info("Start writing %s GGUF model to %s", model_kind, gguf_model.fname_out)
+            if blob_store is not None:
+                # blob mode skips every step that would have created the save
+                # folder (shard writes); without it prepare_metadata's
+                # is_dir() fallback assembles the file one level too high.
+                # The mmproj instance's fname_out is already a FILE path
+                # (<out>/mmproj-model.gguf) - only mkdir directory-style
+                # outputs.
+                if not str(gguf_model.fname_out).endswith(".gguf"):
+                    os.makedirs(gguf_model.fname_out, exist_ok=True)
             gguf_model.write()
+            if blob_store is not None:
+                # blob mode: write() only recorded metadata and spilled tensor
+                # payloads; rebuild the container from the shards (pure
+                # assembly, no quantization math)
+                role = "mmproj" if gguf_model.model_arch == gguf.MODEL_ARCH.MMPROJ else "text"
+                blob_store.finalize_role(gguf_model, role)
+                [out_path] = blob_store.assemble(roles=(role,), progress=True)
+                logger.info("Assembled %s GGUF model to %s", model_kind, out_path)
             rt = time.time() - st
             logger.info(f"Model successfully exported to {gguf_model.fname_out}, running time={rt}")
+        if blob_store is not None:
+            # every role is assembled - the shards were the resumable
+            # intermediate and now only duplicate the final bytes on disk
+            blob_store.discard_shards()
     finally:
         _clear_gguf_model_instances()
 

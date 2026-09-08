@@ -69,6 +69,7 @@ class ModelContext(BaseContext):
         need_calib: bool = True,
         is_act_quantize: bool = False,
         quant_nontext_module: bool = False,
+        stream_quantization: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -84,6 +85,9 @@ class ModelContext(BaseContext):
         assert model is not None, "model must be provided for ModelContext"
         self.model = model
         self.tokenizer = tokenizer
+        self.stream_quantization = stream_quantization
+        self.model_path = str(model) if isinstance(model, (str, os.PathLike)) else None
+        self.checkpoint_streamer = None
 
         # MLLM / diffusion artifacts – always present so callers need no getattr guards.
         # _load_model() will populate the ones that are relevant to the model type.
@@ -118,7 +122,11 @@ class ModelContext(BaseContext):
         # by the time BaseCompressor.post_init() runs.
         self._load_model()
 
-        if unsupported_meta_device(self.model):
+        # meta parameters are legal in the two streaming modes: the
+        # --stream_quantization flag (never-materialize loop) and the env-var
+        # disk-stream route, which builds the same skeleton but drives the
+        # offloader data-driven path (_disk_stream_index marks it was built)
+        if unsupported_meta_device(self.model) and not self.stream_quantization and self._disk_stream_index is None:
             raise RuntimeError(
                 "AutoRound does not support parameters on meta device. "
                 "Please use more GPUs by setting `--device 0,1,2,3` or just place the model on CPU."
@@ -155,8 +163,96 @@ class ModelContext(BaseContext):
     def device(self, value) -> None:
         device_manager.device = value
 
+    def _load_model_on_meta(self):
+        """Load the model structure on the meta device + build a tensor streamer.
+
+        ``stream_quantization`` mode for models far larger than host RAM: weights
+        are never materialized as a whole; the zero-shot block loop streams each
+        block from the checkpoint shards right before quantizing it and the
+        ShardWriter releases it right after (requires immediate saving).
+        """
+        from accelerate import init_empty_weights
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        if self.config is None:
+            self.config = AutoConfig.from_pretrained(self.model, trust_remote_code=self.trust_remote_code)
+        try:
+            self._import_custom_moe_replacements(self.config)
+        except Exception as e:  # structural only - proceed regardless
+            logger.debug(f"_import_custom_moe_replacements skipped: {e}")
+        from auto_round.utils.common import monkey_patch_model
+        from auto_round.utils.model import handle_generation_config
+
+        if self.is_mllm:
+            # Multimodal: AutoModelForCausalLM cannot resolve VL architectures;
+            # build_meta_model resolves the exact class from config.architectures
+            # (same strategy as the AR_DISK_STREAM_MODEL loader). The vision
+            # tower stays meta -- zero-shot never forwards it and the streaming
+            # export passes its tensors through verbatim -- and only the
+            # processor stack loads eagerly for the export copy-through.
+            from auto_round.utils.disk_stream_util import build_meta_model
+
+            model, tokenizer, _index = build_meta_model(self.model, trust_remote_code=self.trust_remote_code)
+            model.path = self.model
+            monkey_patch_model(model)
+            handle_generation_config(model)
+            self.model = model.eval()
+            self.tokenizer = tokenizer
+            try:
+                from transformers import AutoProcessor
+
+                self.processor = AutoProcessor.from_pretrained(
+                    self.model_path, trust_remote_code=self.trust_remote_code
+                )
+                self.image_processor = getattr(self.processor, "image_processor", None)
+                self.tokenizer = getattr(self.processor, "tokenizer", None) or tokenizer
+            except Exception as e:
+                logger.warning(f"[stream_quantization] processor unavailable ({e}); continuing without it.")
+        else:
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=self.trust_remote_code)
+            monkey_patch_model(model)
+            handle_generation_config(model)
+            self.model = model.eval()
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path, trust_remote_code=self.trust_remote_code
+                )
+            except Exception as e:
+                # Zero-shot streaming never consumes calibration data; a tokenizer
+                # is only needed for the export copy-through.
+                logger.warning(f"[stream_quantization] tokenizer unavailable ({e}); continuing without it.")
+                self.tokenizer = None
+        self.checkpoint_streamer = CheckpointStreamer(self.model_path)
+
     def _load_model(self):
+        if self.stream_quantization and not isinstance(self.model, (str, os.PathLike)):
+            raise ValueError(
+                "stream_quantization requires a model path (str): the streaming loop "
+                "reads decoder blocks straight from the on-disk checkpoint and never "
+                "materializes the full model. A preloaded model object cannot be "
+                "streamed; pass the checkpoint path instead."
+            )
+        if self.stream_quantization and envs.AR_DISK_STREAM_MODEL:
+            raise ValueError(
+                "AR_DISK_STREAM_MODEL and --stream_quantization are mutually "
+                "exclusive: the env var selects the offloader (data-driven) disk "
+                "stream, the flag selects the never-materialize streaming loop. "
+                "Unset AR_DISK_STREAM_MODEL to use --stream_quantization."
+            )
         if is_diffusion_model(self.model):
+            if self.stream_quantization:
+                # every other unsupported combination fails loud; a diffusion
+                # pipeline cannot stream decoder blocks (its blocks are not a
+                # decoder list, and the pipeline would be fully materialized
+                # anyway), so silently ignoring the flag here would ship a
+                # run the user believes is memory-bounded but is not
+                raise ValueError(
+                    "--stream_quantization does not support diffusion pipelines (no per-block decoder "
+                    "streaming); drop the flag and rely on offloading, or quantize a text-only checkpoint"
+                )
             self.is_diffusion = True
             self.preloaded_diffusion_pipeline = not isinstance(self.model, str)
             default_torch_dtype = "auto"
@@ -169,9 +265,27 @@ class ModelContext(BaseContext):
                 model_dtype=self.model_dtype,
                 default_torch_dtype=default_torch_dtype,
             )
+        if self.stream_quantization and not os.path.isdir(self.model):
+            # Fail loud with actionable guidance instead of the bare streamer
+            # FileNotFoundError: hub ids are never resolved for the weights
+            # (only config/tokenizer via from_pretrained), so a hub id would
+            # otherwise download the small files and then die at the streamer.
+            raise ValueError(
+                "--stream_quantization requires a local checkpoint directory: weight shards are "
+                f"streamed straight from disk and hub ids are never resolved (got {str(self.model)!r}). "
+                "Download the checkpoint first (e.g. `hf download <repo-id>`, or "
+                "`modelscope download <repo-id>` when using ModelScope) and pass the local path."
+            )
         elif is_mllm_model(self.model, platform=self.platform):
             self.is_mllm = True
-            if isinstance(self.model, str):
+            if self.stream_quantization:
+                # Same never-materialize contract as the text path: the meta
+                # skeleton resolves the multimodal class from architectures,
+                # the vision tower stays meta (zero-shot never forwards it;
+                # export passes its tensors through verbatim), and only the
+                # processor stack loads eagerly.
+                self._load_model_on_meta()
+            elif isinstance(self.model, str):
                 # Multimodal checkpoints used to
                 # bypass disk streaming entirely -- mllm_load_model fully
                 # materializes the checkpoint on CPU, infeasible for a 100B+
@@ -207,6 +321,8 @@ class ModelContext(BaseContext):
                     self.model, self.processor, self.tokenizer, self.image_processor = mllm_load_model(
                         self.model, platform=self.platform, device="cpu", model_dtype=self.model_dtype
                     )
+        elif isinstance(self.model, str) and self.stream_quantization:
+            self._load_model_on_meta()
         elif isinstance(self.model, str):
             config = self.config
             try:

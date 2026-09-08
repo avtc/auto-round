@@ -33,6 +33,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from auto_round.compressors import BaseOrchestrator
+
 import torch
 
 from auto_round.algorithms.block_runner import BlockForwardRunner
@@ -46,16 +49,29 @@ from auto_round.logger import logger
 from auto_round.utils import clear_memory
 from auto_round.utils.device_manager import device_manager
 
-if TYPE_CHECKING:  # avoid circular imports at runtime
-    from auto_round.algorithms.quantization.base import BaseQuantizer
-    from auto_round.algorithms.quantization.config import QuantizationConfig
-    from auto_round.algorithms.transforms.base import BasePreprocessor
-    from auto_round.compressors import BaseOrchestrator
+
+def _stream_out_device(block, low_gpu_mem_usage: bool = False):
+    """Park collected calibration rows on the producing block's home.
+
+    BlockForwardRunner parks returned rows on its fixed cache_device (the
+    primary GPU); under streaming with round-robin homes every non-primary
+    block would then pay a cross-device toll per tuning iteration. When the
+    streaming loop has stamped a home device, collect there instead. Returns
+    None for non-streaming runs (runner default, unchanged behavior).
+
+    ``low_gpu_mem_usage=True`` opts into the data-driven memory contract:
+    the chain stays on host RAM (the block runner chunks rows onto the GPU
+    per forward batch) instead of the home GPU -- lower VRAM at the cost of
+    the per-iteration host->device hop.
+    """
+    home = getattr(block, "_stream_home_device", None)
+    if home is None:
+        return None
+    if low_gpu_mem_usage:
+        return torch.device("cpu")
+    return torch.device(home)
 
 
-# ---------------------------------------------------------------------------
-# Context dataclasses
-# ---------------------------------------------------------------------------
 @dataclass
 class BlockContext:
     """Per-block context threaded through the lifecycle hooks.
@@ -121,9 +137,18 @@ class AlgorithmComposer:
         """
         from auto_round.algorithms.quantization.base import BaseQuantizer
         from auto_round.algorithms.quantization.config import QuantizationConfig
-        from auto_round.algorithms.transforms.base import BasePreprocessor
+        from auto_round.algorithms.transforms.base import BasePreprocessor, BaseRotationConfig
 
         configs = list(configs)
+
+        # Rotation configs travel in the same config list but are not pipeline
+        # members (they are ``BaseRotationConfig``, not ``QuantizationConfig``).
+        # Capture them here so the composer owns the full rotation lifecycle
+        # (see ``apply_model_transforms`` / ``finalize_run``) and the orchestrator
+        # stays rotation-agnostic.
+        self._rotation_configs = [c for c in configs if isinstance(c, BaseRotationConfig)]
+        self._layerwise_rotation = bool(getattr(orchestrator, "layerwise_rotation", False))
+        self._orchestrator_ref = orchestrator
 
         _, block_quantizer_configs = split_quantization_configs(configs)
         if not block_quantizer_configs:
@@ -214,6 +239,10 @@ class AlgorithmComposer:
             if self.block_quantizer is not None:
                 self.block_quantizer.bind_block_forward_runner(self.block_forward)
         self.scheme = getattr(orchestrator, "scheme_context", None)
+
+        # Rotation lifecycle state (populated by apply_model_transforms)
+        self._rotation_transforms: list = []
+        self._rotation_prepared: bool = False
 
     # ── Internal hook helpers (act_max calibration) ───────────────────────────
 
@@ -391,6 +420,14 @@ class AlgorithmComposer:
             - *reference_output*: FP reference output collected before optimization.
         """
         block_forward_fn = self.block_forward
+        _ctx = getattr(self._orchestrator_ref, "compress_context", None)
+        _out_dev = _stream_out_device(block, low_gpu_mem_usage=bool(getattr(_ctx, "low_gpu_mem_usage", False)))
+
+        # -- Step 0: Layer-wise rotation (before any reference/calibration) ----
+        # Rotates this block's weights and installs online hooks so all downstream
+        # calibration and reference collection operate on the rotated block. No-op
+        # unless layer-wise rotation is active.
+        self._run_block_ready_transforms(block, block_ctx)
 
         # ── Step 1: Preprocessor calibration (e.g. AWQ activation stats) ──────
         with torch.no_grad():
@@ -398,7 +435,7 @@ class AlgorithmComposer:
             for pre in self.preprocessors:
                 pre_hooks.extend(pre.register_fp_input_forward_hooks(block))
             if pre_hooks:
-                block_forward_fn(block, fp_inputs, input_others)
+                block_forward_fn(block, fp_inputs, input_others, cache_device=_out_dev)
             for h in pre_hooks:
                 h.remove()
 
@@ -407,7 +444,9 @@ class AlgorithmComposer:
                 if hasattr(pre, "register_qinput_forward_hooks"):
                     pre_q_hooks.extend(pre.register_qinput_forward_hooks(block))
             if pre_q_hooks:
-                block_forward_fn(block, q_inputs if q_inputs is not None else fp_inputs, input_others)
+                block_forward_fn(
+                    block, q_inputs if q_inputs is not None else fp_inputs, input_others, cache_device=_out_dev
+                )
             for h in pre_q_hooks:
                 h.remove()
 
@@ -421,7 +460,7 @@ class AlgorithmComposer:
             with torch.no_grad():
                 quant_hooks = self._get_fp_act_hooks(block)
                 if reference_output is None:
-                    reference_output = block_forward_fn(block, fp_inputs, input_others)
+                    reference_output = block_forward_fn(block, fp_inputs, input_others, cache_device=_out_dev)
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
                     h.remove()
@@ -429,7 +468,9 @@ class AlgorithmComposer:
                 if self.block_quantizer.enable_quanted_input:
                     q_hooks = self._get_q_act_hooks(block)
                     if q_hooks:
-                        block_forward_fn(block, q_inputs if q_inputs is not None else fp_inputs, input_others)
+                        block_forward_fn(
+                            block, q_inputs if q_inputs is not None else fp_inputs, input_others, cache_device=_out_dev
+                        )
                         for h in q_hooks:
                             h.remove()
 
@@ -473,7 +514,7 @@ class AlgorithmComposer:
         # ── Step 6: Collect quantized-block outputs for the next block ──────────
         if self.block_quantizer.enable_quanted_input:
             with torch.no_grad():
-                new_q_input = block_forward_fn(block, effective_input, input_others)
+                new_q_input = block_forward_fn(block, effective_input, input_others, cache_device=_out_dev)
                 new_q_input = getattr(block_forward_fn, "last_output_dict", None) or new_q_input
         else:
             new_q_input = None
@@ -572,3 +613,162 @@ class AlgorithmComposer:
     def finalize_run(self):
         for alg in self.members():
             alg.finalize_run()
+        # Rotation teardown is part of the model-level finalize stage.
+        self._finalize_rotation(self._owning_model())
+
+    # ------------------------------------------------------------------
+    # Rotation lifecycle (owned entirely by the composer)
+    # ------------------------------------------------------------------
+    #
+    # Rotation is a model-level pre-quantisation transform. Full-model rotation
+    # must run *before* calibration data is cached, which is earlier than the
+    # per-member ``prepare_run`` stage; layer-wise rotation instead prepares its
+    # matrices here and rotates each block from within ``compress_block``. Both
+    # are driven internally so the orchestrator only calls the single generic
+    # entry point :meth:`apply_model_transforms`.
+
+    _STREAMED_ROTATION_MSG = (
+        "Rotation transforms on a streamed model (stream_quantization / "
+        "AR_DISK_STREAM_MODEL meta skeleton) can only run layer-wise: leave "
+        "layerwise_rotation unset so it auto-engages under both streaming modes "
+        "(API callers may pass layerwise_rotation=True explicitly), and each "
+        "block is folded inside the block loop instead of materializing the "
+        "whole model."
+    )
+
+    def _model_has_meta(self, model) -> bool:
+        return any(p.device.type == "meta" for p in model.parameters()) or any(
+            b.device.type == "meta" for b in model.buffers()
+        )
+
+    def _assert_model_foldable_in_place(self, model) -> None:
+        """Refuse whole-model rotation on streamed skeletons with an actionable error.
+
+        Lazy-MoE replacement modules legitimately hold expert weights on meta
+        until materialized from their original module -- resolve those first
+        (skipping the call entirely when none exist, so a streamed skeleton does
+        not log thousands of leftover warnings). Any meta parameters or buffers
+        REMAINING afterwards belong to a streamed skeleton (no original to
+        materialize from) and must not be folded.
+        """
+        from auto_round import envs
+
+        if getattr(self._orchestrator_ref, "stream_quantization", False) or bool(envs.AR_DISK_STREAM_MODEL):
+            raise ValueError(self._STREAMED_ROTATION_MSG)
+        from auto_round.modeling.fused_moe.replace_modules import ReplacementModuleBase, materialize_model_
+
+        if any(isinstance(m, ReplacementModuleBase) for m in model.modules()):
+            materialize_model_(model)
+        if self._model_has_meta(model):
+            raise ValueError(self._STREAMED_ROTATION_MSG)
+
+    def _resolve_rotation_data_type(self) -> str:
+        """Best-effort resolution of the quantization data_type for rotation dispatch."""
+        if self.scheme is not None and getattr(self.scheme, "data_type", None):
+            return self.scheme.data_type
+        if self.block_quantizer is not None:
+            return getattr(self.block_quantizer.config, "data_type", "mx_fp")
+        return "mx_fp"
+
+    def _owning_model(self) -> "torch.nn.Module | None":
+        """Return the live model driven by this pipeline (via the block quantizer binding)."""
+        if self.block_quantizer is not None:
+            return getattr(self.block_quantizer, "model", None)
+        return None
+
+    def apply_model_transforms(self, model: "torch.nn.Module") -> "torch.nn.Module":
+        """Apply model-level pre-quantisation transforms (rotation) to *model*.
+
+        Generic entry point invoked once by the orchestrator before calibration
+        caching / the block loop. For full-model rotation the model is rotated
+        immediately and returned; for layer-wise rotation only the rotation
+        matrices are initialised and the per-block work is deferred to
+        :meth:`compress_block`. Idempotent - repeated calls are a no-op.
+
+        Returns:
+            The (possibly mutated) model.
+        """
+        if self._rotation_prepared:
+            return model
+
+        self._rotation_transforms = []
+        if not self._rotation_configs:
+            self._rotation_prepared = True
+            return model
+
+        from auto_round.algorithms.transforms import apply_rotation, normalize_rotation_config
+        from auto_round.algorithms.transforms.base import BaseRotation
+
+        # Weight transforms read and rewrite every module's parameters, so any
+        # lazy materialization (e.g. fused-MoE replacement modules holding
+        # expert weights on the meta device until first use) must be resolved
+        # before the transform pass, not at first block touch. Layer-wise mode
+        # is the exception: transforms apply per block after the block loop
+        # materializes it, so the model must NOT be fully materialized here
+        # (it may be intentionally larger than available memory).
+        if not self._layerwise_rotation:
+            self._assert_model_foldable_in_place(model)
+
+        data_type = self._resolve_rotation_data_type()
+        logger.info("Applying Hadamard transform to the model.")
+        for rotation_cfg in self._rotation_configs:
+            if self._layerwise_rotation:
+                normalised = normalize_rotation_config(rotation_cfg)
+                if normalised is None:
+                    continue
+                rotation = BaseRotation.from_config(normalised)
+                if rotation.supports_layerwise:
+                    logger.info(
+                        "[Rotation] Layer-wise mode: preparing R matrices only "
+                        "(rotation deferred to per-block hook)."
+                    )
+                    rotation.prepare_layerwise(model, data_type=data_type)
+                    self._rotation_transforms.append(rotation)
+                    continue
+                from auto_round import envs as _envs
+
+                streaming = bool(getattr(self._orchestrator_ref, "stream_quantization", False)) or bool(
+                    _envs.AR_DISK_STREAM_MODEL
+                )
+                if streaming:
+                    raise ValueError(
+                        f"{rotation.__class__.__name__} does not support layer-wise "
+                        "rotation, which is required under stream_quantization / "
+                        "AR_DISK_STREAM_MODEL (whole-model folding would materialize "
+                        "the model). Remove the rotation config or use an algorithm "
+                        "that implements the layer-wise protocol."
+                    )
+                logger.warning(
+                    f"[Rotation] {rotation.__class__.__name__} does not support "
+                    f"layer-wise mode. Falling back to full-model rotation."
+                )
+            model = apply_rotation(model, rotation_cfg, data_type=data_type)
+
+        self._rotation_prepared = True
+        return model
+
+    def _run_block_ready_transforms(self, block: "torch.nn.Module", block_ctx: "BlockContext") -> None:
+        """Apply layer-wise rotation to a block before reference collection.
+
+        Called as the first step of :meth:`compress_block`. No-op when no
+        layer-wise rotation transforms are active. Uses the block's global
+        index (``block_ctx.block_index``) as the rotation layer index.
+        """
+        if not self._rotation_transforms:
+            return
+
+        block_idx = block_ctx.block_index
+        block_names = block_ctx.block_names
+        if isinstance(block_names, (list, tuple)) and len(block_names) > 1:
+            sub_modules = list(block.layers) if hasattr(block, "layers") else [block]
+            for j, sub_mod in enumerate(sub_modules):
+                for t in self._rotation_transforms:
+                    t.rotate_layer(sub_mod, layer_idx=block_idx + j)
+        else:
+            for t in self._rotation_transforms:
+                t.rotate_layer(block, layer_idx=block_idx)
+
+    def _finalize_rotation(self, model: "torch.nn.Module") -> None:
+        """Finalize layer-wise rotation after all blocks are processed (no-op when inactive)."""
+        for t in self._rotation_transforms:
+            t.finalize_layerwise(model)

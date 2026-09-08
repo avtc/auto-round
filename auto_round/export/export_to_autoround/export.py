@@ -169,7 +169,7 @@ def pack_layer(layer_name, model, backend, device=None):
     # (crashed) process. Blocks it skipped are never touched in *this*
     # process and stay on the meta device, while their packed weights
     # already live in shard files the previous process flushed to disk (see
-    # ShardWriter._discover_existing_shards). There is nothing to pack here
+    # ShardWriter.adopt_existing_shards). There is nothing to pack here
     # -- attempting to would fail (no real weight data to read `.scale`
     # from) and would be redundant even if it didn't, since the on-disk
     # export for this layer is already complete.
