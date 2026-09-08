@@ -929,9 +929,8 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantizati
 `--stream_quantization` 从本地目录读取 checkpoint（直接流式读取分片，不解析 hub id）；
 如果起点是 hub id，请先下载模型。
 
-- `--stream_quantization`：启用流式路径。与 `AR_DISK_STREAM_MODEL` 互斥（同时设置会报错）。文本 LLM
-  建议优先使用该 flag；env 路径保留给需要量化视觉塔的多模态运行。多模态模型的视觉塔保持不量化
-  （流式模式下会拒绝 `quant_nontext_module`）。
+- `--stream_quantization`：启用流式路径。与 `AR_DISK_STREAM_MODEL` 互斥（同时设置会报错）。
+  多模态模型的视觉塔保持不量化（流式模式下会拒绝 `quant_nontext_module`）。
 - `--stream_prefetch off|auto|on|cpu|<设备>`：在量化当前块的同时，在其他设备上预取下一块的权重。
   `auto` 在另一块 GPU 上预取（当主 GPU 的空闲显存足以容纳最大块时，主 GPU 也会加入轮转；最后回退到
   主机内存）；`cpu` 在主机内存上预取（最慢、容量最大）；单个设备（如 `cuda:1`）在指定设备上预取；
@@ -940,6 +939,19 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantizati
   流式模式下尚不支持旋转类变换：整模型折叠会物化完整模型，且目前尚无变换实现逐块协议，
   因此使用旋转配置会直接报错并给出指引。
 - 断点续跑：`AR_RESUME_DIR` 适用于流式运行；已完成的块会被跳过，其输出分片会被直接采用。
+- AutoScheme：打分需要物化权重，因此流式运行无法在进程内打分，除非所有层索引均已缓存，否则会直接报错。请先在不开启
+  流式的情况下运行一次（例如 `AR_DISK_STREAM_MODEL` env 路径，可配合 `AR_ENABLE_AUTO_SCHEME_PARALLEL=1` 并行
+  worker），并设置 `AR_AUTO_SCHEME_CACHE`；之后的流式运行会解析缓存的 scheme 并据此量化。
+- 循环行为：任一时刻仅驻留一个解码器块，并就地量化在它的暂存设备上；当前块调优时，下一块的权重
+  会预取到另一个设备。完成块的打包 + 分片写入（以及适用时的 GGUF blob 落盘与崩溃恢复快照）在其
+  已空闲的暂存设备上以后台线程执行（`AR_STREAM_BG_PACK`）。
+- MTP/nextn 块：当 `layer_config` pin 覆盖到它们时，会被物化并按 pin 的位宽量化（`iters > 0` 时与其他
+  块一样参与调优）；未 pin 时，文本格式导出会原样透传其张量，而 GGUF 导出会按本次运行的默认量化
+  类型像普通主体张量一样量化它们。
+- GGUF 磁盘占用：流式 GGUF 运行会把逐块打包的载荷写入 `gguf-blobs/` 分片（约为最终模型大小的 1 倍，
+  位于输出目录旁），保存时再从这些字节组装出最终 `.gguf`——运行期间预计需要约 2 倍最终模型大小的
+  磁盘空间，组装期间系统临时目录还会有一份瞬时载荷缓冲。组装过程内存占用很低（一次只开一个分片
+  窗口）；组装成功后 blob 分片会被自动删除，否则保留用于崩溃恢复。
 
 - 支持的格式：流式量化要求逐块可打包的整数格式（`auto_round`、`auto_round:llm_compressor`、
   `auto_round:auto_gptq`、`auto_round:auto_awq`），此外 `gguf:<qtype>` 以分片暂存模式支持：GGUF 是单一

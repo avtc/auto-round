@@ -249,7 +249,9 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 export AR_DISK_STREAM_MODEL=1
 ```
 
-注意：`AR_DISK_STREAM_MODEL` 与 `--stream_quantization` 互斥——同时设置会在启动时报错。文本 LLM 请优先使用 `--stream_quantization`；env 路径保留给需要量化视觉塔的多模态运行。
+注意：`AR_DISK_STREAM_MODEL` 与 `--stream_quantization` 互斥——同时设置会在启动时报错。
+
+磁盘/内存行为：当量化块可以渐进式保存时（整数格式且开启 `low_cpu_mem_usage`），每个处理完的块会直接写入输出分片并释放回 meta——除输出外无需额外暂存空间，峰值内存约为一个块。其他配置会失去这一特性：导出格式为 GGUF（且未使用 `--stream_quantization`）、块外层被量化（如 `--quant_lm_head`）同时 `iters > 0` 调优、或存在绑定的 embedding 权重时，`low_cpu_mem_usage` 会被重置，处理完的块不再释放——模型会逐渐在内存中累积。无法逐块打包的格式或数据类型则会把每个处理完的块状态溢写到 `<AR_WORK_SPACE>/offload`（约需 1 倍模型大小的磁盘空间），直到最终保存。
 
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。

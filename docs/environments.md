@@ -249,7 +249,9 @@ export AR_NVFP4_E5M3_CACHE_HP_WEIGHT=1
 export AR_DISK_STREAM_MODEL=1
 ```
 
-Note: `AR_DISK_STREAM_MODEL` and `--stream_quantization` are mutually exclusive -- setting both raises an error at startup. For text LLMs prefer `--stream_quantization`; the env path remains for multimodal runs that quantize the vision tower.
+Note: `AR_DISK_STREAM_MODEL` and `--stream_quantization` are mutually exclusive -- setting both raises an error at startup.
+
+Disk/RAM behavior: while quantized blocks can be saved progressively (integer formats with `low_cpu_mem_usage`), each processed block is written straight to the output shards and freed back to meta -- no scratch beyond the output, peak RAM roughly one block. Other configurations lose that property: with GGUF as the export format (without `--stream_quantization`), with quantized layers outside the decoder blocks (e.g. `--quant_lm_head`) while tuning with `iters > 0`, or with tied embedding weights, `low_cpu_mem_usage` is reset and processed blocks are no longer freed -- the model accumulates in RAM. Formats or dtypes that cannot pack per-block instead spill each processed block's state to `<AR_WORK_SPACE>/offload` (budget about 1x the model size) until the final save.
 
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.

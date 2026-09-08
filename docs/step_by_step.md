@@ -969,8 +969,7 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantizati
 directly and never resolves hub ids); download the model first when starting from a hub id.
 
 - `--stream_quantization`: enable the streaming path. Mutually exclusive with `AR_DISK_STREAM_MODEL` (an error
-  is raised when both are set). Text LLMs should prefer this flag; the env path remains for multimodal runs
-  that quantize the vision tower. For multimodal models the vision tower stays unquantized
+  is raised when both are set). For multimodal models the vision tower stays unquantized
   (`quant_nontext_module` is rejected under streaming).
 - `--stream_prefetch off|auto|on|cpu|<device>`: stage the next block's weights on another device while the
   current block is quantized. `auto` stages on one other GPU (the primary joins the rotation when its free
@@ -981,6 +980,26 @@ directly and never resolves hub ids); download the model first when starting fro
   staging home. Rotation transforms are NOT yet supported under streaming: whole-model folding would
   materialize the model and no transform implements the layer-wise protocol yet, so a rotation config
   fails loud with guidance.
+- Crash resume: `AR_RESUME_DIR` applies to streaming runs; completed blocks are skipped and their
+  already-written output shards are adopted as-is.
+- AutoScheme: scoring requires materialized weights, so a streaming run cannot score in-process and fails
+  unless every layer index is already cached. Run once without streaming (for example the
+  `AR_DISK_STREAM_MODEL` env path, optionally with `AR_ENABLE_AUTO_SCHEME_PARALLEL=1` to parallelize the
+  workers) with `AR_AUTO_SCHEME_CACHE` set; the streaming run then resolves the cached scheme and
+  quantizes from it.
+- How the loop behaves: exactly one decoder block is resident at a time and is quantized in place on its
+  staging device; the next block's weights are prefetched to another device while the current one is tuned.
+  The finished block's pack + shard write (plus GGUF blob flush and crash-resume snapshot when applicable)
+  run in a background thread on its now-idle staging home (`AR_STREAM_BG_PACK`).
+- MTP/nextn blocks: when a `layer_config` pin covers them they are materialized and quantized at the pinned
+  bits (and tuned like any other block when `iters > 0`); when unpinned, text-format exports pass their
+  tensors through verbatim, while GGUF exports quantize them at the run's default qtype like any other
+  body tensor.
+- GGUF disk usage: a streaming GGUF run spills per-block packed payloads to `gguf-blobs/` shards (about 1x
+  the final model size, next to the output) and assembles the final `.gguf` from those bytes at save time --
+  expect about 2x the final model size on disk during the run, plus a transient payload spool in the system
+  temp directory during assembly. Assembly keeps RAM lean (one shard window at a time); blob shards are
+  deleted automatically after a successful assembly and kept for crash resume otherwise.
 
 - Supported formats: streaming requires per-block packable integer formats (`auto_round`, `auto_round:llm_compressor`,
   `auto_round:auto_gptq`, `auto_round:auto_awq`) plus `gguf:<qtype>` in blob-shard mode: GGUF is a single-container
