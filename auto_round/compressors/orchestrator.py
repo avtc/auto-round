@@ -1574,7 +1574,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         container without its own placement entry inherits its first placed
         descendant's device.
         """
-        from auto_round.compressors.utils import attach_stream_align_
+        from auto_round.compressors.utils import attach_stream_align_, detach_stream_align_
 
         multi = len(device_manager.device_list) > 1
         targets = {}
@@ -1583,6 +1583,23 @@ class CompressionOrchestrator(BaseOrchestrator):
             if dev is not None:
                 targets[name] = str(dev)
         for name, mod in block.named_modules():
+            orig = getattr(mod, "orig_layer", None)
+            if orig is not None:
+                # a quantizer wrapper: own the alignment HERE. The wrapper
+                # moves its input to the leaf device (wrapper.py
+                # ``x = x.to(self.device)``) BEFORE replaying the orig-layer
+                # hooks, so a hook on orig records the leaf's own device as
+                # the caller's and returns the output there instead of the
+                # actual caller. A wrapper-level hook sees the true caller
+                # device (real torch hook semantics, no manual replay); the
+                # stale orig hook is detached so its recording cannot win.
+                dev = getattr(orig, "tuning_device", None) or targets.get(name)
+                if dev is not None:
+                    mod.tuning_device = torch.device(dev)
+                    if multi:
+                        detach_stream_align_(orig)
+                        attach_stream_align_(mod, torch.device(dev), name=name)
+                continue
             if not any(True for _ in mod.parameters(recurse=False)) and list(mod.children()):
                 continue
             dev = targets.get(name)

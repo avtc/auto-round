@@ -349,3 +349,37 @@ class TestAlignTrace:
         assert any("self_attn.q_proj" in m and "cuda:1" in m for m in msgs)
         assert not any("k_proj" in m for m in msgs)
         cu._TRACE_HOPS = None
+
+
+class TestWrapperOwnsAlignment:
+    def test_wrapper_gets_hook_and_orig_detached(self, monkeypatch):
+        import torch
+
+        import auto_round.compressors.orchestrator as orch
+        from auto_round.compressors.utils import StreamAlignHook
+
+        class _DM:
+            device_list = [torch.device("cpu"), torch.device("cpu", 1)]
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+
+        class FakeWrap(torch.nn.Module):
+            def __init__(self, orig):
+                super().__init__()
+                self.orig_layer = orig
+
+        lin = torch.nn.Linear(2, 2)
+        lin.tuning_device = torch.device("cpu", 1)
+        wrap = FakeWrap(lin)
+        block = torch.nn.ModuleDict({"q": wrap})
+        placement = {"q": "cpu:1"}
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        # alignment moved to the wrapper: real torch hooks, correct caller
+        assert getattr(wrap, "_stream_align_hook", None) is not None
+        assert isinstance(wrap._stream_align_hook, StreamAlignHook)
+        assert getattr(wrap, "tuning_device", None) == torch.device("cpu", 1)
+        # stale orig-layer hook detached (its input_device recording is wrong)
+        assert getattr(lin, "_stream_align_hook", None) is None
+        # idempotent re-pin keeps exactly one hook set
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        assert len(wrap._forward_pre_hooks) == 1 and len(wrap._forward_hooks) == 1

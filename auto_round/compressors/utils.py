@@ -180,6 +180,38 @@ def rehome_block_(module: torch.nn.Module, device) -> int:
     return moved
 
 
+def _dump_block_devices_(block, input_others) -> None:
+    """Crash-time device inventory: which module sits where, and what the block was called with.
+
+    Fired from block_forward's exception path under AR_STREAM_TRACE_DEVICES so a
+    cross-device fault names the mismatched pair instead of leaving the block
+    interior a guessing game. One line per module: weight device, pinned target,
+    wrapper output target, align-hook presence.
+    """
+    lines = ["[stream-align] ---- device dump on block fault ----"]
+    flat = {
+        k: str(v.device) if isinstance(v, torch.Tensor) else [str(t.device) for t in v if isinstance(t, torch.Tensor)]
+        for k, v in input_others.items()
+        if isinstance(v, (torch.Tensor, list, tuple))
+    }
+    lines.append(f"[stream-align] inputs: {flat}")
+    for name, mod in block.named_modules():
+        if not name:
+            continue
+        w = next(mod.parameters(recurse=False), None)
+        b = next(mod.buffers(recurse=False), None)
+        t = getattr(mod, "tuning_device", None)
+        align = "align" if getattr(mod, "_stream_align_hook", None) is not None else ""
+        wdev = str(w.device) if w is not None else (f"buf:{b.device}" if b is not None else "-")
+        outdev = getattr(mod, "output_device", None)
+        extra = f" out={outdev}" if outdev is not None else ""
+        lines.append(
+            f"[stream-align]   {name}: w {wdev}{' tgt ' + str(t) if t is not None else ''}{extra} {align}".rstrip()
+        )
+    for ln in lines:
+        logger.info("%s", ln)
+
+
 _TRACE_HOPS = None  # AR_STREAM_TRACE_DEVICES latch: None=unread, False=off
 
 
@@ -410,7 +442,7 @@ def block_forward(
             _trace_block_fwd_n += 1
         except NameError:
             _trace_block_fwd_n = 1
-        if _trace_block_fwd_n <= 3:
+        if _trace_block_fwd_n <= 50:
             devs = {k: str(v.device) for k, v in input_others.items() if isinstance(v, torch.Tensor)}
             nested = {
                 k: [str(t.device) for t in v if isinstance(t, torch.Tensor)]
@@ -424,11 +456,18 @@ def block_forward(
                 devs,
                 nested,
             )
-    if amp:
-        with autocast(device_type=str(device).split(":")[0], dtype=amp_dtype):  # pragma: no cover
+    try:
+        if amp:
+            with autocast(device_type=str(device).split(":")[0], dtype=amp_dtype):  # pragma: no cover
+                output = block(**input_others)
+        else:
             output = block(**input_others)
-    else:
-        output = block(**input_others)
+    except RuntimeError:
+        if _TRACE_HOPS is None:
+            _TRACE_HOPS = os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
+        if _TRACE_HOPS:
+            _dump_block_devices_(block, input_others)
+        raise
     if isinstance(output_return_id, int) and (isinstance(output, list) or isinstance(output, tuple)):
         output = output[output_return_id]
     return output
