@@ -340,8 +340,9 @@ class TestAlignTrace:
         import auto_round.compressors.utils as cu
 
         monkeypatch.setenv("AR_STREAM_TRACE_DEVICES", "1")
+        monkeypatch.setattr(cu.logger, "propagate", True)  # autoround logger keeps its own handler
         cu._TRACE_HOPS = None  # re-read the env
-        with caplog.at_level(_logging.INFO, logger="auto_round"):
+        with caplog.at_level(_logging.INFO, logger=cu.logger.name):
             cu._trace_align_hop("self_attn.q_proj", torch.device("cpu"), torch.device("cuda:1"))
             cu._trace_align_hop("self_attn.k_proj", torch.device("cpu"), torch.device("cpu"))
         msgs = [r.getMessage() for r in caplog.records]
