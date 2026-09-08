@@ -1548,6 +1548,32 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         return is_placement_template(getattr(device_manager, "device_map", None))
 
+    @staticmethod
+    def _pin_stream_mapped_(block, placement: dict) -> None:
+        """Bind a mapped streamed block to its per-leaf devices.
+
+        Sets ``tuning_device`` from the placement (wrappers prefer it:
+        ``wrapper.py self.device = orig_layer.tuning_device or device``) and
+        attaches per-leaf ``AlignDevicesHook(io_same_device=True)`` so chain
+        rows, mask kwargs and activations hop to each module's device during
+        forwards - without this, any block forward (mask-form probe, chain
+        pass, tuning) mixes devices and fails on the first cross-device op.
+        """
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+        multi = len(device_manager.device_list) > 1
+        for name, mod in block.named_modules():
+            if list(mod.children()):
+                continue
+            if not any(True for _ in mod.parameters(recurse=False)):
+                continue
+            dev = placement.get(name)
+            if dev is None:
+                continue
+            mod.tuning_device = torch.device(dev)
+            if multi:
+                add_hook_to_module(mod, AlignDevicesHook(mod.tuning_device, io_same_device=True), True)
+
     def _mapped_shared_groups_(self) -> list:
         """Comma-key layer_config entries = shared-quantization groups."""
         return [
@@ -1730,25 +1756,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # a confusing later OOM
                 clear_memory(device_list=sorted({str(d) for d in placement.values()} | {str(fallback)}))
                 rehome_block_mapped_(block, placement, fallback)
-                from accelerate.hooks import AlignDevicesHook, add_hook_to_module, remove_hook_from_module
-
-                for _n, _mod in block.named_modules():
-                    if list(_mod.children()):
-                        continue
-                    if not any(True for _ in _mod.parameters(recurse=False)):
-                        continue
-                    dev = placement.get(_n)
-                    if dev is None:
-                        continue
-                    _mod.tuning_device = torch.device(dev)
-                    remove_hook_from_module(_mod)
-                    if len(device_manager.device_list) > 1:
-                        add_hook_to_module(_mod, AlignDevicesHook(_mod.tuning_device, io_same_device=True), True)
+                CompressionOrchestrator._pin_stream_mapped_(block, placement)
                 block._stream_mapped = placement
                 with state["lock"]:
                     state["placements"][block_name] = placement
                     state["pending_restage"] = None
-                logger.info("[stream-mapped] restaged %s onto its flow-derived placement before tuning", block_name)
+                logger.debug("[stream-mapped] restaged %s onto its flow-derived placement before tuning", block_name)
 
             return _restage
 
@@ -3035,6 +3048,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                         _n_moved = rehome_block_mapped_(block, _placement, load_device)
                         block._stream_mapped = _placement
+                        self._pin_stream_mapped_(block, _placement)
                         # derivation: probe the reference forward (first full
                         # pass) and restage onto the derived placement at the
                         # fp->wrapper boundary, before any tuning state exists

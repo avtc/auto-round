@@ -181,21 +181,6 @@ class SignRoundQuantizer(BaseQuantizer):
             # streaming loop: the block was streamed onto this device and
             # rehomed there - it is the single tuning device, never sharded
             return self._pin_stream_home(block, stream_home)
-        if getattr(block, "_stream_mapped", None):
-            # streamed mapped placement: leaves carry their tuning_device from
-            # the user's placement template (the streamer staged each module
-            # on its target directly). Wire the cross-device chain hooks once;
-            # never re-partition by free VRAM - the template is the contract.
-            if len(device_manager.device_list) > 1:
-                from accelerate.hooks import AlignDevicesHook, add_hook_to_module
-
-                for _n, _mod in block.named_modules():
-                    if list(_mod.children()) or not hasattr(_mod, "tuning_device"):
-                        continue
-                    add_hook_to_module(_mod, AlignDevicesHook(_mod.tuning_device, io_same_device=True), True)
-            self._card_0_in_high_risk = False
-            self._loss_device = device_manager.device
-            return block
         if (
             is_auto_device_mapping(device_manager.device_map)
             and len(device_manager.device_list) > 1

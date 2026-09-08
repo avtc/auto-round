@@ -1037,8 +1037,9 @@ class TestStreamQuantizeEquivalence:
 
         captured = capfd.readouterr()
         assert "derived placement from the reference forward" in captured.out + captured.err
-        assert "restaged model.layers.0 onto its flow-derived placement" in captured.out + captured.err
         assert "reusing flow-derived placement" in captured.out + captured.err
+        # (the per-block restage line is DEBUG-level: visible with
+        # AR_LOG_LEVEL=DEBUG on the server, not asserted here)
 
         t = {name: load_all(d) for name, d in arms.items()}
         assert set(t["plain"]) == set(t["mapped"])

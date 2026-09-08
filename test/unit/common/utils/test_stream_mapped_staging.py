@@ -95,49 +95,41 @@ class TestLoadModuleDeviceOf:
         assert seen["blk.q_proj.weight"] is None  # not str(cuda:3)
 
 
-class TestDispatchBlockMapped:
-    def _quantizer_shell(self):
-        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+class TestPinStreamMapped:
+    """The materialize-side helper binds wrappers (tuning_device) and chain
+    hooks for a mapped streamed block - streaming never calls dispatch_block,
+    so this is the single attachment site."""
 
-        q = object.__new__(SignRoundQuantizer)
-        return q
-
-    def test_mapped_branch_attaches_hooks_and_keeps_devices(self, monkeypatch):
-        import auto_round.algorithms.quantization.sign_round.quantizer as q_mod
+    def test_pins_tuning_device_and_attaches_hooks(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch
 
         class _DM:
             device = torch.device("cpu", 0)
             device_list = [torch.device("cpu", 0), torch.device("cpu", 1)]
 
-        monkeypatch.setattr(q_mod, "device_manager", _DM())
-        q = self._quantizer_shell()
+        monkeypatch.setattr(orch, "device_manager", _DM())
         block = _Toy()
-        for n, m in block.named_modules():
-            if not list(m.children()):
-                m.tuning_device = torch.device("cpu", 1)
-        block._stream_mapped = True
-        out = q.dispatch_block(block, None, {})
-        assert out is block
-        assert q._card_0_in_high_risk is False
-        assert q._loss_device == torch.device("cpu", 0)
-        # leaves keep the template devices (no re-partition, no single-home pin)
+        placement = {"q_proj": torch.device("cpu", 1), "mlp.gate_proj": torch.device("cpu", 0)}
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        # wrappers bind to the per-leaf template devices
         assert block.q_proj.tuning_device == torch.device("cpu", 1)
-        assert block.mlp["gate_proj"].tuning_device == torch.device("cpu", 1)
+        assert block.mlp["gate_proj"].tuning_device == torch.device("cpu", 0)
+        # cross-device chain hooks attached on multi-device maps
+        assert getattr(block.q_proj, "_hf_hook", None) is not None
 
     def test_single_device_map_skips_hooks(self, monkeypatch):
-        import auto_round.algorithms.quantization.sign_round.quantizer as q_mod
+        import auto_round.compressors.orchestrator as orch
 
         class _DM:
             device = torch.device("cpu")
             device_list = [torch.device("cpu")]
 
-        monkeypatch.setattr(q_mod, "device_manager", _DM())
-        q = self._quantizer_shell()
+        monkeypatch.setattr(orch, "device_manager", _DM())
         block = _Toy()
-        block.q_proj.tuning_device = torch.device("cpu")
-        block._stream_mapped = True
-        out = q.dispatch_block(block, None, {})
-        assert out is block
+        placement = {"q_proj": torch.device("cpu")}
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        assert block.q_proj.tuning_device == torch.device("cpu")
+        assert getattr(block.q_proj, "_hf_hook", None) is None
 
 
 class TestStartPrefetchMapped:
