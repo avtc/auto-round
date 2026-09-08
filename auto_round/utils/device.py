@@ -1656,7 +1656,7 @@ def dispatch_model_by_all_available_devices(
     return model
 
 
-def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
+def log_cuda_memory_census(tag: str, device=None, top: int = 12, log_level: str = "debug") -> None:
     """Log a DEBUG-level VRAM census: allocator totals plus the largest live tensors.
 
     Intended for diagnosing memory pressure at specific points (tuning huge
@@ -1707,8 +1707,9 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
         sum(storages.values()) / 2**30,
         len(groups),
     ]
+    _log = logger.warning if log_level == "warning" else logger.debug
     if _skipped[0]:
-        logger.debug("[vram]   (+%d object(s) could not be sized)", _skipped[0])
-    logger.debug(*lines)
+        _log("[vram]   (+%d object(s) could not be sized)", _skipped[0])
+    _log(*lines)
     for (shape, dtype), (count, nbytes) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]:
-        logger.debug("[vram]   %6.3fGiB x%-3d %s %s", nbytes / 2**30, count, dtype, shape)
+        _log("[vram]   %6.3fGiB x%-3d %s %s", nbytes / 2**30, count, dtype, shape)

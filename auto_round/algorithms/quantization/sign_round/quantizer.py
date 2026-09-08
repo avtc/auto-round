@@ -623,6 +623,19 @@ class SignRoundQuantizer(BaseQuantizer):
                 num_elm = sum(active_inputs[i.item()].numel() for i in whole_indices)
 
         block, sync_gradients = setup_ddp_if_needed_(self, block, device_manager.device_list)
+
+        def _oom_census(where):
+            # fail-visible: name the largest live tensors per tune device at
+            # the OOM point so the holder is identified from the log alone
+            for d in device_manager.device_list:
+                try:
+                    log_cuda_memory_census(f"[tune-oom] {block_ctx.block_name} {where}", d, log_level="warning")
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning("[tune-oom] census failed on %s: %s", d, e)
+
+        if logger.isEnabledFor(10):  # DEBUG: who holds VRAM as the tune starts
+            for d in device_manager.device_list:
+                log_cuda_memory_census(f"tune start {block_ctx.block_name}", d)
         index_sampler = IndexSampler(nsamples, global_batch_size)
         block_fwd = self.block_forward
 
@@ -656,7 +669,11 @@ class SignRoundQuantizer(BaseQuantizer):
                 if _perf:
                     _sync_tune_devices_()
                     _t0 = time.perf_counter()
-                pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
+                try:
+                    pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
+                except torch.OutOfMemoryError:
+                    _oom_census(f"iter {i} fwd")
+                    raise
                 if loss_device is not None:
                     pred_output = pred_output.to(loss_device)
                 if (
@@ -681,7 +698,11 @@ class SignRoundQuantizer(BaseQuantizer):
                 if _perf:
                     _sync_tune_devices_()
                     _t1 = time.perf_counter()
-                self._scale_loss_and_backward(scaler, loss)
+                try:
+                    self._scale_loss_and_backward(scaler, loss)
+                except torch.OutOfMemoryError:
+                    _oom_census(f"iter {i} bwd")
+                    raise
                 if _perf:
                     _sync_tune_devices_()
                     _t["bwd"] += time.perf_counter() - _t1
