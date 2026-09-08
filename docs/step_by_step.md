@@ -969,7 +969,9 @@ For long runs, make the job crash-resumable -- completed blocks are skipped and 
 shards are adopted as-is on restart (the same `AR_RESUME_DIR` contract as the ordinary path):
 
 ```bash
-AR_RESUME_DIR=/home/<user>/auto_round/resume auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16"   --stream_quantization --stream_prefetch auto
+AR_RESUME_DIR=/path/to/resume/state \
+auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" \
+  --stream_quantization --stream_prefetch auto
 ```
 
 `--stream_quantization` reads the checkpoint from a local directory (it streams shards

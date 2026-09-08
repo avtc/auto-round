@@ -930,7 +930,9 @@ auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" --stream_quantizati
 采用（与普通路径相同的 `AR_RESUME_DIR` 约定）：
 
 ```bash
-AR_RESUME_DIR=/home/<用户名>/auto_round/resume auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16"   --stream_quantization --stream_prefetch auto
+AR_RESUME_DIR=/path/to/resume/state \
+auto-round --model /path/to/local/Qwen3-14B --scheme "W4A16" \
+  --stream_quantization --stream_prefetch auto
 ```
 
 `--stream_quantization` 从本地目录读取 checkpoint（直接流式读取分片，不解析 hub id）；
