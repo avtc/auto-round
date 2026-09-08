@@ -368,6 +368,33 @@ class BaseOrchestrator(object):
                 "streaming quantization loop; ignoring it",
                 self.stream_prefetch,
             )
+        # mapped placement: distribute each streamed block's modules across
+        # several GPUs (--device_map template / --stream_prefetch_device_map).
+        # Streaming only; single-process only (mirror-DDP replicas cannot span
+        # a distributed block). The alternate prefetch map additionally
+        # requires block staging to be on - it places the blocks the reader
+        # prefetches, and without the reader it would only narrow the tune.
+        _pf_map_raw = kwargs.pop("stream_prefetch_device_map", None)
+        self.stream_prefetch_device_map = str(_pf_map_raw).strip() if _pf_map_raw else None
+        if self.stream_prefetch_device_map is not None and not self.stream_quantization:
+            raise ValueError(
+                "stream_prefetch_device_map requires stream_quantization: mapped placement distributes "
+                "each streamed block's modules across devices"
+            )
+        if self.stream_prefetch_device_map is not None and self.stream_prefetch in ("off",):
+            raise ValueError(
+                "stream_prefetch_device_map requires stream_prefetch: it places the blocks the "
+                "prefetch reader stages (use --stream_prefetch auto/on/cpu)"
+            )
+        if (self.stream_prefetch_device_map or self._stream_mapped_template()) and self.stream_quantization:
+            from auto_round.utils.distributed import is_distributed
+
+            if is_distributed():
+                raise ValueError(
+                    "mapped placement (device_map template / stream_prefetch_device_map) is not available "
+                    "together with distributed tuning: a DDP replica cannot span a block distributed "
+                    "across devices"
+                )
         # Collect imatrix activation statistics with a streaming forward pass
         # before the zero-shot loop (stream_quantization only): one block at a
         # time is materialized, all calibration rows are pushed through, and
@@ -1982,6 +2009,13 @@ class BaseOrchestrator(object):
         if isinstance(opt, str):
             return getattr(torch.optim, opt, None)
         return opt
+
+    def _stream_mapped_template(self) -> bool:
+        """True when the main device map names modules (a placement template)."""
+        from auto_round.utils.device_manager import device_manager
+        from auto_round.utils.stream_placement import is_placement_template
+
+        return is_placement_template(getattr(device_manager, "device_map", None))
 
     def _adjust_immediate_packing_and_saving(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig

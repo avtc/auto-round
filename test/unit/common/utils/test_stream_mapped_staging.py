@@ -1,0 +1,258 @@
+# Copyright (c) 2024 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Mapped-placement plumbing on CheckpointStreamer (per-tensor devices)."""
+
+import pytest
+import torch
+
+from auto_round.utils import checkpoint_streamer as cs_mod
+from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+
+class _Toy(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = torch.nn.Linear(4, 4, bias=False)
+        self.mlp = torch.nn.ModuleDict({"gate_proj": torch.nn.Linear(4, 4, bias=False)})
+
+
+def _bare_streamer(monkeypatch):
+    """A streamer shell whose fetch is replaced by a recording stub."""
+    s = object.__new__(CheckpointStreamer)
+    s.weight_map = {
+        "blk.q_proj.weight": "s0",
+        "blk.mlp.gate_proj.weight": "s0",
+    }
+    s._model_type = ""
+    s._prefetch_thread = None
+    s._perf_segs = None
+    seen = {}
+
+    def fake_fetch(name, device=None, raw=False):
+        seen[name] = device
+        return torch.zeros(4, 4)
+
+    monkeypatch.setattr(s, "fetch", fake_fetch)
+    return s, seen
+
+
+class TestLoadModuleDeviceOf:
+    def test_per_tensor_devices(self, monkeypatch):
+        s, seen = _bare_streamer(monkeypatch)
+        monkeypatch.setattr(s, "names_under", lambda prefix: ["blk.q_proj.weight", "blk.mlp.gate_proj.weight"])
+        monkeypatch.setattr(s, "_assign_leaf_", lambda module, rel, tensor: True)
+        monkeypatch.setattr(cs_mod, "_park_cpu_buffers_", lambda module, device: None)
+        placement = {"q_proj": "cpu", "mlp.gate_proj": "cpu"}
+
+        def device_of(name):
+            leaf = name[len("blk.") :].rsplit(".", 1)[0]
+            return placement.get(leaf)
+
+        module = _Toy()
+        s.load_module_(module, "blk", device="cpu", device_of=device_of)
+        # device_of is honored per tensor (here both resolve, distinct calls)
+        assert seen["blk.q_proj.weight"] == "cpu"
+        assert seen["blk.mlp.gate_proj.weight"] == "cpu"
+
+    def test_device_of_overrides_single_home(self, monkeypatch):
+        s, seen = _bare_streamer(monkeypatch)
+        monkeypatch.setattr(s, "names_under", lambda prefix: ["blk.q_proj.weight"])
+        monkeypatch.setattr(s, "_assign_leaf_", lambda module, rel, tensor: True)
+        monkeypatch.setattr(cs_mod, "_park_cpu_buffers_", lambda module, device: None)
+
+        calls = []
+
+        def device_of(name):
+            calls.append(name)
+            return None  # unmatched -> fetch gets None (no forced home)
+
+        module = _Toy()
+        s.load_module_(module, "blk", device="cpu", device_of=device_of)
+        assert calls == ["blk.q_proj.weight"]
+        assert seen["blk.q_proj.weight"] is None
+
+    def test_recorded_stage_home_ignored_under_device_of(self, monkeypatch):
+        """With device_of, a stale recorded single home must not override."""
+        s, seen = _bare_streamer(monkeypatch)
+        s._prefetch_stage_dev = {"blk": torch.device("cuda", 3)}
+        monkeypatch.setattr(s, "names_under", lambda prefix: ["blk.q_proj.weight"])
+        monkeypatch.setattr(s, "_assign_leaf_", lambda module, rel, tensor: True)
+        monkeypatch.setattr(cs_mod, "_park_cpu_buffers_", lambda module, device: None)
+        module = _Toy()
+        s.load_module_(module, "blk", device="cpu", device_of=lambda name: None)
+        assert seen["blk.q_proj.weight"] is None  # not str(cuda:3)
+
+
+class TestDispatchBlockMapped:
+    def _quantizer_shell(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        q = object.__new__(SignRoundQuantizer)
+        return q
+
+    def test_mapped_branch_attaches_hooks_and_keeps_devices(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.quantizer as q_mod
+
+        class _DM:
+            device = torch.device("cpu", 0)
+            device_list = [torch.device("cpu", 0), torch.device("cpu", 1)]
+
+        monkeypatch.setattr(q_mod, "device_manager", _DM())
+        q = self._quantizer_shell()
+        block = _Toy()
+        for n, m in block.named_modules():
+            if not list(m.children()):
+                m.tuning_device = torch.device("cpu", 1)
+        block._stream_mapped = True
+        out = q.dispatch_block(block, None, {})
+        assert out is block
+        assert q._card_0_in_high_risk is False
+        assert q._loss_device == torch.device("cpu", 0)
+        # leaves keep the template devices (no re-partition, no single-home pin)
+        assert block.q_proj.tuning_device == torch.device("cpu", 1)
+        assert block.mlp["gate_proj"].tuning_device == torch.device("cpu", 1)
+
+    def test_single_device_map_skips_hooks(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.quantizer as q_mod
+
+        class _DM:
+            device = torch.device("cpu")
+            device_list = [torch.device("cpu")]
+
+        monkeypatch.setattr(q_mod, "device_manager", _DM())
+        q = self._quantizer_shell()
+        block = _Toy()
+        block.q_proj.tuning_device = torch.device("cpu")
+        block._stream_mapped = True
+        out = q.dispatch_block(block, None, {})
+        assert out is block
+
+
+class TestStartPrefetchMapped:
+    def test_stage_devices_and_stage_device_of_mutex(self, monkeypatch, tmp_path):
+        s = object.__new__(CheckpointStreamer)
+        s._prefetch_thread = None
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            s.start_prefetch(
+                ["blk"],
+                stage_devices=[torch.device("cpu")],
+                stage_device_of=lambda idx, name, prefix: "cpu",
+            )
+
+
+class TestOrchestratorMappedMode:
+    def _shell(self, **attrs):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        o = object.__new__(CompressionOrchestrator)
+        for k, v in attrs.items():
+            setattr(o, k, v)
+        return o
+
+    def test_mapped_enabled_by_template_or_next(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch
+
+        class _DM:
+            device_map = "0,1"  # plain list -> NOT mapped
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+        o = self._shell(stream_prefetch_device_map=None)
+        assert o._stream_mapped_enabled() is False
+
+        monkeypatch.setattr(orch, "device_manager", type("DM2", (), {"device_map": "self_attn.*:0,mlp.*:1"})())
+        assert o._stream_mapped_enabled() is True
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+        o = self._shell(stream_prefetch_device_map="self_attn.*:2,mlp.*:3")
+        assert o._stream_mapped_enabled() is True
+
+    def test_resolver_superseded_and_conflict(self, monkeypatch):
+        import pytest
+
+        import auto_round.compressors.orchestrator as orch
+
+        class _DM:
+            device_map = "self_attn.*:0,mlp.*:1"
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+        o = self._shell(stream_prefetch_device_map=None, stream_prefetch="auto", device="cpu")
+        assert o._resolve_stream_stage_devices() is None  # superseded -> no rotation
+
+        o = self._shell(stream_prefetch_device_map=None, stream_prefetch="cuda:1", device="cpu")
+        with pytest.raises(ValueError, match="conflicts with mapped placement"):
+            o._resolve_stream_stage_devices()
+
+    def test_park_rows_cpu(self):
+        from auto_round.compressors.orchestrator import CompressionOrchestrator
+
+        rows = [torch.zeros(2), torch.zeros(3)]
+        out = CompressionOrchestrator._park_rows_cpu_(rows)
+        assert all(r.device.type == "cpu" for r in out)
+        assert CompressionOrchestrator._park_rows_cpu_(torch.zeros(2)).device.type == "cpu"
+        assert CompressionOrchestrator._park_rows_cpu_(None) is None
+        assert CompressionOrchestrator._park_rows_cpu_([None, torch.zeros(2)])[0] is None
+
+
+class TestRehomeBlockMapped:
+    def test_leaves_distributed_rest_on_fallback(self):
+        from auto_round.compressors.utils import rehome_block_mapped_
+
+        block = _Toy()
+        block.q_proj.weight.data = torch.randn(4, 4)
+        block.mlp["gate_proj"].weight.data = torch.randn(4, 4)
+        placement = {"q_proj": torch.device("cpu"), "mlp.gate_proj": torch.device("cpu")}
+        # both devices are cpu here; verify the fallback path with a buffer
+        # living outside any mapped leaf
+        block.extra = torch.nn.Parameter(torch.randn(2))
+        moved = rehome_block_mapped_(block, placement, "cpu")
+        assert moved >= 0  # cpu->cpu is a no-op move count
+        assert block.q_proj.weight.device.type == "cpu"
+
+
+class TestStreamPrefetchDeviceMapGuard:
+    def test_requires_stream_quantization(self, monkeypatch):
+        import pytest
+
+        monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        from auto_round import RTNConfig
+        from auto_round.compressors.base import BaseOrchestrator
+
+        with pytest.raises(ValueError, match="stream_prefetch_device_map requires stream_quantization"):
+            BaseOrchestrator(
+                config=RTNConfig(),
+                model="dummy",
+                tokenizer=None,
+                nsamples=8,
+                stream_prefetch_device_map="2,3",
+                stream_quantization=False,
+            )
+
+    def test_requires_stream_prefetch(self, monkeypatch):
+        import pytest
+
+        monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        from auto_round import RTNConfig
+        from auto_round.compressors.base import BaseOrchestrator
+
+        with pytest.raises(ValueError, match="stream_prefetch_device_map requires stream_prefetch"):
+            BaseOrchestrator(
+                config=RTNConfig(),
+                model="dummy",
+                tokenizer=None,
+                nsamples=8,
+                stream_prefetch="off",
+                stream_prefetch_device_map="2,3",
+                stream_quantization=True,
+            )

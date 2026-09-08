@@ -177,6 +177,47 @@ def rehome_block_(module: torch.nn.Module, device) -> int:
     return moved
 
 
+def rehome_block_mapped_(module: torch.nn.Module, placement: dict, fallback) -> int:
+    """Distribute a streamed block onto its mapped devices.
+
+    Each mapped leaf's tensors move onto the leaf's placement device;
+    every other tensor reachable from ``module`` (setup modules, block-level
+    buffers) lands on ``fallback`` (the primary). Mirrors
+    :func:`rehome_block_` for mapped placement: the block is distributed,
+    never gathered onto one home. Returns the number of tensors moved.
+    """
+    fallback = torch.device(fallback)
+    claimed: set = set()
+    moved = 0
+
+    def _leaf_fn(target):
+        def _fn(t: torch.Tensor) -> torch.Tensor:
+            nonlocal moved
+            claimed.add(id(t))
+            if t.device != target and t.device.type != "meta":
+                moved += 1
+                return t.to(target)
+            return t
+
+        return _fn
+
+    for name, leaf in module.named_modules():
+        target = placement.get(name)
+        if target is None:
+            continue
+        leaf._apply(_leaf_fn(torch.device(target)))
+
+    def _rest(t: torch.Tensor) -> torch.Tensor:
+        nonlocal moved
+        if id(t) in claimed or t.device == fallback or t.device.type == "meta":
+            return t
+        moved += 1
+        return t.to(fallback)
+
+    module._apply(_rest)
+    return moved
+
+
 def block_forward(
     block: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -619,7 +660,10 @@ def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: in
                 module_name = f"{block.global_name}.{_n}"
             if module_name is None:
                 continue
-            names.append(module_name)
+            # mapped placement: pack on the module's own device so weights
+            # never round-trip to the primary (single-home streaming sets
+            # the same tuning_device everywhere = unchanged behavior)
+            names.append((module_name, getattr(_mod, "tuning_device", None)))
     if not names:
         return  # nothing to pack: do not even touch the context singletons
 
@@ -640,8 +684,8 @@ def immediate_pack_block(block, block_name: str, layer_config: dict, nblocks: in
     if not _PACK_DEVICE_LOGGED:
         _PACK_DEVICE_LOGGED = True
         logger.debug("immediate_pack_block: packing on %s", pack_device)
-    for module_name in names:
-        immediate_pack(module_name, layer_config, device=pack_device)
+    for module_name, module_dev in names:
+        immediate_pack(module_name, layer_config, device=get_packing_device(module_dev or pack_device))
 
 
 def immediate_pack(name: str, layer_config: dict, device=None):

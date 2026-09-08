@@ -26,7 +26,7 @@ import re
 import threading
 import time
 from functools import lru_cache
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -460,6 +460,7 @@ class CheckpointStreamer:
         stage_devices: Optional[list] = None,
         tuning_iters: Optional[int] = None,
         moe_routing_bytes: Optional[int] = None,
+        stage_device_of: Optional[Callable[[int, str, str], Optional[str]]] = None,
     ) -> None:
         """Stream whole module prefixes ahead of the consumer on a background
         thread.
@@ -476,6 +477,11 @@ class CheckpointStreamer:
         """
         if self._prefetch_thread is not None:
             raise RuntimeError("prefetch already running; call stop_prefetch() first")
+        if stage_device_of is not None and stage_devices:
+            # mapped placement owns staging homes; a rotation list would
+            # contradict the per-module targets
+            raise ValueError("stage_devices and stage_device_of are mutually exclusive")
+        self._prefetch_stage_device_of = stage_device_of
         if stage_devices:
             for d in stage_devices:
                 if torch.device(d).type == "meta":
@@ -510,7 +516,12 @@ class CheckpointStreamer:
                     if not names:
                         raise KeyError(f"no checkpoint tensors under prefix {prefix!r}")
                     stage_dev = None
-                    if self._prefetch_stage_devices:
+                    if self._prefetch_stage_device_of is not None:
+                        # mapped placement: each tensor lands on its module's
+                        # device directly. No VRAM estimator - the placement
+                        # is an explicit user contract and OOM is the signal.
+                        stage_dev = "mapped"
+                    elif self._prefetch_stage_devices:
                         stage_dev = self._wait_for_stage_device(idx, prefix)
                     if self._prefetch_stop:
                         return
@@ -518,7 +529,11 @@ class CheckpointStreamer:
                         if self._prefetch_stop:
                             return
                         tensor = self._read_tensor(name, self._prefetch_handles, self._prefetch_handle_order)
-                        if stage_dev is not None:
+                        if stage_dev == "mapped":
+                            dev = self._prefetch_stage_device_of(idx, name, prefix)
+                            if dev is not None:
+                                tensor = tensor.to(dev)
+                        elif stage_dev is not None:
                             tensor = tensor.to(stage_dev)
                         with self._prefetch_cond:
                             self._prefetch_cache[name] = tensor
@@ -528,7 +543,7 @@ class CheckpointStreamer:
                         # wake a consumer blocked in _await_prefetch_prefix
                         # (its 5s poll tick would otherwise stall each block)
                         self._prefetch_cond.notify_all()
-                        if stage_dev is not None:
+                        if stage_dev is not None and stage_dev != "mapped":
                             self._prefetch_stage_dev[prefix] = stage_dev
             except BaseException as e:  # surfaced at the next fetch
                 self._prefetch_err = e
@@ -866,11 +881,21 @@ class CheckpointStreamer:
         return rev.get(module_name)
 
     @torch.no_grad()
-    def load_module_(self, module: torch.nn.Module, prefix: str, device: Optional[str] = None) -> list[str]:
+    def load_module_(
+        self,
+        module: torch.nn.Module,
+        prefix: str,
+        device: Optional[str] = None,
+        device_of: Optional[Callable[[str], Optional[str]]] = None,
+    ) -> list[str]:
         """Stream every checkpoint tensor under ``prefix`` into ``module``.
 
         Tensors replace meta placeholders leaf-by-leaf. Buffers absent from
         the checkpoint (e.g. non-persistent rotary tables) are left untouched.
+
+        ``device_of`` (mapped placement) overrides ``device`` per tensor:
+        each weight lands on its module's device as it is read, so the block
+        is never gathered onto one home first.
 
         Returns the list of loaded tensor names.
         """
@@ -891,6 +916,10 @@ class CheckpointStreamer:
         # where the block actually landed. The recorded stage home (written
         # when staging completed) is authoritative - honor it so fetches do
         # not cross-copy a whole block to the guessed device.
+        if device_of is not None:
+            # mapped placement: the reader staged each tensor on its module's
+            # device already; there is no single recorded home to honor
+            device = None
         if device is not None:
             recorded = getattr(self, "_prefetch_stage_dev", {}).get(prefix)
             if recorded is not None and str(recorded) != str(device):
@@ -915,7 +944,8 @@ class CheckpointStreamer:
             if tgt is None:
                 logger.debug(f"[stream] {name} has no matching parameter/buffer in the module; skipped")
                 continue
-            tensor = self.fetch(name, device=device)
+            fetch_dev = device_of(name) if device_of is not None else device
+            tensor = self.fetch(name, device=fetch_dev)
             if tensor.shape != tgt.shape:
                 raise ValueError(
                     f"[stream] shape mismatch for {name}: checkpoint {tuple(tensor.shape)} vs module {tuple(tgt.shape)}"

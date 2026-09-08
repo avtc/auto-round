@@ -64,6 +64,11 @@ def _stream_out_device(block, low_gpu_mem_usage: bool = False):
     per forward batch) instead of the home GPU -- lower VRAM at the cost of
     the per-iteration host->device hop.
     """
+    if getattr(block, "_stream_mapped", None):
+        # mapped placement: rows live on host RAM by contract (they add no
+        # savings on any single GPU of the map - the chain must hop to the
+        # first module's device per batch either way)
+        return torch.device("cpu")
     home = getattr(block, "_stream_home_device", None)
     if home is None:
         return None

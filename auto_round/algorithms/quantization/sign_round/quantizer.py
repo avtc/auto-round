@@ -181,6 +181,21 @@ class SignRoundQuantizer(BaseQuantizer):
             # streaming loop: the block was streamed onto this device and
             # rehomed there - it is the single tuning device, never sharded
             return self._pin_stream_home(block, stream_home)
+        if getattr(block, "_stream_mapped", None):
+            # streamed mapped placement: leaves carry their tuning_device from
+            # the user's placement template (the streamer staged each module
+            # on its target directly). Wire the cross-device chain hooks once;
+            # never re-partition by free VRAM - the template is the contract.
+            if len(device_manager.device_list) > 1:
+                from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+                for _n, _mod in block.named_modules():
+                    if list(_mod.children()) or not hasattr(_mod, "tuning_device"):
+                        continue
+                    add_hook_to_module(_mod, AlignDevicesHook(_mod.tuning_device, io_same_device=True), True)
+            self._card_0_in_high_risk = False
+            self._loss_device = device_manager.device
+            return block
         if (
             is_auto_device_mapping(device_manager.device_map)
             and len(device_manager.device_list) > 1
@@ -457,7 +472,8 @@ class SignRoundQuantizer(BaseQuantizer):
         active_inputs = q_inputs if (q_inputs is not None and self.enable_quanted_input) else fp_inputs
         _home = torch.device(device) if not isinstance(device, torch.device) else device
         _park = _home
-        if self.compress_context.low_gpu_mem_usage:
+        _mapped = bool(getattr(block, "_stream_mapped", None))
+        if _mapped or self.compress_context.low_gpu_mem_usage:
             # host-RAM chain contract: leave the rows where the runner parked
             # them (cpu) instead of bulk-moving them onto the tuning GPU
             _park = torch.device("cpu")
@@ -563,11 +579,8 @@ class SignRoundQuantizer(BaseQuantizer):
         # pred_output is a transient single-batch tensor consumed immediately for the
         # loss and then freed, so keeping it on the compute device costs no persistent
         # extra memory.  Pass it as a per-call override so self.cache_device is unchanged.
-        _fwd_cache_device = (
-            device
-            if getattr(self.compress_context, "low_gpu_mem_usage", False) and not str(device).startswith("cpu")
-            else None
-        )
+        _rows_on_cpu = _mapped or getattr(self.compress_context, "low_gpu_mem_usage", False)
+        _fwd_cache_device = device if _rows_on_cpu and not str(device).startswith("cpu") else None
 
         for i in range(self.iters):
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):

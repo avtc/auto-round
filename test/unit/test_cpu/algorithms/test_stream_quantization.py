@@ -801,6 +801,8 @@ class TestStreamQuantizeEquivalence:
         dataset=None,
         layer_config=None,
         iters=0,
+        device_map="cpu",
+        stream_prefetch_device_map=None,
     ):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
@@ -823,10 +825,11 @@ class TestStreamQuantizeEquivalence:
             alg_configs=alg,
             stream_quantization=stream,
             stream_prefetch=stream_prefetch,
+            device_map=device_map,
+            stream_prefetch_device_map=stream_prefetch_device_map,
             **kwargs,
             format="auto_round",
             disable_model_free=True,
-            device_map="cpu",
             low_gpu_mem_usage=True,
             low_cpu_mem_usage=True,
         )
@@ -918,12 +921,24 @@ class TestStreamQuantizeEquivalence:
 
         torch.manual_seed(7)
         rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]  # vocab_size=64
+        # plain/staged share `rows` with the other arms: their assertions are
+        # all arm-vs-arm (bit-identity / structural), so identical rows keep
+        # them valid while skipping the ~40s default-dataset tokenization.
+        # The default loader path (get_dataloader -> tokenize -> filter ->
+        # sample) is covered by the dedicated test below.
         arms = {}
         for name, kwargs in (
             ("normal", dict(stream=False, dataset=rows)),
-            ("plain", dict(stream=True)),
+            ("plain", dict(stream=True, dataset=rows)),
             ("calib", dict(stream=True, dataset=rows)),
-            ("staged", dict(stream=True, stream_prefetch="cpu" if torch.cuda.device_count() < 2 else "cuda:1")),
+            (
+                "staged",
+                dict(
+                    stream=True,
+                    dataset=rows,
+                    stream_prefetch="cpu" if torch.cuda.device_count() < 2 else "cuda:1",
+                ),
+            ),
         ):
             ck = str(tmp_path / f"ck_{name}")
             shutil.copytree(tiny_checkpoint, ck)
@@ -976,6 +991,59 @@ class TestStreamQuantizeEquivalence:
             assert set(t[variant]) == set(t["plain"])
             for k in t["plain"]:
                 assert torch.equal(t["plain"][k], t[variant][k]), f"tensor {k} differs under {variant}"
+
+    def test_mapped_placement_streaming_end_to_end(self, tiny_checkpoint, tmp_path):
+        """Mapped placement (--device_map module template / --stream_prefetch_device_map)
+        distributes each streamed block's modules onto their template devices
+        at read time. On CPU the placement targets coincide with the plain
+        run's home, so the export must stay BIT-IDENTICAL - any difference
+        means the mapped lane changed numerics, not placement. The prefetch
+        reader also runs (stage_device_of path) via stream_prefetch='auto',
+        which mapped placement supersedes (no rotation, per-module staging)."""
+        import shutil
+
+        torch.manual_seed(7)
+        rows = [torch.randint(0, 64, (1, 32)) for _ in range(8)]  # vocab_size=64
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        arms = {}
+        for name, kwargs in (
+            ("plain", dict(stream=True, dataset=rows)),
+            (
+                "mapped",
+                dict(
+                    stream=True,
+                    dataset=rows,
+                    stream_prefetch="auto",
+                    device_map="self_attn.*:cpu,mlp.*:cpu",
+                    stream_prefetch_device_map="self_attn.*:cpu,mlp.*:cpu",
+                ),
+            ),
+        ):
+            ck = str(tmp_path / f"ck_{name}")
+            shutil.copytree(tiny_checkpoint, ck)
+            arms[name] = self._quantize(ck, str(tmp_path / name), **kwargs)
+
+        t = {name: load_all(d) for name, d in arms.items()}
+        assert set(t["plain"]) == set(t["mapped"]), (
+            f"tensor name mismatch: only-plain={set(t['plain']) - set(t['mapped'])} "
+            f"only-mapped={set(t['mapped']) - set(t['plain'])}"
+        )
+        for k in t["plain"]:
+            assert torch.equal(t["plain"][k], t["mapped"][k]), f"tensor {k} differs under mapped placement"
+        with open(os.path.join(arms["plain"], "quantization_config.json")) as f:
+            assert json.load(f) == json.load(open(os.path.join(arms["mapped"], "quantization_config.json")))
 
     def test_streamed_signround_qoff_keeps_q_inputs_none(self, tiny_checkpoint, tmp_path, monkeypatch):
         """enable_quanted_input=False (qoff): every block tunes against the

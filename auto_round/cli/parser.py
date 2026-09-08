@@ -165,6 +165,20 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
             "place on their staging home."
         ),
     )
+    rt.add_argument(
+        "--stream_prefetch_device_map",
+        dest="stream_prefetch_device_map",
+        default=None,
+        type=str,
+        help=(
+            "Alternate placement map for the prefetched (odd staged index) "
+            "blocks, so tuning (base map) and staging (this map) can use "
+            "disjoint device sets; the staged block is quantized in place on "
+            "it. Requires --stream_prefetch and streaming quantization; "
+            "defaults to the same map as --device_map. Example: "
+            "--device_map 0,1 --stream_prefetch_device_map 2,3."
+        ),
+    )
     rt.add_argument("--output_dir", default="./tmp_autoround", type=str, help="Directory to save quantized artifacts.")
     rt.add_argument("--avg_bits", "--target_bits", default=None, type=float, help="Average target bits for AutoScheme.")
     rt.add_argument(

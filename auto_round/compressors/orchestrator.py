@@ -952,6 +952,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.info("[stream] gguf blob resume: adopted %d tensor(s) from prior shards", adopted)
 
     @staticmethod
+    def _park_rows_cpu_(rows):
+        """Move a row list (or single tensor) to host RAM in place-safe form."""
+        if isinstance(rows, list):
+            return [r.to("cpu") if torch.is_tensor(r) and r.device.type != "cpu" else r for r in rows]
+        if torch.is_tensor(rows) and rows.device.type != "cpu":
+            return rows.to("cpu")
+        return rows
+
+    @staticmethod
     def _snapshot_chain_rows_(state):
         """Detached deep copy of chain rows for a resume snapshot.
 
@@ -1523,6 +1532,44 @@ class CompressionOrchestrator(BaseOrchestrator):
                 return None, None
         return iters, routing
 
+    def _stream_mapped_enabled(self) -> bool:
+        """Mapped placement engages when the device map is a module template
+        or an alternate prefetch map is given (opt-in: plain device lists
+        keep today's prefetch-rotation semantics). The alternate map is only
+        legal with stream_prefetch enabled - enforced at startup."""
+        if getattr(self, "stream_prefetch_device_map", None):
+            return True
+        from auto_round.utils.stream_placement import is_placement_template
+
+        return is_placement_template(getattr(device_manager, "device_map", None))
+
+    def _build_stream_mapped_placements(self, flat_block_names: list) -> dict:
+        """Resolve per-block leaf->device placements for the whole run.
+
+        Staged parity alternates templates: even blocks use the base map,
+        odd blocks the ``stream_prefetch_device_map`` map (default: same
+        map - the shared map keeps per-GPU memory lowest while staging
+        overlaps the tune; a disjoint prefetch map isolates the two).
+        """
+        from auto_round.utils.stream_placement import resolve_block_placement
+
+        base_map = getattr(device_manager, "device_map", None)
+        next_map = getattr(self, "stream_prefetch_device_map", None) or base_map
+        fallback = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+        placements = {}
+        templates = set()
+        for idx, name in enumerate(flat_block_names):
+            template = next_map if idx % 2 else base_map
+            templates.add(str(template))
+            block = get_module(self.model, name)
+            placements[name] = resolve_block_placement(block, template, fallback)
+        logger.info(
+            "[stream-mapped] placement engaged: %d block(s), device set(s) %s; rows park on host RAM",
+            len(placements),
+            sorted(templates),
+        )
+        return placements
+
     def _resolve_stream_stage_devices(self):
         """Resolve the ``stream_prefetch`` mode into the staging-device list.
 
@@ -1536,6 +1583,22 @@ class CompressionOrchestrator(BaseOrchestrator):
         only spread block VRAM around.
         """
         mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
+        from auto_round.utils.stream_placement import is_placement_template
+
+        _mapped = getattr(self, "stream_prefetch_device_map", None) is not None or is_placement_template(
+            getattr(device_manager, "device_map", None)
+        )
+        if _mapped:
+            # mapped placement owns staging homes per module; the rotation
+            # list would contradict the template
+            if mode not in STREAM_PREFETCH_OFF and mode not in ("auto", "cpu"):
+                raise ValueError(
+                    f"stream_prefetch={mode!r} conflicts with mapped placement: the device map "
+                    "already fixes per-module staging targets (use off/auto/cpu)"
+                )
+            if mode not in STREAM_PREFETCH_OFF:
+                logger.info("[stream-mapped] stream_prefetch=%s superseded by the placement map", mode)
+            return None
         if mode in STREAM_PREFETCH_OFF:
             return None
         if mode == "cpu":
@@ -2612,7 +2675,25 @@ class CompressionOrchestrator(BaseOrchestrator):
         # block-sized VRAM.
         _prefetch_mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
         prefetch_depth = 0 if _prefetch_mode in STREAM_PREFETCH_OFF else 1
+        _mapped_placements = (
+            self._build_stream_mapped_placements(flat_block_names)
+            if (streamer is not None and self._stream_mapped_enabled())
+            else None
+        )
         stage_devices = self._resolve_stream_stage_devices() if (streamer is not None and prefetch_depth > 0) else None
+        _stage_device_of = None
+        if _mapped_placements is not None:
+            _fallback = str(self.device)
+
+            def _stage_device_of(idx, name, prefix, _p=_mapped_placements, _fb=_fallback):
+                placement = _p.get(prefix)
+                if not placement:
+                    return None
+                rel = name[len(prefix) + 1 :] if prefix and name.startswith(prefix + ".") else name
+                from auto_round.utils.stream_placement import placement_device_of
+
+                return placement_device_of(placement, rel, _fb)
+
         prefetch_names = flat_block_names
         if resume_states is not None:
             _pending_offset = self._stream_resume_pending_offset(all_blocks, resume_states)
@@ -2633,6 +2714,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 stage_devices=stage_devices,
                 tuning_iters=tuning_iters,
                 moe_routing_bytes=moe_routing_bytes,
+                stage_device_of=_stage_device_of,
             )
 
         # -- Background pack pipeline (AR_STREAM_BG_PACK=auto|1|0)
@@ -2649,6 +2731,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             len(stage_devices) if stage_devices else 0,
             self.compress_context.is_immediate_packing,
         )
+        if _bg_pack_eligible and _mapped_placements is not None:
+            logger.info("[stream-mapped] background packing is not yet wired for mapped placement; packing serially")
+            _bg_pack_eligible = False
         if _bg_pack_eligible and self._gguf_blob_mode():
             # GGUF blob packing runs the conversion instance's prepare_tensors
             # with shared mutable state (current_packing_block); it is not
@@ -2718,19 +2803,33 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _t_seg = _time.perf_counter()
                 if _peak_watch is not None:
                     _peak_watch.set_phase("load")
+                _placement = _mapped_placements.get(block_name) if _mapped_placements is not None else None
                 if streamer is not None:
-                    if stage_devices:
-                        # the reader records where each block was ACTUALLY staged
-                        # (first-fit under asymmetric pressure may diverge from
-                        # the rotation); quantize in place on that home
-                        load_device = str(
-                            streamer._prefetch_stage_dev.get(
-                                block_name, stage_devices[stream_block_idx % len(stage_devices)]
-                            )
-                        )
-                    else:
+                    if _placement is not None:
+                        # mapped placement: fetch every tensor straight to its
+                        # module's device; the primary stays the fallback home
                         load_device = str(self.device)
-                    streamer.load_module_(block, block_name, device=load_device)
+
+                        def _dev_of(name, _p=_placement, _pre=block_name):
+                            rel = name[len(_pre) + 1 :] if _pre and name.startswith(_pre + ".") else name
+                            from auto_round.utils.stream_placement import placement_device_of
+
+                            return placement_device_of(_p, rel, load_device)
+
+                        streamer.load_module_(block, block_name, device=load_device, device_of=_dev_of)
+                    else:
+                        if stage_devices:
+                            # the reader records where each block was ACTUALLY staged
+                            # (first-fit under asymmetric pressure may diverge from
+                            # the rotation); quantize in place on that home
+                            load_device = str(
+                                streamer._prefetch_stage_dev.get(
+                                    block_name, stage_devices[stream_block_idx % len(stage_devices)]
+                                )
+                            )
+                        else:
+                            load_device = str(self.device)
+                        streamer.load_module_(block, block_name, device=load_device)
                     _t_seg = _mark_load_seg(_load_sub, "io", _t_seg)
                     streamer.close_shards_not_serving_(flat_block_names[flat_block_names.index(block_name) + 1 :])
                     streamer.close_main_pool_()
@@ -2740,16 +2839,26 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if streamer is not None:
                     self._assert_block_materialized(block, block_name)
                     strip_stale_device_hooks_(block)
-                    _n_moved = rehome_block_(block, load_device)
-                    block._stream_home_device = torch.device(load_device)
-                    # pin leaf tuning_device to the home: WrapperLinear prefers it
-                    # (wrapper.py self.device = orig_layer.tuning_device or device),
-                    # and quantize_block's local device otherwise defaults to the
-                    # global primary - the wrapper would drag the wrapped layers
-                    # back to cuda:0 while unwrapped siblings (conv1d) stay home.
-                    from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+                    if _placement is not None:
+                        # keep the block distributed: mapped leaves stay on
+                        # their template devices, everything else on the
+                        # primary. No single-home pin - the leaves already
+                        # carry tuning_device from the placement resolver.
+                        from auto_round.compressors.utils import rehome_block_mapped_
 
-                    SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
+                        _n_moved = rehome_block_mapped_(block, _placement, load_device)
+                        block._stream_mapped = _placement
+                    else:
+                        _n_moved = rehome_block_(block, load_device)
+                        block._stream_home_device = torch.device(load_device)
+                        # pin leaf tuning_device to the home: WrapperLinear prefers it
+                        # (wrapper.py self.device = orig_layer.tuning_device or device),
+                        # and quantize_block's local device otherwise defaults to the
+                        # global primary - the wrapper would drag the wrapped layers
+                        # back to cuda:0 while unwrapped siblings (conv1d) stay home.
+                        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+                        SignRoundQuantizer._pin_stream_home(block, block._stream_home_device)
                     if stream_block_idx == 0:
                         logger.debug(
                             "[stream] device hygiene for %s: stale accelerate hooks stripped; %d tensor(s) "
@@ -2764,7 +2873,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                         # stays honest about the actual load cost
                         self._log_device_inventory(calib_state, f"block {stream_block_idx}")
                         _t_seg = _mark_load_seg(_load_sub, "inv", _t_seg)
-                    self._release_cached_segments_if_fragmented(load_device)
+                    if _placement is not None:
+                        for _dev in {str(d) for d in _placement.values()} | {load_device}:
+                            self._release_cached_segments_if_fragmented(_dev)
+                    else:
+                        self._release_cached_segments_if_fragmented(load_device)
                 _t_load = _time.perf_counter() - _t_load
 
                 # ── Pure algorithm ────────────────────────────────────────
@@ -2824,6 +2937,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                         q_inputs=calib_state.get("q_inputs"),
                         input_ids=calib_state.get("token_ids"),
                     )
+                    if _mapped_placements is not None:
+                        # mapped contract: rows live on host RAM (the tune
+                        # parks them there; keep the advanced chain there too
+                        # so the map's GPUs hold only block state)
+                        reference_output = self._park_rows_cpu_(reference_output)
+                        new_q_input = self._park_rows_cpu_(new_q_input)
                     calib_state["fp_inputs"] = reference_output
                     if self.alg_composer.need_quanted_input():
                         # qon: the next block tunes against this block's

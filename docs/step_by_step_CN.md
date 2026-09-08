@@ -957,6 +957,7 @@ AR_RESUME_DIR=/path/to/resume/state auto-round --model /path/to/local/Qwen3-14B 
 - GGUF 运行会把逐块打包的载荷写入 `gguf-blobs/` 分片，保存时组装出最终 `.gguf`——运行期间磁盘占用约为最终模型大小的 2 倍；组装成功后分片会被自动删除。多模态投影器写入单独的 `mmproj-model.gguf`。
 - AutoScheme 需要先跑一次不带 `--stream_quantization` 的打分运行：设置 `AR_AUTO_SCHEME_CACHE` 并运行一次（例如配合 `AR_DISK_STREAM_MODEL=1`），随后的流式运行会解析缓存的 scheme。
 - `--low_gpu_mem_usage` 让校准行驻留在主机内存而非块所在 GPU（显存更低，耗时略增）。
+- 单个解码器块放不进一块 GPU 时，可以用映射式放置把它分布到多卡：给 `--device_map` 传模块模板（例如 `--device_map 'self_attn.*:0,mlp.*:1'`，按块内叶子模块名匹配；MoE 专家等重复容器整体落在同一块卡上），或配合 `--stream_prefetch_device_map` 传逗号分隔的设备列表做按参数量均衡的切分（例如 `--device_map 0,1`）。每个模块的权重在读取时直接落到其映射设备上，调优状态（value、梯度）随模块驻留，因此每卡显存约为块状态除以映射宽度。映射模式下校准行默认驻留主机内存。`--stream_prefetch_device_map` 为被预取的（隔位，即奇数序）块指定另一套映射——例如 `--device_map 0,1 --stream_prefetch_device_map 2,3` 把 4 卡池拆成两个互不重叠的半组，调优与预取永不同卡；被预取的块就地在这套映射上完成量化。该参数要求开启 `--stream_prefetch`（以及流式量化），未开启时直接报错。映射式放置要求 `--stream_quantization`，仅支持单进程，且不能与分布式调优或显式指定的 `--stream_prefetch` 设备组合。后台打包在映射模式下尚未接入，会串行执行。
 - 与 `AR_DISK_STREAM_MODEL` 环境变量互斥（参见[环境变量](./environments_CN.md#ar_disk_stream_model)）：该模式同样让模型整体驻留内存成为不必要，但在无法逐块渐进保存的配置（如 GGUF 导出或带调优的 `--quant_lm_head`）下会额外写入约一份模型大小的 offload 拷贝；流式模式全程只写输出本身。
 
 ### 旋转（Rotation）（研究性）
