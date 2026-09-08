@@ -213,6 +213,7 @@ def _dump_block_devices_(block, input_others) -> None:
 
 
 _TRACE_HOPS = None  # AR_STREAM_TRACE_DEVICES latch: None=unread, False=off
+_trace_block_fwd_n = 0  # block_forward input-map trace latch (first N forwards)
 
 
 def _trace_align_hop(name, input_device, target) -> None:
@@ -375,6 +376,10 @@ def block_forward(
     device: torch.device = torch.device("cpu"),
     output_return_id: int = 0,
 ) -> Union[torch.Tensor, dict]:
+    # module latches for the AR_STREAM_TRACE_DEVICES diagnostics; declared
+    # up front - a use before the global statement is a SyntaxError
+    global _TRACE_HOPS, _trace_block_fwd_n
+
     """Performs a forward pass through a block with the given inputs.
 
     Args:
@@ -437,11 +442,7 @@ def block_forward(
     if _TRACE_HOPS is True or (
         _TRACE_HOPS is None and os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
     ):
-        global _trace_block_fwd_n
-        try:
-            _trace_block_fwd_n += 1
-        except NameError:
-            _trace_block_fwd_n = 1
+        _trace_block_fwd_n += 1
         if _trace_block_fwd_n <= 50:
             devs = {k: str(v.device) for k, v in input_others.items() if isinstance(v, torch.Tensor)}
             nested = {
@@ -463,7 +464,6 @@ def block_forward(
         else:
             output = block(**input_others)
     except RuntimeError:
-        global _TRACE_HOPS
         if _TRACE_HOPS is None:
             _TRACE_HOPS = os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
         if _TRACE_HOPS:
