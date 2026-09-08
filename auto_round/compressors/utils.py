@@ -524,21 +524,21 @@ def collect_best_params_sharded(block, devices=None):
     if not devs:
         logger.warning("[tune] no accelerator devices for the sharded snapshot; parking on host")
         return collect_best_params(block, "cpu")
-    params = {}
-    k = 0
     if hasattr(block, "orig_layer"):
-        for key in block.params.keys():
-            params[key] = block.params[key].data.to(devs[k % len(devs)], copy=True)
-            k += 1
-    else:
-        for n, m in block.named_modules():
-            if hasattr(m, "orig_layer"):
-                dev = devs[k % len(devs)]
-                k += 1
-                params[n] = {}
-                for key in m.params.keys():
-                    params[n][key] = m.params[key].data.to(dev, copy=True)
+        targets = shard_targets_(len(block.params.keys()), devs)
+        return {key: block.params[key].data.to(dev, copy=True) for key, dev in zip(block.params.keys(), targets)}
+    names = [n for n, m in block.named_modules() if hasattr(m, "orig_layer")]
+    targets = shard_targets_(len(names), devs)
+    params = {}
+    for n, dev in zip(names, targets):
+        m = block.get_submodule(n)
+        params[n] = {key: m.params[key].data.to(dev, copy=True) for key in m.params}
     return params
+
+
+def shard_targets_(count: int, devs) -> list:
+    """Round-robin target devices for ``count`` snapshot items (pure, testable)."""
+    return [devs[i % len(devs)] for i in range(count)]
 
 
 def collect_best_params(block, cache_device="cpu"):
