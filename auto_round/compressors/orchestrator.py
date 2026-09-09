@@ -1057,6 +1057,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         q_snap,
         fp_snap,
         is_model_last: bool,
+        perf_load=0.0,
+        perf_load_sub=None,
+        perf_tune=0.0,
     ):
         """Pack + shard-write the FINISHED block in a background thread.
 
@@ -1097,8 +1100,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     holder["write"] = _time.perf_counter() - _t0
                     if envs.AR_PERF_COUNTERS:
                         logger.info(
-                            "[stream] bg pack+write %s: pack %.1fs write %.1fs snapshot %.1fs",
+                            "[perf] block %s: load %.1fs%s tune %.1fs pack %.1fs write %.1fs snap %.1fs",
                             block_name,
+                            perf_load,
+                            _format_load_breakdown(perf_load_sub),
+                            perf_tune,
                             holder["pack"],
                             holder["write"],
                             holder["snap"],
@@ -1106,7 +1112,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 else:
                     mv_module_from_gpu(block)
                     if envs.AR_PERF_COUNTERS:
-                        logger.info("[stream] bg pack %s: pack %.1fs", block_name, holder["pack"])
+                        logger.info(
+                            "[perf] block %s: load %.1fs%s tune %.1fs pack %.1fs write 0.0s snap 0.0s",
+                            block_name,
+                            perf_load,
+                            _format_load_breakdown(perf_load_sub),
+                            perf_tune,
+                            holder["pack"],
+                        )
             except BaseException as e:  # noqa: BLE001 - re-raised at join
                 holder["exc"] = e
             # NOTE: deliberately NO clear_memory()/gc here: empty_cache +
@@ -3523,6 +3536,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _q_snap,
                         _fp_snap,
                         _is_last,
+                        # load/tune travel WITH the worker so the bg path logs
+                        # the SAME [perf] block line as the serial tail (with
+                        # real pack/write/snap numbers, measured here)
+                        perf_load=_t_load,
+                        perf_load_sub=_load_sub,
+                        perf_tune=getattr(block, "_stream_tune_seconds", 0.0),
                     )
                 elif self.compress_context.is_immediate_packing:
                     _t_pack = _time.perf_counter()

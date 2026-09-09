@@ -144,7 +144,7 @@ class TestBgPackWorker:
         orch.shard_writer = _Writer()
         return orch, model, blk
 
-    def _run(self, ctx, is_last=False, pack_impl=None):
+    def _run(self, ctx, is_last=False, pack_impl=None, **worker_kwargs):
         from auto_round.compressors import utils as cutils
 
         orch, model, blk = self._orchestrator(ctx)
@@ -154,7 +154,9 @@ class TestBgPackWorker:
         if pack_impl is not None:
             cutils.immediate_pack_block = pack_impl
         try:
-            t = orch._start_bg_pack_block(blk, "blk", "cpu", {"bits": 4}, 1, set(), rs, q_snap, fp_snap, is_last)
+            t = orch._start_bg_pack_block(
+                blk, "blk", "cpu", {"bits": 4}, 1, set(), rs, q_snap, fp_snap, is_last, **worker_kwargs
+            )
             orch._join_bg_pack(t)
         finally:
             if pack_impl is not None:
@@ -195,6 +197,26 @@ class TestBgPackWorker:
 
         with pytest.raises(RuntimeError, match="pack exploded"):
             self._run(_Ctx(), pack_impl=_boom)
+
+    def test_worker_logs_unified_perf_line_with_load_and_tune(self, monkeypatch, caplog):
+        import logging as _logging
+
+        from auto_round.logger import logger as _lg
+
+        monkeypatch.setenv("AR_PERF_COUNTERS", "1")
+        monkeypatch.setattr(_lg, "propagate", True)
+
+        def _pack(block, name, layer_config, nblocks=1, device=None):
+            pass
+
+        with caplog.at_level(_logging.INFO, logger=_lg.name):
+            self._run(_Ctx(), pack_impl=_pack, perf_load=1.5, perf_tune=12.6)
+        # the bg path logs the SAME [perf] block rollup as the serial tail,
+        # carrying the main loop's load/tune alongside the worker's measured
+        # pack/write/snap
+        assert any(
+            "[perf] block blk: load 1.5s" in r.getMessage() and "tune 12.6s" in r.getMessage() for r in caplog.records
+        )
 
 
 class TestFormatHostBuckets:
