@@ -1555,13 +1555,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         return iters, routing
 
     def _stream_mapped_enabled(self) -> bool:
-        """Mapped placement engages when the device map is a module template
-        or an alternate prefetch map is given. Plain device lists keep the
-        prefetch-rotation semantics while prefetch is on; with prefetch OFF
-        there is no rotation to keep, and single-homing a large block on the
-        primary would OOM - so a plain multi-device list means mapped
-        placement. The alternate map is only legal with stream_prefetch
-        enabled - enforced at startup."""
+        """Mapped placement engages when the device map names modules (a
+        placement template) or spans multiple devices -- mirroring the
+        upstream data-driven allocator, where a multi-device map already
+        shards each block's modules across the listed GPUs. A multi-device
+        map therefore means sharding under every ``stream_prefetch`` setting;
+        rotation is the automatic behavior when no map is declared. The
+        alternate prefetch map is only legal with stream_prefetch enabled -
+        enforced at startup."""
         if getattr(self, "stream_prefetch_device_map", None):
             return True
         from auto_round.utils.stream_placement import is_placement_template
@@ -1569,8 +1570,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         base_map = getattr(device_manager, "device_map", None)
         if is_placement_template(base_map):
             return True
-        if str(getattr(self, "stream_prefetch", "off") or "off").strip().lower() not in STREAM_PREFETCH_OFF:
-            return False
         devices = [d for d in str(base_map or "").split(",") if d.strip()]
         return len(devices) > 1
 
@@ -1978,8 +1977,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
         from auto_round.utils.stream_placement import is_placement_template
 
-        _mapped = getattr(self, "stream_prefetch_device_map", None) is not None or is_placement_template(
-            getattr(device_manager, "device_map", None)
+        _base_map = getattr(device_manager, "device_map", None)
+        # mirrors _stream_mapped_enabled: a multi-device map is mapped
+        # placement under every prefetch setting -- the rotation list would
+        # contradict it (and log a rotation it would lose)
+        _mapped = (
+            getattr(self, "stream_prefetch_device_map", None) is not None
+            or is_placement_template(_base_map)
+            or len([d for d in str(_base_map or "").split(",") if d.strip()]) > 1
         )
         if _mapped:
             # mapped placement owns staging homes per module; the rotation
@@ -2016,12 +2021,18 @@ class CompressionOrchestrator(BaseOrchestrator):
                     return None
                 logger.warning("[stream] stream_prefetch='auto' ignored: no CUDA devices visible")
                 return None
-            # auto staging never reaches outside the user's device map: an
-            # explicit --device_map is a sandbox declaration (other GPUs may
-            # belong to other jobs), while the default (no --device_map)
-            # resolves to every visible GPU, so nothing changes there
+            # auto staging never reaches outside the user's device map when
+            # the map offers another GPU: an explicit multi-device --device_map
+            # is a sandbox declaration (other GPUs may belong to other jobs).
+            # When the map offers no other CUDA device (the default
+            # single-device map), the next visible GPU is still eligible as
+            # the rotation home -- the reader gates actual staging on free
+            # VRAM per device (_wait_for_stage_device)
             allowed = [torch.device(str(d)) for d in device_manager.device_list if str(d).startswith("cuda")]
-            pool = allowed or [torch.device("cuda", i) for i in range(n_gpu)]
+            pool = list(allowed)
+            if not any(d != quant_dev for d in pool):
+                extras = [torch.device("cuda", i) for i in range(n_gpu) if torch.device("cuda", i) != quant_dev]
+                pool = pool + extras[:1]
             others = [d for d in pool if d != quant_dev]
             if others:
                 devices = [others[0]]

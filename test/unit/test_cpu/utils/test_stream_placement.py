@@ -463,13 +463,13 @@ class TestMappedEngagementPredicate:
         self._set_map(monkeypatch, "0,1,2,3")
         assert self._orch("off", None)._stream_mapped_enabled() is True
 
-    def test_plain_list_prefetch_auto_keeps_rotation(self, monkeypatch):
+    def test_plain_list_prefetch_auto_engages_mapped(self, monkeypatch):
         self._set_map(monkeypatch, "0,1,2,3")
-        assert self._orch("auto", None)._stream_mapped_enabled() is False
+        assert self._orch("auto", None)._stream_mapped_enabled() is True
 
-    def test_plain_list_prefetch_on_keeps_rotation(self, monkeypatch):
+    def test_plain_list_prefetch_on_engages_mapped(self, monkeypatch):
         self._set_map(monkeypatch, "0,1")
-        assert self._orch("on", None)._stream_mapped_enabled() is False
+        assert self._orch("on", None)._stream_mapped_enabled() is True
 
     def test_single_device_prefetch_off_stays_single_home(self, monkeypatch):
         self._set_map(monkeypatch, "0")

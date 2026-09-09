@@ -1507,7 +1507,7 @@ class TestStreamQuantizeEquivalence:
         assert block_calls[0] is None, "first block has no upstream quantized input"
         assert any(q is not None for q in block_calls[1:]), "qon chain must feed quantized outputs downstream"
 
-    def _resolve(self, monkeypatch, device_list, quant="cuda:1", primary_fit=None):
+    def _resolve(self, monkeypatch, device_list, quant="cuda:1", primary_fit=None, dm_map=None):
         from types import SimpleNamespace
 
         import torch as _torch
@@ -1523,7 +1523,7 @@ class TestStreamQuantizeEquivalence:
         )
         monkeypatch.setattr(
             "auto_round.compressors.orchestrator.device_manager",
-            SimpleNamespace(device_list=device_list),
+            SimpleNamespace(device_list=device_list, device_map=dm_map),
         )
         return CompressionOrchestrator._resolve_stream_stage_devices(stub)
 
@@ -1621,8 +1621,30 @@ class TestStreamQuantizeEquivalence:
         devices = self._resolve(monkeypatch, device_list=[f"cuda:{i}" for i in range(4)], primary_fit=None)
         assert [str(d) for d in devices] == ["cuda:0"]
 
-    def test_auto_sole_gpu_in_map_without_fit_falls_back_to_ram(self, monkeypatch):
-        assert self._resolve(monkeypatch, device_list=["cuda:1"], primary_fit=None) is None
+    def test_auto_single_gpu_map_without_fit_rotates_to_next_visible(self, monkeypatch):
+        # a single-GPU map cannot be distinguished from the default map, so it
+        # is a starting point rather than a sandbox of one: with other GPUs
+        # visible and the primary unable to join, rotation lands on the next
+        # visible GPU (the reader still gates on its free VRAM)
+        devices = self._resolve(monkeypatch, device_list=["cuda:1"], primary_fit=None)
+        assert [str(d) for d in devices] == ["cuda:0"]
+
+    def test_auto_without_device_map_rotates_to_next_visible(self, monkeypatch):
+        # the default single-device map is a starting point, not a sandbox of
+        # one: with other GPUs visible, auto rotates onto the next one
+        devices = self._resolve(monkeypatch, device_list=["cuda:0"], quant="cuda:0", primary_fit=(6.9, 22.3))
+        assert [str(d) for d in devices] == ["cuda:0", "cuda:1"]
+
+    def test_auto_without_device_map_no_primary_fit_uses_other(self, monkeypatch):
+        devices = self._resolve(monkeypatch, device_list=["cuda:0"], quant="cuda:0", primary_fit=None)
+        assert [str(d) for d in devices] == ["cuda:1"]
+
+    def test_plain_multi_device_map_supersedes_rotation(self, monkeypatch):
+        # a multi-device device_map means mapped placement (mirroring the
+        # upstream data-driven allocator) under every prefetch setting; the
+        # rotation resolver steps aside instead of logging a rotation it
+        # would lose
+        assert self._resolve(monkeypatch, device_list=["cuda:0", "cuda:1"], dm_map="0,1") is None
 
 
 class TestResumeCudaCacheRelease:

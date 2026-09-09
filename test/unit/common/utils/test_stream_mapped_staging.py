@@ -184,13 +184,13 @@ class TestOrchestratorMappedMode:
         import auto_round.compressors.orchestrator as orch
 
         class _DM:
-            device_map = "0,1"  # plain list -> NOT mapped
+            device_map = "0,1"  # plain multi-device list -> mapped, like upstream
 
         monkeypatch.setattr(orch, "device_manager", _DM())
-        # plain list keeps the prefetch-rotation semantics while prefetch is on
+        # a multi-device map means mapped placement under every prefetch
+        # setting -- mirroring the upstream data-driven allocator
         o = self._shell(stream_prefetch="auto", stream_prefetch_device_map=None)
-        assert o._stream_mapped_enabled() is False
-        # ... but with prefetch off there is no rotation: multi-device means mapped
+        assert o._stream_mapped_enabled() is True
         o = self._shell(stream_prefetch="off", stream_prefetch_device_map=None)
         assert o._stream_mapped_enabled() is True
 
