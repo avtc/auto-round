@@ -1664,7 +1664,17 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, log_level: str 
     the ground truth, while the python-side walk names the tensors holding
     the memory; the gap between the two is allocator-internal (autograd-saved
     or graph-owned storage). No-op without CUDA.
+
+    DEBUG censuses are opt-in diagnostics behind ``AR_MEM_COUNTERS`` (they
+    walk every live python object); the ``warning`` census fired on OOM is
+    fail-visible forensics and stays unconditional.
     """
+    if log_level == "debug":
+        from auto_round import envs
+
+        if not envs.AR_MEM_COUNTERS:
+            return
+
     import torch
 
     if device is None:
