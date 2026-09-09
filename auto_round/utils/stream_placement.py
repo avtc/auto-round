@@ -505,8 +505,8 @@ class FlowProbe:
             tokens = main.numel() // max(1, main.shape[-1] if main.dim() else 1)
             for a in tens[1:]:
                 if a.dim() >= 2 and 2 <= a.shape[-1] <= 64 and a.numel() // a.shape[-1] == tokens:
-                    rows = int(main.shape[0]) if main.dim() >= 2 else 1
-                    return int(a.shape[-1]), main.numel() * main.element_size(), rows
+                    tokens = main.numel() // max(1, main.shape[-1] if main.dim() else 1)
+                    return int(a.shape[-1]), main.numel() * main.element_size(), tokens
             return None
 
         for rel, leaf in rel_leaves:

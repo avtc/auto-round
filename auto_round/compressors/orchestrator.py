@@ -1736,7 +1736,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 state["placements"][block_name] = placement
             return placement
 
-        def _derive(block, records, devices, dev_objs):
+        def _derive(block, records, devices, dev_objs, row_len=1):
             leaf_names = [
                 n
                 for n, m in block.named_modules()
@@ -1802,15 +1802,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             _routed_rec = next((r for r in records if str(r[0]).startswith("__routed__:")), None)
             if _routed_rec is not None:
                 _cont = str(_routed_rec[0]).partition("__routed__:")[2]
-                _top_k, _hidden_bytes, _probe_rows = int(_routed_rec[1]), int(_routed_rec[2]), int(_routed_rec[3])
-                # the probe prices the REFERENCE forward's batch; the routed
-                # transient scales with the TUNE forward's batch - rescale
-                # (the derive probe commonly sees fewer rows than the tune
-                # loop's calibration batch)
-                _tune_rows = int(getattr(self.calibration_context, "batch_size", 0) or 0) or _probe_rows
+                _top_k, _hidden_bytes, _probe_tokens = int(_routed_rec[1]), int(_routed_rec[2]), int(_routed_rec[3])
+                # the probe prices the REFERENCE forward's token count; the
+                # routed transient scales with the TUNE forward's tokens
+                # (batch rows x actual row length, both taken from the chain
+                # state - never a configured default)
+                _bs = int(getattr(self.calibration_context, "batch_size", 0) or 0)
+                _tune_tokens = max(1, _bs) * max(1, row_len)
                 # ceil, floored at 1: a floor-div here silently zeroes the
-                # reserve when the probe saw more rows than the tune batch
-                _scale = max(1, -(-max(1, _tune_rows) // max(1, _probe_rows)))
+                # reserve when the probe saw more tokens than a tune batch
+                _scale = max(1, -(-_tune_tokens // max(1, _probe_tokens)))
                 _anchor_dev = next(
                     (placement[n] for n, _m in block.named_modules() if n.startswith(_cont + ".") and n in placement),
                     None,
@@ -1820,12 +1821,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _routed = min(_routed, int(0.25 * sum(b for _n, b, _i, _a in units)))
                     placement = partition_flow_order(units, dev_objs, reserves={_anchor_dev: _routed})
                     logger.debug(
-                        "[stream-mapped] MoE routed buffers (%.1fGiB, top_k=%d, probe rows %d -> tune %d) "
+                        "[stream-mapped] MoE routed buffers (%.1fGiB, top_k=%d, probe tokens %d -> tune %d) "
                         "priced on %s; state rebalanced",
                         _routed / 2**30,
                         _top_k,
-                        _probe_rows,
-                        _tune_rows,
+                        _probe_tokens,
+                        _tune_tokens,
                         _anchor_dev,
                     )
             placement = complete_container_params(placement, block)
@@ -1841,7 +1842,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             return placement
 
-        def _maybe_probe(block, block_name: str, has_forward: bool):
+        def _maybe_probe(block, block_name: str, has_forward: bool, row_len=1):
             """Install the reference-forward probe when derivation applies."""
             if not has_forward:
                 return None
@@ -1856,7 +1857,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     return None
 
             def _on_complete(records):
-                placement = _derive(block, records, devices, dev_objs)
+                placement = _derive(block, records, devices, dev_objs, row_len)
                 with state["lock"]:
                     state["pending_restage"] = {"block_id": id(block), "placement": placement}
 
@@ -3214,7 +3215,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                         # pass) and restage onto the derived placement at the
                         # fp->wrapper boundary, before any tuning state exists
                         _has_fwd = calib_state is not None and calib_state.get("fp_inputs") is not None
-                        if _mapped_state["maybe_probe"](block, block_name, _has_fwd) is not None:
+                        _rows = calib_state.get("fp_inputs") if _has_fwd else None
+                        _row_len = 1
+                        _r0 = _rows[0] if _rows is not None and len(_rows) else None
+                        if _r0 is not None and torch.is_tensor(_r0) and _r0.dim() >= 2:
+                            _row_len = int(_r0.shape[-2])
+                        if _mapped_state["maybe_probe"](block, block_name, _has_fwd, _row_len) is not None:
                             block._stream_restage_after_fp_ = _mapped_state["make_restage"](block, block_name)
                     else:
                         _n_moved = rehome_block_(block, load_device)
