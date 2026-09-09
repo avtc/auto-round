@@ -98,6 +98,9 @@ Use `--iters 0` for fast quantization with some accuracy drop for 4 bits. Detail
 ✅ **Affordable Quantization Cost**
 Quantize 7B models in about 10 minutes on a single GPU. Details are shown in [quantization costs](https://github.com/intel/auto-round/blob/main/docs/step_by_step.md#quantization-costs)
 
+✅ **Streaming Quantization (Experimental Feature)**
+`--stream_quantization` streams decoder blocks from disk with optional prefetch to a second GPU (block rotation, background pack/write). MTP/nextn layers quantize and tune optionally -- exported to CT, GGUF, or a standalone `mtp-*.gguf` draft; GGUF packs in the same run (no full-model offload, intermediate state about 1x the quantized size); lm_head tunes at iters > 0 without offloading the source model; multi-GPU placement is tune-state-aware with atomic expert groups. Details are shown in [streaming quantization](https://github.com/intel/auto-round/blob/main/docs/step_by_step.md#streaming-quantization)
+
 ✅ **10+ VLMs Support**
 Out-of-the-box quantization for 10+ vision-language models [example models](https://huggingface.co/collections/OPEA/vlms-autoround-675bc712fdd6a55ebaf11bfa), [support matrix](https://github.com/intel/auto-round/tree/main/auto_round/compressors/mllm#vlm-support-matrix)
 

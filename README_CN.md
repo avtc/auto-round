@@ -91,6 +91,8 @@ AutoRound 是专为大语言模型（LLMs）和视觉-语言模型（VLMs）设�
 
 ✅ **可接受的量化成本** 在单张 GPU 上量化一个 7B 的模型只需约十分钟。详见：[量化成本](https://github.com/intel/auto-round/blob/main/docs/step_by_step.md#quantization-costs)
 
+✅ **流式量化（实验特性）** `--stream_quantization` 从磁盘逐块流式量化，可选预取到第二块 GPU（块轮转 + 后台打包/写入）。MTP/nextn 层可选量化与调优——可导出 CT、GGUF 或独立的 `mtp-*.gguf` 草稿；GGUF 同一次运行内完成打包（无须 offload 整个模型，中间态约为量化后大小的 1 倍）；iters > 0 时可调优 lm_head 而无须 offload 源模型；多 GPU 放置按调优状态感知，expert 组保持原子。详见：[流式量化](https://github.com/intel/auto-round/blob/main/docs/step_by_step.md#streaming-quantization)
+
 ✅ **支持十余种 VLM 模型**  已支持十余种视觉语言模型，让用户有“开盖即食”般的量化体验。详见：[示例模型](https://huggingface.co/collections/OPEA/vlms-autoround-675bc712fdd6a55ebaf11bfa)，[支持矩阵](https://github.com/intel/auto-round/tree/main/auto_round/compressors/mllm#vlm-support-matrix)
 
 ✅ **多种量化方案可选**  提供 `auto-round-best`​、`auto-round`​、`auto-round-light`​、`auto-round-opt-rtn`（优化版 RTN）以及 `auto-round-rtn`（原始 RTN，最快基线）等多种预设方案，能够满足多样化需求。详见：[量化方案](https://github.com/intel/auto-round/blob/main/docs/step_by_step.md#recipe-recommendation)
