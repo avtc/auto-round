@@ -2467,17 +2467,29 @@ class CompressionOrchestrator(BaseOrchestrator):
         falls back to the primary with a WARNING (never kills the run).
         """
         try:
+            from auto_round.utils.checkpoint_streamer import device_free_bytes
             from auto_round.utils.stream_placement import placement_map_devices
 
             template = mapped_state.get("template_for", lambda _i: None)(0)
+            tokens = sorted(placement_map_devices(template))
             best, best_free = str(self.device), -1.0
-            for dev in sorted(placement_map_devices(template)):
+            degraded = False
+            for dev in tokens:
                 d = torch.device(dev)
-                if d.type != "cuda" or d.index is None:
+                free_b = device_free_bytes(d)
+                if free_b is None:
+                    # free-memory queries are CUDA-only today (device_free_bytes);
+                    # on other backends the heuristic degrades to the primary
+                    degraded = degraded or d.type != "cpu"
                     continue
-                free_b, _total = torch.cuda.mem_get_info(d.index)
                 if free_b / 2**30 > best_free:
                     best, best_free = str(d), free_b / 2**30
+            if degraded:
+                logger.warning(
+                    "[stream-mapped] free-memory query unavailable for non-CUDA devices (%s); the "
+                    "checkpoint-only tree loads on the tune primary",
+                    tokens,
+                )
             return best
         except Exception as e:  # heuristic choice only; the probe runs anywhere
             logger.warning("[stream-mapped] freest-device pick for the tree load failed (%s); using the primary", e)
@@ -2532,25 +2544,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             _tree_dev = self._mapped_tree_load_device_(mapped_state) if mapped_state is not None else str(self.device)
             streamer.load_module_(shell, group, device=_tree_dev)
             materialize_residual_meta(shell, cfg, self.device)
-            if mapped_state is not None:
-                # the tree is a full block for placement purposes (a hy3 MTP
-                # group is a 3.9B-param MoE layer - tuning it whole on the
-                # primary cannot fit): same mapped wiring as the block loop,
-                # so the tree spreads across the device map, its reference
-                # forward drives the flow probe (routed reserve included) and
-                # the calibration parks on host via _stream_mapped
-                _placement = mapped_state["resolve"](group)
-                if _placement:
-                    from auto_round.compressors.utils import rehome_block_mapped_
-
-                    rehome_block_mapped_(shell, _placement, str(self.device))
-                    shell._stream_mapped = _placement
-                    self._pin_stream_mapped_(shell, _placement)
-                    shell._stream_realign_after_wrap_ = lambda _b=shell, _p=_placement: self._pin_stream_mapped_(_b, _p)
-                    _r0 = fp_inputs[0] if fp_inputs and torch.is_tensor(fp_inputs[0]) else None
-                    _row_len = int(_r0.shape[-2]) if _r0 is not None and _r0.dim() >= 2 else 1
-                    if mapped_state["maybe_probe"](shell, group, fp_inputs is not None, _row_len) is not None:
-                        shell._stream_restage_after_fp_ = mapped_state["make_restage"](shell, group)
             # single-row fallback so direct calls (mask probes, spot checks)
             # work without the batched input plumbing
             shell._predictor_e = e_rows[0]
@@ -2558,7 +2551,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             if calib_state.get("keymask_2d"):
                 # resolve the predictor layer's attention-mask convention by
                 # probe, exactly like the block loop (a full-attention
-                # predictor behind gated-delta-net blocks must flip forms)
+                # predictor behind gated-delta-net blocks must flip forms).
+                # This runs BEFORE the mapped FlowProbe is installed: the
+                # probe's forward is tiny (two rows), and were it the probe's
+                # first complete forward it would finalize the placement on
+                # 2-row activation pricing while tune batches are batch_size
+                # rows (the mask probe must not price the placement)
                 from auto_round.utils.streaming_calibration import materialize_mask_form, resolve_chain_mask_form
 
                 # the probe runs two rows: match the shell's single-row
@@ -2580,6 +2578,25 @@ class CompressionOrchestrator(BaseOrchestrator):
                 finally:
                     shell._predictor_e = _e_single
                 io["attention_mask"] = [materialize_mask_form(m, form) for m in calib_state["keymask_2d"]]
+            if mapped_state is not None:
+                # the tree is a full block for placement purposes (a hy3 MTP
+                # group is a 3.9B-param MoE layer - tuning it whole on the
+                # primary cannot fit): same mapped wiring as the block loop,
+                # so the tree spreads across the device map, its reference
+                # forward drives the flow probe (routed reserve included) and
+                # the calibration parks on host via _stream_mapped
+                _placement = mapped_state["resolve"](group)
+                if _placement:
+                    from auto_round.compressors.utils import rehome_block_mapped_
+
+                    rehome_block_mapped_(shell, _placement, str(self.device))
+                    shell._stream_mapped = _placement
+                    self._pin_stream_mapped_(shell, _placement)
+                    shell._stream_realign_after_wrap_ = lambda _b=shell, _p=_placement: self._pin_stream_mapped_(_b, _p)
+                    _r0 = fp_inputs[0] if fp_inputs and torch.is_tensor(fp_inputs[0]) else None
+                    _row_len = int(_r0.shape[-2]) if _r0 is not None and _r0.dim() >= 2 else 1
+                    if mapped_state["maybe_probe"](shell, group, fp_inputs is not None, _row_len) is not None:
+                        shell._stream_restage_after_fp_ = mapped_state["make_restage"](shell, group)
             io["_predictor_e"] = e_rows
             ctx = BlockContext(
                 model=self.model,

@@ -1679,6 +1679,8 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, log_level: str 
 
     if device is None:
         device = torch.device("cuda") if torch.cuda.is_available() else None
+        if device is None:
+            return  # documented no-op without CUDA
     # callers pass whatever device_list holds - including plain strings
     # ("cuda:1"); a string has no .type and would silently return here
     if not isinstance(device, torch.device):

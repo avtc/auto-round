@@ -734,3 +734,79 @@ class TestScopedClearMemory:
         # deduped + sorted, and NEVER routed through the global clear_memory
         # (whose device_list rebind is persistent, singleton-wide)
         assert calls["device_list"] == ["cpu:0", "cpu:1"]
+
+
+class TestMappedTreeLoadDevice:
+    @property
+    def _cls(self):
+        import auto_round.compressors.orchestrator as orch
+
+        return orch.CompressionOrchestrator
+
+    @property
+    def _self(self):
+        return type("S", (), {"device": torch.device("cpu", 0)})()
+
+    def test_picks_freest_device(self, monkeypatch):
+        from auto_round.utils.device_manager import device_manager
+
+        monkeypatch.setattr(device_manager, "_device_list", [torch.device("cuda", 0), torch.device("cuda", 1)])
+
+        def _free(dev):
+            return {0: 2 * 2**30, 1: 10 * 2**30}[dev.index]
+
+        monkeypatch.setattr("auto_round.utils.checkpoint_streamer.device_free_bytes", _free)
+        got = self._cls._mapped_tree_load_device_(self._self, {"template_for": lambda i: "0,1"})
+        assert got == "cuda:1"
+
+    def test_query_failure_falls_back_to_primary_with_warning(self, monkeypatch, caplog):
+        import logging
+
+        from auto_round.logger import logger as _lg
+
+        monkeypatch.setattr(_lg, "propagate", True)
+
+        def _boom(dev):
+            raise RuntimeError("no runtime")
+
+        monkeypatch.setattr("auto_round.utils.checkpoint_streamer.device_free_bytes", _boom)
+        with caplog.at_level(logging.WARNING, logger=_lg.name):
+            got = self._cls._mapped_tree_load_device_(self._self, {"template_for": lambda i: "0,1"})
+        assert got == "cpu:0"
+        assert any("freest-device pick" in r.message for r in caplog.records)
+
+
+class TestFailVisibleWarnings:
+    def test_close_handle_warns_on_failure(self, caplog, monkeypatch):
+        import logging
+
+        from auto_round.logger import logger as _lg
+        from auto_round.utils.checkpoint_streamer import CheckpointStreamer
+
+        monkeypatch.setattr(_lg, "propagate", True)
+
+        class _Bad:
+            def __exit__(self, *a):
+                raise OSError("fd gone")
+
+        with caplog.at_level(logging.WARNING, logger=_lg.name):
+            CheckpointStreamer._close_handle_(_Bad(), "unit-test")
+        assert any("shard-handle close failed" in r.message for r in caplog.records)
+
+    def test_synchronize_devices_warns_on_failure(self, caplog, monkeypatch):
+        import importlib
+        import logging
+
+        dmm = importlib.import_module("auto_round.utils.device_manager")
+        from auto_round.logger import logger as _lg
+
+        monkeypatch.setattr(_lg, "propagate", True)
+
+        class _Broken:
+            def synchronize(self, idx):
+                raise RuntimeError("device lost")
+
+        monkeypatch.setattr(dmm.device_manager, "get_ar_device", lambda d: _Broken())
+        with caplog.at_level(logging.WARNING, logger=_lg.name):
+            dmm.synchronize_devices_([torch.device("cuda", 0)])
+        assert any("sync failed" in r.message.lower() for r in caplog.records)
