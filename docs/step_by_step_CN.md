@@ -953,7 +953,7 @@ AR_RESUME_DIR=/path/to/resume/state auto-round --model /path/to/local/Qwen3-14B 
 - 模型必须以本地 checkpoint 目录传入；hub id 不会被解析——请先下载模型。
 - 支持的算法为 RTN/OptRTN 与 SignRound（`iters > 0`）。其余量化器、旋转、`enable_lfq` 与扩散模型管线尚不支持流式模式，会在启动时报错并给出指引。导出格式照常支持（`auto_round`、`auto_round:llm_compressor`、`auto_round:auto_gptq`、`auto_round:auto_awq`、`gguf:<qtype>`）；多模态模型的视觉塔以未量化形式导出。
 - `--stream_prefetch off|auto|on|cpu|<设备>`（默认 `off`）在量化当前块的同时，把下一块的权重预取到另一块 GPU 或主机内存，略微缩短总耗时——已完成块的打包与分片写入也会与下一块的调优重叠执行。未指定多卡 `--device_map` 时，`auto` 会让块在量化主卡与下一块可见 GPU 之间轮流驻留。
-- MTP/nextn 张量在未被 `layer_config` pin 覆盖时原样透传；GGUF 导出按本次运行的量化类型像普通主体张量一样量化它们。为 MTP 层 pin 更高的位宽（如 `".*mtp.*": {"bits": 8}`）可获得更高质量的投机解码 draft 头。
+- MTP/nextn 张量在未被 `layer_config` pin 覆盖时原样透传；GGUF 导出将未 pin 的 MTP 张量按源精度存储（bf16 -> BF16），与其他导出格式保持一致。为 MTP 层指定位宽（如 `".*mtp.*": {"bits": 8}`）可量化 draft 头，得到更小的投机解码 draft。
 - GGUF 运行会把逐块打包的载荷写入 `gguf-blobs/` 分片，保存时组装出最终 `.gguf`——运行期间磁盘占用约为最终模型大小的 2 倍；组装成功后分片会被自动删除。多模态投影器写入单独的 `mmproj-model.gguf`。
 - AutoScheme 需要先跑一次不带 `--stream_quantization` 的打分运行：设置 `AR_AUTO_SCHEME_CACHE` 并运行一次（例如配合 `AR_DISK_STREAM_MODEL=1`），随后的流式运行会解析缓存的 scheme。
 - `--low_gpu_mem_usage` 让校准行驻留在主机内存而非块所在 GPU（显存更低，耗时略增）。

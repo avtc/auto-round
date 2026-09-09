@@ -590,6 +590,7 @@ def _quant_data(
         data_qtype,
         explicit_only=True,
         source_dtype=source_dtype if source_dtype is not None else data_torch.dtype,
+        base_block_count=_mtp_block_count_(cls),
     )
     if use_layer_attrs:
         compatible_stored_qtype = source_qtype == data_qtype
@@ -651,7 +652,34 @@ def _pack_spec_moe_output(cls, data_torch, data_qtype, moe_output, modify_name, 
     return pack_moe_output(data_torch, data_qtype, moe_output, quantize_expert, context=context)
 
 
-def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=False, source_dtype=None):
+def _source_exact_float_qtype(source_dtype):
+    """Float qtype that is exact for the checkpoint source dtype (bf16 -> BF16)."""
+    if source_dtype == torch.bfloat16:
+        return gguf.GGMLQuantizationType.BF16
+    if source_dtype == torch.float32:
+        return gguf.GGMLQuantizationType.F32
+    return gguf.GGMLQuantizationType.F16
+
+
+def _is_nextn_module_name(name, base_block_count):
+    """True when `name` belongs to a checkpoint-only predictor tree (MTP/nextn).
+
+    Two spellings: the native `mtp.` / `nextn.` prefixes, and the remapped
+    `model.layers.<idx>.` form where idx >= the base decoder block count
+    (predictor layers are appended after the base stack).
+    """
+    root = name.removesuffix(".weight")
+    if root.split(".", 1)[0] in ("mtp", "nextn"):
+        return True
+    if base_block_count is None:
+        return False
+    m = re.match(r"^model\.layers\.(\d+)\.", root + ".")
+    return m is not None and int(m.group(1)) >= base_block_count
+
+
+def get_qtype_by_layer_config(
+    layer_config, name, data_qtype, *, explicit_only=False, source_dtype=None, base_block_count=None
+):
     name = name[: -len(".weight")]
     if name not in layer_config and name.endswith("embed_tokens"):
         embedding_names = [key for key in layer_config if key.endswith("embed_tokens")]
@@ -677,6 +705,12 @@ def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=F
                 layer_config = {**layer_config, name: val}
                 break
         else:
+            if _is_nextn_module_name(name, base_block_count):
+                # unpinned predictor-tree tensors pass through at the
+                # source-exact float type, mirroring the non-GGUF paths
+                # (checkpoint-only groups ship unquantized); a pin - any
+                # bits - still quantizes exactly as pinned
+                return _source_exact_float_qtype(source_dtype)
             return None if explicit_only else data_qtype
     if layer_config[name]["bits"] >= 16:
         # a 16-bit (float) pin means "leave this tensor unquantized": honor
@@ -684,11 +718,7 @@ def get_qtype_by_layer_config(layer_config, name, data_qtype, *, explicit_only=F
         # that is exact for the source (bf16 -> BF16, fp16 -> F16, fp32 ->
         # F32). The precision-rank rule then keeps it over every quantized
         # fallback.
-        if source_dtype == torch.bfloat16:
-            return gguf.GGMLQuantizationType.BF16
-        if source_dtype == torch.float32:
-            return gguf.GGMLQuantizationType.F32
-        return gguf.GGMLQuantizationType.F16
+        return _source_exact_float_qtype(source_dtype)
     bits = layer_config[name].get("bits")
     super_bits = layer_config[name].get("super_bits")
     sym = layer_config[name].get("sym")
@@ -791,9 +821,17 @@ def resolve_restored_qtype(
     diagnostics,
     allow_recipe_fallback=False,
     source_dtype=None,
+    base_block_count=None,
 ):
     source_qtypes = [
-        get_qtype_by_layer_config(layer_config, hf_name, fallback_qtype, explicit_only=True, source_dtype=source_dtype)
+        get_qtype_by_layer_config(
+            layer_config,
+            hf_name,
+            fallback_qtype,
+            explicit_only=True,
+            source_dtype=source_dtype,
+            base_block_count=base_block_count,
+        )
         for hf_name in hf_names
     ]
     matched_qtypes = [qtype for qtype in source_qtypes if qtype is not None]
@@ -1110,7 +1148,11 @@ def prepare_tensors(cls):
                         layer_config_names,
                         fallback_qtype,
                         lambda source_name: get_qtype_by_layer_config(
-                            cls.layer_config, source_name, fallback_qtype, explicit_only=True
+                            cls.layer_config,
+                            source_name,
+                            fallback_qtype,
+                            explicit_only=True,
+                            base_block_count=_mtp_block_count_(cls),
                         ),
                         f"{checkpoint_name} -> {new_name}",
                     )
@@ -1139,6 +1181,7 @@ def prepare_tensors(cls):
                     # upcast: a float pin must store the type that is exact
                     # for the checkpoint source (bf16 -> BF16, not F32)
                     source_dtype=old_dtype,
+                    base_block_count=_mtp_block_count_(cls),
                 )
                 # # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if layer_config_qtype is not None:
