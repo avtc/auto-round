@@ -21,7 +21,7 @@ export AR_LOG_LEVEL=DEBUG
 ```
 
 ### AR_MEM_COUNTERS
-- **Description**: Emit per-block `[stream-mem]` memory diagnostics in the streaming loop: host RSS and per-GPU allocation breakdown with attribution of the largest regions/tensors, plus peak-RSS attribution. Informational only; does not change quantization behavior.
+- **Description**: Emit per-block `[stream-mem]` memory diagnostics in the streaming loop (host RSS and per-GPU allocation breakdown with attribution of the largest regions/tensors, plus peak-RSS attribution) and enable the DEBUG-level `[vram]` device censuses (allocator totals plus the largest live tensors) at tuning start and outside-block layer entries. The WARNING census attached to CUDA OOM errors is always emitted. Informational only; does not change quantization behavior.
 - **Default**: `false`
 - **Usage**: Set this to observe streaming memory residency and leaks
 
