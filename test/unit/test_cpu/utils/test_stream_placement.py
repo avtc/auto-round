@@ -19,8 +19,10 @@ from auto_round.utils.stream_placement import (
     FlowProbe,
     _atomic_groups,
     _normalize_device,
+    _safe_match,
     block_signature,
     is_placement_template,
+    leaf_module_names,
     parse_device_template,
     partition_flow_order,
     placement_device_of,
@@ -290,15 +292,6 @@ class TestFlowProbe:
         FlowProbe(block, lambda records: recorded.extend(records))
         block(torch.zeros(2, 4))
         assert all(b > 0 for _n, b in recorded)
-
-
-@pytest.fixture(autouse=True)
-def _cuda_pool(monkeypatch):
-    """Bare indices resolve through the run device pool; pin it to cuda so
-    template/list resolution is deterministic on any host."""
-    from auto_round.utils.device_manager import device_manager
-
-    monkeypatch.setattr(device_manager, "_device_list", [torch.device("cuda", 0), torch.device("cuda", 1)])
 
 
 class TestContainerParamPlacement:
@@ -674,16 +667,20 @@ class TestNormalizeDevicePool:
 
 class TestPlacementMapDevices:
     def test_plain_list_and_template(self):
-        assert placement_map_devices("0,1") == {"0", "1"}
-        assert placement_map_devices("a.*:0,b.*:1") == {"0", "1"}
+        # canonical: bare indices resolve through the run pool (cuda here)
+        assert placement_map_devices("0,1") == {"cuda:0", "cuda:1"}
+        assert placement_map_devices("a.*:0,b.*:1") == {"cuda:0", "cuda:1"}
         assert placement_map_devices("") == set()
         assert placement_map_devices(None) == set()
 
     def test_partial_overlap_is_detectable(self):
         base = placement_map_devices("0,1")
-        nxt = placement_map_devices("1,2")
+        nxt = placement_map_devices("cuda:1,2")
         assert base != nxt
-        assert base & nxt == {"1"}
+        assert base & nxt == {"cuda:1"}
+
+    def test_mixed_spellings_name_the_same_gpus(self):
+        assert placement_map_devices("0,1") == placement_map_devices("cuda:0,cuda:1")
 
 
 class TestTraceDevicesEnvRegistered:
@@ -699,3 +696,34 @@ class TestTraceDevicesEnvRegistered:
         monkeypatch.setattr(cu, "_TRACE_HOPS", None)
         assert envs.AR_STREAM_TRACE_DEVICES is True
         assert cu._trace_devices_enabled() is True
+
+
+class TestSafeMatch:
+    def test_invalid_pattern_raises_valueerror(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="invalid device_map pattern"):
+            _safe_match("((", "q_proj")
+
+    def test_invalid_later_pattern_surfaces_in_resolve(self):
+        import pytest
+
+        block = _MoEBlock()
+        # the valid pattern misses every leaf; the invalid one must raise the
+        # clean ValueError from the guarded matcher, never a raw re.error
+        with pytest.raises(ValueError, match="invalid device_map pattern"):
+            resolve_block_placement(block, "nope:0,((:1", fallback="cpu")
+
+
+class TestGpuToken:
+    def test_gpu_maps_to_cuda(self):
+        assert _normalize_device("gpu:2") == torch.device("cuda", 2)
+        assert _normalize_device("gpu") == torch.device("cuda")
+
+
+class TestLeafModuleNames:
+    def test_only_owning_leaves(self):
+        names = leaf_module_names(_MoEBlock())
+        assert "self_attn.q_proj" in names
+        assert "self_attn" not in names  # containers excluded
+        assert "moe.experts.0.gate_proj" in names

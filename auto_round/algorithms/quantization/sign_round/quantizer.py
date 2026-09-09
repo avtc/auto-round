@@ -447,6 +447,31 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         return loss
 
+    @staticmethod
+    def _run_restage_after_fp_(block, _restage) -> None:
+        """Run the pending mapped restage; a failure is fatal by design.
+
+        The restage moves the block's tensors onto the flow-derived devices
+        one leaf at a time. A failure mid-way (a torch.OutOfMemoryError during
+        a cross-device copy does NOT inherit torch.AcceleratorError, so it
+        lands here too) leaves the block physically split while every
+        placement-driven artifact - align hooks, wrapper tuning_device, the
+        realign closure - still targets the previous placement: no "keep the
+        old placement" recovery exists, and continuing would crash at an
+        unrelated wrapper forward. Surface the true site instead
+        (fail-visible; the closure's own comment promised "no swallow").
+        """
+        block._stream_restage_after_fp_ = None
+        try:
+            _restage()
+        except Exception as e:
+            logger.error(
+                "[stream-mapped] restage after reference pass failed (%s); the block may be mid-move onto "
+                "its mapped devices - not recoverable",
+                e,
+            )
+            raise
+
     def quantize_block(
         self,
         block,
@@ -515,17 +540,7 @@ class SignRoundQuantizer(BaseQuantizer):
         # the block onto its flow-derived devices before wrappers bind
         _restage = getattr(block, "_stream_restage_after_fp_", None)
         if callable(_restage):
-            try:
-                block._stream_restage_after_fp_ = None
-                _restage()
-            except Exception as e:  # placement refresh must never kill the tune
-                if isinstance(e, torch.AcceleratorError):
-                    # a CUDA/context fault is unrecoverable: every later op
-                    # would fail with the same sticky error and blame
-                    # unrelated code (the next wrapper's init) - surface the
-                    # true site instead
-                    raise
-                logger.warning("[stream-mapped] restage after reference pass failed (%s); keeping placement", e)
+            self._run_restage_after_fp_(block, _restage)
 
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
             block,

@@ -61,7 +61,7 @@ from auto_round.utils import (
 from auto_round.utils.device import (
     _force_trim_malloc,
 )
-from auto_round.utils.device_manager import device_manager
+from auto_round.utils.device_manager import ClearMemory, device_manager
 from auto_round.utils.model import is_moe_model_via_config
 from auto_round.utils.peak_watch import PeakWatcher
 from auto_round.wrapper import WrapperMultiblock
@@ -347,6 +347,21 @@ def materialize_placeholder_linear(
 # values that disable block staging; shared by the loop-start depth check and
 # the staging-device resolver - the CLI parser mirrors it via the same tuple
 STREAM_PREFETCH_OFF = ("", "off", "0", "false")
+
+
+# a PRIVATE clear-memory instance for scoped (single-call) narrowing:
+# ClearMemory rebinds its device_list on every explicit-arg call (singleton
+# semantics pre-existing code relies on), so narrowing the GLOBAL
+# clear_memory would leave every later no-arg call clearing only the last
+# subset - e.g. the disjoint prefetch pair hosting odd blocks would never get
+# its cached segments released. This instance is only ever called with an
+# explicit list, so it is scoped by construction.
+_SCOPED_CLEAR_MEMORY = ClearMemory(device_list=None)
+
+
+def _clear_memory_scoped_(devices) -> None:
+    """clear_memory narrowed to `devices` for this call only (see above)."""
+    _SCOPED_CLEAR_MEMORY(device_list=sorted({str(d) for d in devices}))
 
 
 class CompressionOrchestrator(BaseOrchestrator):
@@ -1694,13 +1709,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         from auto_round.utils.stream_placement import (
             FlowProbe,
             _atomic_groups,
-            _leaf_param_bytes,
             _leaf_tune_state_bytes,
             _normalize_device,
             _shared_atoms,
             block_signature,
             complete_container_params,
             is_placement_template,
+            leaf_module_names,
             partition_flow_order,
             resolve_block_placement,
         )
@@ -1737,11 +1752,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             flat_idx = flat_block_names.index(block_name) if block_name in flat_block_names else 0
             template = _template_for(flat_idx)
             block = get_module(self.model, block_name)
-            leaf_names = [
-                n
-                for n, m in block.named_modules()
-                if not list(m.children()) and any(True for _ in m.parameters(recurse=False))
-            ]
+            leaf_names = leaf_module_names(block)
             devices = _template_devices(template)
             sig = block_signature(block)
             key = (sig, tuple(str(d) for d in devices)) if devices else None
@@ -1778,11 +1789,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             return placement
 
         def _derive(block, records, devices, dev_objs, row_len=1):
-            leaf_names = [
-                n
-                for n, m in block.named_modules()
-                if not list(m.children()) and any(True for _ in m.parameters(recurse=False))
-            ]
+            leaf_names = leaf_module_names(block)
             get_mod = dict(block.named_modules())
             atom_of = {}
             for gkey, leaves in _atomic_groups(leaf_names):
@@ -1818,13 +1825,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             for leaf in leaf_names:  # never executed: place for balance
                 if leaf not in fired:
                     units.append(([leaf], _leaf_tune_state_bytes(get_mod[leaf]), 0, atom_of.get(leaf) is not None))
-            # the FIRST device of the template is the tune primary (loss /
-            # row-cache staging land there): reserve its tune-I/O footprint
-            # (the block input set the probe recorded) so the balanced
-            # block state does not stack on top of it - block 2 of the hy3
-            # 80-block run OOMed exactly there (13G state + ~7G I/O on a
-            # 23.5G card). Capped at half the state total so a huge input
-            # cannot starve the primary entirely.
+            # the tune primary (first template device, where the loss and
+            # row-cache staging land) needs no extra reserve since the
+            # routed-buffer repartition below: the primary's IO footprint is
+            # priced into the activation flow itself (block 2 of the hy3
+            # 80-block run OOMed on 13G state + ~7G I/O before the
+            # routed-buffer pricing existed; the repartition superseded the
+            # separate io-reserve this comment used to describe).
             placement = partition_flow_order(units, dev_objs)
             # MoE routed buffers: the experts loop materializes
             # tokens * top_k hidden rows (input + output accumulators, in the
@@ -1936,7 +1943,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # entries are skipped). No swallow: a failure here (e.g. an
                 # invalid device in the placement) must surface, not defer to
                 # a confusing later OOM
-                clear_memory(device_list=sorted({str(d) for d in placement.values()} | {str(fallback)}))
+                _clear_memory_scoped_({*placement.values(), fallback})
                 rehome_block_mapped_(block, placement, fallback)
                 # drain the moves before anything touches CUDA again: the
                 # rehome enqueues async cross-device copies, and a fault in
@@ -1963,6 +1970,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         state["resolve"] = _resolve
         state["maybe_probe"] = _maybe_probe
+        state["template_for"] = _template_for
         state["make_restage"] = _make_restage
         return state
 
@@ -2446,6 +2454,35 @@ class CompressionOrchestrator(BaseOrchestrator):
         )
         return claimed
 
+    def _mapped_tree_load_device_(self, mapped_state) -> str:
+        """Whole-tree load home for checkpoint-only groups under mapped placement.
+
+        The tree must load WHOLE for its flow derivation (the probe's
+        reference forward runs before any placement exists), but gathering
+        it onto the tune primary stacks the full copy on the busiest device
+        (a hy3 MTP group is 3.9B params) and doubles peak primary VRAM
+        during the later spread. Load onto the freest base-map device
+        instead - the derived restage spreads it right after, exactly as the
+        block loop's heuristic->derived transition does. Any query failure
+        falls back to the primary with a WARNING (never kills the run).
+        """
+        try:
+            from auto_round.utils.stream_placement import placement_map_devices
+
+            template = mapped_state.get("template_for", lambda _i: None)(0)
+            best, best_free = str(self.device), -1.0
+            for dev in sorted(placement_map_devices(template)):
+                d = torch.device(dev)
+                if d.type != "cuda" or d.index is None:
+                    continue
+                free_b, _total = torch.cuda.mem_get_info(d.index)
+                if free_b / 2**30 > best_free:
+                    best, best_free = str(d), free_b / 2**30
+            return best
+        except Exception as e:  # heuristic choice only; the probe runs anywhere
+            logger.warning("[stream-mapped] freest-device pick for the tree load failed (%s); using the primary", e)
+            return str(self.device)
+
     def _tune_checkpoint_only_groups_(self, streamer, tree_groups, calib_state, block_count, mapped_state=None) -> set:
         """Tune materialized predictor trees with the run's tuning config.
 
@@ -2489,7 +2526,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         cfg = self.model_context.model.config
         for group in tree_groups:
             shell = self.model.get_submodule(group)
-            streamer.load_module_(shell, group, device=str(self.device))
+            # mapped: load the tree WHOLE onto the freest base-map device
+            # (NOT the tune primary) so the gather does not double primary
+            # peak VRAM; the flow-derived placement spreads it right after
+            _tree_dev = self._mapped_tree_load_device_(mapped_state) if mapped_state is not None else str(self.device)
+            streamer.load_module_(shell, group, device=_tree_dev)
             materialize_residual_meta(shell, cfg, self.device)
             if mapped_state is not None:
                 # the tree is a full block for placement purposes (a hy3 MTP
@@ -3656,7 +3697,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # compact before the (potentially huge) outside-block wrappers are
             # built, instead of reserving fragmented segments nobody can use
             # (backend-agnostic; cpu entries are skipped by clear_memory)
-            clear_memory(device_list=[str(outside_qdev)])
+            _clear_memory_scoped_([outside_qdev])
             log_cuda_memory_census(f"outside-block loop entry {name}", outside_qdev)
             if streamer is not None:
                 # load the layer itself; streaming its parent prefix would

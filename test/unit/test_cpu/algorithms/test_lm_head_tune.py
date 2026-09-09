@@ -656,7 +656,7 @@ class TestTuningGradBuffers:
 
     def test_outside_block_loop_releases_cached_blocks(self):
         src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
-        assert "clear_memory(device_list=[str(outside_qdev)])" in src
+        assert "_clear_memory_scoped_([outside_qdev])" in src
 
 
 class TestGradScatterSlice:

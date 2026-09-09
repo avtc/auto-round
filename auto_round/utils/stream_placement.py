@@ -106,18 +106,28 @@ def parse_device_template(template: str) -> dict:
 
 
 def placement_map_devices(value) -> set:
-    """Device tokens named by a placement map (template or plain list).
+    """Canonical device tokens named by a placement map (template or plain list).
 
-    Used by the startup guards to compare the base and prefetch maps'
-    device sets; unparsable input yields an empty set (no comparison).
+    Tokens resolve through ``_normalize_device`` so mixed spellings naming
+    the same GPUs ("0" vs "cuda:0") compare equal; unresolvable tokens are
+    kept as written. Used by the startup guards to compare the base and
+    prefetch maps' device sets.
     """
     text = str(value or "").strip()
     try:
         if is_placement_template(text):
-            return {str(dev) for dev in parse_device_template(text).values()}
-        return {part for part in text.split(",") if part.strip()}
+            raw = {str(dev) for dev in parse_device_template(text).values()}
+        else:
+            raw = {part for part in text.split(",") if part.strip()}
     except ValueError:
         return set()
+    canonical = set()
+    for token in raw:
+        try:
+            canonical.add(str(_normalize_device(token)))
+        except (ValueError, RuntimeError):
+            canonical.add(token)  # not a device token (or unresolvable) - compare as written
+    return canonical
 
 
 def _normalize_device(dev: str) -> torch.device:
@@ -130,6 +140,10 @@ def _normalize_device(dev: str) -> torch.device:
     when it covers the index, so the placement always agrees with the
     devices the run actually uses.
     """
+    if dev == "gpu" or dev.startswith("gpu:"):
+        # the token grammar accepts accelerate's legacy "gpu" spelling;
+        # torch only knows "cuda" - map it before parsing
+        dev = "cuda" + dev[3:]
     if dev.isdigit():
         idx = int(dev)
         from auto_round.utils.device_manager import device_manager
@@ -241,6 +255,32 @@ def _leaf_tune_state_bytes(module: torch.nn.Module) -> int:
     return _leaf_param_bytes(module) * factor
 
 
+def _safe_match(pattern: str, leaf: str):
+    """re.match that raises the contract ValueError on an invalid pattern.
+
+    Used by BOTH the per-leaf placement loop and the matched/unmatched
+    accounting: an invalid pattern must fail with the clean ValueError
+    wherever it is first tried, never escape as a raw re.error from the
+    accounting comprehension.
+    """
+    try:
+        return re.match(pattern, leaf)
+    except re.error as e:
+        raise ValueError(f"invalid device_map pattern {pattern!r}: {e}") from e
+
+
+def leaf_module_names(block: torch.nn.Module) -> list:
+    """Names of placement-relevant leaves: no children, own parameters.
+
+    Single definition shared by resolve_block_placement, FlowProbe and the
+    orchestrator's placement resolver - the filter is a placement invariant
+    (a module that qualifies in one path must qualify in all).
+    """
+    return [
+        n for n, m in block.named_modules() if not list(m.children()) and any(True for _ in m.parameters(recurse=False))
+    ]
+
+
 def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.device, shared_leaf_groups=None) -> dict:
     """Resolve ``template`` into ``{leaf_name: device}`` for one block.
 
@@ -250,9 +290,7 @@ def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.de
     comma-key layer_config entries) are kept whole on one device under the
     device-list partition and warn on straddle under a template.
     """
-    leaf_names = [
-        n for n, m in block.named_modules() if not list(m.children()) and any(True for _ in m.parameters(recurse=False))
-    ]
+    leaf_names = leaf_module_names(block)
     if not leaf_names:
         return {}
     get_mod = dict(block.named_modules())
@@ -267,14 +305,11 @@ def resolve_block_placement(block: torch.nn.Module, template, fallback: torch.de
             else:
                 # longest regex match wins, mirroring set_non_auto_device_map
                 for pattern, candidate in spec.items():
-                    try:
-                        if re.match(pattern, leaf):
-                            dev = candidate
-                            break
-                    except re.error as e:
-                        raise ValueError(f"invalid device_map pattern {pattern!r}: {e}") from e
+                    if _safe_match(pattern, leaf):
+                        dev = candidate
+                        break
             placement[leaf] = _normalize_device(dev) if dev is not None else torch.device(fallback)
-        matched = {p for p in spec if any(re.match(p, leaf) or leaf == p for leaf in leaf_names)}
+        matched = {p for p in spec if any(_safe_match(p, leaf) or leaf == p for leaf in leaf_names)}
         unmatched = [p for p in spec if p not in matched]
         if unmatched:
             logger.warning("[stream-mapped] device_map entries matched no module in this block: %s", unmatched)
@@ -551,11 +586,8 @@ class FlowProbe:
         self._done = False
         self._on_complete = on_complete
         self._hooks = []
-        rel_leaves = [
-            (n, m)
-            for n, m in block.named_modules()
-            if not list(m.children()) and any(True for _ in m.parameters(recurse=False))
-        ]
+        _leaf_set = set(leaf_module_names(block))
+        rel_leaves = [(n, m) for n, m in block.named_modules() if n in _leaf_set]
 
         def _first_bytes(args) -> int:
             for a in args:

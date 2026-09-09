@@ -362,14 +362,13 @@ class TestAlignTrace:
 
         monkeypatch.setenv("AR_STREAM_TRACE_DEVICES", "1")
         monkeypatch.setattr(cu.logger, "propagate", True)  # autoround logger keeps its own handler
-        cu._TRACE_HOPS = None  # re-read the env
+        monkeypatch.setattr(cu, "_TRACE_HOPS", None)  # re-read the env; restored on every path
         with caplog.at_level(_logging.INFO, logger=cu.logger.name):
             cu._trace_align_hop("self_attn.q_proj", torch.device("cpu"), torch.device("cuda:1"))
             cu._trace_align_hop("self_attn.k_proj", torch.device("cpu"), torch.device("cpu"))
         msgs = [r.getMessage() for r in caplog.records]
         assert any("self_attn.q_proj" in m and "cuda:1" in m for m in msgs)
         assert not any("k_proj" in m for m in msgs)
-        cu._TRACE_HOPS = None
 
 
 class TestWrapperOwnsAlignment:
@@ -697,3 +696,41 @@ class TestDeviceMapStartupGuards:
                 stream_prefetch="off",
                 stream_prefetch_device_map="2,3",
             )
+
+
+class TestRestageFailFast:
+    def test_mid_rehome_failure_propagates(self):
+        import pytest
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        class _Blk:
+            _stream_restage_after_fp_ = None
+
+        def _boom():
+            raise RuntimeError("mid-move OOM")
+
+        blk = _Blk()
+        # a failure mid-restage leaves the block physically split while hooks
+        # still target the old placement - swallowing it would crash later at
+        # an unrelated wrapper forward, so it must propagate
+        with pytest.raises(RuntimeError, match="mid-move OOM"):
+            SignRoundQuantizer._run_restage_after_fp_(blk, _boom)
+        assert blk._stream_restage_after_fp_ is None  # consumed either way
+
+
+class TestScopedClearMemory:
+    def test_scoped_clear_uses_a_private_instance(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch
+
+        calls = {}
+
+        class _Rec:
+            def __call__(self, tensor=None, device_list=None):
+                calls["device_list"] = device_list
+
+        monkeypatch.setattr(orch, "_SCOPED_CLEAR_MEMORY", _Rec())
+        orch._clear_memory_scoped_({torch.device("cpu", 1), torch.device("cpu", 0)})
+        # deduped + sorted, and NEVER routed through the global clear_memory
+        # (whose device_list rebind is persistent, singleton-wide)
+        assert calls["device_list"] == ["cpu:0", "cpu:1"]
