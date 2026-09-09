@@ -851,9 +851,7 @@ There are typically two scenarios that require multi-GPU tuning: one is the cali
 
 #### Enable multiple gpus calibration in lm_head quantization
 For LM head tuning, AutoRound needs to cache the inputs to the lm-head, which requires the entire model to reside on 
-  the GPU for efficient calibration. If there is no enough VRAM, some layers will fallback to RTN mode. Under
-  [Streaming Quantization](#streaming-quantization), lm_head tuning at `iters > 0` reads its inputs from the
-  calibration chain tail instead, so the full model does not need to reside on GPU.
+  the GPU for efficient calibration. If there is no enough VRAM, some layers will fallback to RTN mode. Under [Streaming Quantization](#streaming-quantization), lm_head tuning at `iters > 0` reads its inputs from the calibration chain tail instead, so the full model does not need to reside on GPU.
 
 #### Manually set the device_map
 
