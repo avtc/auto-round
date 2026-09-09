@@ -79,6 +79,13 @@ def stream_mapped_enabled(device_map=None, prefetch_device_map=None) -> bool:
         return True
     if isinstance(device_map, dict):
         return bool(device_map)
+    if isinstance(device_map, str) and device_map.strip().lower() == "auto":
+        # upstream parity: `auto` = all visible devices, which shards blocks
+        # in the non-streaming allocator; under streaming it is therefore a
+        # multi-device map (mapped placement), not rotation
+        from auto_round.utils.device import parse_available_devices
+
+        return len(parse_available_devices(device_map.strip())) > 1
     if is_placement_template(device_map):
         return True
     devices = [d for d in str(device_map or "").split(",") if d.strip()]

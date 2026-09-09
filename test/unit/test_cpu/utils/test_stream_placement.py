@@ -727,3 +727,21 @@ class TestLeafModuleNames:
         assert "self_attn.q_proj" in names
         assert "self_attn" not in names  # containers excluded
         assert "moe.experts.0.gate_proj" in names
+
+
+class TestAutoDeviceMapEngagesMapped:
+    """Upstream parity: `auto` = all visible devices, which shards blocks in
+    the non-streaming allocator; under streaming it is a multi-device map."""
+
+    def test_auto_multi_visible_is_mapped(self, monkeypatch):
+        monkeypatch.setattr("auto_round.utils.device.parse_available_devices", lambda s: ["cuda:0", "cuda:1", "cuda:2"])
+        assert stream_mapped_enabled("auto", None) is True
+
+    def test_auto_single_visible_stays_single_home(self, monkeypatch):
+        monkeypatch.setattr("auto_round.utils.device.parse_available_devices", lambda s: ["cuda:0"])
+        assert stream_mapped_enabled("auto", None) is False
+
+    def test_explicit_map_unaffected(self, monkeypatch):
+        monkeypatch.setattr("auto_round.utils.device.parse_available_devices", lambda s: ["cuda:0", "cuda:1"])
+        assert stream_mapped_enabled("0,1", None) is True
+        assert stream_mapped_enabled("0", None) is False

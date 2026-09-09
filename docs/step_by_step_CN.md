@@ -934,7 +934,7 @@ auto-round --model_name Qwen/Qwen3-0.6B  --scheme "W4A16" --quant_lm_head --form
 
 实验性功能（仅在有限的模型集上验证过）。
 
-`--stream_quantization` 以逐个解码器块的方式流式完成量化：每块从磁盘读入、物化在单个设备上（`--device_map` 指定多卡时可拆分到多卡，见下文映射式放置）、量化并写入其输出分片。checkpoint 全程保留在磁盘上——峰值内存约为一个解码器块加校准状态，与模型规模无关。块放置显式可控，且循环会在多设备间流水线化地安排块加载、量化与打包（见 `--stream_prefetch`），略微缩短总量化时间。
+`--stream_quantization` 以逐个解码器块的方式流式完成量化：每块从磁盘读入、物化在单个设备上（`--device_map` 覆盖多于一个设备时——设备列表、`auto` 或模块模板——可拆分到多卡，见下文映射式放置）、量化并写入其输出分片。checkpoint 全程保留在磁盘上——峰值内存约为一个解码器块加校准状态，与模型规模无关。块放置显式可控，且循环会在多设备间流水线化地安排块加载、量化与打包（见 `--stream_prefetch`），略微缩短总量化时间。
 
 `AR_DISK_STREAM_MODEL=1` 与 `--stream_quantization` 都按需从 checkpoint 读取解码器块，因此模型只需要磁盘空间而无须整体驻留内存——默认流程中，权重会被加载进 CPU 内存与 GPU 显存（经 `device_map` 分布到多卡）并全程保持驻留。在两种按需读取的模式之间：env 路径保留原有校准流程、全部量化器可用；块放置通过 `device_map` 配置（单个块也可以拆分到多块 GPU 上），部分配置还会在磁盘上额外写一份 offload 的源模型拷贝。`--stream_quantization` 覆盖 RTN/OptRTN 与 SignRound；块加载、调优、打包跨 GPU 流水线化（`--stream_prefetch`，每块 GPU 单个块），也没有 offload 拷贝。
 

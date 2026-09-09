@@ -1574,8 +1574,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         placement template) or spans multiple devices -- mirroring the
         upstream data-driven allocator, where a multi-device map already
         shards each block's modules across the listed GPUs. A multi-device
-        map therefore means sharding under every ``stream_prefetch`` setting;
-        rotation is the automatic behavior when no map is declared. The
+        map therefore means sharding under every ``stream_prefetch`` setting
+        (``auto`` expands to every visible device, matching the non-streaming
+        allocator); rotation is the automatic behavior when no map is
+        declared or the map names a single device. The
         alternate prefetch map is only legal with stream_prefetch enabled -
         enforced at startup."""
         from auto_round.utils.stream_placement import stream_mapped_enabled
@@ -1721,6 +1723,17 @@ class CompressionOrchestrator(BaseOrchestrator):
         )
 
         base_map = getattr(device_manager, "device_map", None)
+        # upstream parity: a non-streaming `auto` map shards the model across
+        # every visible device; expand it to the concrete device list once so
+        # the mapped machinery (template devices, flow partition) sees real
+        # devices instead of the "auto" token (a single visible device stays
+        # a single-device list - rotation territory, not mapped)
+        if isinstance(base_map, str) and base_map.strip().lower() == "auto":
+            from auto_round.utils.device import parse_available_devices
+
+            _auto_devices = [str(d) for d in parse_available_devices(base_map.strip())]
+            if len(_auto_devices) > 1:
+                base_map = ",".join(_auto_devices)
         next_map = getattr(self, "stream_prefetch_device_map", None) or base_map
         fallback = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
         shared_groups = self._mapped_shared_groups_()
