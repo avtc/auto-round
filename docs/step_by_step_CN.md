@@ -763,7 +763,7 @@ AutoRound(
 </details>
 
 ### GGUF 格式量化
-实验性功能。该格式适用 CPU 设备，在社区应用广泛。
+实验性功能。该格式适用 CPU 设备，在社区应用广泛。对于大模型，[流式量化](#流式量化)可在单次运行中逐块完成量化并写出 GGUF，无须完整加载整个模型。
 
 除 3-bits 外的各精度均建议使用优化版 RTN 模式（开启 `--iters 0` ）。
 
@@ -833,7 +833,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A1
 通常有两种情况需要启用多 GPU 训练：一是主要针对 lm-head 量化的标定阶段，二是参数量极大（如显存占用超 100GB）的模型。
 
 #### lm_head 量化中开启多 GPU 标定
-量化 lm-head 时，AutoRound 需要缓存其输入数据以进行高效的标定，这要求**整个模型驻留在 GPU 显存中** ；若 GPU 显存不足，部分层会退回至 Pure RTN 模式。
+量化 lm-head 时，AutoRound 需要缓存其输入数据以进行高效的标定，这要求**整个模型驻留在 GPU 显存中** ；若 GPU 显存不足，部分层会退回至 Pure RTN 模式。在[流式量化](#流式量化)下，`iters > 0` 的 lm_head 调优直接从标定链尾部读取输入，无须整个模型驻留 GPU。
 
 <a id="llm-head-multi-gpu"></a>
 #### 手动配置设备映射

@@ -773,7 +773,7 @@ AutoRound(
 </details>
 
 ### GGUF format
-Experimental feature. This format is well-suited for CPU devices and is widely adopted by the community. 
+Experimental feature. This format is well-suited for CPU devices and is widely adopted by the community. For large models, [Streaming Quantization](#streaming-quantization) can quantize and write the GGUF in a single pass, block by block, without materializing the full model. 
 
 The optimized RTN mode is suggested (--iters 0) for all bits other than 3 bits.
 
@@ -851,7 +851,9 @@ There are typically two scenarios that require multi-GPU tuning: one is the cali
 
 #### Enable multiple gpus calibration in lm_head quantization
 For LM head tuning, AutoRound needs to cache the inputs to the lm-head, which requires the entire model to reside on 
-  the GPU for efficient calibration. If there is no enough VRAM, some layers will fallback to RTN mode
+  the GPU for efficient calibration. If there is no enough VRAM, some layers will fallback to RTN mode. Under
+  [Streaming Quantization](#streaming-quantization), lm_head tuning at `iters > 0` reads its inputs from the
+  calibration chain tail instead, so the full model does not need to reside on GPU.
 
 #### Manually set the device_map
 
