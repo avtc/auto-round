@@ -575,3 +575,125 @@ def test_block_forward_crash_dump_fires_without_trace_env(monkeypatch, caplog):
     assert "device dump on block fault" in caplog.text
     assert "lin" in caplog.text  # per-module inventory lines are present
     assert "forward #1 inputs" not in caplog.text  # input-map trace stays env-gated
+
+
+class TestPinSpanFollowsPlacement:
+    def test_hooks_attach_when_placement_spans_more_than_base_pool(self, monkeypatch):
+        """--device_map 0 --stream_prefetch_device_map 1,2: the base pool is
+        single-device but the placement spans two devices - the hook gate
+        must follow the placement span or the first forward dies on a
+        cross-device op."""
+        import auto_round.compressors.orchestrator as orch
+
+        class _DM:
+            device = torch.device("cpu")
+            device_list = [torch.device("cpu")]
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+        block = _Toy()
+        placement = {"q_proj": torch.device("cpu"), "mlp.gate_proj": torch.device("cpu", 0)}
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        assert getattr(block.q_proj, "_stream_align_hook", None) is not None
+        assert getattr(block.mlp["gate_proj"], "_stream_align_hook", None) is not None
+
+
+class TestRehomeTiedParamWarning:
+    def test_tied_param_split_across_devices_warns(self, caplog, monkeypatch):
+        import logging
+
+        from auto_round.compressors.utils import rehome_block_mapped_
+        from auto_round.logger import logger as _lg
+
+        # the project logger does not propagate; surface it for caplog
+        monkeypatch.setattr(_lg, "propagate", True)
+
+        class _Tied(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(4, 4, bias=False)
+                self.b = torch.nn.Linear(4, 4, bias=False)
+                self.b.weight = self.a.weight  # tied parameter
+
+        block = _Tied()
+        placement = {"a": torch.device("cpu"), "b": torch.device("cpu", 0)}
+        with caplog.at_level(logging.WARNING, logger=_lg.name):
+            rehome_block_mapped_(block, placement, "cpu")
+        assert any("tied parameter" in r.message for r in caplog.records)
+
+    def test_tied_param_on_one_device_stays_silent(self, caplog, monkeypatch):
+        import logging
+
+        from auto_round.compressors.utils import rehome_block_mapped_
+        from auto_round.logger import logger as _lg
+
+        monkeypatch.setattr(_lg, "propagate", True)
+
+        class _Tied(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(4, 4, bias=False)
+                self.b = torch.nn.Linear(4, 4, bias=False)
+                self.b.weight = self.a.weight
+
+        block = _Tied()
+        placement = {"a": torch.device("cpu"), "b": torch.device("cpu")}
+        with caplog.at_level(logging.WARNING, logger=_lg.name):
+            rehome_block_mapped_(block, placement, "cpu")
+        assert not any("tied parameter" in r.message for r in caplog.records)
+
+
+class TestDeviceMapStartupGuards:
+    def test_dict_device_map_rejected_under_streaming(self, monkeypatch):
+        import pytest
+
+        monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        from auto_round import RTNConfig
+        from auto_round.compressors.base import BaseOrchestrator
+
+        with pytest.raises(ValueError, match="does not accept a dict device_map"):
+            BaseOrchestrator(
+                config=RTNConfig(),
+                model="dummy",
+                tokenizer=None,
+                nsamples=8,
+                stream_quantization=True,
+                stream_prefetch="auto",
+                device_map={"model.layers.0": 0, "model.layers.1": 1},
+            )
+
+    def test_plain_multi_device_map_rejects_distributed(self, monkeypatch):
+        import pytest
+
+        monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        monkeypatch.setattr("auto_round.utils.distributed.is_distributed", lambda: True)
+        from auto_round import RTNConfig
+        from auto_round.compressors.base import BaseOrchestrator
+
+        with pytest.raises(ValueError, match="mapped placement"):
+            BaseOrchestrator(
+                config=RTNConfig(),
+                model="dummy",
+                tokenizer=None,
+                nsamples=8,
+                stream_quantization=True,
+                stream_prefetch="auto",
+                device_map="0,1",
+            )
+
+    def test_prefetch_required_message_does_not_recommend_on(self, monkeypatch):
+        import pytest
+
+        monkeypatch.delenv("AR_DISK_STREAM_MODEL", raising=False)
+        from auto_round import RTNConfig
+        from auto_round.compressors.base import BaseOrchestrator
+
+        with pytest.raises(ValueError, match="use --stream_prefetch auto or cpu"):
+            BaseOrchestrator(
+                config=RTNConfig(),
+                model="dummy",
+                tokenizer=None,
+                nsamples=8,
+                stream_quantization=True,
+                stream_prefetch="off",
+                stream_prefetch_device_map="2,3",
+            )

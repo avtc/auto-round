@@ -18,12 +18,15 @@ import torch
 from auto_round.utils.stream_placement import (
     FlowProbe,
     _atomic_groups,
+    _normalize_device,
     block_signature,
     is_placement_template,
     parse_device_template,
     partition_flow_order,
     placement_device_of,
+    placement_map_devices,
     resolve_block_placement,
+    stream_mapped_enabled,
 )
 
 
@@ -91,6 +94,15 @@ class TestAtomicGroups:
         by_key = dict(groups)
         assert by_key["moe.experts.0"] == ["moe.experts.0.gate_proj", "moe.experts.0.down_proj"]
         assert by_key["mlp.gate_proj"] == ["mlp.gate_proj"]
+
+
+@pytest.fixture(autouse=True)
+def _cuda_pool(monkeypatch):
+    """Bare indices resolve through the run device pool; pin it to cuda so
+    template/list resolution is deterministic on any host."""
+    from auto_round.utils.device_manager import device_manager
+
+    monkeypatch.setattr(device_manager, "_device_list", [torch.device("cuda", 0), torch.device("cuda", 1)])
 
 
 class TestResolvePlacement:
@@ -278,6 +290,15 @@ class TestFlowProbe:
         FlowProbe(block, lambda records: recorded.extend(records))
         block(torch.zeros(2, 4))
         assert all(b > 0 for _n, b in recorded)
+
+
+@pytest.fixture(autouse=True)
+def _cuda_pool(monkeypatch):
+    """Bare indices resolve through the run device pool; pin it to cuda so
+    template/list resolution is deterministic on any host."""
+    from auto_round.utils.device_manager import device_manager
+
+    monkeypatch.setattr(device_manager, "_device_list", [torch.device("cuda", 0), torch.device("cuda", 1)])
 
 
 class TestContainerParamPlacement:
@@ -612,3 +633,69 @@ class TestFlowProbeRoutedDetection:
         FlowProbe(blk, lambda records: got.extend(records))
         blk(torch.randn(4, 8))
         assert not [r for r in got if str(r[0]).startswith("__routed__:")]
+
+
+class TestStreamMappedEnabled:
+    """Shared predicate: the orchestrator engagement decision, the staging
+    resolver and the base.py startup guards must agree - a stale inline copy
+    let the distributed guard miss plain multi-device device_map lists."""
+
+    def test_arms(self):
+        assert stream_mapped_enabled(None, "1,2") is True  # alternate prefetch map
+        assert stream_mapped_enabled("self_attn.*:0,mlp.*:1", None) is True  # template
+        assert stream_mapped_enabled("0,1", None) is True  # plain multi-device list
+        assert stream_mapped_enabled({"model.layers.0": 0}, None) is True  # dict names modules
+        assert stream_mapped_enabled({}, None) is False
+        assert stream_mapped_enabled("0", None) is False
+        assert stream_mapped_enabled(None, None) is False
+        assert stream_mapped_enabled("cuda:0", None) is False
+
+
+class TestCpuWithIndexToken:
+    def test_cpu_with_index_is_a_device_not_a_template(self):
+        # "cpu:0" is valid torch spelling; it must parse as a device list
+        # entry, never as a "module:device" placement template
+        assert is_placement_template("cpu:0") is False
+        assert _normalize_device("cpu:0").type == "cpu"
+        assert is_placement_template("cpu:0,cpu:1") is False
+
+
+class TestNormalizeDevicePool:
+    def test_bare_index_follows_run_device_pool_not_cuda(self, monkeypatch):
+        from auto_round.utils.device_manager import device_manager
+
+        monkeypatch.setattr(device_manager, "_device_list", [torch.device("hpu", 0), torch.device("hpu", 1)])
+        assert _normalize_device("0") == torch.device("hpu", 0)
+        assert _normalize_device("1") == torch.device("hpu", 1)
+
+    def test_explicit_type_unaffected(self):
+        assert _normalize_device("cuda:1") == torch.device("cuda", 1)
+
+
+class TestPlacementMapDevices:
+    def test_plain_list_and_template(self):
+        assert placement_map_devices("0,1") == {"0", "1"}
+        assert placement_map_devices("a.*:0,b.*:1") == {"0", "1"}
+        assert placement_map_devices("") == set()
+        assert placement_map_devices(None) == set()
+
+    def test_partial_overlap_is_detectable(self):
+        base = placement_map_devices("0,1")
+        nxt = placement_map_devices("1,2")
+        assert base != nxt
+        assert base & nxt == {"1"}
+
+
+class TestTraceDevicesEnvRegistered:
+    def test_env_registration_and_latch(self, monkeypatch):
+        from auto_round import envs
+        from auto_round.compressors import utils as cu
+
+        monkeypatch.delenv("AR_STREAM_TRACE_DEVICES", raising=False)
+        monkeypatch.setattr(cu, "_TRACE_HOPS", None)
+        assert envs.AR_STREAM_TRACE_DEVICES is False
+        assert cu._trace_devices_enabled() is False
+        monkeypatch.setenv("AR_STREAM_TRACE_DEVICES", "1")
+        monkeypatch.setattr(cu, "_TRACE_HOPS", None)
+        assert envs.AR_STREAM_TRACE_DEVICES is True
+        assert cu._trace_devices_enabled() is True

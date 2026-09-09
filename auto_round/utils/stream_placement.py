@@ -35,7 +35,9 @@ import torch
 
 from auto_round.logger import logger
 
-_DEVICE_TOKEN = re.compile(r"^(?:cuda|gpu)(?::(\d+))?$|^cpu$|^xpu(?::(\d+))?$|^hpu(?::(\d+))?$|^mps$|^npu(?::(\d+))?$")
+_DEVICE_TOKEN = re.compile(
+    r"^(?:cuda|gpu)(?::(\d+))?$|^cpu(?::(\d+))?$|^xpu(?::(\d+))?$|^hpu(?::(\d+))?$|^mps$|^npu(?::(\d+))?$"
+)
 
 
 def is_placement_template(value) -> bool:
@@ -48,9 +50,39 @@ def is_placement_template(value) -> bool:
         return False
     value = value.strip()
     if _DEVICE_TOKEN.match(value):
-        return False  # a single device token ("cuda:0", "cpu", "0")
+        return False  # a single device token ("cuda:0", "cpu", "0", "cpu:0")
     parts = [part for part in value.split(",") if part.strip()]
-    return bool(parts) and all(":" in part for part in parts)
+    if not parts:
+        return False
+    for part in parts:
+        # a part that is ITSELF a device token ("cuda:0", "cpu:1", "0")
+        # marks the whole value as a device list, never a name:device
+        # template - otherwise "cuda:0,cuda:1" would masquerade as one
+        if _DEVICE_TOKEN.match(part) or ":" not in part:
+            return False
+    return True
+
+
+def stream_mapped_enabled(device_map=None, prefetch_device_map=None) -> bool:
+    """True when streamed blocks use mapped (per-module) placement.
+
+    Single source of truth shared by the orchestrator engagement decision,
+    the staging resolver, and the base.py startup guards - the three must
+    agree or staging and engagement diverge (a block placed by map while
+    staging still rotates). Three arms: an alternate prefetch map is set;
+    the main device map names modules (a placement template, dict maps
+    included); or the main device map is a plain multi-device list (block
+    sharding - matching the upstream data-driven allocator, where a
+    multi-device map already shards each block's modules).
+    """
+    if prefetch_device_map:
+        return True
+    if isinstance(device_map, dict):
+        return bool(device_map)
+    if is_placement_template(device_map):
+        return True
+    devices = [d for d in str(device_map or "").split(",") if d.strip()]
+    return len(devices) > 1
 
 
 def parse_device_template(template: str) -> dict:
@@ -73,9 +105,52 @@ def parse_device_template(template: str) -> dict:
     return spec
 
 
+def placement_map_devices(value) -> set:
+    """Device tokens named by a placement map (template or plain list).
+
+    Used by the startup guards to compare the base and prefetch maps'
+    device sets; unparsable input yields an empty set (no comparison).
+    """
+    text = str(value or "").strip()
+    try:
+        if is_placement_template(text):
+            return {str(dev) for dev in parse_device_template(text).values()}
+        return {part for part in text.split(",") if part.strip()}
+    except ValueError:
+        return set()
+
+
 def _normalize_device(dev: str) -> torch.device:
+    """Normalize one device token; bare indices follow repo-wide semantics.
+
+    A bare index means "device N of the first available accelerator type"
+    (``parse_available_devices`` semantics) - NOT hard-coded cuda: on
+    HPU/XPU builds ``--device_map 0,1`` must resolve to ``hpu:0/hpu:1``.
+    Prefers the run's parsed device pool (``device_manager.device_list``)
+    when it covers the index, so the placement always agrees with the
+    devices the run actually uses.
+    """
     if dev.isdigit():
-        return torch.device("cuda", int(dev))
+        idx = int(dev)
+        from auto_round.utils.device_manager import device_manager
+
+        pool = [
+            e if isinstance(e, torch.device) else torch.device(str(e))
+            for e in (getattr(device_manager, "device_list", None) or [])
+        ]
+        for entry in pool:
+            if entry.type != "cpu" and entry.index == idx:
+                return entry
+        # index beyond the pool: extend the run's accelerator type with the
+        # given index ("2" with a cuda run -> cuda:2), keeping the token's
+        # meaning instead of collapsing to the fallback device
+        types = sorted({e.type for e in pool if e.type != "cpu"})
+        if types:
+            return torch.device(types[0], idx)
+        from auto_round.utils.device import parse_available_devices
+
+        parsed = torch.device(parse_available_devices(dev)[0])
+        return torch.device(parsed.type, parsed.index if parsed.index is not None else idx)
     return torch.device(dev)
 
 
@@ -505,7 +580,6 @@ class FlowProbe:
             tokens = main.numel() // max(1, main.shape[-1] if main.dim() else 1)
             for a in tens[1:]:
                 if a.dim() >= 2 and 2 <= a.shape[-1] <= 64 and a.numel() // a.shape[-1] == tokens:
-                    tokens = main.numel() // max(1, main.shape[-1] if main.dim() else 1)
                     return int(a.shape[-1]), main.numel() * main.element_size(), tokens
             return None
 

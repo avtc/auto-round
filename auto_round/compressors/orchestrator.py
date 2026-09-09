@@ -1563,15 +1563,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         rotation is the automatic behavior when no map is declared. The
         alternate prefetch map is only legal with stream_prefetch enabled -
         enforced at startup."""
-        if getattr(self, "stream_prefetch_device_map", None):
-            return True
-        from auto_round.utils.stream_placement import is_placement_template
+        from auto_round.utils.stream_placement import stream_mapped_enabled
 
-        base_map = getattr(device_manager, "device_map", None)
-        if is_placement_template(base_map):
-            return True
-        devices = [d for d in str(base_map or "").split(",") if d.strip()]
-        return len(devices) > 1
+        return stream_mapped_enabled(
+            getattr(device_manager, "device_map", None), getattr(self, "stream_prefetch_device_map", None)
+        )
 
     @staticmethod
     def _pin_stream_mapped_(block, placement: dict) -> None:
@@ -1592,7 +1588,15 @@ class CompressionOrchestrator(BaseOrchestrator):
         """
         from auto_round.compressors.utils import attach_stream_align_, detach_stream_align_
 
-        multi = len(device_manager.device_list) > 1
+        _devs = {str(d) for d in placement.values()}
+        # the hook gate follows the pool width OR the actual placement span:
+        # the pool width covers the staged-elsewhere case (a single-device
+        # placement on a non-primary GPU still needs the caller-device
+        # return path), the span covers --device_map 0
+        # --stream_prefetch_device_map 1,2 (placement wider than the pool -
+        # hooks must attach or the first forward dies on a cross-device op,
+        # the exact residual+hidden failure the hooks exist to prevent)
+        multi = len(device_manager.device_list) > 1 or len(_devs) > 1
         targets = {}
         for name, mod in block.named_modules():
             dev = placement.get(name)
@@ -1975,17 +1979,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         only spread block VRAM around.
         """
         mode = str(getattr(self, "stream_prefetch", "off") or "off").strip().lower()
-        from auto_round.utils.stream_placement import is_placement_template
+        from auto_round.utils.stream_placement import stream_mapped_enabled
 
         _base_map = getattr(device_manager, "device_map", None)
-        # mirrors _stream_mapped_enabled: a multi-device map is mapped
-        # placement under every prefetch setting -- the rotation list would
-        # contradict it (and log a rotation it would lose)
-        _mapped = (
-            getattr(self, "stream_prefetch_device_map", None) is not None
-            or is_placement_template(_base_map)
-            or len([d for d in str(_base_map or "").split(",") if d.strip()]) > 1
-        )
+        # mirrors _stream_mapped_enabled via the shared helper: a
+        # multi-device map is mapped placement under every prefetch setting
+        # -- the rotation list would contradict it (and log a rotation it
+        # would lose)
+        _mapped = stream_mapped_enabled(_base_map, getattr(self, "stream_prefetch_device_map", None))
         if _mapped:
             # mapped placement owns staging homes per module; the rotation
             # list would contradict the template
@@ -3117,13 +3118,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         _stage_device_of = None
         if _mapped_state is not None:
             _fallback = str(self.device)
+            from auto_round.utils.stream_placement import first_placement_device, placement_device_of
 
             def _stage_device_of(idx, name, prefix, _st=_mapped_state, _fb=_fallback):
                 placement = _st["resolve"](prefix)
                 if not placement:
                     return None
                 rel = name[len(prefix) + 1 :] if prefix and name.startswith(prefix + ".") else name
-                from auto_round.utils.stream_placement import first_placement_device, placement_device_of
 
                 # tensors that match no entry default INSIDE the block's map
                 # (front of the block), never the global primary
@@ -3244,7 +3245,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if _placement is not None:
                         # mapped placement: fetch every tensor straight to its
                         # module's device; the primary stays the fallback home
-                        from auto_round.utils.stream_placement import first_placement_device
+                        from auto_round.utils.stream_placement import first_placement_device, placement_device_of
 
                         # unmatched tensors load INSIDE the block's device set,
                         # never onto the global primary (it may host prefetch
@@ -3253,8 +3254,6 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                         def _dev_of(name, _p=_placement, _pre=block_name):
                             rel = name[len(_pre) + 1 :] if _pre and name.startswith(_pre + ".") else name
-                            from auto_round.utils.stream_placement import placement_device_of
-
                             return placement_device_of(_p, rel, load_device)
 
                         streamer.load_module_(block, block_name, device=load_device, device_of=_dev_of)

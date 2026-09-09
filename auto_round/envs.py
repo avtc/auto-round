@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     AR_LOG_LEVEL: str = "INFO"
     AR_PERF_COUNTERS: bool = False
     AR_MEM_COUNTERS: bool = False
+    AR_STREAM_TRACE_DEVICES: bool = False
     AR_USE_MODELSCOPE: bool = "False"
     AR_MODEL_FREE_SHARD_PARALLELISM: Optional[int] = None
     AUTO_ROUND_CACHE: Optional[str] = None
@@ -71,6 +72,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_ENABLE_COMPILE_PACKING": lambda: os.getenv("AR_ENABLE_COMPILE_PACKING", "0").lower() in ("1", "true", "yes"),
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "0").lower() in ("1", "true", "yes"),
     "AR_MEM_COUNTERS": lambda: os.getenv("AR_MEM_COUNTERS", "0").lower() in ("1", "true", "yes"),
+    "AR_STREAM_TRACE_DEVICES": lambda: os.getenv("AR_STREAM_TRACE_DEVICES", "0").lower() in ("1", "true", "yes"),
     "AR_USE_MODELSCOPE": lambda: os.getenv("AR_USE_MODELSCOPE", "False").lower() in ["1", "true"],
     "AR_WORK_SPACE": lambda: os.getenv("AR_WORK_SPACE", "ar_work_space").lower(),
     "AR_ENABLE_UNIFY_MOE_INPUT_SCALE": lambda: os.getenv("AR_ENABLE_UNIFY_MOE_INPUT_SCALE", "False").lower()

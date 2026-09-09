@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import logging
 import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
@@ -633,7 +634,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning("[tune-oom] census failed on %s: %s", d, e)
 
-        if logger.isEnabledFor(10):  # DEBUG: who holds VRAM as the tune starts
+        if logger.isEnabledFor(logging.DEBUG):  # DEBUG: who holds VRAM as the tune starts
             for d in device_manager.device_list:
                 log_cuda_memory_census(f"tune start {block_ctx.block_name}", d)
         index_sampler = IndexSampler(nsamples, global_batch_size)
@@ -652,7 +653,7 @@ class SignRoundQuantizer(BaseQuantizer):
         from auto_round import envs
 
         _perf = bool(envs.AR_PERF_COUNTERS)
-        _t = {"fwd": 0.0, "loss": 0.0, "bwd": 0.0, "snap": 0.0, "iters": 0}
+        _t = {"fwd": 0.0, "bwd": 0.0, "snap": 0.0, "iters": 0}
 
         for i in range(self.iters):
             if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):

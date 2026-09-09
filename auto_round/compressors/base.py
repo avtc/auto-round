@@ -390,9 +390,36 @@ class BaseOrchestrator(object):
         if self.stream_prefetch_device_map is not None and self.stream_prefetch in ("off",):
             raise ValueError(
                 "stream_prefetch_device_map requires stream_prefetch: it places the blocks the "
-                "prefetch reader stages (use --stream_prefetch auto/on/cpu)"
+                "prefetch reader stages (use --stream_prefetch auto or cpu)"
             )
-        if (self.stream_prefetch_device_map or self._stream_mapped_template()) and self.stream_quantization:
+        from auto_round.utils.stream_placement import placement_map_devices, stream_mapped_enabled
+
+        # the constructor arg, NOT device_manager.device_map: configure() runs
+        # later in __init__, so the singleton still holds the previous run's
+        # map at guard time
+        _run_device_map = device_map
+        if self.stream_quantization and isinstance(_run_device_map, dict):
+            # mapped placement parses 'module:device' templates and device
+            # lists; a dict map would fall through to template parsing on its
+            # repr and die with an opaque device-string error - fail fast
+            # instead, naming the supported forms
+            raise ValueError(
+                "stream_quantization does not accept a dict device_map: use a plain device list ('0,1'), a "
+                "'module:device' placement template ('self_attn.*:0,mlp.*:1'), or --stream_prefetch_device_map"
+            )
+        if self.stream_prefetch_device_map is not None and self.stream_quantization:
+            # partially-overlapping base/next maps contend for the shared
+            # GPUs: those devices host both tuning state and staged weights,
+            # the exact pressure the separate-map option exists to avoid
+            _base_devs = placement_map_devices(_run_device_map)
+            _next_devs = placement_map_devices(self.stream_prefetch_device_map)
+            if _base_devs and _next_devs and _base_devs != _next_devs and _base_devs & _next_devs:
+                logger.warning(
+                    "[stream-mapped] --stream_prefetch_device_map shares devices %s with --device_map but is "
+                    "not identical: those GPUs host both tuning state and staged weights",
+                    sorted(_base_devs & _next_devs),
+                )
+        if stream_mapped_enabled(_run_device_map, self.stream_prefetch_device_map) and self.stream_quantization:
             from auto_round.utils.distributed import is_distributed
 
             if is_distributed():
@@ -2015,13 +2042,6 @@ class BaseOrchestrator(object):
         if isinstance(opt, str):
             return getattr(torch.optim, opt, None)
         return opt
-
-    def _stream_mapped_template(self) -> bool:
-        """True when the main device map names modules (a placement template)."""
-        from auto_round.utils.device_manager import device_manager
-        from auto_round.utils.stream_placement import is_placement_template
-
-        return is_placement_template(getattr(device_manager, "device_map", None))
 
     def _adjust_immediate_packing_and_saving(self):
         from auto_round.algorithms.quantization.rtn.config import RTNConfig

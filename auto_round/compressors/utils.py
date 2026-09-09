@@ -216,12 +216,19 @@ _TRACE_HOPS = None  # AR_STREAM_TRACE_DEVICES latch: None=unread, False=off
 _trace_block_fwd_n = 0  # block_forward input-map trace latch (first N forwards)
 
 
-def _trace_align_hop(name, input_device, target) -> None:
-    """Log real cross-device hops when AR_STREAM_TRACE_DEVICES is set."""
+def _trace_devices_enabled() -> bool:
+    """AR_STREAM_TRACE_DEVICES latch, read once (registered env; see envs.py)."""
     global _TRACE_HOPS
     if _TRACE_HOPS is None:
-        _TRACE_HOPS = os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
-    if _TRACE_HOPS and input_device != target:
+        from auto_round import envs
+
+        _TRACE_HOPS = bool(envs.AR_STREAM_TRACE_DEVICES)
+    return _TRACE_HOPS
+
+
+def _trace_align_hop(name, input_device, target) -> None:
+    """Log real cross-device hops when AR_STREAM_TRACE_DEVICES is set."""
+    if _trace_devices_enabled() and input_device != target:
         logger.info("[stream-align] %s: input %s -> %s", name, input_device, target)
 
 
@@ -309,6 +316,26 @@ def rehome_block_mapped_(module: torch.nn.Module, placement: dict, fallback) -> 
     synchronize_devices_({_default, fallback, *placement.values()})
     claimed: set = set()
     moved = 0
+    # tied parameters (shared weight objects under different modules)
+    # placed on different devices get one copy per device - the tie breaks
+    # silently and later in-place updates (rounding-value application)
+    # diverge across the copies. Detect and name them before moving.
+    _tied_owners: dict = {}
+    for _tname, _tleaf in module.named_modules():
+        _ttarget = placement.get(_tname)
+        if _ttarget is None:
+            continue
+        for _tp in _tleaf.parameters(recurse=False):
+            _tied_owners.setdefault(id(_tp), []).append((_tname, str(_ttarget)))
+    for _owners in _tied_owners.values():
+        _devs = {d for _, d in _owners}
+        if len(_devs) > 1:
+            logger.warning(
+                "[stream-mapped] tied parameter shared by %s is split across devices %s: each device gets "
+                "its own copy and in-place updates diverge - keep tied modules on one device",
+                sorted(n for n, _ in _owners),
+                sorted(_devs),
+            )
 
     def _leaf_fn(target):
         def _fn(t: torch.Tensor) -> torch.Tensor:
@@ -376,10 +403,6 @@ def block_forward(
     device: torch.device = torch.device("cpu"),
     output_return_id: int = 0,
 ) -> Union[torch.Tensor, dict]:
-    # module latches for the AR_STREAM_TRACE_DEVICES diagnostics; declared
-    # up front - a use before the global statement is a SyntaxError
-    global _TRACE_HOPS, _trace_block_fwd_n
-
     """Performs a forward pass through a block with the given inputs.
 
     Args:
@@ -394,6 +417,9 @@ def block_forward(
     Returns:
     output: The output of the forward pass.
     """
+    # module latches for the AR_STREAM_TRACE_DEVICES diagnostics; declared
+    # up front - a use before the global statement is a SyntaxError
+    global _TRACE_HOPS, _trace_block_fwd_n
     from auto_round.utils.model import to_device
 
     # A block replaying on its own device (e.g. a round-robin home GPU under
@@ -439,9 +465,7 @@ def block_forward(
                     input_others[param_name] = val
         positional_inputs = ()
 
-    if _TRACE_HOPS is True or (
-        _TRACE_HOPS is None and os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
-    ):
+    if _trace_devices_enabled():
         _trace_block_fwd_n += 1
         if _trace_block_fwd_n <= 50:
             devs = {k: str(v.device) for k, v in input_others.items() if isinstance(v, torch.Tensor)}
