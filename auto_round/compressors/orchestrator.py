@@ -1852,7 +1852,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # ceil, floored at 1: a floor-div here silently zeroes the
                 # reserve when the probe saw more tokens than a tune batch
                 _scale = max(1, -(-_tune_tokens // max(1, _probe_tokens)))
-                _routed = _hidden_bytes * _top_k * 4 * _scale
+                # x6: the loop holds input + output accumulators AND the
+                # backward materializes a same-sized grad for the routed set
+                # (observed as the exact 2GiB OOM ask) - fp32-vs-bf16 folded
+                # into the constant (bf16-emitting archs over-reserve 2x,
+                # the safe direction)
+                _routed = _hidden_bytes * _top_k * 6 * _scale
                 if _routed > 0:
                     _routed = min(_routed, int(0.25 * sum(b for _n, b, _i, _a in units)))
                     _loads = {}
