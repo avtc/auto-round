@@ -123,6 +123,27 @@ class TestPinStreamMapped:
         assert len(block.q_proj._forward_hooks) == 1
         assert block.q_proj._stream_align_hook.target == torch.device("cpu", 1)
 
+    def test_routed_host_pins_container_explicitly(self, monkeypatch):
+        """The routed MoE container pins to the headroom-chosen device from
+        the flow derivation instead of inheriting its first registered
+        descendant - reserving the inherited anchor evicts it in the
+        repartition (the anchor chases the reserve)."""
+        import auto_round.compressors.orchestrator as orch
+
+        class _DM:
+            device = torch.device("cpu", 0)
+            device_list = [torch.device("cpu", 0), torch.device("cpu", 1)]
+
+        monkeypatch.setattr(orch, "device_manager", _DM())
+        block = _Toy()
+        # expert 0 (first registered descendant) on cpu:0; routed host chose cpu:1
+        placement = {"mlp.gate_proj": torch.device("cpu", 0), "mlp.up_proj": torch.device("cpu", 1)}
+        block._stream_routed_host_ = ("mlp", torch.device("cpu", 1))
+        orch.CompressionOrchestrator._pin_stream_mapped_(block, placement)
+        mlp_hook = getattr(block.mlp, "_stream_align_hook", None)
+        assert mlp_hook is not None, "routed container got no align hook"
+        assert mlp_hook.target == torch.device("cpu", 1), "routed host pin ignored (inherited instead)"
+
     def test_single_device_map_skips_hooks(self, monkeypatch):
         import auto_round.compressors.orchestrator as orch
 

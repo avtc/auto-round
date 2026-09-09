@@ -1609,10 +1609,20 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # interior math (attention SDPA/rotary, residual adds, MoE
                 # routing) must run on one defined device, and their output
                 # must return to the caller's device.
-                for sub_name, sub_dev in targets.items():
-                    if sub_name.startswith(name + "."):
-                        dev = sub_dev
-                        break
+                # EXCEPTION - the routed MoE container: its device hosts the
+                # loop's dispatched hidden buffers (tokens*top_k rows), so it
+                # is pinned EXPLICITLY to the headroom-chosen device from the
+                # flow derivation (reserving that device's first descendant
+                # instead would evict it in the repartition - the anchor
+                # chases the reserve and never stabilizes).
+                _routed_host = getattr(block, "_stream_routed_host_", None)
+                if _routed_host is not None and name == _routed_host[0]:
+                    dev = str(_routed_host[1])
+                else:
+                    for sub_name, sub_dev in targets.items():
+                        if sub_name.startswith(name + "."):
+                            dev = sub_dev
+                            break
             if dev is None:
                 continue
             if any(True for _ in mod.parameters(recurse=False)):
@@ -1679,7 +1689,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         next_map = getattr(self, "stream_prefetch_device_map", None) or base_map
         fallback = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
         shared_groups = self._mapped_shared_groups_()
-        state = {"lock": threading.RLock(), "placements": {}, "flow_templates": {}, "pending_restage": None}
+        state = {
+            "lock": threading.RLock(),
+            "placements": {},
+            "flow_templates": {},
+            "flow_routed_hosts": {},
+            "pending_restage": None,
+        }
         logged = {"engaged": False}
 
         def _template_for(flat_idx: int):
@@ -1718,6 +1734,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # (co-located container-direct params, e.g. GDN A_log) -
                 # re-derive them for THIS block's module tree
                 placement = complete_container_params(placement, block)
+                _routed_host = state["flow_routed_hosts"].get(key)
+                if _routed_host is not None:
+                    block._stream_routed_host_ = _routed_host
                 if not logged.get("reused"):
                     logged["reused"] = True
                     logger.info(
@@ -1788,19 +1807,21 @@ class CompressionOrchestrator(BaseOrchestrator):
             # cannot starve the primary entirely.
             placement = partition_flow_order(units, dev_objs)
             # MoE routed buffers: the experts loop materializes
-            # tokens * top_k hidden rows (in the model's emit dtype, input and
-            # output accumulators) on the device the container's hidden lands
-            # on - the router unit's device. They are runtime transients of
-            # the (upstream) loop and cannot be moved; price them as a reserve
-            # on that device and repartition once so an equal amount of tune
-            # state moves off it. routed = entry_bytes * top_k * 4 (both
-            # buffers; fp32-vs-bf16 doubling folded into the constant).
+            # tokens * top_k hidden rows (input + output accumulators, in the
+            # model's emit dtype) on the device the container's hidden lands
+            # on. They are runtime transients of the (upstream) loop and
+            # cannot be moved; price them as a reserve and repartition so an
+            # equal amount of tune state moves off the host device.
             # top_k/entry bytes come from the probe's routed-dispatch marker
             # (pure arg shapes - attribute spellings differ per architecture).
-            # The routed buffers allocate on the container's align target,
-            # which the staging contract defines as the FIRST PLACED
-            # DESCENDANT IN REGISTRATION ORDER (container inheritance below);
-            # mirror that rule exactly to find the device.
+            # The HOST is an explicit decision, not an inheritance side
+            # effect: the container would otherwise align to its first
+            # registered placed descendant, and reserving THAT device evicts
+            # the descendant in the repartition - the anchor chases the
+            # reserve and never stabilizes (observed: reserve on cuda:0,
+            # routed materialized on cuda:1). Instead: pick the device with
+            # the most headroom after the unreserved partition, reserve it,
+            # and PIN the container to it explicitly (see _pin_stream_mapped_).
             _routed_rec = next((r for r in records if str(r[0]).startswith("__routed__:")), None)
             if _routed_rec is not None:
                 _cont = str(_routed_rec[0]).partition("__routed__:")[2]
@@ -1814,27 +1835,32 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # ceil, floored at 1: a floor-div here silently zeroes the
                 # reserve when the probe saw more tokens than a tune batch
                 _scale = max(1, -(-_tune_tokens // max(1, _probe_tokens)))
-                _anchor_dev = next(
-                    (placement[n] for n, _m in block.named_modules() if n.startswith(_cont + ".") and n in placement),
-                    None,
-                )
                 _routed = _hidden_bytes * _top_k * 4 * _scale
-                if _anchor_dev is not None and _routed > 0:
+                if _routed > 0:
                     _routed = min(_routed, int(0.25 * sum(b for _n, b, _i, _a in units)))
-                    placement = partition_flow_order(units, dev_objs, reserves={_anchor_dev: _routed})
+                    _loads = {}
+                    for _u_names, _b, _i2, _a2 in units:
+                        _dev = placement.get(_u_names[0])
+                        if _dev is not None:
+                            _loads[_dev] = _loads.get(_dev, 0) + _b
+                    _host = min(dev_objs, key=lambda d: _loads.get(d, 0))
+                    placement = partition_flow_order(units, dev_objs, reserves={_host: _routed})
+                    block._stream_routed_host_ = (_cont, _host)
                     logger.debug(
                         "[stream-mapped] MoE routed buffers (%.1fGiB, top_k=%d, probe tokens %d -> tune %d) "
-                        "priced on %s; state rebalanced",
+                        "host pinned to %s; state rebalanced",
                         _routed / 2**30,
                         _top_k,
                         _probe_tokens,
                         _tune_tokens,
-                        _anchor_dev,
+                        _host,
                     )
             placement = complete_container_params(placement, block)
             key = (block_signature(block), tuple(str(d) for d in devices))
             with state["lock"]:
                 state["flow_templates"][key] = placement
+                if getattr(block, "_stream_routed_host_", None) is not None:
+                    state["flow_routed_hosts"][key] = block._stream_routed_host_
             logger.info(
                 "[stream-mapped] derived placement from the reference forward (layout %s..., %d modules, "
                 "%d devices); identical layouts reuse it",
