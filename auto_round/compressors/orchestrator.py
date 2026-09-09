@@ -232,6 +232,17 @@ def forward_checkpoint_only_predictor(shell: torch.nn.Module, hidden_states: tor
     refs = getattr(shell, "_predictor_refs", None)
     if refs is None:
         raise RuntimeError("predictor forward called on a shell without bound role refs")
+    # role refs must resolve through the LIVE tree at call time: the dict
+    # aliases modules captured at tree-build time, but wrapping replaces the
+    # tree entries with quantizer wrappers later - calling the aliased orig
+    # bypasses the wrapper (fp math, no device move; under mapped placement
+    # a straight device-mismatch crash, and in EVERY run an inert fc tune)
+    ref_paths = getattr(shell, "_predictor_ref_paths", None) or {}
+
+    def _ref(role):
+        path_ = ref_paths.get(role)
+        return shell.get_submodule(path_) if path_ else refs[role]
+
     e = input_others.pop("_predictor_e", None)
     if e is None:
         e = shell._predictor_e
@@ -243,22 +254,28 @@ def forward_checkpoint_only_predictor(shell: torch.nn.Module, hidden_states: tor
         e = torch.cat(list(e), dim=0)
     if e.device != hidden_states.device:
         e = e.to(hidden_states.device)
-    x = torch.cat([refs["norm_e"](e), refs["norm_h"](hidden_states)], dim=-1)
-    x = refs["fc"](x)
-    x = refs["layer"](x, **input_others)
+    x = torch.cat([_ref("norm_e")(e), _ref("norm_h")(hidden_states)], dim=-1)
+    x = _ref("fc")(x)
+    x = refs["layer"](x, **input_others)  # layer children resolve via the live tree
     x = x[0] if isinstance(x, (tuple, list)) else x
-    final_norm = refs.get("final_norm")
+    final_norm = _ref("final_norm") if ref_paths.get("final_norm") else refs.get("final_norm")
     return final_norm(x) if final_norm is not None else x
 
 
-def bind_checkpoint_only_predictor(shell: torch.nn.Module, refs: dict, e: torch.Tensor = None) -> None:
+def bind_checkpoint_only_predictor(
+    shell: torch.nn.Module, refs: dict, e: torch.Tensor = None, ref_paths: dict = None
+) -> None:
     """Attach the predictor forward and role refs to the group shell.
 
     The ref dict keeps module handles out of ``named_modules`` (the real tree
     already registers them once under their checkpoint paths), and the bound
     forward lets block-level machinery call the group like any decoder
-    block. ``e`` may be bound later, right before the first forward."""
+    block. ``e`` may be bound later, right before the first forward.
+    ``ref_paths`` maps roles to module paths: the forward resolves them
+    through the live tree per call so wrapped entries are called as
+    wrappers, never as the pre-wrap originals the dict aliases."""
     shell._predictor_refs = refs
+    shell._predictor_ref_paths = ref_paths or {}
     shell._predictor_e = e
     shell.forward = lambda hidden_states, **input_others: forward_checkpoint_only_predictor(
         shell, hidden_states, **input_others
@@ -2389,6 +2406,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         layer_call = layer_mod
         if shell is layer_mod:
             layer_call = type(layer_mod).forward.__get__(layer_mod, type(layer_mod))
+        _group_prefix = group + "."
+        _paths = {
+            "norm_e": info["norm_e"][: -len(".weight")].removeprefix(_group_prefix),
+            "norm_h": info["norm_h"][: -len(".weight")].removeprefix(_group_prefix),
+            "fc": fc_path.removeprefix(_group_prefix),
+        }
+        if info.get("final_norm"):
+            _paths["final_norm"] = info["final_norm"][: -len(".weight")].removeprefix(_group_prefix)
         bind_checkpoint_only_predictor(
             shell,
             {
@@ -2400,6 +2425,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "fc": fc,
                 "layer": layer_call,
             },
+            ref_paths=_paths,
         )
         return claimed
 
