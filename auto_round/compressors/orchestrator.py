@@ -1696,7 +1696,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 cached = state["placements"].get(block_name)
             if cached is not None:
                 return cached
-            flat_idx = flat_block_names.index(block_name)
+            # checkpoint-only groups (e.g. the MTP tree) are not in the
+            # block list: resolve them against the base template
+            flat_idx = flat_block_names.index(block_name) if block_name in flat_block_names else 0
             template = _template_for(flat_idx)
             block = get_module(self.model, block_name)
             leaf_names = [
@@ -1846,7 +1848,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             """Install the reference-forward probe when derivation applies."""
             if not has_forward:
                 return None
-            flat_idx = flat_block_names.index(block_name)
+            flat_idx = flat_block_names.index(block_name) if block_name in flat_block_names else 0
             devices = _template_devices(_template_for(flat_idx))
             if not devices:
                 return None
@@ -2375,7 +2377,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         )
         return claimed
 
-    def _tune_checkpoint_only_groups_(self, streamer, tree_groups, calib_state, block_count) -> set:
+    def _tune_checkpoint_only_groups_(self, streamer, tree_groups, calib_state, block_count, mapped_state=None) -> set:
         """Tune materialized predictor trees with the run's tuning config.
 
         The tree joins the chain's tail as one extra block: hidden states are
@@ -2420,6 +2422,25 @@ class CompressionOrchestrator(BaseOrchestrator):
             shell = self.model.get_submodule(group)
             streamer.load_module_(shell, group, device=str(self.device))
             materialize_residual_meta(shell, cfg, self.device)
+            if mapped_state is not None:
+                # the tree is a full block for placement purposes (a hy3 MTP
+                # group is a 3.9B-param MoE layer - tuning it whole on the
+                # primary cannot fit): same mapped wiring as the block loop,
+                # so the tree spreads across the device map, its reference
+                # forward drives the flow probe (routed reserve included) and
+                # the calibration parks on host via _stream_mapped
+                _placement = mapped_state["resolve"](group)
+                if _placement:
+                    from auto_round.compressors.utils import rehome_block_mapped_
+
+                    rehome_block_mapped_(shell, _placement, str(self.device))
+                    shell._stream_mapped = _placement
+                    self._pin_stream_mapped_(shell, _placement)
+                    shell._stream_realign_after_wrap_ = lambda _b=shell, _p=_placement: self._pin_stream_mapped_(_b, _p)
+                    _r0 = fp_inputs[0] if fp_inputs and torch.is_tensor(fp_inputs[0]) else None
+                    _row_len = int(_r0.shape[-2]) if _r0 is not None and _r0.dim() >= 2 else 1
+                    if mapped_state["maybe_probe"](shell, group, fp_inputs is not None, _row_len) is not None:
+                        shell._stream_restage_after_fp_ = mapped_state["make_restage"](shell, group)
             # single-row fallback so direct calls (mask probes, spot checks)
             # work without the batched input plumbing
             shell._predictor_e = e_rows[0]
@@ -3516,7 +3537,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             if tree_groups:
                 _tune_iters = self._max_tune_iters()
                 if _tune_iters > 0:
-                    mtp_tuned = self._tune_checkpoint_only_groups_(streamer, tree_groups, calib_state, total_block_cnt)
+                    mtp_tuned = self._tune_checkpoint_only_groups_(
+                        streamer, tree_groups, calib_state, total_block_cnt, mapped_state=_mapped_state
+                    )
         if streamer is not None and prefetch_depth > 0:
             streamer.stop_prefetch()
         if streamer is not None:

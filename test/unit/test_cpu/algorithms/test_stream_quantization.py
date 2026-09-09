@@ -1527,6 +1527,78 @@ class TestStreamQuantizeEquivalence:
         )
         return CompressionOrchestrator._resolve_stream_stage_devices(stub)
 
+    def test_mtp_group_tree_tunes_mapped_spread(self, tiny_checkpoint, tmp_path, capfd):
+        """The checkpoint-only tree joins the MAPPED path (a hy3 MTP group is
+        a full MoE block that cannot fit one device): the group resolves
+        against the base template, its reference forward drives the flow
+        probe, and the tune runs spread. On CPU the devices coincide with the
+        plain run's home, so the export must stay BIT-IDENTICAL."""
+        import shutil
+
+        H = 32
+        extra = {
+            "model.layers.3.eh_proj.weight": torch.randn(H, 2 * H),
+            "model.layers.3.enorm.weight": torch.randn(H),
+            "model.layers.3.hnorm.weight": torch.randn(H),
+            "model.layers.3.final_layernorm.weight": torch.randn(H),
+            "model.layers.3.input_layernorm.weight": torch.randn(H),
+            "model.layers.3.post_attention_layernorm.weight": torch.randn(H),
+            "model.layers.3.self_attn.q_proj.weight": torch.randn(H, H),
+            "model.layers.3.self_attn.k_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.v_proj.weight": torch.randn(16, H),
+            "model.layers.3.self_attn.o_proj.weight": torch.randn(H, H),
+            "model.layers.3.mlp.gate_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.up_proj.weight": torch.randn(64, H),
+            "model.layers.3.mlp.down_proj.weight": torch.randn(H, 64),
+        }
+
+        def load_all(d):
+            from safetensors import safe_open
+
+            out = {}
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(d, fn), framework="pt") as f:
+                    for k in f.keys():
+                        out[k] = f.get_tensor(k)
+            return out
+
+        arms = {}
+        for name, kwargs in (
+            ("plain", dict(iters=1)),
+            (
+                "mapped",
+                dict(
+                    iters=1,
+                    stream_prefetch="auto",
+                    device_map="cpu,cpu",
+                    stream_prefetch_device_map="cpu,cpu",
+                ),
+            ),
+        ):
+            src_ck = str(tmp_path / f"ck_{name}")
+            shutil.copytree(tiny_checkpoint, src_ck)
+            src_ck = self._add_extra_group(src_ck, tmp_path / f"x_{name}", extra)
+            arms[name] = self._quantize(
+                src_ck,
+                str(tmp_path / name),
+                stream=True,
+                dataset="NeelNanda/pile-10k",
+                layer_config={"model.layers.3": {"bits": 8}, "lm_head": {"bits": 8}},
+                **kwargs,
+            )
+
+        captured = capfd.readouterr()
+        console = captured.out + captured.err
+        assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
+        assert "model.layers.3.eh_proj.qweight" in self._export_keys(arms["mapped"]), "tree not packed under mapped"
+
+        t = {name: load_all(d) for name, d in arms.items()}
+        assert set(t["plain"]) == set(t["mapped"])
+        for k in t["plain"]:
+            assert torch.equal(t["plain"][k], t["mapped"][k]), f"tensor {k} differs under mapped tree tune"
+
     def test_auto_excludes_gpus_outside_device_map(self, monkeypatch):
         devices = self._resolve(monkeypatch, device_list=["cuda:1", "cuda:2"])
         # cuda:0 and cuda:3 are visible but not in the map: never staged;
