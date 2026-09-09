@@ -505,7 +505,8 @@ class FlowProbe:
             tokens = main.numel() // max(1, main.shape[-1] if main.dim() else 1)
             for a in tens[1:]:
                 if a.dim() >= 2 and 2 <= a.shape[-1] <= 64 and a.numel() // a.shape[-1] == tokens:
-                    return int(a.shape[-1]), main.numel() * main.element_size()
+                    rows = int(main.shape[0]) if main.dim() >= 2 else 1
+                    return int(a.shape[-1]), main.numel() * main.element_size(), rows
             return None
 
         for rel, leaf in rel_leaves:
@@ -529,7 +530,7 @@ class FlowProbe:
                     return
                 sig = _routed_sig(args)
                 if sig:
-                    self.records.append((f"__routed__:{_rel}", sig[0], sig[1]))
+                    self.records.append((f"__routed__:{_rel}", sig[0], sig[1], sig[2]))
 
             self._hooks.append(mod.register_forward_pre_hook(_cpre))
 

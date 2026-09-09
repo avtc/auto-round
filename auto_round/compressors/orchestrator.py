@@ -1802,19 +1802,30 @@ class CompressionOrchestrator(BaseOrchestrator):
             _routed_rec = next((r for r in records if str(r[0]).startswith("__routed__:")), None)
             if _routed_rec is not None:
                 _cont = str(_routed_rec[0]).partition("__routed__:")[2]
-                _top_k, _hidden_bytes = int(_routed_rec[1]), int(_routed_rec[2])
+                _top_k, _hidden_bytes, _probe_rows = int(_routed_rec[1]), int(_routed_rec[2]), int(_routed_rec[3])
+                # the probe prices the REFERENCE forward's batch; the routed
+                # transient scales with the TUNE forward's batch - rescale
+                # (the derive probe commonly sees fewer rows than the tune
+                # loop's calibration batch)
+                _tune_rows = int(getattr(self.calibration_context, "batch_size", 0) or 0) or _probe_rows
+                # ceil, floored at 1: a floor-div here silently zeroes the
+                # reserve when the probe saw more rows than the tune batch
+                _scale = max(1, -(-max(1, _tune_rows) // max(1, _probe_rows)))
                 _anchor_dev = next(
                     (placement[n] for n, _m in block.named_modules() if n.startswith(_cont + ".") and n in placement),
                     None,
                 )
-                _routed = _hidden_bytes * _top_k * 4
+                _routed = _hidden_bytes * _top_k * 4 * _scale
                 if _anchor_dev is not None and _routed > 0:
                     _routed = min(_routed, int(0.25 * sum(b for _n, b, _i, _a in units)))
                     placement = partition_flow_order(units, dev_objs, reserves={_anchor_dev: _routed})
                     logger.debug(
-                        "[stream-mapped] MoE routed buffers (%.1fGiB, top_k=%d) priced on %s; state rebalanced",
+                        "[stream-mapped] MoE routed buffers (%.1fGiB, top_k=%d, probe rows %d -> tune %d) "
+                        "priced on %s; state rebalanced",
                         _routed / 2**30,
                         _top_k,
+                        _probe_rows,
+                        _tune_rows,
                         _anchor_dev,
                     )
             placement = complete_container_params(placement, block)

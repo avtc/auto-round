@@ -587,10 +587,11 @@ class TestFlowProbeRoutedDetection:
         blk(torch.randn(4, 16))
         routed = [r for r in got if str(r[0]).startswith("__routed__:")]
         assert routed, f"no routed marker in {got}"
-        name, top_k, hidden_bytes = routed[0]
+        name, top_k, hidden_bytes, rows = routed[0]
         assert name == "__routed__:experts"
         assert top_k == 8
         assert hidden_bytes == 4 * 16 * 4  # fp32 default dtype numel x elemsize
+        assert rows == 4
 
     def test_plain_container_records_no_marker(self):
         import torch
