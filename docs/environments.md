@@ -238,6 +238,17 @@ export AR_SCHEME_MEM_INVENTORY=1
 ```bash
 export AR_STREAM_BG_PACK=0
 ```
+
+### AR_STREAM_TRACE_DEVICES
+
+- **Type**: bool (`1` / `0`; default unset)
+- **Description**: Streaming-quantization only. Debug tracing for streamed-block device placement, logged under the `[stream-align]` prefix: every cross-device tensor hop (one line per module per forward), per-block input device maps for the first 50 block forwards, and, on a placement-related `RuntimeError`, a dump of every module's weight device so a mismatched pair is named instead of guessed. The crash dump fires regardless of this variable.
+- **Usage**: Very verbose -- use for short reproductions of device-placement errors and unset once the placement is confirmed.
+
+```bash
+export AR_STREAM_TRACE_DEVICES=1
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **Description**: Controls whether `NVFP4E5M3QuantLinear` caches a dequantized high-precision weight after the first forward pass, instead of dequantizing the packed FP4 weight on every call.
 - **Default**: `False` (equivalent to `"0"`)

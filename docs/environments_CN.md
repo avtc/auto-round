@@ -239,6 +239,17 @@ export AR_SCHEME_MEM_INVENTORY=1
 ```bash
 export AR_STREAM_BG_PACK=0
 ```
+
+### AR_STREAM_TRACE_DEVICES
+
+- **类型**：布尔（`1` / `0`；默认未设置）
+- **描述**：仅用于流式量化。面向流式分块设备放置的调试跟踪，输出带 `[stream-align]` 前缀：每次跨设备张量搬运（每模块每次前向一行）、前 50 次分块前向的输入设备映射，以及放置相关 `RuntimeError` 发生时逐模块列出权重所在设备的崩溃转储，直接点名错配的设备对。崩溃转储不受该变量控制，始终输出。
+- **用途**：输出量很大——仅用于设备放置问题的短时复现，确认后请取消设置。
+
+```bash
+export AR_STREAM_TRACE_DEVICES=1
+```
+
 ### AR_NVFP4_E5M3_CACHE_HP_WEIGHT
 - **描述**：控制 `NVFP4E5M3QuantLinear` 是否在首次前向后缓存解量化得到的高精度权重，而不是每次调用都从打包的 FP4 权重重新解量化。
 - **默认值**：`False`（等价于 `"0"`）

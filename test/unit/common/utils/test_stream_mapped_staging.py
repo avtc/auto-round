@@ -546,3 +546,32 @@ class TestLocalSnapshot:
         monkeypatch.undo()
         assert str(params["a"]["v"].device) == "cpu"
         assert any("local snapshot" in r.getMessage() for r in caplog.records)
+
+
+def test_block_forward_crash_dump_fires_without_trace_env(monkeypatch, caplog):
+    """The crash device inventory is unconditional (fail-visible); only the
+    per-hop and input-map traces stay behind AR_STREAM_TRACE_DEVICES."""
+    import logging
+
+    from auto_round.compressors import utils as cu
+
+    monkeypatch.delenv("AR_STREAM_TRACE_DEVICES", raising=False)
+    monkeypatch.setattr(cu.logger, "propagate", True)
+
+    class _Broken(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(2, 2)
+
+        def forward(self, input_ids):
+            raise RuntimeError("synthetic device fault")
+
+    block = _Broken()
+    with caplog.at_level(logging.INFO, logger=cu.logger.name):
+        with pytest.raises(RuntimeError, match="synthetic device fault"):
+            cu.block_forward(
+                block, torch.zeros(1, 2, dtype=torch.long), {"input_ids": torch.zeros(1, 2, dtype=torch.long)}
+            )
+    assert "device dump on block fault" in caplog.text
+    assert "lin" in caplog.text  # per-module inventory lines are present
+    assert "forward #1 inputs" not in caplog.text  # input-map trace stays env-gated

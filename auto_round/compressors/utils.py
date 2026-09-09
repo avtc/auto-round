@@ -183,9 +183,9 @@ def rehome_block_(module: torch.nn.Module, device) -> int:
 def _dump_block_devices_(block, input_others) -> None:
     """Crash-time device inventory: which module sits where, and what the block was called with.
 
-    Fired from block_forward's exception path under AR_STREAM_TRACE_DEVICES so a
-    cross-device fault names the mismatched pair instead of leaving the block
-    interior a guessing game. One line per module: weight device, pinned target,
+    Fired unconditionally from block_forward's exception path so a cross-device
+    fault names the mismatched pair instead of leaving the block interior a
+    guessing game. One line per module: weight device, pinned target,
     wrapper output target, align-hook presence.
     """
     lines = ["[stream-align] ---- device dump on block fault ----"]
@@ -464,10 +464,9 @@ def block_forward(
         else:
             output = block(**input_others)
     except RuntimeError:
-        if _TRACE_HOPS is None:
-            _TRACE_HOPS = os.environ.get("AR_STREAM_TRACE_DEVICES", "").lower() in ("1", "true", "yes")
-        if _TRACE_HOPS:
-            _dump_block_devices_(block, input_others)
+        # fail-visible: the crash inventory fires unconditionally; only the
+        # per-hop and input-map traces stay behind AR_STREAM_TRACE_DEVICES
+        _dump_block_devices_(block, input_others)
         raise
     if isinstance(output_return_id, int) and (isinstance(output, list) or isinstance(output, tuple)):
         output = output[output_return_id]
