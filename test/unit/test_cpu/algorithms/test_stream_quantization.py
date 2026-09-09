@@ -1592,6 +1592,12 @@ class TestStreamQuantizeEquivalence:
         captured = capfd.readouterr()
         console = captured.out + captured.err
         assert "[stream] tuning checkpoint-only group model.layers.3" in console, "tree tune never started"
+        # the tree DERIVES ITS OWN placement (its layout signature differs
+        # from the regular blocks): one derive for the shared block layout,
+        # one for the tree - the base template only supplied the device list
+        assert (
+            console.count("derived placement from the reference forward") >= 2
+        ), "tree did not derive its own flow placement: " + str(console.count("derived placement"))
         assert "model.layers.3.eh_proj.qweight" in self._export_keys(arms["mapped"]), "tree not packed under mapped"
 
         t = {name: load_all(d) for name, d in arms.items()}
