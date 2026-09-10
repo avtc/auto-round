@@ -197,3 +197,69 @@ def test_oversized_tensor_does_not_leave_tiny_preceding_shard(tmp_path, monkeypa
 
     assert writer.shard_counter == 1
     assert set(writer.current_shard_tensors) == set()
+
+
+class _PackedLinear(torch.nn.Module):
+    """The packed form a previous process flushed for a quantized module."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("qweight", torch.zeros(8, dtype=torch.int32))
+        self.register_buffer("scales", torch.ones(2))
+
+
+class _StaleWrapperLinear(torch.nn.Module):
+    """Mimics a quant wrapper left on a resume-skipped module: carries the
+    `orig_layer` marker (kept out of state_dict) and exposes the fp weight
+    under the plain ``.weight`` name, like the real DataWrapper does."""
+
+    def __init__(self):
+        super().__init__()
+        inner = torch.nn.Linear(4, 4, bias=False)
+        self.__dict__["orig_layer"] = inner
+        self.weight = inner.weight
+
+
+class _ResumedModel(torch.nn.Module):
+
+    def __init__(self, linear):
+        super().__init__()
+        block = torch.nn.Module()
+        block.linear = linear
+        self.blocks = torch.nn.ModuleList([block])
+        self.embed = torch.nn.Linear(4, 4, bias=False)
+
+
+def test_finalize_drops_stale_wrapper_weights_of_resume_skipped_modules(tmp_path, monkeypatch):
+    """A resumed process never re-packs blocks its resume manifest marks done.
+    Their packed tensors already live in shards flushed by the interrupted
+    process, while the live model still holds the quant wrappers with their fp
+    ``.weight``. finalize() must NOT write those stale fp tensors -- otherwise
+    the artifact contains BOTH forms for the same module and a loader may
+    silently serve the unquantized fp layer."""
+    import glob
+
+    monkeypatch.delenv("AR_RESUME_DIR", raising=False)
+    # Process 1 (interrupted): flushed the PACKED form of blocks.0.linear.
+    prev = _ResumedModel(_PackedLinear())
+    writer1 = _make_writer(prev, str(tmp_path), monkeypatch)
+    writer1.save_module(prev.blocks[0].linear, name="blocks.0.linear")
+    writer1._flush_shard()
+    ShardWriter.reset()
+
+    # Process 2 (resumed): same output_dir; skipped module is still a wrapper
+    # with its real fp weight; a later block's write triggers shard discovery
+    # exactly like the real per-block loop does.
+    monkeypatch.setenv("AR_RESUME_DIR", str(tmp_path / "resume"))
+    model = _ResumedModel(_StaleWrapperLinear())
+    writer2 = _make_writer(model, str(tmp_path), monkeypatch)
+    writer2.save_module(model.embed, name="embed")
+    writer2._flush_shard()
+    writer2.write(None, is_finalize=True)
+
+    tensors = {}
+    for f in sorted(glob.glob(str(tmp_path / "*.bin"))):
+        tensors.update(torch.load(f, map_location="cpu"))
+    assert "blocks.0.linear.qweight" in tensors, "packed form from the old shard must be kept"
+    assert "blocks.0.linear.weight" not in tensors, "stale fp wrapper weight must be dropped"
+    assert "embed.weight" in tensors, "untouched modules must still be saved"

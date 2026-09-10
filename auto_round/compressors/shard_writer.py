@@ -379,17 +379,44 @@ class ShardWriter:
             tie_word_embeddings = self.model.config.tie_word_embeddings
 
         finalize_skipped_meta_tensors = []
+        # A resumed process never re-tunes or re-packs blocks its resume
+        # manifest marks done: those modules stay quant wrappers holding
+        # their fp weights in memory, while their packed tensors
+        # (qweight/qzeros/scales, written by the interrupted process) already
+        # live in the discovered shard files. Writing such a wrapper's stale
+        # fp ``.weight`` here would emit an artifact where the module has
+        # BOTH forms -- loaders may then prefer the fp tensor and silently
+        # serve an unquantized layer (seen on a resumed run: 318 modules with
+        # both ``.weight`` and ``.qweight``, a 47GB artifact instead of 18GB,
+        # and a 2.3x "improved" KL that was really 51/64 layers left in
+        # bf16). Exact-name dedup cannot catch this because the packed form
+        # lives under different tensor names.
+        saved_module_prefixes = {p.rsplit(".", 1)[0] for p in self._all_saved}
+        resume_dropped_wrapper_tensors = []
         for pname, tensor in full_sd.items():
             if pname in self._all_saved:
                 continue
             if tensor.device.type == "meta":
                 continue
             layer_name = ".".join(pname.split(".")[:-1])
+            module = get_module(self.model, layer_name)
+            if module is not None and hasattr(module, "orig_layer") and layer_name in saved_module_prefixes:
+                resume_dropped_wrapper_tensors.append(pname)
+                continue
             if self.lm_head_name is not None and layer_name == self.lm_head_name and tie_word_embeddings:
                 lm_head_module = get_module(self.model, self.lm_head_name)
                 lm_head_module.to("meta")  # Must to meta, otherwise model's saver will dump it again
                 continue
             self._add_tensor(pname, tensor.detach().to("cpu"))
+
+        if resume_dropped_wrapper_tensors:
+            logger.warning(
+                "ShardWriter.finalize: dropped %d stale fp tensor(s) from resume-skipped quant "
+                "wrapper module(s) whose packed tensors are already in previously-flushed shards "
+                "(e.g. %s); keeping only the packed form in the output.",
+                len(resume_dropped_wrapper_tensors),
+                resume_dropped_wrapper_tensors[:3],
+            )
 
         self._flush_shard()
 
