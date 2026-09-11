@@ -30,6 +30,7 @@ entries exist for stream/event placement when the CUDA-stream mechanics
 land; on CPU devices they carry no synchronization meaning.
 """
 
+import contextlib
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
 
@@ -191,3 +192,70 @@ class StageStreams:
         if not self._active:
             return
         self._events[(micro_batch, stage)].record(stream=self._streams[(micro_batch, stage)])
+
+
+@contextlib.contextmanager
+def device_stream_scope(devices, stream_factory=None):
+    """Yield per-device CUDA streams and make them current for the block.
+
+    Independent no-grad forwards enqueued back-to-back under this scope
+    pipeline across devices for free: every op lands on the current stream
+    of its tensors' device (PyTorch resolves op streams from input-tensor
+    devices), per-device streams are FIFO across chunks, and cross-device
+    copies synchronize their source/target streams internally (event-based,
+    handled by torch itself). One stream per device is shared by all chunks
+    -- the pipelining comes from enqueue order, not from per-chunk streams.
+
+    CPU devices have no streams; a CPU-only (or mixed) world only gets
+    streams for its CUDA devices, and a CPU-only world yields ``{}`` (the
+    caller stays on default streams = sequential execution, which is
+    already correct there).
+
+    ``stream_factory`` is injectable for tests.
+    """
+    import torch
+
+    cuda_devs = [d for d in devices if getattr(d, "type", "cpu") == "cuda"]
+    if not cuda_devs:
+        yield {}
+        return
+    real_streams = stream_factory is None
+    if stream_factory is None:
+        stream_factory = lambda d: torch.cuda.Stream(device=d)  # noqa: E731
+    streams = {d: stream_factory(d) for d in cuda_devs}
+    if not real_streams:
+        # injected (fake) streams: caller only inspects the mapping; entering
+        # real CUDA device/stream contexts would crash CUDA-less test builds
+        yield streams
+        return
+    cm_stack = contextlib.ExitStack()
+    try:
+        for dev, stream in streams.items():
+            cm_stack.enter_context(torch.cuda.device(dev))
+            cm_stack.enter_context(torch.cuda.stream(stream))
+        yield streams
+    finally:
+        cm_stack.close()
+
+
+def pipelined_nograd_forwards(forward_fn, chunks, devices):
+    """Run independent no-grad chunk forwards under the device stream scope.
+
+    The pre-tune fp-reference pass and the post-tune quantized cascade pass
+    walk the calibration pool in ``batch_size`` chunks (e.g. 16 chunked
+    [8, 2048] forwards for the default recipe). Each chunk is an
+    independent forward; enqueuing them back-to-back inside
+    :func:`device_stream_scope` overlaps device-resident segments across
+    chunks (utilization 1/K -> #chunks/(#chunks+K-1) at chunk granularity)
+    without splitting the block into stages or touching the align hooks.
+
+    Returns the per-chunk outputs in chunk order. On CPU devices this is a
+    plain sequential loop.
+    """
+    if not chunks:
+        raise ValueError("pipelined_nograd_forwards: no chunks to run")
+    import torch
+
+    with torch.no_grad(), device_stream_scope(devices) as _streams:
+        outputs = [forward_fn(chunk) for chunk in chunks]
+    return outputs

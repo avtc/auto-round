@@ -292,3 +292,78 @@ class TestStageStreams:
         assert len(losses) == 2
         ref = b(a(x)).pow(2).mean()
         assert abs(sum(l.item() for l in losses) - ref.item()) < 1e-5
+
+
+class TestPipelinedCollection:
+    """Chunk-granular no-grad collection pipelining (per-device streams)."""
+
+    def test_outputs_match_serial_loop(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.microbatch import pipelined_nograd_forwards
+
+        block = torch.nn.Linear(4, 4)
+        chunks = [torch.randn(2, 4) for _ in range(5)]
+        out = pipelined_nograd_forwards(lambda c: block(c), chunks, devices=[torch.device("cpu")])
+        ref = [block(c) for c in chunks]
+        for a, b in zip(out, ref):
+            assert torch.allclose(a, b)
+
+    def test_enqueue_order_is_chunk_order(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.microbatch import pipelined_nograd_forwards
+
+        order = []
+
+        def fn(c, _i):
+            order.append(_i)
+            return c
+
+        chunks = [(i, torch.randn(1, 2)) for i in range(4)]
+        outs = pipelined_nograd_forwards(lambda c: fn(c, c[0]), chunks, devices=[torch.device("cpu")])
+        assert order == [0, 1, 2, 3]
+        assert len(outs) == 4
+
+    def test_cpu_multi_device_degrades_to_sequential(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.microbatch import pipelined_nograd_forwards
+
+        devs = [torch.device("cpu", i) for i in range(3)]
+        block = torch.nn.Linear(2, 2)
+        chunks = [torch.randn(1, 2) for _ in range(3)]
+        outs = pipelined_nograd_forwards(lambda c: block(c), chunks, devices=devs)
+        assert all(torch.allclose(a, block(c)) for a, c in zip(outs, chunks))
+
+    def test_empty_chunks_raise(self):
+        import pytest
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.microbatch import pipelined_nograd_forwards
+
+        with pytest.raises(ValueError):
+            pipelined_nograd_forwards(lambda c: c, [], devices=[torch.device("cpu")])
+
+    def test_stream_scope_creates_streams_only_for_cuda(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.microbatch import device_stream_scope
+
+        # CPU-only world: scope is a no-op (no streams exist on CPU)
+        with device_stream_scope([torch.device("cpu")]) as streams:
+            assert streams is None or streams == {}
+
+        made = {}
+
+        class _FakeStream:
+            def __init__(self, dev):
+                self.dev = dev
+                made[dev] = self
+
+        with device_stream_scope(
+            [torch.device("cuda", 0), torch.device("cpu")], stream_factory=lambda d: _FakeStream(d)
+        ) as streams:
+            assert set(streams) == {torch.device("cuda", 0)}
+            assert isinstance(streams[torch.device("cuda", 0)], _FakeStream)
+        assert len(made) == 1
