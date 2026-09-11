@@ -50,6 +50,7 @@ state moves ONLY through pre-allocated, reused exchange buffers via
 """
 
 import copy
+import time as _time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -59,6 +60,10 @@ from auto_round.compressors.utils import _best_param_key_is_round as _is_round_k
 from auto_round.logger import logger
 
 _ZERO_PEER_ACCESS_LOGGED = False
+
+# per-phase wall accumulators for the [perf] tune-zero line; keyed per
+# group instance id so concurrent blocks (never in practice) stay separate
+_ZERO_PHASE_WALLS: dict = {}
 
 __all__ = ["ZeroReplicaGroup", "split_bounds", "is_zero_candidate"]
 
@@ -330,6 +335,13 @@ class ZeroReplicaGroup:
                 lo, hi = e.bounds[owner]
                 flat[lo:hi].copy_(self._v_shard[owner][e.uid])
 
+    @staticmethod
+    def _acc(phase: str, seconds: float, ident: int) -> None:
+        walls = _ZERO_PHASE_WALLS.setdefault(ident, {})
+        acc = walls.setdefault(phase, [0.0, 0])
+        acc[0] += seconds
+        acc[1] += 1
+
     def gather_stage(self, r: int, entries: List[_Entry]) -> None:
         """Pre-forward (and recompute) hook: refresh replica r's stages.
 
@@ -338,12 +350,17 @@ class ZeroReplicaGroup:
         are frozen while an iteration is in flight, so concurrent reads are
         safe and every replica stages identical values.
         """
+        _t0 = _time.perf_counter()
         for e in entries:
             stage = self._stages[r][tuple(e.param_by_replica[r].shape)]
             flat = stage.reshape(-1)
             for owner in range(self.world):
                 lo, hi = e.bounds[owner]
                 flat[lo:hi].copy_(self._v_shard[owner][e.uid])
+        # cuda copies enqueue async; attribute their completion honestly
+        if stage.is_cuda:
+            torch.cuda.synchronize(self.devices[r])
+        self._acc("gather", _time.perf_counter() - _t0, id(self))
 
     # ------------------------------------------------------------------ #
     # gradient deposit (post-accumulate hook) + reduce
@@ -351,6 +368,7 @@ class ZeroReplicaGroup:
     def deposit_grad(self, r: int, e: _Entry, grad: torch.Tensor) -> None:
         """Replica r deposits bf16 slices of a freshly finalized full grad
         into every owner's inbox slot and the hook frees the full grad."""
+        _t0 = _time.perf_counter()
         flat = grad.reshape(-1).detach()
         for owner in range(self.world):
             lo, hi = e.bounds[owner]
@@ -359,10 +377,17 @@ class ZeroReplicaGroup:
                 slot = torch.empty(hi - lo, dtype=torch.bfloat16, device=self.devices[owner])
                 self._inbox[owner][e.uid][r] = slot
             slot.copy_(flat[lo:hi].to(torch.bfloat16).to(self.devices[owner], non_blocking=False))
+        try:
+            if grad.is_cuda:
+                torch.cuda.synchronize(self.devices[r])
+        except Exception:  # pragma: no cover - cpu path
+            pass
+        self._acc("deposit", _time.perf_counter() - _t0, id(self))
 
     def reduce_inboxes(self) -> None:
         """After the backward join: each owner folds its bf16 inbox slots
         into its fp32 grad shard. Deterministic sum order (depositor index)."""
+        _t0 = _time.perf_counter()
         for owner in range(self.world):
             for e in self.entries:
                 acc = self._g_shard[owner][e.uid]
@@ -375,6 +400,7 @@ class ZeroReplicaGroup:
                 # grad (e.g. a skipped MoE expert) must contribute ZERO, not
                 # this iteration's deposits
                 self._inbox[owner][e.uid] = [None] * self.world
+        self._acc("reduce", _time.perf_counter() - _t0, id(self))
 
     def run_threaded(self, fns) -> None:
         """Same contract as ReplicaGroup.run_threaded: one callable per
@@ -474,6 +500,16 @@ class ZeroReplicaGroup:
                 lo, hi = e.bounds[owner]
                 flat[lo:hi].copy_(source[owner][e.uid].to(home_p.device))
             home_p.data = full
+        from auto_round import envs as _penvs
+
+        walls = _ZERO_PHASE_WALLS.pop(id(self), None)
+        if walls and _penvs.AR_PERF_COUNTERS:
+            parts = []
+            for phase in ("gather", "deposit", "reduce"):
+                acc = walls.get(phase)
+                if acc and acc[1]:
+                    parts.append(f"{phase}={1000 * acc[0]:.0f}ms/{1000 * acc[0] / acc[1]:.0f}ms(x{acc[1]})")
+            logger.info("[perf] tune-zero block: %s (total/mean per call)", " ".join(parts))
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
