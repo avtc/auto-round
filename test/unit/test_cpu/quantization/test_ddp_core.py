@@ -474,6 +474,39 @@ class TestBlockHasTuningEntries:
         assert block_has_tuning_entries(torch.nn.Sequential(RoundHolder())) is True
 
 
+class TestPerfTraceHelpers:
+    """AR_PERF_TRACE one-shot iteration profiler (diagnostic scaffolding)."""
+
+    def test_unset_and_valid_values(self, monkeypatch):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _perf_trace_iter
+
+        monkeypatch.delenv("AR_PERF_TRACE", raising=False)
+        assert _perf_trace_iter(50) is None
+        monkeypatch.setenv("AR_PERF_TRACE", "2")
+        assert _perf_trace_iter(50) == 2
+
+    def test_invalid_values_return_none(self, monkeypatch, caplog, _autoround_log_propagate):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _perf_trace_iter
+
+        monkeypatch.setenv("AR_PERF_TRACE", "abc")
+        assert _perf_trace_iter(50) is None
+        monkeypatch.setenv("AR_PERF_TRACE", "-1")
+        assert _perf_trace_iter(50) is None
+        monkeypatch.setenv("AR_PERF_TRACE", "50")
+        assert _perf_trace_iter(50) is None
+        assert any("AR_PERF_TRACE" in r.message for r in caplog.records)
+
+    def test_start_stop_exports_trace(self, monkeypatch, tmp_path):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _start_perf_trace, _stop_perf_trace
+
+        out = tmp_path / "trace.json"
+        monkeypatch.setenv("AR_PERF_TRACE_PATH", str(out))
+        prof = _start_perf_trace(0)
+        x = torch.ones(4, 4).sum()
+        _stop_perf_trace(prof, "unit-test")
+        assert out.exists() and out.stat().st_size > 0
+
+
 @pytest.fixture()
 def _autoround_log_propagate():
     """Temporarily enable propagation on the ``autoround`` logger so pytest's

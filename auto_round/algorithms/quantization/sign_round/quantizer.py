@@ -48,6 +48,54 @@ def _tune_phase_line(phases: dict, iters: int) -> str:
         phases.get("tail", 0.0),
     )
 
+def _perf_trace_iter(iters: int):
+    """One-shot iteration profiler: AR_PERF_TRACE=<iter index> captures that
+    tuning iteration (CPU+CUDA activities, python stacks) and exports a chrome
+    trace to AR_PERF_TRACE_PATH (default ``tune_trace.json``). Diagnostic only;
+    unset or out-of-range values are ignored with a warning."""
+    import os
+
+    raw = os.environ.get("AR_PERF_TRACE")
+    if raw is None:
+        return None
+    try:
+        idx = int(raw)
+    except ValueError:
+        logger.warning("[perf-trace] AR_PERF_TRACE=%r is not an int; ignoring", raw)
+        return None
+    if idx < 0 or idx >= max(iters, 1):
+        logger.warning("[perf-trace] AR_PERF_TRACE=%d outside [0, %d); ignoring", idx, max(iters, 1))
+        return None
+    return idx
+
+
+def _start_perf_trace(iter_idx: int):
+    import os
+
+    from torch.profiler import ProfilerActivity, profile
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+    prof = profile(activities=activities, with_stack=True)
+    prof.start()
+    path = os.environ.get("AR_PERF_TRACE_PATH") or "tune_trace.json"
+    prof._ar_trace_path = path
+    logger.info("[perf-trace] capturing iteration %d (python stacks on) -> %s", iter_idx, path)
+    return prof
+
+
+def _stop_perf_trace(prof, reason: str):
+    import os
+
+    prof.stop()
+    path = getattr(prof, "_ar_trace_path", None) or os.environ.get("AR_PERF_TRACE_PATH") or "tune_trace.json"
+    try:
+        prof.export_chrome_trace(path)
+        logger.info("[perf-trace] wrote %s (stopped at %s)", path, reason)
+    except Exception as e:  # pragma: no cover - export failure is fail-visible
+        logger.warning("[perf-trace] failed to export %s: %s", path, e)
+
 
 from auto_round.utils import (
     htcore,
@@ -699,7 +747,15 @@ class SignRoundQuantizer(BaseQuantizer):
         _tp["prepare"] = _ptime.perf_counter() - _t0
         _t0 = _ptime.perf_counter()  # loop
         try:
+            _trace_iter = _perf_trace_iter(self.iters)
+            _prof = None
             for i in range(self.iters):
+                if _prof is None and _trace_iter is not None and i == _trace_iter:
+                    _prof = _start_perf_trace(i)
+                elif _prof is not None:
+                    _stop_perf_trace(_prof, "next-iteration")
+                    _prof = None
+                    _trace_iter = None
                 if self.enable_alg_ext and self.scheme.data_type.endswith("dq"):
                     for n, m in block.named_modules():
                         m.cur_iter = i
@@ -870,6 +926,9 @@ class SignRoundQuantizer(BaseQuantizer):
         finally:
             _tp["loop"] = _ptime.perf_counter() - _t0
             _t0 = _ptime.perf_counter()  # tail
+
+            if _prof is not None:
+                _stop_perf_trace(_prof, "loop-exit")
             if replica_group is not None:
                 # engagement defines both; serial never enters this branch
                 _t0 = _ptime.perf_counter()
