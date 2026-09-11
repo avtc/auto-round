@@ -18,6 +18,7 @@ import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
+    AR_PERF_COUNTERS: bool = False
     AR_LOG_LEVEL: str = "INFO"
     AR_USE_MODELSCOPE: bool = "False"
     AR_MODEL_FREE_SHARD_PARALLELISM: Optional[int] = None
@@ -57,6 +58,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this is used for configuring the default logging level
     "AR_LOG_LEVEL": lambda: os.getenv("AR_LOG_LEVEL", "INFO").upper(),
     "AR_ENABLE_COMPILE_PACKING": lambda: os.getenv("AR_ENABLE_COMPILE_PACKING", "0").lower() in ("1", "true", "yes"),
+    # Emit [perf] phase-breakdown log lines (per-block load/tune/pack/write/clean/offload
+    # in the data-driven loop; per-block mirrors/warmup/fwd/bwd/exch/step/teardown for DDP tuning).
+    "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "0").lower() in ("1", "true", "yes"),
     "AR_USE_MODELSCOPE": lambda: os.getenv("AR_USE_MODELSCOPE", "False").lower() in ["1", "true"],
     "AR_WORK_SPACE": lambda: os.getenv("AR_WORK_SPACE", "ar_work_space").lower(),
     "AR_ENABLE_UNIFY_MOE_INPUT_SCALE": lambda: os.getenv("AR_ENABLE_UNIFY_MOE_INPUT_SCALE", "False").lower()
@@ -198,6 +202,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE": lambda: os.getenv("AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE", "1").lower()
     not in ("0", "false", "no", "off"),
     "AR_ALLOW_W8_ASYM": lambda: os.getenv("AR_ALLOW_W8_ASYM", "0").lower() in ("1", "true", "yes"),
+    # Single-process data-parallel SignRound tuning (in-process mirror replicas;
+    # distinct from the multi-process torchrun lane, with which it never coexists).
+    # World size: 1 (default, off) or a power-of-two replica count. Replicas hold
+    # full tune-state mirrors on the plan devices and draw disjoint calibration
+    # shards, so the effective batch matches the serial run's data coverage.
+    "AR_TUNE_DDP_WORLD": lambda: int(os.getenv("AR_TUNE_DDP_WORLD", "1") or 1),
+    # Optional explicit comma-separated replica devices (e.g. "0,1,2,3"); by default
+    # the plan picks from the visible CUDA devices with enough free VRAM.
+    "AR_TUNE_DDP_DEVICES": lambda: os.getenv("AR_TUNE_DDP_DEVICES", ""),
+    "AR_TUNE_DISABLE_P2P": lambda: os.getenv("AR_TUNE_DISABLE_P2P", "0").lower() in ("1", "true", "yes"),
 }
 
 
