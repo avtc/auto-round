@@ -179,7 +179,8 @@ export AR_TUNE_DDP_DEVICES=0,1,2,3
   so block tuning fits on GPUs where a full mirror does not. Round values are staged per module from
   the shards (checkpointed re-gather during backward), gradients reduce into per-owner shards, and the
   best-iteration snapshot is kept sharded; only bf16 weights plus one module's staged values are ever
-  resident per GPU. Requires `--parallel_quantization auto|N` (world >= 2).
+  resident per GPU. Requires `--parallel_quantization auto|N` (world >= 2) and `momentum=0`
+  (sign updates are elementwise).
 - **Default**: off (full-mirror replicas)
 - **Valid Values**: `1` to enable
 

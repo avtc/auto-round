@@ -477,3 +477,74 @@ class TestR1Regressions:
         assert group._hooks == []
         assert group._pool is None
         assert group.replicas == [block]
+
+
+class TestR2Regressions:
+    def test_world3_distinct_params_per_replica(self):
+        """R2-1 regression: each replica must bind its OWN param copy -- the
+        flat mirror map kept only the last mirror, so at world>=3 one mirror
+        tuned stale and another got duplicate deposit hooks."""
+        torch.manual_seed(5)
+        block = _ToyBlock(2)
+        group = ZeroReplicaGroup(block, _CpuPlan(3))
+        for e in group.entries:
+            ids = [id(p) for p in e.param_by_replica]
+            assert len(set(ids)) == group.world, f"{e.uid}: {ids}"
+            # exactly one deposit hook per replica param
+            for r in range(group.world):
+                p = e.param_by_replica[r]
+                hooks = getattr(p, "_post_accumulate_grad_hooks", None)
+                assert hooks is not None and len(hooks) == 1, (e.uid, r)
+        # every replica's stage tracks its own shards
+        with torch.no_grad():
+            group._v_shard[1][group.entries[0].uid].fill_(3.0)
+        group.replicas[1](torch.randn(2, 6))
+        e = group.entries[0]
+        stage = group._stages[1][tuple(e.param_by_replica[1].shape)].reshape(-1)
+        lo, hi = e.bounds[1]
+        assert torch.equal(stage[lo:hi], group._v_shard[1][e.uid])
+        group.teardown()
+
+    def test_engine_rejects_momentum(self):
+        block = _ToyBlock(1)
+        with pytest.raises(ValueError, match="momentum"):
+            ZeroReplicaGroup(block, _CpuPlan(2), momentum=0.9)
+
+    def test_collect_best_params_filters(self):
+        from auto_round.compressors.utils import collect_best_params
+
+        block = _ToyBlock(1)
+        out_all = collect_best_params(block)
+        out_round = collect_best_params(block, exclude_round=True)
+        out_mm = collect_best_params(block, exclude_minmax=True)
+        n = "layers.0"
+        assert set(out_all[n]) == {"v", "scale_max"}
+        assert set(out_round[n]) == {"scale_max"}
+        assert set(out_mm[n]) == {"v"}
+        assert collect_best_params(block, exclude_round=True, exclude_minmax=True) == {}
+
+    def test_shell_missing_attribute_raises(self):
+        block, group = _make_group()
+        shell = next(m for m in block.modules() if type(m).__name__ == "_ZeROShell")
+        with pytest.raises(AttributeError):
+            shell.definitely_not_a_real_attribute
+        group.teardown()
+
+    def test_sync_grads_geometry_mismatch_warns_and_skips(self):
+        block, group = _make_group()
+
+        def rep_step(r):
+            loss = torch.mean(group.replicas[r](torch.randn(3, 6)) ** 2)
+            loss.backward()
+
+        group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
+        minmax = _minmax_per_replica(group)
+        for ps in minmax:
+            for p in ps:
+                p.grad = torch.full_like(p, 1.0)
+        # hand in only ONE replica's list: geometry mismatch -> skip, grads untouched
+        group.sync_grads(minmax[:1])
+        for r, ps in enumerate(minmax):
+            for p in ps:
+                assert torch.allclose(p.grad, torch.full_like(p, 1.0))
+        group.teardown()

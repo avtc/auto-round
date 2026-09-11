@@ -55,6 +55,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from auto_round.compressors.utils import _best_param_key_is_round as _is_round_key
 from auto_round.logger import logger
 
 __all__ = ["ZeroReplicaGroup", "split_bounds", "is_zero_candidate"]
@@ -70,12 +71,6 @@ def split_bounds(numel: int, world: int) -> List[Tuple[int, int]]:
         bounds.append((start, start + size))
         start += size
     return bounds
-
-
-def _is_round_key(key: str) -> bool:
-    """Round (value) keys are everything the optimizer steps elementwise;
-    min/max keys are scale/zp and stay full-mirrored."""
-    return "min" not in key and "max" not in key
 
 
 def is_zero_candidate(module) -> bool:
@@ -171,9 +166,13 @@ class ZeroReplicaGroup:
     while this group is active.
     """
 
-    def __init__(self, block: nn.Module, plan):
+    def __init__(self, block: nn.Module, plan, momentum: Optional[float] = None):
         if plan.world < 2:
             raise ValueError("ZeRO-2-lite requires world >= 2")
+        if momentum is not None and float(momentum) != 0.0:
+            # shard-local sign updates are elementwise and carry no momentum
+            # buffers; silently dropping momentum would change the algorithm
+            raise ValueError(f"ZeRO-2-lite requires momentum=0, got {momentum}")
         self.plan = plan
         self.world = plan.world
         self.home = block
@@ -218,17 +217,19 @@ class ZeroReplicaGroup:
                 )
             self.mirrors.append(mirror)
 
-        # map home entries -> mirror params by (module_name, key)
-        mirror_params: Dict[Tuple[str, str], nn.Parameter] = {}
-        for m in self.mirrors:
+        # map home entries -> mirror params by (mirror index, module_name, key)
+        mirror_params: Dict[Tuple[int, str, str], nn.Parameter] = {}
+        for m_idx, m in enumerate(self.mirrors):
             for name, mod in m.named_modules():
                 params = getattr(mod, "params", None)
                 if isinstance(params, dict):
                     for key, p in params.items():
-                        mirror_params[(name, key)] = p
+                        mirror_params[(m_idx, name, key)] = p
         for e in self.entries:
             home_p = _param_by_entry(block, e)
-            e.param_by_replica = [home_p] + [mirror_params[(e.module_name, e.key)] for _ in self.mirrors]
+            e.param_by_replica = [home_p] + [
+                mirror_params[(m_idx, e.module_name, e.key)] for m_idx in range(len(self.mirrors))
+            ]
 
         # ---- persistent buffers ------------------------------------------
         # stage: per (replica, shape) full-size fp32, backs param.data
@@ -284,7 +285,7 @@ class ZeroReplicaGroup:
         self._pool = None
         self._teardown_done = False
         logger.info(
-            "[tune-zero] engaged: world=%d entries=%d sharded tune state ~= %.2f GiB/replica saved",
+            "[tune-zero] engaged: world=%d entries=%d (est. %.2f GiB fp32 tune state sharded per replica)",
             self.world,
             len(self.entries),
             sum(e.numel for e in self.entries) * 4 * (self.world - 1) / self.world / 2**30,
@@ -370,8 +371,10 @@ class ZeroReplicaGroup:
             _write_back_grads,
             halving_doubling_allreduce,
         )
+        from auto_round.utils.tune_profile import stage as _stage
 
-        self.reduce_inboxes()
+        with _stage(prof, "exchange"):
+            self.reduce_inboxes()
         round_ids = {id(p) for e in self.entries for p in e.param_by_replica}
         # one buffer PER REPLICA (params_per_replica is already per-replica);
         # concatenating them into one would corrupt the allreduce geometry
@@ -380,9 +383,10 @@ class ZeroReplicaGroup:
         if len(extra_per_replica) == self.world:
             bufs = _param_grad_buffers(extra_per_replica)
             if all(b is not None for b in bufs):
-                halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport="bf16")
-                for buf, ps in zip(bufs, extra_per_replica):
-                    _write_back_grads(buf, ps)
+                with _stage(prof, "exchange"):
+                    halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport="bf16")
+                    for buf, ps in zip(bufs, extra_per_replica):
+                        _write_back_grads(buf, ps)
         elif extra_per_replica:
             logger.warning(
                 "[tune-zero] skipping minmax exchange: got %d replica param lists, world=%d",
@@ -401,7 +405,7 @@ class ZeroReplicaGroup:
     # ------------------------------------------------------------------ #
     # step / capture / teardown
     # ------------------------------------------------------------------ #
-    def step(self, lr_by_param: Optional[Dict[int, float]] = None) -> None:
+    def step(self, lr_by_param: Dict[int, float]) -> None:
         """Shard-local SignRound update: v -= lr * sign(g).
 
         Elementwise for momentum 0 (the only supported regime);
@@ -409,7 +413,6 @@ class ZeroReplicaGroup:
         CURRENT lr (the scheduler decays it per iteration -- a build-time lr
         would freeze the schedule).
         """
-        lr_by_param = lr_by_param or {}
         with torch.no_grad():
             for owner in range(self.world):
                 for e in self.entries:
@@ -424,10 +427,6 @@ class ZeroReplicaGroup:
             for e in self.entries:
                 self._snap_shard[owner][e.uid].copy_(self._v_shard[owner][e.uid])
         self._captured = True
-
-    @property
-    def captured(self) -> bool:
-        return self._captured
 
     def teardown(self) -> None:
         """Scatter the final (best-captured, else last) shards into the home
@@ -457,6 +456,9 @@ class ZeroReplicaGroup:
             self._pool = None
         del self.mirrors[:]
         self.replicas = [self.home]  # replicas[0] retained; mirrors released
+        # exchange state is dead after the scatter; release the copies
+        self._g_shard = [dict() for _ in range(self.world)]
+        self._snap_shard = [dict() for _ in range(self.world)]
         self._stages = [dict() for _ in range(self.world)]
         self._inbox = [dict() for _ in range(self.world)]
 
