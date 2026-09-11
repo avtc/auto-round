@@ -466,12 +466,12 @@ class TestMicroBatchConfig:
 
         assert SignRoundConfig().micro_batch is None
 
-    def test_invalid_value_warns_and_disables(self, caplog):
+    def test_invalid_value_disables(self):
         from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 
-        cfg = SignRoundConfig(micro_batch=0)
-        assert cfg.micro_batch is None
-        assert any("micro_batch" in r.message for r in caplog.records) or True  # logger may not propagate here
+        assert SignRoundConfig(micro_batch=0).micro_batch is None
+        assert SignRoundConfig(micro_batch=-3).micro_batch is None
+        assert SignRoundConfig(micro_batch=2).micro_batch == 2
 
     def test_cli_arg_registered(self):
         # the declarative registry wires --micro_batch from the config class
@@ -575,3 +575,143 @@ class TestMicroBatchedBatchParity(unittest.TestCase):
         self.assertEqual(len(grads_mb), len(grads_serial))
         for gm, gs in zip(grads_mb, grads_serial):
             self.assertTrue(torch.allclose(gm, gs, atol=1e-6), "micro-batched grad != serial grad")
+
+
+class TestMicroBatchDeclineGuards:
+    """Loud decline paths: slice sums cannot reproduce the serial loss there."""
+
+    def _q(self, mb=2, **attrs):
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        class _Q(SignRoundQuantizer):
+            def __init__(self):
+                self.config = SimpleNamespace(micro_batch=mb)
+                for k, v in attrs.items():
+                    setattr(self, k, v)
+
+        return _Q()
+
+    def test_v2_contract_declines(self):
+        q = self._q(micro_batch_supported=False)
+        assert q._micro_batch_n(torch.arange(4)) is None
+
+    def test_gradient_accumulate_declines(self):
+        q = self._q(gradient_accumulate_steps=4)
+        assert q._micro_batch_n(torch.arange(4)) is None
+
+    def test_tuning_cache_declines(self):
+        q = self._q()
+        assert q._micro_batch_n(torch.arange(4), tuning_cache=object()) is None
+        assert q._micro_batch_n(torch.arange(4), tuning_cache=None) == 2
+
+    def test_lfq_last_block_declines(self):
+        from types import SimpleNamespace
+
+        q = self._q(enable_lfq=True)
+        last = SimpleNamespace(block_index=3, block_cnt=4)
+        mid = SimpleNamespace(block_index=1, block_cnt=4)
+        assert q._micro_batch_n(torch.arange(4), block_ctx=last) is None
+        assert q._micro_batch_n(torch.arange(4), block_ctx=mid) == 2
+
+    def test_v2_quantizer_class_opts_out(self):
+        from auto_round.algorithms.quantization.sign_roundv2.quantizer import SignRoundV2Quantizer
+
+        assert SignRoundV2Quantizer.micro_batch_supported is False
+
+
+class TestMicroBatchedMaskedParity(unittest.TestCase):
+    """Masked MSE parity: weighted slice means reproduce the serial loss."""
+
+    def test_masked_valid_token_par(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        torch.manual_seed(5)
+        block = torch.nn.Linear(4, 3)
+        n = 4
+        x = torch.randn(n, 5, 4)
+        ref = torch.randn(n, 5, 3)
+        # per-sample masks with DIFFERENT valid counts (the hard case)
+        vm = torch.ones(n, 1, 5)
+        vm[0, :, 3:] = 0
+        vm[1, :, 1:] = 0
+        vm[3, :, 4:] = 0
+
+        class _Q(SignRoundQuantizer):
+            def __init__(self):
+                self.config = SimpleNamespace(micro_batch=2)
+                self.enable_lfq = False
+
+            def _get_loss(self, pred, r, indices, loss_func, device="cpu", valid_token_mask=None, input_ids=None):
+                # mirror the base masked path: mean over FULL element count
+                m = torch.cat([valid_token_mask[int(i)] for i in indices], dim=0).unsqueeze(-1).to(pred.device)
+                return ((pred * m) - (r * m)).pow(2).mean()
+
+            def _scale_loss_and_backward(self, scaler, loss):
+                loss.backward()
+
+        class _Fwd:
+            def forward(self, block_, active_inputs, input_others, indices, cache_device=None):
+                return block_(torch.cat([active_inputs[int(i)] for i in indices], dim=0))
+
+        q = _Q()
+        got = q._tune_batch_micro_batched(
+            block=block,
+            indices=torch.arange(n),
+            active_inputs=[x[i : i + 1] for i in range(n)],
+            input_others={},
+            fp_outputs=[ref[i : i + 1] for i in range(n)],
+            input_ids=None,
+            tuning_cache=None,
+            block_fwd=_Fwd(),
+            mse_loss=None,
+            valid_token_mask=vm,
+            num_elm=int(vm.sum()),
+            scaler=None,
+            loss_device=None,
+            fwd_cache_device=None,
+            home_device="cpu",
+            block_ctx=SimpleNamespace(block_index=0, block_cnt=4),
+        )
+
+        # serial reference: same loss fn over the whole batch, /num_elm like the loop
+        serial_loss = q._get_loss(block(x), ref, torch.arange(n), None, "cpu", vm)
+        serial_contrib = serial_loss.item() / int(vm.sum())
+        self.assertAlmostEqual(got, serial_contrib, places=6)
+
+        # gradients: sum of weighted slice grads == serial grad
+        for p in block.parameters():
+            p.grad = None
+        q2 = _Q()
+        q2._tune_batch_micro_batched(
+            block=block,
+            indices=torch.arange(n),
+            active_inputs=[x[i : i + 1] for i in range(n)],
+            input_others={},
+            fp_outputs=[ref[i : i + 1] for i in range(n)],
+            input_ids=None,
+            tuning_cache=None,
+            block_fwd=_Fwd(),
+            mse_loss=None,
+            valid_token_mask=vm,
+            num_elm=int(vm.sum()),
+            scaler=None,
+            loss_device=None,
+            fwd_cache_device=None,
+            home_device="cpu",
+            block_ctx=SimpleNamespace(block_index=0, block_cnt=4),
+        )
+        block2 = torch.nn.Linear(4, 3)
+        block2.load_state_dict(block.state_dict())
+        # the serial loop backwards the UNDIVIDED batch loss (the /num_elm
+        # division is reporting-only), so the reference matches that exactly
+        q2._get_loss(block2(x), ref, torch.arange(n), None, "cpu", vm).backward()
+        for p, p2 in zip(block.parameters(), block2.parameters()):
+            assert torch.allclose(p.grad, p2.grad, atol=1e-6)

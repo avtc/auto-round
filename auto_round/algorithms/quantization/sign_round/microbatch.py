@@ -346,7 +346,9 @@ class DeviceStreamScope:
         self.devices = list(devices)
         cuda_devs = [d for d in self.devices if getattr(d, "type", "cpu") == "cuda"]
         self.streams = {}
-        if cuda_devs:
+        if len(cuda_devs) >= 2:
+            # a single CUDA device gains nothing from a side stream (no
+            # cross-device overlap to expose) and pays bridging overhead
             if stream_factory is None:
                 stream_factory = lambda d: torch.cuda.Stream(device=d)  # noqa: E731
             self.streams = {d: stream_factory(d) for d in cuda_devs}
@@ -361,8 +363,18 @@ class DeviceStreamScope:
         cm_stack = contextlib.ExitStack()
         try:
             for dev, stream in self.streams.items():
+                # bridge IN: work staged on the device's default stream before
+                # this call (input H2D copies, optimizer steps) must be visible
+                # to the scope stream before its kernels run
+                stream.wait_stream(torch.cuda.default_stream(dev))
                 cm_stack.enter_context(torch.cuda.device(dev))
                 cm_stack.enter_context(torch.cuda.stream(stream))
             yield self.streams
         finally:
+            for dev, stream in self.streams.items():
+                # bridge OUT: work enqueued on the scope stream must complete
+                # before anything the caller runs next on the default stream
+                # (parameter reads, .item()s, cache captures) -- otherwise the
+                # next consumer races the pipelined kernels
+                torch.cuda.default_stream(dev).wait_stream(stream)
             cm_stack.close()

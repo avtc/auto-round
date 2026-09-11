@@ -313,14 +313,49 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         return loss
 
-    def _micro_batch_n(self, indices) -> "int | None":
+    # Parity guards: micro-batching is only sound on loss paths whose
+    # per-slice weighted sums reproduce the whole-batch loss exactly.
+    # Subclasses with a different loss contract (outlier-supervised top-k,
+    # per-slice normalization) must opt out via this class attribute.
+    micro_batch_supported = True
+
+    def _micro_batch_n(self, indices, tuning_cache=None, block_ctx=None) -> "int | None":
         """Effective micro-batch count for one forward batch (``None`` = off).
 
         Values larger than the batch clamp to the batch size (one-sample
-        micro-batches); ``< 2`` after clamping stays serial.
+        micro-batches); ``< 2`` after clamping stays serial. Loudly declines
+        (``None`` + one-time warnings) on paths where slice sums cannot
+        reproduce the serial whole-batch loss exactly:
+
+        * quantizers whose loss contract differs (``micro_batch_supported``
+          is False, e.g. the SignRoundV2 outlier-supervised loss),
+        * ``gradient_accumulate_steps > 1`` (sum-reduction scaling differs),
+        * an active tuning cache (staged entries are whole-batch),
+        * the LFQ last-block branch (per-sample CE token counts differ, so
+          per-slice means cannot be reweighted by sample count alone).
         """
         mb = getattr(getattr(self, "config", None), "micro_batch", None)
         if not mb or int(mb) < 2:
+            return None
+        if not getattr(self, "micro_batch_supported", True):
+            logger.warning_once(
+                "micro_batch ignored: this quantizer's loss contract does not support micro-batching; staying serial"
+            )
+            return None
+        if getattr(self, "gradient_accumulate_steps", 1) > 1:
+            logger.warning_once(
+                "micro_batch ignored with gradient_accumulate_steps > 1 (sum-reduction parity); staying serial"
+            )
+            return None
+        if tuning_cache is not None:
+            logger.warning_once("micro_batch ignored with an active tuning cache; staying serial")
+            return None
+        if (
+            block_ctx is not None
+            and getattr(self, "enable_lfq", False)
+            and block_ctx.block_index == block_ctx.block_cnt - 1
+        ):
+            logger.warning_once("micro_batch ignored on the LFQ last block (CE parity); staying serial")
             return None
         mb = min(int(mb), len(indices))
         return mb if mb >= 2 else None
@@ -360,6 +395,10 @@ class SignRoundQuantizer(BaseQuantizer):
         """
         from auto_round.algorithms.quantization.sign_round.microbatch import DeviceStreamScope
 
+        logger.warning_once(
+            "micro-batching engaged: all micro-batch graphs are retained until the backward "
+            "phase, so mid-iteration memory clearing is skipped on this path"
+        )
         mb = self._micro_batch_n(indices)
         n = len(indices)
         slices = [indices[k * n // mb : (k + 1) * n // mb] for k in range(mb)]
@@ -388,9 +427,9 @@ class SignRoundQuantizer(BaseQuantizer):
                 ):
                     loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in sl], dim=0))
                 else:
-                    loss = self._get_loss(
-                        pred_output, ref_output, sl, mse_loss, home_device, valid_token_mask, input_ids
-                    )
+                    # same positional shape as the serial call site (SignRoundV2's
+                    # _get_loss override does not take input_ids)
+                    loss = self._get_loss(pred_output, ref_output, sl, mse_loss, home_device, valid_token_mask)
                 graphs.append(loss * (len(sl) / n))
             for scaled in graphs:
                 self._scale_loss_and_backward(scaler, scaled)
@@ -596,7 +635,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
-                    if self._micro_batch_n(indices) is not None:
+                    if self._micro_batch_n(indices, tuning_cache, block_ctx) is not None:
                         total_loss += self._tune_batch_micro_batched(
                             block,
                             indices,
