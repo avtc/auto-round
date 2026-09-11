@@ -548,3 +548,9 @@ class TestR2Regressions:
             for p in ps:
                 assert torch.allclose(p.grad, torch.full_like(p, 1.0))
         group.teardown()
+
+
+class TestR3:
+    def test_flat_single_wrapper_block_rejected(self):
+        with pytest.raises(ValueError, match="container block"):
+            ZeroReplicaGroup(_ToyLinear(), _CpuPlan(2))

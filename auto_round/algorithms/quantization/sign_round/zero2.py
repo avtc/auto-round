@@ -178,6 +178,12 @@ class ZeroReplicaGroup:
         self.home = block
         self.devices = [d for d in plan.devices]
 
+        if hasattr(block, "orig_layer"):
+            # a bare wrapped layer as the block root: entry collection and the
+            # shell walk both assume a container block; fail loud instead of
+            # the raw AttributeError the walk would raise later
+            raise ValueError("ZeRO-2-lite expects a container block (block_name_to_quantize), not a bare layer")
+
         # ---- collect round entries from the home tree -------------------
         self.entries: List[_Entry] = []
         for name, mod in block.named_modules():

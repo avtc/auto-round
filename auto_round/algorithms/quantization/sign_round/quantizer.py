@@ -926,7 +926,11 @@ class SignRoundQuantizer(BaseQuantizer):
             # gone so unwrapper_block sees every key it expects
             _round_best = collect_best_params(block, self.compress_context.cache_device, exclude_minmax=True)
             for _n, _kv in _round_best.items():
+                if not isinstance(_kv, dict):  # flat single-wrapper shape
+                    continue
                 _dst = best_params.setdefault(_n, {})
+                if not isinstance(_dst, dict):
+                    continue
                 for _k, _t in _kv.items():
                     _dst[_k] = _t
         with torch.no_grad():
