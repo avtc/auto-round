@@ -28,11 +28,21 @@ micro-batch; backwards therefore run at graph level, in the micro-batch
 order the plan's backward phase visits. The (micro-batch, stage) backward
 entries exist for stream/event placement when the CUDA-stream mechanics
 land; on CPU devices they carry no synchronization meaning.
+
+Production wiring today: ``DeviceStreamScope`` is the only class the
+quantizer and calibration loop consume (the tune loop's phase-split lives
+in ``_tune_batch_micro_batched`` because whole-block forwards have no
+stage-callable decomposition). The plans, driver, slicer, and collection
+runner here are the tested foundation for that integration and for
+stage-granular stream placement; they carry the schedule contracts
+(grad parity, one-step semantics, stash bounds) as CPU-tier unit tests.
 """
 
 import contextlib
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
+
+import torch
 
 
 @dataclass
@@ -103,7 +113,7 @@ class GPipeDriver:
         microbatches: Sequence,
         loss_fn: Callable,
         on_step: Optional[Callable] = None,
-    ) -> List["torch.Tensor"]:  # noqa: F821 - torch typed lazily for CPU-only tests
+    ) -> List[torch.Tensor]:
         current = {mb: None for mb in range(len(microbatches))}
         losses = [None] * len(microbatches)
         done = set()
@@ -124,8 +134,6 @@ class GPipeDriver:
             done.add(mb)
 
         if self.schedule == "1f1b":
-            from auto_round.algorithms.quantization.sign_round.microbatch import plan_1f1b
-
             ops = plan_1f1b(len(microbatches), len(self.stages))
             for kind, mb, stage in ops:
                 if kind == "fwd":
@@ -196,7 +204,6 @@ class StageStreams:
         self._streams = {}
         self._events = {}
         self._active = True
-        import torch
 
         if stream_factory is None or event_factory is None:
             if not all(getattr(d, "type", "cpu") == "cuda" for d in self.devices):
@@ -242,8 +249,6 @@ def device_stream_scope(devices, stream_factory=None):
 
     ``stream_factory`` is injectable for tests.
     """
-    import torch
-
     cuda_devs = [d for d in devices if getattr(d, "type", "cpu") == "cuda"]
     if not cuda_devs:
         yield {}
@@ -341,7 +346,6 @@ class DeviceStreamScope:
     """
 
     def __init__(self, devices, stream_factory=None):
-        import torch
 
         self.devices = list(devices)
         cuda_devs = [d for d in self.devices if getattr(d, "type", "cpu") == "cuda"]
@@ -355,7 +359,6 @@ class DeviceStreamScope:
 
     @contextlib.contextmanager
     def context(self):
-        import torch
 
         if not self.streams:
             yield {}

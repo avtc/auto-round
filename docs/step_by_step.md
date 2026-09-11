@@ -863,7 +863,7 @@ off by default. On MoE blocks with large expert loops N=4 is the practical
 sweet spot (Python enqueue overhead grows ~2x from N=4 to N=8).
 
 ~~~bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A16"     --device_map "auto" --micro_batch 4
+CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A16" --device_map "auto" --micro_batch 4
 ~~~
 
 There are typically two scenarios that require multi-GPU tuning: one is the calibration phase mainly for lm-head quantization, and the other is quantizing extremely large models (e.g., models larger than 100 GB).

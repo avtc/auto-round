@@ -1,4 +1,4 @@
-# coding=utf-8 -*-
+# coding=utf-8
 # Copyright 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,8 +6,7 @@
 
 The scheduler splits one tuning iteration's forward batch on the sample
 dimension into M micro-batches and pipelines them across the K device-mapped
-stages of a block. Contract under test (design doc
-.featyard/design/02-microbatch-pipeline.md):
+stages of a block. Contract under test (the micro-batch pipeline design):
 
 * gradients of the summed per-micro-batch losses equal the whole-batch serial
   gradients (autograd is additive across micro-batches),
@@ -134,10 +133,6 @@ class TestGPipeGradParity(unittest.TestCase):
         # both micro-batches went through both stages in order
         self.assertEqual(calls.count(("s0", "2")), 2)
         self.assertEqual(calls.count(("s1", "2")), 2)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestBatchDimSlicing:
@@ -715,3 +710,7 @@ class TestMicroBatchedMaskedParity(unittest.TestCase):
         q2._get_loss(block2(x), ref, torch.arange(n), None, "cpu", vm).backward()
         for p, p2 in zip(block.parameters(), block2.parameters()):
             assert torch.allclose(p.grad, p2.grad, atol=1e-6)
+
+
+if __name__ == "__main__":
+    unittest.main()
