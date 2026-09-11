@@ -556,6 +556,36 @@ class TestR3:
             ZeroReplicaGroup(_ToyLinear(), _CpuPlan(2))
 
 
+class TestBlockHasTuningEntries:
+    """Shared DDP decline check: all-float blocks, minmax-only blocks."""
+
+    def test_plain_block_has_no_entries(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import block_has_tuning_entries
+
+        assert block_has_tuning_entries(torch.nn.Sequential(torch.nn.Linear(8, 8))) is False
+
+    def test_minmax_only_block_counts_as_tunable(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import block_has_tuning_entries
+
+        class MinmaxOnly(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.params = {"wmax": nn.Parameter(torch.ones(1))}
+
+        # full-mirror can still tune minmax params; only the zero lane declines
+        assert block_has_tuning_entries(torch.nn.Sequential(MinmaxOnly())) is True
+
+    def test_round_block_counts(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import block_has_tuning_entries
+
+        class RoundHolder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.params = {"v": nn.Parameter(torch.ones(4))}
+
+        assert block_has_tuning_entries(torch.nn.Sequential(RoundHolder())) is True
+
+
 class TestBlockHasRoundEntries:
     """All-float pinned / minmax-only blocks must be detectable before engagement."""
 

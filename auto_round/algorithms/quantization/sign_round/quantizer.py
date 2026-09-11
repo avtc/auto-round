@@ -499,7 +499,6 @@ class SignRoundQuantizer(BaseQuantizer):
                         "(minmax-only); tuning on the serial path"
                     )
                     _dp_eligible = False
-                _dp_eligible = False
         replica_group = None
         _zero = False
         if _dp_eligible:
