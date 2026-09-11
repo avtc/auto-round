@@ -58,6 +58,8 @@ import torch.nn as nn
 from auto_round.compressors.utils import _best_param_key_is_round as _is_round_key
 from auto_round.logger import logger
 
+_ZERO_PEER_ACCESS_LOGGED = False
+
 __all__ = ["ZeroReplicaGroup", "split_bounds", "is_zero_candidate"]
 
 
@@ -208,7 +210,26 @@ class ZeroReplicaGroup:
         from auto_round.algorithms.quantization.sign_round.data_parallel import (
             _enforce_mirror_device_,
             _relocate_params,
+            enable_peer_access,
         )
+
+        # the per-iteration stage gathers and grad deposits move ~2x the tune
+        # state across devices; without explicit peer access every copy stages
+        # through host memory (~3-4 GB/s instead of 13-26 GB/s measured P2P),
+        # which dominated the first real run (30-40% GPU util, ~2.8x the
+        # full-mirror lane's wall). One global pair-enable, like the
+        # full-mirror group does.
+        global _ZERO_PEER_ACCESS_LOGGED
+        if not _ZERO_PEER_ACCESS_LOGGED and any(d.type == "cuda" for d in self.devices):
+            _ZERO_PEER_ACCESS_LOGGED = True
+            pairs = enable_peer_access(self.devices)
+            if pairs:
+                logger.info("[tune-zero] P2P peer access enabled for %d pair(s)", len(pairs))
+            else:
+                logger.info(
+                    "[tune-zero] P2P peer access NOT enabled (no accessible pairs); "
+                    "gathers/deposits may stage through host memory"
+                )
 
         self.mirrors: List[nn.Module] = []
         for d in self.devices[1:]:
