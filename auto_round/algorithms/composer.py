@@ -46,6 +46,29 @@ from auto_round.logger import logger
 from auto_round.utils import clear_memory
 from auto_round.utils.device_manager import device_manager
 
+
+def _apply_compile_force(blockers: list, quantizer_name: str) -> list:
+    """Apply the AR_TUNE_COMPILE_FORCE experimental bypass (see composer init).
+
+    Removes ONLY the quantizer's own blanket veto from ``blockers``; structural
+    vetoes (preprocessors, rotations) are preserved. Returns the (possibly
+    unchanged) list.
+    """
+    import os
+
+    if not os.environ.get("AR_TUNE_COMPILE_FORCE"):
+        return blockers
+    if quantizer_name in blockers:
+        blockers = [b for b in blockers if b != quantizer_name]
+        logger.warning(
+            "AR_TUNE_COMPILE_FORCE=1: bypassing the %s compile veto (experiment); "
+            "dynamo errors will propagate verbatim; run with "
+            "TORCH_LOGS=graph_breaks to enumerate graph breaks",
+            quantizer_name,
+        )
+    return blockers
+
+
 if TYPE_CHECKING:  # avoid circular imports at runtime
     from auto_round.algorithms.quantization.base import BaseQuantizer
     from auto_round.algorithms.quantization.config import QuantizationConfig
@@ -193,6 +216,12 @@ class AlgorithmComposer:
             for component in [*self.preprocessors, *rotation_configs]:
                 if not getattr(component, "can_compile_block_forward", lambda: True)():
                     blockers.append(type(component).__name__)
+            # AR_TUNE_COMPILE_FORCE=1: experimental bypass of the quantizer's
+            # OWN blanket veto (SignRoundV2Quantizer's returns False
+            # unconditionally). Dynamo errors propagate verbatim; run with
+            # TORCH_LOGS=graph_breaks to enumerate graph breaks. Structural
+            # vetoes (preprocessors, rotations, NVFP4) are never bypassed.
+            blockers = _apply_compile_force(blockers, type(self.block_quantizer).__name__)
             can_compile_block_forward = user_torch_compile and not blockers
             if user_torch_compile and blockers:
                 logger.info(

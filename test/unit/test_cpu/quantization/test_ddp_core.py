@@ -474,6 +474,30 @@ class TestBlockHasTuningEntries:
         assert block_has_tuning_entries(torch.nn.Sequential(RoundHolder())) is True
 
 
+class TestCompileForceBypass:
+    """AR_TUNE_COMPILE_FORCE bypasses only the quantizer's blanket compile veto."""
+
+    def test_noop_when_unset(self, monkeypatch):
+        from auto_round.algorithms.composer import _apply_compile_force
+
+        monkeypatch.delenv("AR_TUNE_COMPILE_FORCE", raising=False)
+        assert _apply_compile_force(["SignRoundV2Quantizer"], "SignRoundV2Quantizer") == ["SignRoundV2Quantizer"]
+
+    def test_removes_only_quantizer_veto(self, monkeypatch, caplog, _autoround_log_propagate):
+        from auto_round.algorithms.composer import _apply_compile_force
+
+        monkeypatch.setenv("AR_TUNE_COMPILE_FORCE", "1")
+        out = _apply_compile_force(["SignRoundV2Quantizer", "SomeRotation"], "SignRoundV2Quantizer")
+        assert out == ["SomeRotation"]
+        assert any("bypassing the SignRoundV2Quantizer compile veto" in r.message for r in caplog.records)
+
+    def test_set_with_no_quantizer_blocker_is_noop(self, monkeypatch):
+        from auto_round.algorithms.composer import _apply_compile_force
+
+        monkeypatch.setenv("AR_TUNE_COMPILE_FORCE", "1")
+        assert _apply_compile_force(["SomeRotation"], "SignRoundV2Quantizer") == ["SomeRotation"]
+
+
 class TestPerfTraceHelpers:
     """AR_PERF_TRACE one-shot iteration profiler (diagnostic scaffolding)."""
 
