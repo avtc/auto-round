@@ -173,6 +173,19 @@ export AR_TUNE_DDP_DEVICES=0,1,2,3
   where peer access misbehaves.
 - **Default**: off (P2P enabled when available)
 - **Valid Values**: `1`/`true`/`yes`
+### AR_TUNE_ZERO_LITE
+- **Description**: Experimental. Shards the fp32 tune state (rounding values, gradients, best-MSE
+  snapshots) across the `--parallel_quantization` replica group while bf16 block weights stay mirrored,
+  so block tuning fits on GPUs where a full mirror does not. Round values are staged per module from
+  the shards (checkpointed re-gather during backward), gradients reduce into per-owner shards, and the
+  best-iteration snapshot is kept sharded; only bf16 weights plus one module's staged values are ever
+  resident per GPU. Requires `--parallel_quantization auto|N` (world >= 2).
+- **Default**: off (full-mirror replicas)
+- **Valid Values**: `1` to enable
+
+```bash
+export AR_TUNE_ZERO_LITE=1
+```
 
 ### AR_AUTO_SCHEME_NSAMPLES
 - **Description**: Controls the default number of calibration samples used by AutoScheme scoring when `AutoScheme.nsamples` is not explicitly set.

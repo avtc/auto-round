@@ -255,18 +255,41 @@ def check_need_act_calibration(
     return False
 
 
-def collect_best_params(block, cache_device="cpu"):
-    """Collect the best parameters from the block to the specified device."""
+def _best_param_key_is_round(key):
+    """Round (value) keys are everything but min/max scale keys."""
+    return "min" not in key and "max" not in key
+
+
+def collect_best_params(block, cache_device="cpu", exclude_round=False, exclude_minmax=False):
+    """Collect the best parameters from the block to the specified device.
+
+    ``exclude_round``/``exclude_minmax`` skip value (``v``/``bias_v``) or
+    scale/zp keys respectively -- the ZeRO-2-lite lane snapshots round values
+    in shards (its stage-backed params only hold transient per-module values)
+    and collects them once after teardown.
+    """
+    if exclude_round and exclude_minmax:
+        return {}
     params = {}
+
+    def _keep(key):
+        if exclude_round and _best_param_key_is_round(key):
+            return False
+        if exclude_minmax and not _best_param_key_is_round(key):
+            return False
+        return True
+
     if hasattr(block, "orig_layer"):
         for key in block.params.keys():
-            params[key] = block.params[key].data.to(cache_device, copy=True)
+            if _keep(key):
+                params[key] = block.params[key].data.to(cache_device, copy=True)
     else:
         for n, m in block.named_modules():
             if hasattr(m, "orig_layer"):
                 params[n] = {}
                 for key in m.params.keys():
-                    params[n][key] = m.params[key].data.to(cache_device, copy=True)
+                    if _keep(key):
+                        params[n][key] = m.params[key].data.to(cache_device, copy=True)
     return params
 
 

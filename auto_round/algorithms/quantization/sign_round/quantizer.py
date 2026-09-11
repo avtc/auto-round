@@ -441,6 +441,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 logger.info("[tune-ddp] declining: no tuning parameters in this block (all-float pinned); serial path")
                 _dp_eligible = False
         replica_group = None
+        _zero = False
         if _dp_eligible:
             from auto_round.algorithms.quantization.sign_round.data_parallel import (
                 ReplicaGroup,
@@ -459,7 +460,18 @@ class SignRoundQuantizer(BaseQuantizer):
             import time as _ptime
 
             _t0 = _ptime.perf_counter()
-            replica_group = ReplicaGroup(block, _plan)
+            if _envs.AR_TUNE_ZERO_LITE:
+                from auto_round.algorithms.quantization.sign_round.zero2 import ZeroReplicaGroup
+
+                try:
+                    replica_group = ZeroReplicaGroup(block, _plan)
+                except (ValueError, RuntimeError) as _zero_err:
+                    # fail visible: ZeRO was explicitly requested; continuing
+                    # with full mirrors would silently exceed the memory the
+                    # user planned around
+                    raise RuntimeError(f"[tune-zero] ZeRO-2-lite engagement failed: {_zero_err}") from _zero_err
+            else:
+                replica_group = ReplicaGroup(block, _plan)
             _ddp_perf = {
                 "build": _ptime.perf_counter() - _t0,
                 "warm": 0.0,
@@ -577,11 +589,19 @@ class SignRoundQuantizer(BaseQuantizer):
             _dp_samplers = shard_samplers(nsamples, replica_group.world, global_batch_size // replica_group.world)
         if _dp_eligible and replica_group is not None:
             # mirror-side optimizers replicate the home group structure
+            _zero = bool(getattr(_envs, "AR_TUNE_ZERO_LITE", False)) and replica_group is not None
             for mirror in replica_group.mirrors:
                 r_ps, m_ps, r_gr, m_gr = _collect_tuning_params(mirror)
-                m_params = [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in r_gr.items()]
+                if _zero:
+                    # round leaves are hook-managed by the ZeRO engine and
+                    # never carry grads past their deposit hook
+                    m_params = []
+                else:
+                    m_params = [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in r_gr.items()]
                 if self.enable_minmax_tuning:
                     m_params += [{"params": ps, "lr": torch.tensor(g_lr)} for g_lr, ps in m_gr.items()]
+                if not m_params:
+                    continue
                 m_opt = self.optimizer(m_params, lr=lr, weight_decay=0, **extra_kwargs)
                 m_sched = (
                     torch.optim.lr_scheduler.LinearLR(m_opt, start_factor=1.0, end_factor=0.0, total_iters=self.iters)
@@ -619,6 +639,8 @@ class SignRoundQuantizer(BaseQuantizer):
                 _ddp_perf["warm"] = _ptime.perf_counter() - _t0
                 for _opt in [optimizer] + mirror_optimizers:
                     _opt.zero_grad()
+                if _zero:
+                    replica_group.reset_exchange()
             except Exception as _warm_err:  # noqa: BLE001 - re-raised with context
                 try:  # fail-visible: tensor-device census + hook inventory per replica
                     for _ri, _rep in enumerate(replica_group.replicas):
@@ -787,10 +809,22 @@ class SignRoundQuantizer(BaseQuantizer):
                 if total_loss < best_loss:
                     best_loss = total_loss
                     if not self.not_use_best_mse:
-                        best_params = collect_best_params(block, self.compress_context.cache_device)
+                        if _zero:
+                            # stage-backed round leaves only hold transient
+                            # per-module values; round bests live in the shards
+                            best_params = collect_best_params(
+                                block, self.compress_context.cache_device, exclude_round=True
+                            )
+                            replica_group.capture_best()
+                        else:
+                            best_params = collect_best_params(block, self.compress_context.cache_device)
                         last_best_iter = i
                 if self.not_use_best_mse and i == self.iters - 1:
-                    best_params = collect_best_params(block, self.compress_context.cache_device)
+                    if _zero:
+                        best_params = collect_best_params(block, self.compress_context.cache_device, exclude_round=True)
+                        replica_group.capture_best()
+                    else:
+                        best_params = collect_best_params(block, self.compress_context.cache_device)
 
                 if not self.not_use_best_mse:
                     if 0 < self.dynamic_max_gap <= i - last_best_iter:
@@ -805,13 +839,29 @@ class SignRoundQuantizer(BaseQuantizer):
                         sched.step()
 
                     _t0 = _ptime.perf_counter()
-                    replica_group.run_threaded(
-                        [lambda: self._step(scaler, optimizer, lr_schedule)]
-                        + [
-                            lambda oo=opt, ss=sch: _mirror_step(oo, ss)
-                            for opt, sch in zip(mirror_optimizers, mirror_schedules)
-                        ]
-                    )
+                    if _zero:
+                        # round values step shard-locally with the CURRENT
+                        # per-group lr (the scheduler advances it below)
+                        _lr_now = {}
+                        for _g in optimizer.param_groups:
+                            for _p in _g["params"]:
+                                _lr_now[id(_p)] = float(_g["lr"])
+                        replica_group.run_threaded(
+                            [lambda: self._step(scaler, optimizer, lr_schedule)]
+                            + [
+                                lambda oo=opt, ss=sch: _mirror_step(oo, ss)
+                                for opt, sch in zip(mirror_optimizers, mirror_schedules)
+                            ]
+                        )
+                        replica_group.step(_lr_now)
+                    else:
+                        replica_group.run_threaded(
+                            [lambda: self._step(scaler, optimizer, lr_schedule)]
+                            + [
+                                lambda oo=opt, ss=sch: _mirror_step(oo, ss)
+                                for opt, sch in zip(mirror_optimizers, mirror_schedules)
+                            ]
+                        )
                     _ddp_perf["step"].append(_ptime.perf_counter() - _t0)
                 else:
                     sync_gradients()
@@ -870,6 +920,15 @@ class SignRoundQuantizer(BaseQuantizer):
         self.compress_context.clear_memory()  # clear cached memory during training
         if len(unquantized_layer_names) != 0:
             logger.info(f"Unquantized layers: {unquantized_layer_names}")
+        if _zero and best_params:
+            # teardown already scattered the best-captured round shards into
+            # the home wrapper params; collect them now that the stages are
+            # gone so unwrapper_block sees every key it expects
+            _round_best = collect_best_params(block, self.compress_context.cache_device, exclude_minmax=True)
+            for _n, _kv in _round_best.items():
+                _dst = best_params.setdefault(_n, {})
+                for _k, _t in _kv.items():
+                    _dst[_k] = _t
         with torch.no_grad():
             unwrapper_block(block, best_params)
 

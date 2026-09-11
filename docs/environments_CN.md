@@ -171,6 +171,18 @@ export AR_TUNE_DDP_DEVICES=0,1,2,3
   或在 P2P 使能导致问题的机器上排查问题。
 - **默认值**：关闭（启用 P2P）
 - **有效值**：`1`/`true`/`yes`
+### AR_TUNE_ZERO_LITE
+- **描述**：实验特性。将 fp32 调参状态（rounding 值、梯度、best-MSE 快照）分片到
+  `--parallel_quantization` 的副本组，而 bf16 块权重仍然全量镜像，从而在完整镜像放不下的 GPU
+  上也能进行块调参。rounding 值按模块从分片现场汇聚（backward 期间以 checkpoint 方式重新汇聚），
+  梯度归约到各属主的分片，best 迭代快照也保持分片；每块 GPU 上任一时刻只驻留 bf16 权重和单个
+  模块的汇聚值。需要 `--parallel_quantization auto|N`（world >= 2）。
+- **默认值**：关闭（完整镜像副本）
+- **取值**：`1` 启用
+
+```bash
+export AR_TUNE_ZERO_LITE=1
+```
 
 ### AR_AUTO_SCHEME_NSAMPLES
 - **描述**：控制 AutoScheme 评分时使用的校准样本数默认值，仅在 `AutoScheme.nsamples` 未显式设置时生效。

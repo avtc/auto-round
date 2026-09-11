@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     AR_PERF_COUNTERS: bool = False
+    AR_TUNE_ZERO_LITE: bool = False
     AR_LOG_LEVEL: str = "INFO"
     AR_USE_MODELSCOPE: bool = "False"
     AR_MODEL_FREE_SHARD_PARALLELISM: Optional[int] = None
@@ -212,6 +213,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the plan picks from the visible CUDA devices with enough free VRAM.
     "AR_TUNE_DDP_DEVICES": lambda: os.getenv("AR_TUNE_DDP_DEVICES", ""),
     "AR_TUNE_DISABLE_P2P": lambda: os.getenv("AR_TUNE_DISABLE_P2P", "0").lower() in ("1", "true", "yes"),
+    # ZeRO-2-lite tune-state sharding for --parallel_quantization tuning:
+    # shards fp32 round values/grads/snapshots across the replica group so
+    # block tuning fits when a full mirror does not. Experimental.
+    "AR_TUNE_ZERO_LITE": lambda: os.getenv("AR_TUNE_ZERO_LITE", "0").lower() in ("1", "true", "yes"),
 }
 
 

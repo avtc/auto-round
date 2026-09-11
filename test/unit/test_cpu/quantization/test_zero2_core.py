@@ -72,13 +72,17 @@ class _CpuPlan:
 def _make_group(world=2, n_modules=2):
     torch.manual_seed(7)
     block = _ToyBlock(n_modules)
-    lrs = {}
+    plan = _CpuPlan(world)
+    group = ZeroReplicaGroup(block, plan)
+    return block, group
+
+
+def _lr_map(block, lr=0.5):
+    out = {}
     for _, m in block.named_modules():
         if is_zero_candidate(m):
-            lrs[id(m.params["v"])] = 0.5
-    plan = _CpuPlan(world)
-    group = ZeroReplicaGroup(block, plan, lr_by_param=lrs)
-    return block, group
+            out[id(m.params["v"])] = lr
+    return out
 
 
 class TestSplitBounds:
@@ -109,11 +113,7 @@ class TestBuildAndTeardown:
         torch.manual_seed(7)
         block = _ToyBlock(2)
         v0 = {n: m.params["v"].detach().clone() for n, m in block.named_modules() if is_zero_candidate(m)}
-        lrs = {}
-        for _, m in block.named_modules():
-            if is_zero_candidate(m):
-                lrs[id(m.params["v"])] = 0.5
-        group = ZeroReplicaGroup(block, _CpuPlan(2), lr_by_param=lrs)
+        group = ZeroReplicaGroup(block, _CpuPlan(2))
         # the shards -- not the (shape-shared, transient) stages -- are the
         # source of truth and hold the bitwise-exact original values
         for e in group.entries:
@@ -123,7 +123,7 @@ class TestBuildAndTeardown:
         with torch.no_grad():
             # post-capture shard pollution must NOT leak into teardown output
             group._v_shard[0][group.entries[0].uid].add_(123.0)
-        group.step()  # g_shards are zero -> sign(0)=0, no-op
+        group.step(_lr_map(block))  # g_shards are zero -> sign(0)=0, no-op
         group.teardown()
         for n, m in block.named_modules():
             if is_zero_candidate(m):
@@ -153,7 +153,7 @@ class TestParityAnchor:
             for _, m in block.named_modules():
                 if is_zero_candidate(m):
                     lrs[id(m.params["v"])] = 0.5
-            group = ZeroReplicaGroup(block, _CpuPlan(world), lr_by_param=lrs)
+            group = ZeroReplicaGroup(block, _CpuPlan(world))
             shards = [[0, 2], [1, 3]] if world == 2 else [list(range(4))]
             losses = [None] * world
 
@@ -169,7 +169,7 @@ class TestParityAnchor:
             group.run_threaded([lambda r=r: rep_step(r) for r in range(world)])
             group.reduce_inboxes()
             mean_loss = sum(losses) / world
-            group.step()
+            group.step(lrs)
             group.teardown()
             vs = {n: m.params["v"].detach().clone() for n, m in block.named_modules() if is_zero_candidate(m)}
             return vs, mean_loss
@@ -211,6 +211,55 @@ class TestParityAnchor:
                 if is_zero_candidate(m):
                     assert m.params["v"].grad is None
         group.reduce_inboxes()
+        group.teardown()
+
+
+class TestExchangeReset:
+    def test_reset_exchange_clears_inboxes_and_grad_shards(self):
+        block, group = _make_group()
+
+        def rep_step(r):
+            loss = torch.mean(group.replicas[r](torch.randn(3, 6)) ** 2)
+            loss.backward()
+
+        group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
+        group.reduce_inboxes()
+        assert any(
+            any(s is not None for s in group._inbox[o][e.uid]) for o in range(group.world) for e in group.entries
+        )
+        assert any(group._g_shard[o][e.uid].abs().sum() > 0 for o in range(group.world) for e in group.entries)
+        group.reset_exchange()
+        for o in range(group.world):
+            for e in group.entries:
+                assert all(s is None for s in group._inbox[o][e.uid])
+                assert float(group._g_shard[o][e.uid].abs().sum()) == 0.0
+        group.teardown()
+
+    def test_sync_grads_allreduces_minmax_only(self):
+        block, group = _make_group()
+
+        def rep_step(r):
+            loss = torch.mean(group.replicas[r](torch.randn(3, 6)) ** 2)
+            loss.backward()
+
+        group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
+        # minmax params keep classic per-replica grads (no hooks on them)
+        minmax_per_replica = []
+        for rep in group.replicas:
+            ps = []
+            for _, m in rep.named_modules():
+                if is_zero_candidate(m):
+                    ps.append(m.params["scale_max"])
+            minmax_per_replica.append(ps)
+        # craft distinguishable grads: replica r gets value r+1 on every element
+        for r, ps in enumerate(minmax_per_replica):
+            for p in ps:
+                p.grad = torch.full_like(p, float(r + 1))
+        group.sync_grads(minmax_per_replica)
+        for r, ps in enumerate(minmax_per_replica):
+            for p in ps:
+                # mean over replicas of (1, 2) == 1.5
+                assert torch.allclose(p.grad, torch.full_like(p, 1.5), atol=1e-2)
         group.teardown()
 
 

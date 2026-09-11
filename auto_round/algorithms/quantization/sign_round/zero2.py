@@ -86,7 +86,7 @@ class _Entry:
     """One round leaf Parameter shared across replicas (same object on the
     home, deep-copied per mirror)."""
 
-    __slots__ = ("module_name", "key", "numel", "bounds", "param_by_replica", "lr")
+    __slots__ = ("module_name", "key", "numel", "bounds", "param_by_replica", "home_param_id")
 
     def __init__(self, module_name, key, numel):
         self.module_name = module_name
@@ -94,7 +94,7 @@ class _Entry:
         self.numel = numel
         self.bounds = None  # set once world is known
         self.param_by_replica: List[nn.Parameter] = []
-        self.lr: Optional[float] = None
+        self.home_param_id: Optional[int] = None
 
     @property
     def uid(self):
@@ -153,7 +153,7 @@ class ZeroReplicaGroup:
     while this group is active.
     """
 
-    def __init__(self, block: nn.Module, plan, lr_by_param: Optional[Dict[int, float]] = None):
+    def __init__(self, block: nn.Module, plan):
         if plan.world < 2:
             raise ValueError("ZeRO-2-lite requires world >= 2")
         self.plan = plan
@@ -172,7 +172,7 @@ class ZeroReplicaGroup:
                 if not _is_round_key(key) or not isinstance(p, nn.Parameter):
                     continue
                 e = _Entry(name, key, p.numel())
-                e.lr = (lr_by_param or {}).get(id(p))
+                e.home_param_id = id(p)
                 mod_entries.append(e)
                 self.entries.append(e)
             if mod_entries:
@@ -339,29 +339,64 @@ class ZeroReplicaGroup:
     def sync_grads(self, params_per_replica=None, prof=None, sign_exchange: bool = False) -> None:
         """ZeRO exchange phase -- called where the full-mirror lane allreduces.
 
-        The real work already happened in the deposit hooks during backward;
-        this folds the bf16 inboxes into the fp32 grad shards. The minmax
-        (scale/zp) parameters stay on the full-mirror allreduce and are NOT
-        handled here.
+        Round leaves were already deposited to owner inboxes by their
+        post-accumulate hooks during backward; this folds the inboxes into
+        the fp32 grad shards. Any OTHER parameters handed in (the minmax
+        scale/zp set, which stays full-mirrored) go through the plain
+        value allreduce, mirroring the full-mirror lane's semantics.
         """
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _param_grad_buffers,
+            _write_back_grads,
+            halving_doubling_allreduce,
+        )
+
         self.reduce_inboxes()
+        round_ids = {id(p) for e in self.entries for p in e.param_by_replica}
+        # one buffer PER REPLICA (params_per_replica is already per-replica);
+        # concatenating them into one would corrupt the allreduce geometry
+        extra_per_replica = [[p for p in ps if id(p) not in round_ids] for ps in (params_per_replica or [])]
+        extra_per_replica = [ps for ps in extra_per_replica if ps]
+        if len(extra_per_replica) == self.world:
+            bufs = _param_grad_buffers(extra_per_replica)
+            if all(b is not None for b in bufs):
+                halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport="bf16")
+                for buf, ps in zip(bufs, extra_per_replica):
+                    _write_back_grads(buf, ps)
+        elif extra_per_replica:
+            logger.warning(
+                "[tune-zero] skipping minmax exchange: got %d replica param lists, world=%d",
+                len(extra_per_replica),
+                self.world,
+            )
+
+    def reset_exchange(self) -> None:
+        """Drop any deposits from warm-up / aborted iterations so the first
+        real iteration starts from clean grad shards and inboxes."""
+        for owner in range(self.world):
+            for e in self.entries:
+                self._g_shard[owner][e.uid].zero_()
+                self._inbox[owner][e.uid] = [None] * self.world
 
     # ------------------------------------------------------------------ #
     # step / capture / teardown
     # ------------------------------------------------------------------ #
-    def step(self) -> None:
+    def step(self, lr_by_param: Optional[Dict[int, float]] = None) -> None:
         """Shard-local SignRound update: v -= lr * sign(g).
 
-        Elementwise for momentum 0 (the only supported regime); the lr is
-        per entry (per-layer lr groups of the serial optimizer).
+        Elementwise for momentum 0 (the only supported regime);
+        ``lr_by_param`` maps the HOME parameter object id to the group's
+        CURRENT lr (the scheduler decays it per iteration -- a build-time lr
+        would freeze the schedule).
         """
+        lr_by_param = lr_by_param or {}
         with torch.no_grad():
             for owner in range(self.world):
                 for e in self.entries:
-                    lr = e.lr if e.lr is not None else 0.0
+                    lr = float(lr_by_param.get(e.home_param_id, 0.0))
                     shard = self._v_shard[owner][e.uid]
                     grad = self._g_shard[owner][e.uid]
-                    shard.add_(torch.sign(grad), alpha=-float(lr))
+                    shard.add_(torch.sign(grad), alpha=-lr)
 
     def capture_best(self) -> None:
         """Snapshot the current shards (cheap: sharded, GPU-local)."""
