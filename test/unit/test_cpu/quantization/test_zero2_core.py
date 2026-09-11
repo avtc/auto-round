@@ -224,11 +224,15 @@ class TestExchangeReset:
             loss.backward()
 
         group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
-        group.reduce_inboxes()
         assert any(
             any(s is not None for s in group._inbox[o][e.uid]) for o in range(group.world) for e in group.entries
         )
+        group.reduce_inboxes()
+        # folding clears the slots (R1-3): a grad-less later iteration folds zero
         assert any(group._g_shard[o][e.uid].abs().sum() > 0 for o in range(group.world) for e in group.entries)
+        for o in range(group.world):
+            for e in group.entries:
+                assert all(s is None for s in group._inbox[o][e.uid])
         group.reset_exchange()
         for o in range(group.world):
             for e in group.entries:
@@ -406,3 +410,70 @@ def _minmax_per_replica(group):
                 ps.append(m.params["scale_max"])
         out.append(ps)
     return out
+
+
+class TestR1Regressions:
+    def test_mirror_stages_track_shard_updates(self):
+        """R1-1 regression: every replica's shell must gather ITS OWN stage
+        from the current shards, independent of which worker thread runs it."""
+        block, group = _make_group()
+        with torch.no_grad():
+            group._v_shard[1][group.entries[0].uid].fill_(7.0)
+        # forward replica 1 (runs in this thread -- shells are thread-agnostic)
+        group.replicas[1](torch.randn(2, 6))
+        e = group.entries[0]
+        stage1 = group._stages[1][tuple(e.param_by_replica[1].shape)].reshape(-1)
+        lo, hi = e.bounds[1]
+        assert torch.equal(stage1[lo:hi], group._v_shard[1][e.uid])
+        group.teardown()
+
+    def test_wrapper_seen_once_in_module_walk(self):
+        """R1-2 regression: the shell must not double-register the wrapper,
+        which duplicated every tuning param in optimizer collections."""
+        block, group = _make_group(n_modules=2)
+        for rep in group.replicas:
+            with_orig = [n for n, m in rep.named_modules() if hasattr(m, "orig_layer")]
+            assert len(with_orig) == 2, with_orig  # exactly one per toy module
+        group.teardown()
+
+    def test_stale_inbox_cleared_after_fold(self):
+        """R1-3 regression: a later iteration with no deposit must fold ZERO,
+        not the previous iteration's slots."""
+        block, group = _make_group()
+
+        def rep_step(r):
+            loss = torch.mean(group.replicas[r](torch.randn(3, 6)) ** 2)
+            loss.backward()
+
+        group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
+        group.reduce_inboxes()
+        e = group.entries[0]
+        assert float(torch.cat([group._g_shard[o][e.uid] for o in range(group.world)]).abs().sum()) > 0
+        # iteration 2: no forward/backward at all
+        group.reduce_inboxes()
+        for o in range(group.world):
+            assert float(group._g_shard[o][e.uid].abs().sum()) == 0.0
+            assert all(s is None for s in group._inbox[o][e.uid])
+        group.teardown()
+
+    def test_shell_delegates_wrapper_attributes(self):
+        block, group = _make_group()
+        shell = next(m for m in block.modules() if type(m).__name__ == "_ZeROShell")
+        assert shell.orig_layer is shell.wrapped.orig_layer
+        # plain attribute of the wrapped linear (e.g. its weight)
+        assert shell.weight is shell.wrapped.weight
+        group.teardown()
+
+    def test_hooks_removed_and_pool_shutdown_at_teardown(self):
+        block, group = _make_group()
+
+        def rep_step(r):
+            loss = torch.mean(group.replicas[r](torch.randn(3, 6)) ** 2)
+            loss.backward()
+
+        group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
+        pool = group._pool
+        group.teardown()
+        assert group._hooks == []
+        assert group._pool is None
+        assert group.replicas == [block]

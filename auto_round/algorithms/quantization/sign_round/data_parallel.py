@@ -1050,6 +1050,19 @@ def _enforce_mirror_device_(mirror: torch.nn.Module, dev: torch.device) -> List[
     return moved
 
 
+def run_threaded_with_pool(host, fns) -> None:
+    """Run one callable per replica in parallel threads via the host's
+    persistent worker pool (built lazily on first use), falling back to
+    spawn-per-call when the callable count does not match the pool width."""
+    pool = getattr(host, "_pool", None)
+    if pool is None:
+        host._pool = pool = ReplicaThreadPool(len(fns))
+    if len(fns) == pool.n:
+        pool.run(fns)
+    else:
+        run_threaded_spawn(fns)
+
+
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
@@ -1164,13 +1177,7 @@ class ReplicaGroup:
         in the joining thread -- a swallowed worker failure would otherwise
         leave missing shard losses/grads and corrupt the step silently.
         """
-        pool = getattr(self, "_pool", None)
-        if pool is None:
-            self._pool = pool = ReplicaThreadPool(len(fns))
-        if len(fns) == pool.n:
-            pool.run(fns)
-        else:
-            run_threaded_spawn(fns)
+        run_threaded_with_pool(self, fns)
 
     def teardown(self) -> None:
         if getattr(self, "_torn_down", False):

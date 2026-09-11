@@ -463,6 +463,13 @@ class SignRoundQuantizer(BaseQuantizer):
             if _envs.AR_TUNE_ZERO_LITE:
                 from auto_round.algorithms.quantization.sign_round.zero2 import ZeroReplicaGroup
 
+                if self.momentum is not None and float(self.momentum) != 0.0:
+                    # shard-local sign updates have no momentum buffers;
+                    # silently dropping momentum would change the algorithm
+                    raise RuntimeError(
+                        "[tune-zero] ZeRO-2-lite requires momentum=0 (sign updates are elementwise); "
+                        f"got momentum={self.momentum}"
+                    )
                 try:
                     replica_group = ZeroReplicaGroup(block, _plan)
                 except (ValueError, RuntimeError) as _zero_err:

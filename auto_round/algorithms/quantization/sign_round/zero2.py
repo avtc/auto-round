@@ -42,12 +42,14 @@ alone exceeds a 24 GB card. This module shards only the *tune state*:
   the home wrapper's full-size values.
 
 Standing design principle (never violate): wrapper Parameter objects stay
-the autograd leaves; per-leaf gradient accumulation is untouched; state
-moves ONLY through pre-allocated, reused exchange buffers via ``copy_``.
+the autograd leaves and gradients accumulate on them exactly as in serial
+training; the deposit hook then consumes and frees each leaf's gradient
+right after its node's backward (steady-state gradient memory = shards);
+state moves ONLY through pre-allocated, reused exchange buffers via
+``copy_``.
 """
 
 import copy
-import threading
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -114,11 +116,18 @@ class _ZeROShell(nn.Module):
     seeing the wrapper.
     """
 
-    def __init__(self, wrapped: nn.Module, entries: List[_Entry], group: "ZeroReplicaGroup"):
+    def __init__(self, wrapped: nn.Module, entries: List[_Entry], group: "ZeroReplicaGroup", replica_index: int):
         super().__init__()
-        self.wrapped = wrapped
+        # NOT registered as a submodule -- registering it made
+        # named_modules() yield the wrapper twice (shell + wrapped), which
+        # duplicated every tuning param in optimizer collections. Stored as
+        # a plain attribute, mirroring how the wrapper itself keeps
+        # orig_layer out of the module tree. __getattr__ delegates the rest
+        # of the wrapper contract (weight, bits, ...).
+        self.__dict__["wrapped"] = wrapped
         self._entries = entries
         self._group = group
+        self._replica_index = replica_index
 
     @property
     def params(self):
@@ -129,11 +138,20 @@ class _ZeROShell(nn.Module):
         return self.wrapped.orig_layer
 
     def _gathered_forward(self, *args, **kwargs):
-        self._group.gather_stage(self._entries)
+        self._group.gather_stage(self._replica_index, self._entries)
         return self.wrapped(*args, **kwargs)
 
     def forward(self, *args, **kwargs):
         return torch.utils.checkpoint.checkpoint(self._gathered_forward, *args, use_reentrant=False, **kwargs)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            wrapped = self.__dict__.get("wrapped")
+            if wrapped is not None:
+                return getattr(wrapped, name)
+            raise
 
 
 class ZeroReplicaGroup:
@@ -181,8 +199,24 @@ class ZeroReplicaGroup:
         if not self.entries:
             raise ValueError("no round tuning parameters found to shard")
 
-        # ---- mirrors (proven deepcopy path) ------------------------------
-        self.mirrors: List[nn.Module] = [copy.deepcopy(block).to(d) for d in self.devices[1:]]
+        # ---- mirrors (proven deepcopy path + its hardening) --------------
+        from auto_round.algorithms.quantization.sign_round.data_parallel import (
+            _enforce_mirror_device_,
+            _relocate_params,
+        )
+
+        self.mirrors: List[nn.Module] = []
+        for d in self.devices[1:]:
+            mirror = copy.deepcopy(block).to(d)
+            _relocate_params(mirror, d)
+            strays = _enforce_mirror_device_(mirror, d)
+            if strays:
+                logger.warning(
+                    "[tune-zero] mirror device sweep moved %d straggler tensor(s) onto %s",
+                    len(strays),
+                    d,
+                )
+            self.mirrors.append(mirror)
 
         # map home entries -> mirror params by (module_name, key)
         mirror_params: Dict[Tuple[str, str], nn.Parameter] = {}
@@ -239,7 +273,7 @@ class ZeroReplicaGroup:
                 if not is_zero_candidate(mod):
                     continue
                 mod_entries = [e for e in self.entries if e.module_name == name]
-                shell = _ZeROShell(mod, mod_entries, self)
+                shell = _ZeROShell(mod, mod_entries, self, r)
                 _replace_module(rep, name, shell)
                 for e in mod_entries:
                     p = e.param_by_replica[r]
@@ -268,32 +302,20 @@ class ZeroReplicaGroup:
                 lo, hi = e.bounds[owner]
                 flat[lo:hi].copy_(self._v_shard[owner][e.uid])
 
-    def gather_stage(self, entries: List[_Entry]) -> None:
-        """Pre-forward (and recompute) hook: refresh the stages this shell needs.
+    def gather_stage(self, r: int, entries: List[_Entry]) -> None:
+        """Pre-forward (and recompute) hook: refresh replica r's stages.
 
-        Called from every replica's forward thread for its own stages;
-        shards are frozen while an iteration is in flight, so concurrent
-        reads are safe and every replica stages identical values.
+        Each shell knows its replica index, so the refresh is correct from
+        any thread (worker pools run replicas in arbitrary threads); shards
+        are frozen while an iteration is in flight, so concurrent reads are
+        safe and every replica stages identical values.
         """
-        r = self._replica_index_of_current_thread()
         for e in entries:
             stage = self._stages[r][tuple(e.param_by_replica[r].shape)]
             flat = stage.reshape(-1)
             for owner in range(self.world):
                 lo, hi = e.bounds[owner]
                 flat[lo:hi].copy_(self._v_shard[owner][e.uid])
-
-    def _replica_index_of_current_thread(self) -> int:
-        tid = threading.get_ident()
-        for r, ident in enumerate(getattr(self, "_thread_idents", [])):
-            if ident == tid:
-                return r
-        # fallback: the home runs in the coordinating thread
-        return 0
-
-    def bind_thread_idents(self, idents: List[int]) -> None:
-        """Record which thread runs which replica (home = caller thread)."""
-        self._thread_idents = list(idents)
 
     # ------------------------------------------------------------------ #
     # gradient deposit (post-accumulate hook) + reduce
@@ -308,7 +330,7 @@ class ZeroReplicaGroup:
             if slot is None or slot.shape != flat[lo:hi].shape or slot.device != self.devices[owner]:
                 slot = torch.empty(hi - lo, dtype=torch.bfloat16, device=self.devices[owner])
                 self._inbox[owner][e.uid][r] = slot
-            slot.copy_(flat[lo:hi].to(self.devices[owner], non_blocking=False).to(torch.bfloat16))
+            slot.copy_(flat[lo:hi].to(torch.bfloat16).to(self.devices[owner], non_blocking=False))
 
     def reduce_inboxes(self) -> None:
         """After the backward join: each owner folds its bf16 inbox slots
@@ -321,20 +343,18 @@ class ZeroReplicaGroup:
                     slot = self._inbox[owner][e.uid][depositor]
                     if slot is not None:
                         acc.add_(slot.to(torch.float32))
+                # clear after folding: a later iteration where a leaf gets no
+                # grad (e.g. a skipped MoE expert) must contribute ZERO, not
+                # this iteration's deposits
+                self._inbox[owner][e.uid] = [None] * self.world
 
     def run_threaded(self, fns) -> None:
         """Same contract as ReplicaGroup.run_threaded: one callable per
         replica (home first), persistent pool, spawn fallback on width
         mismatch, first failure re-raised."""
-        from auto_round.algorithms.quantization.sign_round.data_parallel import ReplicaThreadPool, run_threaded_spawn
+        from auto_round.algorithms.quantization.sign_round.data_parallel import run_threaded_with_pool
 
-        pool = getattr(self, "_pool", None)
-        if pool is None:
-            self._pool = pool = ReplicaThreadPool(len(fns))
-        if len(fns) == pool.n:
-            pool.run(fns)
-        else:
-            run_threaded_spawn(fns)
+        run_threaded_with_pool(self, fns)
 
     def sync_grads(self, params_per_replica=None, prof=None, sign_exchange: bool = False) -> None:
         """ZeRO exchange phase -- called where the full-mirror lane allreduces.
@@ -431,7 +451,12 @@ class ZeroReplicaGroup:
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            pool.shutdown()
+            self._pool = None
         del self.mirrors[:]
+        self.replicas = [self.home]  # replicas[0] retained; mirrors released
         self._stages = [dict() for _ in range(self.world)]
         self._inbox = [dict() for _ in range(self.world)]
 
@@ -453,14 +478,10 @@ def _replace_module(model: nn.Module, name: str, new_module: nn.Module) -> None:
     for part in parts[:-1]:
         parent = getattr(parent, part)
     last = parts[-1]
-    if hasattr(parent, last) and not last.isdigit():
-        setattr(parent, last, new_module)
+    if last in getattr(parent, "_modules", {}):
+        parent._modules[last] = new_module  # ModuleList / Sequential children
     else:
-        idx = int(last)
-        if isinstance(parent, nn.ModuleList):
-            parent[idx] = new_module
-        else:  # pragma: no cover - defensive
-            raise TypeError(f"cannot replace {name}: parent {type(parent).__name__} is not a ModuleList")
+        setattr(parent, last, new_module)
 
 
 def _register_deposit_hook(param: nn.Parameter, group: "ZeroReplicaGroup", e: _Entry, r: int):
