@@ -86,6 +86,16 @@ def is_zero_candidate(module) -> bool:
     return isinstance(params, dict) and any(_is_round_key(k) for k in params)
 
 
+def block_has_round_entries(block) -> bool:
+    """True if any module in the block tree carries round tuning parameters.
+
+    All-float pinned blocks (e.g. a ``'bits': 16, 'data_type': 'float'``
+    layer_config pin) and minmax-only blocks have nothing to shard; callers
+    use this to decline the parallel lane before mirror setup.
+    """
+    return any(is_zero_candidate(m) for _, m in block.named_modules())
+
+
 class _Entry:
     """One round leaf Parameter shared across replicas (same object on the
     home, deep-copied per mirror)."""
@@ -209,7 +219,7 @@ class ZeroReplicaGroup:
                 for e in mod_entries:
                     e.bounds = split_bounds(e.numel, self.world)
         if not self.entries:
-            raise ValueError("no round tuning parameters found to shard")
+            raise ValueError("no round tuning parameters found to shard (all-float pinned or minmax-only block?)")
 
         # ---- mirrors (proven deepcopy path + its hardening) --------------
         from auto_round.algorithms.quantization.sign_round.data_parallel import (

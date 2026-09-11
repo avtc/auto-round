@@ -554,3 +554,35 @@ class TestR3:
     def test_flat_single_wrapper_block_rejected(self):
         with pytest.raises(ValueError, match="container block"):
             ZeroReplicaGroup(_ToyLinear(), _CpuPlan(2))
+
+
+class TestBlockHasRoundEntries:
+    """All-float pinned / minmax-only blocks must be detectable before engagement."""
+
+    def test_plain_block_has_no_entries(self):
+        from auto_round.algorithms.quantization.sign_round.zero2 import block_has_round_entries
+
+        block = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 8))
+        assert block_has_round_entries(block) is False
+
+    def test_minmax_only_block_has_no_entries(self):
+        from auto_round.algorithms.quantization.sign_round.zero2 import block_has_round_entries
+
+        class MinmaxOnly(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.params = {"wmax": nn.Parameter(torch.ones(1)), "wmin": nn.Parameter(torch.zeros(1))}
+
+        block = torch.nn.Sequential(MinmaxOnly())
+        assert block_has_round_entries(block) is False
+
+    def test_block_with_round_entry_is_detected(self):
+        from auto_round.algorithms.quantization.sign_round.zero2 import block_has_round_entries
+
+        class RoundHolder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.params = {"v": nn.Parameter(torch.ones(4)), "wmax": nn.Parameter(torch.ones(1))}
+
+        block = torch.nn.Sequential(torch.nn.Linear(8, 8), RoundHolder())
+        assert block_has_round_entries(block) is True

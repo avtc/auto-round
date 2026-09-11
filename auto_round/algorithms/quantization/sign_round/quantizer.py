@@ -488,6 +488,18 @@ class SignRoundQuantizer(BaseQuantizer):
             if not block_has_tuning_entries(block):
                 logger.info("[tune-ddp] declining: no tuning parameters in this block (all-float pinned); serial path")
                 _dp_eligible = False
+            elif _envs.AR_TUNE_ZERO_LITE:
+                # minmax-only blocks still tune on the full-mirror lane but
+                # cannot shard (round-only) on the zero lane
+                from auto_round.algorithms.quantization.sign_round.zero2 import block_has_round_entries
+
+                if not block_has_round_entries(block):
+                    logger.info(
+                        "[tune-zero] declining: no round tuning parameters in this block "
+                        "(minmax-only); tuning on the serial path"
+                    )
+                    _dp_eligible = False
+                _dp_eligible = False
         replica_group = None
         _zero = False
         if _dp_eligible:
