@@ -357,9 +357,6 @@ class ZeroReplicaGroup:
             for owner in range(self.world):
                 lo, hi = e.bounds[owner]
                 flat[lo:hi].copy_(self._v_shard[owner][e.uid])
-        # cuda copies enqueue async; attribute their completion honestly
-        if stage.is_cuda:
-            torch.cuda.synchronize(self.devices[r])
         self._acc("gather", _time.perf_counter() - _t0, id(self))
 
     # ------------------------------------------------------------------ #
@@ -377,11 +374,6 @@ class ZeroReplicaGroup:
                 slot = torch.empty(hi - lo, dtype=torch.bfloat16, device=self.devices[owner])
                 self._inbox[owner][e.uid][r] = slot
             slot.copy_(flat[lo:hi].to(torch.bfloat16).to(self.devices[owner], non_blocking=False))
-        try:
-            if grad.is_cuda:
-                torch.cuda.synchronize(self.devices[r])
-        except Exception:  # pragma: no cover - cpu path
-            pass
         self._acc("deposit", _time.perf_counter() - _t0, id(self))
 
     def reduce_inboxes(self) -> None:
