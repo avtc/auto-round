@@ -83,10 +83,11 @@ class GPipeDriver:
     exactly once per iteration, after every micro-batch backward.
     """
 
-    def __init__(self, stages: Sequence[Callable]):
+    def __init__(self, stages: Sequence[Callable], streams: Optional["StageStreams"] = None):
         if not stages:
             raise ValueError("GPipeDriver needs at least one stage callable")
         self.stages = list(stages)
+        self.streams = streams
 
     def run_iteration(
         self,
@@ -98,9 +99,13 @@ class GPipeDriver:
         current = {mb: None for mb in range(len(microbatches))}
         losses = [None] * len(microbatches)
         for mb, stage in plan.forward:
+            if self.streams is not None:
+                self.streams.before(mb, stage)
             if current[mb] is None:
                 current[mb] = microbatches[mb]
             current[mb] = self.stages[stage](current[mb])
+            if self.streams is not None:
+                self.streams.after(mb, stage)
         for mb in range(len(microbatches)):
             losses[mb] = loss_fn(current[mb])
         bwd_order = []
@@ -112,3 +117,77 @@ class GPipeDriver:
         if on_step is not None:
             on_step()
         return losses
+
+
+def slice_pool_rows(entry, rows):
+    """Slice cached pool entries on the batch (sample) dimension.
+
+    Handles the layouts the calibration cache produces: whole-batch tensors
+    (``index_select`` on dim 0), per-sample lists (entry pick), rope-style
+    tuples of tensors (each sliced on dim 0), dicts (recursively), and
+    scalars (returned unchanged). ``rows`` is a non-empty list of sample
+    indices.
+    """
+    import torch
+
+    if not rows:
+        raise ValueError("slice_pool_rows: empty row selection")
+    if torch.is_tensor(entry):
+        idx = torch.as_tensor(list(rows), dtype=torch.long, device=entry.device)
+        return entry.index_select(0, idx)
+    if isinstance(entry, list):
+        return [entry[int(i)] for i in rows]
+    if isinstance(entry, tuple) and entry and all(torch.is_tensor(t) for t in entry):
+        return tuple(slice_pool_rows(t, rows) for t in entry)
+    if isinstance(entry, dict):
+        return {k: slice_pool_rows(v, rows) for k, v in entry.items()}
+    return entry
+
+
+class StageStreams:
+    """Per-(micro-batch, stage) stream/event plumbing for one iteration.
+
+    Real cross-stage overlap comes from CUDA streams: each stage's kernels
+    are enqueued (by the single driver thread) on the stream of the device
+    hosting that stage, and stage ``k+1`` of micro-batch ``i`` waits on an
+    event recorded after stage ``k`` of the SAME micro-batch. On CPU-only
+    worlds the object is inert (sequential execution is already correct;
+    streams do not exist) -- before/after become no-ops.
+
+    ``stream_factory``/``event_factory`` are injectable for testing; when
+    they are omitted, streams/events are only created if every device is
+    CUDA (otherwise the object stays inert).
+    """
+
+    def __init__(self, microbatches, stages, devices, stream_factory=None, event_factory=None):
+        self.microbatches = microbatches
+        self.stages = stages
+        self.devices = list(devices)
+        self._streams = {}
+        self._events = {}
+        self._active = True
+        import torch
+
+        if stream_factory is None or event_factory is None:
+            if not all(getattr(d, "type", "cpu") == "cuda" for d in self.devices):
+                self._active = False
+                return
+            stream_factory = lambda d: torch.cuda.Stream(device=d)  # noqa: E731
+            event_factory = lambda **kw: torch.cuda.Event(**kw)
+        for mb in range(microbatches):
+            for stage in range(stages):
+                self._streams[(mb, stage)] = stream_factory(self.devices[stage % len(self.devices)])
+                self._events[(mb, stage)] = event_factory()
+
+    def before(self, micro_batch: int, stage: int) -> None:
+        """Enter stage ``stage`` of ``micro_batch``: wait on its producer."""
+        if not self._active:
+            return
+        if stage > 0:
+            self._events[(micro_batch, stage - 1)].wait(stream=self._streams[(micro_batch, stage)])
+
+    def after(self, micro_batch: int, stage: int) -> None:
+        """Leave stage ``stage``: record the event stage+1 will wait on."""
+        if not self._active:
+            return
+        self._events[(micro_batch, stage)].record(stream=self._streams[(micro_batch, stage)])
