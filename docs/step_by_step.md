@@ -853,10 +853,11 @@ blocks, e.g. when a block does not fit a single device), the per-iteration
 forward and backward execute the device-resident segments sequentially —
 only one GPU is busy at a time. `--micro_batch N` splits each tuning
 iteration's forward batch into N micro-batches and pipelines them across the
-devices hosting the block: utilization rises from 1/K to N/(N+K-1) for K
-devices, with identical results (gradients of the micro-batch losses sum to
-the whole-batch gradient exactly; the optimizer still steps once per
-iteration). The calibration collection passes pipeline at chunk granularity
+devices hosting the block: the utilization bound rises from 1/K to N/(N+K-1)
+for K devices (the realized speedup depends on the block's device layout and
+on per-block Python overheads). Gradients of the micro-batch losses sum to
+the whole-batch gradient exactly up to floating-point reduction order, and
+the optimizer still steps once per iteration. The calibration collection passes pipeline at chunk granularity
 under the same flag. The sample is the splitting floor — token-dim splitting
 is never used. Values larger than the batch size clamp to it; the flag is
 off by default. On MoE blocks with large expert loops N=4 is the practical

@@ -357,11 +357,23 @@ class SignRoundQuantizer(BaseQuantizer):
         ):
             logger.warning_once("micro_batch ignored on the LFQ last block (CE parity); staying serial")
             return None
+        try:
+            import torch.distributed as _dist
+
+            if _dist.is_available() and _dist.is_initialized():
+                logger.warning_once(
+                    "micro_batch ignored under distributed wrapping (DDP allreduce hooks assume "
+                    "one forward+backward per iteration); staying serial"
+                )
+                return None
+        except Exception:  # pragma: no cover - torch.distributed always importable
+            pass
         mb = min(int(mb), len(indices))
         return mb if mb >= 2 else None
 
     def _tune_batch_micro_batched(
         self,
+        mb,
         block,
         indices,
         active_inputs,
@@ -399,11 +411,13 @@ class SignRoundQuantizer(BaseQuantizer):
             "micro-batching engaged: all micro-batch graphs are retained until the backward "
             "phase, so mid-iteration memory clearing is skipped on this path"
         )
-        mb = self._micro_batch_n(indices)
         n = len(indices)
         slices = [indices[k * n // mb : (k + 1) * n // mb] for k in range(mb)]
         slices = [sl for sl in slices if len(sl) > 0]
-        assert len(slices) >= 2, "micro-batch split degenerated; caller should have stayed serial"
+        if len(slices) < 2:
+            raise RuntimeError(
+                "micro-batch split degenerated below two slices; the engage check should have kept this batch serial"
+            )
 
         ne = 1 if (num_elm is None or num_elm <= 0) else num_elm
         scope = DeviceStreamScope({p.device for p in block.parameters()})
@@ -419,17 +433,11 @@ class SignRoundQuantizer(BaseQuantizer):
                     pred_output = tuning_cache.forward(block, staged, fwd_cache_device)
                 if loss_device is not None:
                     pred_output = pred_output.to(loss_device)
-                if (
-                    block_ctx.block_index == block_ctx.block_cnt - 1
-                    and self.enable_lfq
-                    and input_ids is not None
-                    and self._is_text_decoder_block(block_ctx.block_name)
-                ):
-                    loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in sl], dim=0))
-                else:
-                    # same positional shape as the serial call site (SignRoundV2's
-                    # _get_loss override does not take input_ids)
-                    loss = self._get_loss(pred_output, ref_output, sl, mse_loss, home_device, valid_token_mask)
+                # same positional shape as the serial call site (SignRoundV2's
+                # _get_loss override does not take input_ids). The LFQ last-block
+                # branch is declined at engage; sample-count reweighting cannot
+                # reproduce a token-mean CE, so it must never reach this helper.
+                loss = self._get_loss(pred_output, ref_output, sl, mse_loss, home_device, valid_token_mask)
                 graphs.append(loss * (len(sl) / n))
             for scaled in graphs:
                 self._scale_loss_and_backward(scaler, scaled)
@@ -635,8 +643,10 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
-                    if self._micro_batch_n(indices, tuning_cache, block_ctx) is not None:
+                    _mb = self._micro_batch_n(indices, tuning_cache, block_ctx)
+                    if _mb is not None:
                         total_loss += self._tune_batch_micro_batched(
+                            _mb,
                             block,
                             indices,
                             active_inputs,

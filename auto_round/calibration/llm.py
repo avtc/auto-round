@@ -62,6 +62,9 @@ class LLMCalibrator(Calibrator):
         Verbatim port of the legacy ``Compressor.try_cache_inter_data_gpucpu``.
         """
         self.hook_handles = []  # clear origin handles
+        # set by the compressor when --micro_batch is active (pipelined
+        # calibration batch forwards); declared here so the default is explicit
+        self.micro_batch_pipeline = False
         self.inputs = {}  # clear origin inputs
 
         if is_quantized_input_module(self.model):  # e.g. FP8 model

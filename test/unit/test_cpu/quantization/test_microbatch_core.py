@@ -530,6 +530,7 @@ class TestMicroBatchedBatchParity(unittest.TestCase):
         q = _Q()
         ctx = SimpleNamespace(block_index=0, block_cnt=2)
         contributed = q._tune_batch_micro_batched(
+            2,
             block=block,
             indices=torch.arange(n),
             active_inputs=[x[i : i + 1] for i in range(n)],
@@ -658,6 +659,7 @@ class TestMicroBatchedMaskedParity(unittest.TestCase):
 
         q = _Q()
         got = q._tune_batch_micro_batched(
+            2,
             block=block,
             indices=torch.arange(n),
             active_inputs=[x[i : i + 1] for i in range(n)],
@@ -686,6 +688,7 @@ class TestMicroBatchedMaskedParity(unittest.TestCase):
             p.grad = None
         q2 = _Q()
         q2._tune_batch_micro_batched(
+            2,
             block=block,
             indices=torch.arange(n),
             active_inputs=[x[i : i + 1] for i in range(n)],
