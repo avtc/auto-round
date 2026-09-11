@@ -84,11 +84,19 @@ class GPipeDriver:
     exactly once per iteration, after every micro-batch backward.
     """
 
-    def __init__(self, stages: Sequence[Callable], streams: Optional["StageStreams"] = None):
+    def __init__(
+        self,
+        stages: Sequence[Callable],
+        streams: Optional["StageStreams"] = None,
+        schedule: str = "gpipe",
+    ):
         if not stages:
             raise ValueError("GPipeDriver needs at least one stage callable")
+        if schedule not in ("gpipe", "1f1b"):
+            raise ValueError(f"unknown schedule {schedule!r}; expected 'gpipe' or '1f1b'")
         self.stages = list(stages)
         self.streams = streams
+        self.schedule = schedule
 
     def run_iteration(
         self,
@@ -96,10 +104,11 @@ class GPipeDriver:
         loss_fn: Callable,
         on_step: Optional[Callable] = None,
     ) -> List["torch.Tensor"]:  # noqa: F821 - torch typed lazily for CPU-only tests
-        plan = plan_gpipe(len(microbatches), len(self.stages))
         current = {mb: None for mb in range(len(microbatches))}
         losses = [None] * len(microbatches)
-        for mb, stage in plan.forward:
+        done = set()
+
+        def _fwd(mb, stage):
             if self.streams is not None:
                 self.streams.before(mb, stage)
             if current[mb] is None:
@@ -107,14 +116,34 @@ class GPipeDriver:
             current[mb] = self.stages[stage](current[mb])
             if self.streams is not None:
                 self.streams.after(mb, stage)
-        for mb in range(len(microbatches)):
+
+        def _bwd(mb):
             losses[mb] = loss_fn(current[mb])
-        bwd_order = []
-        for mb, _stage in plan.backward:
-            if mb not in bwd_order:
-                bwd_order.append(mb)
-        for mb in bwd_order:
             losses[mb].backward()
+            current[mb] = None
+            done.add(mb)
+
+        if self.schedule == "1f1b":
+            from auto_round.algorithms.quantization.sign_round.microbatch import plan_1f1b
+
+            ops = plan_1f1b(len(microbatches), len(self.stages))
+            for kind, mb, stage in ops:
+                if kind == "fwd":
+                    _fwd(mb, stage)
+                elif mb not in done:
+                    _bwd(mb)
+        else:
+            plan = plan_gpipe(len(microbatches), len(self.stages))
+            for mb, stage in plan.forward:
+                _fwd(mb, stage)
+            for mb in range(len(microbatches)):
+                losses[mb] = loss_fn(current[mb])
+            bwd_order = []
+            for mb, _stage in plan.backward:
+                if mb not in bwd_order:
+                    bwd_order.append(mb)
+            for mb in bwd_order:
+                losses[mb].backward()
         if on_step is not None:
             on_step()
         return losses
@@ -259,3 +288,41 @@ def pipelined_nograd_forwards(forward_fn, chunks, devices):
     with torch.no_grad(), device_stream_scope(devices) as _streams:
         outputs = [forward_fn(chunk) for chunk in chunks]
     return outputs
+
+
+def plan_1f1b(microbatches: int, stages: int):
+    """One-forward-one-backward schedule with the in-flight stash bounded at K.
+
+    After a warmup of ``stages`` micro-batch forwards, each additional
+    forward is immediately followed by the backward of the oldest
+    in-flight micro-batch (micro-batch gradients are independent and
+    additive, so backward order is free). GPipe stashes all M forward
+    graphs before the first backward; this schedule bounds the live
+    graphs at ~K, which is what unlocks raising ``batch_size`` under the
+    same activation memory.
+
+    Returns ``(kind, micro_batch, stage)`` op tuples; forward stage
+    entries keep the per-micro-batch stage order, backward entries carry
+    the stage they unpin (informational for stream/event placement).
+    """
+    if microbatches < 1 or stages < 1:
+        raise ValueError(f"plan_1f1b needs microbatches>=1 and stages>=1, got {microbatches}/{stages}")
+    plan = plan_gpipe(microbatches, stages)
+    fwd_by_mb = {}
+    for mb, stage in plan.forward:
+        fwd_by_mb.setdefault(mb, []).append((mb, stage))
+    ops = []
+    in_flight = []
+    for mb in range(microbatches):
+        # pop-before-forward: the oldest in-flight backward fires BEFORE the
+        # next forward once the pipeline is full, keeping in-flight <= K at
+        # every prefix (the stash bound this schedule exists for)
+        if len(in_flight) == stages:
+            done = in_flight.pop(0)
+            ops.extend(("bwd", done, stage) for stage in reversed(range(stages)))
+        ops.extend(("fwd", *pair) for pair in fwd_by_mb[mb])
+        in_flight.append(mb)
+    while in_flight:
+        done = in_flight.pop(0)
+        ops.extend(("bwd", done, stage) for stage in reversed(range(stages)))
+    return ops

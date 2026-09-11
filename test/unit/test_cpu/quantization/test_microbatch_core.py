@@ -367,3 +367,92 @@ class TestPipelinedCollection:
             assert set(streams) == {torch.device("cuda", 0)}
             assert isinstance(streams[torch.device("cuda", 0)], _FakeStream)
         assert len(made) == 1
+
+
+class TestOneFOneBPlan:
+    """The 1F1B schedule: stash bounded at ~K in-flight micro-batches."""
+
+    def test_in_flight_ceiling_is_stages(self):
+        from auto_round.algorithms.quantization.sign_round.microbatch import plan_1f1b
+
+        for M, K in [(4, 2), (8, 4), (6, 3), (3, 4)]:
+            ops = plan_1f1b(M, K)
+            fwd_done, bwd_done, max_inflight = set(), set(), 0
+            for kind, mb, _stage in ops:
+                if kind == "fwd":
+                    fwd_done.add(mb)
+                else:
+                    bwd_done.add(mb)
+                inflight = len(fwd_done) - len(bwd_done)
+                max_inflight = max(max_inflight, inflight)
+            assert len(fwd_done) == M and len(bwd_done) == M, (M, K)
+            assert max_inflight <= K, f"M={M} K={K}: stash hit {max_inflight}"
+
+    def test_fwd_precedes_own_bwd(self):
+        from auto_round.algorithms.quantization.sign_round.microbatch import plan_1f1b
+
+        ops = plan_1f1b(6, 3)
+        seen_fwd, seen_bwd = set(), set()
+        for kind, mb, stage in ops:
+            if kind == "fwd":
+                # forward entries are per-stage; each (mb, stage) fires once,
+                # stages ascend per micro-batch
+                assert (mb, stage) not in seen_fwd
+                prior = max((st for m, st in seen_fwd if m == mb), default=-1)
+                assert stage == prior + 1, f"mb {mb}: stage {stage} after {prior}"
+                seen_fwd.add((mb, stage))
+            elif mb not in seen_bwd:
+                # backward entries are per-stage (stream placement); only the
+                # first per micro-batch is the graph-level backward
+                assert any(m == mb for m, _ in seen_fwd), f"bwd of {mb} before its fwd"
+                seen_bwd.add(mb)
+
+    def test_warmup_is_k_microbatches(self):
+        from auto_round.algorithms.quantization.sign_round.microbatch import plan_1f1b
+
+        ops = plan_1f1b(8, 4)
+        heads = []
+        for kind, mb, _s in ops:
+            if kind == "fwd" and mb not in heads:
+                heads.append(mb)
+        assert heads[:4] == [0, 1, 2, 3]
+        # first backward interleaves right after warmup: bwd(0) fires before fwd(4)
+        idx = {(kind, mb): i for i, (kind, mb, _s) in enumerate(ops)}
+        assert idx[("bwd", 0)] < idx[("fwd", 4)]
+
+
+class TestOneFOneBDriver:
+    """The driver executes the 1F1B plan with identical gradient results."""
+
+    def test_grad_and_step_parity_with_gpipe(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.microbatch import GPipeDriver
+
+        torch.manual_seed(7)
+        a, b = torch.nn.Linear(6, 8), torch.nn.Linear(8, 5)
+        x = torch.randn(4, 3, 6)
+        steps = []
+
+        def run(schedule):
+            for p in list(a.parameters()) + list(b.parameters()):
+                p.grad = None
+            driver = GPipeDriver(
+                stages=[lambda t, _a=a: _a(t), lambda t, _b=b: _b(t)],
+                schedule=schedule,
+            )
+            losses = driver.run_iteration(
+                microbatches=[x[:2], x[2:]],
+                loss_fn=lambda o: o.pow(2).mean(),
+                on_step=lambda: steps.append(schedule),
+            )
+            grads = [p.grad.clone() for p in list(a.parameters()) + list(b.parameters())]
+            return losses, grads
+
+        losses_g, grads_g = run("gpipe")
+        losses_f, grads_f = run("1f1b")
+        assert steps == ["gpipe", "1f1b"]
+        for lg, lf in zip(losses_g, losses_f):
+            assert torch.allclose(lg, lf, atol=1e-7)
+        for g_g, g_f in zip(grads_g, grads_f):
+            assert torch.allclose(g_g, g_f, atol=1e-6)
