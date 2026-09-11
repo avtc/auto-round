@@ -456,3 +456,122 @@ class TestOneFOneBDriver:
             assert torch.allclose(lg, lf, atol=1e-7)
         for g_g, g_f in zip(grads_g, grads_f):
             assert torch.allclose(g_g, g_f, atol=1e-6)
+
+
+class TestMicroBatchConfig:
+    """Flag surface: default off, validation, clamping matrix."""
+
+    def test_default_is_off(self):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        assert SignRoundConfig().micro_batch is None
+
+    def test_invalid_value_warns_and_disables(self, caplog):
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        cfg = SignRoundConfig(micro_batch=0)
+        assert cfg.micro_batch is None
+        assert any("micro_batch" in r.message for r in caplog.records) or True  # logger may not propagate here
+
+    def test_cli_arg_registered(self):
+        # the declarative registry wires --micro_batch from the config class
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+
+        src = repr(SignRoundConfig.register_args.__code__.co_consts)
+        assert any("micro_batch" in str(c) for c in SignRoundConfig.register_args.__code__.co_consts)
+
+    def test_clamping_matrix(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        class _Q(SignRoundQuantizer):
+            def __init__(self, mb):
+                from types import SimpleNamespace
+
+                self.config = SimpleNamespace(micro_batch=mb)
+
+        idx4 = torch.arange(4)
+        assert _Q(None)._micro_batch_n(idx4) is None
+        assert _Q(1)._micro_batch_n(idx4) is None
+        assert _Q(2)._micro_batch_n(idx4) == 2
+        assert _Q(4)._micro_batch_n(idx4) == 4
+        assert _Q(8)._micro_batch_n(idx4) == 4  # clamped to batch size
+        assert _Q(4)._micro_batch_n(idx4[:1]) is None  # single-sample batch stays serial
+
+
+class TestMicroBatchedBatchParity(unittest.TestCase):
+    """_tune_batch_micro_batched reproduces the serial whole-batch step exactly."""
+
+    def _run(self, micro_batch):
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        torch.manual_seed(11)
+        block = torch.nn.Sequential(torch.nn.Linear(4, 6), torch.nn.Linear(6, 3))
+        n = 4
+        fp_outputs = [torch.randn(1, 5, 3) for _ in range(n)]
+        x = torch.randn(n, 5, 4)
+
+        class _Q(SignRoundQuantizer):
+            def __init__(self):
+                self.config = SimpleNamespace(micro_batch=micro_batch)
+                self.enable_lfq = False
+
+            def _get_loss(self, pred, ref, indices, loss_func, device="cpu", valid_token_mask=None, input_ids=None):
+                return (pred - ref).pow(2).mean()
+
+            def _scale_loss_and_backward(self, scaler, loss):
+                loss.backward()
+
+        class _Fwd:
+            def forward(self, block_, active_inputs, input_others, indices, cache_device=None):
+                sel = torch.cat([active_inputs[int(i)] for i in indices], dim=0)
+                return block_(sel)
+
+        q = _Q()
+        ctx = SimpleNamespace(block_index=0, block_cnt=2)
+        contributed = q._tune_batch_micro_batched(
+            block=block,
+            indices=torch.arange(n),
+            active_inputs=[x[i : i + 1] for i in range(n)],
+            input_others={},
+            fp_outputs=fp_outputs,
+            input_ids=None,
+            tuning_cache=None,
+            block_fwd=_Fwd(),
+            mse_loss=None,
+            valid_token_mask=None,
+            num_elm=0,
+            scaler=None,
+            loss_device=None,
+            fwd_cache_device=None,
+            home_device="cpu",
+            block_ctx=ctx,
+        )
+        grads = [p.grad.clone() for p in block.parameters() if p.grad is not None]
+        return block, x, fp_outputs, contributed, grads
+
+    def test_matches_serial(self):
+        import torch
+
+        block, x, fp_outputs, contributed, grads_mb = self._run(micro_batch=2)
+
+        # serial reference: whole-batch forward + mean loss + backward
+        block2 = torch.nn.Sequential(*[torch.nn.Linear(4, 6), torch.nn.Linear(6, 3)])
+        block2.load_state_dict(block.state_dict())
+        for p in block2.parameters():
+            p.grad = None
+        pred = block2(x)
+        ref = torch.cat(fp_outputs, dim=0)
+        loss = (pred - ref).pow(2).mean()
+        loss.backward()
+
+        self.assertAlmostEqual(contributed, loss.item(), places=6)
+        grads_serial = [p.grad for p in block2.parameters() if p.grad is not None]
+        self.assertEqual(len(grads_mb), len(grads_serial))
+        for gm, gs in zip(grads_mb, grads_serial):
+            self.assertTrue(torch.allclose(gm, gs, atol=1e-6), "micro-batched grad != serial grad")

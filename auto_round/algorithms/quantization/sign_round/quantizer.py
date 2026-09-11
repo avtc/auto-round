@@ -313,6 +313,89 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         return loss
 
+    def _micro_batch_n(self, indices) -> "int | None":
+        """Effective micro-batch count for one forward batch (``None`` = off).
+
+        Values larger than the batch clamp to the batch size (one-sample
+        micro-batches); ``< 2`` after clamping stays serial.
+        """
+        mb = getattr(getattr(self, "config", None), "micro_batch", None)
+        if not mb or int(mb) < 2:
+            return None
+        mb = min(int(mb), len(indices))
+        return mb if mb >= 2 else None
+
+    def _tune_batch_micro_batched(
+        self,
+        block,
+        indices,
+        active_inputs,
+        input_others,
+        fp_outputs,
+        input_ids,
+        tuning_cache,
+        block_fwd,
+        mse_loss,
+        valid_token_mask,
+        num_elm,
+        scaler,
+        loss_device,
+        fwd_cache_device,
+        home_device,
+        block_ctx,
+    ):
+        """Phase-split micro-batched execution of one forward batch (GPipe).
+
+        All micro-batch forwards run first (autograd graphs retained), then
+        all backwards; gradients of the weighted slice losses sum to the
+        whole-batch serial gradient exactly (weight ``len(sl)/len(indices)``
+        reproduces the serial mean; masks only zero the numerator so the
+        full-element-count denominator splits proportionally). The optimizer
+        step stays with the caller (once per iteration). Forwards and
+        backwards are enqueued inside a cached per-device stream scope so
+        device-resident segments of different micro-batches overlap on
+        device-mapped blocks without any stage surgery. Mid-iteration memory
+        clearing is skipped here: the stash must stay alive until the
+        backward phase and threshold clears could free live graphs.
+        """
+        from auto_round.algorithms.quantization.sign_round.microbatch import DeviceStreamScope
+
+        mb = self._micro_batch_n(indices)
+        n = len(indices)
+        slices = [indices[k * n // mb : (k + 1) * n // mb] for k in range(mb)]
+        slices = [sl for sl in slices if len(sl) > 0]
+        assert len(slices) >= 2, "micro-batch split degenerated; caller should have stayed serial"
+
+        ne = 1 if (num_elm is None or num_elm <= 0) else num_elm
+        scope = DeviceStreamScope({p.device for p in block.parameters()})
+        graphs = []
+        with scope.context():
+            for sl in slices:
+                staged = tuning_cache.get(sl) if tuning_cache is not None else None
+                if staged is None:
+                    ref_output = torch.cat([fp_outputs[i] for i in sl], dim=0).to(loss_device)
+                    pred_output = block_fwd.forward(block, active_inputs, input_others, sl, fwd_cache_device)
+                else:
+                    ref_output = staged[2]
+                    pred_output = tuning_cache.forward(block, staged, fwd_cache_device)
+                if loss_device is not None:
+                    pred_output = pred_output.to(loss_device)
+                if (
+                    block_ctx.block_index == block_ctx.block_cnt - 1
+                    and self.enable_lfq
+                    and input_ids is not None
+                    and self._is_text_decoder_block(block_ctx.block_name)
+                ):
+                    loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in sl], dim=0))
+                else:
+                    loss = self._get_loss(
+                        pred_output, ref_output, sl, mse_loss, home_device, valid_token_mask, input_ids
+                    )
+                graphs.append(loss * (len(sl) / n))
+            for scaled in graphs:
+                self._scale_loss_and_backward(scaler, scaled)
+        return float(sum(g.item() for g in graphs)) / ne
+
     def quantize_block(
         self,
         block,
@@ -513,6 +596,26 @@ class SignRoundQuantizer(BaseQuantizer):
 
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
+                    if self._micro_batch_n(indices) is not None:
+                        total_loss += self._tune_batch_micro_batched(
+                            block,
+                            indices,
+                            active_inputs,
+                            input_others,
+                            fp_outputs,
+                            input_ids,
+                            tuning_cache,
+                            block_fwd,
+                            mse_loss,
+                            valid_token_mask,
+                            num_elm,
+                            scaler,
+                            loss_device,
+                            _fwd_cache_device,
+                            device,
+                            block_ctx,
+                        )
+                        continue
                     staged = tuning_cache.get(indices) if tuning_cache is not None else None
                     if staged is None:
                         ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)

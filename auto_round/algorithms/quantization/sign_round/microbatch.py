@@ -326,3 +326,43 @@ def plan_1f1b(microbatches: int, stages: int):
         done = in_flight.pop(0)
         ops.extend(("bwd", done, stage) for stage in reversed(range(stages)))
     return ops
+
+
+class DeviceStreamScope:
+    """Cached per-device CUDA streams, re-enterable across forward calls.
+
+    One :func:`device_stream_scope` context creates fresh streams each time,
+    which would break cross-call FIFO ordering. Calibration loops that want
+    pipelined batch forwards keep a single ``DeviceStreamScope`` alive and
+    re-enter ``context()`` around each forward: every forward's ops enqueue
+    on the same per-device streams, so consecutive batches pipeline while
+    per-device order stays FIFO. CPU-only worlds carry no streams and the
+    context is a no-op.
+    """
+
+    def __init__(self, devices, stream_factory=None):
+        import torch
+
+        self.devices = list(devices)
+        cuda_devs = [d for d in self.devices if getattr(d, "type", "cpu") == "cuda"]
+        self.streams = {}
+        if cuda_devs:
+            if stream_factory is None:
+                stream_factory = lambda d: torch.cuda.Stream(device=d)  # noqa: E731
+            self.streams = {d: stream_factory(d) for d in cuda_devs}
+
+    @contextlib.contextmanager
+    def context(self):
+        import torch
+
+        if not self.streams:
+            yield {}
+            return
+        cm_stack = contextlib.ExitStack()
+        try:
+            for dev, stream in self.streams.items():
+                cm_stack.enter_context(torch.cuda.device(dev))
+                cm_stack.enter_context(torch.cuda.stream(stream))
+            yield self.streams
+        finally:
+            cm_stack.close()

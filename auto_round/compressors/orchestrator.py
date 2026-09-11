@@ -137,6 +137,17 @@ class CompressionOrchestrator(BaseOrchestrator):
         if self.calibration is None:
             self.post_init()
 
+        _quantizers = self.alg_composer.block_quantizer
+        _quantizers = _quantizers if isinstance(_quantizers, (list, tuple)) else [_quantizers]
+        _micro_batch = next(
+            (
+                getattr(getattr(q, "config", None), "micro_batch", None)
+                for q in _quantizers
+                if getattr(getattr(q, "config", None), "micro_batch", None)
+            ),
+            None,
+        )
+        self.calibration.micro_batch_pipeline = bool(_micro_batch)
         res = self.calibration(block_names, nsamples, layer_names=layer_names, last_cache_name=last_cache_name)
         # Sync batch_size back in case calibration clamped it due to insufficient samples
         # Tricky setting

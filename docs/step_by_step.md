@@ -846,6 +846,26 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A1
 ~~~
 
 
+#### Micro-batch pipelining on device-mapped blocks
+
+When a transformer block's modules are spread over several GPUs (device-mapped
+blocks, e.g. when a block does not fit a single device), the per-iteration
+forward and backward execute the device-resident segments sequentially —
+only one GPU is busy at a time. `--micro_batch N` splits each tuning
+iteration's forward batch into N micro-batches and pipelines them across the
+devices hosting the block: utilization rises from 1/K to N/(N+K-1) for K
+devices, with identical results (gradients of the micro-batch losses sum to
+the whole-batch gradient exactly; the optimizer still steps once per
+iteration). The calibration collection passes pipeline at chunk granularity
+under the same flag. The sample is the splitting floor — token-dim splitting
+is never used. Values larger than the batch size clamp to it; the flag is
+off by default. On MoE blocks with large expert loops N=4 is the practical
+sweet spot (Python enqueue overhead grows ~2x from N=4 to N=8).
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A16"     --device_map "auto" --micro_batch 4
+~~~
+
 There are typically two scenarios that require multi-GPU tuning: one is the calibration phase mainly for lm-head quantization, and the other is quantizing extremely large models (e.g., models larger than 100 GB).
 
 #### Enable multiple gpus calibration in lm_head quantization

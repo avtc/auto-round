@@ -305,6 +305,17 @@ class LLMCalibrator(Calibrator):
         else:
             self.dataloader = self.dataset
         total_cnt = 0
+        mb_scope = None
+        if getattr(self, "micro_batch_pipeline", False):
+            # pipelined calibration batches: one cached per-device stream scope
+            # for the whole pass, re-entered around every batch forward so the
+            # independent batch forwards enqueue back-to-back and overlap
+            # device-resident segments (chunk-granular pipelining)
+            from auto_round.algorithms.quantization.sign_round.microbatch import DeviceStreamScope
+
+            devs = {p.device for p in self.model.parameters()}
+            devs |= {b.device for b in self.model.buffers()}
+            mb_scope = DeviceStreamScope(devs)
         if self.dataloader.__class__.__name__ == "BatchEncoding":
             self.dataloader = [self.dataloader.data]
 
@@ -404,12 +415,21 @@ class LLMCalibrator(Calibrator):
                 if new_attention_mask is not None and not (isinstance(data_new, dict) and "attention_mask" in data_new):
                     kwargs["attention_mask"] = new_attention_mask
 
-                if isinstance(data_new, torch.Tensor):
-                    self.model(data_new, **kwargs)
-                elif isinstance(data_new, tuple) or isinstance(data_new, list):
-                    self.model(*data_new, **kwargs)
+                if mb_scope is None:
+                    if isinstance(data_new, torch.Tensor):
+                        self.model(data_new, **kwargs)
+                    elif isinstance(data_new, tuple) or isinstance(data_new, list):
+                        self.model(*data_new, **kwargs)
+                    else:
+                        self.model(**data_new, **kwargs)
                 else:
-                    self.model(**data_new, **kwargs)
+                    with mb_scope.context():
+                        if isinstance(data_new, torch.Tensor):
+                            self.model(data_new, **kwargs)
+                        elif isinstance(data_new, tuple) or isinstance(data_new, list):
+                            self.model(*data_new, **kwargs)
+                        else:
+                            self.model(**data_new, **kwargs)
             except NotImplementedError as error:
                 error_msg = str(error)
                 # Re-raise to fallback to CUDA when flash_attn does not support CPU.

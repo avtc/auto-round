@@ -829,6 +829,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A1
 ~~~
 
 
+#### 设备映射分块上的微批流水线
+
+当一个 transformer block 的模块分布在多块 GPU 上（设备映射分块，例如单卡放不下整个 block 的场景），
+每次迭代的正向与反向会按设备段顺序执行——同一时刻只有一块 GPU 在工作。`--micro_batch N`
+将每次调优迭代的正向 batch 切分为 N 个微批并在承载该 block 的多块 GPU 之间流水执行：
+对于 K 块 GPU，利用率从 1/K 提升到 N/(N+K-1)，且结果完全一致（各微批损失的梯度之和
+精确等于整批梯度；优化器仍然每次迭代只更新一次）。标定收集阶段的多个分块前向在同一
+标志下按分块粒度流水执行。切分只发生在样本维度——绝不切分 token 维度。大于 batch size
+的取值会被截断到 batch size；该标志默认关闭。对于带大型专家循环的 MoE block，N=4
+是实际的甜点值（N 从 4 到 8 时 Python 侧入队开销约增长 2 倍）。
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A16"     --device_map "auto" --micro_batch 4
+~~~
+
 通常有两种情况需要启用多 GPU 训练：一是主要针对 lm-head 量化的标定阶段，二是参数量极大（如显存占用超 100GB）的模型。
 
 #### lm_head 量化中开启多 GPU 标定

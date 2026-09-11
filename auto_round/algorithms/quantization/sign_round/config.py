@@ -44,6 +44,15 @@ class SignRoundConfig(QuantizationConfig):
         registry.add_argument(
             "--nblocks", field="nblocks", default=1, type=int, help="Number of blocks to optimize together."
         )
+        registry.add_argument(
+            "--micro_batch",
+            field="micro_batch",
+            default=None,
+            type=int,
+            help="Split each tuning iteration's forward batch into N micro-batches and pipeline "
+            "them across the devices hosting a device-mapped block (default: off; clamped to "
+            "the batch size; collection passes pipeline at chunk granularity regardless of N).",
+        )
         minmax = registry.add_mutually_exclusive_group()
         minmax.add_argument(
             "--enable_minmax_tuning",
@@ -130,6 +139,7 @@ class SignRoundConfig(QuantizationConfig):
         lr_scheduler: Callable | None = None,
         momentum: float = 0.0,
         nblocks: int = 1,
+        micro_batch: int | None = None,
         enable_minmax_tuning: bool = True,
         enable_norm_bias_tuning: bool = False,
         gradient_accumulate_steps: int = 1,
@@ -155,6 +165,12 @@ class SignRoundConfig(QuantizationConfig):
                 scheduler object used by the optimizer.
             momentum: Momentum factor used by the optimizer.
             nblocks: Number of blocks to optimize together.
+            micro_batch: Split each tuning iteration's forward batch into
+                this many micro-batches and pipeline them across the devices
+                hosting a device-mapped block (raise utilization from 1/K to
+                M/(M+K-1)). ``None`` disables (whole-batch forwards);
+                values < 1 warn and disable; larger than the batch size
+                clamps to it.
             enable_minmax_tuning: Whether to tune weight min/max ranges.
             enable_norm_bias_tuning: Whether to tune normalization and
                 bias terms.
@@ -192,6 +208,10 @@ class SignRoundConfig(QuantizationConfig):
         self.lr_scheduler = lr_scheduler
 
         self.nblocks = nblocks
+        self.micro_batch = micro_batch
+        if self.micro_batch is not None and self.micro_batch < 1:
+            logger.warning("`micro_batch` must be >= 1 when set, disabling micro-batching")
+            self.micro_batch = None
         self.momentum = momentum
         self.enable_alg_ext = enable_alg_ext
 
