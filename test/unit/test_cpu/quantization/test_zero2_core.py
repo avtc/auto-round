@@ -22,6 +22,7 @@ download or GPU is needed. The parity anchor compares one ZeRO iteration
 mathematically equivalent full-batch reference.
 """
 
+import copy
 import types
 
 import pytest
@@ -274,3 +275,134 @@ class TestShardMath:
         stage = group._stages[1][tuple(e.param_by_replica[1].shape)].reshape(-1)
         lo, hi = e.bounds[0]
         assert torch.equal(stage[lo:hi], group._v_shard[0][e.uid])
+
+
+class TestScheduler:
+    def test_stage_buffers_reused_across_iterations(self):
+        block, group = _make_group()
+
+        def rep_step(r):
+            loss = torch.mean(group.replicas[r](torch.randn(3, 6)) ** 2)
+            loss.backward()
+
+        stage_ids_before = {k: id(t) for r in range(group.world) for k, t in group._stages[r].items()}
+        for _ in range(3):
+            group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
+            group.sync_grads(_minmax_per_replica(group))
+            group.step(_lr_map(block))
+        stage_ids_after = {k: id(t) for r in range(group.world) for k, t in group._stages[r].items()}
+        assert stage_ids_before == stage_ids_after
+        group.teardown()
+
+    def test_backward_recompute_regathers_per_module(self):
+        """Same-shape modules share one stage; only the backward recompute's
+        re-gather can give module 1 its OWN gradient after module 2's forward
+        overwrote the shared stage."""
+        torch.manual_seed(3)
+        block = _ToyBlock(2)
+        # make the two modules' values distinguishable
+        with torch.no_grad():
+            block.layers[0].v.fill_(0.10)
+            block.layers[1].v.fill_(-0.10)
+        group = ZeroReplicaGroup(block, _CpuPlan(2))
+        x = torch.randn(5, 6)
+
+        # engine grad for module 0 (world=2 halves the batch, but grads on
+        # round leaves deposit the SUM of shard contributions pre-mean --
+        # compare against a reference scaled accordingly)
+        ref_block = copy.deepcopy(block)
+        x_all = torch.cat([x, x])
+        out = ref_block(x_all)
+        loss = torch.mean(out**2)
+        g_ref = torch.autograd.grad(loss, [ref_block.layers[0].params["v"]])[0]
+
+        def rep_step(r):
+            loss_r = torch.mean(group.replicas[r](x) ** 2)
+            loss_r.backward()
+
+        group.run_threaded([lambda r=r: rep_step(r) for r in range(group.world)])
+        group.reduce_inboxes()
+        # engine grad shard for module 0: each replica contributed
+        # d(mean over its shard) -- two equal shards sum to the full-batch
+        # mean gradient (no 1/world scaling in the deposit, matching the
+        # full-mirror lane where sync divides by world at exchange; here the
+        # owner folds raw deposits, so compare after multiplying by world)
+        e0 = next(e for e in group.entries if e.module_name == "layers.0")
+        g_engine = torch.cat([group._g_shard[o][e0.uid] for o in range(group.world)])
+        # deposits hold the SUM of the two equal-size shard-mean grads, i.e.
+        # world x the full-batch mean gradient (sign-invariant at the step)
+        assert torch.allclose(g_engine, group.world * g_ref.reshape(-1), atol=5e-2)
+        group.teardown()
+
+    def test_multi_iteration_progression_matches_reference(self):
+        """Three iterations of the full ZeRO cycle == three manual
+        full-batch sign steps (bf16 transport tolerance)."""
+        torch.manual_seed(23)
+        block = _ToyBlock(2)
+        xs = [torch.randn(3, 6) for _ in range(4)]
+        ws = [torch.randn(3, 4) for _ in range(4)]
+        lr = 0.1
+        group = ZeroReplicaGroup(block, _CpuPlan(2))
+        shards = [[0, 2], [1, 3]]
+        for _it in range(3):
+            losses = [None, None]
+
+            def rep_step(r):
+                rep = group.replicas[r]
+                x = torch.cat([xs[j] for j in shards[r]])
+                y = torch.cat([ws[j] for j in shards[r]])
+                loss = torch.mean((rep(x) - y) ** 2)
+                losses[r] = loss.item()
+                loss.backward()
+
+            group.run_threaded([lambda r=r: rep_step(r) for r in range(2)])
+            group.reduce_inboxes()
+            group.step(_lr_map(block, lr))
+        group.capture_best()
+        group.teardown()
+        zero_vs = {n: m.params["v"].detach().clone() for n, m in block.named_modules() if is_zero_candidate(m)}
+
+        torch.manual_seed(23)
+        ref = _ToyBlock(2)
+        for _it in range(3):
+            out = ref(torch.cat(xs))
+            loss = torch.mean((out - torch.cat(ws)) ** 2)
+            loss.backward()
+            with torch.no_grad():
+                for _, m in ref.named_modules():
+                    if is_zero_candidate(m):
+                        m.params["v"].sub_(torch.sign(m.params["v"].grad), alpha=lr)
+                        m.params["v"].grad = None
+        for n, m in ref.named_modules():
+            if is_zero_candidate(m):
+                assert torch.allclose(zero_vs[n], m.params["v"].detach(), atol=5e-2), n
+
+
+class TestEngagement:
+    def test_world_one_rejected(self):
+        block = _ToyBlock(1)
+        with pytest.raises(ValueError):
+            ZeroReplicaGroup(block, _CpuPlan(1))
+
+    def test_no_round_params_rejected(self):
+        class _Plain(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.lin(x)
+
+        with pytest.raises(ValueError):
+            ZeroReplicaGroup(_Plain(), _CpuPlan(2))
+
+
+def _minmax_per_replica(group):
+    out = []
+    for rep in group.replicas:
+        ps = []
+        for _, m in rep.named_modules():
+            if is_zero_candidate(m):
+                ps.append(m.params["scale_max"])
+        out.append(ps)
+    return out
