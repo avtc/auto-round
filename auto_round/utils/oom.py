@@ -41,16 +41,28 @@ def _group_tensors_by_shape(objs) -> list:
     Covers every non-cpu accelerator (cuda, hpu, xpu, mps, ...): the census
     must name the residents on whichever device ran out.
     """
+
+    def _shape_key(shape) -> tuple:
+        try:
+            return tuple(int(d) for d in shape)
+        except Exception:  # symbolic dims (SymInt) or exotic shapes: stringify
+            return (str(tuple(shape)),)
+
     groups: dict = {}
     for obj in objs:
-        if isinstance(obj, torch.Tensor) and obj.device.type not in ("cpu", "meta"):
-            key = (str(obj.device), str(obj.dtype), tuple(obj.shape))
-            g = groups.get(key)
-            if g is None:
-                groups[key] = [1, obj.numel() * obj.element_size()]
-            else:
-                g[0] += 1
-                g[1] += obj.numel() * obj.element_size()
+        try:
+            if not isinstance(obj, torch.Tensor) or obj.device.type in ("cpu", "meta"):
+                continue
+            key = (str(obj.device), str(obj.dtype), _shape_key(obj.shape))
+            nbytes = obj.numel() * obj.element_size()
+        except Exception:  # one unreadable tensor must never kill the census
+            continue
+        g = groups.get(key)
+        if g is None:
+            groups[key] = [1, nbytes]
+        else:
+            g[0] += 1
+            g[1] += nbytes
     return sorted(groups.items(), key=lambda kv: -kv[1][1])
 
 

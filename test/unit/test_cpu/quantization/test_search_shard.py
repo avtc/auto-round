@@ -295,6 +295,30 @@ class TestOomCensus(unittest.TestCase):
         self.assertTrue(installed)
         self.assertEqual(census.call_count, 1)
 
+    def test_symbolic_dims_and_bad_tensors_do_not_kill_census(self):
+        import auto_round.utils.oom as oom_mod
+
+        class UnhashableDim:
+            def __int__(self):
+                raise TypeError("cannot convert SymInt to int")
+
+            def __hash__(self):
+                raise TypeError("unhashable")
+
+        class SymishTensor(torch.Tensor):
+            pass
+
+        t = torch.randn(4, 4)
+        with mock.patch.object(type(t), "shape", new_callable=lambda *a: property(lambda self: (UnhashableDim(),))):
+            groups = oom_mod._group_tensors_by_shape([t])
+        self.assertEqual(groups, [])  # cpu tensor anyway excluded; symbolic shape did not raise
+
+        class ExplodingTensor:
+            pass
+
+        groups = oom_mod._group_tensors_by_shape([ExplodingTensor(), torch.randn(4, 4)])
+        self.assertEqual(groups, [])
+
     def test_cpu_tensors_excluded_from_census_groups(self):
         # cpu-only box: grouping must not count cpu (or meta) tensors
         import auto_round.utils.oom as oom_mod
