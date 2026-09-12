@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time as _ptime
+
 import torch
 
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.rtn.config import OptimizedRTNConfig, RTNConfig
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.logger import logger
+
+
+def _rtn_phase_line(norm, quant, n, mean, max_):
+    """Format the zero-shot RTN phase breakdown for AR_PERF_COUNTERS."""
+    return "[perf] rtn phases: norm=%.2fs quant=%.2fs (n=%d, mean=%.3fs, max=%.3fs)" % (norm, quant, n, mean, max_)
+
+
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
     check_to_quantized,
@@ -136,16 +145,34 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         # optimized RTN scale search is weight-local (weight + imatrix), so on a
         # block whose layers sit on several devices the searches run in
         # parallel, one worker per device.
+        import auto_round.envs as _envs
         from auto_round.algorithms.quantization import search_shard
 
+        _perf = bool(getattr(_envs, "AR_PERF_COUNTERS", False))
+        _t_norm = _ptime.perf_counter()
         for _name, m in block.named_modules():
             if hasattr(m, "imatrix"):
                 m.imatrix /= m.imatrix_cnt
+        _t_q0 = _ptime.perf_counter()
+        _n = 0
+        _q_max = 0.0
         work = [m for _name, m in block.named_modules() if hasattr(m, "global_name") and check_to_quantized(m)]
         groups = search_shard.group_items_by_device(work, device_of=lambda m: str(getattr(m, "tuning_device", "cpu")))
+
+        def _quantize_counted(m):
+            nonlocal _n, _q_max
+            _l0 = _ptime.perf_counter() if _perf else 0.0
+            self.quantize_layer_outside_block(m)
+            if _perf:
+                _q_max = max(_q_max, _ptime.perf_counter() - _l0)
+            _n += 1
+
         if search_shard.shard_eligible(groups.keys()) and not search_shard.shard_disabled_by_env():
-            search_shard.run_items_by_device(groups, lambda _idx, m: self.quantize_layer_outside_block(m))
+            search_shard.run_items_by_device(groups, lambda _idx, m: _quantize_counted(m))
             search_shard.log_engaged_once("optimized rtn search")
         else:
             for m in work:
-                self.quantize_layer_outside_block(m)
+                _quantize_counted(m)
+        if _perf:
+            _t_q1 = _ptime.perf_counter()
+            logger.info("%s", _rtn_phase_line(_t_q0 - _t_norm, _t_q1 - _t_q0, _n, (_t_q1 - _t_q0) / max(_n, 1), _q_max))
