@@ -239,7 +239,7 @@ def _batch_cap(group, device_key, max_batch):
     if max_batch is not None:
         return max(1, max_batch)
     inputs0 = group[0]._deferred_search_inputs
-    elements_per_module = inputs0[0].numel() + inputs0[3].numel()
+    elements_per_module = inputs0[0].numel() + (inputs0[3].numel() if inputs0[3] is not None else 0)
     # the search is bandwidth-bound: batches beyond ~1 GiB of stacked weights move
     # the same total bytes, so the fixed element budget only lowers transient VRAM
     elem_cap = max(1, _wrap_batch_max_elems() // max(elements_per_module, 1))
@@ -314,7 +314,19 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
                 search_fn = inputs0[5]
                 stacked_w = torch.stack([w._deferred_search_inputs[0] for w in chunk])
                 stacked_im = torch.stack([w._deferred_search_inputs[3] for w in chunk])
-                results = search_fn(stacked_w, _bits, stacked_im)
+                try:
+                    results = search_fn(stacked_w, _bits, stacked_im)
+                except torch.OutOfMemoryError:
+                    logger.warning(
+                        "[search-shard] stacked wrap search OOM (%d modules); finishing this chunk "
+                        "per-module (shrink batches with AR_WRAP_SEARCH_BATCH_GB or disable with "
+                        "AR_DISABLE_SEARCH_SHARD=1)",
+                        len(chunk),
+                    )
+                    for w in chunk:
+                        w._run_deferred_search_now()
+                    stats[device_key]["singletons"] += len(chunk)
+                    continue
                 for w, res in zip(chunk, results):
                     w.finalize_batched_search(res)
                 stats[device_key]["batches"] += 1

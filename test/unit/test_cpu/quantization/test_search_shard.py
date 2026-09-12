@@ -213,35 +213,34 @@ class TestWrapperBlockShard(unittest.TestCase):
 
 
 class TestRtnSearchShard(unittest.TestCase):
-    def test_optimized_rtn_quantize_block_shards(self):
+    def test_optimized_rtn_stages_into_batched_driver(self):
         from auto_round.algorithms.quantization.rtn.quantizer import OptimizedRTNQuantizer
 
         q = object.__new__(OptimizedRTNQuantizer)
-        calls = []
-        lock = threading.Lock()
+        staged_seen = []
+        # 'model' is a read-only property; the patched driver ignores it anyway
 
-        def fake_outside_block(m):
-            with lock:
-                calls.append((m.name, threading.current_thread().name))
-
-        q.quantize_layer_outside_block = fake_outside_block
+        def fake_via_rtn(self_, m, disable_opt_rtn=None, defer_search=False):
+            assert defer_search is True
+            staged_seen.append((getattr(m, "global_name", None), m))
+            return "wrapper"
 
         block = torch.nn.Module()
-        for i, dev in enumerate(["cuda:0", "cuda:1", "cuda:0"]):
+        for i in range(3):
             m = _linear()
             m.name = f"m{i}"
-            m.tuning_device = dev
-            setattr(block, f"m{i}", m)
             m.global_name = f"m{i}"
+            setattr(block, f"m{i}", m)
 
-        with mock.patch.object(search_shard, "shard_eligible", return_value=True):
+        with mock.patch.object(type(q), "_quantize_layer_via_rtn", fake_via_rtn), mock.patch.object(
+            type(q), "model", torch.nn.Module()
+        ), mock.patch(
+            "auto_round.algorithms.quantization.rtn.batched_search.run_batched_rtn_search",
+            side_effect=lambda model, staged: staged_seen.extend([]) or [],
+        ) as drv:
             q.quantize_block(block, None, None, None, None, None)
-        order = [c[0] for c in calls]
-        self.assertEqual(sorted(order), ["m0", "m1", "m2"])
-        # same-device items keep their relative order; cross-device interleaving is scheduler-dependent
-        self.assertLess(order.index("m0"), order.index("m2"))
-        names = {c[0]: c[1] for c in calls}
-        self.assertNotEqual(names["m0"], names["m1"])
+        self.assertEqual(drv.call_count, 1)
+        self.assertEqual([n for n, _m in staged_seen], ["m0", "m1", "m2"])
 
     def test_single_device_runs_serial(self):
         from auto_round.algorithms.quantization.rtn.quantizer import OptimizedRTNQuantizer
@@ -257,7 +256,8 @@ class TestRtnSearchShard(unittest.TestCase):
         m.global_name = "m0"
         m.tuning_device = "cpu"
         block.m0 = m
-        q.quantize_block(block, None, None, None, None, None)
+        with mock.patch.object(search_shard, "shard_disabled_by_env", return_value=True):
+            q.quantize_block(block, None, None, None, None, None)
         self.assertEqual(calls, [caller])
 
 

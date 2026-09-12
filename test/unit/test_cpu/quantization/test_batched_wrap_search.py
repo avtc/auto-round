@@ -384,3 +384,112 @@ class TestWrapperBlockDrivesBatching(unittest.TestCase):
         self.assertEqual(stats["inline"], 3)  # no deferral at all under the kill switch
         self.assertEqual(stats["now"], 0)
         self.assertIsNotNone(block.l0.init_scale)
+
+
+class TestBatchedRtnSearchParity(unittest.TestCase):
+    """iters=0 batching: stacked vs serial must be bit-identical (incl. the imatrix path)."""
+
+    def _layer(self, seed, sym=True, with_imatrix=True):
+        import torch.nn as nn
+
+        g = torch.Generator().manual_seed(seed)
+        layer = nn.Linear(128, 64, bias=False)
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn(64, 128, generator=g))
+        layer.data_type = "int"
+        layer.bits = 4
+        layer.sym = sym
+        layer.group_size = 128
+        layer.iters = 0
+        layer.act_bits = 16
+        layer.scale_dtype = torch.float16
+        if with_imatrix:
+            layer.imatrix = torch.rand(128, generator=g) + 0.5
+        return layer
+
+    def _make_wrapper(self, layer):
+        from auto_round.wrapper import WrapperLinear
+
+        return WrapperLinear(
+            layer,
+            device="cpu",
+            enable_minmax_tuning=False,
+            enable_norm_bias_tuning=False,
+            enable_round_tuning=False,
+            enable_torch_compile=False,
+            disable_opt_rtn=False,
+            iters=0,
+        )
+
+    def _run(self, sym, with_imatrix):
+        from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+
+        # serial arm (production callers run under no_grad)
+        serial = []
+        with torch.no_grad():
+            for i in range(3):
+                layer = self._layer(seed=i, sym=sym, with_imatrix=with_imatrix)
+                w = self._make_wrapper(layer)
+                out = w.unwrapper({})
+                serial.append((out.weight.data.clone(), out.scale, out.zp))
+        # batched arm
+        import torch.nn as nn
+
+        model = nn.Module()
+        staged = []
+        for i in range(3):
+            layer = self._layer(seed=i, sym=sym, with_imatrix=with_imatrix)
+            setattr(model, f"l{i}", layer)
+            w = self._make_wrapper(layer)
+            staged.append((f"l{i}", w))
+        leftovers = run_batched_rtn_search(model, staged)
+        self.assertEqual(leftovers, [])
+        for i in range(3):
+            got = getattr(model, f"l{i}")
+            ref_w, ref_scale, ref_zp = serial[i]
+            self.assertTrue(torch.equal(got.weight.data, ref_w), f"weight mismatch module {i}")
+            if isinstance(ref_scale, torch.Tensor):
+                self.assertTrue(torch.equal(got.scale, ref_scale), f"scale mismatch module {i}")
+            if ref_zp is not None and isinstance(ref_zp, torch.Tensor):
+                self.assertTrue(torch.equal(got.zp, ref_zp), f"zp mismatch module {i}")
+
+    def test_parity_sym_with_imatrix(self):
+        self._run(sym=True, with_imatrix=True)
+
+    def test_parity_sym_no_imatrix(self):
+        self._run(sym=True, with_imatrix=False)
+
+    def test_parity_asym_with_imatrix(self):
+        self._run(sym=False, with_imatrix=True)
+
+    def test_oom_chunk_falls_back_per_module(self):
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.rtn import batched_search
+
+        model = nn.Module()
+        staged = []
+        for i in range(2):
+            layer = self._layer(seed=i)
+            setattr(model, f"l{i}", layer)
+            staged.append((f"l{i}", self._make_wrapper(layer)))
+        real_fn = staged[0][1].weight_quant_func
+        calls = {"n": 0, "raised": 0}
+
+        def boom(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:  # only the stacked call raises; per-module fallback delegates
+                calls["raised"] += 1
+                raise torch.OutOfMemoryError("simulated")
+            return real_fn(*a, **k)
+
+        # patch BOTH wrappers with the SAME callable so the group key still matches
+        with mock.patch.object(staged[0][1], "weight_quant_func", boom), mock.patch.object(
+            staged[1][1], "weight_quant_func", boom
+        ):
+            leftovers = batched_search.run_batched_rtn_search(model, staged)
+        self.assertEqual(calls["raised"], 1)  # the stacked call raised exactly once
+        self.assertEqual(calls["n"], 3)  # then the two per-module fallbacks delegated to the real fn
+        for i in range(2):
+            got = getattr(model, f"l{i}")
+            self.assertIsNotNone(getattr(got, "scale", None))  # per-module fallback quantized it

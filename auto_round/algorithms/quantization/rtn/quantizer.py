@@ -30,6 +30,7 @@ def _rtn_phase_line(norm, quant, n, mean, max_):
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
     check_to_quantized,
+    set_module,
 )
 
 
@@ -157,7 +158,6 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         _n = 0
         _q_max = 0.0
         work = [m for _name, m in block.named_modules() if hasattr(m, "global_name") and check_to_quantized(m)]
-        groups = search_shard.group_items_by_device(work, device_of=lambda m: str(getattr(m, "tuning_device", "cpu")))
 
         def _quantize_counted(m):
             nonlocal _n, _q_max
@@ -167,9 +167,28 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                 _q_max = max(_q_max, _ptime.perf_counter() - _l0)
             _n += 1
 
-        if search_shard.shard_eligible(groups.keys()) and not search_shard.shard_disabled_by_env():
-            search_shard.run_items_by_device(groups, lambda _idx, m: _quantize_counted(m))
-            search_shard.log_engaged_once("optimized rtn search")
+        def _quantize_staged(name, m):
+            nonlocal _n
+            _l0 = _ptime.perf_counter() if _perf else 0.0
+            w = self._quantize_layer_via_rtn(m, defer_search=True)
+            if _perf:
+                _q_max = max(_q_max, _ptime.perf_counter() - _l0)
+            _n += 1
+            return name, w
+
+        if not search_shard.shard_disabled_by_env():
+            from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+
+            staged = []
+            for m in work:
+                name, w = _quantize_staged(getattr(m, "global_name", None) or "", m)
+                if w is not None:  # None = OOM fallback already finished it serially
+                    staged.append((name, w))
+            leftovers = run_batched_rtn_search(self.model, staged)
+            for _name, w in leftovers:
+                layer = w.unwrapper({})
+                set_module(self.model, _name, layer)
+            search_shard.log_engaged_once("batched rtn search")
         else:
             for m in work:
                 _quantize_counted(m)
