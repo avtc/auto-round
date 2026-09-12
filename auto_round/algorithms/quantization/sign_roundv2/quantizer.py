@@ -322,10 +322,15 @@ class SignRoundDQWrapperLinear(WrapperLinear):
 class SignRoundV2Quantizer(SignRoundQuantizer):
     """SignRound variant using the open algorithm-extension path in the new architecture."""
 
-    # Micro-batching opt-out: the V2 loss drops outlier supervision per
-    # selection (top-k over the batch), so per-slice weighted means cannot
-    # reproduce the whole-batch loss; the base class declines with a warning.
-    micro_batch_supported = False
+    @property
+    def micro_batch_supported(self) -> bool:
+        # The outlier-suppressed loss drops the batch-wide top-0.1% error
+        # elements, so per-slice weighted means cannot reproduce the
+        # whole-batch loss; opt out there (symmetric int/mx/nv schemes with
+        # act_bits <= 4 or bits < 4). Every other recipe delegates to the
+        # base masked-MSE loss, which decomposes exactly across slices, so
+        # micro-batching stays sound for those.
+        return not getattr(self, "_use_outlier_suppressed_loss", False)
 
     def __init__(self, config: SignRoundConfig) -> None:
         super().__init__(config)

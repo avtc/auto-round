@@ -860,7 +860,9 @@ the whole-batch gradient exactly up to floating-point reduction order, and
 the optimizer still steps once per iteration. The calibration collection passes pipeline at chunk granularity
 under the same flag. The sample is the splitting floor — token-dim splitting
 is never used. Values larger than the batch size clamp to it; the flag is
-off by default. On MoE blocks with large expert loops N=4 is the practical
+off by default. Recipes whose loss drops the batch-wide top outlier elements
+(the SignRoundV2 outlier-supervised low-bit/act-quant loss) stay serial with a
+one-time warning, since per-slice weighted means cannot reproduce that loss. On MoE blocks with large expert loops N=4 is the practical
 sweet spot (Python enqueue overhead grows ~2x from N=4 to N=8).
 
 ~~~bash

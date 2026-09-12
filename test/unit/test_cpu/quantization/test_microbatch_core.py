@@ -613,10 +613,29 @@ class TestMicroBatchDeclineGuards:
         assert q._micro_batch_n(torch.arange(4), block_ctx=last) is None
         assert q._micro_batch_n(torch.arange(4), block_ctx=mid) == 2
 
-    def test_v2_quantizer_class_opts_out(self):
+    def _v2(self, outlier_loss: bool):
         from auto_round.algorithms.quantization.sign_roundv2.quantizer import SignRoundV2Quantizer
 
-        assert SignRoundV2Quantizer.micro_batch_supported is False
+        q = object.__new__(SignRoundV2Quantizer)  # skip the heavy __init__
+        q._use_outlier_suppressed_loss = outlier_loss
+        return q
+
+    def test_v2_plain_mse_recipe_supports_micro_batch(self):
+        # W4A16/W8A16-style recipes never activate the outlier-suppressed loss:
+        # the loss delegates to the base masked MSE, which decomposes across slices.
+        assert self._v2(outlier_loss=False).micro_batch_supported is True
+
+    def test_v2_outlier_loss_recipe_opts_out(self):
+        # Low-bit / act-quant recipes select the batch-wide top-0.1% error
+        # elements; per-slice weighted means cannot reproduce that loss.
+        from types import SimpleNamespace
+
+        import torch
+
+        q = self._v2(outlier_loss=True)
+        assert q.micro_batch_supported is False
+        q.config = SimpleNamespace(micro_batch=2)
+        assert q._micro_batch_n(torch.arange(4)) is None
 
 
 class TestMicroBatchedMaskedParity(unittest.TestCase):
