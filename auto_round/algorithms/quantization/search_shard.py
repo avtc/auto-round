@@ -27,6 +27,7 @@ weight-local and must stay on their serial paths.
 """
 
 import threading
+import time
 from collections import OrderedDict
 
 import torch
@@ -267,6 +268,8 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
         dev = _wrap_batch_device_of(inputs)
         device_groups.setdefault(dev, []).append(w)
 
+    stats = {dev: {"modules": 0, "batches": 0, "singletons": 0} for dev in device_groups}
+
     def _run_one(wrapper):
         inputs = wrapper._deferred_search_inputs
         if inputs is None:
@@ -275,12 +278,14 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
         wrapper.finalize_batched_search(search_fn(weight, bits, imatrix))
 
     def _run_device(device_key, wrappers):
+        _t0 = time.perf_counter()
         by_key = OrderedDict()
         for w in wrappers:
             by_key.setdefault(_wrap_batch_key(w._deferred_search_inputs), []).append(w)
         for _key, group in by_key.items():
             if len(group) < 2:
                 _run_one(group[0])
+                stats[device_key]["singletons"] += 1
                 continue
             cap = _batch_cap(group, device_key, max_batch)
             for start in range(0, len(group), cap):
@@ -293,6 +298,9 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
                 results = search_fn(stacked_w, _bits, stacked_im)
                 for w, res in zip(chunk, results):
                     w.finalize_batched_search(res)
+                stats[device_key]["batches"] += 1
+        stats[device_key]["modules"] = len(wrappers)
+        stats[device_key]["wall"] = time.perf_counter() - _t0
 
     if len(device_groups) > 1:
         keyed = group_items_by_device(
@@ -304,4 +312,20 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
     else:
         for dev, ws in device_groups.items():
             _run_device(dev, ws)
+    log_engaged_once("batched wrap search")
+    _t_total = sum(st.get("wall", 0.0) for st in stats.values())
+    _n_mod = sum(st["modules"] for st in stats.values())
+    _n_batch = sum(st["batches"] for st in stats.values())
+    _n_single = sum(st["singletons"] for st in stats.values())
+    per_device = " ".join(f"{dev}={st.get('wall', 0.0):.2f}s" for dev, st in stats.items())
+    logger.debug(
+        "[search-shard] wrap search: %d modules, %d batch + %d singleton search calls, "
+        "%.2fs device-wall (%.2fs summed) [%s]",
+        _n_mod,
+        _n_batch,
+        _n_single,
+        max(st.get("wall", 0.0) for st in stats.values()),
+        _t_total,
+        per_device,
+    )
     return True
