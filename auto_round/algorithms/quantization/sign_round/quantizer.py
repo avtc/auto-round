@@ -515,6 +515,26 @@ class SignRoundQuantizer(BaseQuantizer):
 
             run_deferred_wrap_searches(block, None)
 
+        # wrapped-init checksum: one float over every tunable entry of the
+        # wrapped block (scales, min/max, rounding values, init_scale). The
+        # wrap searches are deterministic given (weight, imatrix), so THIS
+        # NUMBER MUST MATCH across serial / ddp / mapped-dp runs of the same
+        # block -- a mismatch indicts a mode-dependent search input (e.g. an
+        # imatrix fold bug); a match proves any iter-0 loss difference is
+        # sample-draw noise alone.
+        _ck_sum = 0.0
+        _ck_n = 0
+        for _n, _m in block.named_modules():
+            if hasattr(_m, "orig_layer"):
+                _ck_n += 1
+                for _v in getattr(_m, "params", {}).values():
+                    if torch.is_tensor(_v):
+                        _ck_sum += float(_v.double().abs().sum())
+                _is = getattr(_m, "init_scale", None)
+                if torch.is_tensor(_is):
+                    _ck_sum += float(_is.double().abs().sum())
+        logger.info("[tune] wrapped-init checksum: block layers=%d sum=%.6e", _ck_n, _ck_sum)
+
         def _collect_tuning_params(mod):
             """Collect (round, minmax) params + per-lr groups from a wrapped block."""
             r_params, m_params = [], []
@@ -768,6 +788,10 @@ class SignRoundQuantizer(BaseQuantizer):
                         global_indices = index_sampler.next_batch()
                         _shard = len(global_indices) // _world
                         _shards = [global_indices[r * _shard : (r + 1) * _shard] for r in range(_world)]
+                    if i == 0:
+                        logger.debug(
+                            "[tune] iter 0 draw: shards=%s (serial-equivalent batch=%s)", _shards, global_indices
+                        )
                     if valid_token_mask is not None:
                         # same global normalization as the serial path (reporting only)
                         num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
@@ -830,6 +854,8 @@ class SignRoundQuantizer(BaseQuantizer):
                     _t_iter = _ptime.perf_counter()
                     _t0 = _ptime.perf_counter()
                     global_indices = index_sampler.next_batch()
+                    if i == 0:
+                        logger.debug("[tune] iter 0 draw: batch=%s", global_indices)
                     if valid_token_mask:
                         num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
                     _tp["loop_prep_pending"] = _tp.get("loop_prep_pending", 0.0) + (_ptime.perf_counter() - _t0)
