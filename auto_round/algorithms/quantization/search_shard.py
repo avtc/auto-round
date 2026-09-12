@@ -323,6 +323,7 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
                         "AR_DISABLE_SEARCH_SHARD=1)",
                         len(chunk),
                     )
+                    dump_oom_tensor_census_("wrap search")
                     for w in chunk:
                         w._run_deferred_search_now()
                     stats[device_key]["singletons"] += len(chunk)
@@ -359,3 +360,41 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
         per_device,
     )
     return True
+
+
+def _group_tensors_by_shape(objs) -> list:
+    """(device, dtype, shape) -> [count, bytes] over cuda tensors; sorted by bytes."""
+    groups: dict = {}
+    for obj in objs:
+        if isinstance(obj, torch.Tensor) and obj.device.type == "cuda":
+            key = (str(obj.device), str(obj.dtype), tuple(obj.shape))
+            g = groups.get(key)
+            if g is None:
+                groups[key] = [1, obj.numel() * obj.element_size()]
+            else:
+                g[0] += 1
+                g[1] += obj.numel() * obj.element_size()
+    return sorted(groups.items(), key=lambda kv: -kv[1][1])
+
+
+def dump_oom_tensor_census_(context: str = "") -> None:
+    """Tensor census at OOM time: per-device allocator state + top tensor groups.
+
+    Names the accumulating residents (a leak shows as one (shape, dtype)
+    group growing across blocks). Best effort: never masks the OOM itself.
+    """
+    import gc
+
+    try:
+        for idx in range(torch.cuda.device_count()):
+            logger.error(
+                "[oom] cuda:%s allocated=%.2fGiB reserved=%.2fGiB",
+                idx,
+                torch.cuda.memory_allocated(idx) / 2**30,
+                torch.cuda.memory_reserved(idx) / 2**30,
+            )
+        top = _group_tensors_by_shape(gc.get_objects())[:8]
+        for (_dev, _dt, _shape), (_cnt, _nb) in top:
+            logger.error("[oom] %s %s %s x%d = %.2fGiB", _dev, _dt, list(_shape), _cnt, _nb / 2**30)
+    except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
+        logger.error("[oom] tensor census failed (%s)", e)

@@ -32,6 +32,7 @@ import torch
 from auto_round.algorithms.quantization.search_shard import (
     _batch_cap,
     _fn_key,
+    dump_oom_tensor_census_,
     group_items_by_device,
     run_items_by_device,
 )
@@ -144,6 +145,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
                         "(shrink batches with AR_WRAP_SEARCH_BATCH_GB or disable with AR_DISABLE_SEARCH_SHARD=1)",
                         len(chunk),
                     )
+                    dump_oom_tensor_census_("rtn batched search")
                     for e in chunk:
                         _finish_one(e)
                     continue

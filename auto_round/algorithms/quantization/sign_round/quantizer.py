@@ -950,7 +950,13 @@ class SignRoundQuantizer(BaseQuantizer):
         The scaled loss.
         """
         scale_loss = loss * 1000
-        scale_loss.backward()
+        try:
+            scale_loss.backward()
+        except torch.OutOfMemoryError:
+            from auto_round.algorithms.quantization.search_shard import dump_oom_tensor_census_
+
+            dump_oom_tensor_census_("tune backward")
+            raise
         if is_hpex_available():
             htcore.mark_step()
         return scale_loss

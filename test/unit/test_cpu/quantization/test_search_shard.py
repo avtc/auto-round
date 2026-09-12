@@ -261,6 +261,16 @@ class TestRtnSearchShard(unittest.TestCase):
         self.assertEqual(calls, [caller])
 
 
+class TestOomCensus(unittest.TestCase):
+    def test_census_never_masks_and_never_raises(self):
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+
+        # CPU-only box: the census must swallow its own failures and return cleanly
+        shard_mod.dump_oom_tensor_census_("test")
+        with mock.patch.object(shard_mod, "_group_tensors_by_shape", side_effect=RuntimeError("boom")):
+            shard_mod.dump_oom_tensor_census_("test")  # diagnostics failure swallowed
+
+
 class TestTunePhaseLine(unittest.TestCase):
     def _fmt(self):
         from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
