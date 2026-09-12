@@ -292,6 +292,34 @@ class TestRealV2Construction(unittest.TestCase):
         self.assertIsNone(w._deferred_search_inputs)  # old callers unchanged
 
 
+class TestWorkerBucketKeys(unittest.TestCase):
+    def test_multi_worker_keys_are_device_parseable(self):
+        """Regression: the threading key once carried the chunk entry dict itself."""
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.rtn import batched_search
+
+        model = nn.Module()
+        staged = []
+        for i in range(2):
+            layer = TestBatchedRtnSearchParity()._layer(seed=i)
+            setattr(model, f"l{i}", layer)
+            staged.append((f"l{i}", TestBatchedRtnSearchParity()._make_wrapper(layer)))
+        captured = {}
+
+        def fake_run(keyed, fn):
+            captured["keys"] = list(keyed.keys())
+
+        with mock.patch.object(
+            batched_search, "pick_search_worker_devices", return_value=["cuda:9"]
+        ), mock.patch.object(batched_search, "run_items_by_device", side_effect=fake_run):
+            batched_search.run_batched_rtn_search(model, staged)
+        # distinct worker bucket vs home -> multi-bucket path taken; every key must parse
+        self.assertEqual(sorted(captured["keys"]), ["cpu", "cuda:9"])
+        for k in captured["keys"]:
+            torch.device(k)  # the exact operation that crashed on the server
+
+
 class TestKwargRelocation(unittest.TestCase):
     def test_non_tensors_and_cpu_scalars_untouched(self):
         from auto_round.algorithms.quantization.rtn.batched_search import _relocate_tensor_kwargs

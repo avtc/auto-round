@@ -157,10 +157,16 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             ", ".join(f"{w}:{len(cs)}" for w, cs in buckets.items()),
         )
 
-    def _run_chunk(chunk):
+    def _worker_of(chunks):
+        for wk, cs in buckets.items():
+            if any(c is chunks[0] for c in cs):
+                return str(wk)
+        return str(chunks[0][0]["weight"].device)
+
+    def _run_chunk(chunk, worker):
         w0 = chunk[0]["w"]
         dev = str(chunk[0]["weight"].device)
-        worker = str(next(wk for wk, cs in buckets.items() if any(c is chunk for c in cs)))
+        worker = str(worker)
         if len(chunk) == 1:
             layer = chunk[0]["w"].unwrapper({})
             set_module(model, chunk[0]["name"], layer)
@@ -198,16 +204,15 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             e["w"]._apply_qdq(qdq[i], scale_parts[i], zp_parts[i])
             set_module(model, e["name"], e["w"].orig_layer)
 
-    def _run_worker(_worker_key, worker_chunks):
-        for chunk in worker_chunks:
-            _run_chunk(chunk)
-
     if len(buckets) > 1:
-        keyed = group_items_by_device(list(buckets.values()), device_of=lambda cs: str(cs[0][0]))
-        run_items_by_device(keyed, lambda _idx, cs: _run_worker(str(cs[0][0]), cs))
+        keyed = OrderedDict()
+        for wk, cs in buckets.items():
+            keyed.setdefault(str(wk), []).append((len(keyed), cs))
+        run_items_by_device(keyed, lambda _idx, cs: [_run_chunk(c, _worker_of(c)) for c in cs])
     else:
-        for wk, wcs in buckets.items():
-            _run_worker(wk, wcs)
+        for wcs in buckets.values():
+            for c in wcs:
+                _run_chunk(c, _worker_of(c))
     return []
 
 
