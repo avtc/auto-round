@@ -242,7 +242,7 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 ```
 
 ### AR_DISABLE_SEARCH_SHARD
-- **Description**: Disables running weight-local wrap-time quantization searches (SignRoundV2 init-scale, GGUF DQ scale, optimized-RTN scale search) in parallel across the devices that host the sharded weights. By default, when a block's weights span two or more CUDA devices, one worker thread per device runs the searches concurrently; each search only reads its own module's weight plus per-module statistics, so results are identical to the serial path. Set this to fall back to the fully serial search loop (e.g. for debugging).
+- **Description**: Disables the weight-local wrap-time search optimizations: stacked same-shape batch searches for the SignRoundV2 init-scale search (modules sharing device/shape/config are searched in one call with bit-identical per-module results) and per-device parallel execution of the optimized-RTN iters=0 searches. Each search only reads its own module's weight plus per-module statistics. Set this to fall back to the fully per-module serial search loop (e.g. for debugging).
 - **Default**: `0` (sharding enabled when weights span multiple CUDA devices)
 - **Valid Values**: `0` / `1`
 - **Usage**: Kill switch for the per-device search parallelism.

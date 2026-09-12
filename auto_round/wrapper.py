@@ -818,6 +818,13 @@ def wrapper_block(
         elif enable_norm_bias_tuning and "norm" in m.__class__.__name__.lower():
             work.append((n, m, "norm"))
 
+    from auto_round.algorithms.quantization import search_shard
+
+    _defer_batch = (
+        bool(getattr(wrapper_cls, "supports_batched_search", False)) and not search_shard.shard_disabled_by_env()
+    )
+    deferred_wrappers = []
+
     def _wrap_one(n, m, kind):
         if kind == "norm":
             if m.__class__.__name__ in NORM_MAPPING.keys():
@@ -836,6 +843,7 @@ def wrapper_block(
             return None
         if kind == "skip":
             return "u"
+        extra = {"defer_search": True} if _defer_batch else {}
         new_m = wrapper_cls(
             m,
             enable_minmax_tuning=enable_minmax_tuning,
@@ -843,11 +851,12 @@ def wrapper_block(
             enable_torch_compile=enable_torch_compile,
             device=device,
             **kwargs,
+            **extra,
         )
         set_module(block, n, new_m)
+        if _defer_batch:
+            deferred_wrappers.append(new_m)
         return "q"
-
-    from auto_round.algorithms.quantization import search_shard
 
     groups = search_shard.group_items_by_device(work, device_of=lambda it: _wrap_item_device(it[1], device))
     if (
@@ -867,6 +876,12 @@ def wrapper_block(
     else:
         results = [_wrap_one(n, m, kind) for n, m, kind in work]
 
+    if _defer_batch and deferred_wrappers:
+        # stacked same-shape batches per (device, shape, config, search fn);
+        # singletons and the kill-switch fall back to the identical per-module call
+        if not search_shard.run_batched_wrap_search(deferred_wrappers):
+            for w in deferred_wrappers:
+                w._run_deferred_search_now()
     quantized_layers = [n for (n, _m, _k), r in zip(work, results) if r == "q"]
     unquantized_layers = [n for (n, _m, _k), r in zip(work, results) if r == "u"]
     return quantized_layers, unquantized_layers

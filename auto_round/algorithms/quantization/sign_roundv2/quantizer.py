@@ -25,6 +25,7 @@ from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQua
 
 if TYPE_CHECKING:
     from auto_round.algorithms.composer import AlgorithmComposer
+
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.data_type.gguf import (
     double_quant_tensor_sym_rtn,
@@ -38,6 +39,7 @@ from auto_round.data_type.utils import (
     get_optimized_quant_func,
     reshape_imatrix_for_weight,
     reshape_pad_tensor_by_group_size,
+    resolve_optimized_init_scale_fn,
     revert_tensor_by_pad,
     round_ste,
     search_optimized_init_scale,
@@ -100,8 +102,12 @@ def _dq_asym_group_size(bits: int) -> int:
 
 class SignRoundOptimizedWrapperLinear(WrapperLinear):
     minmax_scale_bound = (0.0, 2.0)
+    # Opt-in protocol for wrapper_block: the init-scale search is weight-local
+    # and row-independent, so same-shape modules can be searched as one stacked
+    # batch (bit-identical per module, far fewer python/launch round-trips).
+    supports_batched_search = True
 
-    def _init_tuning_params_and_quant_func(self):
+    def _init_tuning_params_and_quant_func(self, defer_search: bool = False):
         super()._init_tuning_params_and_quant_func()
 
         layer = self.orig_layer
@@ -109,21 +115,45 @@ class SignRoundOptimizedWrapperLinear(WrapperLinear):
         weight_reshape = self._prepare_init_scale_weight()
         imatrix = reshape_imatrix_for_weight(getattr(layer, "imatrix", None), weight_reshape, layer.group_size)
 
-        self.init_scale = search_optimized_init_scale(
-            weight_reshape, data_type, layer.bits, imatrix, self.q_scale_thresh
-        )
         self.weight_quant_func = get_optimized_quant_func(data_type)
-        if self.init_scale is None or self.weight_quant_func is None:
+        search_fn = resolve_optimized_init_scale_fn(data_type, self.q_scale_thresh)
+        if search_fn is None or self.weight_quant_func is None:
             raise ValueError(
                 f"SignRound optimized path does not support data_type={data_type!r}; "
                 "expected a symmetric int / mx / nv type."
             )
-
         self.data_type = data_type
+        self.init_scale = None
+        self._deferred_search_inputs = None
+        if defer_search:
+            # staged for run_batched_wrap_search: the exact callable the
+            # per-module path would invoke travels with the module
+            self._deferred_search_inputs = (
+                weight_reshape,
+                data_type,
+                layer.bits,
+                imatrix,
+                self.q_scale_thresh,
+                search_fn,
+            )
+        else:
+            self.init_scale = search_fn(weight_reshape, layer.bits, imatrix)
+
         if hasattr(layer, "imatrix"):
             del layer.imatrix
         if self.enable_torch_compile:
             self.weight_quant_func = compile_func(self.weight_quant_func, self.device)
+
+    def _run_deferred_search_now(self):
+        """Run the staged search per-module (fallback when batching is off)."""
+        weight, _data_type, bits, imatrix, _thresh, search_fn = self._deferred_search_inputs
+        self.init_scale = search_fn(weight, bits, imatrix)
+        self._deferred_search_inputs = None
+
+    def finalize_batched_search(self, init_scale):
+        """Adopt a search result computed on a stacked same-shape batch."""
+        self.init_scale = init_scale
+        self._deferred_search_inputs = None
 
     def _prepare_init_scale_weight(self) -> torch.Tensor:
         """Return the group-reshaped weight that seeds the init-scale search.

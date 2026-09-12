@@ -160,3 +160,142 @@ def wrap_shard_enabled():
     2.7x faster when threaded and stay enabled by default.
     """
     return bool(envs.AR_ENABLE_WRAP_SEARCH_SHARD)
+
+
+def _wrap_batch_device_of(inputs):
+    return str(inputs[0].device)
+
+
+def _fn_key(fn):
+    """Stable, safe key term for a resolved search callable.
+
+    Plain functions key by identity location (same function = same behavior);
+    ``functools.partial`` objects key by their visible captures; anything else
+    (e.g. a per-call closure, whose captures are not introspectable) keys by
+    ``repr`` so it never merges with a lookalike. Merging two different searches
+    into one stacked batch would silently apply the wrong math to one side, so
+    unknown callables always stay separate.
+    """
+    import functools
+
+    if isinstance(fn, functools.partial):
+        kwargs = tuple(sorted(fn.keywords.items(), key=lambda kv: str(kv[0])))
+        try:
+            qualname = fn.func.__qualname__
+            module = fn.func.__module__
+        except AttributeError:  # pragma: no cover - exotic callables
+            return repr(fn)
+        return ("partial", module, qualname, fn.args, kwargs)
+    if callable(fn):
+        try:
+            return ("fn", fn.__module__, fn.__qualname__)
+        except AttributeError:  # pragma: no cover - exotic callables
+            return repr(fn)
+    return repr(fn)
+
+
+def _wrap_batch_key(inputs):
+    weight, _data_type, bits, _imatrix, thresh, search_fn = inputs
+    return (
+        str(weight.device),
+        tuple(weight.shape),
+        str(weight.dtype),
+        bits,
+        float(thresh),
+        _fn_key(search_fn),
+    )
+
+
+def _probe_usable_bytes(device_key):
+    """Corrected free bytes on a cuda device (raw free + reserved-but-unallocated)."""
+    try:
+        dev = torch.device(str(device_key))
+        if dev.type != "cuda" or dev.index is None or not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info(dev.index)
+        free += torch.cuda.memory_reserved(dev.index) - torch.cuda.memory_allocated(dev.index)
+        return max(free, 0)
+    except (ValueError, RuntimeError, AttributeError):
+        return None
+
+
+def _batch_cap(group, device_key, max_batch):
+    if max_batch is not None:
+        return max(1, max_batch)
+    inputs0 = group[0]._deferred_search_inputs
+    per_module_bytes = (inputs0[0].numel() + inputs0[3].numel()) * 4 * 4
+    cap = 64
+    usable = _probe_usable_bytes(device_key)
+    if usable is not None:
+        cap = max(1, min(1024, usable // 2 // max(per_module_bytes, 1)))
+    return cap
+
+
+def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget=4 * 2**30):
+    """Run deferred weight-local wrap searches on stacked same-shape batches.
+
+    Wrappers stage ``(weight_reshape, data_type, bits, imatrix, q_scale_thresh,
+    search_fn)`` tuples in ``_deferred_search_inputs``, where ``search_fn`` is the
+    exact callable the per-module path would have invoked (resolved at wrap time,
+    so future dispatch changes -- e.g. alternative optimized searches -- travel
+    with the module automatically). Modules whose staged key
+    ``(device, shape, weight dtype, bits, threshold, search_fn)`` matches are
+    stacked along a leading dim and searched with ONE ``search_fn`` call: the
+    per-row math is unchanged (row-independent reductions over the last dim), so
+    results are bit-identical to the per-module path while python/launch overhead
+    drops by the batch factor. Batches are capped by ``max_batch`` and by a VRAM
+    budget on the group's device; groups on different devices run on one worker
+    thread per device; singleton groups take the identical per-module call.
+
+    Returns True when the inputs were consumed; False when sharding is disabled
+    by AR_DISABLE_SEARCH_SHARD (the caller then runs the searches per module).
+    """
+    del batch_vram_budget  # budget derived per device in _batch_cap
+    if shard_disabled_by_env():
+        return False
+    if not deferred_wrappers:
+        return False
+
+    device_groups = OrderedDict()
+    for w in deferred_wrappers:
+        dev = _wrap_batch_device_of(w._deferred_search_inputs)
+        device_groups.setdefault(dev, []).append(w)
+
+    def _run_one(wrapper):
+        inputs = wrapper._deferred_search_inputs
+        if inputs is None:
+            return
+        weight, _data_type, bits, imatrix, _thresh, search_fn = inputs
+        wrapper.finalize_batched_search(search_fn(weight, bits, imatrix))
+
+    def _run_device(device_key, wrappers):
+        by_key = OrderedDict()
+        for w in wrappers:
+            by_key.setdefault(_wrap_batch_key(w._deferred_search_inputs), []).append(w)
+        for _key, group in by_key.items():
+            if len(group) < 2:
+                _run_one(group[0])
+                continue
+            cap = _batch_cap(group, device_key, max_batch)
+            for start in range(0, len(group), cap):
+                chunk = group[start : start + cap]
+                inputs0 = chunk[0]._deferred_search_inputs
+                _bits = inputs0[2]
+                search_fn = inputs0[5]
+                stacked_w = torch.stack([w._deferred_search_inputs[0] for w in chunk])
+                stacked_im = torch.stack([w._deferred_search_inputs[3] for w in chunk])
+                results = search_fn(stacked_w, _bits, stacked_im)
+                for w, res in zip(chunk, results):
+                    w.finalize_batched_search(res)
+
+    if len(device_groups) > 1:
+        keyed = group_items_by_device(
+            list(device_groups.values()), device_of=lambda ws: _wrap_batch_device_of(ws[0]._deferred_search_inputs)
+        )
+        run_items_by_device(
+            keyed, lambda _idx, ws: _run_device(_wrap_batch_device_of(ws[0]._deferred_search_inputs), ws)
+        )
+    else:
+        for dev, ws in device_groups.items():
+            _run_device(dev, ws)
+    return True
