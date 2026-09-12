@@ -292,6 +292,24 @@ class TestRealV2Construction(unittest.TestCase):
         self.assertIsNone(w._deferred_search_inputs)  # old callers unchanged
 
 
+class TestKwargRelocation(unittest.TestCase):
+    def test_non_tensors_and_cpu_scalars_untouched(self):
+        from auto_round.algorithms.quantization.rtn.batched_search import _relocate_tensor_kwargs
+
+        scal = torch.tensor(1.0)
+        kwargs = {"bits": 4, "v": scal, "group_size": 128, "data_type": "int"}
+        out = _relocate_tensor_kwargs(dict(kwargs), "cpu")
+        self.assertIs(out["v"], scal)  # cpu scalar: same object, no copy
+        self.assertEqual(out["bits"], 4)
+
+    def test_returns_same_dict_semantics(self):
+        from auto_round.algorithms.quantization.rtn.batched_search import _relocate_tensor_kwargs
+
+        kwargs = {"imatrix": None, "tensor_min": None}
+        out = _relocate_tensor_kwargs(kwargs, "cpu")
+        self.assertIsNone(out["imatrix"])
+
+
 class TestSearchWorkerPicking(unittest.TestCase):
     def _pick(self, working_set, free_map, home="cuda:0"):
         import auto_round.algorithms.quantization.search_shard as shard_mod

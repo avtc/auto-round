@@ -177,6 +177,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         kwargs = w0._quant_call_kwargs(
             torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0), imatrix_override=stacked_im
         )
+        kwargs = _relocate_tensor_kwargs(kwargs, str(stacked_w.device))
         try:
             qdq, scale, zp = w0.weight_quant_func(stacked_w, **kwargs)
         except torch.OutOfMemoryError:
@@ -208,6 +209,21 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         for wk, wcs in buckets.items():
             _run_worker(wk, wcs)
     return []
+
+
+def _relocate_tensor_kwargs(kwargs: dict, device: str) -> dict:
+    """Move accelerator-valued kwargs onto the compute device.
+
+    The weight-local searches normally run on the weight's own device, so
+    tensor kwargs (e.g. an nv-fp4 ``global_scale``) live wherever the layer
+    lives; under worker offload the stacked call runs elsewhere and a
+    left-behind operand would fault at the first cross-device op (the mapped-
+    lane init_scale crash class). CPU scalars broadcast and are left alone.
+    """
+    for key, val in kwargs.items():
+        if isinstance(val, torch.Tensor) and val.device.type != "cpu" and str(val.device) != device:
+            kwargs[key] = val.to(device)
+    return kwargs
 
 
 def _split_leading(result, n):
