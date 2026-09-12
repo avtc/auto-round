@@ -66,6 +66,54 @@ def _group_tensors_by_shape(objs) -> list:
     return sorted(groups.items(), key=lambda kv: -kv[1][1])
 
 
+def _representatives(groups, objs):
+    """One representative tensor per group, drawn from a single scan."""
+    wanted = {g[0] for g in groups}  # group keys are (device, dtype, shape)
+    seen = {}
+    for obj in objs:
+        try:
+            if not isinstance(obj, torch.Tensor) or obj.device.type in ("cpu", "meta"):
+                continue
+            key = (str(obj.device), str(obj.dtype), _shape_key_public(obj.shape))
+        except Exception:
+            continue
+        if key in wanted and key not in seen:
+            seen[key] = obj
+    for gk, meta in groups:
+        if gk in seen:
+            yield seen[gk], (gk, meta)
+
+
+def _shape_key_public(shape):
+    try:
+        return tuple(int(d) for d in shape)
+    except Exception:
+        return (str(tuple(shape)),)
+
+
+def _describe_referrers(tensor, limit=4):
+    """Short descriptions of what holds ``tensor`` (best effort, frames skipped)."""
+    import gc as _gc
+
+    out = []
+    try:
+        for ref in _gc.get_referrers(tensor):
+            t = type(ref)
+            if t in (dict,):
+                keys = [str(k) for k in list(ref.keys())[:4]]
+                out.append(f"dict[{','.join(keys)}]" + (f"(len={len(ref)})" if len(keys) < len(ref) else ""))
+            elif t in (list, tuple, set):
+                out.append(f"{t.__name__}(len={len(ref)})")
+            else:
+                name = getattr(ref, "__class__", t).__name__
+                out.append(name)
+            if len(out) >= limit:
+                break
+    except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
+        out.append(f"<referrer scan failed: {e}>")
+    return out
+
+
 def dump_oom_tensor_census_(context: str = "") -> None:
     """Tensor census at OOM time: per-device allocator state + top tensor groups.
 
@@ -93,6 +141,10 @@ def dump_oom_tensor_census_(context: str = "") -> None:
             logger.error("[oom] %s live tensors ≈ %.2fGiB", _dev, _nb / 2**30)
         for (_dev, _dt, _shape), (_cnt, _nb) in top[:8]:
             logger.error("[oom] %s %s %s x%d = %.2fGiB", _dev, _dt, list(_shape), _cnt, _nb / 2**30)
+        # name the holders: referrers of one representative tensor per top group
+        for rep, (( _dev, _dt, _shape), (_cnt, _nb)) in _representatives(top[:3], gc.get_objects()):
+            for desc in _describe_referrers(rep):
+                logger.error("[oom]   %s %s held by: %s", _dev, list(_shape), desc)
     except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
         logger.error("[oom] tensor census failed (%s)", e)
 
