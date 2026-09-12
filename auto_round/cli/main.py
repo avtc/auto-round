@@ -226,6 +226,9 @@ def _print_algorithm_help(argv: list[str]) -> bool:
 
 
 def start(recipe="default", argv=None):
+    from auto_round.utils.oom import install_oom_census_hook
+
+    install_oom_census_hook()  # last-resort tensor census for uncaught CUDA OOMs
     recipe_defaults = RECIPES[recipe]
     argv = list(sys.argv[1:] if argv is None else argv)
     format_was_explicit = any(

@@ -262,12 +262,51 @@ class TestRtnSearchShard(unittest.TestCase):
 
 
 class TestOomCensus(unittest.TestCase):
+    def test_context_manager_plugs_anywhere_and_reraises(self):
+        from auto_round.utils.oom import oom_census
+
+        with mock.patch("auto_round.utils.oom.dump_oom_tensor_census_") as census:
+            with self.assertRaisesRegex(torch.OutOfMemoryError, "boom"):
+                with oom_census("surgical frame"):
+                    raise torch.OutOfMemoryError("boom")
+        census.assert_called_once_with("surgical frame")
+
+    def test_context_manager_passes_non_oom_through_silently(self):
+        from auto_round.utils.oom import oom_census
+
+        with mock.patch("auto_round.utils.oom.dump_oom_tensor_census_") as census:
+            with self.assertRaisesRegex(ValueError, "other"):
+                with oom_census("frame"):
+                    raise ValueError("other")
+        census.assert_not_called()
+
+    def test_global_hook_fires_on_uncaught_oom(self):
+        import sys
+
+        import auto_round.utils.oom as oom_mod
+
+        installed = oom_mod.install_oom_census_hook()
+        self.assertFalse(oom_mod.install_oom_census_hook())  # idempotent
+        with mock.patch.object(oom_mod, "dump_oom_tensor_census_") as census:
+            try:
+                raise torch.OutOfMemoryError("boom")
+            except torch.OutOfMemoryError:
+                sys.excepthook(*sys.exc_info())
+        self.assertTrue(installed)
+        self.assertEqual(census.call_count, 1)
+
+    def test_reexport_from_search_shard(self):
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.utils.oom as oom_mod
+
+        self.assertIs(shard_mod.dump_oom_tensor_census_, oom_mod.dump_oom_tensor_census_)
+
     def test_census_never_masks_and_never_raises(self):
         import auto_round.algorithms.quantization.search_shard as shard_mod
 
         # CPU-only box: the census must swallow its own failures and return cleanly
         shard_mod.dump_oom_tensor_census_("test")
-        with mock.patch.object(shard_mod, "_group_tensors_by_shape", side_effect=RuntimeError("boom")):
+        with mock.patch("auto_round.utils.oom._group_tensors_by_shape", side_effect=RuntimeError("boom")):
             shard_mod.dump_oom_tensor_census_("test")  # diagnostics failure swallowed
 
 
