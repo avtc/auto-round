@@ -36,17 +36,21 @@ def _tune_phase_line(phases: dict, iters: int) -> str:
 
     ``wrap`` = wrapper_block (params init, quant-func resolve + optional
     per-wrapper torch.compile, SignRoundV2 init-scale search); ``prepare`` =
-    DDP engagement + tuning-param collection + optimizer/scheduler build;
+    DDP engagement + tuning-param collection + optimizer/scheduler build (the
+    optional ``mirrors=`` bucket surfaces the replica build separately);
     ``loop`` = the iteration try/finally (overlaps the tune-ddp line at
     iters>0); ``tail`` = best-params restore, clear_memory, unwrapping.
     """
-    return "[perf] tune phases (iters=%d): wrap=%.2fs prepare=%.2fs loop=%.2fs tail=%.2fs" % (
+    line = "[perf] tune phases (iters=%d): wrap=%.2fs prepare=%.2fs loop=%.2fs tail=%.2fs" % (
         iters,
         phases.get("wrap", 0.0),
         phases.get("prepare", 0.0),
         phases.get("loop", 0.0),
         phases.get("tail", 0.0),
     )
+    if "mirrors" in phases:  # DDP replica build (deepcopy + placement)
+        line += " mirrors=%.2fs" % phases["mirrors"]
+    return line
 
 
 from auto_round.utils import (
@@ -449,13 +453,24 @@ class SignRoundQuantizer(BaseQuantizer):
         if _dp_eligible:
             from auto_round.algorithms.quantization.sign_round.data_parallel import (
                 ReplicaGroup,
+                align_block_stages_,
                 distribute_pool,
                 gather_block_for_mirroring_,
             )
 
             # the source block must sit whole on the home device before
-            # mirroring (data-driven multi-GPU may have sharded its leaves)
-            gather_block_for_mirroring_(block, _plan.devices[0])
+            # mirroring (data-driven multi-GPU may have sharded its leaves).
+            # Mapped plans are the exception: the home KEEPS its stage layout
+            # (a gather would squash it and break the stage-count contract),
+            # but each module's wrapper state must sit with its weight -- the
+            # tuning-device allocation and the weight placement are
+            # independent and diverge on spanning blocks
+            if _plan.replica_devices is None:
+                gather_block_for_mirroring_(block, _plan.devices[0])
+            else:
+                _aligned = align_block_stages_(block)
+                if _aligned:
+                    logger.info("[tune-ddp] home block stage-aligned (%d leaf moves)", _aligned)
             # distributed calibration pool: shard-local tune reads; each
             # device owns a contiguous 1/world slice of the samples
             distribute_pool(active_inputs, _plan.devices)
@@ -473,6 +488,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 "exch": [],
                 "step": [],
             }
+            _tp["mirrors"] = _ddp_perf["build"]  # surface in the phase line too
             for note in _plan.notes:
                 logger.info("[tune-ddp] %s", note)
 

@@ -389,6 +389,19 @@ class AlgorithmComposer:
         except Exception as e:  # pragma: no cover - resolver reachability on odd hosts
             logger.warning("[tune-ddp] collection sharding declined: resolver unreachable (%s)", e)
             return None
+        if plan.replica_devices is not None:
+            # device-mapped replicas: the ephemeral single-device collection
+            # mirrors would squash the block's stage layout (unregistered
+            # leaves and per-stage buffers left behind); the collection runs
+            # serial on the spanning lane instead (tuning still engages
+            # mapped replicas). Checked on the RESOLVED plan: the cache is
+            # empty on the first spanning block, and reading it before the
+            # resolver call would miss exactly that engagement.
+            logger.info(
+                "[tune-ddp] collection sharding declined: device-mapped replica plan "
+                "(spanning block) uses the serial collection"
+            )
+            return None
         return plan.devices if plan.world > 1 else None
 
     def _collect_forward_timed(self, *args, **kwargs):

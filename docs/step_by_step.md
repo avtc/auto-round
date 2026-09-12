@@ -865,6 +865,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A1
   Blocks with nothing to tune (all-float pinned) still take the serial path.
 - Replicas draw disjoint calibration shards, so the effective batch covers the same data as the serial run and
   accuracy is preserved.
+- A tuning block whose modules span several GPUs (an oversized block sharded by the upstream placement
+  machinery) engages **device-mapped replicas** under the same flag: each replica reproduces the block's stage
+  layout on its own set of `K` devices instead of holding a squashed single-device mirror, so `world x K`
+  devices are reserved in total. The fit is priced per device (stage weights plus the fp32 tune state plus an
+  activation allowance) and declines loudly when devices or VRAM are insufficient. The no-grad collection pass
+  runs serial on such blocks (accelerate hooks stage the inputs); only the tuning loop is mirrored.
 - `AR_TUNE_DDP_DEVICES` selects specific mirror devices -- see [environment variables](environments.md).
 - What runs in parallel depends on the algorithm family: the block collection passes and the SignRound (V1/V2)
   tuning loop are always sharded; at `--iters 0` the per-layer RTN/optimized-RTN zero-shot searches shard

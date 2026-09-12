@@ -46,6 +46,10 @@ class DDPPlan:
     devices: List[torch.device]
     shard_size: int
     notes: List[str] = field(default_factory=list)
+    # device-mapped mode: per-replica device SETS (replica r's stages live on
+    # replica_devices[r]); None = the single-device-per-replica mode. Index 0
+    # is the home replica's own stages.
+    replica_devices: Optional[List[List[torch.device]]] = None
 
     @property
     def enabled(self) -> bool:
@@ -136,6 +140,115 @@ def _move_tensor(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     return t.to(device)
 
 
+def _block_stage_bytes(block) -> List[int]:
+    """Per-stage leaf byte counts over the block's accelerator stages."""
+    from auto_round.algorithms.quantization.sign_round.placement import accelerator_stage_devices, tensor_leaves
+
+    stages = accelerator_stage_devices(block)
+    idx = {d: i for i, d in enumerate(stages)}
+    bytes_per = [0] * len(stages)
+    for _n, tensor, _c, _k in tensor_leaves(block):
+        i = idx.get(tensor.device)
+        if i is not None:
+            bytes_per[i] += tensor.numel() * tensor.element_size()
+    return bytes_per
+
+
+def resolve_mapped_ddp_plan(
+    world: int,
+    block: torch.nn.Module,
+    home_stages: List[torch.device],
+    free: Optional[dict],
+    batch_size: Optional[int] = None,
+    act_allowance_bytes: int = 2 * 2**30,
+) -> DDPPlan:
+    """Resolve a device-mapped replica plan for a multi-device block.
+
+    Each replica reproduces the home block's stage layout on its OWN device
+    set: the home keeps its stages, and every mirror needs ``len(home_stages)``
+    further devices, all sets pairwise disjoint. Declines loudly (world=1 with
+    notes) when there are not enough devices or free VRAM.
+
+    VRAM pricing: per device, a mirror holds bf16 weights plus the fp32 tune
+    state (value + grads + best-MSE snapshot) -- ~7x the bf16 weight bytes of
+    the stages resident there (weight 2 + value 4 + grads 4 + snapshot 4 bytes
+    per bf16 param byte, divided by the 2-byte weight -> 7x) -- plus an activation
+    allowance per device (``act_allowance_bytes``, default 2 GiB: fp32 hidden
+    states at the shard's sample count flow through every stage boundary).
+    """
+    notes: List[str] = []
+    k = len(home_stages)
+    if world is None or world <= 1:
+        return DDPPlan(1, home_stages, batch_size or 0, notes)
+    if world & (world - 1) != 0:
+        # the gradient exchange (halving-doubling allreduce / sign cast)
+        # requires a power-of-two world, exactly like the full-mirror lane
+        notes.append(f"resolved world {world} is not a power of two")
+        return DDPPlan(1, home_stages, batch_size or 0, notes)
+    if batch_size is not None and batch_size % world != 0:
+        notes.append(f"batch_size {batch_size} not divisible by world {world}")
+        return DDPPlan(1, home_stages, batch_size, notes)
+    if any(d.type != home_stages[0].type for d in home_stages):
+        # mixed accelerator families cannot be reproduced positionally (the
+        # candidate enumeration is per-family) -- decline loudly instead of
+        # cross-assigning stages onto the wrong family
+        notes.append(f"home stages span mixed accelerator families: {home_stages}")
+        return DDPPlan(1, home_stages, batch_size or 0, notes)
+    try:
+        count = torch.cuda.device_count() if home_stages and home_stages[0].type == "cuda" else 0
+    except Exception as e:  # pragma: no cover - non-CUDA reachability
+        logger.warning("[tune-ddp] mapped-plan CUDA device probe failed (%s); declining mapped replicas", e)
+        count = 0
+    home_idx = {d.index for d in home_stages if d.type == "cuda"}
+    candidates = [torch.device("cuda", i) for i in range(count) if i not in home_idx]
+    # progressive world demotion on device shortage, matching the full-mirror
+    # lane's "world reduced X -> Y by VRAM guard": 'auto' derives the world
+    # before this resolver runs, and world x K devices can exceed the host
+    # even when a smaller world fits
+    feasible = world
+    while feasible > 1 and len(candidates) < (feasible - 1) * k:
+        feasible //= 2
+    if feasible < world:
+        if feasible < 2:
+            notes.append(
+                f"mapped replicas need {(world - 1) * k} extra device(s) for world={world} x K={k}; "
+                f"only {len(candidates)} free of the home's devices (no smaller world fits)"
+            )
+            return DDPPlan(1, home_stages, batch_size or 0, notes=notes)
+        notes.append(f"world reduced {world} -> {feasible} by mapped device availability")
+        world = feasible
+        if batch_size is not None and batch_size % world != 0:
+            notes.append(f"batch_size {batch_size} not divisible by reduced world {world}")
+            return DDPPlan(1, home_stages, batch_size, notes)
+
+    replica_devices = [list(home_stages)]
+    for r in range(world - 1):
+        replica_devices.append(candidates[r * k : (r + 1) * k])
+
+    stage_bytes = _block_stage_bytes(block)
+    if free is not None:
+        vram_notes: List[str] = []
+        for r, devs in enumerate(replica_devices):
+            for dev, wbytes in zip(devs, stage_bytes):
+                est = wbytes * 7 + act_allowance_bytes
+                have = free.get(dev)
+                if have is not None and est > have:
+                    vram_notes.append(
+                        f"mapped replica {r} device {dev}: estimated {est / 2**30:.1f}GiB "
+                        f"(weights {wbytes / 2**30:.1f}GiB x7 tune state) exceeds free {have / 2**30:.1f}GiB"
+                    )
+        if vram_notes:
+            return DDPPlan(1, home_stages, batch_size or 0, notes=notes + vram_notes)
+
+    for r, devs in enumerate(replica_devices):
+        per = " ".join(f"{d}:{b / 2**30:.1f}GiB" for d, b in zip(devs, stage_bytes))
+        notes.append(f"replica {r}: {per}")
+    shard = (batch_size // world) if batch_size is not None else 0
+    plan = DDPPlan(world, [devs[0] for devs in replica_devices], shard, notes=notes)
+    plan.replica_devices = replica_devices
+    return plan
+
+
 def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=None, log: bool = True):
     """Resolve the engaged DDP plan for one block -- shared by quantizer + composer.
 
@@ -216,15 +329,40 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         except Exception as e:  # pragma: no cover - non-CUDA reachability
             logger.warning("[tune-ddp] free-VRAM probe failed (%s); resolving the plan without VRAM filtering", e)
             free = None
-        plan = resolve_ddp_plan(
-            world,
-            home,
-            global_batch_size,
-            visible_cuda_devices=list(range(torch.cuda.device_count())) if free else None,
-            explicit_devices=explicit or None,
-            vram_free_bytes=free,
-            mirror_footprint_bytes=mirror_bytes,
-        )
+        from auto_round.algorithms.quantization.sign_round.placement import accelerator_stage_devices
+
+        home_stages = accelerator_stage_devices(block)
+        if len(home_stages) > 1:
+            # a block spanning several accelerator devices cannot use
+            # single-device mirrors (they would squash the stage layout);
+            # resolve device-mapped replicas on disjoint sets instead
+            mapped = resolve_mapped_ddp_plan(world, block, home_stages, free, batch_size=global_batch_size)
+            for note in mapped.notes:
+                logger.info("[tune-ddp] %s", note)
+            if mapped.enabled:
+                if log:
+                    logger.info(
+                        "[tune-ddp] engaged device-mapped replicas: world=%d x K=%d devices shard=%d",
+                        mapped.world,
+                        len(home_stages),
+                        mapped.shard_size,
+                    )
+                quantizer._resolved_ddp_plan = mapped
+                return mapped
+            # declined: fall through to the shared requirement check below so
+            # an explicitly requested world raises instead of silently
+            # degrading to serial (same semantics as the full-mirror lane)
+            plan = mapped
+        else:
+            plan = resolve_ddp_plan(
+                world,
+                home,
+                global_batch_size,
+                visible_cuda_devices=list(range(torch.cuda.device_count())) if free else None,
+                explicit_devices=explicit or None,
+                vram_free_bytes=free,
+                mirror_footprint_bytes=mirror_bytes,
+            )
         if log:
             global _ENGAGED_LOGGED_SIG
             sig = (plan.world, tuple(str(d) for d in plan.devices), plan.shard_size)
@@ -315,43 +453,102 @@ def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:
       -- repointed so wrapper forward staging targets the mirror, not home.
     """
     for _n, m in module.named_modules():
-        params = getattr(m, "params", None)
-        if isinstance(params, dict):
-            for key, val in params.items():
-                if isinstance(val, torch.nn.Parameter):
-                    # move IN PLACE: the dict entry and the registered
-                    # _parameters entry are the SAME object by construction
-                    # (wrapper _init_params). Replacing the object here broke
-                    # that aliasing -- optimizers collected the dict's dead
-                    # clone while the forward/backward used the registered
-                    # Parameter, so mirror grads stayed None, sync_grads
-                    # silently skipped the allreduce, and the home stepped on
-                    # its own shard's gradient only (quality regressed,
-                    # monotonically in world size).
-                    val.data = _move_tensor(val.detach(), device)
-        for key, val in list(m.__dict__.items()):
-            if isinstance(val, torch.Tensor) and val.device != device and val.device.type != "meta":
-                m.__dict__[key] = _move_tensor(val, device)
-            elif isinstance(val, torch.device):
-                m.__dict__[key] = device
-            elif (
-                key in ("tuning_device", "device", "output_device")
-                and isinstance(val, str)
-                and _parse_device_token(val).type == device.type
-            ):
-                # wrapper staging targets (plain strings -- invisible to the
-                # torch.device branch above); same accelerator family only
-                m.__dict__[key] = str(device)
+        _relocate_module_state(m, device)
 
 
-def _param_grad_buffers(params_by_device: List[List[torch.nn.Parameter]]) -> List[Optional[torch.Tensor]]:
-    """Flatten each replica's gradients into one contiguous fp32 buffer."""
+def _relocate_module_state(m: torch.nn.Module, device: torch.device) -> None:
+    """Per-module half of :func:`_relocate_params` (single target device)."""
+    params = getattr(m, "params", None)
+    if isinstance(params, dict):
+        for key, val in params.items():
+            if isinstance(val, torch.nn.Parameter):
+                # move IN PLACE: the dict entry and the registered
+                # _parameters entry are the SAME object by construction
+                # (wrapper _init_params). Replacing the object here broke
+                # that aliasing -- optimizers collected the dict's dead
+                # clone while the forward/backward used the registered
+                # Parameter, so mirror grads stayed None, sync_grads
+                # silently skipped the allreduce, and the home stepped on
+                # its own shard's gradient only (quality regressed,
+                # monotonically in world size).
+                val.data = _move_tensor(val.detach(), device)
+    for key, val in list(m.__dict__.items()):
+        if isinstance(val, torch.Tensor) and val.device != device and val.device.type != "meta":
+            m.__dict__[key] = _move_tensor(val, device)
+        elif isinstance(val, torch.device):
+            m.__dict__[key] = device
+        elif (
+            key in ("tuning_device", "device", "output_device")
+            and isinstance(val, str)
+            and _parse_device_token(val).type == device.type
+        ):
+            # wrapper staging targets (plain strings -- invisible to the
+            # torch.device branch above); same accelerator family only
+            m.__dict__[key] = str(device)
+
+
+def align_block_stages_(block) -> int:
+    """Co-locate every module's state onto the stage of its own first tensor leaf.
+
+    A spanning home block carries a latent split: wrapper tunables are
+    created on ``orig_layer.tuning_device`` (an independently allocated
+    per-layer knob) while ``init_scale`` is searched from the orig weight
+    (the weight's resident device). On a single-device block the two
+    coincide; on a spanning block the first wrapper forward meets a
+    cross-device ``init_scale * max_scale`` mul (eager would hit it too --
+    torch.compile just fails first in fake-tensor propagation). The
+    full-mirror lane never sees this because the pre-mirror gather squashes
+    the whole block onto one device; the mapped lane keeps the layout, so
+    the home is stage-aligned instead: each module's own leaves (registered
+    params/buffers, container-held tensors, bare attrs) move onto the
+    device of its first tensor leaf, and wrapper state (params dict, device
+    attrs) follows. CPU-only modules are left alone. Returns leaf moves.
+    """
+    from auto_round.algorithms.quantization.sign_round.placement import _assign_leaf, _module_leaves
+
+    accel = ("cuda", "xpu", "hpu")
+    moved = 0
+    for mod_name, mod in block.named_modules():
+        # anchor = the module's first REGISTERED leaf (the weight; wrapper
+        # state is unregistered) -- falls back to the first accelerator leaf
+        # for registry-less modules, skips CPU-only subtrees
+        stage = None
+        fallback = None
+        for _n, tensor, container, _k in _module_leaves(mod):
+            if container is None:  # registered param/buffer
+                stage = tensor.device
+                break
+            if fallback is None and tensor.device.type in accel:
+                fallback = tensor.device
+        if stage is None:
+            stage = fallback
+        if stage is None or stage.type == "cpu":
+            continue  # CPU-anchored or CPU-only subtree: keep its state on CPU
+        for _path, tensor, container, key in _module_leaves(mod):
+            if _assign_leaf(tensor, stage, container, key):
+                moved += 1
+        _relocate_module_state(mod, stage)
+    return moved
+
+
+def _param_grad_buffers(
+    params_by_device: List[List[torch.nn.Parameter]], staging_device: Optional[torch.device] = None
+) -> List[Optional[torch.Tensor]]:
+    """Flatten each replica's gradients into one contiguous fp32 buffer.
+
+    ``staging_device`` matters for device-mapped replicas whose parameters
+    live on several devices: torch.cat is same-device only, so the parts are
+    staged onto one device first (registered-parameter grads carry their own
+    devices; the copies are plain D2D moves torch synchronizes internally).
+    """
     bufs: List[Optional[torch.Tensor]] = []
     for params in params_by_device:
         parts = [p.grad.detach().reshape(-1) for p in params if p.grad is not None]
         if not parts:
             bufs.append(None)
             continue
+        if staging_device is not None:
+            parts = [part.to(staging_device) for part in parts]
         buf = torch.cat(parts) if len(parts) > 1 else parts[0].clone()
         bufs.append(buf.to(torch.float32) if buf.dtype != torch.float32 else buf)
     return bufs
@@ -1064,24 +1261,95 @@ class ReplicaGroup:
         self.grad_transport = grad_transport
         self.home = block
         self.mirrors: List[torch.nn.Module] = []
-        for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
-            mirror = self._make_mirror(block, dev)
-            _relocate_params(mirror, dev)
-            _strays = _enforce_mirror_device_(mirror, dev)
-            if _strays:
-                logger.warning(
-                    "[tune-ddp] mirror device sweep moved %d straggler tensor(s) onto %s: %s%s",
-                    len(_strays),
-                    dev,
-                    ", ".join(_strays[:8]),
-                    " ..." if len(_strays) > 8 else "",
-                )
-            self.mirrors.append(mirror)
+        mapped_sets = plan.replica_devices
+        if mapped_sets is not None:
+            self._build_mapped_mirrors(block, plan, mapped_sets)
+        else:
+            for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
+                mirror = self._make_mirror(block, dev)
+                _relocate_params(mirror, dev)
+                _strays = _enforce_mirror_device_(mirror, dev)
+                if _strays:
+                    logger.warning(
+                        "[tune-ddp] mirror device sweep moved %d straggler tensor(s) onto %s: %s%s",
+                        len(_strays),
+                        dev,
+                        ", ".join(_strays[:8]),
+                        " ..." if len(_strays) > 8 else "",
+                    )
+                self.mirrors.append(mirror)
         self.replicas = [block] + self.mirrors
         self.world = len(self.replicas)
         # persistent replica worker pool (built lazily on first run_threaded;
         # None until then)
         self._pool = None
+
+    def _build_mapped_mirrors(self, block, plan: DDPPlan, mapped_sets: List[List[torch.device]]) -> None:
+        """Mirrors for a multi-device home block: same stage layout, disjoint device sets.
+
+        The home block spans ``len(mapped_sets[0])`` accelerator devices;
+        every mirror reproduces that layout on its own set via
+        :func:`place_module_tree` (which also moves the unregistered tensor
+        leaves plain ``.to()`` misses). Device sets must be pairwise disjoint
+        and disjoint from the home's -- sharing would silently put two
+        replicas' tune state on one card.
+        """
+        from auto_round.algorithms.quantization.sign_round.placement import (
+            accelerator_stage_devices,
+            place_module_tree,
+            tensor_leaves,
+        )
+
+        home_stages = accelerator_stage_devices(block)
+        if len(home_stages) != len(mapped_sets[0]):
+            raise RuntimeError(
+                f"mapped plan stage count {len(mapped_sets[0])} does not match the home "
+                f"block's {len(home_stages)} accelerator stage(s)"
+            )
+        seen: set = set()
+        for devs in mapped_sets:
+            for d in devs:
+                key = (d.type, d.index)
+                if key in seen:
+                    raise RuntimeError(f"mapped replica device sets overlap on {d}")
+                seen.add(key)
+
+        # module-name -> home stage index, resolved via the module's first
+        # accelerator tensor leaf (mixed-device modules resolve via the first)
+        stage_of_module = {}
+        for mod_name, mod in block.named_modules():
+            for _n, tensor, _c, _k in tensor_leaves(mod):
+                if tensor.device in home_stages:
+                    stage_of_module[mod_name] = home_stages.index(tensor.device)
+                    break
+
+        # modules with no accelerator leaf anywhere in their subtree keep
+        # their CPU state on CPU (pinned caches / self-managed subtrees --
+        # the _enforce_mirror_device_ invariant); only stage-resident modules
+        # relocate. The subtree walk is O(N * subtree) at block scale.
+        cpu_only = {n for n, _m in block.named_modules() if n not in stage_of_module}
+
+        for r, replica_devs in enumerate(mapped_sets[1:], start=1):
+            mirror = copy.deepcopy(block)
+            moved = place_module_tree(
+                mirror,
+                lambda name, _rd=replica_devs: (
+                    torch.device("cpu") if name in cpu_only else _rd[stage_of_module[name]]
+                ),
+            )
+            # wrapper-held state (params dict, device attrs) follows each
+            # module's stage target
+            for _mn, _m in mirror.named_modules():
+                if _mn in cpu_only:
+                    continue
+                _relocate_module_state(_m, replica_devs[stage_of_module[_mn]])
+            logger.info(
+                "[tune-ddp] mapped mirror %d placed on %s (%d leaf moves)",
+                r,
+                ", ".join(str(d) for d in replica_devs),
+                moved,
+            )
+            self.mirrors.append(mirror)
 
     def _make_mirror(self, block, dev):
         """Mirror the block onto ``dev`` with a plain deepcopy.
@@ -1118,8 +1386,18 @@ class ReplicaGroup:
         """
         from auto_round.utils.tune_profile import stage as _stage
 
+        mapped_sets = getattr(self.plan, "replica_devices", None)
         with _stage(prof, "bufprep"):
-            bufs = _param_grad_buffers(params_per_replica)
+            if mapped_sets is not None:
+                # device-mapped replicas: each replica's grads stage onto its
+                # primary stage device before flattening (torch.cat is
+                # same-device only)
+                bufs = [
+                    _param_grad_buffers([params_r], staging_device=mapped_sets[r][0])[0]
+                    for r, params_r in enumerate(params_per_replica)
+                ]
+            else:
+                bufs = _param_grad_buffers(params_per_replica)
         if any(b is None for b in bufs):
             # a replica without gradients means the collected params are not
             # the ones the forward/backward touched -- the tune would silently

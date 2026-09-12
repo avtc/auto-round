@@ -471,6 +471,16 @@ class TestTunePhaseLine:
         line = _tune_phase_line({}, 10)
         assert "wrap=0.00s" in line and "tail=0.00s" in line and "iters=10" in line
 
+    def test_optional_mirrors_bucket(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
+
+        base = _tune_phase_line({"wrap": 1.0, "prepare": 2.0, "loop": 3.0, "tail": 0.5}, 20)
+        assert "mirrors" not in base
+        # the DDP mirror build (deepcopy + placement) surfaces in the phase
+        # line alongside the [perf] tune-ddp block line's own attribution
+        ext = _tune_phase_line({"wrap": 1.0, "prepare": 2.0, "loop": 3.0, "tail": 0.5, "mirrors": 4.25}, 20)
+        assert "mirrors=4.25s" in ext
+
 
 class TestBlockHasTuningEntries:
     """DDP decline check: all-float blocks must be detectable pre-engagement."""
