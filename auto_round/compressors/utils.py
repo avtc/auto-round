@@ -213,6 +213,9 @@ def check_need_act_calibration(
     return False
 
 
+from auto_round.logger import logger
+
+
 def collect_best_params_local(block):
     """Best-params snapshot copied on each param's OWN device.
 
