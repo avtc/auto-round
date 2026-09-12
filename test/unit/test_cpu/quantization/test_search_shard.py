@@ -295,6 +295,33 @@ class TestOomCensus(unittest.TestCase):
         self.assertTrue(installed)
         self.assertEqual(census.call_count, 1)
 
+    def test_cpu_tensors_excluded_from_census_groups(self):
+        # cpu-only box: grouping must not count cpu (or meta) tensors
+        import auto_round.utils.oom as oom_mod
+
+        t = torch.randn(4, 4)
+        groups = oom_mod._group_tensors_by_shape([t])
+        self.assertEqual(groups, [])
+
+    def test_message_based_oom_triggers_census(self):
+        # HPU-class OOMs surface as RuntimeError("... out of memory ...")
+        from auto_round.utils.oom import oom_census
+
+        with mock.patch("auto_round.utils.oom.dump_oom_tensor_census_") as census:
+            with self.assertRaisesRegex(RuntimeError, "Out of Memory in HPU"):
+                with oom_census("hpu frame"):
+                    raise RuntimeError("Out of Memory in HPU allocator")
+        census.assert_called_once_with("hpu frame")
+
+    def test_plain_runtime_error_does_not_trigger_census(self):
+        from auto_round.utils.oom import oom_census
+
+        with mock.patch("auto_round.utils.oom.dump_oom_tensor_census_") as census:
+            with self.assertRaisesRegex(RuntimeError, "shape mismatch"):
+                with oom_census("frame"):
+                    raise RuntimeError("shape mismatch")
+        census.assert_not_called()
+
     def test_reexport_from_search_shard(self):
         import auto_round.algorithms.quantization.search_shard as shard_mod
         import auto_round.utils.oom as oom_mod

@@ -36,10 +36,14 @@ from auto_round.logger import logger
 
 
 def _group_tensors_by_shape(objs) -> list:
-    """(device, dtype, shape) -> [count, bytes] over cuda tensors; sorted by bytes."""
+    """(device, dtype, shape) -> [count, bytes] over accelerator tensors; sorted by bytes.
+
+    Covers every non-cpu accelerator (cuda, hpu, xpu, mps, ...): the census
+    must name the residents on whichever device ran out.
+    """
     groups: dict = {}
     for obj in objs:
-        if isinstance(obj, torch.Tensor) and obj.device.type == "cuda":
+        if isinstance(obj, torch.Tensor) and obj.device.type not in ("cpu", "meta"):
             key = (str(obj.device), str(obj.dtype), tuple(obj.shape))
             g = groups.get(key)
             if g is None:
@@ -59,18 +63,33 @@ def dump_oom_tensor_census_(context: str = "") -> None:
     import gc
 
     try:
-        for idx in range(torch.cuda.device_count()):
-            logger.error(
-                "[oom] cuda:%s allocated=%.2fGiB reserved=%.2fGiB",
-                idx,
-                torch.cuda.memory_allocated(idx) / 2**30,
-                torch.cuda.memory_reserved(idx) / 2**30,
-            )
-        top = _group_tensors_by_shape(gc.get_objects())[:8]
+        try:
+            for idx in range(torch.cuda.device_count()):
+                logger.error(
+                    "[oom] cuda:%s allocated=%.2fGiB reserved=%.2fGiB",
+                    idx,
+                    torch.cuda.memory_allocated(idx) / 2**30,
+                    torch.cuda.memory_reserved(idx) / 2**30,
+                )
+        except Exception:  # pragma: no cover - allocator stats are cuda-only
+            pass
+        per_device: dict = {}
+        top = _group_tensors_by_shape(gc.get_objects())
         for (_dev, _dt, _shape), (_cnt, _nb) in top:
+            per_device[_dev] = per_device.get(_dev, 0) + _nb
+        for _dev, _nb in sorted(per_device.items(), key=lambda kv: -kv[1]):
+            logger.error("[oom] %s live tensors ≈ %.2fGiB", _dev, _nb / 2**30)
+        for (_dev, _dt, _shape), (_cnt, _nb) in top[:8]:
             logger.error("[oom] %s %s %s x%d = %.2fGiB", _dev, _dt, list(_shape), _cnt, _nb / 2**30)
     except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
         logger.error("[oom] tensor census failed (%s)", e)
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """torch.OutOfMemoryError (cuda, modern xpu) or message-based OOM (hpu et al.)."""
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 @contextmanager
@@ -84,8 +103,9 @@ def oom_census(context: str = ""):
     """
     try:
         yield
-    except torch.OutOfMemoryError:
-        dump_oom_tensor_census_(context)
+    except Exception as exc:
+        if _is_oom(exc):
+            dump_oom_tensor_census_(context)
         raise
 
 
@@ -111,7 +131,7 @@ def install_oom_census_hook() -> bool:
 
     def _sys_hook(tp, val, tb):
         try:
-            if isinstance(val, torch.OutOfMemoryError):
+            if _is_oom(val):
                 dump_oom_tensor_census_("uncaught")
         except Exception:  # pragma: no cover - diagnostics must not mask the error
             pass
@@ -119,7 +139,7 @@ def install_oom_census_hook() -> bool:
 
     def _the_hook(args):
         try:
-            if isinstance(args.exc_value, torch.OutOfMemoryError):
+            if _is_oom(args.exc_value):
                 name = args.thread.name if args.thread is not None else "?"
                 dump_oom_tensor_census_(f"uncaught (thread {name})")
         except Exception:  # pragma: no cover - diagnostics must not mask the error
