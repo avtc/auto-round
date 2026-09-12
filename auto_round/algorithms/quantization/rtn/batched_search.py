@@ -132,7 +132,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
                     for e in group
                 ],
                 dev,
-                None,
+                max_batch,
             )
             for start in range(0, len(group), cap):
                 chunks.append((dev, group[start : start + cap]))
