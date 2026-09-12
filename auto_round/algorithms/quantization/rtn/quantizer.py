@@ -168,7 +168,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             _n += 1
 
         def _quantize_staged(name, m):
-            nonlocal _n
+            nonlocal _n, _q_max
             _l0 = _ptime.perf_counter() if _perf else 0.0
             w = self._quantize_layer_via_rtn(m, defer_search=True)
             if _perf:
