@@ -261,6 +261,16 @@ AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
 AR_ENABLE_WRAP_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
+### AR_PERF_COUNTERS
+- **Description**: Emits one per-block `[perf] tune phases` INFO line with the wall time of each tuning phase (wrap / prepare / loop / tail) and, inside the loop, the sampler draw, best-params snapshots, gradient sync + optimizer step, rest, and the serial forward+loss+backward time. Intended for performance attribution of large multi-device quantization runs; adds negligible overhead.
+- **Default**: `0` (disabled)
+- **Valid Values**: `0` / `1`
+- **Usage**: Set during benchmarking runs to attribute block time to wrap searches vs the tuning loop.
+
+```bash
+AR_PERF_COUNTERS=1 python -m auto_round --model ... --device_map 0,1,2,3
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

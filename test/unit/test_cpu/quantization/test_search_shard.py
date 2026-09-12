@@ -261,6 +261,55 @@ class TestRtnSearchShard(unittest.TestCase):
         self.assertEqual(calls, [caller])
 
 
+class TestTunePhaseLine(unittest.TestCase):
+    def _fmt(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
+
+        return _tune_phase_line
+
+    def test_base_line_matches_ddp_formatter(self):
+        line = self._fmt()({"wrap": 1.5, "prepare": 0.0, "loop": 9.5, "tail": 0.5}, 10)
+        self.assertEqual(line, "[perf] tune phases (iters=10): wrap=1.50s prepare=0.00s loop=9.50s tail=0.50s")
+
+    def test_loop_split_appended_with_serial(self):
+        line = self._fmt()(
+            {
+                "wrap": 1.0,
+                "prepare": 0.0,
+                "loop": 9.5,
+                "tail": 0.5,
+                "lp_sampler": 0.0,
+                "lp_snap": 0.06,
+                "lp_step": 0.02,
+                "lp_rest": 0.82,
+                "lp_serial": 8.6,
+            },
+            10,
+        )
+        self.assertIn("(loop: sampler=0.00s snap=0.06s step=0.02s rest=0.82s serial: fwd+loss+bwd=8.60s)", line)
+
+    def test_loop_split_omitted_without_keys(self):
+        line = self._fmt()({"wrap": 1.0, "prepare": 0.0, "loop": 9.5, "tail": 0.5}, 10)
+        self.assertNotIn("loop:", line.split("loop=9.50s")[-1])
+
+    def test_serial_omitted_when_zero(self):
+        line = self._fmt()(
+            {
+                "wrap": 1.0,
+                "prepare": 0.0,
+                "loop": 9.5,
+                "tail": 0.5,
+                "lp_sampler": 0.0,
+                "lp_snap": 0.0,
+                "lp_step": 0.0,
+                "lp_rest": 9.5,
+                "lp_serial": 0.0,
+            },
+            10,
+        )
+        self.assertNotIn("serial:", line)
+
+
 class TestSnapshotRouting(unittest.TestCase):
     """snapshot_best_params: non-CPU cache device -> per-param device copies."""
 
