@@ -638,6 +638,43 @@ class TestMicroBatchDeclineGuards:
         assert q._micro_batch_n(torch.arange(4)) is None
 
 
+class TestSharedSliceIndexDomain(unittest.TestCase):
+    """Shared entries are captured-batch rows; callers pass POOL indices (collection chunks, tune draws)."""
+
+    def _runner(self):
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+
+        r = object.__new__(BlockForwardRunner)
+        r.batch_dim = 0
+        r.batch_size = 8
+        r.shared_cache_keys = ("position_embeddings",)
+        return r
+
+    def test_collection_chunk_two_slices_in_range(self):
+        # collection forwards 128 samples in chunks of 8; chunk 2 = pool indices [8..15]
+        import torch
+
+        r = self._runner()
+        n, s_, d = 8, 5, 3
+        cos = torch.arange(n * s_ * d, dtype=torch.float32).reshape(n, s_, d)
+        inputs = [torch.randn(4, 2) for _ in range(128)]
+        idx = torch.arange(8, 16)
+        _, others = r._select_batch(inputs, {"position_embeddings": (cos, cos)}, idx)
+        assert others["position_embeddings"][0].shape[0] == 8
+
+    def test_tune_pool_draw_maps_to_batch_rows(self):
+        # tune-loop draws are pool indices (e.g. [9, 92]); rows must map into the 8-row table
+        import torch
+
+        r = self._runner()
+        n, s_, d = 8, 5, 3
+        cos = torch.arange(n * s_ * d, dtype=torch.float32).reshape(n, s_, d)
+        inputs = [torch.randn(4, 2) for _ in range(128)]
+        idx = torch.tensor([9, 92])
+        _, others = r._select_batch(inputs, {"position_embeddings": (cos, cos)}, idx)
+        assert torch.equal(others["position_embeddings"][0], cos.index_select(0, torch.tensor([1, 4])))
+
+
 class TestSelectBatchSharedRopeSlicing(unittest.TestCase):
     """Shared-cache rope entries are stored ONCE as the whole-batch tuple; slice rows per draw."""
 

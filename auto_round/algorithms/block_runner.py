@@ -413,8 +413,17 @@ class BlockForwardRunner:
             def _maybe_rows(t):
                 if not isinstance(t, torch.Tensor) or t.dim() <= batch_dim or t.shape[batch_dim] != bs or bs < 2:
                     return t
+                # ``indices`` are POOL indices (collection chunks, tune-loop draws,
+                # micro-batch slices of a draw); the entry holds the captured batch's
+                # rows. Map pool -> row space; the row count (== len(indices), capped
+                # by the modulo) is what the forward needs, and for the batched rope
+                # tables this key family caches, rows are position-identical, so any
+                # in-range mapping yields the same values. Never index_select with
+                # raw pool indices: on CUDA an out-of-range row is a fatal device-side
+                # assert, not a catchable error.
+                rows = torch.remainder(indices.to(device=t.device), bs)
                 try:
-                    return t.index_select(batch_dim, indices.to(device=t.device))
+                    return t.index_select(batch_dim, rows)
                 except (RuntimeError, IndexError):
                     logger.warning_once(
                         "shared-cache kwarg slicing fell back to the unsliced tensor; "
