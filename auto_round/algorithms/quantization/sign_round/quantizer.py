@@ -936,6 +936,16 @@ class SignRoundQuantizer(BaseQuantizer):
                 # engagement defines both; serial never enters this branch
                 _t0 = _ptime.perf_counter()
                 replica_group.teardown()
+                if getattr(self.compress_context, "enable_torch_compile", False):
+                    # per-replica compiled weight-quant funcs left guard
+                    # entries in dynamo's cache that PIN the mirror modules:
+                    # allocated VRAM grew ~a tune mirror per block until the
+                    # plan resolver declined. Every block's wrappers are new
+                    # instances and recompile anyway -- the cache is dead
+                    # weight, so it goes.
+                    import torch._dynamo as _dynamo
+
+                    _dynamo.reset()
                 _ddp_perf["teardown"] = _ptime.perf_counter() - _t0
                 _phase_t0 = _ptime.perf_counter()  # tail resumes after teardown
 

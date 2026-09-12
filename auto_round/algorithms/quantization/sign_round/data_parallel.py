@@ -233,9 +233,19 @@ def resolve_mapped_ddp_plan(
                 est = wbytes * 7 + act_allowance_bytes
                 have = free.get(dev)
                 if have is not None and est > have:
+                    _alloc = _reserved = None
+                    if dev.type == "cuda":
+                        try:
+                            _alloc = torch.cuda.memory_allocated(dev) / 2**30
+                            _reserved = torch.cuda.memory_reserved(dev) / 2**30
+                        except Exception:  # pragma: no cover - defensive probe
+                            pass
+                    _mem = (
+                        f", torch allocated={_alloc:.1f}GiB reserved={_reserved:.1f}GiB" if _alloc is not None else ""
+                    )
                     vram_notes.append(
                         f"mapped replica {r} device {dev}: estimated {est / 2**30:.1f}GiB "
-                        f"(weights {wbytes / 2**30:.1f}GiB x7 tune state) exceeds free {have / 2**30:.1f}GiB"
+                        f"(weights {wbytes / 2**30:.1f}GiB x7 tune state) exceeds free {have / 2**30:.1f}GiB{_mem}"
                     )
         if vram_notes:
             return DDPPlan(1, home_stages, batch_size or 0, notes=notes + vram_notes)
@@ -1533,8 +1543,29 @@ class ReplicaGroup:
         pool, self._pool = getattr(self, "_pool", None), None
         if pool is not None:
             pool.shutdown()
+        mirror_devs = sorted({_block_device(m) for m in self.mirrors}, key=str)
         self.mirrors = []
         self.replicas = [self.home]
+        # a mirror that stays ALLOCATED after teardown pins its device: the
+        # next block's plan resolves against the shrunken free VRAM and
+        # declines. Force the release and (under perf counters) verify it
+        # landed -- a non-zero residue means a live reference is holding the
+        # mirror (dynamo cache entries pinning per-replica compiled wrappers
+        # are the known suspect class).
+        import gc
+
+        gc.collect()
+        from auto_round import envs as _envs
+
+        if getattr(_envs, "AR_PERF_COUNTERS", False):
+            for dev in mirror_devs:
+                if dev.type == "cuda":
+                    logger.info(
+                        "[tune-ddp] post-teardown cuda:%s allocated=%.2fGiB reserved=%.2fGiB",
+                        dev.index,
+                        torch.cuda.memory_allocated(dev) / 2**30,
+                        torch.cuda.memory_reserved(dev) / 2**30,
+                    )
 
 
 def _block_device(block) -> torch.device:
