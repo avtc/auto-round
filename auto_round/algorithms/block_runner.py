@@ -397,17 +397,48 @@ class BlockForwardRunner:
 
         selected_others = {"positional_inputs": input_others.get("positional_inputs")}
 
+        def _slice_shared_entry(entry):
+            """Row-slice a shared-cache entry that carries the cached batch dim.
+
+            Shared rope entries (``position_embeddings``) are captured ONCE per
+            batch as whole-batch tensors/tuples, so any forward smaller than the
+            cached batch (micro-batch slices, shard draws) must row-slice them or
+            rope application crashes on hidden-batch-N vs cos-batch-full. Entries
+            whose leading dim is NOT the cached batch size (broadcast [1, S, D]
+            tables, 1-D ``cache_position``, per-token lists) pass through
+            unsliced -- index_select would silently corrupt them.
+            """
+            bs = self.batch_size
+
+            def _maybe_rows(t):
+                if not isinstance(t, torch.Tensor) or t.dim() <= batch_dim or t.shape[batch_dim] != bs or bs < 2:
+                    return t
+                try:
+                    return t.index_select(batch_dim, indices.to(device=t.device))
+                except (RuntimeError, IndexError):
+                    logger.warning_once(
+                        "shared-cache kwarg slicing fell back to the unsliced tensor; "
+                        "sub-batch draws may see the wrong batch's entry"
+                    )
+                    return t
+
+            if isinstance(entry, torch.Tensor):
+                return _maybe_rows(entry)
+            if isinstance(entry, tuple) and entry and all(torch.is_tensor(t) for t in entry):
+                return tuple(_maybe_rows(t) for t in entry)
+            return entry
+
         for key, val in input_others.items():
             if "positional_inputs" in key:
                 continue
             if key in shared_cache_keys:
                 if isinstance(val, list) and len(val) == 1:
-                    selected_others[key] = val[0]
+                    selected_others[key] = _slice_shared_entry(val[0])
                 elif isinstance(val, list) and len(val) > 1:
                     idx = int(indices[0]) if len(indices) == 1 else 0
-                    selected_others[key] = val[idx] if idx < len(val) else val[0]
+                    selected_others[key] = _slice_shared_entry(val[idx] if idx < len(val) else val[0])
                 else:
-                    selected_others[key] = val
+                    selected_others[key] = _slice_shared_entry(val)
             elif isinstance(val, list):
                 batch_vals = [val[i] for i in indices]
                 if len(batch_vals) == 1:

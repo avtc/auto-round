@@ -638,6 +638,49 @@ class TestMicroBatchDeclineGuards:
         assert q._micro_batch_n(torch.arange(4)) is None
 
 
+class TestSelectBatchSharedRopeSlicing(unittest.TestCase):
+    """Shared-cache rope entries are stored ONCE as the whole-batch tuple; slice rows per draw."""
+
+    def _runner(self):
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+
+        r = object.__new__(BlockForwardRunner)
+        r.batch_dim = 0
+        r.batch_size = 8
+        r.shared_cache_keys = ("position_ids", "cache_position", "position_embeddings", "cu_seqlens")
+        return r
+
+    def test_shared_position_embeddings_tuple_row_sliced(self):
+        import torch
+
+        r = self._runner()
+        n, s_, d = 8, 5, 3
+        cos = torch.arange(n * s_ * d, dtype=torch.float32).reshape(n, s_, d)
+        sin = cos + 100.0
+        inputs = [torch.randn(4, 2) for _ in range(8)]
+        idx = torch.tensor([1, 5])
+        _, others = r._select_batch(inputs, {"position_embeddings": (cos, sin)}, idx)
+        got = others["position_embeddings"]
+        assert isinstance(got, tuple) and len(got) == 2
+        assert got[0].shape[0] == 2 and torch.equal(got[0], cos.index_select(0, idx))
+
+    def test_shared_broadcast_and_1d_entries_pass_through(self):
+        import torch
+
+        r = self._runner()
+        inputs = [torch.randn(4, 2) for _ in range(8)]
+        idx = torch.tensor([1, 5])
+        others = {
+            "position_embeddings": (torch.randn(1, 5, 3), torch.randn(1, 5, 3)),  # broadcast tables
+            "cache_position": torch.arange(8192),  # 1-D per-token: index_select would corrupt
+            "cu_seqlens": [0, 128, 256],  # shared list entries keep the pick-one semantic
+        }
+        _, sel = r._select_batch(inputs, others, idx)
+        assert sel["position_embeddings"][0].shape[0] == 1
+        assert torch.equal(sel["cache_position"], others["cache_position"])
+        assert sel["cu_seqlens"] == 0  # same pick-one as the serial path (val[0])
+
+
 class TestSelectBatchRopeTuples(unittest.TestCase):
     """transformers-v5 rope kwargs arrive as ``(cos, sin)`` tuples; slice them per micro-batch."""
 
