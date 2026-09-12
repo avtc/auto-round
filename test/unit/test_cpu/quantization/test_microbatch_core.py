@@ -681,6 +681,27 @@ class TestSelectBatchSharedRopeSlicing(unittest.TestCase):
         assert sel["cu_seqlens"] == 0  # same pick-one as the serial path (val[0])
 
 
+class TestTunePhaseLine(unittest.TestCase):
+    """[perf] tune phases line: base buckets always, micro-batch split only when engaged."""
+
+    def _line(self, **ph):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
+
+        base = {"wrap": 1.0, "prepare": 2.0, "loop": 3.0, "tail": 0.5}
+        base.update(ph)
+        return _tune_phase_line(base, 10)
+
+    def test_base_buckets(self):
+        assert self._line() == "[perf] tune phases (iters=10): wrap=1.00s prepare=2.00s loop=3.00s tail=0.50s"
+
+    def test_micro_batch_split_appended_when_engaged(self):
+        line = self._line(mb_fwd=2.0, mb_bwd=0.5, mb_other=0.5, mb_n=40)
+        assert line.endswith(" (micro-batch: fwd=2.00s bwd=0.50s other=0.50s slices=40)")
+
+    def test_micro_batch_split_omitted_when_not_engaged(self):
+        assert "(micro-batch" not in self._line(mb_n=0)
+
+
 class TestSelectBatchRopeTuples(unittest.TestCase):
     """transformers-v5 rope kwargs arrive as ``(cos, sin)`` tuples; slice them per micro-batch."""
 

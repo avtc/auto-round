@@ -327,3 +327,12 @@ else:
 - `AR_USE_MODELSCOPE` 的布尔值会自动转换为适当的字符串表示
 - 所有环境变量名称区分大小写
 - 通过 `set_config()` 所做的修改将影响当前进程及其子进程
+
+## AR_PERF_COUNTERS
+
+设为 `1` 时，数据驱动量化会在每个块输出一条 INFO 级别的
+`[perf] tune phases (iters=N): wrap=...s prepare=...s loop=...s tail=...s` 日志：`wrap` = wrapper_block
+（参数初始化、量化函数解析、可选的逐 wrapper `torch.compile`）；`prepare` = 调参参数收集 + 优化器/
+调度器构建；`loop` = 迭代循环；`tail` = 最优参数恢复与清理。启用 micro-batching 时，该行还会附加
+`(micro-batch: fwd=...s bwd=...s other=...s slices=N)` —— 全部前向阶段、全部反向阶段、切片/暂存/
+item 求和开销，以及该块的 micro-batch 数量。默认关闭。

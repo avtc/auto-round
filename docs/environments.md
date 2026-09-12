@@ -327,3 +327,12 @@ else:
 - Boolean values for `AR_USE_MODELSCOPE` are automatically converted to appropriate string representations
 - All environment variable names are case-sensitive
 - Changes made through `set_config()` will affect the current process and any child processes
+
+## AR_PERF_COUNTERS
+
+Set to `1` to emit a per-block `[perf] tune phases (iters=N): wrap=...s prepare=...s loop=...s tail=...s`
+INFO line during data-driven tuning: `wrap` = wrapper_block (params init, quant-func resolve, optional
+per-wrapper `torch.compile`), `prepare` = tuning-param collection + optimizer/scheduler build, `loop` = the
+iteration loop, `tail` = best-params restore + cleanup. When micro-batching is engaged the line appends
+`(micro-batch: fwd=...s bwd=...s other=...s slices=N)` — the all-forwards phase, the all-backwards phase,
+slicing/staging/item-sum overhead, and the micro-batch count for the block. Default off.

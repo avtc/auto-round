@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import time as _ptime
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import torch
 from torch import autocast
 
+from auto_round import envs
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
@@ -27,6 +29,37 @@ from auto_round.compressors.utils import (
     collect_best_params,
 )
 from auto_round.logger import logger
+
+
+def _tune_phase_line(phases: dict, iters: int) -> str:
+    """Format the per-block tuning phase breakdown for AR_PERF_COUNTERS.
+
+    ``wrap`` = wrapper_block (params init, quant-func resolve, optional
+    per-wrapper torch.compile); ``prepare`` = tuning-param collection +
+    optimizer/scheduler build + sampler setup; ``loop`` = the iteration
+    try/finally; ``tail`` = best-params restore, clear_memory, unwrapping.
+    The ``micro-batch`` split appears only when micro-batched batches ran:
+    ``fwd`` = all-forwards phase (forwards + losses), ``bwd`` = all-backwards
+    phase, ``other`` = slicing/staging/item-sums, ``slices`` = micro-batch
+    count across the block.
+    """
+    line = "[perf] tune phases (iters=%d): wrap=%.2fs prepare=%.2fs loop=%.2fs tail=%.2fs" % (
+        iters,
+        phases.get("wrap", 0.0),
+        phases.get("prepare", 0.0),
+        phases.get("loop", 0.0),
+        phases.get("tail", 0.0),
+    )
+    if phases.get("mb_n", 0):
+        line += " (micro-batch: fwd=%.2fs bwd=%.2fs other=%.2fs slices=%d)" % (
+            phases.get("mb_fwd", 0.0),
+            phases.get("mb_bwd", 0.0),
+            phases.get("mb_other", 0.0),
+            phases["mb_n"],
+        )
+    return line
+
+
 from auto_round.utils import (
     htcore,
     is_hpex_available,
@@ -422,6 +455,9 @@ class SignRoundQuantizer(BaseQuantizer):
         ne = 1 if (num_elm is None or num_elm <= 0) else num_elm
         scope = DeviceStreamScope({p.device for p in block.parameters()})
         graphs = []
+        _mbp = getattr(self, "_mb_perf", None)
+        _call_t0 = _ptime.perf_counter() if _mbp is not None else None
+        _fwd_t0 = _call_t0
         with scope.context():
             for sl in slices:
                 staged = tuning_cache.get(sl) if tuning_cache is not None else None
@@ -439,8 +475,17 @@ class SignRoundQuantizer(BaseQuantizer):
                 # reproduce a token-mean CE, so it must never reach this helper.
                 loss = self._get_loss(pred_output, ref_output, sl, mse_loss, home_device, valid_token_mask)
                 graphs.append(loss * (len(sl) / n))
+            if _mbp is not None:
+                _fwd_wall = _ptime.perf_counter() - _fwd_t0
+                _bwd_t0 = _ptime.perf_counter()
             for scaled in graphs:
                 self._scale_loss_and_backward(scaler, scaled)
+        if _mbp is not None:
+            _bwd_wall = _ptime.perf_counter() - _bwd_t0
+            _mbp["fwd"] += _fwd_wall
+            _mbp["bwd"] += _bwd_wall
+            _mbp["other"] += max(_ptime.perf_counter() - _call_t0 - _fwd_wall - _bwd_wall, 0.0)
+            _mbp["n"] += len(slices)
         return float(sum(g.item() for g in graphs)) / ne
 
     def quantize_block(
@@ -498,6 +543,9 @@ class SignRoundQuantizer(BaseQuantizer):
         active_inputs = q_inputs if (q_inputs is not None and self.enable_quanted_input) else fp_inputs
         nsamples = len(active_inputs) if isinstance(active_inputs, list) else self._count_samples(active_inputs)
 
+        _tune_perf = {"wrap": 0.0, "prepare": 0.0, "loop": 0.0, "tail": 0.0} if envs.AR_PERF_COUNTERS else None
+        self._mb_perf = {"fwd": 0.0, "bwd": 0.0, "other": 0.0, "n": 0} if _tune_perf is not None else None
+        _tp0 = _ptime.perf_counter()
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
             block,
             self.enable_minmax_tuning,
@@ -505,6 +553,9 @@ class SignRoundQuantizer(BaseQuantizer):
             enable_torch_compile=self.compress_context.enable_torch_compile,
             device=device,
         )
+        if _tune_perf is not None:
+            _tune_perf["wrap"] = _ptime.perf_counter() - _tp0
+            _tp1 = _ptime.perf_counter()
 
         round_params = []
         minmax_params = []
@@ -615,6 +666,9 @@ class SignRoundQuantizer(BaseQuantizer):
             and (loss_device is None or torch.device(loss_device) == torch.device(device))
         )
 
+        if _tune_perf is not None:
+            _tune_perf["prepare"] = _ptime.perf_counter() - _tp1
+            _tp2 = _ptime.perf_counter()
         try:
             for i in range(self.iters):
                 # Auto observes a complete forward/backward/optimizer iteration
@@ -726,6 +780,9 @@ class SignRoundQuantizer(BaseQuantizer):
         finally:
             if tuning_cache is not None:
                 tuning_cache.close()
+        if _tune_perf is not None:
+            _tune_perf["loop"] = _ptime.perf_counter() - _tp2
+            _tp3 = _ptime.perf_counter()
 
         last_loss = total_loss
         best_iter = self.iters
@@ -753,6 +810,18 @@ class SignRoundQuantizer(BaseQuantizer):
             # enable moe experts act_max automatic generation for WrapperWALayer
             set_amax_for_all_moe_layers(block, attr_name="orig_layer.act_max")
 
+        if _tune_perf is not None:
+            _tune_perf["tail"] = _ptime.perf_counter() - _tp3
+            if self._mb_perf is not None:
+                _tune_perf.update(
+                    {
+                        "mb_fwd": self._mb_perf["fwd"],
+                        "mb_bwd": self._mb_perf["bwd"],
+                        "mb_other": self._mb_perf["other"],
+                        "mb_n": self._mb_perf["n"],
+                    }
+                )
+            logger.info(_tune_phase_line(_tune_perf, self.iters))
         logger.infoclean(dump_info)
         return best_params
 
