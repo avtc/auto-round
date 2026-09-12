@@ -312,7 +312,6 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
     else:
         for dev, ws in device_groups.items():
             _run_device(dev, ws)
-    log_engaged_once("batched wrap search")
     _t_total = sum(st.get("wall", 0.0) for st in stats.values())
     _n_mod = sum(st["modules"] for st in stats.values())
     _n_batch = sum(st["batches"] for st in stats.values())
