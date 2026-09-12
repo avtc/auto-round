@@ -26,6 +26,12 @@ drift apart.
 """
 
 from collections import OrderedDict
+from contextlib import nullcontext as _null_ctx_single
+
+
+def _null_ctx():
+    return _null_ctx_single()
+
 
 import torch
 
@@ -184,8 +190,12 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0), imatrix_override=stacked_im
         )
         kwargs = _relocate_tensor_kwargs(kwargs, str(stacked_w.device))
+        _cm = (
+            torch.compiler.disable() if (worker != dev and getattr(w0, "enable_torch_compile", False)) else _null_ctx()
+        )
         try:
-            qdq, scale, zp = w0.weight_quant_func(stacked_w, **kwargs)
+            with _cm:
+                qdq, scale, zp = w0.weight_quant_func(stacked_w, **kwargs)
         except torch.OutOfMemoryError:
             logger.warning(
                 "[rtn-batch] stacked search OOM (%d modules); finishing this chunk per-module "
