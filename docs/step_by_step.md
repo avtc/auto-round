@@ -870,7 +870,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A1
   layout on its own set of `K` devices instead of holding a squashed single-device mirror, so `world x K`
   devices are reserved in total. The fit is priced per device (stage weights plus the fp32 tune state plus an
   activation allowance) and declines loudly when devices or VRAM are insufficient. The no-grad collection pass
-  runs serial on such blocks (accelerate hooks stage the inputs); only the tuning loop is mirrored.
+  shards across the groups the same way (each group's copy forwards a disjoint sample shard); stage-boundary
+  hooks (upstream accelerate) stage inputs/outputs across the stages for every forward, serial runs included.
 - `AR_TUNE_DDP_DEVICES` selects specific mirror devices -- see [environment variables](environments.md).
 - What runs in parallel depends on the algorithm family: the block collection passes and the SignRound (V1/V2)
   tuning loop are always sharded; at `--iters 0` the per-layer RTN/optimized-RTN zero-shot searches shard

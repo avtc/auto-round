@@ -848,7 +848,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 auto-round --model "Qwen/Qwen3-0.6B" --scheme "W4A1
 - 若调优块的模块跨越多块 GPU（因过大而被上游放置机制分片），同一 flag 会启用**设备映射副本**：每个副本在
   自己的一组 `K` 块设备上复现该块的阶段布局，而不是把整个块压到单个镜像设备上，因此总共预留 `world x K` 块
   设备。适配性按设备定价（阶段权重 + fp32 调优状态 + 激活余量），设备或显存不足时会显式拒绝。此类 block 的
-  无梯度收集阶段串行执行（accelerate hook 负责输入分段）；仅调优循环被镜像。
+  无梯度收集阶段同样在各组之间分片（每组的副本转发互不重叠的样本分片）；阶段边界 hook（上游 accelerate）
+  为所有前向（含串行运行）在各阶段之间分段输入/输出。
 - `AR_TUNE_DDP_DEVICES` 可指定镜像设备——参见[环境变量](environments_CN.md)。
 - 实际并行的内容取决于算法家族：block 采集前向与 SignRound（V1/V2）调优循环始终分片执行；`--iters 0` 时
   每层的 RTN/optimized-RTN 零样本搜索按轮转方式分摊到各 GPU；SignRoundV2 的 wrap 阶段初始 scale 搜索同样在
