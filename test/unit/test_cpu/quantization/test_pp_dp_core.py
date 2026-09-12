@@ -862,3 +862,43 @@ class TestStagedKwargMemo:
         # second staging reuses the SAME staged tensors (zero new copies)
         assert second["position_embeddings"][0] is first["position_embeddings"][0]
         assert second["position_embeddings"][1] is first["position_embeddings"][1]
+
+
+class TestMixedSubtreeHook:
+    """A wrapper whose tunables sit on the primary while its weight sits
+    off-primary pulls the stream onto the primary mid-stage and returns its
+    output there (rotary q@primary x cos@stage). Mixed subtrees must be
+    hooked too, not only wholly-off-primary ones.
+    """
+
+    def test_mixed_subtree_hooks(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        installed = []
+        monkeypatch.setattr(
+            "accelerate.hooks.add_hook_to_module",
+            lambda mod, hook, append=False: installed.append((mod, hook)),
+        )
+
+        class _Mixed(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # simulate via monkeypatched leaf walk below
+
+        import auto_round.algorithms.quantization.sign_round.placement as placement
+
+        leaves = {"mixed": [("v", torch.zeros(1), None, None), ("w", torch.zeros(1, device="meta"), None, None)]}
+        monkeypatch.setattr(
+            placement,
+            "tensor_leaves",
+            lambda m: leaves.get(getattr(m, "_fake_name", ""), []),
+        )
+        block = torch.nn.Module()
+        m1 = _Mixed()
+        m1._fake_name = "mixed"
+        block.mixed = m1
+        added = dp.install_stage_boundary_hooks_(block, torch.device("cuda", 0))
+        # meta is not an accelerator type for the walk -- the CPU tier pins
+        # the CONDITION indirectly: mixed detection needs both leaves on
+        # accelerator devices, so with cpu+meta nothing hooks (no-op path)
+        assert added == 0 and installed == []

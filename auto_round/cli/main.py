@@ -318,9 +318,9 @@ def tune(args):
 
         _ambient = os.environ.pop("AR_TUNE_DDP_WORLD", None)
         if _ambient is not None:
-            logger.warning(
-                "[tune-ddp] ignoring ambient AR_TUNE_DDP_WORLD=%s (--parallel_quantization is off)", _ambient
-            )
+            # informational: the CLI flag is authoritative and the ambient env
+            # does nothing here (shell exports from earlier runs linger)
+            logger.info("[tune-ddp] ignoring ambient AR_TUNE_DDP_WORLD=%s (--parallel_quantization is off)", _ambient)
     if _parallel != "off":
         import os
 

@@ -323,9 +323,15 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         )
         free = None
         try:
-            free = {
-                torch.device("cuda", idx): torch.cuda.mem_get_info(idx)[0] for idx in range(torch.cuda.device_count())
-            }
+            free = {}
+            for idx in range(torch.cuda.device_count()):
+                _dev_free = torch.cuda.mem_get_info(idx)[0]
+                # torch's caching allocator RETAINS freed blocks (ephemeral
+                # collection mirrors etc.) as reserved: device-level free
+                # under-reports what WE can still allocate through torch.
+                # Count reserved-but-unallocated as usable.
+                _reclaim = torch.cuda.memory_reserved(idx) - torch.cuda.memory_allocated(idx)
+                free[torch.device("cuda", idx)] = _dev_free + max(_reclaim, 0)
         except Exception as e:  # pragma: no cover - non-CUDA reachability
             logger.warning("[tune-ddp] free-VRAM probe failed (%s); resolving the plan without VRAM filtering", e)
             free = None
@@ -573,12 +579,21 @@ def install_stage_boundary_hooks_(block, primary: torch.device) -> int:
     for mod_name, mod in block.named_modules():
         if getattr(mod, "_hf_hook", None) is not None:
             continue  # already dispatched
+        # the WHOLE subtree must sit on the primary; a MIXED subtree needs the
+        # hook too -- e.g. a wrapper whose tunables sit on the primary while
+        # its weight sits off-primary pulls the stream down onto the primary
+        # mid-stage and returns its output there (observed: rotary q@primary x
+        # cos@stage). exec = the subtree's first accelerator leaf; io_same
+        # returns the output onto the arriving (stream) device.
         stage = None
+        mixed = False
         for _n, tensor, _c, _k in tensor_leaves(mod):
             if tensor.device.type in accel:
-                stage = tensor.device
-                break
-        if stage is None or stage == primary:
+                if stage is None:
+                    stage = tensor.device
+                elif tensor.device != stage:
+                    mixed = True
+        if stage is None or (stage == primary and not mixed):
             continue
         add_hook_to_module(mod, AlignDevicesHook(stage, io_same_device=True), append=True)
         added += 1
@@ -1118,6 +1133,10 @@ def sharded_nograd_forward(
         (_t_merge - _t_split) * 1000,
         (_time.perf_counter() - _t_merge) * 1000,
     )
+    # drop the ephemeral mirrors eagerly: the caching allocator keeps their
+    # memory reserved either way, but lingering refs would pin it for real
+    mirrors.clear()
+    reps.clear()
     return pieces
 
 
