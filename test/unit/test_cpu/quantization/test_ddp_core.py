@@ -480,6 +480,15 @@ class TestTunePhaseLine:
         # line alongside the [perf] tune-ddp block line's own attribution
         ext = _tune_phase_line({"wrap": 1.0, "prepare": 2.0, "loop": 3.0, "tail": 0.5, "mirrors": 4.25}, 20)
         assert "mirrors=4.25s" in ext
+        assert "serial loop" not in ext  # serial sub-buckets absent on DDP runs
+
+    def test_serial_loop_subsplit_buckets(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
+
+        line = _tune_phase_line(
+            {"wrap": 1.0, "prepare": 2.0, "loop": 9.0, "tail": 0.5, "loop_prep": 1.2, "loop_reps": 6.5}, 10
+        )
+        assert "serial loop: prep=1.20s reps=6.50s other=1.30s" in line
 
 
 class TestBlockHasTuningEntries:

@@ -50,6 +50,10 @@ def _tune_phase_line(phases: dict, iters: int) -> str:
     )
     if "mirrors" in phases:  # DDP replica build (deepcopy + placement)
         line += " mirrors=%.2fs" % phases["mirrors"]
+    if "loop_prep" in phases and phases.get("loop_reps"):  # serial loop split
+        _lt = phases.get("loop", 0.0)
+        _lo = max(_lt - phases["loop_prep"] - phases["loop_reps"], 0.0)
+        line += " (serial loop: prep=%.2fs reps=%.2fs other=%.2fs)" % (phases["loop_prep"], phases["loop_reps"], _lo)
     return line
 
 
@@ -485,6 +489,9 @@ class SignRoundQuantizer(BaseQuantizer):
                 "bwd": [],
                 "exch": [],
                 "step": [],
+                "prep": [],
+                "reps": [],
+                "iter": [],
             }
             _tp["mirrors"] = _ddp_perf["build"]  # surface in the phase line too
             for note in _plan.notes:
@@ -751,6 +758,8 @@ class SignRoundQuantizer(BaseQuantizer):
                 total_loss = 0
 
                 if replica_group is not None:
+                    _t_iter = _ptime.perf_counter()
+                    _t0 = _ptime.perf_counter()
                     _world = replica_group.world
                     if _dp_samplers is not None:
                         _shards = [s_.next_batch() for s_ in _dp_samplers]
@@ -762,6 +771,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     if valid_token_mask is not None:
                         # same global normalization as the serial path (reporting only)
                         num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
+                    _ddp_perf["prep"].append(_ptime.perf_counter() - _t0)
                     _losses = [None] * _world
 
                     _fwd_walls = [0.0] * _world
@@ -793,7 +803,9 @@ class SignRoundQuantizer(BaseQuantizer):
                             # surfaces in the exch wall below
                             _bwd_walls[r] = _ptime.perf_counter() - _t0
 
+                    _t0 = _ptime.perf_counter()
                     replica_group.run_threaded([lambda r=r: _dp_replica_step(r, _shards[r]) for r in range(_world)])
+                    _ddp_perf["reps"].append(_ptime.perf_counter() - _t0)
                     _ddp_perf["fwd"].append(max(_fwd_walls))
                     _ddp_perf["bwd"].append(max(_bwd_walls))
                     # sync_grads: cross-replica gradient exchange. sign_exchange:
@@ -815,9 +827,14 @@ class SignRoundQuantizer(BaseQuantizer):
                     total_loss = sum(l.item() for l in _losses if l is not None) / _world / _ne
 
                 else:
+                    _t_iter = _ptime.perf_counter()
+                    _t0 = _ptime.perf_counter()
                     global_indices = index_sampler.next_batch()
                     if valid_token_mask:
                         num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
+                    _tp["loop_prep_pending"] = _tp.get("loop_prep_pending", 0.0) + (_ptime.perf_counter() - _t0)
+                    _tp["loop_prep"] = _tp.get("loop_prep", 0.0) + (_ptime.perf_counter() - _t0)
+                    _t0 = _ptime.perf_counter()
                     for batch_start in range(0, len(global_indices), batch_size):
                         indices = global_indices[batch_start : batch_start + batch_size]
                         staged = tuning_cache.get(indices) if tuning_cache is not None else None
@@ -852,6 +869,10 @@ class SignRoundQuantizer(BaseQuantizer):
                         if mid_iter_mem_check:
                             # clear memory to avoid OOM due to memory fragmentation
                             clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
+                    if replica_group is None:
+                        # serial reps span: the whole batch loop (fwd + loss + bwd)
+                        _tp["loop_reps"] = _tp.get("loop_reps", 0.0) + (_ptime.perf_counter() - _t0)
+                        _tp["loop_reps_pending"] = _tp.get("loop_reps_pending", 0.0) + (_ptime.perf_counter() - _t0)
 
                 if i == 0:
                     init_loss = total_loss
@@ -895,9 +916,16 @@ class SignRoundQuantizer(BaseQuantizer):
                         ]
                     )
                     _ddp_perf["step"].append(_ptime.perf_counter() - _t0)
+                    _ddp_perf["iter"].append(_ptime.perf_counter() - _t_iter)
                 else:
                     sync_gradients()
                     self._step(scaler, optimizer, lr_schedule)
+                    _tp["loop_other"] = (
+                        _tp.get("loop_other", 0.0)
+                        + (_ptime.perf_counter() - _t_iter)
+                        - _tp.pop("loop_prep_pending", 0.0)
+                        - _tp.pop("loop_reps_pending", 0.0)
+                    )
 
         finally:
             if tuning_cache is not None:
@@ -918,9 +946,18 @@ class SignRoundQuantizer(BaseQuantizer):
                 return f"{1000 * x:.0f}ms"
 
             _bwd = _ddp_perf["bwd"]
+            _prep, _reps, _iter = _ddp_perf["prep"], _ddp_perf["reps"], _ddp_perf["iter"]
+            # the loop bucket's unaccounted time: iter - (prep + reps + exch +
+            # step) -- loss .item() syncs, best-params snapshots, scheduler
+            _other_mean = 0.0
+            if _iter:
+                _other_mean = sum(_iter) / len(_iter) - sum(
+                    sum(_x) / max(len(_x), 1) for _x in (_prep, _reps, _exch, _step)
+                )
             logger.info(
                 "[perf] tune-ddp block (%s): mirrors=%s warmup=%s "
-                "fwd=%s/%s bwd=%s/%s exch=%s/%s step=%s/%s teardown=%s (mean/max per iter)",
+                "fwd=%s/%s bwd=%s/%s exch=%s/%s step=%s/%s prep=%s/%s reps=%s/%s other=%s teardown=%s "
+                "(mean/max per iter; reps=threaded replica span incl. ref-cat; other=loss-sync/best-params/sched)",
                 type(block).__name__,
                 _ms(_ddp_perf["build"]),
                 _ms(_ddp_perf["warm"]),
@@ -932,6 +969,11 @@ class SignRoundQuantizer(BaseQuantizer):
                 _ms(max(_exch)) if _exch else "n/a",
                 _ms(sum(_step) / max(len(_step), 1)),
                 _ms(max(_step)) if _step else "n/a",
+                _ms(sum(_prep) / max(len(_prep), 1)),
+                _ms(max(_prep)) if _prep else "n/a",
+                _ms(sum(_reps) / max(len(_reps), 1)),
+                _ms(max(_reps)) if _reps else "n/a",
+                _ms(_other_mean),
                 _ms(_ddp_perf.get("teardown", 0.0)),
             )
 
