@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Union
 import torch
 
 from auto_round.compressors.utils import block_forward
+from auto_round.logger import logger
 from auto_round.utils.device_manager import device_manager
 
 if TYPE_CHECKING:
@@ -418,6 +419,27 @@ class BlockForwardRunner:
                 # (and other accelerator backends) require index tensors on
                 # the same device as the indexed value.
                 selected_others[key] = torch.index_select(val, batch_dim, indices.to(device=val.device))
+            elif isinstance(val, tuple) and val and all(torch.is_tensor(t) for t in val):
+                # tuple-of-tensors kwargs (transformers v5 passes rope as
+                # ``position_embeddings=(cos, sin)`` with a per-sample batch
+                # dim). Slice each element like the tensor branch; elements
+                # that are NOT per-sample (e.g. broadcast [1, S, D] tables)
+                # fail the select and pass through unsliced, preserving their
+                # broadcast behavior. Without this, forwards smaller than the
+                # cached batch (micro-batch slices, shard draws) crash in
+                # apply_rotary_pos_emb (hidden batch N vs cos batch full).
+                parts = []
+                for t in val:
+                    try:
+                        _idx = torch.as_tensor(indices, device=t.device)
+                        parts.append(t.index_select(batch_dim, _idx))
+                    except (RuntimeError, IndexError):
+                        logger.warning_once(
+                            "shared-cache kwarg element slicing fell back to the unsliced tensor; "
+                            "sub-batch draws may see the wrong batch's entry"
+                        )
+                        parts.append(t)
+                selected_others[key] = tuple(parts)
             elif isinstance(val, (str, bool, type(None))):
                 selected_others[key] = val
             else:

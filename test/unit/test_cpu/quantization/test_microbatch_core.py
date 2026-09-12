@@ -638,6 +638,44 @@ class TestMicroBatchDeclineGuards:
         assert q._micro_batch_n(torch.arange(4)) is None
 
 
+class TestSelectBatchRopeTuples(unittest.TestCase):
+    """transformers-v5 rope kwargs arrive as ``(cos, sin)`` tuples; slice them per micro-batch."""
+
+    def _runner(self):
+        from auto_round.algorithms.block_runner import BlockForwardRunner
+
+        r = object.__new__(BlockForwardRunner)
+        r.batch_dim = 0
+        r.batch_size = 8
+        r.shared_cache_keys = ("past_key_values", "past_key_values_kwargs")
+        return r
+
+    def test_position_embeddings_tuple_sliced_by_indices(self):
+        import torch
+
+        r = self._runner()
+        n, s, d = 8, 5, 3
+        cos = torch.arange(n * s * d, dtype=torch.float32).reshape(n, s, d)
+        sin = cos + 100.0
+        inputs = [torch.randn(4, 2) for _ in range(n)]
+        idx = torch.tensor([1, 5, 7])
+        _, others = r._select_batch(inputs, {"position_embeddings": (cos, sin)}, idx)
+        got = others["position_embeddings"]
+        assert isinstance(got, tuple) and len(got) == 2
+        assert torch.equal(got[0], cos.index_select(0, idx))
+        assert torch.equal(got[1], sin.index_select(0, idx))
+
+    def test_broadcast_table_passes_through_unsliced(self):
+        import torch
+
+        r = self._runner()
+        cos = torch.randn(1, 5, 3)  # broadcast [1, S, D]: not per-sample
+        inputs = [torch.randn(4, 2) for _ in range(8)]
+        idx = torch.tensor([0, 3])
+        _, others = r._select_batch(inputs, {"position_embeddings": (cos, cos)}, idx)
+        assert torch.equal(others["position_embeddings"][0], cos)
+
+
 class TestMicroBatchedMaskedParity(unittest.TestCase):
     """Masked MSE parity: weighted slice means reproduce the serial loss."""
 
