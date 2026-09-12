@@ -271,6 +271,16 @@ AR_ENABLE_WRAP_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,
 AR_PERF_COUNTERS=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
+### AR_WRAP_SEARCH_BATCH_GB
+- **描述**：以 GiB（每次批量调用的堆叠 fp32 权重大小）覆盖封装期批量搜索的元素预算（默认约 1 GiB，与专家批量搜索使用的固定预算一致）。该搜索受带宽限制，更大的批次通常不会缩短耗时；仅在显存紧张的卡上缩小瞬态占用或实验批次大小时使用。
+- **默认值**：未设置（固定约 1 GiB 预算）
+- **有效取值**：正浮点数（GiB）
+- **用法**：在显存紧张的多设备运行中缩小批次。
+
+```bash
+AR_WRAP_SEARCH_BATCH_GB=0.5 python -m auto_round --model ... --device_map 0,1
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

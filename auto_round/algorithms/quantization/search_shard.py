@@ -223,6 +223,17 @@ def _probe_usable_bytes(device_key):
 _WRAP_BATCH_MAX_ELEMS = 2**28  # ~1 GiB fp32 stacked weights per batched call (matches the NeUQI expert batching)
 
 
+def _wrap_batch_max_elems():
+    """Element budget per stacked batch; AR_WRAP_SEARCH_BATCH_GB overrides in GiB of fp32 weights."""
+    try:
+        gb = float(envs.AR_WRAP_SEARCH_BATCH_GB)
+    except (TypeError, ValueError):
+        gb = None
+    if gb is not None and gb > 0:
+        return max(int(gb * 2**30 // 4), 1)
+    return _WRAP_BATCH_MAX_ELEMS
+
+
 def _batch_cap(group, device_key, max_batch):
     """Modules per stacked batch: explicit cap > free-VRAM probe > 64, capped by the element budget."""
     if max_batch is not None:
@@ -231,7 +242,7 @@ def _batch_cap(group, device_key, max_batch):
     elements_per_module = inputs0[0].numel() + inputs0[3].numel()
     # the search is bandwidth-bound: batches beyond ~1 GiB of stacked weights move
     # the same total bytes, so the fixed element budget only lowers transient VRAM
-    elem_cap = max(1, _WRAP_BATCH_MAX_ELEMS // max(elements_per_module, 1))
+    elem_cap = max(1, _wrap_batch_max_elems() // max(elements_per_module, 1))
     probe_cap = 64
     usable = _probe_usable_bytes(device_key)
     if usable is not None:

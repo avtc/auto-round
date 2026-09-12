@@ -170,6 +170,38 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
         # with a small module count still takes the element cap path when modules are many:
         self.assertTrue(all(c == 6 for c in calls))
 
+    def test_env_gb_override_caps_batches(self):
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+
+        # tiny modules (0.26M elems each): 1 GiB budget would allow ~1000 -> force 2 per batch via GB override
+        fakes = [FakeDeferred(seed=i, shape=(1024, 128)) for i in range(4)]
+        calls = []
+        real_stack = torch.stack
+
+        def spy_stack(tensors, *a, **k):
+            calls.append(len(tensors))
+            return real_stack(tensors, *a, **k)
+
+        with mock.patch.object(shard_mod.envs, "AR_WRAP_SEARCH_BATCH_GB", 0.001), mock.patch.object(
+            torch, "stack", side_effect=spy_stack
+        ):
+            run_batched_wrap_search(fakes)
+        # 0.001 GiB = ~268K elements -> 268214 // (2*1024*128=262144) = 1 module/batch;
+        # 4 batches x (weights + imatrices) = 8 stacks of size 1
+        self.assertEqual(calls, [1] * 8)
+        for f in fakes:
+            self.assertIsNotNone(f.init_scale)
+
+    def test_env_gb_override_invalid_falls_back(self):
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+
+        fakes = [FakeDeferred(seed=i) for i in range(4)]
+        with mock.patch.object(shard_mod.envs, "AR_WRAP_SEARCH_BATCH_GB", "not-a-number"):
+            handled = run_batched_wrap_search(fakes)
+        self.assertTrue(handled)  # default budget applies, no crash
+        for f in fakes:
+            self.assertIsNotNone(f.init_scale)
+
     def test_kill_switch_disables(self):
         fakes = [FakeDeferred(seed=i) for i in range(3)]
         with mock.patch.object(search_shard.envs, "AR_DISABLE_SEARCH_SHARD", True):

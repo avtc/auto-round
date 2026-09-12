@@ -271,6 +271,16 @@ AR_ENABLE_WRAP_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,
 AR_PERF_COUNTERS=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
+### AR_WRAP_SEARCH_BATCH_GB
+- **Description**: Overrides the element budget of the batched wrap-time searches in GiB of stacked fp32 weights per batched call (default ~1 GiB, matching the fixed budget used by the expert batching). The searches are bandwidth-bound, so larger batches rarely reduce wall time; use this only to shrink transient VRAM on tight cards or to experiment with batch sizes.
+- **Default**: unset (fixed ~1 GiB budget)
+- **Valid Values**: positive float (GiB)
+- **Usage**: Shrink batches on memory-tight multi-device runs.
+
+```bash
+AR_WRAP_SEARCH_BATCH_GB=0.5 python -m auto_round --model ... --device_map 0,1
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

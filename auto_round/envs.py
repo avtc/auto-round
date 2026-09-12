@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     AR_DISABLE_SEARCH_SHARD: bool = False
     AR_ENABLE_WRAP_SEARCH_SHARD: bool = False
     AR_PERF_COUNTERS: bool = False
+    AR_WRAP_SEARCH_BATCH_GB: Optional[float] = None
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -146,6 +147,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_ENABLE_WRAP_SEARCH_SHARD": lambda: os.getenv("AR_ENABLE_WRAP_SEARCH_SHARD", "False").strip().lower()
     in ("1", "true", "yes"),
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "False").strip().lower() in ("1", "true", "yes"),
+    "AR_WRAP_SEARCH_BATCH_GB": lambda: (
+        (lambda v: v if v is None else (float(v) if v.replace(".", "", 1).replace("-", "", 1).isdigit() else None))(
+            os.getenv("AR_WRAP_SEARCH_BATCH_GB", "").strip() or None
+        )
+    ),
     # When enabled, MoE routing can be overridden in selected model wrappers
     # to rotate token assignments across all experts for calibration coverage.
     "AR_FORCE_MOE_ROUTING_ALL_EXPERTS": lambda: os.getenv("AR_FORCE_MOE_ROUTING_ALL_EXPERTS", "0").lower()
