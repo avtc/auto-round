@@ -641,6 +641,44 @@ class TestMicroBatchDeclineGuards:
 class TestLoopSplitAndLocalSnapshot(unittest.TestCase):
     """(loop: sampler/snap/step/rest) split + device-local best-params snapshot."""
 
+    def test_serial_split_appended_when_serial_ran(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
+
+        line = _tune_phase_line(
+            {
+                "wrap": 1.0,
+                "prepare": 0.0,
+                "loop": 9.5,
+                "tail": 0.5,
+                "lp_sampler": 0.0,
+                "lp_snap": 0.0,
+                "lp_step": 0.01,
+                "lp_rest": 0.9,
+                "lp_serial": 8.6,
+            },
+            10,
+        )
+        assert "(loop: sampler=0.00s snap=0.00s step=0.01s rest=0.90s serial: fwd+loss+bwd=8.60s)" in line
+
+    def test_serial_split_omitted_when_zero(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
+
+        line = _tune_phase_line(
+            {
+                "wrap": 1.0,
+                "prepare": 0.0,
+                "loop": 9.5,
+                "tail": 0.5,
+                "lp_sampler": 0.0,
+                "lp_snap": 0.0,
+                "lp_step": 0.01,
+                "lp_rest": 9.4,
+                "lp_serial": 0.0,
+            },
+            10,
+        )
+        assert "serial:" not in line
+
     def test_loop_split_appended(self):
         from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
 

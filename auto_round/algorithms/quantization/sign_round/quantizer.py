@@ -59,12 +59,17 @@ def _tune_phase_line(phases: dict, iters: int) -> str:
             phases["mb_n"],
         )
     if "lp_sampler" in phases:
-        line += " (loop: sampler=%.2fs snap=%.2fs step=%.2fs rest=%.2fs)" % (
+        line += " (loop: sampler=%.2fs snap=%.2fs step=%.2fs rest=%.2fs" % (
             phases["lp_sampler"],
             phases["lp_snap"],
             phases["lp_step"],
             phases["lp_rest"],
         )
+        if phases.get("lp_serial", 0.0):
+            # serial (non-micro-batched) batches timed inline: fwd+loss includes the
+            # .item() drain of the backward enqueued by the previous batches.
+            line += " serial: fwd+loss+bwd=%.2fs" % phases["lp_serial"]
+        line += ")"
     return line
 
 
@@ -490,10 +495,14 @@ class SignRoundQuantizer(BaseQuantizer):
                 self._scale_loss_and_backward(scaler, scaled)
         if _mbp is not None:
             _bwd_wall = _ptime.perf_counter() - _bwd_t0
+            _ret_t0 = _ptime.perf_counter()
+            _ret = float(sum(g.item() for g in graphs)) / ne  # .item() drains the enqueued backwards
+            _total = _ptime.perf_counter() - _call_t0
             _mbp["fwd"] += _fwd_wall
             _mbp["bwd"] += _bwd_wall
-            _mbp["other"] += max(_ptime.perf_counter() - _call_t0 - _fwd_wall - _bwd_wall, 0.0)
+            _mbp["other"] += max(_total - _fwd_wall - _bwd_wall, 0.0)  # includes the item drain
             _mbp["n"] += len(slices)
+            return _ret
         return float(sum(g.item() for g in graphs)) / ne
 
     def quantize_block(
@@ -553,7 +562,11 @@ class SignRoundQuantizer(BaseQuantizer):
 
         _tune_perf = {"wrap": 0.0, "prepare": 0.0, "loop": 0.0, "tail": 0.0} if envs.AR_PERF_COUNTERS else None
         self._mb_perf = {"fwd": 0.0, "bwd": 0.0, "other": 0.0, "n": 0} if _tune_perf is not None else None
-        _loop_perf = {"sampler": 0.0, "snap": 0.0, "step": 0.0} if _tune_perf is not None else None
+        _loop_perf = (
+            {"sampler": 0.0, "snap": 0.0, "step": 0.0, "s_fwd": 0.0, "s_loss": 0.0, "s_bwd": 0.0}
+            if _tune_perf is not None
+            else None
+        )
         # Snapshot placement: device-local duplicates shard with the wrappers on
         # multi-device blocks (each device holds only its own slice), but a
         # single-device low-gpu-mem run would park the WHOLE snapshot on the one
@@ -738,6 +751,8 @@ class SignRoundQuantizer(BaseQuantizer):
                             block_ctx,
                         )
                         continue
+                    if _loop_perf is not None:
+                        _sf_t0 = _ptime.perf_counter()
                     staged = tuning_cache.get(indices) if tuning_cache is not None else None
                     if staged is None:
                         ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
@@ -747,6 +762,9 @@ class SignRoundQuantizer(BaseQuantizer):
                         pred_output = tuning_cache.forward(block, staged, _fwd_cache_device)
                     if loss_device is not None:
                         pred_output = pred_output.to(loss_device)
+                    if _loop_perf is not None:
+                        _loop_perf["s_fwd"] += _ptime.perf_counter() - _sf_t0
+                        _sl_t0 = _ptime.perf_counter()
                     if (
                         block_ctx.block_index == block_ctx.block_cnt - 1
                         and self.enable_lfq
@@ -758,12 +776,17 @@ class SignRoundQuantizer(BaseQuantizer):
                         loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
                     num_elm = 1 if num_elm <= 0 else num_elm
                     total_loss += loss.item() / num_elm
+                    if _loop_perf is not None:
+                        _loop_perf["s_loss"] += _ptime.perf_counter() - _sl_t0
+                        _sb_t0 = _ptime.perf_counter()
 
                     if mid_iter_mem_check:
                         # clear memory to avoid OOM due to memory fragmentation
                         clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
 
                     self._scale_loss_and_backward(scaler, loss)
+                    if _loop_perf is not None:
+                        _loop_perf["s_bwd"] += _ptime.perf_counter() - _sb_t0
 
                     if mid_iter_mem_check:
                         # clear memory to avoid OOM due to memory fragmentation
@@ -861,6 +884,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     }
                 )
             if _loop_perf is not None:
+                _serial_fwd = _loop_perf["s_fwd"] + _loop_perf["s_loss"] + _loop_perf["s_bwd"]
                 _rest = max(
                     _tune_perf["loop"]
                     - _loop_perf["sampler"]
@@ -868,7 +892,8 @@ class SignRoundQuantizer(BaseQuantizer):
                     - _loop_perf["step"]
                     - _tune_perf.get("mb_fwd", 0.0)
                     - _tune_perf.get("mb_bwd", 0.0)
-                    - _tune_perf.get("mb_other", 0.0),
+                    - _tune_perf.get("mb_other", 0.0)
+                    - _serial_fwd,
                     0.0,
                 )
                 _tune_perf.update(
@@ -877,6 +902,7 @@ class SignRoundQuantizer(BaseQuantizer):
                         "lp_snap": _loop_perf["snap"],
                         "lp_step": _loop_perf["step"],
                         "lp_rest": _rest,
+                        "lp_serial": _serial_fwd,
                     }
                 )
             logger.info(_tune_phase_line(_tune_perf, self.iters))
