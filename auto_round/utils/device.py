@@ -721,6 +721,27 @@ def _preassign_moe_experts(
     return assigned
 
 
+def _atomic_parent_groups(layer_memory_dict: dict) -> dict:
+    """Group leaf entries by parent container for atomic placement.
+
+    Leaves under one parent (q/k/v under self_attn, gate/up under mlp, each
+    experts.N) form one atomic unit: splitting siblings across devices puts
+    stage boundaries inside attention/MLP containers (mixed-device tensors
+    mid-computation -- the rotary q x cos crash class). Returns
+    ``{parent: {"param_memory": total, "members": [leaves]}}`` for parents
+    with MORE than one leaf; single leaves stay standalone.
+    """
+    groups: dict = {}
+    for leaf, info in layer_memory_dict.items():
+        parent = leaf.rpartition(".")[0] if "." in leaf else ""
+        if not parent:
+            continue
+        groups.setdefault(parent, {"param_memory": 0.0, "members": []})
+        groups[parent]["param_memory"] += info.get("param_memory", 0.0)
+        groups[parent]["members"].append(leaf)
+    return {k: v for k, v in groups.items() if len(v["members"]) > 1}
+
+
 def _allocate_layers_to_devices(
     layer_memory_dict: dict, device_memory: dict, gpu_devices: list, mem_per_param: float
 ) -> tuple[dict, list]:
@@ -1118,10 +1139,58 @@ def set_auto_device_map_for_block_with_tuning(
         device_memory[gpu_devices[i]] = get_device_memory(device_idx)
 
     # Allocate layers to devices using load-balancing strategy
-    device_map, names = _allocate_layers_to_devices(layer_memory_dict, device_memory, gpu_devices, mem_per_param)
+    # Atomic sibling groups: leaves under one parent container (q/k/v under
+    # self_attn, gate/up under mlp, each experts.N) allocate as ONE unit --
+    # splitting siblings across devices leaves the attention/MLP chain with
+    # mixed-device tensors mid-computation (rotary q x cos crash class) and
+    # makes every stage boundary land inside a container. Merged entries keep
+    # the parent's total param memory so the balancer prices them whole;
+    # member names expand back after allocation.
+    _atomic_by_parent, _member_of = _atomic_parent_groups(layer_memory_dict), {}
+    for _parent, _agg in _atomic_by_parent.items():
+        for _m in _agg["members"]:
+            _member_of[_m] = _parent
+    _merged_memory = {
+        _leaf: dict(_info)
+        for _leaf, _info in layer_memory_dict.items()
+        if _leaf not in _member_of  # standalone leaves unchanged
+    }
+    for _parent, _agg in _atomic_by_parent.items():
+        if len(_agg["members"]) > 1:
+            _merged_memory[_parent] = {"param_memory": _agg["param_memory"]}
+    device_map, names = _allocate_layers_to_devices(_merged_memory, device_memory, gpu_devices, mem_per_param)
+
+    # expand parent atoms back to their member leaves (all on the parent's device)
+    _expanded_map = {}
+    for _key, _dev in device_map.items():
+        if _key in _atomic_by_parent:
+            for _m in _atomic_by_parent[_key]["members"]:
+                _expanded_map[_m] = _dev
+        else:
+            _expanded_map[_key] = _dev
+    device_map = _expanded_map
+    names = [n for n in names for n in ([n] if n not in _atomic_by_parent else _atomic_by_parent[n]["members"])]
 
     logger.debug(f"Auto device map for block: {device_map}")
+    # The map DISTRIBUTES THE BLOCK'S WEIGHTS: after the (now atomic) split,
+    # every leaf's state moves onto its assigned device -- tuning markers and
+    # dispatch hooks point there, and a leaf left behind on its loader device
+    # gets a hook dragging inputs onto the wrong GPU (weight/input mismatch).
     set_non_auto_device_map(block, device_map, names)
+    from auto_round.utils.model import _module_manages_own_device as _manages_own
+
+    for _name in names:
+        _mod = get_module(block, _name)
+        _target = device_map.get(_name)
+        if _mod is None or _target is None:
+            continue
+        _target = get_major_device(_target)
+        _params = list(_mod.parameters(recurse=False)) + list(_mod.buffers(recurse=False))
+        if not _params or all(p.device == _target for p in _params):
+            continue
+        if _manages_own(_mod):
+            continue  # self-managed subtrees keep their own placement
+        _mod.to(_target)
 
     # Ensure all remaining modules with parameters/buffers are moved to expected device, by default device_0
     output_device = device_0 if output_device is None else output_device

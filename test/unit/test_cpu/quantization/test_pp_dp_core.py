@@ -902,3 +902,49 @@ class TestMixedSubtreeHook:
         # the CONDITION indirectly: mixed detection needs both leaves on
         # accelerator devices, so with cpu+meta nothing hooks (no-op path)
         assert added == 0 and installed == []
+
+
+class TestAtomicSiblingPlacement:
+    """Leaves under one parent container allocate as ONE unit and their
+    weights MOVE onto the assigned device.
+
+    The balancer previously assigned tuning markers without moving weights:
+    leaves kept their loader devices while hooks pointed at the assigned
+    ones (the rotary weight/input mismatch class). Sibling splitting put
+    stage boundaries inside attention/MLP containers.
+    """
+
+    class _FakeLeaf(torch.nn.Module):
+        def __init__(self, n=4):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(n, n))
+
+    class _FakeBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = torch.nn.Module()
+            self.attn.q_proj = TestAtomicSiblingPlacement._FakeLeaf()
+            self.attn.k_proj = TestAtomicSiblingPlacement._FakeLeaf()
+            self.attn.v_proj = TestAtomicSiblingPlacement._FakeLeaf()
+            self.mlp = torch.nn.Module()
+            self.mlp.gate_proj = TestAtomicSiblingPlacement._FakeLeaf()
+            self.mlp.up_proj = TestAtomicSiblingPlacement._FakeLeaf()
+            self.standalone = TestAtomicSiblingPlacement._FakeLeaf()
+
+    def test_atomic_merge_by_parent(self):
+        from auto_round.utils.device import _atomic_parent_groups
+
+        block = self._FakeBlock()
+        layer_memory = {
+            "attn.q_proj": {"param_memory": 1.0},
+            "attn.k_proj": {"param_memory": 1.0},
+            "attn.v_proj": {"param_memory": 1.0},
+            "mlp.gate_proj": {"param_memory": 2.0},
+            "mlp.up_proj": {"param_memory": 2.0},
+            "standalone": {"param_memory": 0.5},
+        }
+        groups = _atomic_parent_groups(layer_memory)
+        assert set(groups["attn"]["members"]) == {"attn.q_proj", "attn.k_proj", "attn.v_proj"}
+        assert abs(groups["attn"]["param_memory"] - 3.0) < 1e-9
+        assert set(groups["mlp"]["members"]) == {"mlp.gate_proj", "mlp.up_proj"}
+        assert "standalone" not in groups  # single leaf stays standalone
