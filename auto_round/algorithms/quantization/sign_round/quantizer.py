@@ -453,9 +453,9 @@ class SignRoundQuantizer(BaseQuantizer):
         if _dp_eligible:
             from auto_round.algorithms.quantization.sign_round.data_parallel import (
                 ReplicaGroup,
-                align_block_stages_,
                 distribute_pool,
                 gather_block_for_mirroring_,
+                install_stage_boundary_hooks_,
             )
 
             # the source block must sit whole on the home device before
@@ -468,9 +468,13 @@ class SignRoundQuantizer(BaseQuantizer):
             if _plan.replica_devices is None:
                 gather_block_for_mirroring_(block, _plan.devices[0])
             else:
-                _aligned = align_block_stages_(block)
-                if _aligned:
-                    logger.info("[tune-ddp] home block stage-aligned (%d leaf moves)", _aligned)
+                # the mapped home keeps its spanning layout: container-level
+                # staging (residual adds around off-primary submodules) comes
+                # from upstream accelerate AlignDevicesHooks, which the
+                # mirrors inherit through deepcopy (retargeted per mirror)
+                _hooked = install_stage_boundary_hooks_(block, _plan.devices[0])
+                if _hooked:
+                    logger.info("[tune-ddp] mapped home: %d stage-boundary hook(s) installed", _hooked)
             # distributed calibration pool: shard-local tune reads; each
             # device owns a contiguous 1/world slice of the samples
             distribute_pool(active_inputs, _plan.devices)

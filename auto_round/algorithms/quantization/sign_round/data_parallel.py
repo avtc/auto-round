@@ -333,26 +333,45 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
 
         home_stages = accelerator_stage_devices(block)
         if len(home_stages) > 1:
-            # a block spanning several accelerator devices cannot use
-            # single-device mirrors (they would squash the stage layout);
-            # resolve device-mapped replicas on disjoint sets instead
-            mapped = resolve_mapped_ddp_plan(world, block, home_stages, free, batch_size=global_batch_size)
-            for note in mapped.notes:
-                logger.info("[tune-ddp] %s", note)
-            if mapped.enabled:
-                if log:
-                    logger.info(
-                        "[tune-ddp] engaged device-mapped replicas: world=%d x K=%d devices shard=%d",
-                        mapped.world,
-                        len(home_stages),
-                        mapped.shard_size,
-                    )
-                quantizer._resolved_ddp_plan = mapped
-                return mapped
-            # declined: fall through to the shared requirement check below so
-            # an explicitly requested world raises instead of silently
-            # degrading to serial (same semantics as the full-mirror lane)
-            plan = mapped
+            # A block spanning several accelerator devices CAN still take the
+            # full-mirror lane when some device holds a whole mirror: the
+            # pre-mirror gather squashes the block onto the home device (the
+            # wrappers self-stage everything onto their tuning device, so the
+            # squash loses nothing). Device-mapped replicas are for blocks
+            # that do NOT fit a single device -- resolve them on disjoint
+            # sets only then.
+            full_mirror_viable = free is None or any(
+                dev != home_stages[0] and have is not None and have >= mirror_bytes + 2 * 2**30
+                for dev, have in free.items()
+            )
+            if full_mirror_viable:
+                plan = resolve_ddp_plan(
+                    world,
+                    home,
+                    global_batch_size,
+                    visible_cuda_devices=list(range(torch.cuda.device_count())) if free else None,
+                    explicit_devices=explicit or None,
+                    vram_free_bytes=free,
+                    mirror_footprint_bytes=mirror_bytes,
+                )
+            else:
+                mapped = resolve_mapped_ddp_plan(world, block, home_stages, free, batch_size=global_batch_size)
+                for note in mapped.notes:
+                    logger.info("[tune-ddp] %s", note)
+                if mapped.enabled:
+                    if log:
+                        logger.info(
+                            "[tune-ddp] engaged device-mapped replicas: world=%d x K=%d devices shard=%d",
+                            mapped.world,
+                            len(home_stages),
+                            mapped.shard_size,
+                        )
+                    quantizer._resolved_ddp_plan = mapped
+                    return mapped
+                # declined: fall through to the shared requirement check below
+                # so an explicitly requested world raises instead of silently
+                # degrading to serial (same semantics as the full-mirror lane)
+                plan = mapped
         else:
             plan = resolve_ddp_plan(
                 world,
@@ -487,47 +506,59 @@ def _relocate_module_state(m: torch.nn.Module, device: torch.device) -> None:
             m.__dict__[key] = str(device)
 
 
-def align_block_stages_(block) -> int:
-    """Co-locate every module's state onto the stage of its own first tensor leaf.
+def install_stage_boundary_hooks_(block, primary: torch.device) -> int:
+    """Stage-boundary hooks for a block whose modules span several devices.
 
-    A spanning home block carries a latent split: wrapper tunables are
-    created on ``orig_layer.tuning_device`` (an independently allocated
-    per-layer knob) while ``init_scale`` is searched from the orig weight
-    (the weight's resident device). On a single-device block the two
-    coincide; on a spanning block the first wrapper forward meets a
-    cross-device ``init_scale * max_scale`` mul (eager would hit it too --
-    torch.compile just fails first in fake-tensor propagation). The
-    full-mirror lane never sees this because the pre-mirror gather squashes
-    the whole block onto one device; the mapped lane keeps the layout, so
-    the home is stage-aligned instead: each module's own leaves (registered
-    params/buffers, container-held tensors, bare attrs) move onto the
-    device of its first tensor leaf, and wrapper state (params dict, device
-    attrs) follows. CPU-only modules are left alone. Returns leaf moves.
+    Wrapper modules self-stage (``x.to(self.device)``; the weight follows
+    per call), but the CONTAINER forward around them -- residual adds,
+    layernorms, router dispatch -- has no staging: a submodule chain
+    living off the primary returns its output on the wrong device and the
+    first decoder-level add crashes. Each module whose subtree's first
+    accelerator leaf sits off ``primary`` gets upstream accelerate's
+    ``AlignDevicesHook(execution_device=stage, io_same_device=True)`` --
+    inputs move onto the module's stage, outputs move back onto the
+    arriving device; the exact mechanism accelerate dispatch uses for
+    device_map models. Installed on the home when a mapped plan engages;
+    mirrors inherit the hooks through deepcopy and the mapped build
+    retargets their execution devices. Returns the number of hooks added.
     """
-    from auto_round.algorithms.quantization.sign_round.placement import _assign_leaf, _module_leaves
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+    from auto_round.algorithms.quantization.sign_round.placement import tensor_leaves
 
     accel = ("cuda", "xpu", "hpu")
-    moved = 0
+    added = 0
     for mod_name, mod in block.named_modules():
-        # anchor = the module's first REGISTERED leaf (the weight; wrapper
-        # state is unregistered) -- falls back to the first accelerator leaf
-        # for registry-less modules, skips CPU-only subtrees
+        if getattr(mod, "_hf_hook", None) is not None:
+            continue  # already dispatched
         stage = None
-        fallback = None
-        for _n, tensor, container, _k in _module_leaves(mod):
-            if container is None:  # registered param/buffer
+        for _n, tensor, _c, _k in tensor_leaves(mod):
+            if tensor.device.type in accel:
                 stage = tensor.device
                 break
-            if fallback is None and tensor.device.type in accel:
-                fallback = tensor.device
-        if stage is None:
-            stage = fallback
-        if stage is None or stage.type == "cpu":
-            continue  # CPU-anchored or CPU-only subtree: keep its state on CPU
-        for _path, tensor, container, key in _module_leaves(mod):
-            if _assign_leaf(tensor, stage, container, key):
-                moved += 1
-        _relocate_module_state(mod, stage)
+        if stage is None or stage == primary:
+            continue
+        add_hook_to_module(mod, AlignDevicesHook(stage, io_same_device=True), append=True)
+        added += 1
+    return added
+
+
+def retarget_stage_hooks_(block, device_of) -> int:
+    """Point inherited AlignDevicesHooks at a mirror's mapped devices.
+
+    Deepcopy carries the home's hooks with the home's execution devices;
+    after ``place_module_tree`` re-homes the mirror's leaves, each hooked
+    module's ``_hf_hook.execution_device`` must follow its new stage.
+    """
+    moved = 0
+    for mod_name, mod in block.named_modules():
+        hook = getattr(mod, "_hf_hook", None)
+        if hook is None:
+            continue
+        target = device_of(mod_name)
+        if getattr(hook, "execution_device", None) is not None and hook.execution_device != target:
+            hook.execution_device = target
+            moved += 1
     return moved
 
 
@@ -1343,6 +1374,13 @@ class ReplicaGroup:
                 if _mn in cpu_only:
                     continue
                 _relocate_module_state(_m, replica_devs[stage_of_module[_mn]])
+            # inherited stage hooks follow their module's mapped stage
+            retarget_stage_hooks_(
+                mirror,
+                lambda name, _rd=replica_devs: (
+                    torch.device("cpu") if name in cpu_only else _rd[stage_of_module[name]]
+                ),
+            )
             logger.info(
                 "[tune-ddp] mapped mirror %d placed on %s (%d leaf moves)",
                 r,

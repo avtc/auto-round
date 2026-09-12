@@ -661,65 +661,108 @@ class TestComposerMappedDecline:
         assert _Q._resolved_ddp_plan is None  # the mock left the cache empty (first-block condition)
 
 
-class TestHomeStageAlign:
-    """The spanning-home latent split: wrapper state vs weight placement.
+class TestFullMirrorPreferred:
+    """A spanning block that FITS a single device takes the full-mirror lane.
 
-    Wrapper tunables are created on ``tuning_device`` (an independent
-    per-layer allocation) while init_scale is searched from the orig weight
-    (its resident device); on a spanning block they diverge and the first
-    wrapper forward meets a cross-device mul. align_block_stages_ co-locates
-    each module's unregistered state onto its first REGISTERED leaf (the
-    weight; the anchor rule keeps CPU-pinned caches of CPU-anchored modules
-    on CPU). The CPU tier pins the mechanism with a meta-anchored weight and
-    cpu-constructed wrapper state (the observable stand-in for the cuda/other
-    split); Parameter .data swaps across tensor types stay GPU-handoff.
+    The gather squashes the block onto the home device and the wrappers
+    self-stage (the proven path); mapped replicas are only for blocks that
+    do not fit a single device.
     """
 
-    class _FakeWrapper(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.ones(4, 4, device="meta"))  # the stage anchor
-            self.init_scale = torch.ones(4, 1)  # searched from the weight: wrong device
-            self.weight_min = torch.zeros(4)  # plain attr cache: wrong device
-            self.params = {"max_scale": torch.ones(4, 1)}  # tunable-state dict: wrong device
-            self.tdev = torch.device("cpu")  # captured device attr
-            self.device = "cpu"  # string staging target
+    def test_spanning_fits_uses_full_mirror(self, monkeypatch, _autoround_log_propagate):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+        import auto_round.algorithms.quantization.sign_round.placement as placement
 
-    def test_align_moves_wrapper_state_onto_weight_stage(self):
-        from auto_round.algorithms.quantization.sign_round.data_parallel import align_block_stages_
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+        stages = [torch.device("cuda", 0), torch.device("cuda", 1)]
+        full_mirror = dp.DDPPlan(2, [torch.device("cuda", 0), torch.device("cuda", 4)], 4)
+        monkeypatch.setattr(dp, "resolve_ddp_plan", lambda *a, **k: full_mirror)
+        calls = []
+        monkeypatch.setattr(dp, "resolve_mapped_ddp_plan", lambda *a, **k: calls.append(1) or dp.DDPPlan(1, stages, 8))
+        monkeypatch.setattr(placement, "accelerator_stage_devices", lambda b: stages)
 
-        block = torch.nn.Module()
-        block.mlp_gate = self._FakeWrapper()
-        block.cpu_mod = torch.nn.Linear(2, 2)  # cpu-anchored: untouched
-        before = block.mlp_gate.params["max_scale"]
-        moved = align_block_stages_(block)
-        w = block.mlp_gate
-        assert moved >= 3
-        assert w.init_scale.device.type == "meta"
-        assert w.weight_min.device.type == "meta"
-        assert w.params["max_scale"].device.type == "meta"
-        assert w.params["max_scale"] is not before  # replaced in the dict
-        assert w.tdev == torch.device("meta")  # device attr repointed
-        assert w.device == "cpu"  # string stays: cross-family repoint is deliberate
-        assert w.weight.device.type == "meta"  # anchor: untouched
-        assert block.cpu_mod.weight.device.type == "cpu"  # cpu-anchored module skipped
+        class _Q:
+            _resolved_ddp_plan = None
+            enable_lfq = False
+            gradient_accumulate_steps = 1
+            calibration_context = None
 
-    def test_align_is_idempotent(self):
-        from auto_round.algorithms.quantization.sign_round.data_parallel import align_block_stages_
+        # probe failure -> free=None -> full mirror preferred, mapped never consulted
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda idx=0: (_ for _ in ()).throw(OSError("no probe")))
+        monkeypatch.setattr(dp, "_ENGAGED_LOGGED_SIG", None)  # engaged-path global
+        plan = dp.resolve_tune_ddp_plan_(
+            _Q(), FakeMoEBlock(), [torch.zeros(1)] * 8, None, torch.device("cuda", 0), world=2, log=True
+        )
+        assert plan.replica_devices is None and plan.world == 2
+        assert calls == []
 
-        block = torch.nn.Module()
-        block.mlp_gate = self._FakeWrapper()
-        first = align_block_stages_(block)
-        second = align_block_stages_(block)
-        assert first >= 3 and second == 0
+    def test_spanning_too_big_goes_mapped(self, monkeypatch, _autoround_log_propagate):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+        import auto_round.algorithms.quantization.sign_round.placement as placement
+
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+        stages = [torch.device("cuda", 0), torch.device("cuda", 1)]
+        monkeypatch.setattr(placement, "accelerator_stage_devices", lambda b: stages)
+        engaged = dp.DDPPlan(2, [torch.device("cuda", 0)], 4)
+        engaged.replica_devices = [stages, [torch.device("cuda", 2), torch.device("cuda", 3)]]
+        monkeypatch.setattr(dp, "resolve_mapped_ddp_plan", lambda *a, **k: engaged)
+
+        class _Q:
+            _resolved_ddp_plan = None
+            enable_lfq = False
+            gradient_accumulate_steps = 1
+            calibration_context = None
+
+        # every non-home device is starved: no full mirror fits -> mapped
+        monkeypatch.setattr(dp, "_ENGAGED_LOGGED_SIG", None)
+        free = {torch.device("cuda", i): 1024 for i in range(8)}
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda idx=0: (free[torch.device("cuda", idx)], 0))
+        plan = dp.resolve_tune_ddp_plan_(
+            _Q(), FakeMoEBlock(), [torch.zeros(1)] * 8, None, torch.device("cuda", 0), world=2, log=True
+        )
+        assert plan.replica_devices is not None
+
+
+class TestStageBoundaryHooks:
+    """accelerate AlignDevicesHook staging for spanning subtrees (bookkeeping).
+
+    Real cross-device staging is GPU-handoff; the CPU tier pins the no-op
+    path (CPU-only subtrees never hook) and mirror retargeting repoints
+    execution devices.
+    """
+
+    def test_install_skips_cpu_only_subtrees(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        installed = []
+
+        monkeypatch.setattr(
+            "accelerate.hooks.add_hook_to_module",
+            lambda mod, hook, append=False: installed.append(mod),
+        )
+        block = torch.nn.Linear(4, 4)  # all leaves on cpu: nothing hooks
+        added = dp.install_stage_boundary_hooks_(block, torch.device("cuda", 0))
+        assert added == 0 and installed == []
+
+    def test_retarget_repoints_execution_devices(self):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        class _Hook:
+            def __init__(self, dev):
+                self.execution_device = dev
+
+        m = torch.nn.Linear(4, 4)
+        m._hf_hook = _Hook(torch.device("cuda", 0))
+        moved = dp.retarget_stage_hooks_(m, lambda name: torch.device("cuda", 5))
+        assert moved == 1 and m._hf_hook.execution_device == torch.device("cuda", 5)
+        assert dp.retarget_stage_hooks_(m, lambda name: torch.device("cuda", 5)) == 0
 
 
 class TestInitScaleDevice:
     """init_scale must land on the wrapper's device, not the search input's.
 
     The deferred V2 init-scale search runs on the ORIG WEIGHT's device
-    (align_block_stages_ executes BEFORE the search, so it cannot fix a
-    fresh result); the finalize receives vals from the round-robin search
+    (which can differ from the wrapper's device on a spanning block); the finalize receives vals from the round-robin search
     on ANOTHER replica's device. Both land on self.device -- the wrapper's
     canonical device where min/max_scale already live. Pinned with meta
     stand-ins for the foreign device.
