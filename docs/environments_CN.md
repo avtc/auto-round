@@ -241,6 +241,16 @@ export AR_DISK_STREAM_MODEL=1
 AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --format auto_round
 ```
 
+### AR_DISABLE_SEARCH_SHARD
+- **描述**：禁用按权重所在设备并行执行仅依赖权重的封装期量化搜索（SignRoundV2 init-scale、GGUF DQ scale、optimized-RTN scale 搜索）。默认情况下，当一个 block 的权重分布在两个及以上 CUDA 设备时，每个设备各启动一个工作线程并发执行搜索；每个搜索只读取自身模块的权重与逐模块统计量，因此结果与串行路径完全一致。设置该变量可回退到完全串行的搜索循环（例如用于调试）。
+- **默认值**：`0`（权重跨多个 CUDA 设备时启用分片）
+- **有效取值**：`0` / `1`
+- **用法**：按设备搜索并行化的开关。
+
+```bash
+AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

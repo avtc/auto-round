@@ -132,9 +132,21 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             input_ids: Raw token IDs from the tokenizer (unused in RTN).
             **kwargs: Reserved for forward-compatibility with future parameters.
         """
-        # Normalize imatrix and quantize layers
-        for name, m in block.named_modules():
+        # Normalize imatrix first (cheap, serial), then quantize layers. The
+        # optimized RTN scale search is weight-local (weight + imatrix), so on a
+        # block whose layers sit on several devices the searches run in
+        # parallel, one worker per device.
+        from auto_round.algorithms.quantization import search_shard
+
+        for _name, m in block.named_modules():
             if hasattr(m, "imatrix"):
                 m.imatrix /= m.imatrix_cnt
-            if hasattr(m, "global_name") and check_to_quantized(m):
+        work = [m for _name, m in block.named_modules() if hasattr(m, "global_name") and check_to_quantized(m)]
+        groups = search_shard.group_items_by_device(work, device_of=lambda m: str(getattr(m, "tuning_device", "cpu")))
+        if search_shard.shard_eligible(groups.keys()) and not search_shard.shard_disabled_by_env():
+            _t0 = search_shard._time_perf()
+            search_shard.run_items_by_device(groups, lambda _idx, m: self.quantize_layer_outside_block(m))
+            search_shard.maybe_log_shard("optimized rtn search", groups, search_shard._time_perf() - _t0)
+        else:
+            for m in work:
                 self.quantize_layer_outside_block(m)

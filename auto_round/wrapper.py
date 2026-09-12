@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import time
 from math import ceil
 
 import torch
@@ -771,6 +772,15 @@ class WrapperMultiblock(torch.nn.Module):
         return hidden_states
 
 
+def _wrap_item_device(m, device):
+    """Device where this module's wrap-time search math will run (its weight device)."""
+    w = getattr(m, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return str(w.device)
+    td = getattr(m, "tuning_device", None)
+    return str(td) if td is not None else str(device)
+
+
 def wrapper_block(
     block,
     enable_minmax_tuning,
@@ -794,37 +804,68 @@ def wrapper_block(
     """
     quantized_layers = []
     unquantized_layers = []
+
+    # Wrap-time searches (SignRoundV2 init-scale, GGUF DQ scale) read only the
+    # module's own weight plus per-module statistics, never calibration
+    # activations. On a block whose weights are sharded across devices the
+    # searches therefore run in parallel, one worker per weight device; results
+    # are keyed by work index so the returned lists keep the original
+    # ``named_modules`` order on every path.
+    work = []
     for n, m in block.named_modules():
         if type(m) in SUPPORTED_LAYER_TYPES:
-            if not check_to_quantized(m):
-                unquantized_layers.append(n)
-                continue
-            new_m = wrapper_cls(
-                m,
-                enable_minmax_tuning=enable_minmax_tuning,
-                enable_norm_bias_tuning=enable_norm_bias_tuning,
-                enable_torch_compile=enable_torch_compile,
-                device=device,
-                **kwargs,
-            )
-            set_module(block, n, new_m)
-            quantized_layers.append(n)
+            work.append((n, m, "skip" if not check_to_quantized(m) else "linear"))
+        elif enable_norm_bias_tuning and "norm" in m.__class__.__name__.lower():
+            work.append((n, m, "norm"))
 
-        elif enable_norm_bias_tuning:
-            if "norm" in m.__class__.__name__.lower():
-                if m.__class__.__name__ in NORM_MAPPING.keys():
-                    wrapper_layer_class = NORM_MAPPING[m.__class__.__name__]
-                    new_m = wrapper_layer_class(m, device=device)
-                    set_module(block, n, new_m)
-                elif "RMSNorm" in m.__class__.__name__:
-                    logger.warning_once(
-                        f"use LlamaRMSNorm to wrap {m.__class__.__name__}, please check the correctness yourself"
-                    )
-                    wrapper_layer_class = NORM_MAPPING["LlamaRMSNorm"]
-                    new_m = wrapper_layer_class(m, device=device)
-                    set_module(block, n, new_m)
-                else:
-                    logger.warning_once(f"{m.__class__.__name__} is not supported")
+    def _wrap_one(n, m, kind):
+        if kind == "norm":
+            if m.__class__.__name__ in NORM_MAPPING.keys():
+                wrapper_layer_class = NORM_MAPPING[m.__class__.__name__]
+                new_m = wrapper_layer_class(m, device=device)
+                set_module(block, n, new_m)
+            elif "RMSNorm" in m.__class__.__name__:
+                logger.warning_once(
+                    f"use LlamaRMSNorm to wrap {m.__class__.__name__}, please check the correctness yourself"
+                )
+                wrapper_layer_class = NORM_MAPPING["LlamaRMSNorm"]
+                new_m = wrapper_layer_class(m, device=device)
+                set_module(block, n, new_m)
+            else:
+                logger.warning_once(f"{m.__class__.__name__} is not supported")
+            return None
+        if kind == "skip":
+            return "u"
+        new_m = wrapper_cls(
+            m,
+            enable_minmax_tuning=enable_minmax_tuning,
+            enable_norm_bias_tuning=enable_norm_bias_tuning,
+            enable_torch_compile=enable_torch_compile,
+            device=device,
+            **kwargs,
+        )
+        set_module(block, n, new_m)
+        return "q"
+
+    from auto_round.algorithms.quantization import search_shard
+
+    groups = search_shard.group_items_by_device(work, device_of=lambda it: _wrap_item_device(it[1], device))
+    if search_shard.shard_eligible(groups.keys()) and not search_shard.shard_disabled_by_env():
+        outcomes = {}
+
+        def _wrap_indexed(idx, item):
+            n, m, kind = item
+            outcomes[idx] = _wrap_one(n, m, kind)
+
+        _t0 = search_shard._time_perf()
+        search_shard.run_items_by_device(groups, _wrap_indexed)
+        search_shard.maybe_log_shard("wrapper search", groups, search_shard._time_perf() - _t0)
+        results = [outcomes.get(i) for i in range(len(work))]
+    else:
+        results = [_wrap_one(n, m, kind) for n, m, kind in work]
+
+    quantized_layers = [n for (n, _m, _k), r in zip(work, results) if r == "q"]
+    unquantized_layers = [n for (n, _m, _k), r in zip(work, results) if r == "u"]
     return quantized_layers, unquantized_layers
 
 

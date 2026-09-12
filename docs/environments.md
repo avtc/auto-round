@@ -241,6 +241,16 @@ export AR_DISK_STREAM_MODEL=1
 AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --format auto_round
 ```
 
+### AR_DISABLE_SEARCH_SHARD
+- **Description**: Disables running weight-local wrap-time quantization searches (SignRoundV2 init-scale, GGUF DQ scale, optimized-RTN scale search) in parallel across the devices that host the sharded weights. By default, when a block's weights span two or more CUDA devices, one worker thread per device runs the searches concurrently; each search only reads its own module's weight plus per-module statistics, so results are identical to the serial path. Set this to fall back to the fully serial search loop (e.g. for debugging).
+- **Default**: `0` (sharding enabled when weights span multiple CUDA devices)
+- **Valid Values**: `0` / `1`
+- **Usage**: Kill switch for the per-device search parallelism.
+
+```bash
+AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)
