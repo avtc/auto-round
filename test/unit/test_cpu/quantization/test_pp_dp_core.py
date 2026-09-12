@@ -822,3 +822,43 @@ class TestStageHookStrip:
         block = torch.nn.Linear(2, 2)
         dp._strip_stage_hooks_(block)
         assert calls == [block]
+
+
+class TestStagedKwargMemo:
+    """Shared-cache kwargs are static: stage once per (tensor, device).
+
+    Without the memo the device sweep copies the same rope/position tables
+    every batch -- x iterations per block, so a 200-iter run copies the
+    same tens of MB 200x per replica. The memo keys on the tensor object
+    (no id-reuse hazard) and returns the same staged copy afterwards.
+    """
+
+    def test_same_tensor_same_device_one_copy(self):
+        from auto_round.compressors.utils import _STAGED_KWARGS, _staged_kwarg_copy, _staged_to_device
+
+        _STAGED_KWARGS.clear()
+        t = torch.ones(4)
+        meta = torch.device("meta")
+        a = _staged_kwarg_copy(t, meta)
+        b = _staged_kwarg_copy(t, meta)
+        assert a is b and a.device.type == "meta"
+        assert len(_STAGED_KWARGS) == 1
+        other = torch.zeros(4)
+        c = _staged_kwarg_copy(other, meta)
+        assert c is not a and len(_STAGED_KWARGS) == 2
+        # already-staged tensors pass through untouched
+        assert _staged_kwarg_copy(a, meta) is a
+
+    def test_container_staging_memoizes_leaves(self):
+        from auto_round.compressors.utils import _STAGED_KWARGS, _staged_to_device
+
+        _STAGED_KWARGS.clear()
+        meta = torch.device("meta")
+        rope = (torch.ones(4), torch.zeros(4))
+        first = _staged_to_device({"position_embeddings": rope, "use_cache": False}, meta)
+        second = _staged_to_device({"position_embeddings": rope, "use_cache": False}, meta)
+        assert first["use_cache"] is False
+        assert first["position_embeddings"][0].device.type == "meta"
+        # second staging reuses the SAME staged tensors (zero new copies)
+        assert second["position_embeddings"][0] is first["position_embeddings"][0]
+        assert second["position_embeddings"][1] is first["position_embeddings"][1]

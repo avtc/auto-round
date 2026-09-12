@@ -118,6 +118,37 @@ def is_block_wfp8(ar_or_format):
 
 _SWEEP_LOGGED: set = set()
 
+# Shared-cache kwargs (rope tables, position ids) are STATIC across samples
+# and iterations: staging them per batch would copy the same tens of MB
+# every forward (x iterations -- 200-iter runs copy 200x for nothing).
+# Stage-once per (tensor, device): the first batch pays the D2D copy, every
+# later batch/iteration/replica on that device reuses it. Keyed by the
+# tensor object (strong key: no id-reuse hazard; entries live as long as
+# the pool). Races are benign -- both threads compute identical copies.
+_STAGED_KWARGS: dict = {}
+
+
+def _staged_kwarg_copy(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    key = (tensor, device)
+    got = _STAGED_KWARGS.get(key)
+    if got is None:
+        got = tensor.to(device)
+        _STAGED_KWARGS[key] = got
+    return got
+
+
+def _staged_to_device(obj, device: torch.device):
+    """Container-aware staging with tensor-level memoization."""
+    if torch.is_tensor(obj):
+        return obj if obj.device == device else _staged_kwarg_copy(obj, device)
+    if isinstance(obj, list):
+        return [_staged_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_staged_to_device(v, device) for v in obj)
+    if isinstance(obj, dict):
+        return {k: _staged_to_device(v, device) for k, v in obj.items()}
+    return obj
+
 
 def block_forward(
     block: torch.nn.Module,
@@ -222,9 +253,9 @@ def block_forward(
         for _k in list(input_others.keys()):
             if torch.is_tensor(input_others[_k]) and input_others[_k].device.type in ("cuda", "xpu", "hpu"):
                 if input_others[_k].device != _block_dev:
-                    input_others[_k] = input_others[_k].to(_block_dev)
+                    input_others[_k] = _staged_kwarg_copy(input_others[_k], _block_dev)
             elif isinstance(input_others[_k], (list, tuple, dict)):
-                input_others[_k] = to_device(input_others[_k], _block_dev)
+                input_others[_k] = _staged_to_device(input_others[_k], _block_dev)
 
     if amp:
         with autocast(device_type=str(device).split(":")[0], dtype=amp_dtype):  # pragma: no cover
