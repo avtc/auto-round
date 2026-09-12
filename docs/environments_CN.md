@@ -281,6 +281,16 @@ AR_PERF_COUNTERS=1 python -m auto_round --model ... --device_map 0,1,2,3
 AR_WRAP_SEARCH_BATCH_GB=0.5 python -m auto_round --model ... --device_map 0,1
 ```
 
+### AR_DISABLE_SEARCH_OFFLOAD
+- **描述**：禁用在空闲设备上运行批量化的仅依赖权重的搜索。此类搜索只读取自身模块的权重与逐模块统计量，因此堆叠批次可以在任何有瞬态工作集余量的 GPU 上执行——尤其是零样本（iters=0）单设备 lane 中原本空闲的 GPU。工作设备由修正后的空闲显存探针选择；当没有设备放得下时，批次留在权重所在设备并依赖逐批次的 OOM 回退。
+- **默认值**：`0`（启用卸载，探针门控）
+- **有效取值**：`0` / `1`
+- **用法**：当机架上的 GPU 不应接收搜索流量时的开关。
+
+```bash
+AR_DISABLE_SEARCH_OFFLOAD=1 python -m auto_round --model ... --iters 0
+```
+
 ### AR_RESUME_DIR
 - **描述**：设置为目录路径后，逐块调优循环会在每完成一个块后将进度写入该目录，并在针对同一目录的新一次运行中从第一个未完成的块继续——而不是在崩溃或被杀死后从第 0 块重新开始整个调优过程。
 - **默认值**：未设置(不支持断点续跑)

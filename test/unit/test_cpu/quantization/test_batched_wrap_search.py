@@ -292,6 +292,63 @@ class TestRealV2Construction(unittest.TestCase):
         self.assertIsNone(w._deferred_search_inputs)  # old callers unchanged
 
 
+class TestSearchWorkerPicking(unittest.TestCase):
+    def _pick(self, working_set, free_map, home="cuda:0"):
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+
+        with mock.patch.object(torch.cuda, "device_count", return_value=len(free_map)), mock.patch.object(
+            shard_mod, "_probe_usable_bytes", side_effect=lambda k: free_map.get(k)
+        ):
+            return shard_mod.pick_search_worker_devices(working_set, home_device=home)
+
+    def test_full_home_goes_to_idle_devices(self):
+        free = {"cuda:0": 1 * 2**30, "cuda:1": 12 * 2**30, "cuda:2": 12 * 2**30}
+        ws = 4 * 2**30
+        self.assertEqual(self._pick(ws, free), ["cuda:1", "cuda:2"])  # home excluded, idles viable
+
+    def test_all_full_falls_back_to_home(self):
+        free = {"cuda:0": 0, "cuda:1": 1 * 2**30}
+        self.assertEqual(self._pick(4 * 2**30, free), ["cuda:0"])
+
+    def test_home_participates_when_it_fits(self):
+        free = {"cuda:0": 10 * 2**30, "cuda:1": 10 * 2**30}
+        self.assertEqual(self._pick(2 * 2**30, free), ["cuda:0", "cuda:1"])
+
+    def test_kill_switch_pins_home(self):
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+
+        with mock.patch.object(shard_mod.envs, "AR_DISABLE_SEARCH_OFFLOAD", True):
+            self.assertEqual(shard_mod.pick_search_worker_devices(4 * 2**30, home_device="cuda:3"), ["cuda:3"])
+
+    def test_no_cuda_returns_home(self):
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+
+        with mock.patch.object(torch.cuda, "device_count", return_value=0):
+            self.assertEqual(shard_mod.pick_search_worker_devices(4 * 2**30, home_device="cpu"), ["cpu"])
+
+    def test_rtn_driver_offloads_to_viable_worker(self):
+        # CPU-only: workers = [home] so behavior is the parity path already covered;
+        # this pins that the bucket machinery runs end-to-end with the picker patched.
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+
+        model = nn.Module()
+        staged = []
+        for i in range(2):
+            layer = TestBatchedRtnSearchParity()._layer(seed=i)
+            setattr(model, f"l{i}", layer)
+            staged.append((f"l{i}", TestBatchedRtnSearchParity()._make_wrapper(layer)))
+        with mock.patch(
+            "auto_round.algorithms.quantization.search_shard.pick_search_worker_devices",
+            return_value=["cpu"],
+        ):
+            leftovers = run_batched_rtn_search(model, staged)
+        self.assertEqual(leftovers, [])
+        for i in range(2):
+            self.assertIsNotNone(getattr(model, f"l{i}").scale)
+
+
 class TestWrapperBlockDrivesBatching(unittest.TestCase):
     def _fake_block(self):
         block = torch.nn.Module()

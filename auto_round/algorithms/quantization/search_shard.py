@@ -127,6 +127,41 @@ def shard_eligible(device_keys):
     return False
 
 
+def search_offload_disabled():
+    """Kill switch for running batched searches on idle devices."""
+    return bool(envs.AR_DISABLE_SEARCH_OFFLOAD)
+
+
+def pick_search_worker_devices(working_set_bytes, home_device=None, margin_bytes=512 * 2**20):
+    """Viable worker devices for a batched search chunk, in device-index order.
+
+    The searches are weight-local (weight + imatrix only), so a chunk may run on
+    ANY device with headroom for its transient working set -- including devices
+    that hold no model weights at all (the zero-shot lane's idle GPUs). The home
+    device participates only when it fits like any other candidate; when nothing
+    fits, the home device is returned so the caller keeps today's behavior and
+    relies on the per-chunk OOM fallback.
+    """
+    if search_offload_disabled():
+        return [home_device] if home_device is not None else []
+    try:
+        count = torch.cuda.device_count()
+    except Exception:  # pragma: no cover - non-cuda builds
+        count = 0
+    if count == 0:
+        return [home_device] if home_device is not None else []
+    viable = []
+    for idx in range(count):
+        key = f"cuda:{idx}"
+        free = _probe_usable_bytes(key)
+        if free is None or free - margin_bytes < working_set_bytes:
+            continue
+        viable.append(key)
+    if not viable:
+        return [home_device] if home_device is not None else []
+    return viable
+
+
 _ENGAGED_LOGGED = set()
 
 

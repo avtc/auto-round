@@ -281,6 +281,16 @@ AR_PERF_COUNTERS=1 python -m auto_round --model ... --device_map 0,1,2,3
 AR_WRAP_SEARCH_BATCH_GB=0.5 python -m auto_round --model ... --device_map 0,1
 ```
 
+### AR_DISABLE_SEARCH_OFFLOAD
+- **Description**: Disables running batched weight-local searches on idle devices. The searches read only their module's weight plus per-module statistics, so a stacked batch may execute on any GPU with headroom for its transient working set -- notably the otherwise-idle GPUs of the zero-shot (iters=0) single-device lane. Worker devices are chosen by a corrected free-VRAM probe; when nothing fits, chunks stay on the weight's home device and rely on the per-chunk OOM fallback.
+- **Default**: `0` (offload enabled, probe-gated)
+- **Valid Values**: `0` / `1`
+- **Usage**: Kill switch when a rig's GPUs must not receive search traffic.
+
+```bash
+AR_DISABLE_SEARCH_OFFLOAD=1 python -m auto_round --model ... --iters 0
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

@@ -34,6 +34,7 @@ from auto_round.algorithms.quantization.search_shard import (
     _fn_key,
     dump_oom_tensor_census_,
     group_items_by_device,
+    pick_search_worker_devices,
     run_items_by_device,
 )
 from auto_round.logger import logger
@@ -111,59 +112,101 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         layer = e["w"].unwrapper({})
         set_module(model, e["name"], layer)
 
-    def _run_device(device_key, batch):
+    # Offload pass: the searches are weight-local, so chunks may run on any
+    # device with headroom (the zero-shot lane leaves every non-home GPU idle).
+    # Chunks are assigned round-robin over viable worker devices; the weights
+    # and imatrices move to the worker for the stacked call and results write
+    # back cross-device through _apply_qdq.
+    chunks = []  # (home_device, entries)
+    for dev, batch in device_groups.items():
         by_key = OrderedDict()
         for e in batch:
             by_key.setdefault(_staged_key(e["w"], e["weight"], e["im"]), []).append(e)
         for _key, group in by_key.items():
             if len(group) < 2:
-                _finish_one(group[0])
+                chunks.append((dev, group))
                 continue
             cap = _batch_cap(
                 [
                     type("S", (), {"_deferred_search_inputs": (e["weight"], None, None, e["im"], None, None)})()
                     for e in group
                 ],
-                device_key,
-                max_batch,
+                dev,
+                None,
             )
             for start in range(0, len(group), cap):
-                chunk = group[start : start + cap]
-                w0 = chunk[0]["w"]
-                stacked_w = torch.stack([e["weight"] for e in chunk])
-                stacked_im = None
-                if chunk[0]["im"] is not None:
-                    stacked_im = torch.stack([e["im"] for e in chunk])
-                kwargs = w0._quant_call_kwargs(
-                    torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0), imatrix_override=stacked_im
-                )
-                try:
-                    qdq, scale, zp = w0.weight_quant_func(stacked_w, **kwargs)
-                except torch.OutOfMemoryError:
-                    logger.warning(
-                        "[rtn-batch] stacked search OOM (%d modules); finishing this chunk per-module "
-                        "(shrink batches with AR_WRAP_SEARCH_BATCH_GB or disable with AR_DISABLE_SEARCH_SHARD=1)",
-                        len(chunk),
-                    )
-                    dump_oom_tensor_census_("rtn batched search")
-                    for e in chunk:
-                        _finish_one(e)
-                    continue
-                n = len(chunk)
-                scale_parts = _split_leading(scale, n)
-                zp_parts = _split_leading(zp, n)
-                for i, e in enumerate(chunk):
-                    e["w"]._apply_qdq(qdq[i], scale_parts[i], zp_parts[i])
-                    if hasattr(e["w"].orig_layer, "global_name"):
-                        pass  # global_name lives on orig_layer already; unwrapper copies it onto itself
-                    set_module(model, e["name"], e["w"].orig_layer)
+                chunks.append((dev, group[start : start + cap]))
 
-    if len(device_groups) > 1:
-        keyed = group_items_by_device(list(device_groups.values()), device_of=lambda es: str(es[0]["weight"].device))
-        run_items_by_device(keyed, lambda _idx, es: _run_device(str(es[0]["weight"].device), es))
+    def _chunk_working_set(chunk):
+        e0 = chunk[0]
+        per = (e0["weight"].numel() + (e0["im"].numel() if e0["im"] is not None else 0)) * 4 * 4
+        return per * len(chunk)
+
+    buckets = OrderedDict()
+    rr = 0
+    for dev, chunk in chunks:
+        workers = pick_search_worker_devices(_chunk_working_set(chunk), home_device=dev)
+        worker = workers[rr % len(workers)] if workers else dev
+        rr += 1
+        buckets.setdefault(str(worker), []).append(chunk)
+    if buckets:
+        _n_chunk = sum(len(c) for cs in buckets.values() for c in cs)
+        logger.debug(
+            "[rtn-batch] %d chunks over workers [%s]",
+            _n_chunk,
+            ", ".join(f"{w}:{len(cs)}" for w, cs in buckets.items()),
+        )
+
+    def _run_chunk(chunk):
+        w0 = chunk[0]["w"]
+        dev = str(chunk[0]["weight"].device)
+        worker = str(next(wk for wk, cs in buckets.items() if any(c is chunk for c in cs)))
+        if len(chunk) == 1:
+            layer = chunk[0]["w"].unwrapper({})
+            set_module(model, chunk[0]["name"], layer)
+            return
+        weights = [e["weight"] for e in chunk]
+        ims = [e["im"] for e in chunk]
+        if worker != dev:
+            weights = [w.to(worker) for w in weights]
+            ims = [im.to(worker) if im is not None else None for im in ims]
+        stacked_w = torch.stack(weights)
+        stacked_im = None
+        if ims and ims[0] is not None:
+            stacked_im = torch.stack(ims)
+        kwargs = w0._quant_call_kwargs(
+            torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0), imatrix_override=stacked_im
+        )
+        try:
+            qdq, scale, zp = w0.weight_quant_func(stacked_w, **kwargs)
+        except torch.OutOfMemoryError:
+            logger.warning(
+                "[rtn-batch] stacked search OOM (%d modules); finishing this chunk per-module "
+                "(shrink batches with AR_WRAP_SEARCH_BATCH_GB or disable with AR_DISABLE_SEARCH_SHARD=1)",
+                len(chunk),
+            )
+            dump_oom_tensor_census_("rtn batched search")
+            for e in chunk:
+                layer = e["w"].unwrapper({})
+                set_module(model, e["name"], layer)
+            return
+        n = len(chunk)
+        scale_parts = _split_leading(scale, n)
+        zp_parts = _split_leading(zp, n)
+        for i, e in enumerate(chunk):
+            e["w"]._apply_qdq(qdq[i], scale_parts[i], zp_parts[i])
+            set_module(model, e["name"], e["w"].orig_layer)
+
+    def _run_worker(_worker_key, worker_chunks):
+        for chunk in worker_chunks:
+            _run_chunk(chunk)
+
+    if len(buckets) > 1:
+        keyed = group_items_by_device(list(buckets.values()), device_of=lambda cs: str(cs[0][0]))
+        run_items_by_device(keyed, lambda _idx, cs: _run_worker(str(cs[0][0]), cs))
     else:
-        for dev, batch in device_groups.items():
-            _run_device(dev, batch)
+        for wk, wcs in buckets.items():
+            _run_worker(wk, wcs)
     return []
 
 
