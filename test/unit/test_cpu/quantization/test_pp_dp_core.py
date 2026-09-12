@@ -712,3 +712,59 @@ class TestHomeStageAlign:
         first = align_block_stages_(block)
         second = align_block_stages_(block)
         assert first >= 3 and second == 0
+
+
+class TestInitScaleDevice:
+    """init_scale must land on the wrapper's device, not the search input's.
+
+    The deferred V2 init-scale search runs on the ORIG WEIGHT's device
+    (align_block_stages_ executes BEFORE the search, so it cannot fix a
+    fresh result); the finalize receives vals from the round-robin search
+    on ANOTHER replica's device. Both land on self.device -- the wrapper's
+    canonical device where min/max_scale already live. Pinned with meta
+    stand-ins for the foreign device.
+    """
+
+    def _wrapper_stub(self):
+        from auto_round.algorithms.quantization.sign_roundv2.quantizer import SignRoundOptimizedWrapperLinear
+
+        w = SignRoundOptimizedWrapperLinear.__new__(SignRoundOptimizedWrapperLinear)
+        layer = type("L", (), {})()
+        layer.data_type = "int"
+        layer.bits = 4
+        layer.group_size = 128
+        w.orig_layer = layer
+        # meta as the wrapper's device: plain tensors CAN move onto meta
+        # (copying OUT of meta is impossible), so the .to(self.device)
+        # co-location is observable in the result's device
+        w.device = torch.device("meta")
+        w.q_scale_thresh = 0.0
+        w._compile_own_quant_func = lambda: None
+        return w
+
+    def test_search_lands_on_wrapper_device(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_roundv2.quantizer as v2q
+
+        w = self._wrapper_stub()
+        # the search input (grouped weight) and result live on the FOREIGN device
+        monkeypatch.setattr(
+            v2q.SignRoundOptimizedWrapperLinear, "_prepare_init_scale_weight", lambda self: torch.ones(8, 128)
+        )
+        # the searched scale arrives on the FOREIGN (cpu) device
+        monkeypatch.setattr(v2q, "search_optimized_init_scale", lambda *a, **k: torch.ones(8, 1))
+        monkeypatch.setattr(v2q, "reshape_imatrix_for_weight", lambda im, wr, gs: None)
+        w._run_init_scale_search()
+        assert w.init_scale is not None and w.init_scale.device.type == "meta"
+
+    def test_finalize_cross_replica_val(self, monkeypatch):
+        w = self._wrapper_stub()
+        w.init_scale = None
+        # val searched on another replica's (cpu) device
+        w._finalize_deferred_init(val=torch.ones(8, 1))
+        assert w.init_scale.device.type == "meta"
+
+    def test_finalize_keeps_own_search_result(self):
+        w = self._wrapper_stub()
+        w.init_scale = torch.ones(8, 1, device="meta")  # already searched locally
+        w._finalize_deferred_init(val=None)
+        assert w.init_scale.device.type == "meta"

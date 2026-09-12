@@ -141,6 +141,12 @@ class SignRoundOptimizedWrapperLinear(WrapperLinear):
                 f"SignRound optimized path does not support data_type={layer.data_type!r}; "
                 "expected a symmetric int / mx / nv type."
             )
+        # the search runs on the ORIG WEIGHT's device; the wrapper's tuning
+        # state lives on self.device -- on a block spanning several devices
+        # the two differ and the first quant_tensor_sym mul would be
+        # cross-device (align_block_stages_ runs BEFORE the deferred search,
+        # so it cannot fix this one)
+        self.init_scale = self.init_scale.to(self.device)
         if hasattr(layer, "imatrix"):
             del layer.imatrix
 
@@ -151,7 +157,9 @@ class SignRoundOptimizedWrapperLinear(WrapperLinear):
         if getattr(self, "init_scale", None) is None:
             if val is None:
                 raise ValueError("deferred init-scale search produced no scale")
-            self.init_scale = val
+            # val may come from the round-robin search on ANOTHER replica's
+            # device (mirrors-first): land it on this wrapper's device
+            self.init_scale = val.to(self.device)
         if hasattr(self.orig_layer, "imatrix"):
             del self.orig_layer.imatrix
         self._compile_own_quant_func()
