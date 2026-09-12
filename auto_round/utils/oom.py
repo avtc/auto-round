@@ -91,22 +91,65 @@ def _shape_key_public(shape):
         return (str(tuple(shape)),)
 
 
-def _describe_referrers(tensor, limit=4):
-    """Short descriptions of what holds ``tensor`` (best effort, frames skipped)."""
+def _is_census_noise(ref, skip_ids):
+    """Referrers that are the census's own structures or whole-heap scans."""
+    if id(ref) in skip_ids:
+        return True
+    if isinstance(ref, (list, tuple, set)) and len(ref) > 4096:
+        return True  # heap snapshots and other scans, never real holders
+    return False
+
+
+def _attr_name_of(owner, target):
+    """The attribute of ``owner`` (if any) that holds ``target`` by identity."""
+    try:
+        d = getattr(owner, "__dict__", None)
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if v is target:
+                    return str(k)
+    except Exception:
+        pass
+    return None
+
+
+def _describe(obj, depth=0):
+    """One-line description of a holder object."""
+    t = type(obj)
+    if t is dict:
+        keys = [str(k) for k in list(obj.keys())[:3]]
+        return f"dict[{','.join(keys)}]"
+    if t in (list, tuple, set):
+        return f"{t.__name__}(len={len(obj)})"
+    name = getattr(obj, "__class__", t).__name__
+    mod = getattr(getattr(obj, "__class__", t), "__module__", "")
+    return f"{mod}.{name}" if mod and mod != "builtins" else name
+
+
+def _describe_referrers(tensor, skip_ids, limit=6, depth=0):
+    """Holders of ``tensor``; small containers are unwrapped one more level."""
     import gc as _gc
 
     out = []
     try:
         for ref in _gc.get_referrers(tensor):
-            t = type(ref)
-            if t in (dict,):
-                keys = [str(k) for k in list(ref.keys())[:4]]
-                out.append(f"dict[{','.join(keys)}]" + (f"(len={len(ref)})" if len(keys) < len(ref) else ""))
-            elif t in (list, tuple, set):
-                out.append(f"{t.__name__}(len={len(ref)})")
-            else:
-                name = getattr(ref, "__class__", t).__name__
-                out.append(name)
+            if _is_census_noise(ref, skip_ids):
+                continue
+            desc = _describe(ref)
+            attr = _attr_name_of(ref, tensor) if depth == 0 else None
+            if attr:
+                desc += f".{attr}"
+            out.append(desc)
+            # unwrap small containers one level: name who holds the holder
+            if depth == 0 and isinstance(ref, (list, tuple, set, dict)) and len(ref) <= 4096:
+                for owner in _gc.get_referrers(ref):
+                    if _is_census_noise(owner, skip_ids) or owner is tensor:
+                        continue
+                    od = _describe(owner, 1)
+                    oattr = _attr_name_of(owner, ref)
+                    out.append(f"  <- {od}" + (f".{oattr}" if oattr else ""))
+                    if len(out) >= limit:
+                        break
             if len(out) >= limit:
                 break
     except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
@@ -121,7 +164,17 @@ def dump_oom_tensor_census_(context: str = "") -> None:
     group growing across blocks). Best effort: never masks the OOM itself.
     """
     import gc
+    import warnings
 
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)  # isinstance over heap objects
+            _dump_census(gc)
+    except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
+        logger.error("[oom] tensor census failed (%s)", e)
+
+
+def _dump_census(gc):
     try:
         try:
             for idx in range(torch.cuda.device_count()):
@@ -133,8 +186,9 @@ def dump_oom_tensor_census_(context: str = "") -> None:
                 )
         except Exception:  # pragma: no cover - allocator stats are cuda-only
             pass
+        objs = gc.get_objects()
         per_device: dict = {}
-        top = _group_tensors_by_shape(gc.get_objects())
+        top = _group_tensors_by_shape(objs)
         for (_dev, _dt, _shape), (_cnt, _nb) in top:
             per_device[_dev] = per_device.get(_dev, 0) + _nb
         for _dev, _nb in sorted(per_device.items(), key=lambda kv: -kv[1]):
@@ -144,12 +198,13 @@ def dump_oom_tensor_census_(context: str = "") -> None:
         # holder attribution runs LAST and fully guarded: it must never cost the
         # inventory above (a symbolic-shape failure here previously ate the totals)
         try:
-            for rep, ((_dev, _dt, _shape), (_cnt, _nb)) in _representatives(top[:3], gc.get_objects()):
-                for desc in _describe_referrers(rep):
+            skip = {id(objs), id(top)}
+            for rep, ((_dev, _dt, _shape), (_cnt, _nb)) in _representatives(top[:3], objs):
+                for desc in _describe_referrers(rep, skip):
                     logger.error("[oom]   %s %s held by: %s", _dev, list(_shape), desc)
-        except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
+        except Exception as e:  # pragma: no cover - must not cost the inventory
             logger.error("[oom] holder attribution failed (%s)", e)
-    except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
+    except Exception as e:  # pragma: no cover - must not mask the OOM
         logger.error("[oom] tensor census failed (%s)", e)
 
 
