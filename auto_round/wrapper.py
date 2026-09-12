@@ -244,6 +244,97 @@ class WrapperLinear(torch.nn.Module):
 
         setattr(self, name, p)
 
+    def _apply_qdq(self, qdq_weight, scale, zp):
+        """Write a quantize-dequantized result back onto the original layer.
+
+        The single source of the unwrapper's write-back conventions (weight
+        copy, scale/zp attribute shapes and devices, grad reset, global
+        scale), shared with the batched zero-shot search driver.
+        """
+        self.orig_layer.weight.data.copy_(qdq_weight)
+        self.orig_layer.weight.grad = None
+
+        shape = qdq_weight.shape
+        if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
+            shape = qdq_weight.t().shape
+
+        def _set_dict_attr(attr_dict, attr_name):
+            for key in attr_dict.keys():
+                if key == attr_name:
+                    setattr(self.orig_layer, attr_name, attr_dict[key].reshape(shape[0], -1).to("cpu"))
+                else:
+                    name = "w_" + key
+                    setattr(self.orig_layer, name, attr_dict[key].to("cpu"))
+
+        if not isinstance(self.orig_layer.group_size, tuple):
+            if isinstance(scale, dict):
+                _set_dict_attr(scale, "scale")
+            elif scale is None:
+                self.orig_layer.scale = None
+            elif scale.numel() > 1:
+                self.orig_layer.scale = scale.reshape(shape[0], -1).to("cpu")
+            else:
+                self.orig_layer.scale = scale.view(-1).to("cpu")
+        else:
+            self.orig_layer.scale = scale.to("cpu")
+
+        if zp is not None:
+            if isinstance(zp, dict):
+                _set_dict_attr(zp, "zp")
+            elif isinstance(zp, torch.Tensor):
+                if zp.numel() > 1:
+                    zp = zp.reshape(shape[0], -1)
+                    self.orig_layer.zp = zp.to("cpu")
+                else:
+                    self.orig_layer.zp = zp.view(-1).to("cpu")
+            else:
+                self.orig_layer.zp = zp
+        else:
+            self.orig_layer.zp = None
+
+        if self.weight_global_scale is not None:
+            global_scale = self.weight_global_scale
+            assert global_scale.numel() == 1
+            self.orig_layer.weight_global_scale = global_scale.to("cpu")
+
+    def _quant_call_kwargs(self, value, min_scale, max_scale, imatrix_override=None):
+        """Assemble the weight_quant_func call kwargs from wrapper + layer state.
+
+        Single source of the quant-call contract, shared by the serial
+        ``_qdq_weight`` path and the batched zero-shot search driver (which
+        passes an explicit stacked ``imatrix_override``). ``weight_quant_func``
+        itself takes the weight as its first positional argument.
+        """
+        quant_kwargs = {}
+        if hasattr(self.orig_layer, "super_bits"):
+            quant_kwargs["super_bits"] = self.orig_layer.super_bits
+            quant_kwargs["super_group_size"] = self.orig_layer.super_group_size
+        if hasattr(self, "_extra_quant_kwargs"):
+            quant_kwargs.update(self._extra_quant_kwargs())
+        imatrix = imatrix_override
+        if imatrix is None:
+            imatrix = (
+                self.orig_layer.imatrix.to(self.orig_layer.weight.device)
+                if hasattr(self.orig_layer, "imatrix")
+                else None
+            )
+        return {
+            "bits": self.orig_layer.bits,
+            "group_size": self.orig_layer.group_size,
+            "v": value,
+            "min_scale": min_scale,
+            "max_scale": max_scale,
+            "scale_dtype": self.orig_layer.scale_dtype,
+            "tensor_min": self.weight_min,
+            "tensor_max": self.weight_max,
+            "data_type": self.data_type,
+            "q_scale_thresh": self.q_scale_thresh,
+            "imatrix": imatrix,
+            "global_scale": getattr(self, "weight_global_scale", None),
+            "init_scale": getattr(self, "init_scale", None),
+            **quant_kwargs,
+        }
+
     def _qdq_weight(self, value, min_scale, max_scale):
         """Quantizes and dequantizes weights with tuning parameters.
 
@@ -275,20 +366,12 @@ class WrapperLinear(torch.nn.Module):
 
         weight_q, scale, zp = self.weight_quant_func(
             weight.to(self.device),
-            bits=self.orig_layer.bits,
-            group_size=self.orig_layer.group_size,
-            v=value,
-            min_scale=min_scale,
-            max_scale=max_scale,
-            scale_dtype=self.orig_layer.scale_dtype,
-            tensor_min=self.weight_min,
-            tensor_max=self.weight_max,
-            data_type=self.data_type,
-            q_scale_thresh=self.q_scale_thresh,
-            imatrix=self.orig_layer.imatrix.to(weight.device) if hasattr(self.orig_layer, "imatrix") else None,
-            global_scale=getattr(self, "weight_global_scale", None),
-            init_scale=getattr(self, "init_scale", None),
-            **quant_kwargs,
+            **self._quant_call_kwargs(
+                value,
+                min_scale,
+                max_scale,
+                imatrix_override=None,
+            ),
         )
         weight_q = weight_q.to(weight.dtype)
         if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
@@ -369,53 +452,7 @@ class WrapperLinear(torch.nn.Module):
             self.orig_layer.to(self.device)
         # Unwrapper weight
         qdq_weight, scale, zp = self._qdq_weight(v, min_scale, max_scale)
-        # if hasattr(self.orig_layer, "imatrix"):
-        #     self.orig_layer.imatrix = None
-        self.orig_layer.weight.data.copy_(qdq_weight)
-        self.orig_layer.weight.grad = None
-
-        shape = qdq_weight.shape
-        if type(self.orig_layer) == transformers.pytorch_utils.Conv1D:
-            shape = qdq_weight.t().shape
-
-        def _set_dict_attr(attr_dict, attr_name):
-            for key in attr_dict.keys():
-                if key == attr_name:
-                    setattr(self.orig_layer, attr_name, attr_dict[key].reshape(shape[0], -1).to("cpu"))
-                else:
-                    name = "w_" + key
-                    setattr(self.orig_layer, name, attr_dict[key].to("cpu"))
-
-        if not isinstance(self.orig_layer.group_size, tuple):
-            if isinstance(scale, dict):
-                _set_dict_attr(scale, "scale")
-            elif scale is None:
-                self.orig_layer.scale = None
-            elif scale.numel() > 1:
-                self.orig_layer.scale = scale.reshape(shape[0], -1).to("cpu")
-            else:
-                self.orig_layer.scale = scale.view(-1).to("cpu")
-        else:
-            self.orig_layer.scale = scale.to("cpu")
-
-        if zp is not None:
-            if isinstance(zp, dict):
-                _set_dict_attr(zp, "zp")
-            elif isinstance(zp, torch.Tensor):
-                if zp.numel() > 1:
-                    zp = zp.reshape(shape[0], -1)
-                    self.orig_layer.zp = zp.to("cpu")
-                else:
-                    self.orig_layer.zp = zp.view(-1).to("cpu")
-            else:
-                self.orig_layer.zp = zp
-        else:
-            self.orig_layer.zp = None
-
-        if self.weight_global_scale is not None:
-            global_scale = self.weight_global_scale
-            assert global_scale.numel() == 1
-            self.orig_layer.weight_global_scale = global_scale.to("cpu")
+        self._apply_qdq(qdq_weight, scale, zp)
 
         # Unwrapper bias
         if self.enable_norm_bias_tuning and "bias_v" in best_params.keys():  ##fake quant
