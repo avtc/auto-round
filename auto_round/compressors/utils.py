@@ -122,18 +122,53 @@ _SWEEP_LOGGED: set = set()
 # and iterations: staging them per batch would copy the same tens of MB
 # every forward (x iterations -- 200-iter runs copy 200x for nothing).
 # Stage-once per (tensor, device): the first batch pays the D2D copy, every
-# later batch/iteration/replica on that device reuses it. Keyed by the
-# tensor object (strong key: no id-reuse hazard; entries live as long as
-# the pool). Races are benign -- both threads compute identical copies.
+# later batch/iteration/replica on that device reuses it. WEAK-keyed: the
+# sweep also stages per-batch inputs (hidden_states), and a strong key
+# pinned every pool tensor plus its copy for the whole run (+3.4GiB per
+# block on BOTH the source and the staging device -- the error4/error5
+# leak). Weak keys die with their source (the pool) and take the staged
+# copy with them; entries live exactly as long as the tensor is in use.
+# get/set race under the replica threads is benign (identical copies), but
+# WeakKeyDictionary is not thread-safe for concurrent writes -- lock it.
+import threading as _threading
+import weakref as _weakref
+
+# id(tensor) -> (weakref-to-source, {device_str: staged copy}). The
+# finalize callback evicts the entry when the source tensor is collected,
+# freeing its staged copies with it -- a strong-keyed memo pinned every
+# pool tensor plus its copy for the whole run (+3.4GiB per block on BOTH
+# the source and the staging device). id-reuse is disambiguated by the
+# weakref (a recycled id whose entry belongs to a dead tensor is purged).
 _STAGED_KWARGS: dict = {}
+_STAGED_KWARGS_LOCK = _threading.Lock()
 
 
 def _staged_kwarg_copy(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-    key = (tensor, device)
-    got = _STAGED_KWARGS.get(key)
-    if got is None:
-        got = tensor.to(device)
-        _STAGED_KWARGS[key] = got
+    key = id(tensor)
+    ent = _STAGED_KWARGS.get(key)
+    if ent is not None:
+        if ent[0]() is None:  # source died (id reused or entry stale)
+            _STAGED_KWARGS.pop(key, None)
+            ent = None
+        else:
+            got = ent[1].get(str(device))
+            if got is not None:
+                return got
+    with _STAGED_KWARGS_LOCK:
+        ent = _STAGED_KWARGS.get(key)
+        if ent is not None and ent[0]() is None:
+            _STAGED_KWARGS.pop(key, None)
+            ent = None
+        if ent is None:
+            per_dev = {}
+            _STAGED_KWARGS[key] = (_weakref.ref(tensor), per_dev)
+            _weakref.finalize(tensor, _STAGED_KWARGS.pop, key, None)
+        else:
+            per_dev = ent[1]
+        got = per_dev.get(str(device))
+        if got is None:
+            got = tensor.to(device)
+            per_dev[str(device)] = got
     return got
 
 

@@ -927,6 +927,13 @@ class SignRoundQuantizer(BaseQuantizer):
                         - _tp.pop("loop_reps_pending", 0.0)
                     )
 
+        except torch.OutOfMemoryError:
+            # name the residents before re-raising: per-device allocator state
+            # + top tensor groups by (device, dtype, shape)
+            from auto_round.algorithms.quantization.sign_round.data_parallel import dump_oom_tensor_census_
+
+            dump_oom_tensor_census_("tune")
+            raise
         finally:
             if tuning_cache is not None:
                 tuning_cache.close()
