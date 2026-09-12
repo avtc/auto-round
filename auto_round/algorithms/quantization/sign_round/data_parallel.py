@@ -1559,13 +1559,35 @@ class ReplicaGroup:
 
         if getattr(_envs, "AR_PERF_COUNTERS", False):
             for dev in mirror_devs:
-                if dev.type == "cuda":
-                    logger.info(
-                        "[tune-ddp] post-teardown cuda:%s allocated=%.2fGiB reserved=%.2fGiB",
-                        dev.index,
-                        torch.cuda.memory_allocated(dev) / 2**30,
-                        torch.cuda.memory_reserved(dev) / 2**30,
-                    )
+                if dev.type != "cuda":
+                    continue
+                alloc = torch.cuda.memory_allocated(dev)
+                logger.info(
+                    "[tune-ddp] post-teardown cuda:%s allocated=%.2fGiB reserved=%.2fGiB",
+                    dev.index,
+                    alloc / 2**30,
+                    torch.cuda.memory_reserved(dev) / 2**30,
+                )
+                if alloc > 2 * 2**30:
+                    # name the holder: live nn.Modules whose parameters sit on
+                    # this device, counted by type (error4 showed +3.4GiB/block
+                    # surviving dynamo.reset + gc -- a live reference chain)
+                    _census: dict = {}
+                    for obj in gc.get_objects():
+                        if isinstance(obj, torch.nn.Module):
+                            try:
+                                _p = next(obj.parameters()), None
+                            except StopIteration:
+                                continue
+                            if _p[0].device == dev:
+                                _t = type(obj).__name__
+                                _census[_t] = _census.get(_t, 0) + 1
+                    if _census:
+                        logger.info(
+                            "[tune-ddp] post-teardown cuda:%s module census: %s",
+                            dev.index,
+                            ", ".join(f"{k}x{v}" for k, v in sorted(_census.items(), key=lambda kv: -kv[1])[:8]),
+                        )
 
 
 def _block_device(block) -> torch.device:

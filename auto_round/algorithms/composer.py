@@ -494,7 +494,9 @@ class AlgorithmComposer:
         if len(_stages) > 1:
             _hooked = install_stage_boundary_hooks_(block, _stages[0])
             if _hooked:
-                logger.info("[tune-ddp] spanning block: %d stage-boundary hook(s) installed", _hooked)
+                # lane-neutral prefix + debug level: fires for EVERY spanning
+                # block, serial runs included (64 INFO lines per run = noise)
+                logger.debug("[tune-placement] spanning block: %d stage-boundary hook(s) installed", _hooked)
         if self._coll_devs:
             # distributed calibration pool: each DDP device owns its sample
             # shard (matching the tune shards), so shard-local reads never
