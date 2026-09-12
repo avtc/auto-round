@@ -389,19 +389,11 @@ class AlgorithmComposer:
         except Exception as e:  # pragma: no cover - resolver reachability on odd hosts
             logger.warning("[tune-ddp] collection sharding declined: resolver unreachable (%s)", e)
             return None
-        if plan.replica_devices is not None:
-            # device-mapped replicas: the ephemeral single-device collection
-            # mirrors would squash the block's stage layout (unregistered
-            # leaves and per-stage buffers left behind); the collection runs
-            # serial on the spanning lane instead (tuning still engages
-            # mapped replicas). Checked on the RESOLVED plan: the cache is
-            # empty on the first spanning block, and reading it before the
-            # resolver call would miss exactly that engagement.
-            logger.info(
-                "[tune-ddp] collection sharding declined: device-mapped replica plan "
-                "(spanning block) uses the serial collection"
-            )
-            return None
+        if plan.world > 1:
+            # device-mapped plans shard too: each group's ephemeral mirror is
+            # built with the mapped placement machinery (a plain .to() would
+            # squash the spanning layout)
+            self._coll_replica_sets = plan.replica_devices
         return plan.devices if plan.world > 1 else None
 
     def _collect_forward_timed(self, *args, **kwargs):
@@ -443,6 +435,7 @@ class AlgorithmComposer:
             self._coll_devs,
             merge_stats=True,
             max_devices=4 if hook_pass else 0,
+            replica_sets=getattr(self, "_coll_replica_sets", None),
         )
 
     # ── Per-block pipeline orchestration ─────────────────────────────────────
@@ -485,7 +478,23 @@ class AlgorithmComposer:
         """
         self.last_collect_wall = 0.0
         block_forward_fn = self.block_forward
+        self._coll_replica_sets = None
         self._coll_devs = self._ddp_collection_devices(block, fp_inputs)
+        # A block spanning several accelerator devices (device_map sharding)
+        # needs stage-boundary staging for ANY forward -- serial runs
+        # included: leaf modules without wrappers (layernorms, skipped
+        # linears) return outputs on their own device and the residual
+        # stream crashes otherwise. Installed unconditionally and
+        # idempotently here, before the first collection forward; the tune
+        # inherits them (mapped mirrors retarget them per stage).
+        from auto_round.algorithms.quantization.sign_round.data_parallel import install_stage_boundary_hooks_
+        from auto_round.algorithms.quantization.sign_round.placement import accelerator_stage_devices
+
+        _stages = accelerator_stage_devices(block)
+        if len(_stages) > 1:
+            _hooked = install_stage_boundary_hooks_(block, _stages[0])
+            if _hooked:
+                logger.info("[tune-ddp] spanning block: %d stage-boundary hook(s) installed", _hooked)
         if self._coll_devs:
             # distributed calibration pool: each DDP device owns its sample
             # shard (matching the tune shards), so shard-local reads never

@@ -507,6 +507,47 @@ def _relocate_module_state(m: torch.nn.Module, device: torch.device) -> None:
             m.__dict__[key] = str(device)
 
 
+def _stage_map_(block, home_stages):
+    """module-name -> home stage index + the CPU-only module set."""
+    from auto_round.algorithms.quantization.sign_round.placement import tensor_leaves
+
+    stage_of_module = {}
+    for mod_name, mod in block.named_modules():
+        for _n, tensor, _c, _k in tensor_leaves(mod):
+            if tensor.device in home_stages:
+                stage_of_module[mod_name] = home_stages.index(tensor.device)
+                break
+    # modules with no accelerator leaf anywhere in their subtree keep their
+    # CPU state on CPU (pinned caches / self-managed subtrees -- the
+    # _enforce_mirror_device_ invariant); only stage-resident modules relocate.
+    # The subtree walk is O(N * subtree) at block scale.
+    cpu_only = {n for n, _m in block.named_modules() if n not in stage_of_module}
+    return stage_of_module, cpu_only
+
+
+def build_mapped_mirror(block, stage_of_module, cpu_only, replica_devs, home_stages):
+    """One mapped mirror: the home's stage layout reproduced on ``replica_devs``.
+
+    Deepcopy + :func:`place_module_tree` (which also moves the unregistered
+    tensor leaves plain ``.to()`` misses), wrapper state relocated per stage,
+    inherited stage hooks retargeted onto the mirror's stages. Returns the
+    mirror (leaf-move count is logged by the caller).
+    """
+    from auto_round.algorithms.quantization.sign_round.placement import place_module_tree
+
+    def target_of(name, _rd=replica_devs):
+        return torch.device("cpu") if name in cpu_only else _rd[stage_of_module[name]]
+
+    mirror = copy.deepcopy(block)
+    moved = place_module_tree(mirror, target_of)
+    for _mn, _m in mirror.named_modules():
+        if _mn in cpu_only:
+            continue
+        _relocate_module_state(_m, replica_devs[stage_of_module[_mn]])
+    retarget_stage_hooks_(mirror, target_of)
+    return mirror, moved
+
+
 def install_stage_boundary_hooks_(block, primary: torch.device) -> int:
     """Stage-boundary hooks for a block whose modules span several devices.
 
@@ -905,6 +946,7 @@ def sharded_nograd_forward(
     sample_count: Optional[int] = None,
     merge_stats: bool = False,
     max_devices: int = 0,
+    replica_sets: Optional[List[List[torch.device]]] = None,
 ):
     """Parallelize a no-grad collection forward across ``devices``.
 
@@ -960,10 +1002,20 @@ def sharded_nograd_forward(
     home_dev = _block_device(block)
     mirrors: List[torch.nn.Module] = []
     reps: List[torch.nn.Module] = []
-    for dev in devices:
+    stage_of_module = cpu_only = None
+    if replica_sets is not None:
+        home_stages = replica_sets[0]
+        stage_of_module, cpu_only = _stage_map_(block, home_stages)
+    for r, dev in enumerate(devices):
         if dev == home_dev:
             reps.append(block)
             mirrors.append(None)
+        elif replica_sets is not None:
+            # ephemeral MAPPED mirror: the spanning layout reproduced on this
+            # group's device set (a plain .to() would squash it)
+            m, _moved = build_mapped_mirror(block, stage_of_module, cpu_only, replica_sets[r], home_stages)
+            reps.append(m)
+            mirrors.append(m)
         else:
             m = copy.deepcopy(block).to(dev)
             _relocate_params(m, dev)
@@ -1349,42 +1401,10 @@ class ReplicaGroup:
                     raise RuntimeError(f"mapped replica device sets overlap on {d}")
                 seen.add(key)
 
-        # module-name -> home stage index, resolved via the module's first
-        # accelerator tensor leaf (mixed-device modules resolve via the first)
-        stage_of_module = {}
-        for mod_name, mod in block.named_modules():
-            for _n, tensor, _c, _k in tensor_leaves(mod):
-                if tensor.device in home_stages:
-                    stage_of_module[mod_name] = home_stages.index(tensor.device)
-                    break
-
-        # modules with no accelerator leaf anywhere in their subtree keep
-        # their CPU state on CPU (pinned caches / self-managed subtrees --
-        # the _enforce_mirror_device_ invariant); only stage-resident modules
-        # relocate. The subtree walk is O(N * subtree) at block scale.
-        cpu_only = {n for n, _m in block.named_modules() if n not in stage_of_module}
+        stage_of_module, cpu_only = _stage_map_(block, home_stages)
 
         for r, replica_devs in enumerate(mapped_sets[1:], start=1):
-            mirror = copy.deepcopy(block)
-            moved = place_module_tree(
-                mirror,
-                lambda name, _rd=replica_devs: (
-                    torch.device("cpu") if name in cpu_only else _rd[stage_of_module[name]]
-                ),
-            )
-            # wrapper-held state (params dict, device attrs) follows each
-            # module's stage target
-            for _mn, _m in mirror.named_modules():
-                if _mn in cpu_only:
-                    continue
-                _relocate_module_state(_m, replica_devs[stage_of_module[_mn]])
-            # inherited stage hooks follow their module's mapped stage
-            retarget_stage_hooks_(
-                mirror,
-                lambda name, _rd=replica_devs: (
-                    torch.device("cpu") if name in cpu_only else _rd[stage_of_module[name]]
-                ),
-            )
+            mirror, moved = build_mapped_mirror(block, stage_of_module, cpu_only, replica_devs, home_stages)
             logger.info(
                 "[tune-ddp] mapped mirror %d placed on %s (%d leaf moves)",
                 r,

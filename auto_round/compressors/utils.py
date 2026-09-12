@@ -116,6 +116,9 @@ def is_block_wfp8(ar_or_format):
     return _as_scheme(ar_or_format).is_block_wfp8()
 
 
+_SWEEP_LOGGED: set = set()
+
+
 def block_forward(
     block: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -201,13 +204,21 @@ def block_forward(
     for _k, _v in input_others.items():
         _audit(_v, str(_k), _bad)
     if _bad:
-        logger.warning(
-            "[block-forward] device sweep: moving %d stale kwarg tensor(s) onto %s: %s%s",
-            len(_bad),
-            _block_dev,
-            ", ".join(_bad[:8]),
-            " ..." if len(_bad) > 8 else "",
-        )
+        # once per (device, signature): the shared-cache kwargs (rope tables,
+        # position ids) live on the pool's home primary and stage lazily per
+        # batch -- logging every batch hides real signals in a 64-block run
+        global _SWEEP_LOGGED
+        _sig = (str(_block_dev), tuple(_bad))
+        if _sig not in _SWEEP_LOGGED:
+            _SWEEP_LOGGED.add(_sig)
+            logger.warning(
+                "[block-forward] device sweep: moving %d stale kwarg tensor(s) onto %s "
+                "(once per signature; per-batch moves continue silently): %s%s",
+                len(_bad),
+                _block_dev,
+                ", ".join(_bad[:8]),
+                " ..." if len(_bad) > 8 else "",
+            )
         for _k in list(input_others.keys()):
             if torch.is_tensor(input_others[_k]) and input_others[_k].device.type in ("cuda", "xpu", "hpu"):
                 if input_others[_k].device != _block_dev:

@@ -615,25 +615,25 @@ class TestWorldDemotion:
         assert any("mixed accelerator families" in n for n in plan.notes)
 
 
-class TestComposerMappedDecline:
-    """Q-1/Q-3: the composer's collection sharding declines for mapped plans.
+class TestComposerMappedCollection:
+    """Mapped plans shard the collection too, with replica sets threaded.
 
-    The check must fire on the plan RETURNED by the resolver -- the cache is
-    empty on the first spanning block, so a cache-first read would miss
-    exactly that engagement and build squashed ephemeral mirrors.
+    Each group's ephemeral mirror is built by the mapped placement
+    machinery (a plain .to() would squash the spanning layout): the decline
+    is gone -- _ddp_collection_devices returns the primaries and stashes the
+    per-group device sets for sharded_nograd_forward.
     """
 
     class _FakeComposer:
         def __init__(self, quantizer):
             self.block_quantizer = quantizer
-            runner = type("R", (), {"output_config": {"hidden_states": 1}})
-            self.block_forward = runner()
+            self.block_forward = type("R", (), {"output_config": {"hidden_states": 1}})()
 
-    def test_first_engagement_declines_collection(self, monkeypatch, _autoround_log_propagate):
+    def test_mapped_plan_shards_with_replica_sets(self, monkeypatch, _autoround_log_propagate):
         import auto_round.algorithms.composer as composer_mod
-        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+        from auto_round.algorithms.quantization.sign_round.data_parallel import DDPPlan
 
-        engaged = resolve_tune_ddp_plan_.__globals__["DDPPlan"](2, [torch.device("cuda", 0)], 4)
+        engaged = DDPPlan(2, [torch.device("cuda", 0)], 4)
         engaged.replica_devices = [
             [torch.device("cuda", 0), torch.device("cuda", 1)],
             [torch.device("cuda", 2), torch.device("cuda", 3)],
@@ -645,20 +645,20 @@ class TestComposerMappedDecline:
             gradient_accumulate_steps = 1
             calibration_context = None
 
-        import auto_round.algorithms.quantization.sign_round.placement as placement
-
-        monkeypatch.setattr(
-            placement, "accelerator_stage_devices", lambda b: [torch.device("cuda", 0), torch.device("cuda", 1)]
-        )
         monkeypatch.setattr(
             "auto_round.algorithms.quantization.sign_round.data_parallel.resolve_tune_ddp_plan_",
             lambda *a, **k: engaged,
         )
         comp = self._FakeComposer(_Q())
-        fp_inputs = [torch.zeros(1)] * 8
-        got = composer_mod.AlgorithmComposer._ddp_collection_devices.__get__(comp)(type("B", (), {})(), fp_inputs)
-        assert got is None  # declined: mapped plan -> serial collection
-        assert _Q._resolved_ddp_plan is None  # the mock left the cache empty (first-block condition)
+
+        class _Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(4, 4)
+
+        got = composer_mod.AlgorithmComposer._ddp_collection_devices.__get__(comp)(_Block(), [torch.zeros(1)] * 8)
+        assert got == [torch.device("cuda", 0)]  # sharding engaged
+        assert comp._coll_replica_sets == engaged.replica_devices  # sets threaded
 
 
 class TestSpanningAlwaysMapped:
