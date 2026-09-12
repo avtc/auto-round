@@ -857,9 +857,8 @@ def wrapper_block(
             n, m, kind = item
             outcomes[idx] = _wrap_one(n, m, kind)
 
-        _t0 = search_shard._time_perf()
         search_shard.run_items_by_device(groups, _wrap_indexed)
-        search_shard.maybe_log_shard("wrapper search", groups, search_shard._time_perf() - _t0)
+        search_shard.log_engaged_once("wrapper search")
         results = [outcomes.get(i) for i in range(len(work))]
     else:
         results = [_wrap_one(n, m, kind) for n, m, kind in work]

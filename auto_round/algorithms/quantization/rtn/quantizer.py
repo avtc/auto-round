@@ -144,9 +144,8 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         work = [m for _name, m in block.named_modules() if hasattr(m, "global_name") and check_to_quantized(m)]
         groups = search_shard.group_items_by_device(work, device_of=lambda m: str(getattr(m, "tuning_device", "cpu")))
         if search_shard.shard_eligible(groups.keys()) and not search_shard.shard_disabled_by_env():
-            _t0 = search_shard._time_perf()
             search_shard.run_items_by_device(groups, lambda _idx, m: self.quantize_layer_outside_block(m))
-            search_shard.maybe_log_shard("optimized rtn search", groups, search_shard._time_perf() - _t0)
+            search_shard.log_engaged_once("optimized rtn search")
         else:
             for m in work:
                 self.quantize_layer_outside_block(m)

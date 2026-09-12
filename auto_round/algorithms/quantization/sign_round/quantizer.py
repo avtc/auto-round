@@ -25,6 +25,7 @@ from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.compressors.utils import (
     IndexSampler,
     collect_best_params,
+    snapshot_best_params,
 )
 from auto_round.logger import logger
 from auto_round.utils import (
@@ -555,14 +556,14 @@ class SignRoundQuantizer(BaseQuantizer):
                         best_params = (
                             tuning_cache.collect_best_params()
                             if tuning_cache is not None and tuning_cache.best is not None
-                            else collect_best_params(block, self.compress_context.cache_device)
+                            else snapshot_best_params(block, self.compress_context.cache_device)
                         )
                         last_best_iter = i
                 if self.not_use_best_mse and i == self.iters - 1:
                     best_params = (
                         tuning_cache.collect_best_params()
                         if tuning_cache is not None and tuning_cache.best is not None
-                        else collect_best_params(block, self.compress_context.cache_device)
+                        else snapshot_best_params(block, self.compress_context.cache_device)
                     )
 
                 if not self.not_use_best_mse:

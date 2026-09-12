@@ -237,3 +237,80 @@ class TestRtnSearchShard(unittest.TestCase):
         block.m0 = m
         q.quantize_block(block, None, None, None, None, None)
         self.assertEqual(calls, [caller])
+
+
+class TestSnapshotRouting(unittest.TestCase):
+    """snapshot_best_params: non-CPU cache device -> per-param device copies."""
+
+    def _fake_block(self):
+        class W(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.orig_layer = torch.nn.Linear(8, 8, bias=False)
+                self.params = {"value": torch.nn.Parameter(torch.arange(16, dtype=torch.float32).reshape(4, 4))}
+
+        block = torch.nn.Module()
+        block.w0 = W()
+        block.w1 = W()
+        return block
+
+    def test_cpu_cache_device_uses_host_path(self):
+        from auto_round.compressors.utils import snapshot_best_params
+
+        block = self._fake_block()
+        out = snapshot_best_params(block, torch.device("cpu"))
+        for n in ("w0", "w1"):
+            self.assertTrue(out[n]["value"].data_ptr() != block.get_submodule(n).params["value"].data_ptr())
+            self.assertTrue(torch.equal(out[n]["value"], block.get_submodule(n).params["value"]))
+            self.assertEqual(out[n]["value"].device.type, "cpu")
+
+    def test_non_cpu_cache_device_keeps_params_on_own_device(self):
+        from auto_round.compressors.utils import snapshot_best_params
+
+        block = self._fake_block()
+        # router keys on the cache-device label; params live on cpu in this test
+        out = snapshot_best_params(block, "cuda:0")
+        for n in ("w0", "w1"):
+            src = block.get_submodule(n).params["value"]
+            self.assertEqual(out[n]["value"].device, src.device)  # own device, not the cache device
+            self.assertTrue(torch.equal(out[n]["value"], src))
+
+    def test_local_snapshot_storage_is_distinct(self):
+        from auto_round.compressors.utils import snapshot_best_params
+
+        block = self._fake_block()
+        out = snapshot_best_params(block, "cuda:0")
+        src = block.w0.params["value"]
+        with torch.no_grad():
+            src.add_(1.0)
+            self.assertFalse(torch.equal(out["w0"]["value"], src))  # snapshot isolated from mutation
+            src.sub_(1.0)
+
+    def test_local_copy_failure_falls_back_to_host(self):
+        from auto_round.compressors.utils import collect_best_params_local
+
+        block = self._fake_block()
+
+        class FlakyData:
+            # local path passes a torch.device object; the host fallback passes the "cpu" string
+            device = torch.device("cpu")
+
+            def to(self, device=None, copy=False):
+                if isinstance(device, torch.device):
+                    raise RuntimeError("simulated local-copy failure")
+                return torch.zeros(2, 2)
+
+        class Pseudo:
+            data = FlakyData()
+
+        block.w0.params["flaky"] = Pseudo()
+        out = collect_best_params_local(block)
+        self.assertIn("w0", out)  # host fallback still produced a snapshot
+        self.assertIn("flaky", out["w0"])
+
+    def test_invalid_cache_device_label_keeps_historical_behavior(self):
+        from auto_round.compressors.utils import snapshot_best_params
+
+        block = self._fake_block()
+        with self.assertRaisesRegex(RuntimeError, "Invalid device"):
+            snapshot_best_params(block, "not-a-device")  # same failure as the historical path

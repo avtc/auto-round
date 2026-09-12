@@ -27,7 +27,6 @@ weight-local and must stay on their serial paths.
 """
 
 import threading
-import time
 from collections import OrderedDict
 
 import torch
@@ -127,16 +126,19 @@ def shard_eligible(device_keys):
     return False
 
 
-def maybe_log_shard(name, groups, wall):
-    """Log one engagement line for a sharded search phase."""
-    counts = {str(k): len(v) for k, v in groups.items()}
-    logger.info(
-        "[search-shard] %s: %d modules across %d devices in %.1fs (%s)", name, sum(counts.values()), len(counts), counts
-    )
+_ENGAGED_LOGGED = set()
 
 
-def _time_perf():
-    return time.perf_counter()
+def log_engaged_once(label):
+    """Log the sharding engagement once per process (INFO, no counters).
+
+    Detailed per-block counters are intentionally not emitted here; they belong
+    to the perf-counter infrastructure of the parallel-tuning work.
+    """
+    if label in _ENGAGED_LOGGED:
+        return
+    _ENGAGED_LOGGED.add(label)
+    logger.info("[search-shard] %s: running weight-local searches with one worker per device", label)
 
 
 def shard_disabled_by_env():
