@@ -157,11 +157,11 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             ", ".join(f"{w}:{len(cs)}" for w, cs in buckets.items()),
         )
 
-    def _worker_of(chunks):
+    def _worker_of(chunk):
         for wk, cs in buckets.items():
-            if any(c is chunks[0] for c in cs):
+            if any(c is chunk for c in cs):
                 return str(wk)
-        return str(chunks[0][0]["weight"].device)
+        return str(chunk[0]["weight"].device)  # not found (should not happen): stay home
 
     def _run_chunk(chunk, worker):
         w0 = chunk[0]["w"]

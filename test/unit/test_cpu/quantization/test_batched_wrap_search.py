@@ -311,9 +311,11 @@ class TestWorkerBucketKeys(unittest.TestCase):
             captured["keys"] = list(keyed.keys())
 
         with mock.patch.object(
-            batched_search, "pick_search_worker_devices", return_value=["cuda:9"]
+            batched_search, "pick_search_worker_devices", side_effect=[["cuda:9"], ["cpu"]]
         ), mock.patch.object(batched_search, "run_items_by_device", side_effect=fake_run):
-            batched_search.run_batched_rtn_search(model, staged)
+            # max_batch=1 -> two singleton chunks -> two distinct worker buckets;
+            # run_items_by_device is mocked so nothing actually moves to cuda:9
+            batched_search.run_batched_rtn_search(model, staged, max_batch=1)
         # distinct worker bucket vs home -> multi-bucket path taken; every key must parse
         self.assertEqual(sorted(captured["keys"]), ["cpu", "cuda:9"])
         for k in captured["keys"]:
