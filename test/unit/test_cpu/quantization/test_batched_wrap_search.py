@@ -322,6 +322,41 @@ class TestWorkerBucketKeys(unittest.TestCase):
             torch.device(k)  # the exact operation that crashed on the server
 
 
+class TestPreWarm(unittest.TestCase):
+    def _mk_chunk(self, compiled, shape=(64, 128), fn_obj=None):
+        w = mock.Mock()
+        w.enable_torch_compile = compiled
+        w.weight_quant_func = fn_obj if fn_obj is not None else (lambda x, **k: x)
+        layer = TestBatchedRtnSearchParity()._layer(seed=0)
+        weight = layer.weight.data.reshape(shape)
+        return [{"w": w, "weight": weight, "im": None, "name": "x"}]
+
+    def test_warms_one_chunk_per_variant_serially(self):
+        from auto_round.algorithms.quantization.rtn import batched_search
+
+        ran = []
+
+        def exec_fn(chunk, worker):
+            ran.append((worker, id(chunk[0]["w"].weight_quant_func)))
+
+        def fn_a():
+            pass
+
+        c1 = self._mk_chunk(True, fn_obj=fn_a)
+        c2 = self._mk_chunk(True, fn_obj=fn_a)  # same fn+shape+worker -> already warmed
+        c3 = self._mk_chunk(True, shape=(128, 64), fn_obj=fn_a)  # new shape -> warmed
+        c4 = self._mk_chunk(False)  # not compiled -> no warm
+        buckets = {"cuda:1": [c1, c2, c3, c4]}
+        out = batched_search._prewarm_buckets(buckets, exec_fn)
+        self.assertEqual(len(ran), 2)  # c1 and c3 warmed; c2 same-variant, c4 not compiled
+        self.assertEqual(out["cuda:1"], [c2, c4])  # leftovers for the threaded path
+        # second call warms nothing (set persists)
+        ran.clear()
+        out2 = batched_search._prewarm_buckets({"cuda:1": [c1]}, exec_fn)
+        self.assertEqual(ran, [])
+        self.assertEqual(out2["cuda:1"], [c1])
+
+
 class TestEagerUnwrap(unittest.TestCase):
     def test_compiled_fn_unwraps_to_original(self):
         import torch

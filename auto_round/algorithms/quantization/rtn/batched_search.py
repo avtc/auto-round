@@ -184,14 +184,8 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0), imatrix_override=stacked_im
         )
         kwargs = _relocate_tensor_kwargs(kwargs, str(stacked_w.device))
-        fn = w0.weight_quant_func
-        if worker != dev:
-            # offloaded first-calls of lazily-compiled functions race dynamo across
-            # worker threads; the eager original avoids the compiled wrapper entirely
-            # (the search is bandwidth-bound, compilation is optional here)
-            fn = getattr(fn, "_torchdynamo_orig_callable", None) or fn
         try:
-            qdq, scale, zp = fn(stacked_w, **kwargs)
+            qdq, scale, zp = w0.weight_quant_func(stacked_w, **kwargs)
         except torch.OutOfMemoryError:
             logger.warning(
                 "[rtn-batch] stacked search OOM (%d modules); finishing this chunk per-module "
@@ -211,6 +205,8 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             set_module(model, e["name"], e["w"].orig_layer)
 
     if len(buckets) > 1:
+        buckets = _prewarm_buckets(buckets, _run_chunk)
+    if len(buckets) > 1:
         keyed = OrderedDict()
         for wk, cs in buckets.items():
             keyed.setdefault(str(wk), []).append((len(keyed), cs))
@@ -220,6 +216,37 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             for c in wcs:
                 _run_chunk(c, _worker_of(c))
     return []
+
+
+_WARMED_SEARCHES = set()
+
+
+def _prewarm_buckets(buckets, run_chunk_fn):
+    """Serially run one chunk per (underlying fn, worker, shape) before threading.
+
+    First calls of lazily-compiled functions trace/compile inside dynamo, which
+    races across worker threads. The dynamo code-cache is shared by every
+    wrapper of the same underlying function, so warming one chunk per variant
+    serially (keyed on the ORIGINAL callable's id -- stable across blocks; the
+    weight shape covers static-shape guard variants) leaves the threads hitting
+    the cache only. Non-compiled configurations skip the warm entirely.
+    """
+    for wk in list(buckets.keys()):
+        keep = []
+        for c in buckets[wk]:
+            fn0 = c[0]["w"].weight_quant_func
+            warm_key = (
+                id(getattr(fn0, "_torchdynamo_orig_callable", None) or fn0),
+                str(wk),
+                tuple(c[0]["weight"].shape),
+            )
+            if getattr(c[0]["w"], "enable_torch_compile", False) and warm_key not in _WARMED_SEARCHES:
+                _WARMED_SEARCHES.add(warm_key)
+                run_chunk_fn(c, wk)
+            else:
+                keep.append(c)
+        buckets[wk] = keep
+    return OrderedDict((k, v) for k, v in buckets.items() if v)
 
 
 def _relocate_tensor_kwargs(kwargs: dict, device: str) -> dict:
