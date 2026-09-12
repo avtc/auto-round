@@ -141,10 +141,14 @@ def dump_oom_tensor_census_(context: str = "") -> None:
             logger.error("[oom] %s live tensors ≈ %.2fGiB", _dev, _nb / 2**30)
         for (_dev, _dt, _shape), (_cnt, _nb) in top[:8]:
             logger.error("[oom] %s %s %s x%d = %.2fGiB", _dev, _dt, list(_shape), _cnt, _nb / 2**30)
-        # name the holders: referrers of one representative tensor per top group
-        for rep, (( _dev, _dt, _shape), (_cnt, _nb)) in _representatives(top[:3], gc.get_objects()):
-            for desc in _describe_referrers(rep):
-                logger.error("[oom]   %s %s held by: %s", _dev, list(_shape), desc)
+        # holder attribution runs LAST and fully guarded: it must never cost the
+        # inventory above (a symbolic-shape failure here previously ate the totals)
+        try:
+            for rep, ((_dev, _dt, _shape), (_cnt, _nb)) in _representatives(top[:3], gc.get_objects()):
+                for desc in _describe_referrers(rep):
+                    logger.error("[oom]   %s %s held by: %s", _dev, list(_shape), desc)
+        except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
+            logger.error("[oom] holder attribution failed (%s)", e)
     except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
         logger.error("[oom] tensor census failed (%s)", e)
 
