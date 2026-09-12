@@ -258,7 +258,13 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
 
     device_groups = OrderedDict()
     for w in deferred_wrappers:
-        dev = _wrap_batch_device_of(w._deferred_search_inputs)
+        inputs = w._deferred_search_inputs
+        if inputs is None:
+            raise RuntimeError(
+                f"{type(w).__name__} was queued for batched wrap search without staged inputs; "
+                "the defer_search flag never reached its search init"
+            )
+        dev = _wrap_batch_device_of(inputs)
         device_groups.setdefault(dev, []).append(w)
 
     def _run_one(wrapper):

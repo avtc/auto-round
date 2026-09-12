@@ -117,7 +117,9 @@ class WrapperLinear(torch.nn.Module):
             self.q_scale_thresh = 1e-8
         else:
             self.q_scale_thresh = 1e-5
-        self._init_tuning_params_and_quant_func()
+        # consumed here so subclasses never see it in **kwargs; forwarded to the
+        # search init (staging for batched same-shape wrap searches)
+        self._init_tuning_params_and_quant_func(defer_search=bool(kwargs.pop("defer_search", False)))
         if deepspeed_exists:
             if type(self.orig_layer) in (torch.nn.Linear, LinearLayer):
                 self.orig_forward = self.linear_forward
@@ -137,7 +139,7 @@ class WrapperLinear(torch.nn.Module):
     def bias(self):
         return self.orig_layer.bias
 
-    def _init_tuning_params_and_quant_func(self):
+    def _init_tuning_params_and_quant_func(self, defer_search: bool = False):
         """Initializes tuning parameters and quantization functions.
 
         This method sets up required parameters and functions for weight quantization,

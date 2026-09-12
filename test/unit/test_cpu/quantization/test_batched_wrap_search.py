@@ -195,6 +195,51 @@ class TestV2DeferralProtocol(unittest.TestCase):
         self.assertIsNone(w2._deferred_search_inputs)
 
 
+class TestRealV2Construction(unittest.TestCase):
+    """The kwarg must survive the REAL base __init__ chain (regression: kwargs swallowed it)."""
+
+    def _layer(self):
+        import torch.nn as nn
+
+        layer = nn.Linear(128, 64, bias=False)
+        layer.data_type = "int"
+        layer.bits = 4
+        layer.sym = True
+        layer.group_size = 128
+        layer.iters = 10
+        layer.act_bits = 16
+        return layer
+
+    def _make(self, defer_search):
+        from auto_round.algorithms.quantization.sign_roundv2.quantizer import SignRoundOptimizedWrapperLinear
+
+        layer = self._layer()
+        return SignRoundOptimizedWrapperLinear(
+            layer,
+            enable_minmax_tuning=False,
+            enable_norm_bias_tuning=False,
+            enable_torch_compile=False,
+            device="cpu",
+            defer_search=defer_search,
+        )
+
+    def test_deferred_stages_through_real_init(self):
+        w = self._make(defer_search=True)
+        self.assertIsNotNone(w._deferred_search_inputs, "defer_search was swallowed by the base __init__ kwargs")
+        self.assertIsNone(w.init_scale)
+        w._run_deferred_search_now()
+        self.assertIsNotNone(w.init_scale)
+
+    def test_non_deferred_searches_inline_through_real_init(self):
+        w = self._make(defer_search=False)
+        self.assertIsNone(w._deferred_search_inputs)
+        self.assertIsNotNone(w.init_scale)
+
+    def test_kwarg_absent_by_default(self):
+        w = self._make(defer_search=False)
+        self.assertIsNone(w._deferred_search_inputs)  # old callers unchanged
+
+
 class TestWrapperBlockDrivesBatching(unittest.TestCase):
     def _fake_block(self):
         block = torch.nn.Module()

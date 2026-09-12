@@ -204,7 +204,9 @@ class SignRoundDQWrapperLinear(WrapperLinear):
         self.prev_d_scale = None
         self.prev_d_wmin = None
 
-    def _init_tuning_params_and_quant_func(self):
+    def _init_tuning_params_and_quant_func(self, defer_search: bool = False):
+        # the DQ scale search stays inline; the parameter keeps the base-class
+        # call signature uniform (staged batching applies to the optimized path)
         super()._init_tuning_params_and_quant_func()
         # The double-quant search path is data-dependent and kept un-compiled,
         # while ``weight_quant_func`` is the compilable pure-math half.
