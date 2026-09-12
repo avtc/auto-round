@@ -213,6 +213,30 @@ def check_need_act_calibration(
     return False
 
 
+def collect_best_params_local(block):
+    """Best-params snapshot copied on each param's OWN device.
+
+    A host snapshot (``collect_best_params`` with a CPU cache device) D2H-copies
+    every wrapper param on EVERY improving iteration -- at 27B scale that is
+    gigabytes per snapshot and seconds per block. A device-local duplicate has
+    no cross-device traffic and the unwrap/apply copy back is local too. Falls
+    back to a host snapshot (with a warning) when a local copy fails.
+    """
+    params = {}
+    try:
+        if hasattr(block, "orig_layer"):
+            for key, p_ in block.params.items():
+                params[key] = p_.data.to(p_.data.device, copy=True)
+        else:
+            for n, m in block.named_modules():
+                if hasattr(m, "orig_layer"):
+                    params[n] = {key: p_.data.to(p_.data.device, copy=True) for key, p_ in m.params.items()}
+        return params
+    except RuntimeError as e:
+        logger.warning("[tune] local snapshot copy failed (%s); parking the snapshot on host", e)
+        return collect_best_params(block, "cpu")
+
+
 def collect_best_params(block, cache_device="cpu"):
     """Collect the best parameters from the block to the specified device."""
     params = {}

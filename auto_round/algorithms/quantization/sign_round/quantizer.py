@@ -27,6 +27,7 @@ from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.compressors.utils import (
     IndexSampler,
     collect_best_params,
+    collect_best_params_local,
 )
 from auto_round.logger import logger
 
@@ -56,6 +57,13 @@ def _tune_phase_line(phases: dict, iters: int) -> str:
             phases.get("mb_bwd", 0.0),
             phases.get("mb_other", 0.0),
             phases["mb_n"],
+        )
+    if "lp_sampler" in phases:
+        line += " (loop: sampler=%.2fs snap=%.2fs step=%.2fs rest=%.2fs)" % (
+            phases["lp_sampler"],
+            phases["lp_snap"],
+            phases["lp_step"],
+            phases["lp_rest"],
         )
     return line
 
@@ -545,6 +553,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
         _tune_perf = {"wrap": 0.0, "prepare": 0.0, "loop": 0.0, "tail": 0.0} if envs.AR_PERF_COUNTERS else None
         self._mb_perf = {"fwd": 0.0, "bwd": 0.0, "other": 0.0, "n": 0} if _tune_perf is not None else None
+        _loop_perf = {"sampler": 0.0, "snap": 0.0, "step": 0.0} if _tune_perf is not None else None
         _tp0 = _ptime.perf_counter()
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
             block,
@@ -691,9 +700,13 @@ class SignRoundQuantizer(BaseQuantizer):
                     for n, m in block.named_modules():
                         m.cur_iter = i
                 total_loss = 0
+                if _loop_perf is not None:
+                    _smp_t0 = _ptime.perf_counter()
                 global_indices = index_sampler.next_batch()
                 if valid_token_mask:
                     num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
+                if _loop_perf is not None:
+                    _loop_perf["sampler"] += _ptime.perf_counter() - _smp_t0
 
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
@@ -758,24 +771,36 @@ class SignRoundQuantizer(BaseQuantizer):
                 if total_loss < best_loss:
                     best_loss = total_loss
                     if not self.not_use_best_mse:
+                        if _loop_perf is not None:
+                            _snap_t0 = _ptime.perf_counter()
                         best_params = (
                             tuning_cache.collect_best_params()
                             if tuning_cache is not None and tuning_cache.best is not None
-                            else collect_best_params(block, self.compress_context.cache_device)
+                            else collect_best_params_local(block)
                         )
+                        if _loop_perf is not None:
+                            _loop_perf["snap"] += _ptime.perf_counter() - _snap_t0
                         last_best_iter = i
                 if self.not_use_best_mse and i == self.iters - 1:
+                    if _loop_perf is not None:
+                        _snap_t0 = _ptime.perf_counter()
                     best_params = (
                         tuning_cache.collect_best_params()
                         if tuning_cache is not None and tuning_cache.best is not None
-                        else collect_best_params(block, self.compress_context.cache_device)
+                        else collect_best_params_local(block)
                     )
+                    if _loop_perf is not None:
+                        _loop_perf["snap"] += _ptime.perf_counter() - _snap_t0
 
                 if not self.not_use_best_mse:
                     if 0 < self.dynamic_max_gap <= i - last_best_iter:
                         break
+                if _loop_perf is not None:
+                    _stp_t0 = _ptime.perf_counter()
                 sync_gradients()
                 self._step(scaler, optimizer, lr_schedule)
+                if _loop_perf is not None:
+                    _loop_perf["step"] += _ptime.perf_counter() - _stp_t0
 
         finally:
             if tuning_cache is not None:
@@ -819,6 +844,25 @@ class SignRoundQuantizer(BaseQuantizer):
                         "mb_bwd": self._mb_perf["bwd"],
                         "mb_other": self._mb_perf["other"],
                         "mb_n": self._mb_perf["n"],
+                    }
+                )
+            if _loop_perf is not None:
+                _rest = max(
+                    _tune_perf["loop"]
+                    - _loop_perf["sampler"]
+                    - _loop_perf["snap"]
+                    - _loop_perf["step"]
+                    - _tune_perf.get("mb_fwd", 0.0)
+                    - _tune_perf.get("mb_bwd", 0.0)
+                    - _tune_perf.get("mb_other", 0.0),
+                    0.0,
+                )
+                _tune_perf.update(
+                    {
+                        "lp_sampler": _loop_perf["sampler"],
+                        "lp_snap": _loop_perf["snap"],
+                        "lp_step": _loop_perf["step"],
+                        "lp_rest": _rest,
                     }
                 )
             logger.info(_tune_phase_line(_tune_perf, self.iters))

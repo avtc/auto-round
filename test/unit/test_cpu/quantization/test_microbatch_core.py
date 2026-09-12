@@ -638,6 +638,55 @@ class TestMicroBatchDeclineGuards:
         assert q._micro_batch_n(torch.arange(4)) is None
 
 
+class TestLoopSplitAndLocalSnapshot(unittest.TestCase):
+    """(loop: sampler/snap/step/rest) split + device-local best-params snapshot."""
+
+    def test_loop_split_appended(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tune_phase_line
+
+        line = _tune_phase_line(
+            {
+                "wrap": 1.0,
+                "prepare": 0.0,
+                "loop": 10.0,
+                "tail": 0.4,
+                "mb_fwd": 5.0,
+                "mb_bwd": 0.7,
+                "mb_other": 0.0,
+                "mb_n": 40,
+                "lp_sampler": 0.1,
+                "lp_snap": 3.0,
+                "lp_step": 0.2,
+                "lp_rest": 1.0,
+            },
+            10,
+        )
+        assert "(loop: sampler=0.10s snap=3.00s step=0.20s rest=1.00s)" in line
+
+    def test_local_snapshot_same_device_new_storage(self):
+        import torch
+
+        from auto_round.compressors.utils import collect_best_params_local
+
+        w = torch.nn.Linear(4, 4)
+
+        class FakeWrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.orig_layer = w
+                self.params = {"value": torch.nn.Parameter(torch.ones(3))}
+
+        blk = torch.nn.ModuleList([FakeWrapper(), FakeWrapper()])
+        got = collect_best_params_local(blk)
+        assert set(got) == {"0", "1"}
+        for entry in got.values():
+            val = entry["value"]
+            assert val.device == blk[0].params["value"].device
+            assert torch.equal(val, torch.ones(3))
+            val.fill_(9.0)  # distinct storage: mutating the snapshot leaves the param alone
+            assert torch.equal(blk[0].params["value"].data, torch.ones(3))
+
+
 class TestSharedSliceIndexDomain(unittest.TestCase):
     """Shared entries are captured-batch rows; callers pass POOL indices (collection chunks, tune draws)."""
 
