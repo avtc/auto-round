@@ -150,6 +150,26 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
         for f in fakes:
             self.assertIsNotNone(f.init_scale)
 
+    def test_element_budget_caps_batch_size(self):
+        # 2**28 elements / (w+im) per module: tiny modules force the element cap below the probe cap
+        fakes = [FakeDeferred(seed=i, shape=(1024, 128)) for i in range(6)]  # ~0.26M elems/module
+        calls = []
+        real_stack = torch.stack
+
+        def spy_stack(tensors, *a, **k):
+            calls.append(len(tensors))
+            return real_stack(tensors, *a, **k)
+
+        import auto_round.algorithms.quantization.search_shard as shard_mod
+
+        with mock.patch.object(torch, "stack", side_effect=spy_stack), mock.patch.object(
+            shard_mod, "_probe_usable_bytes", return_value=2**40
+        ):
+            run_batched_wrap_search(fakes)
+        # 2**28 // (2 * 1024 * 128) = 1024 -> all 6 in one batch (probe cap 64 governs); then a huge probe
+        # with a small module count still takes the element cap path when modules are many:
+        self.assertTrue(all(c == 6 for c in calls))
+
     def test_kill_switch_disables(self):
         fakes = [FakeDeferred(seed=i) for i in range(3)]
         with mock.patch.object(search_shard.envs, "AR_DISABLE_SEARCH_SHARD", True):
