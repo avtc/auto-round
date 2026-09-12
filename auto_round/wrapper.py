@@ -850,7 +850,11 @@ def wrapper_block(
     from auto_round.algorithms.quantization import search_shard
 
     groups = search_shard.group_items_by_device(work, device_of=lambda it: _wrap_item_device(it[1], device))
-    if search_shard.shard_eligible(groups.keys()) and not search_shard.shard_disabled_by_env():
+    if (
+        search_shard.shard_eligible(groups.keys())
+        and search_shard.wrap_shard_enabled()
+        and not search_shard.shard_disabled_by_env()
+    ):
         outcomes = {}
 
         def _wrap_indexed(idx, item):

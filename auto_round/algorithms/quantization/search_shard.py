@@ -144,3 +144,19 @@ def log_engaged_once(label):
 def shard_disabled_by_env():
     """Kill switch for the per-device search sharding."""
     return bool(envs.AR_DISABLE_SEARCH_SHARD)
+
+
+def wrap_shard_enabled():
+    """Opt-in gate for threading the wrapper-time searches.
+
+    Measured on a 300B MoE block spanning 8 GPUs, threading the per-module
+    wrapper searches made the wrap phase SLOWER (+32 s per block). The
+    serialization mechanism is not yet profiled; torch.compile is NOT a wrap-
+    phase factor (compile_func only lazily binds the callable -- actual
+    compilation happens at each wrapper's first tune-loop call), so the
+    leading unmeasured candidates are GIL contention on the many short
+    python-dominated searches and allocator/dispatch contention. The
+    optimized-RTN iters=0 searches (fewer, much longer searches) measured
+    2.7x faster when threaded and stay enabled by default.
+    """
+    return bool(envs.AR_ENABLE_WRAP_SEARCH_SHARD)

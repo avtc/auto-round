@@ -251,6 +251,16 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
+### AR_ENABLE_WRAP_SEARCH_SHARD
+- **Description**: Opt-in parallel execution of the wrapper-time quantization searches (SignRoundV2 init-scale, GGUF DQ scale) across the devices hosting the sharded weights. Disabled by default: on blocks with many small per-module searches (e.g. 300B MoE blocks with 583 wrapped modules) the threaded wrap measured slower than the serial loop (+32 s per block); the exact serialization mechanism (leading candidates: GIL contention and allocator/dispatch contention; torch.compile is not a wrap-phase factor because compile_func only lazily binds the callable) is not yet profiled. The optimized-RTN iters=0 searches are not affected by this switch (their per-search cost is much larger and they shard by default when weights span multiple CUDA devices).
+- **Default**: `0` (serial wrapper searches)
+- **Valid Values**: `0` / `1`
+- **Usage**: Experiment switch for blocks whose wrapper searches are long enough to benefit from threading.
+
+```bash
+AR_ENABLE_WRAP_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
+```
+
 ### AR_RESUME_DIR
 - **Description**: When set to a directory path, the per-block tuning loop checkpoints its progress there after each completed block, and resumes from the first not-yet-completed block on a fresh run against the same directory -- instead of restarting the whole tuning pass from block 0 after a crash or kill.
 - **Default**: unset (no resumability)

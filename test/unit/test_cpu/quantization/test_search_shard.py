@@ -141,7 +141,9 @@ class TestWrapperBlockShard(unittest.TestCase):
         layers = [block.l0, block.l1]
         with mock.patch.object(
             wrapper_mod, "_wrap_item_device", side_effect=lambda m, device: f"cuda:{layers.index(m)}"
-        ), mock.patch.object(search_shard, "shard_eligible", return_value=True):
+        ), mock.patch.object(search_shard, "shard_eligible", return_value=True), mock.patch.object(
+            search_shard, "wrap_shard_enabled", return_value=True
+        ):
             q, u = wrapper_mod.wrapper_block(
                 block, False, False, enable_torch_compile=False, device="cpu", wrapper_cls=FakeWrapper
             )
@@ -171,6 +173,24 @@ class TestWrapperBlockShard(unittest.TestCase):
         self.assertEqual(engaged, [])  # never engaged on single-device blocks
         self.assertTrue(isinstance(block.l0, FakeWrapper))
 
+    def test_wrap_shard_off_by_default(self):
+        import auto_round.wrapper as wrapper_mod
+
+        class FakeWrapper(torch.nn.Module):
+            def __init__(self, layer, **kwargs):
+                super().__init__()
+                self.orig_layer = layer
+
+        block = self._fake_block()
+        layers = [block.l0, block.l1]
+        with mock.patch.object(
+            wrapper_mod, "_wrap_item_device", side_effect=lambda m, device: f"cuda:{layers.index(m)}"
+        ), mock.patch.object(search_shard, "shard_eligible", return_value=True):
+            q, u = wrapper_mod.wrapper_block(
+                block, False, False, enable_torch_compile=False, device="cpu", wrapper_cls=FakeWrapper
+            )
+        self.assertEqual(q, ["l0", "l1"])  # serial path: multi-device alone no longer threads the wrap
+
     def test_thread_exception_reraised(self):
         import auto_round.wrapper as wrapper_mod
 
@@ -183,7 +203,9 @@ class TestWrapperBlockShard(unittest.TestCase):
         layers = [block.l0, block.l1]
         with mock.patch.object(
             wrapper_mod, "_wrap_item_device", side_effect=lambda m, device: f"cuda:{layers.index(m)}"
-        ), mock.patch.object(search_shard, "shard_eligible", return_value=True):
+        ), mock.patch.object(search_shard, "shard_eligible", return_value=True), mock.patch.object(
+            search_shard, "wrap_shard_enabled", return_value=True
+        ):
             with self.assertRaisesRegex(ValueError, "search failed"):
                 wrapper_mod.wrapper_block(
                     block, False, False, enable_torch_compile=False, device="cpu", wrapper_cls=BadWrapper
