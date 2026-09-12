@@ -554,6 +554,12 @@ class SignRoundQuantizer(BaseQuantizer):
         _tune_perf = {"wrap": 0.0, "prepare": 0.0, "loop": 0.0, "tail": 0.0} if envs.AR_PERF_COUNTERS else None
         self._mb_perf = {"fwd": 0.0, "bwd": 0.0, "other": 0.0, "n": 0} if _tune_perf is not None else None
         _loop_perf = {"sampler": 0.0, "snap": 0.0, "step": 0.0} if _tune_perf is not None else None
+        # Snapshot placement: device-local duplicates shard with the wrappers on
+        # multi-device blocks (each device holds only its own slice), but a
+        # single-device low-gpu-mem run would park the WHOLE snapshot on the one
+        # device -- exactly the VRAM that mode exists to save (a 27B block adds
+        # ~1.7 GB fp32 on top of a ~22 GB peak). Host snapshot there.
+        _snap_local = (not self.compress_context.low_gpu_mem_usage) or len(device_manager.device_list) > 1
         _tp0 = _ptime.perf_counter()
         quantized_layer_names, unquantized_layer_names = self.wrapper_block(
             block,
@@ -776,7 +782,11 @@ class SignRoundQuantizer(BaseQuantizer):
                         best_params = (
                             tuning_cache.collect_best_params()
                             if tuning_cache is not None and tuning_cache.best is not None
-                            else collect_best_params_local(block)
+                            else (
+                                collect_best_params_local(block)
+                                if _snap_local
+                                else collect_best_params(block, self.compress_context.cache_device)
+                            )
                         )
                         if _loop_perf is not None:
                             _loop_perf["snap"] += _ptime.perf_counter() - _snap_t0
@@ -787,7 +797,11 @@ class SignRoundQuantizer(BaseQuantizer):
                     best_params = (
                         tuning_cache.collect_best_params()
                         if tuning_cache is not None and tuning_cache.best is not None
-                        else collect_best_params_local(block)
+                        else (
+                            collect_best_params_local(block)
+                            if _snap_local
+                            else collect_best_params(block, self.compress_context.cache_device)
+                        )
                     )
                     if _loop_perf is not None:
                         _loop_perf["snap"] += _ptime.perf_counter() - _snap_t0
