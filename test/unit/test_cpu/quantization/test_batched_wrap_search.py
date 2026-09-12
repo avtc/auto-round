@@ -322,6 +322,23 @@ class TestWorkerBucketKeys(unittest.TestCase):
             torch.device(k)  # the exact operation that crashed on the server
 
 
+class TestEagerUnwrap(unittest.TestCase):
+    def test_compiled_fn_unwraps_to_original(self):
+        import torch
+
+        def orig(x):
+            return x * 2
+
+        compiled = torch.compile(orig)
+        unwrapped = getattr(compiled, "_torchdynamo_orig_callable", None) or compiled
+        self.assertIs(unwrapped, orig)  # offloaded calls bypass the compiled wrapper
+        self.assertEqual(unwrapped(torch.ones(2)).sum().item(), 4.0)
+
+    def test_plain_fn_passes_through(self):
+        fn = lambda x: x  # noqa: E731
+        self.assertIs(getattr(fn, "_torchdynamo_orig_callable", None) or fn, fn)
+
+
 class TestKwargRelocation(unittest.TestCase):
     def test_non_tensors_and_cpu_scalars_untouched(self):
         from auto_round.algorithms.quantization.rtn.batched_search import _relocate_tensor_kwargs
