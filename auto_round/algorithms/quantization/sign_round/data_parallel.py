@@ -333,45 +333,28 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
 
         home_stages = accelerator_stage_devices(block)
         if len(home_stages) > 1:
-            # A block spanning several accelerator devices CAN still take the
-            # full-mirror lane when some device holds a whole mirror: the
-            # pre-mirror gather squashes the block onto the home device (the
-            # wrappers self-stage everything onto their tuning device, so the
-            # squash loses nothing). Device-mapped replicas are for blocks
-            # that do NOT fit a single device -- resolve them on disjoint
-            # sets only then.
-            full_mirror_viable = free is None or any(
-                dev != home_stages[0] and have is not None and have >= mirror_bytes + 2 * 2**30
-                for dev, have in free.items()
-            )
-            if full_mirror_viable:
-                plan = resolve_ddp_plan(
-                    world,
-                    home,
-                    global_batch_size,
-                    visible_cuda_devices=list(range(torch.cuda.device_count())) if free else None,
-                    explicit_devices=explicit or None,
-                    vram_free_bytes=free,
-                    mirror_footprint_bytes=mirror_bytes,
-                )
-            else:
-                mapped = resolve_mapped_ddp_plan(world, block, home_stages, free, batch_size=global_batch_size)
-                for note in mapped.notes:
-                    logger.info("[tune-ddp] %s", note)
-                if mapped.enabled:
-                    if log:
-                        logger.info(
-                            "[tune-ddp] engaged device-mapped replicas: world=%d x K=%d devices shard=%d",
-                            mapped.world,
-                            len(home_stages),
-                            mapped.shard_size,
-                        )
-                    quantizer._resolved_ddp_plan = mapped
-                    return mapped
-                # declined: fall through to the shared requirement check below
-                # so an explicitly requested world raises instead of silently
-                # degrading to serial (same semantics as the full-mirror lane)
-                plan = mapped
+            # An explicit device_map means the weights are sharded -- a block
+            # spanning several accelerator devices is the EXPECTED layout,
+            # not an anomaly to gather away. Such blocks cannot use
+            # single-device mirrors (they would squash the layout the user
+            # asked for); resolve device-mapped replicas on disjoint sets.
+            mapped = resolve_mapped_ddp_plan(world, block, home_stages, free, batch_size=global_batch_size)
+            for note in mapped.notes:
+                logger.info("[tune-ddp] %s", note)
+            if mapped.enabled:
+                if log:
+                    logger.info(
+                        "[tune-ddp] engaged device-mapped replicas: world=%d x K=%d devices shard=%d",
+                        mapped.world,
+                        len(home_stages),
+                        mapped.shard_size,
+                    )
+                quantizer._resolved_ddp_plan = mapped
+                return mapped
+            # declined: fall through to the shared requirement check below
+            # so an explicitly requested world raises instead of silently
+            # degrading to serial (same semantics as the full-mirror lane)
+            plan = mapped
         else:
             plan = resolve_ddp_plan(
                 world,
@@ -418,6 +401,21 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
     return plan
 
 
+def _strip_stage_hooks_(block) -> None:
+    """Remove accelerate dispatch hooks once a block sits on one device.
+
+    AlignDevicesHooks carry the execution devices of the layout they were
+    installed for; after a gather (or an ephemeral mirror's ``.to``) the
+    weights live elsewhere and the stale hook drags inputs back onto the old
+    device -- the first F.linear then sees input and weight on different
+    GPUs. A single-device block needs no staging at all (the wrappers
+    self-stage), so the hooks go.
+    """
+    from accelerate.hooks import remove_hook_from_submodules
+
+    remove_hook_from_submodules(block)
+
+
 def gather_block_for_mirroring_(block, home: torch.device) -> bool:
     """Gather a (possibly module-sharded) block whole onto ``home`` for DDP mirroring.
 
@@ -455,6 +453,9 @@ def gather_block_for_mirroring_(block, home: torch.device) -> bool:
             m.tuning_device = home
             moved = True
     _relocate_params(block, home)
+    # dispatch hooks staged the OLD spanning layout; on one device they
+    # would drag inputs back to stale stages -- strip them
+    _strip_stage_hooks_(block)
     return moved
 
 
@@ -966,6 +967,9 @@ def sharded_nograd_forward(
         else:
             m = copy.deepcopy(block).to(dev)
             _relocate_params(m, dev)
+            # inherited hooks still target the home's layout and would drag
+            # the staged inputs back onto it mid-forward
+            _strip_stage_hooks_(m)
             reps.append(m)
             mirrors.append(m)
     global _coll_mirror_setup_logged

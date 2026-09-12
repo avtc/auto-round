@@ -661,42 +661,18 @@ class TestComposerMappedDecline:
         assert _Q._resolved_ddp_plan is None  # the mock left the cache empty (first-block condition)
 
 
-class TestFullMirrorPreferred:
-    """A spanning block that FITS a single device takes the full-mirror lane.
+class TestSpanningAlwaysMapped:
+    """An explicit device_map shards the block's weights -- spanning blocks
+    always resolve device-mapped replicas.
 
-    The gather squashes the block onto the home device and the wrappers
-    self-stage (the proven path); mapped replicas are only for blocks that
-    do not fit a single device.
+    The one-block-at-a-time flow materializes a block from meta and the
+    device_map distributes ITS weights across GPUs (block + tune state
+    fit); the spanning layout is the requested condition, so even when a
+    single device happens to have room for a whole mirror, the plan still
+    reproduces the layout on disjoint sets instead of gathering it away.
     """
 
-    def test_spanning_fits_uses_full_mirror(self, monkeypatch, _autoround_log_propagate):
-        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
-        import auto_round.algorithms.quantization.sign_round.placement as placement
-
-        monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-        stages = [torch.device("cuda", 0), torch.device("cuda", 1)]
-        full_mirror = dp.DDPPlan(2, [torch.device("cuda", 0), torch.device("cuda", 4)], 4)
-        monkeypatch.setattr(dp, "resolve_ddp_plan", lambda *a, **k: full_mirror)
-        calls = []
-        monkeypatch.setattr(dp, "resolve_mapped_ddp_plan", lambda *a, **k: calls.append(1) or dp.DDPPlan(1, stages, 8))
-        monkeypatch.setattr(placement, "accelerator_stage_devices", lambda b: stages)
-
-        class _Q:
-            _resolved_ddp_plan = None
-            enable_lfq = False
-            gradient_accumulate_steps = 1
-            calibration_context = None
-
-        # probe failure -> free=None -> full mirror preferred, mapped never consulted
-        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda idx=0: (_ for _ in ()).throw(OSError("no probe")))
-        monkeypatch.setattr(dp, "_ENGAGED_LOGGED_SIG", None)  # engaged-path global
-        plan = dp.resolve_tune_ddp_plan_(
-            _Q(), FakeMoEBlock(), [torch.zeros(1)] * 8, None, torch.device("cuda", 0), world=2, log=True
-        )
-        assert plan.replica_devices is None and plan.world == 2
-        assert calls == []
-
-    def test_spanning_too_big_goes_mapped(self, monkeypatch, _autoround_log_propagate):
+    def test_spanning_with_ample_free_still_mapped(self, monkeypatch, _autoround_log_propagate):
         import auto_round.algorithms.quantization.sign_round.data_parallel as dp
         import auto_round.algorithms.quantization.sign_round.placement as placement
 
@@ -706,6 +682,10 @@ class TestFullMirrorPreferred:
         engaged = dp.DDPPlan(2, [torch.device("cuda", 0)], 4)
         engaged.replica_devices = [stages, [torch.device("cuda", 2), torch.device("cuda", 3)]]
         monkeypatch.setattr(dp, "resolve_mapped_ddp_plan", lambda *a, **k: engaged)
+        full_mirror_calls = []
+        monkeypatch.setattr(
+            dp, "resolve_ddp_plan", lambda *a, **k: full_mirror_calls.append(1) or dp.DDPPlan(1, stages, 8)
+        )
 
         class _Q:
             _resolved_ddp_plan = None
@@ -713,14 +693,16 @@ class TestFullMirrorPreferred:
             gradient_accumulate_steps = 1
             calibration_context = None
 
-        # every non-home device is starved: no full mirror fits -> mapped
-        monkeypatch.setattr(dp, "_ENGAGED_LOGGED_SIG", None)
-        free = {torch.device("cuda", i): 1024 for i in range(8)}
+        # every device has ample free VRAM -- a full mirror would fit; the
+        # spanning layout still maps
+        free = {torch.device("cuda", i): 2**40 for i in range(8)}
         monkeypatch.setattr(torch.cuda, "mem_get_info", lambda idx=0: (free[torch.device("cuda", idx)], 0))
+        monkeypatch.setattr(dp, "_ENGAGED_LOGGED_SIG", None)
         plan = dp.resolve_tune_ddp_plan_(
             _Q(), FakeMoEBlock(), [torch.zeros(1)] * 8, None, torch.device("cuda", 0), world=2, log=True
         )
-        assert plan.replica_devices is not None
+        assert plan.replica_devices is not None and plan.world == 2
+        assert full_mirror_calls == []  # never consulted for a spanning block
 
 
 class TestStageBoundaryHooks:
@@ -811,3 +793,32 @@ class TestInitScaleDevice:
         w.init_scale = torch.ones(8, 1, device="meta")  # already searched locally
         w._finalize_deferred_init(val=None)
         assert w.init_scale.device.type == "meta"
+
+
+class TestStageHookStrip:
+    """Stale dispatch hooks must go once a block sits on one device.
+
+    AlignDevicesHooks carry the execution devices of the layout they were
+    installed for; a gather or an ephemeral mirror's .to moves the weights
+    but not the hook targets, and the stale hook then drags inputs back
+    onto the old device mid-forward (observed on GPU: the sharded
+    collection's r=1 mirror met F.linear input@cuda:0 weight@cuda:1).
+    """
+
+    def test_gather_strips_hooks(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        calls = []
+        monkeypatch.setattr("accelerate.hooks.remove_hook_from_submodules", lambda b: calls.append(b))
+        block = torch.nn.Linear(4, 4)  # single-device: gather is a no-op move
+        moved = dp.gather_block_for_mirroring_(block, torch.device("cpu"))
+        assert calls == [block]  # strip runs even when nothing moved
+
+    def test_strip_helper_calls_the_library(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp
+
+        calls = []
+        monkeypatch.setattr("accelerate.hooks.remove_hook_from_submodules", lambda b: calls.append(b))
+        block = torch.nn.Linear(2, 2)
+        dp._strip_stage_hooks_(block)
+        assert calls == [block]
