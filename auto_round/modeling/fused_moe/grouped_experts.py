@@ -214,6 +214,44 @@ def _act_quant_is_row_independent(layer: nn.Module) -> bool:
     return True
 
 
+def _hooks_are_alignment_only(module: nn.Module) -> bool:
+    """Whether every hook on ``module`` is one the grouped path satisfies manually.
+
+    accelerate's ``AlignDevicesHook`` (mapped placement) and ``AddContiguousHook`` only
+    move/contiguify inputs -- the grouped path does both explicitly (``.to(plan.device)``
+    on the way in, contiguous ``index_select`` gathers). A hook that carries an offload
+    (``io_has_offload`` / weights_offload) still must run: it loads the weights, which the
+    grouped path reads directly. Calibration hooks (act_max collectors) are not alignment
+    hooks and remain a hard fallback so they keep firing.
+    """
+    hooks = list(module._forward_pre_hooks.values()) + list(module._forward_hooks.values())
+    if not hooks:
+        return True
+    hook_classes = []
+    try:
+        from accelerate.hooks import AlignDevicesHook
+
+        hook_classes.append(AlignDevicesHook)
+    except Exception:  # pragma: no cover - accelerate always present in our lanes
+        pass
+    try:  # newer accelerate only
+        from accelerate.hooks import AddContiguousHook
+
+        hook_classes.append(AddContiguousHook)
+    except Exception:
+        pass
+    if not hook_classes:
+        return False
+    for h in hooks:
+        if not isinstance(h, tuple(hook_classes)):
+            return False
+        # Offload-carrying variants (weights streaming in from host) must still run
+        # their own forward; alignment-only variants are satisfied manually.
+        if getattr(h, "offload", False) or getattr(h, "io_has_offload", False) or getattr(h, "weights_offload", None):
+            return False
+    return True
+
+
 def _projection_is_supported(layer: nn.Module) -> bool:
     if type(layer) is nn.Linear:
         # A plain Linear carrying forward (pre-)hooks must run its own forward so the hooks
@@ -221,15 +259,20 @@ def _projection_is_supported(layer: nn.Module) -> bool:
         # forward hook on each expert Linear, and the grouped path -- which multiplies the
         # weights directly and never calls ``Linear.forward`` -- would silently skip them,
         # leaving every expert without ``act_max`` (breaking static-act export, e.g. NVFP4).
-        if layer._forward_pre_hooks or layer._forward_hooks:
+        # Alignment-only accelerate hooks are exempt: the grouped path performs that exact
+        # move itself (mapped multi-GPU placement attaches them to off-primary experts).
+        if (layer._forward_pre_hooks or layer._forward_hooks) and not _hooks_are_alignment_only(layer):
             return False
         return True
     if not _is_wrapper_linear(layer):
         return False
+    # accelerate's stage hooks attach to the tree module -- the wrapper itself.
+    if (layer._forward_pre_hooks or layer._forward_hooks) and not _hooks_are_alignment_only(layer):
+        return False
     orig = layer.orig_layer
     if type(orig) is not nn.Linear:
         return False  # Conv1D / LinearAllreduce need their own forward
-    if orig._forward_pre_hooks or orig._forward_hooks:
+    if (orig._forward_pre_hooks or orig._forward_hooks) and not _hooks_are_alignment_only(orig):
         return False  # e.g. online Hadamard rotation must run per layer
     if getattr(layer, "enable_act_quant", False) and not _act_quant_is_row_independent(layer):
         return False
@@ -1084,50 +1127,78 @@ def _run_routes(
     if num_valid == 0:
         return torch.zeros_like(hidden_states)
 
-    plan = _build_plan(module, active_ids)
-    if plan is None:
-        return None
+    # Per-device plans: mapped placement spreads one layer's experts across GPUs; each
+    # home device gets its own plan and its own grouped GEMM over the same token/expert
+    # pair stream. (token, top_k) pairs are unique, so per-group index_copy into one
+    # shared buffer combines exactly, and the final sum(dim=1) is unchanged.
+    by_device: dict[torch.device, list[int]] = {}
+    for pos, expert_id in enumerate(active_ids):
+        expert = getattr(module, str(expert_id), None)
+        if expert is None or not hasattr(expert, "up_proj"):
+            _log_fallback_once("expert container missing")
+            return None
+        by_device.setdefault(_compute_device(expert.up_proj), []).append(pos)
+
+    plans = []
+    for positions in by_device.values():
+        plan = _build_plan(module, [active_ids[p] for p in positions])
+        if plan is None:
+            return None  # reason already logged; fall the whole layer back
+        plans.append((plan, positions))
 
     perm_valid = perm[:num_valid]
-    token_idx = torch.div(perm_valid, num_top_k, rounding_mode="floor")
-    x = hidden_states.index_select(0, token_idx).to(plan.device)
+    # Shared combine buffer on the input device: each group scatters its weighted rows.
+    out_per_sample = torch.zeros(num_pairs, hidden_dim, device=device, dtype=hidden_states.dtype)
 
-    offsets = torch.tensor(active_counts, device=plan.device, dtype=torch.int32).cumsum(0).to(torch.int32)
-
-    # --- input projections (gate / up) -------------------------------------------------
-    x = _quantize_activation(plan.experts[0].up_proj, x)
-
-    up = _slot_weights([e.up_proj for e in plan.experts], plan.batched_qdq.get("up_proj", False))
-    up_out = _grouped_linear(x, up, active_counts, offsets)
-
-    if plan.has_gate:
-        gate = _slot_weights([e.gate_proj for e in plan.experts], plan.batched_qdq.get("gate_proj", False))
-        gate_out = _grouped_linear(x, gate, active_counts, offsets)
-        if hasattr(module, "_apply_gate"):
-            # Keep the module's own gating (clamping, alpha, ...) and its [gate; up] layout,
-            # exactly as linear_loop_experts_forward does.
-            hidden = module._apply_gate(torch.cat([gate_out, up_out], dim=-1))
+    for plan, positions in plans:
+        counts = [active_counts[p] for p in positions]
+        if len(positions) == len(active_ids):
+            perm_g = perm_valid  # single group: today's exact path
         else:
-            hidden = module.act_fn(gate_out) * up_out
-    else:
-        hidden = module.act_fn(up_out)
+            ranges = []
+            start = 0
+            for c in active_counts:
+                ranges.append((start, start + c))
+                start += c
+            perm_g = torch.cat([perm_valid[ranges[p][0] : ranges[p][1]] for p in positions])
+        token_idx = torch.div(perm_g, num_top_k, rounding_mode="floor")
+        x = hidden_states.index_select(0, token_idx).to(plan.device)
 
-    # --- down projection ---------------------------------------------------------------
-    hidden = _quantize_activation(plan.experts[0].down_proj, hidden)
-    down = _slot_weights([e.down_proj for e in plan.experts], plan.batched_qdq.get("down_proj", False))
-    out = _grouped_linear(hidden, down, active_counts, offsets)
+        offsets = torch.tensor(counts, device=plan.device, dtype=torch.int32).cumsum(0).to(torch.int32)
 
-    out = out.to(plan.output_device)
-    # ``sample_weights``/``perm_valid`` live on the input device, which can differ from the
-    # experts' device in multi-GPU tuning (a whole layer's experts co-located on one card
-    # while the block input flows on another). Align to ``out`` before the multiply.
-    sample_weights_out = sample_weights.index_select(0, perm_valid).to(device=out.device, dtype=out.dtype)
-    out = out * sample_weights_out.unsqueeze(-1)
+        # --- input projections (gate / up) ---------------------------------------------
+        x = _quantize_activation(plan.experts[0].up_proj, x)
 
-    # Scatter back to the original (token, top_k) order and reduce over top_k.
-    out_per_sample = torch.zeros(num_pairs, hidden_dim, device=out.device, dtype=out.dtype)
-    out_per_sample = out_per_sample.index_copy(0, perm_valid.to(out.device), out)
-    return out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1).to(device)
+        up = _slot_weights([e.up_proj for e in plan.experts], plan.batched_qdq.get("up_proj", False))
+        up_out = _grouped_linear(x, up, counts, offsets)
+
+        if plan.has_gate:
+            gate = _slot_weights([e.gate_proj for e in plan.experts], plan.batched_qdq.get("gate_proj", False))
+            gate_out = _grouped_linear(x, gate, counts, offsets)
+            if hasattr(module, "_apply_gate"):
+                # Keep the module's own gating (clamping, alpha, ...) and its [gate; up] layout,
+                # exactly as linear_loop_experts_forward does.
+                hidden = module._apply_gate(torch.cat([gate_out, up_out], dim=-1))
+            else:
+                hidden = module.act_fn(gate_out) * up_out
+        else:
+            hidden = module.act_fn(up_out)
+
+        # --- down projection -------------------------------------------------------------
+        hidden = _quantize_activation(plan.experts[0].down_proj, hidden)
+        down = _slot_weights([e.down_proj for e in plan.experts], plan.batched_qdq.get("down_proj", False))
+        out = _grouped_linear(hidden, down, counts, offsets)
+
+        out = out.to(plan.output_device)
+        # ``sample_weights``/``perm_g`` live on the input device, which can differ from the
+        # experts' device in multi-GPU tuning. Align to ``out`` before the multiply.
+        sample_weights_out = sample_weights.index_select(0, perm_g).to(device=out.device, dtype=out.dtype)
+        out = out * sample_weights_out.unsqueeze(-1)
+
+        # Scatter this group's rows into the shared (token, top_k) buffer.
+        out_per_sample.index_copy_(0, perm_g.to(device), out.to(device))
+
+    return out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
 
 
 def _opaque_to_dynamo(fn):
