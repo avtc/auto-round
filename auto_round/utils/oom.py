@@ -97,7 +97,28 @@ def _is_census_noise(ref, skip_ids):
         return True
     if isinstance(ref, (list, tuple, set)) and len(ref) > 4096:
         return True  # heap snapshots and other scans, never real holders
+    if isinstance(ref, dict) and ref:
+        for k in list(ref.keys())[:3]:
+            if isinstance(k, tuple) and len(k) == 3 and all(isinstance(x, str) for x in k):
+                return True  # the census's own representative dicts
     return False
+
+
+def _describe_frame(frame, target):
+    """Frame as '<func> (<file>:<line>)' plus the local names holding target."""
+    try:
+        code = frame.f_code
+        where = f"{code.co_name} ({code.co_filename.split('/')[-1]}:{frame.f_lineno})"
+        names = []
+        for k, v in list(frame.f_locals.items())[:80]:
+            try:
+                if v is target or (isinstance(v, list) and len(v) <= 4096 and target in v):
+                    names.append(str(k))
+            except Exception:
+                continue
+        return where + (f" locals:{','.join(names[:4])}" if names else "")
+    except Exception:
+        return "frame"
 
 
 def _attr_name_of(owner, target):
@@ -115,10 +136,16 @@ def _attr_name_of(owner, target):
 
 def _describe(obj, depth=0):
     """One-line description of a holder object."""
+    import types
+
     t = type(obj)
     if t is dict:
         keys = [str(k) for k in list(obj.keys())[:3]]
         return f"dict[{','.join(keys)}]"
+    if t is types.FrameType:
+        return "frame"
+    if t is types.GeneratorType:
+        return "generator"
     if t in (list, tuple, set):
         return f"{t.__name__}(len={len(obj)})"
     name = getattr(obj, "__class__", t).__name__
@@ -134,6 +161,13 @@ def _describe_referrers(tensor, skip_ids, limit=6, depth=0):
     try:
         for ref in _gc.get_referrers(tensor):
             if _is_census_noise(ref, skip_ids):
+                continue
+            import types as _types
+
+            if isinstance(ref, _types.FrameType):
+                out.append(_describe_frame(ref, tensor))
+                if len(out) >= limit:
+                    break
                 continue
             desc = _describe(ref)
             attr = _attr_name_of(ref, tensor) if depth == 0 else None
