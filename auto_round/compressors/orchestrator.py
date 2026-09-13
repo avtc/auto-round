@@ -442,6 +442,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             # devices the math runs on GPU (~2.3ms/module) and the packed
             # artifacts land on host by construction (qweight/qzeros are .to(
             # "cpu") in the packers), so VRAM pressure stays one-module-sized.
+            _pack_call = 0.0
+            _pack_scaffold = 0.0
+            _t_loop = time.perf_counter()
             if self.compress_context.is_immediate_packing:
                 for _n, _mod in m.named_modules():
                     if hasattr(_mod, "bits") and check_to_quantized(_mod):
@@ -452,7 +455,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                             module_name = f"{n}.{_n}"
                         if module_name is None:
                             continue
+                        _pack_scaffold += time.perf_counter() - _t_loop
+                        _t_call = time.perf_counter()
                         _immediate_pack(module_name, self.layer_config)
+                        _pack_call += time.perf_counter() - _t_call
+                        _t_loop = time.perf_counter()
+            _pack_scaffold += time.perf_counter() - _t_loop
             _marks["post.pack"] = time.perf_counter()
 
             mv_module_from_gpu(m)
@@ -525,7 +533,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     if _pp["count"]:
                         _pack_note = (
                             f" | pack[{_pp['count']} mods: ctor={_pp['ctor']:.2f}s"
-                            f" pack={_pp['pack']:.2f}s moves={_pp['moves']:.2f}s]"
+                            f" pack={_pp['pack']:.2f}s moves={_pp['moves']:.2f}s"
+                            f" call={_pack_call:.2f}s scaffold={_pack_scaffold:.2f}s]"
                         )
                         for _k in _pp:
                             _pp[_k] = 0.0
