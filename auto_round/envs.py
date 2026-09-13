@@ -76,6 +76,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # re-quantization). Unset = upstream behavior (cpu). Set to e.g. "cuda:0"
     # to run the whole pass on GPU -- see el_requantize_blocks.py.
     "AR_CALIB_STREAM_DEVICE": lambda: os.getenv("AR_CALIB_STREAM_DEVICE", None),
+    # Block calibration output-pool placement (auto_round.utils.pool_placement):
+    # "auto" (default) keeps everything on the primary cache device when it fits
+    # and spreads chunks over free GPUs when it does not; "off" keeps today's
+    # behavior; an explicit csv ("cuda:1,cuda:2") pins the shard targets. Never
+    # falls back to CPU silently -- that is low_gpu_mem_usage's job.
+    "AR_POOL_SHARD": lambda: os.getenv("AR_POOL_SHARD", "auto"),
+    # Primary headroom reserved for the forward working set + fragmentation
+    # before a pool is considered to fit (census-calibrated default 6 GiB).
+    "AR_POOL_SHARD_MARGIN_GB": lambda: os.getenv("AR_POOL_SHARD_MARGIN_GB", None),
     "AR_ACT_SCALE": lambda: float(os.getenv("AR_ACT_SCALE", "1.0")),
     "AR_ENABLE_ACT_MINMAX_TUNING": lambda: os.getenv("AR_ENABLE_ACT_MINMAX_TUNING", "0").lower()
     in ("1", "true", "yes"),

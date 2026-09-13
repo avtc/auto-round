@@ -192,6 +192,10 @@ class BlockForwardRunner:
             Normalized output tensor on ``cache_device`` (or ``self.cache_device``).
         """
         out_device = cache_device if cache_device is not None else self.cache_device
+        # Per-chunk output placement (AR_POOL_SHARD): only in list mode (indices is
+        # None -- the cat at the end of indices-mode requires same-device outputs)
+        # and only when the caller did not pin a device for this call.
+        placement = getattr(self, "pool_placement", None) if cache_device is None and indices is None else None
         is_returned_list = True
         if indices is not None:
             is_returned_list = False
@@ -233,7 +237,11 @@ class BlockForwardRunner:
                     for key, value in batch_output_dict.items():
                         output_dict.setdefault(key, []).append(value.to(out_device))
                 output = [output]
-            outputs.extend(item.to(out_device) for item in output)
+            if placement is not None:
+                base = len(outputs)
+                outputs.extend(item.to(placement.device_for_index(base + j)) for j, item in enumerate(output))
+            else:
+                outputs.extend(item.to(out_device) for item in output)
             del raw_output, batch_output_dict, output, batch_inputs, batch_others
 
         if not outputs:

@@ -173,6 +173,27 @@ class CompressionOrchestrator(BaseOrchestrator):
             first_input_name=first_input_name,
         )
 
+    def _attach_pool_placement(self, input_ids) -> None:
+        """Resolve AR_POOL_SHARD placement for the upcoming block and attach it.
+
+        No-op (placement cleared) whenever the policy is off, the lane is
+        CPU-parked (low_gpu_mem_usage), or the pool fits the primary device.
+        """
+        runner = getattr(self.alg_composer, "block_forward", None)
+        if runner is None:  # pragma: no cover - defensive
+            return
+        try:
+            from auto_round.utils.device_manager import device_manager
+            from auto_round.utils.pool_placement import resolve_placement_for_pool
+
+            chains = 2 if self.alg_composer.need_quanted_input() else 1
+            placement = resolve_placement_for_pool(
+                input_ids, chains, str(self.compress_context.cache_device), device_manager.device_list
+            )
+        except Exception:  # pragma: no cover - placement must never break quantization
+            placement = None
+        runner.pool_placement = placement
+
     def _quantize_blocks(
         self,
         model: torch.nn.Module,
@@ -293,6 +314,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                 pbar=pbar,
                 block_cnt=(len(block_names) + nblocks - 1) // nblocks,
             )
+
+            # ── Infrastructure: output-pool placement (AR_POOL_SHARD) ─────────
+            # Decide where this block's calibration output pool will live: on the
+            # primary cache device when it fits (today's behavior, zero peer
+            # traffic), or sharded across free GPUs when it does not. Placement is
+            # pure memory behavior -- chunk values are bit-identical.
+            self._attach_pool_placement(input_ids)
 
             # ── Run block pipeline (calibration → quantization → collection) ──
             new_q_input, reference_output = self.alg_composer.compress_block(
@@ -773,6 +801,11 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         pbar.set_description("Quantizing done")
         pbar.close()
+        # Pool placement is per-block: clear it so later forwards (outside-block
+        # layers, lm_head) keep today's cache-device behavior.
+        runner = getattr(self.alg_composer, "block_forward", None)
+        if runner is not None:
+            runner.pool_placement = None
         if self.compress_context.low_cpu_mem_usage:
             if envs.AR_RESUME_DIR and not self.compress_context.is_immediate_saving:
                 # `reload(names=None)` only reloads names in
