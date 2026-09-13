@@ -15,6 +15,7 @@
 import copy
 import functools
 import inspect
+import time
 import json
 import os
 from dataclasses import fields
@@ -140,6 +141,11 @@ def pack_qact_layer(name, model):
     qlayer.to(device)
 
 
+# Per-phase pack accounting (read by the orchestrator's AR_PERF_COUNTERS
+# summary): buffer allocation vs pack math vs device round trips.
+PACK_PHASES = {"ctor": 0.0, "pack": 0.0, "moves": 0.0, "count": 0}
+
+
 def pack_layer(layer_name, model, backend, device=None):
     """
     Packs a model layer for quantization based on its type and configuration.
@@ -203,6 +209,7 @@ def pack_layer(layer_name, model, backend, device=None):
         out_features = layer.weight.shape[1]
     bias = layer.bias is not None
 
+    _t_ctor = time.perf_counter()
     new_layer = QuantLinear(  ##pylint: disable=E1123
         bits, group_size, in_features, out_features, bias=bias, weight_dtype=layer.weight.dtype
     )
@@ -210,6 +217,8 @@ def pack_layer(layer_name, model, backend, device=None):
     set_module(model, layer_name, new_layer)
     qlayer = new_layer
     import auto_round_extension.torch.qlinear_torch
+    PACK_PHASES["ctor"] += time.perf_counter() - _t_ctor
+    PACK_PHASES["count"] += 1
 
     if (
         sym
@@ -218,6 +227,7 @@ def pack_layer(layer_name, model, backend, device=None):
     ):
         zp = int(zp.flatten()[0])
 
+    _t_pack = time.perf_counter()
     qlayer.to("cpu")
     # Force to float32 to be compatible with torch 2.0
     sig = inspect.signature(qlayer.pack)
@@ -226,7 +236,10 @@ def pack_layer(layer_name, model, backend, device=None):
         qlayer.pack(layer, scale, device=device)
     else:
         qlayer.pack(layer, scale, zp, None, device=device)
+    PACK_PHASES["pack"] += time.perf_counter() - _t_pack
+    _t_mv = time.perf_counter()
     qlayer.to(orig_device)
+    PACK_PHASES["moves"] += time.perf_counter() - _t_mv
 
     # Inject rotation buffers right after packing so that
     # ShardWriter.save_module() captures them before offloading to meta.

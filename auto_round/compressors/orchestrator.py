@@ -518,11 +518,25 @@ class CompressionOrchestrator(BaseOrchestrator):
                 for _k in _order[1:]:
                     _parts.append(f"{_k.rsplit('.', 1)[-1]}={_marks[_k] - _prev:.2f}s")
                     _prev = _marks[_k]
+                _pack_note = ""
+                try:
+                    from auto_round.export.export_to_autoround.export import PACK_PHASES as _pp
+
+                    if _pp["count"]:
+                        _pack_note = (
+                            f" | pack[{_pp['count']} mods: ctor={_pp['ctor']:.2f}s"
+                            f" pack={_pp['pack']:.2f}s moves={_pp['moves']:.2f}s]"
+                        )
+                        for _k in _pp:
+                            _pp[_k] = 0.0
+                except Exception as e:  # pragma: no cover - diagnostics only
+                    logger.warning("pack phase accounting unavailable (%s)", e)
                 logger.info(
-                    "[perf] block %s phases: %s total=%.2fs",
+                    "[perf] block %s phases: %s total=%.2fs%s",
                     n,
                     " ".join(_parts),
                     _marks["post.write"] - _marks["reload"],
+                    _pack_note,
                 )
         if pbar is not None:
             pbar.update(1)
