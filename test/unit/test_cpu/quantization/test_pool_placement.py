@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for AR_POOL_SHARD output-pool placement (pure policy + runner routing).
+"""Unit tests for AR_CALIBRATION_DATA_DEVICE calibration-data placement (policy + routing).
 
 No CUDA required: free-memory probing and device candidates are injected, and the
 BlockForwardRunner integration uses meta/cpu device targets to observe routing.
@@ -63,11 +63,27 @@ class TestResolvePoolPlacement(unittest.TestCase):
     def _resolve(self, mode="auto", free=None, pool=1 * GB, margin=2 * GB, primary="cuda:0", candidates=None):
         free = free if free is not None else {"cuda:0": 20 * self.GB}
         candidates = candidates if candidates is not None else ["cuda:0", "cuda:1", "cuda:2"]
-        with mock.patch.object(pp.envs, "AR_POOL_SHARD", mode):
+        with mock.patch.object(pp.envs, "AR_CALIBRATION_DATA_DEVICE", mode):
             return pp.resolve_pool_placement(pool, 128, primary, margin, candidates, _fake_probe(free))
 
     def test_off_env_returns_none(self):
         self.assertIsNone(self._resolve(mode="off"))
+
+    def test_cpu_mode_parks_on_host(self):
+        plan = self._resolve(mode="cpu")
+        self.assertEqual(plan.devices, ["cpu"])
+        self.assertEqual(plan.counts(), {"cpu": 128})
+
+    def test_need_estimator_floor_and_growth(self):
+        floor = pp.placement_need_bytes(None, None, 8)
+        self.assertGreaterEqual(floor, int(0.5 * 2**30))
+        with mock.patch(
+            "auto_round.utils.device.estimate_tuning_block_mem",
+            return_value=({}, 3.0, 4.0, 5.0),
+        ):
+            need = pp.placement_need_bytes(object(), [], 8)
+        # layer_activation(3.0) + additional(5.0) GiB + 0.5 GiB reserve
+        self.assertEqual(need, int(8.5 * 2**30))
 
     def test_cpu_primary_returns_none(self):
         self.assertIsNone(self._resolve(primary="cpu"))

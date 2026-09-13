@@ -12,24 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-chunk output placement for block calibration pools (``AR_POOL_SHARD``).
+"""Per-chunk device placement for block calibration data (``AR_CALIBRATION_DATA_DEVICE``).
 
 Policy (user rulings, Sep-13):
 
-* primary-first: when the pool fits the primary cache device (free minus a
-  working-set margin), every chunk stays there -- byte-identical to today's
-  behavior, zero peer traffic.
-* otherwise shard: chunks are spread over the candidate devices proportionally
-  to free capacity (the primary included), and consumed chunk-wise by the
-  existing per-batch ``.to(compute_device)`` in the block forward path.
-* never silently fall back to CPU: CPU parking is ``low_gpu_mem_usage``'s job.
-  When sharding cannot help either, ``None`` is returned so the caller keeps
+* primary-first: when the block input/output pools fit the primary cache device
+  (free minus the estimated forward working set minus a flat 0.5 GiB allocator
+  reserve), every chunk stays there -- byte-identical to today's behavior, zero
+  peer traffic. The working-set estimate reuses the same per-block accounting
+  the streaming branch's block placement used (``estimate_tuning_block_mem``:
+  ``layer_activation_memory + additional_memory``), computed from each block's
+  own module tree, never from the previous block.
+* otherwise shard: chunks spread over the candidate devices proportionally to
+  free capacity (the primary included), and are consumed chunk-wise by the
+  existing per-batch ``.to(compute_device)`` in the block forward path, so only
+  the at-rest placement changes.
+* ``cpu`` mode parks the pools on host RAM explicitly (forwards still run on
+  the GPUs) -- the pool-scoped equivalent of ``low_gpu_mem_usage`` without its
+  other side effects. ``auto`` never falls back to CPU silently: when sharding
+  cannot hold the pools either, ``None`` is returned so the caller keeps
   today's behavior and the genuine OOM fires (with the census diagnostics).
 
-``AR_POOL_SHARD``: ``auto`` (default) | ``off`` | explicit csv (``cuda:1,cuda:2``).
-``AR_POOL_SHARD_MARGIN_GB``: primary headroom reserved for the forward working
-set + fragmentation (default 6 GiB, census-calibrated: ~4.6 GiB linear-loop
-working set + ~2.3 GiB reserved-unallocated observed at the block-2 wall).
+``AR_CALIBRATION_DATA_DEVICE``: ``auto`` (default) | ``off`` | ``cpu`` |
+explicit csv (``cuda:1,cuda:2``). Pinned by the same-name CLI argument.
 """
 
 from typing import Callable, List, Optional, Sequence
@@ -123,19 +128,25 @@ def resolve_pool_placement(
     pool_bytes: int,
     n_chunks: int,
     primary: str,
-    margin_bytes: int,
+    need_bytes: int,
     candidate_devices: Sequence[str],
     free_probe: Callable[[str], Optional[int]],
 ) -> Optional[PoolPlacement]:
     """Decide per-chunk output placement for a calibration pool.
 
+    ``need_bytes`` is the primary's own forward working-set demand (estimated
+    per block via :func:`placement_need_bytes`); the pool must fit in
+    ``free(primary) - need_bytes`` to stay primary-resident.
+
     Returns ``None`` when the caller should keep today's behavior (policy off,
     CPU-parked lane, or sharding cannot hold the pool -- the genuine OOM then
     fires loudly per the no-silent-CPU ruling).
     """
-    mode = (envs.AR_POOL_SHARD or "auto").strip().lower()
+    mode = (envs.AR_CALIBRATION_DATA_DEVICE or "auto").strip().lower()
     if mode == "off":
         return None
+    if mode == "cpu":
+        return PoolPlacement(["cpu"], [1], n_chunks)  # explicit host-RAM parking
     if str(primary).startswith("cpu"):
         return None  # low_gpu_mem_usage (or a CPU lane) owns placement here
     forced = None
@@ -161,55 +172,57 @@ def resolve_pool_placement(
         return None
 
     primary_free = dict(usable).get(str(primary), 0)
-    if primary_free - margin_bytes >= pool_bytes:
+    if primary_free - need_bytes >= pool_bytes:
         # primary-first: identical to today's behavior, zero peer traffic
-        return PoolPlacement([str(primary)], [max(primary_free - margin_bytes, 1)], n_chunks)
+        return PoolPlacement([str(primary)], [max(primary_free - need_bytes, 1)], n_chunks)
 
     total = sum(f for _, f in usable)
-    if total - margin_bytes < pool_bytes:
+    if total - need_bytes < pool_bytes:
         return None  # sharding cannot help either: keep today's behavior, real OOM fires
 
-    # capacity-aware sharding: subtract the working-set margin from the primary only
+    # capacity-aware sharding: subtract the working-set need from the primary only
     devices = [d for d, _ in usable]
-    capacities = [max(f - margin_bytes, 1) if d == str(primary) else f for d, f in usable]
+    capacities = [max(f - need_bytes, 1) if d == str(primary) else f for d, f in usable]
     return PoolPlacement(devices, capacities, n_chunks)
 
 
-def pool_shard_margin_bytes() -> int:
-    """Primary-headroom margin for the forward working set + fragmentation."""
+_RESERVE_BYTES = int(0.5 * 2**30)  # flat allocator reserve (24 GiB-class cards)
+
+
+def placement_need_bytes(block, pool, batch_size: int) -> int:
+    """Primary working-set need: the streaming branch's per-block accounting.
+
+    Ports the card-0 accounting of ``set_auto_device_map_for_block_with_tuning``
+    (mapped-placement era): ``layer_activation_memory + additional_memory`` from
+    ``estimate_tuning_block_mem``, computed from THIS block's module tree (never
+    the previous block's measurements), plus a flat 0.5 GiB allocator reserve.
+    """
+    if block is None:
+        return _RESERVE_BYTES
     try:
-        gb = float(getattr(envs, "AR_POOL_SHARD_MARGIN_GB", None) or 6.0)
-    except (TypeError, ValueError):
-        gb = 6.0
-    return int(gb * 2**30)
+        from auto_round.utils.device import estimate_tuning_block_mem
 
-
-_SHARD_ENGAGED_LOGGED = set()
-
-
-def _log_engaged_once(plan: PoolPlacement, pool_bytes: int, primary: str) -> None:
-    key = repr(plan)
-    if key in _SHARD_ENGAGED_LOGGED:
-        return
-    _SHARD_ENGAGED_LOGGED.add(key)
-    logger.info(
-        "[pool-shard] output pool (%.2fGiB x%d chunks) does not fit %s; spreading %s",
-        pool_bytes / 2**30,
-        len(plan.plan),
-        primary,
-        plan.counts(),
-    )
+        _, layer_activation_memory, _, additional_memory = estimate_tuning_block_mem(block, pool, batch_size)
+        return int((layer_activation_memory + additional_memory) * 2**30) + _RESERVE_BYTES
+    except Exception:  # pragma: no cover - placement must never break quantization
+        return _RESERVE_BYTES
 
 
 def resolve_placement_for_pool(
-    pool, chains: int, primary: str, candidate_devices: Sequence[str]
+    pool,
+    chains: int,
+    primary: str,
+    candidate_devices: Sequence[str],
+    block=None,
+    batch_size: int = 8,
 ) -> Optional[PoolPlacement]:
     """Resolve placement from a live pool object (orchestrator entry point).
 
     ``primary`` must be the lane's actual cache device: a CPU primary
     (``low_gpu_mem_usage``) deactivates the policy so the two mechanisms never
     fight. ``chains`` doubles the byte demand when a second (quantized-input)
-    pool of the same size will also be produced for the block.
+    pool of the same size will also be produced for the block. ``block`` feeds
+    the per-block working-set estimate.
     """
     from auto_round.algorithms.quantization.search_shard import _probe_usable_bytes
 
@@ -218,17 +231,21 @@ def resolve_placement_for_pool(
     if n_chunks <= 0 or pool_bytes <= 0:
         return None
     try:
-        free_probe = _probe_usable_bytes
         plan = resolve_pool_placement(
             pool_bytes,
             n_chunks,
             primary,
-            pool_shard_margin_bytes(),
+            placement_need_bytes(block, pool, batch_size),
             candidate_devices,
-            free_probe,
+            _probe_usable_bytes,
         )
     except Exception:  # pragma: no cover - placement must never break quantization
         return None
-    if plan is not None and len(plan.devices) > 1:
-        _log_engaged_once(plan, pool_bytes, primary)
+    if plan is not None:
+        logger.debug(
+            "[calib-data-device] pool %.2fGiB x%d chunks -> %s",
+            pool_bytes / 2**30,
+            n_chunks,
+            plan.counts(),
+        )
     return plan

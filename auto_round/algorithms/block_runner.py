@@ -192,7 +192,7 @@ class BlockForwardRunner:
             Normalized output tensor on ``cache_device`` (or ``self.cache_device``).
         """
         out_device = cache_device if cache_device is not None else self.cache_device
-        # Per-chunk output placement (AR_POOL_SHARD): only in list mode (indices is
+        # Per-chunk calibration-data placement (AR_CALIBRATION_DATA_DEVICE): list mode (indices is
         # None -- the cat at the end of indices-mode requires same-device outputs)
         # and only when the caller did not pin a device for this call.
         placement = getattr(self, "pool_placement", None) if cache_device is None and indices is None else None

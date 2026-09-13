@@ -173,8 +173,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             first_input_name=first_input_name,
         )
 
-    def _attach_pool_placement(self, input_ids) -> None:
-        """Resolve AR_POOL_SHARD placement for the upcoming block and attach it.
+    def _attach_pool_placement(self, block, input_ids) -> None:
+        """Resolve calibration-data placement for the upcoming block and attach it.
 
         No-op (placement cleared) whenever the policy is off, the lane is
         CPU-parked (low_gpu_mem_usage), or the pool fits the primary device.
@@ -188,7 +188,12 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             chains = 2 if self.alg_composer.need_quanted_input() else 1
             placement = resolve_placement_for_pool(
-                input_ids, chains, str(self.compress_context.cache_device), device_manager.device_list
+                input_ids,
+                chains,
+                str(self.compress_context.cache_device),
+                device_manager.device_list,
+                block=block,
+                batch_size=self.calibration_context.batch_size,
             )
         except Exception:  # pragma: no cover - placement must never break quantization
             placement = None
@@ -315,12 +320,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block_cnt=(len(block_names) + nblocks - 1) // nblocks,
             )
 
-            # ── Infrastructure: output-pool placement (AR_POOL_SHARD) ─────────
+            # ── Infrastructure: calibration-data placement (AR_CALIBRATION_DATA_DEVICE)
             # Decide where this block's calibration output pool will live: on the
             # primary cache device when it fits (today's behavior, zero peer
             # traffic), or sharded across free GPUs when it does not. Placement is
             # pure memory behavior -- chunk values are bit-identical.
-            self._attach_pool_placement(input_ids)
+            self._attach_pool_placement(m, input_ids)
 
             # ── Run block pipeline (calibration → quantization → collection) ──
             new_q_input, reference_output = self.alg_composer.compress_block(

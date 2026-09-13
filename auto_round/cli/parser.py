@@ -157,6 +157,15 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         "--low_gpu_mem_usage", action="store_true", help="Enable memory-efficient mode by offloading features to CPU."
     )
     rt.add_argument(
+        "--calibration_data_device",
+        default=None,
+        type=str,
+        help="Device placement for block calibration data (inputs/outputs between blocks): "
+        "'auto' (default) keeps the pools on the primary cache device when they fit and spreads "
+        "chunks over free GPUs otherwise; 'cpu' parks them on host RAM; 'off' keeps the "
+        "single-device behavior; or an explicit csv list like 'cuda:1,cuda:2'.",
+    )
+    rt.add_argument(
         "--low_cpu_mem_usage",
         action="store_true",
         help="Deprecated compatibility flag. Low CPU memory mode is enabled by default.",
