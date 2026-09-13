@@ -35,19 +35,21 @@ import torch
 from auto_round.logger import logger
 
 
+def _shape_key(shape) -> tuple:
+    """Shape as a hashable key; symbolic dims (SymInt) fall back to a string form."""
+    try:
+        return tuple(int(d) for d in shape)
+    except Exception as e:  # symbolic dims (SymInt) or exotic shapes: stringify
+        logger.debug("[oom] census shape key fell back to str for %s (%s)", type(shape).__name__, e)
+        return (str(tuple(shape)),)
+
+
 def _group_tensors_by_shape(objs) -> tuple:
     """(device, dtype, shape) -> [count, bytes] over accelerator tensors; sorted by bytes.
 
     Covers every non-cpu accelerator (cuda, hpu, xpu, mps, ...): the census
     must name the residents on whichever device ran out.
     """
-
-    def _shape_key(shape) -> tuple:
-        try:
-            return tuple(int(d) for d in shape)
-        except Exception as e:  # symbolic dims (SymInt) or exotic shapes: stringify
-            logger.debug("[oom] census shape key fell back to str for %s (%s)", type(shape).__name__, e)
-            return (str(tuple(shape)),)
 
     skipped = 0
 
@@ -79,7 +81,7 @@ def _representatives(groups, objs):
         try:
             if not isinstance(obj, torch.Tensor) or obj.device.type in ("cpu", "meta"):
                 continue
-            key = (str(obj.device), str(obj.dtype), _shape_key_public(obj.shape))
+            key = (str(obj.device), str(obj.dtype), _shape_key(obj.shape))
         except Exception as e:
             logger.debug("[oom] census representative scan skipped a tensor (%s)", e)
             continue
@@ -88,14 +90,6 @@ def _representatives(groups, objs):
     for gk, meta in groups:
         if gk in seen:
             yield seen[gk], (gk, meta)
-
-
-def _shape_key_public(shape):
-    try:
-        return tuple(int(d) for d in shape)
-    except Exception as e:
-        logger.debug("[oom] census public shape key fell back to str (%s)", e)
-        return (str(tuple(shape)),)
 
 
 def _is_census_noise(ref, skip_ids):
@@ -218,6 +212,7 @@ def dump_oom_tensor_census_(context: str = "") -> None:
 
 
 def _dump_census(gc):
+    idx = "?"  # bound before the loop so the handler below can always name it
     try:
         try:
             for idx in range(torch.cuda.device_count()):

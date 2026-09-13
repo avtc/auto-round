@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for AR_CALIBRATION_DATA_DEVICE calibration-data placement (policy + routing).
+"""Unit tests for --calibration_data_device calibration-data placement (policy + routing).
 
 No CUDA required: free-memory probing and device candidates are injected, and the
 BlockForwardRunner integration uses meta/cpu device targets to observe routing.
@@ -230,7 +230,7 @@ class TestConsolidate(unittest.TestCase):
         return (
             mock.patch.object(pp, "placement_need_bytes", return_value=int(need_gib * 2**30)),
             mock.patch(
-                "auto_round.algorithms.quantization.search_dispatch._probe_usable_bytes",
+                "auto_round.utils.device.probe_usable_bytes",
                 return_value=int(free_gib * 2**30),
             ),
         )

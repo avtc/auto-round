@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-chunk device placement for block calibration data (``AR_CALIBRATION_DATA_DEVICE``).
+"""Per-chunk device placement for block calibration data (--calibration_data_device).
 
 Policy (user rulings, Sep-13):
 
@@ -33,8 +33,9 @@ Policy (user rulings, Sep-13):
   cannot hold the pools either, ``None`` is returned so the caller keeps
   today's behavior and the genuine OOM fires (with the census diagnostics).
 
-``AR_CALIBRATION_DATA_DEVICE``: ``auto`` (default) | ``off`` | ``cpu`` |
-explicit csv (``cuda:1,cuda:2``). Pinned by the same-name CLI argument.
+``calibration_data_device`` parameter (CLI ``--calibration_data_device`` / API
+keyword): ``auto`` (default) | ``off`` | ``cpu`` | explicit csv (``cuda:1,cuda:2``).
+There is deliberately no environment variable for this knob.
 """
 
 from typing import Callable, List, Optional, Sequence
@@ -222,12 +223,12 @@ def consolidate_pool_onto(objs, target: str, block, batch_size: int, reserved_by
     """
     if not str(target).startswith("cuda"):
         return "spread"
-    from auto_round.algorithms.quantization.search_dispatch import _probe_usable_bytes
+    from auto_round.utils.device import probe_usable_bytes
 
     total = sum(_tensor_bytes(o) for o in objs if o is not None)
     if total <= 0:
         return "local"
-    free = _probe_usable_bytes(target)
+    free = probe_usable_bytes(target)
     if free is None:
         return "spread"
     need = placement_need_bytes(block, objs[0], batch_size, iters=iters, primary=target)
@@ -306,6 +307,14 @@ def resolve_pool_placement(
             candidates.append(key)
 
     probed = [(d, free_probe(d)) for d in candidates]
+    rejected = [d for d, f in probed if f is None]
+    if rejected:
+        # a forced csv with a typo (e.g. cuda1) must not vanish silently
+        logger.warning(
+            "[calib-data-device] ignoring unusable device entr%s %s (not parseable as a cuda device with free memory)",
+            "y" if len(rejected) == 1 else "ies",
+            ", ".join(rejected),
+        )
     usable = [(d, f) for d, f in probed if f is not None and f > 0]
     if not usable:
         logger.debug("[calib-data-device] resolve: none (no usable device among %s)", candidates)
@@ -392,7 +401,7 @@ def resolve_placement_for_pool(
     pool of the same size will also be produced for the block. ``block`` feeds
     the per-block working-set estimate.
     """
-    from auto_round.algorithms.quantization.search_dispatch import _probe_usable_bytes
+    from auto_round.utils.device import probe_usable_bytes
 
     pool_bytes = _tensor_bytes(pool) * max(int(chains), 1)
     n_chunks = _pool_chunk_count(pool)
@@ -405,7 +414,7 @@ def resolve_placement_for_pool(
             primary,
             placement_need_bytes(block, pool, batch_size, iters=iters, primary=primary),
             candidate_devices,
-            _probe_usable_bytes,
+            probe_usable_bytes,
             mode=mode,
         )
     except Exception as e:  # pragma: no cover - placement must never break quantization

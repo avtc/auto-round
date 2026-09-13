@@ -34,6 +34,8 @@ import torch
 
 import auto_round.envs as envs
 from auto_round.logger import logger
+from auto_round.utils.device import probe_usable_bytes
+from auto_round.utils.oom import dump_oom_tensor_census_  # re-exported for existing call sites
 
 
 def group_items_by_device(items, device_of, none_key="uncategorized"):
@@ -135,7 +137,7 @@ def pick_search_worker_devices(working_set_bytes, home_device=None, margin_bytes
     viable = []
     for idx in range(count):
         key = f"cuda:{idx}"
-        free = _probe_usable_bytes(key)
+        free = probe_usable_bytes(key)
         if free is None or free - margin_bytes < working_set_bytes:
             continue
         viable.append(key)
@@ -210,20 +212,6 @@ def _wrap_batch_key(inputs):
     )
 
 
-def _probe_usable_bytes(device_key):
-    """Corrected free bytes on a cuda device (raw free + reserved-but-unallocated)."""
-    try:
-        dev = torch.device(str(device_key))
-        if dev.type != "cuda" or dev.index is None or not torch.cuda.is_available():
-            return None
-        free, _total = torch.cuda.mem_get_info(dev.index)
-        free += torch.cuda.memory_reserved(dev.index) - torch.cuda.memory_allocated(dev.index)
-        return max(free, 0)
-    except (ValueError, RuntimeError, AttributeError) as e:
-        logger.debug("[batched-search] free-memory probe failed for %s (%s)", device_key, e)
-        return None
-
-
 _WRAP_BATCH_MAX_ELEMS = 2**28  # ~1 GiB fp32 stacked weights per batched call (matches the NeUQI expert batching)
 
 
@@ -248,7 +236,7 @@ def _batch_cap(group, device_key, max_batch):
     # the same total bytes, so the fixed element budget only lowers transient VRAM
     elem_cap = max(1, _wrap_batch_max_elems() // max(elements_per_module, 1))
     probe_cap = 64
-    usable = _probe_usable_bytes(device_key)
+    usable = probe_usable_bytes(device_key)
     if usable is not None:
         per_module_bytes = elements_per_module * 4 * 4  # fp32 working set incl. temporaries
         probe_cap = max(1, min(1024, usable // 2 // max(per_module_bytes, 1)))
@@ -364,7 +352,3 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
         per_device,
     )
     return True
-
-
-# re-exported for the existing call sites (implementation lives in utils.oom)
-from auto_round.utils.oom import dump_oom_tensor_census_  # noqa: E402  (circular-safe: utils.oom imports logger only)

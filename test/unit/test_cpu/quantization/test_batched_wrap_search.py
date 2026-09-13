@@ -151,8 +151,9 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
             self.assertIsNotNone(f.init_scale)
 
     def test_element_budget_caps_batch_size(self):
-        # 2**28 elements / (w+im) per module: tiny modules force the element cap below the probe cap
-        fakes = [FakeDeferred(seed=i, shape=(1024, 128)) for i in range(6)]  # ~0.26M elems/module
+        # the ELEMENT budget (not the VRAM probe) binds: budget mocked to two
+        # modules' worth of elements -> 6 modules split into batches of 2
+        fakes = [FakeDeferred(seed=i, shape=(64, 32)) for i in range(6)]
         calls = []
         real_stack = torch.stack
 
@@ -162,13 +163,12 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
 
         import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
+        per_module = 2 * 64 * 32  # weight + imatrix elements
         with mock.patch.object(torch, "stack", side_effect=spy_stack), mock.patch.object(
-            dispatch_mod, "_probe_usable_bytes", return_value=2**40
-        ):
+            dispatch_mod, "probe_usable_bytes", return_value=2**40
+        ), mock.patch.object(dispatch_mod, "_wrap_batch_max_elems", return_value=2 * per_module):
             run_batched_wrap_search(fakes)
-        # 2**28 // (2 * 1024 * 128) = 1024 -> all 6 in one batch (probe cap 64 governs); then a huge probe
-        # with a small module count still takes the element cap path when modules are many:
-        self.assertTrue(all(c == 6 for c in calls))
+        self.assertEqual(calls, [2, 2, 2, 2, 2, 2])  # 3 batches x 2 stacks (weights + imatrix)
 
     def test_env_gb_override_caps_batches(self):
         import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
@@ -362,7 +362,7 @@ class TestSearchWorkerPicking(unittest.TestCase):
         import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
         with mock.patch.object(torch.cuda, "device_count", return_value=len(free_map)), mock.patch.object(
-            dispatch_mod, "_probe_usable_bytes", side_effect=lambda k: free_map.get(k)
+            dispatch_mod, "probe_usable_bytes", side_effect=lambda k: free_map.get(k)
         ):
             return dispatch_mod.pick_search_worker_devices(working_set, home_device=home)
 
@@ -408,8 +408,7 @@ class TestSearchWorkerPicking(unittest.TestCase):
             "auto_round.algorithms.quantization.search_dispatch.pick_search_worker_devices",
             return_value=["cpu"],
         ):
-            leftovers = run_batched_rtn_search(model, staged)
-        self.assertEqual(leftovers, [])
+            run_batched_rtn_search(model, staged)
         for i in range(2):
             self.assertIsNotNone(getattr(model, f"l{i}").scale)
 
@@ -564,8 +563,7 @@ class TestBatchedRtnSearchParity(unittest.TestCase):
             setattr(model, f"l{i}", layer)
             w = self._make_wrapper(layer)
             staged.append((f"l{i}", w))
-        leftovers = run_batched_rtn_search(model, staged)
-        self.assertEqual(leftovers, [])
+        run_batched_rtn_search(model, staged)
         for i in range(3):
             got = getattr(model, f"l{i}")
             ref_w, ref_scale, ref_zp = serial[i]
@@ -583,6 +581,56 @@ class TestBatchedRtnSearchParity(unittest.TestCase):
 
     def test_parity_asym_with_imatrix(self):
         self._run(sym=False, with_imatrix=True)
+
+    def _conv1d_layer(self, seed, nf, nx):
+        from transformers.pytorch_utils import Conv1D
+
+        g = torch.Generator().manual_seed(seed)
+        layer = Conv1D(nf, nx)  # weight is [nx, nf]; quant math runs on the transpose
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn(nx, nf, generator=g))
+        layer.data_type = "int"
+        layer.bits = 4
+        layer.sym = True
+        layer.group_size = min(nx, 128)
+        layer.iters = 0
+        layer.act_bits = 16
+        layer.scale_dtype = torch.float16
+        layer.imatrix = torch.rand(nx, generator=g) + 0.5
+        return layer
+
+    def _run_conv1d(self, nf, nx):
+        from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+
+        with torch.no_grad():
+            serial = []
+            for i in range(3):
+                w = self._make_wrapper(self._conv1d_layer(seed=i, nf=nf, nx=nx))
+                out = w.unwrapper({})
+                serial.append((out.weight.data.clone(), out.scale, out.zp))
+        import torch.nn as nn
+
+        model = nn.Module()
+        staged = []
+        for i in range(3):
+            layer = self._conv1d_layer(seed=i, nf=nf, nx=nx)
+            setattr(model, f"c{i}", layer)
+            staged.append((f"c{i}", self._make_wrapper(layer)))
+        run_batched_rtn_search(model, staged)
+        for i in range(3):
+            got = getattr(model, f"c{i}")
+            ref_w, ref_scale, ref_zp = serial[i]
+            self.assertTrue(torch.equal(got.weight.data, ref_w), f"weight mismatch module {i}")
+            self.assertEqual(tuple(got.weight.data.shape), (nx, nf))  # Conv1D layout restored
+            if isinstance(ref_scale, torch.Tensor):
+                self.assertTrue(torch.equal(got.scale, ref_scale), f"scale mismatch module {i}")
+
+    def test_parity_conv1d_square(self):
+        self._run_conv1d(nf=64, nx=64)
+
+    def test_parity_conv1d_nonsquare(self):
+        # non-square is where the missing transpose is a hard crash, not silent corruption
+        self._run_conv1d(nf=64, nx=128)
 
     def test_oom_chunk_falls_back_per_module(self):
         import torch.nn as nn
@@ -609,7 +657,7 @@ class TestBatchedRtnSearchParity(unittest.TestCase):
         with mock.patch.object(staged[0][1], "weight_quant_func", boom), mock.patch.object(
             staged[1][1], "weight_quant_func", boom
         ):
-            leftovers = batched_search.run_batched_rtn_search(model, staged)
+            batched_search.run_batched_rtn_search(model, staged)
         self.assertEqual(calls["raised"], 1)  # the stacked call raised exactly once
         self.assertEqual(calls["n"], 3)  # then the two per-module fallbacks delegated to the real fn
         for i in range(2):

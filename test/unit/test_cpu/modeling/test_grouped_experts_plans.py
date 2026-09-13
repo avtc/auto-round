@@ -9,7 +9,6 @@ import torch
 from torch import nn
 
 from auto_round.modeling.fused_moe.grouped_experts import (
-    _build_plan,
     _hooks_are_alignment_only,
     _projection_is_supported,
     _run_routes,
@@ -73,27 +72,6 @@ class TestHookExemption(unittest.TestCase):
         self.assertFalse(_projection_is_supported(lin))
 
 
-class TestBuildPlanPerSubset(unittest.TestCase):
-    def test_single_device_subset_builds(self):
-        experts = _Experts(2)
-        plan = _build_plan(experts, [0, 1])
-        self.assertIsNotNone(plan)
-        self.assertEqual(plan.device, torch.device("cpu"))
-
-    def test_mixed_bits_within_subset_falls_back(self):
-        experts = _Experts(2)
-        experts.up_proj = None  # break slot resolution -> container validation fails
-        try:
-            experts.up_proj = None
-        except AttributeError:
-            pass
-        # remove slot attribute entirely via a container without it
-        container = nn.Module()
-        container.not_a_slot = _linear()
-        setattr(experts, "0", container)
-        self.assertIsNone(_build_plan(experts, [0]))
-
-
 class TestRunRoutesSingleGroupCPU(unittest.TestCase):
     def test_matches_reference(self):
         torch.manual_seed(7)
@@ -112,6 +90,53 @@ class TestRunRoutesSingleGroupCPU(unittest.TestCase):
                 h = nn.functional.silu(e.gate_proj(x[t])) * e.up_proj(x[t])
                 ref[t] += w[t, k] * e.down_proj(h)
         torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+    def _wrapped_linear(self, bits, seed):
+        from auto_round.wrapper import WrapperLinear
+
+        layer = _linear()
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn_like(layer.weight))
+        layer.bits = bits
+        layer.group_size = -1
+        layer.sym = True
+        layer.data_type = "int"
+        layer.iters = 0
+        layer.act_bits = 16
+        layer.scale_dtype = torch.float16
+        return WrapperLinear(
+            layer,
+            device="cpu",
+            enable_minmax_tuning=False,
+            enable_norm_bias_tuning=False,
+            enable_round_tuning=False,
+            enable_torch_compile=False,
+            disable_opt_rtn=False,
+            iters=0,
+        )
+
+    def test_mixed_bits_across_experts_falls_back(self):
+        # different quant signatures inside one device group must reject the
+        # grouped path (sharing one grouped GEMM across differently-quantized
+        # experts is unsound), not silently merge them. Plain Linears carry no
+        # quant signature at all (None == None), so the mix needs wrappers.
+        experts = _Experts(2)
+        getattr(experts, "0").up_proj = self._wrapped_linear(bits=4, seed=1)
+        getattr(experts, "1").up_proj = self._wrapped_linear(bits=8, seed=2)
+        x = torch.randn(6, 4)
+        idx = torch.tensor([[0, 1]] * 6)  # both experts active
+        w = torch.rand(6, 2)
+        self.assertIsNone(_run_routes(experts, x, idx, w, experts.n))
+
+    def test_missing_slot_falls_back(self):
+        torch.manual_seed(3)
+        experts = _Experts(2)
+        object.__setattr__(getattr(experts, "1"), "up_proj", None)  # slot absent on expert 1
+        x = torch.randn(6, 4)
+        idx = torch.tensor([[0, 1]] * 6)
+        w = torch.rand(6, 2)
+        self.assertIsNone(_run_routes(experts, x, idx, w, experts.n))
 
 
 @unittest.skipIf(

@@ -241,6 +241,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             n_chunks = _pool_chunk_count(input_ids)
             ATTACH_PHASES["walks"] += _time.perf_counter() - _ta
             primary = str(self.compress_context.cache_device)
+            mode = getattr(self.compress_context, "calibration_data_device", "auto")
             _iters = int(getattr(getattr(self.alg_composer, "block_quantizer", None), "iters", 0) or 0)
             _ta = _time.perf_counter()
             placement = resolve_placement_for_pool(
@@ -250,11 +251,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                 device_manager.device_list,
                 block=block,
                 batch_size=self.calibration_context.batch_size,
-                mode=getattr(self.compress_context, "calibration_data_device", "auto"),
                 iters=_iters,
             )
 
             ATTACH_PHASES["resolve"] += _time.perf_counter() - _ta
+            # Docstring contract: never consolidate when the policy is off, the
+            # lane is CPU-parked (low_gpu_mem_usage keeps pools on the host), or
+            # the resolved placement itself parks pools on the host (mode=cpu).
+            placement_on_host = placement is not None and any(str(_d).startswith("cpu") for _d in placement.devices)
+            if mode == "off" or str(primary).startswith("cpu") or placement_on_host:
+                runner.pool_placement = placement
+                return
             # Fits-home rung: when the incoming (possibly sharded) pools fit on
             # the compute device next to the block's working set AND next to the
             # outputs this block will place there, consolidate them -- the whole
@@ -384,8 +391,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # offload call further down), matching upstream's own choice not to cycle
             # blocks for these formats.
             _perf = bool(getattr(envs, "AR_PERF_COUNTERS", False))
-            _t_reload = time.perf_counter()
-            self._t_prev_reload_start = time.perf_counter()
+            _t_reload_start = time.perf_counter()
             disk_streaming = getattr(self.model_context, "_disk_stream_index", None) is not None
             if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL or disk_streaming:
                 if nblocks == 1:
@@ -399,11 +405,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # (inter-finish deltas) showed a ~54s unmeasured gap in the
             # atomic-placement era -- reload is the prime suspect, now visible.
             if _perf:
-                logger.info(
-                    "[perf] block %s reload-phase=%.2fs",
-                    n,
-                    _t_reload_mark - getattr(self, "_t_prev_reload_start", _t_reload_mark),
-                )
+                logger.info("[perf] block %s reload-phase=%.2fs", n, _t_reload_mark - _t_reload_start)
 
             block_name_or_names = n if nblocks == 1 else names
 
@@ -435,7 +437,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block_cnt=(len(block_names) + nblocks - 1) // nblocks,
             )
 
-            # ── Infrastructure: calibration-data placement (AR_CALIBRATION_DATA_DEVICE)
+            # ── Infrastructure: calibration-data placement (--calibration_data_device)
             # Decide where this block's calibration output pool will live: on the
             # primary cache device when it fits (today's behavior, zero peer
             # traffic), or sharded across free GPUs when it does not. Placement is
@@ -656,7 +658,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _pack_note,
                     _attach_note,
                 )
-            _bg_writer.join()  # flush the last block before the model-level cleanup
+        _bg_writer.join()  # flush the last block before the model-level cleanup
         _bg_resume.join()  # durable resume manifest for the last block
         if pbar is not None:
             pbar.update(1)

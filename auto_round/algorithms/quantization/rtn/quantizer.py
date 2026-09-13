@@ -184,10 +184,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
                 name, w = _quantize_staged(getattr(m, "global_name", None) or "", m)
                 if w is not None:  # None = OOM fallback already finished it serially
                     staged.append((name, w))
-            leftovers = run_batched_rtn_search(self.model, staged)
-            for _name, w in leftovers:
-                layer = w.unwrapper({})
-                set_module(self.model, _name, layer)
+            run_batched_rtn_search(self.model, staged)
             search_dispatch.log_engaged_once("batched rtn search")
         else:
             for m in work:

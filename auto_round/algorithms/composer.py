@@ -480,6 +480,10 @@ class AlgorithmComposer:
             _release_pool_inplace(fp_inputs)
             fp_inputs = None
             clear_memory()
+        else:
+            # lanes without a separate q-input pool (first block; quanted-input
+            # disabled) still get the pre-tuning cache clear the base code had
+            clear_memory()
         # ── Step 4: quantize_block ──────────────────────────────────────────────
         # When quantized input is available from the previous block, use it;
         # otherwise fall back to the FP input.

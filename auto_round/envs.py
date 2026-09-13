@@ -57,6 +57,20 @@ def _get_optional_positive_int_env(name: str) -> Optional[int]:
     return value
 
 
+def _get_optional_positive_float_env(name: str) -> Optional[float]:
+    """Read an optional env var that must be a positive float when set."""
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive float, got {raw!r}") from exc
+    if not (value > 0 and value != float("inf")):
+        raise ValueError(f"{name} must be a positive finite float, got {value}")
+    return value
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # this is used for configuring the default logging level
     "AR_LOG_LEVEL": lambda: os.getenv("AR_LOG_LEVEL", "INFO").upper(),
@@ -145,11 +159,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_DISABLE_BATCHED_SEARCH": lambda: os.getenv("AR_DISABLE_BATCHED_SEARCH", "False").strip().lower()
     in ("1", "true", "yes"),
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "False").strip().lower() in ("1", "true", "yes"),
-    "AR_SEARCH_BATCH_GB": lambda: (
-        (lambda v: v if v is None else (float(v) if v.replace(".", "", 1).replace("-", "", 1).isdigit() else None))(
-            os.getenv("AR_SEARCH_BATCH_GB", "").strip() or None
-        )
-    ),
+    "AR_SEARCH_BATCH_GB": lambda: _get_optional_positive_float_env("AR_SEARCH_BATCH_GB"),
     "AR_DISABLE_MULTIGPU_SEARCH": lambda: os.getenv("AR_DISABLE_MULTIGPU_SEARCH", "False").strip().lower()
     in ("1", "true", "yes"),
     # When enabled, MoE routing can be overridden in selected model wrappers

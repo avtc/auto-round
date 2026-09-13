@@ -552,9 +552,9 @@ class SignRoundQuantizer(BaseQuantizer):
             if any(t.device != _ld for t in fp_outputs):
                 _pool_b = sum(t.numel() * t.element_size() for t in fp_outputs)
                 try:
-                    from auto_round.algorithms.quantization.search_dispatch import _probe_usable_bytes
+                    from auto_round.utils.device import probe_usable_bytes
 
-                    _free = _probe_usable_bytes(str(_ld))
+                    _free = probe_usable_bytes(str(_ld))
                 except Exception as e:  # pragma: no cover - diagnostics only
                     logger.warning("[tune] free-memory probe failed for %s (%s); keeping pool sharded", _ld, e)
                     _free = None

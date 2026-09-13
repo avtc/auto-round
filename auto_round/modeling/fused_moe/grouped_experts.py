@@ -103,7 +103,7 @@ GROUPED_LINEAR_SLICED_IMPL = "linear_grouped_sliced"
 
 # Set once if the native grouped_mm kernel raises; afterwards we always use the sliced loop.
 _NATIVE_GROUPED_MM_DISABLED = False
-_LOGGED_FALLBACK_REASONS: set[str] = set()
+_LOGGED_FALLBACK_REASONS: set[tuple[str, str]] = set()
 # Bumped whenever the plan-building path changes; logged once per process so a
 # log unambiguously identifies which grouped implementation produced it.
 GROUPED_PLANS_VERSION = "slot-stage-v3"
@@ -115,14 +115,14 @@ def _log_fallback_once(reason: str, detail: str = "") -> None:
     if not _LOGGED_VERSION:
         _LOGGED_VERSION = True
         logger.debug(f"[MoE grouped] plans version {GROUPED_PLANS_VERSION}")
-    if reason not in _LOGGED_FALLBACK_REASONS or detail:
-        msg = f"[MoE grouped] falling back to linear_loop: {reason}"
-        if detail:
-            _LOGGED_FALLBACK_REASONS.add(reason)
-            msg = f"{msg} ({detail})"
-        elif reason not in _LOGGED_FALLBACK_REASONS:
-            _LOGGED_FALLBACK_REASONS.add(reason)
-        logger.debug(msg)
+    key = (reason, detail)
+    if key in _LOGGED_FALLBACK_REASONS:
+        return
+    _LOGGED_FALLBACK_REASONS.add(key)
+    msg = f"[MoE grouped] falling back to linear_loop: {reason}"
+    if detail:
+        msg = f"{msg} ({detail})"
+    logger.debug(msg)
 
 
 # --------------------------------------------------------------------------------------
@@ -783,166 +783,6 @@ def _quantize_activation(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-# --------------------------------------------------------------------------------------
-# Plan
-# --------------------------------------------------------------------------------------
-
-
-@dataclass
-class _GroupedPlan:
-    """Everything needed to run one grouped forward, resolved for the *active* experts."""
-
-    experts: list[nn.Module]
-    has_gate: bool
-    device: torch.device
-    output_device: torch.device
-    # Per-slot: may the fake-quantization of all active experts be fused into one call?
-    batched_qdq: dict[str, bool]
-
-
-_SLOTS = ("gate_proj", "up_proj", "down_proj")
-
-
-def _build_plan(module: nn.Module, active_ids: list[int]) -> _GroupedPlan | None:
-    """Validate the active experts and gather them, or return ``None`` to fall back."""
-    experts: list[nn.Module] = []
-    has_gate: bool | None = None
-    device: torch.device | None = None
-    output_device: torch.device | None = None
-    # Per-slot reference signatures: every active expert must agree on them.
-    quant_signatures: dict[str, object] = {}
-    layouts: dict[str, object] = {}
-    batched_qdq: dict[str, bool] = {}
-
-    for expert_id in active_ids:
-        expert = getattr(module, str(expert_id), None)
-        if expert is None:
-            _log_fallback_once("expert container missing")
-            return None
-        if not hasattr(expert, "up_proj") or not hasattr(expert, "down_proj"):
-            _log_fallback_once("expert does not expose up_proj/down_proj")
-            return None
-
-        expert_has_gate = hasattr(expert, "gate_proj")
-        if has_gate is None:
-            has_gate = expert_has_gate
-        elif has_gate != expert_has_gate:
-            _log_fallback_once("experts disagree on gate_proj")
-            return None
-
-        slots = _SLOTS if expert_has_gate else ("up_proj", "down_proj")
-        for slot in slots:
-            projection = getattr(expert, slot)
-            if not _projection_is_supported(projection):
-                _log_fallback_once(f"unsupported projection type {type(projection).__name__}")
-                return None
-
-            proj_device = _compute_device(projection)
-            if device is None:
-                device = proj_device
-                output_device = _output_device(projection)
-            elif proj_device != device:
-                _log_fallback_once(
-                    "experts live on different devices",
-                    detail=f"expert {expert_id} slot {slot}: {proj_device} vs group {device}"
-                    f" (up_proj said {_compute_device(expert.up_proj)})",
-                )
-                return None
-
-            # Mixed-bit MoE: bail out instead of batching differently-quantized experts.
-            signature = _quant_signature(projection)
-            if slot in quant_signatures:
-                if quant_signatures[slot] != signature:
-                    _log_fallback_once(f"mixed quantization schemes across experts for '{slot}'")
-                    return None
-            else:
-                quant_signatures[slot] = signature
-
-            layout = _weight_layout(projection)
-            if slot in layouts:
-                if layouts[slot] != layout:
-                    _log_fallback_once(f"experts have different weight shape/dtype for '{slot}'")
-                    return None
-            else:
-                layouts[slot] = layout
-
-            supports_batched = _supports_batched_qdq(projection)
-            batched_qdq[slot] = batched_qdq.get(slot, True) and supports_batched
-
-        # gate_proj and up_proj consume the *same* tensor, which the grouped path
-        # activation-quantizes once, so their activation settings must be identical.
-        if expert_has_gate:
-            gate_act = _act_signature(expert.gate_proj) if _is_wrapper_linear(expert.gate_proj) else None
-            up_act = _act_signature(expert.up_proj) if _is_wrapper_linear(expert.up_proj) else None
-            gate_enabled = bool(getattr(expert.gate_proj, "enable_act_quant", False))
-            up_enabled = bool(getattr(expert.up_proj, "enable_act_quant", False))
-            if gate_enabled != up_enabled or (gate_enabled and gate_act != up_act):
-                _log_fallback_once("gate_proj/up_proj activation quantization differ")
-                return None
-
-        experts.append(expert)
-
-    if not experts or device is None or output_device is None:
-        return None
-    return _GroupedPlan(
-        experts=experts,
-        has_gate=bool(has_gate),
-        device=device,
-        output_device=output_device,
-        batched_qdq=batched_qdq,
-    )
-
-
-# --------------------------------------------------------------------------------------
-# Grouped matmul
-# --------------------------------------------------------------------------------------
-#
-# Two ways to run the routed GEMM, plus one we deliberately avoid:
-#
-#   sliced loop  one ``F.linear`` per *active* expert over a contiguous slice.
-#                Same kernels as transformers' ``grouped_mm_fallback``, but without its
-#                extra ``offs.tolist()`` sync -- we already hold the counts on the host.
-#                Enable with ``AR_MOE_EXPERTS_IMPL=linear_grouped_sliced``.
-#   grouped_mm   (default) ``torch.nn.functional.grouped_mm`` / ``torch._grouped_mm``: one
-#                kernel for all experts, driven by ``offsets``. Differentiable, and
-#                bit-identical to the loop (verified on A100). Disable with
-#                ``AR_MOE_EXPERTS_IMPL=linear_grouped_sliced``.
-#   batched_mm   transformers' ``_batched_linear``/``torch.bmm`` path gathers
-#                ``weight[expert_ids]`` into an ``(S, out, in)`` tensor -- one weight copy
-#                per routed token. That is a decode-time trick (S == top_k); at tuning
-#                shapes it is orders of magnitude slower (measured ~87x) and the gather
-#                alone would be hundreds of GB. Never used here.
-#
-# Why grouped_mm is the default: the winner depends on the number of routed (token, expert)
-# pairs, i.e. on the calibration batch. At realistic tuning sizes (batch=8, seqlen=2048 ->
-# ~131k pairs) the sliced loop issues ~num_experts separate grad GEMMs in backward, whose
-# launch pressure dominates; the single fused grouped_mm backward then wins by a wide margin
-# -- up to ~5x on a synthetic full Qwen3.5-MoE decoder layer (A100, sm80, bf16), with the
-# gap almost entirely in backward.
-#
-# The earlier, small-batch microbench below (only 4096 routed pairs, 2048x768 experts) is
-# where the two looked equal and the loop was historically preferred -- it under-represented
-# the backward launch count. Speedup over ``linear_loop`` for 16/32/64/128/256 experts:
-#
-#   forward+backward   grouped_mm 3.89 4.36 5.11 4.84 5.05  |  sliced 4.36 4.70 5.32 5.14 5.24
-#   forward (wrapped)  grouped_mm 2.57 2.99 3.21 3.30 3.28  |  sliced 3.13 3.44 3.69 3.80  -
-#   forward (plain fp) grouped_mm 2.07 2.53 2.76 2.99 2.93  |  sliced 1.90 2.21 2.29 2.42 2.39
-#
-# grouped_mm needs a ``torch.stack`` copy when the qdq was not fused (higher peak memory)
-# and has dtype/alignment/compute-capability constraints, so it transparently falls back to
-# the sliced loop when the native kernel is not usable. torch's CPU ``grouped_mm`` loses, so
-# on CPU the loop still runs.
-#
-# Deciding whether the native kernel is *legal* is fiddly (torch version, device, compute
-# capability, dynamo, 16-byte alignment on CPU), so when it is requested we defer to
-# transformers' own ``_can_use_grouped_mm`` rather than re-deriving it.
-
-try:  # transformers >= 5.0
-    from transformers.integrations.moe import _can_use_grouped_mm as _transformers_can_use_grouped_mm
-except Exception:  # pragma: no cover - older/absent transformers
-    _transformers_can_use_grouped_mm = None
-
-
 def _sliced_grouped_mm_requested() -> bool:
     """Whether the sliced per-expert GEMM loop was explicitly requested.
 
@@ -962,6 +802,12 @@ def _native_grouped_mm_available() -> bool:
 def _native_grouped_mm_preferred(device: torch.device) -> bool:
     """Whether the native kernel is opted into. On by default; see the note above."""
     return not _sliced_grouped_mm_requested()
+
+
+try:
+    from transformers.integrations.moe import _can_use_grouped_mm as _transformers_can_use_grouped_mm
+except ImportError:  # older/newer transformers layouts
+    _transformers_can_use_grouped_mm = None
 
 
 def _native_grouped_mm_usable(x: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> bool:

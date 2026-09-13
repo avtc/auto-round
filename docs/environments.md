@@ -242,7 +242,7 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 ```
 
 ### AR_DISABLE_BATCHED_SEARCH
-- **Description**: Disables the batched quantization-search machinery: wrap-time init-scale searches (iters>0, SignRoundV2/GGUF DQ) and optimized-RTN scale searches (iters=0) then run fully serially, one module at a time, on the device hosting each weight. Batching stacks modules sharing device/shape/config into one call with bit-identical per-module results; set this to fall back to the serial loop (e.g. for debugging or bisecting a suspected batching-related difference). Stacking also changes the transient VRAM envelope (see `AR_SEARCH_BATCH_GB`).
+- **Description**: Disables the batched quantization-search machinery: SignRoundV2 wrap-time init-scale searches (iters>0) and optimized-RTN scale searches (iters=0) then run fully serially (the GGUF DQ scale search always runs inline per module), one module at a time, on the device hosting each weight. Batching stacks modules sharing device/shape/config into one call with bit-identical per-module results; set this to fall back to the serial loop (e.g. for debugging or bisecting a suspected batching-related difference). Stacking also changes the transient VRAM envelope (see `AR_SEARCH_BATCH_GB`).
 - **Default**: `0` (batching enabled)
 - **Valid Values**: `0` / `1`
 - **Usage**: Kill switch for the batched/parallel search machinery.
@@ -272,7 +272,7 @@ AR_SEARCH_BATCH_GB=0.5 python -m auto_round --model ... --device_map 0,1
 ```
 
 ### AR_DISABLE_MULTIGPU_SEARCH
-- **Description**: Keeps batched search batches on the device that hosts each weight instead of also using other GPUs. Without this flag, a stacked batch may execute on ANY CUDA device with free VRAM for its transient working set (chosen by a free-memory probe with margin), because the searches read only their module's weight plus per-module statistics -- never calibration activations. The primary winner is the zero-shot (iters=0) lane where the whole block sits on one GPU and the other cards are idle; it is not MoE-specific (any stacked chunk can travel). Set to `1` on rigs whose GPUs are shared with other jobs (a free-memory probe cannot see foreign reservations), when debugging cross-device behavior, or on hosts where the PCIe transfers outweigh the search cost. When no device fits, chunks stay on the weight's home device and rely on the per-chunk OOM fallback.
+- **Description**: Keeps batched search batches on the device that hosts each weight instead of also using other GPUs. Without this flag, a stacked batch may execute on ANY CUDA device with free VRAM for its transient working set (chosen by a free-memory probe with margin), because the searches read only their module's weight plus per-module statistics -- never calibration activations. The primary winner is the zero-shot (iters=0) lane where the whole block sits on one GPU and the other cards are idle. Only the optimized-RTN (iters=0) searches offload this way; iters>0 wrap-search batches always stay on the weight's device. Set to `1` on rigs whose GPUs are shared with other jobs (a free-memory probe cannot see foreign reservations), when debugging cross-device behavior, or on hosts where the PCIe transfers outweigh the search cost. When no device fits, chunks stay on the weight's home device and rely on the per-chunk OOM fallback.
 - **Default**: `0` (multi-GPU search enabled, probe-gated)
 - **Valid Values**: `0` / `1`
 - **Usage**: Pin search traffic to the weight-hosting devices.

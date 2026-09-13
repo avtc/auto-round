@@ -94,9 +94,9 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         staged: list of (layer_name, wrapper) with the search deferred.
         max_batch: optional explicit chunk size.
 
-    Returns:
-        List of (layer_name, wrapper) that were NOT consumed and must be
-        finished per-module by the caller (``wrapper.unwrapper({})``).
+    Every staged module is finished by this function itself -- grouped and
+    stacked, singleton-per-module, or via the per-module OOM fallback -- so
+    the caller never has leftover wrappers to finish.
     """
     entries = []
     for layer_name, wrapper in staged:
@@ -107,10 +107,6 @@ def run_batched_rtn_search(model, staged, max_batch=None):
     device_groups = OrderedDict()
     for e in entries:
         device_groups.setdefault(str(e["weight"].device), []).append(e)
-
-    def _finish_one(e):
-        layer = e["w"].unwrapper({})
-        set_module(model, e["name"], layer)
 
     # Offload pass: the searches are weight-local, so chunks may run on any
     # device with headroom (the zero-shot lane leaves every non-home GPU idle).
@@ -163,7 +159,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
                 return str(wk)
         return str(chunk[0]["weight"].device)  # not found (should not happen): stay home
 
-    def _run_chunk(chunk, worker):
+    def _run_chunk(chunk, worker, threaded=False):
         w0 = chunk[0]["w"]
         dev = str(chunk[0]["weight"].device)
         worker = str(worker)
@@ -185,10 +181,11 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         )
         kwargs = _relocate_tensor_kwargs(kwargs, str(stacked_w.device))
         fn = w0.weight_quant_func
-        if worker != dev:
+        if worker != dev or threaded:
             # measured: the compiled path on workers (pre-warmed) ran 3x slower than
             # eager for this bandwidth-bound grid search; eager also sidesteps the
-            # cross-thread dynamo trace race entirely
+            # cross-thread dynamo trace race entirely -- including for home-staying
+            # chunks, which the multi-device path also executes on worker threads
             fn = getattr(fn, "_torchdynamo_orig_callable", None) or fn
         try:
             qdq, scale, zp = fn(stacked_w, **kwargs)
@@ -206,20 +203,28 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         n = len(chunk)
         scale_parts = _split_leading(scale, n)
         zp_parts = _split_leading(zp, n)
+        import transformers
+
         for i, e in enumerate(chunk):
-            e["w"]._apply_qdq(qdq[i], scale_parts[i], zp_parts[i])
-            set_module(model, e["name"], e["w"].orig_layer)
+            res = qdq[i]
+            w = e["w"]
+            # mirror the serial _qdq_weight tail: cast back to the stored dtype
+            # and restore the HF Conv1D [in, out] layout (staging transposed it)
+            res = res.to(w.orig_layer.weight.dtype)
+            if type(w.orig_layer) == transformers.pytorch_utils.Conv1D:
+                res = res.t()
+            w._apply_qdq(res, scale_parts[i], zp_parts[i])
+            set_module(model, e["name"], w.orig_layer)
 
     if len(buckets) > 1:
         keyed = OrderedDict()
         for wk, cs in buckets.items():
             keyed.setdefault(str(wk), []).append((len(keyed), cs))
-        run_items_by_device(keyed, lambda _idx, cs: [_run_chunk(c, _worker_of(c)) for c in cs])
+        run_items_by_device(keyed, lambda _idx, cs: [_run_chunk(c, _worker_of(c), threaded=True) for c in cs])
     else:
         for wcs in buckets.values():
             for c in wcs:
                 _run_chunk(c, _worker_of(c))
-    return []
 
 
 def _relocate_tensor_kwargs(kwargs: dict, device: str) -> dict:

@@ -58,6 +58,20 @@ DEVICE_ENVIRON_VARIABLE_MAPPING = {
 
 
 ################ Check available sys.module to decide behavior #################
+def probe_usable_bytes(device_key):
+    """Corrected free bytes on a cuda device (raw free + reserved-but-unallocated)."""
+    try:
+        dev = torch.device(str(device_key))
+        if dev.type != "cuda" or dev.index is None or not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info(dev.index)
+        free += torch.cuda.memory_reserved(dev.index) - torch.cuda.memory_allocated(dev.index)
+        return max(free, 0)
+    except (ValueError, RuntimeError, AttributeError) as e:
+        logger.debug("[device] free-memory probe failed for %s (%s)", device_key, e)
+        return None
+
+
 def is_package_available(package_name: str) -> bool:
     """Check if the package exists in the environment without importing.
 
