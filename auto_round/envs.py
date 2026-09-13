@@ -76,15 +76,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # re-quantization). Unset = upstream behavior (cpu). Set to e.g. "cuda:0"
     # to run the whole pass on GPU -- see el_requantize_blocks.py.
     "AR_CALIB_STREAM_DEVICE": lambda: os.getenv("AR_CALIB_STREAM_DEVICE", None),
-    # Device placement for block calibration data (inputs/outputs between
-    # blocks): "auto" (default) keeps the pools on the primary cache device when
-    # they fit (estimated working set + 0.5 GiB reserve) and spreads chunks over
-    # free GPUs when they do not; "cpu" parks the pools on host RAM explicitly;
-    # an explicit csv ("cuda:1,cuda:2") pins the targets; "off" keeps today's
-    # behavior. auto never falls back to CPU silently -- that is either
-    # low_gpu_mem_usage's or the explicit "cpu" mode's job. Pinned by the
-    # --calibration_data_device CLI argument of the same name.
-    "AR_CALIBRATION_DATA_DEVICE": lambda: os.getenv("AR_CALIBRATION_DATA_DEVICE", "auto"),
     "AR_ACT_SCALE": lambda: float(os.getenv("AR_ACT_SCALE", "1.0")),
     "AR_ENABLE_ACT_MINMAX_TUNING": lambda: os.getenv("AR_ENABLE_ACT_MINMAX_TUNING", "0").lower()
     in ("1", "true", "yes"),

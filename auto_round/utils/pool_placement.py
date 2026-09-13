@@ -41,7 +41,6 @@ from typing import Callable, List, Optional, Sequence
 
 import torch
 
-from auto_round import envs
 from auto_round.logger import logger
 
 
@@ -94,6 +93,55 @@ def _spread_plan(devices: Sequence[str], capacities: Sequence[int], n_chunks: in
     return plan
 
 
+def _bytes_by_device(obj) -> tuple:
+    """(device_str -> bytes, total bytes) for tensor leaves of a nested pool object."""
+    per_device: dict = {}
+
+    def _walk(o):
+        if isinstance(o, torch.Tensor):
+            key = str(o.device)
+            per_device[key] = per_device.get(key, 0) + o.numel() * o.element_size()
+        elif isinstance(o, dict):
+            for v in o.values():
+                _walk(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                _walk(v)
+
+    _walk(obj)
+    return per_device, sum(per_device.values())
+
+
+def calib_data_line(input_kinds: dict, plan, outputs_bytes: int, n_chunks: int, primary: str) -> str:
+    """One-line calibration-data summary (per user format):
+
+    ``inputs: fp 4.00GiB, q 4.00GiB, aux 0.12GiB | outputs: 8.00GiB | per device: c0 6.12GiB, c1 6.00GiB``
+
+    Inputs/aux are ground truth (walked from the live tensors' devices); outputs
+    are this block's planned placement (the plan, or all-primary when the policy
+    resolved to today's behavior). Per-device totals combine parked + planned.
+    """
+    per_device: dict = {}
+    parts = []
+    for label, obj in input_kinds.items():
+        by_dev, total = _bytes_by_device(obj)
+        if total <= 0:
+            continue
+        parts.append(f"{label} {total / 2**30:.2f}GiB")
+        for d, b in by_dev.items():
+            per_device[d] = per_device.get(d, 0) + b
+    inputs_part = ", ".join(parts) if parts else "none"
+    if outputs_bytes > 0:
+        if plan is not None:
+            per_chunk = outputs_bytes / max(n_chunks, 1)
+            for dev, cnt in plan.counts().items():
+                per_device[dev] = per_device.get(dev, 0) + int(cnt * per_chunk)
+        else:
+            per_device[str(primary)] = per_device.get(str(primary), 0) + outputs_bytes
+    devs = ", ".join(f"{d} {b / 2**30:.2f}GiB" for d, b in sorted(per_device.items(), key=lambda kv: -kv[1]))
+    return f"inputs: {inputs_part} | outputs: {outputs_bytes / 2**30:.2f}GiB | per device: {devs}"
+
+
 def _tensor_bytes(obj) -> int:
     """Total bytes of tensor leaves in a nested list/tuple/dict pool object."""
     if isinstance(obj, torch.Tensor):
@@ -131,6 +179,7 @@ def resolve_pool_placement(
     need_bytes: int,
     candidate_devices: Sequence[str],
     free_probe: Callable[[str], Optional[int]],
+    mode: str = "auto",
 ) -> Optional[PoolPlacement]:
     """Decide per-chunk output placement for a calibration pool.
 
@@ -142,7 +191,7 @@ def resolve_pool_placement(
     CPU-parked lane, or sharding cannot hold the pool -- the genuine OOM then
     fires loudly per the no-silent-CPU ruling).
     """
-    mode = (envs.AR_CALIBRATION_DATA_DEVICE or "auto").strip().lower()
+    mode = (mode or "auto").strip().lower()
     if mode == "off":
         return None
     if mode == "cpu":
@@ -215,6 +264,7 @@ def resolve_placement_for_pool(
     candidate_devices: Sequence[str],
     block=None,
     batch_size: int = 8,
+    mode: str = "auto",
 ) -> Optional[PoolPlacement]:
     """Resolve placement from a live pool object (orchestrator entry point).
 
@@ -238,14 +288,8 @@ def resolve_placement_for_pool(
             placement_need_bytes(block, pool, batch_size),
             candidate_devices,
             _probe_usable_bytes,
+            mode=mode,
         )
     except Exception:  # pragma: no cover - placement must never break quantization
         return None
-    if plan is not None:
-        logger.debug(
-            "[calib-data-device] pool %.2fGiB x%d chunks -> %s",
-            pool_bytes / 2**30,
-            n_chunks,
-            plan.counts(),
-        )
     return plan

@@ -173,7 +173,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             first_input_name=first_input_name,
         )
 
-    def _attach_pool_placement(self, block, input_ids) -> None:
+    def _attach_pool_placement(self, block, input_ids, q_input=None, input_others=None) -> None:
         """Resolve calibration-data placement for the upcoming block and attach it.
 
         No-op (placement cleared) whenever the policy is off, the lane is
@@ -184,16 +184,35 @@ class CompressionOrchestrator(BaseOrchestrator):
             return
         try:
             from auto_round.utils.device_manager import device_manager
-            from auto_round.utils.pool_placement import resolve_placement_for_pool
+            from auto_round.utils.pool_placement import (
+                _pool_chunk_count,
+                _tensor_bytes,
+                calib_data_line,
+                resolve_placement_for_pool,
+            )
 
             chains = 2 if self.alg_composer.need_quanted_input() else 1
+            pool_bytes = _tensor_bytes(input_ids) * chains
+            n_chunks = _pool_chunk_count(input_ids)
+            primary = str(self.compress_context.cache_device)
             placement = resolve_placement_for_pool(
                 input_ids,
                 chains,
-                str(self.compress_context.cache_device),
+                primary,
                 device_manager.device_list,
                 block=block,
                 batch_size=self.calibration_context.batch_size,
+                mode=getattr(self.compress_context, "calibration_data_device", "auto"),
+            )
+            logger.debug(
+                "[calib-data-device] %s",
+                calib_data_line(
+                    {"fp": input_ids, "q": q_input, "aux": input_others},
+                    placement,
+                    pool_bytes,
+                    n_chunks,
+                    primary,
+                ),
             )
         except Exception:  # pragma: no cover - placement must never break quantization
             placement = None
@@ -325,7 +344,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             # primary cache device when it fits (today's behavior, zero peer
             # traffic), or sharded across free GPUs when it does not. Placement is
             # pure memory behavior -- chunk values are bit-identical.
-            self._attach_pool_placement(m, input_ids)
+            self._attach_pool_placement(m, input_ids, q_input, input_others)
 
             # ── Run block pipeline (calibration → quantization → collection) ──
             new_q_input, reference_output = self.alg_composer.compress_block(

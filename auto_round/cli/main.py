@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import os
 import sys
 
 from auto_round.cli.algorithms import AlgorithmHandler
@@ -60,6 +59,7 @@ def _build_entry_base_kwargs(args, *, low_cpu_mem_usage, enable_torch_compile, l
         "nsamples": args.nsamples,
         "batch_size": args.batch_size,
         "low_gpu_mem_usage": args.low_gpu_mem_usage,
+        "calibration_data_device": args.calibration_data_device,
         "low_cpu_mem_usage": low_cpu_mem_usage,
         "device_map": args.device_map,
         "enable_torch_compile": enable_torch_compile,
@@ -252,10 +252,6 @@ def start(recipe="default", argv=None):
 
 
 def tune(args):
-    calib_dev = getattr(args, "calibration_data_device", None)
-    if calib_dev:
-        # Same-name env pin: the placement policy reads it lazily per block
-        os.environ["AR_CALIBRATION_DATA_DEVICE"] = str(calib_dev)
     assert args.model or args.model_name, "[model] or --model MODEL_NAME should be set."
     if args.model is None:
         args.model = args.model_name

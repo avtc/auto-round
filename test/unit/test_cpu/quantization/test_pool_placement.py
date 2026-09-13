@@ -60,11 +60,10 @@ class TestPoolPlacement(unittest.TestCase):
 class TestResolvePoolPlacement(unittest.TestCase):
     GB = 2**30
 
-    def _resolve(self, mode="auto", free=None, pool=1 * GB, margin=2 * GB, primary="cuda:0", candidates=None):
+    def _resolve(self, mode="auto", free=None, pool=1 * GB, need=2 * GB, primary="cuda:0", candidates=None):
         free = free if free is not None else {"cuda:0": 20 * self.GB}
         candidates = candidates if candidates is not None else ["cuda:0", "cuda:1", "cuda:2"]
-        with mock.patch.object(pp.envs, "AR_CALIBRATION_DATA_DEVICE", mode):
-            return pp.resolve_pool_placement(pool, 128, primary, margin, candidates, _fake_probe(free))
+        return pp.resolve_pool_placement(pool, 128, primary, need, candidates, _fake_probe(free), mode=mode)
 
     def test_off_env_returns_none(self):
         self.assertIsNone(self._resolve(mode="off"))
@@ -143,6 +142,38 @@ class TestPoolBytes(unittest.TestCase):
     def test_chunk_count(self):
         pool = {"hidden_states": [torch.zeros(1) for _ in range(7)]}
         self.assertEqual(pp._pool_chunk_count(pool), 7)
+
+
+class TestCalibDataLine(unittest.TestCase):
+    def test_bytes_by_device_counts_referenced_leaves(self):
+        a = torch.zeros(10)  # 40B
+        b = torch.zeros(6)  # 24B
+        per_dev, total = pp._bytes_by_device({"h": [a, b], "m": a})
+        self.assertEqual(per_dev, {"cpu": 104})  # 'm' references a again
+        self.assertEqual(total, 104)
+
+    def test_line_format_kinds_devices_and_outputs(self):
+        fp = [torch.zeros(64)]  # 256B
+        q = [torch.zeros(32)]  # 128B
+        plan = pp.PoolPlacement(["d0", "d1"], [1, 1], 4)
+        line = pp.calib_data_line({"fp": fp, "q": q, "aux": None}, plan, 512, 4, "d0")
+        self.assertIn("inputs: fp 0.00GiB, q 0.00GiB", line)
+        self.assertIn("outputs: 0.00GiB", line)
+        self.assertIn("per device:", line)
+        # no kind-per-device matrix: device section names devices only
+        devs = line.split("per device: ")[1]
+        self.assertNotIn("fp", devs)
+        self.assertNotIn("q", devs)
+
+    def test_line_without_plan_falls_back_to_primary(self):
+        fp = [torch.zeros(64)]
+        line = pp.calib_data_line({"fp": fp}, None, 256, 1, "cuda:0")
+        self.assertIn("cuda:0", line)
+        self.assertIn("outputs:", line)
+
+    def test_line_empty_inputs(self):
+        line = pp.calib_data_line({}, None, 0, 0, "cpu")
+        self.assertIn("inputs: none", line)
 
 
 class TestRunnerRouting(unittest.TestCase):

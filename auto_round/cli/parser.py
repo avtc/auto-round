@@ -158,7 +158,7 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
     )
     rt.add_argument(
         "--calibration_data_device",
-        default=None,
+        default="auto",
         type=str,
         help="Device placement for block calibration data (inputs/outputs between blocks): "
         "'auto' (default) keeps the pools on the primary cache device when they fit and spreads "
