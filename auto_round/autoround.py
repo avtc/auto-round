@@ -811,6 +811,11 @@ class AutoRound:
         nsamples: Number of calibration samples.
         batch_size: Calibration batch size.
         low_gpu_mem_usage: Enable lower-memory calibration at the cost of speed.
+        calibration_data_device: Placement of the block calibration-data pools:
+            ``"auto"`` (default; primary-first, shard across GPUs when needed),
+            ``"off"`` (no placement machinery), ``"cpu"`` (park pools in host
+            RAM), or an explicit csv such as ``"cuda:1,cuda:2"``. Forwards still
+            run on the compute devices; only the at-rest pool placement changes.
         device_map: Device or device mapping used for quantization.
         enable_torch_compile: Whether to use ``torch.compile`` where supported.
         seed: Random seed used by calibration and tuning.

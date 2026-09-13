@@ -96,7 +96,13 @@ def run_items_by_device(groups, fn, use_cuda_ctx=True):
                     fn(_idx, item)
         except BaseException as exc:  # noqa: B036 - re-raised below, never swallowed
             with error_lock:
-                if not first_error:
+                if first_error:
+                    logger.error(
+                        "[batched-search] worker %s also failed (%r); raising the first failure",
+                        device_key,
+                        exc,
+                    )
+                else:
                     first_error.append(exc)
 
     for device_key, indexed_items in groups.items():
@@ -192,6 +198,11 @@ def _fn_key(fn):
             return repr(fn)
         return ("partial", module, qualname, fn.args, kwargs)
     if callable(fn):
+        if getattr(fn, "__closure__", None):
+            # a per-call closure shares (module, qualname) with its siblings
+            # from the same factory; its captures are not introspectable, so
+            # key by repr and never merge lookalikes into one batch
+            return ("closure", repr(fn))
         try:
             return ("fn", fn.__module__, fn.__qualname__)
         except AttributeError as e:  # pragma: no cover - exotic callables
@@ -201,14 +212,34 @@ def _fn_key(fn):
 
 
 def _wrap_batch_key(inputs):
-    weight, _data_type, bits, _imatrix, thresh, search_fn = inputs
+    weight, _data_type, bits, imatrix_raw, thresh, search_fn = inputs
     return (
         str(weight.device),
         tuple(weight.shape),
         str(weight.dtype),
         bits,
         float(thresh),
+        imatrix_raw is not None,
         _fn_key(search_fn),
+    )
+
+
+def _materialize_wrap_imatrix(chunk, stacked_w):
+    """Chunk-time imatrix stack from the staged RAW column vectors.
+
+    None means uniform importance: an all-None chunk (the default tuning
+    lane) becomes one ``ones_like`` allocation instead of N expanded copies.
+    """
+    raws = [w._deferred_search_inputs[3] for w in chunk]
+    if raws[0] is None:
+        return torch.ones_like(stacked_w)
+    from auto_round.data_type.utils import reshape_imatrix_for_weight
+
+    return torch.stack(
+        [
+            reshape_imatrix_for_weight(r, w._deferred_search_inputs[0], w.orig_layer.group_size)
+            for r, w in zip(raws, chunk)
+        ]
     )
 
 
@@ -232,7 +263,9 @@ def _batch_cap(group, device_key, max_batch):
     if max_batch is not None:
         return max(1, max_batch)
     inputs0 = group[0]._deferred_search_inputs
-    elements_per_module = inputs0[0].numel() + (inputs0[3].numel() if inputs0[3] is not None else 0)
+    # staged imatrix is the raw column; the chunk-time expansion reaches the
+    # weight's full size, so the budget counts it at its expanded size
+    elements_per_module = inputs0[0].numel() * (2 if inputs0[3] is not None else 1)
     # the search is bandwidth-bound: batches beyond ~1 GiB of stacked weights move
     # the same total bytes, so the fixed element budget only lowers transient VRAM
     elem_cap = max(1, _wrap_batch_max_elems() // max(elements_per_module, 1))
@@ -286,7 +319,10 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
         inputs = wrapper._deferred_search_inputs
         if inputs is None:
             return
-        weight, _data_type, bits, imatrix, _thresh, search_fn = inputs
+        weight, _data_type, bits, imatrix_raw, _thresh, search_fn = inputs
+        from auto_round.data_type.utils import reshape_imatrix_for_weight
+
+        imatrix = reshape_imatrix_for_weight(imatrix_raw, weight, wrapper.orig_layer.group_size)
         wrapper.finalize_batched_search(search_fn(weight, bits, imatrix))
 
     def _run_device(device_key, wrappers):
@@ -306,7 +342,7 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
                 _bits = inputs0[2]
                 search_fn = inputs0[5]
                 stacked_w = torch.stack([w._deferred_search_inputs[0] for w in chunk])
-                stacked_im = torch.stack([w._deferred_search_inputs[3] for w in chunk])
+                stacked_im = _materialize_wrap_imatrix(chunk, stacked_w)
                 try:
                     results = search_fn(stacked_w, _bits, stacked_im)
                 except torch.OutOfMemoryError:

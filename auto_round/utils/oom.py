@@ -206,13 +206,15 @@ def dump_oom_tensor_census_(context: str = "") -> None:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)  # isinstance over heap objects
-            _dump_census(gc)
+            _dump_census(gc, context)
     except Exception as e:  # pragma: no cover - diagnostics must not mask the OOM
         logger.error("[oom] tensor census failed (%s)", e)
 
 
-def _dump_census(gc):
+def _dump_census(gc, context=""):
     idx = "?"  # bound before the loop so the handler below can always name it
+    if context:
+        logger.error("[oom] tensor census (context: %s)", context)
     try:
         try:
             for idx in range(torch.cuda.device_count()):

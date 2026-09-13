@@ -806,7 +806,7 @@ def _native_grouped_mm_preferred(device: torch.device) -> bool:
 
 try:
     from transformers.integrations.moe import _can_use_grouped_mm as _transformers_can_use_grouped_mm
-except ImportError:  # older/newer transformers layouts
+except Exception:  # pragma: no cover - transformers-internal API drift; degrade to the sliced loop
     _transformers_can_use_grouped_mm = None
 
 

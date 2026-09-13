@@ -114,6 +114,11 @@ class SignRoundOptimizedWrapperLinear(WrapperLinear):
         data_type = layer.data_type
         weight_reshape = self._prepare_init_scale_weight()
         imatrix = reshape_imatrix_for_weight(getattr(layer, "imatrix", None), weight_reshape, layer.group_size)
+        # staged deferral keeps only the RAW column imatrix (or None): the
+        # expanded full-size copy would be pinned per module for the whole
+        # wrap phase -- N x weight bytes -- while the batched call needs it
+        # only transiently per chunk (bounded by the batch cap)
+        imatrix_raw = getattr(layer, "imatrix", None)
 
         self.weight_quant_func = get_optimized_quant_func(data_type)
         search_fn = resolve_optimized_init_scale_fn(data_type, self.q_scale_thresh)
@@ -132,7 +137,7 @@ class SignRoundOptimizedWrapperLinear(WrapperLinear):
                 weight_reshape,
                 data_type,
                 layer.bits,
-                imatrix,
+                imatrix_raw,
                 self.q_scale_thresh,
                 search_fn,
             )
@@ -146,7 +151,8 @@ class SignRoundOptimizedWrapperLinear(WrapperLinear):
 
     def _run_deferred_search_now(self):
         """Run the staged search per-module (fallback when batching is off)."""
-        weight, _data_type, bits, imatrix, _thresh, search_fn = self._deferred_search_inputs
+        weight, _data_type, bits, imatrix_raw, _thresh, search_fn = self._deferred_search_inputs
+        imatrix = reshape_imatrix_for_weight(imatrix_raw, weight, self.orig_layer.group_size)
         self.init_scale = search_fn(weight, bits, imatrix)
         self._deferred_search_inputs = None
 

@@ -52,14 +52,19 @@ def _staged_weight(wrapper):
 
 
 def _staged_imatrix(wrapper, weight):
-    """Per-column imatrix pre-expanded to the full weight shape (or None).
+    """The RAW per-column imatrix (or None) -- expansion happens chunk-time.
 
-    The quant functions flatten the imatrix and expand it across the whole
-    tensor; pre-expanding per module keeps that flatten-expand an identity
-    under stacking, which is what makes the batched call elementwise-equal to
-    the per-module calls.
+    Staging the expanded full-size copy would pin N x weight bytes across the
+    whole staging phase; the chunk-time expansion below is transient and
+    bounded by the batch cap. Groups are homogeneous on imatrix presence (it
+    is part of the staged key), so chunks are all-None or all-tensor.
     """
-    im = getattr(wrapper.orig_layer, "imatrix", None)
+    del weight
+    return getattr(wrapper.orig_layer, "imatrix", None)
+
+
+def _expand_imatrix(im, weight):
+    """Expand one module's raw imatrix to its full weight shape (chunk-time)."""
     if im is None:
         return None
     im = im.to(weight.device, weight.dtype)
@@ -68,6 +73,19 @@ def _staged_imatrix(wrapper, weight):
     if im.shape == weight.shape:
         return im.contiguous()
     return im
+
+
+def _extra_quant_kwargs_key(wrapper):
+    """Per-module _extra_quant_kwargs hook values as a hashable key term.
+
+    Any wrapper subclass defining the hook injects arbitrary per-module kwargs
+    into the quant call; two modules with differing extras must never share a
+    stacked chunk (same hazard class as differing global_scale).
+    """
+    hook = getattr(wrapper, "_extra_quant_kwargs", None)
+    if not callable(hook):
+        return None
+    return tuple(sorted((str(k), repr(v)) for k, v in hook().items()))
 
 
 def _staged_key(wrapper, weight, imatrix):
@@ -92,6 +110,7 @@ def _staged_key(wrapper, weight, imatrix):
         getattr(layer, "super_bits", None),
         getattr(layer, "super_group_size", None),
         None if global_scale is None else float(global_scale),
+        _extra_quant_kwargs_key(wrapper),
     )
 
 
@@ -208,7 +227,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         stacked_w = torch.stack(weights)
         stacked_im = None
         if ims and ims[0] is not None:
-            stacked_im = torch.stack(ims)
+            stacked_im = torch.stack([_expand_imatrix(im, w) for im, w in zip(ims, weights)])
         kwargs = w0._quant_call_kwargs(
             torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0), imatrix_override=stacked_im
         )

@@ -14,6 +14,7 @@
 """Batched same-shape wrap-search tests: grouping, bit-parity, deferral protocol."""
 
 import threading
+import types
 import unittest
 from unittest import mock
 
@@ -28,7 +29,7 @@ def _mk_inputs(seed=0, shape=(6, 128), dtype="int", bits=4, thresh=1e-5, device=
 
     g = torch.Generator().manual_seed(seed)
     w = torch.randn(*shape, generator=g)
-    im = torch.rand(*shape, generator=g) + 0.5
+    im = torch.rand(shape[1], generator=g) + 0.5  # RAW per-column imatrix, as production stages it
     fn = resolve_optimized_init_scale_fn(dtype, thresh)
     return w, im, dtype, bits, thresh, device, fn
 
@@ -46,10 +47,13 @@ class FakeDeferred:
         self.init_scale = None
         self.finalized_on_thread = None
         self.name = f"m{seed}"
+        self.orig_layer = types.SimpleNamespace(group_size=128)
 
     def _run_deferred_search_now(self):
-        w, _dt, b, im, _th, fn = self._deferred_search_inputs
-        self.init_scale = fn(w, b, im)
+        from auto_round.data_type.utils import reshape_imatrix_for_weight
+
+        w, _dt, b, im_raw, _th, fn = self._deferred_search_inputs
+        self.init_scale = fn(w, b, reshape_imatrix_for_weight(im_raw, w, self.orig_layer.group_size))
         self._deferred_search_inputs = None
 
     def finalize_batched_search(self, init_scale):
@@ -63,7 +67,7 @@ class TestBatchedBitParity(unittest.TestCase):
         fakes = [FakeDeferred(seed=i) for i in range(5)]
         individual = [_individual(f) for f in fakes]
         stacked_w = torch.stack([f._deferred_search_inputs[0] for f in fakes])
-        stacked_im = torch.stack([f._deferred_search_inputs[3] for f in fakes])
+        stacked_im = _stacked_im(fakes, stacked_w)
         batched = fakes[0]._deferred_search_inputs[5](stacked_w, 4, stacked_im)
         for i, ref in enumerate(individual):
             self.assertTrue(torch.equal(batched[i], ref), f"module {i} diverged")
@@ -75,11 +79,8 @@ class TestBatchedBitParity(unittest.TestCase):
                 f._deferred_search_inputs[5](f._deferred_search_inputs[0], bits, f._deferred_search_inputs[3])
                 for f in fakes
             ]
-            batched = fakes[0]._deferred_search_inputs[5](
-                torch.stack([f._deferred_search_inputs[0] for f in fakes]),
-                bits,
-                torch.stack([f._deferred_search_inputs[3] for f in fakes]),
-            )
+            _sw = torch.stack([f._deferred_search_inputs[0] for f in fakes])
+            batched = fakes[0]._deferred_search_inputs[5](_sw, bits, _stacked_im(fakes, _sw))
             for i, ref in enumerate(refs):
                 self.assertTrue(torch.equal(batched[i], ref))
 
@@ -221,8 +222,16 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
 
 
 def _individual(fake):
-    w, _dt, b, im, _th, fn = fake._deferred_search_inputs
-    return fn(w, b, im)
+    from auto_round.data_type.utils import reshape_imatrix_for_weight
+
+    w, _dt, b, im_raw, _th, fn = fake._deferred_search_inputs
+    return fn(w, b, reshape_imatrix_for_weight(im_raw, w, fake.orig_layer.group_size))
+
+
+def _stacked_im(fakes, stacked_w):
+    from auto_round.algorithms.quantization.search_dispatch import _materialize_wrap_imatrix
+
+    return _materialize_wrap_imatrix(fakes, stacked_w)
 
 
 class TestV2DeferralProtocol(unittest.TestCase):
@@ -232,6 +241,7 @@ class TestV2DeferralProtocol(unittest.TestCase):
         w = object.__new__(SignRoundOptimizedWrapperLinear)
         w.init_scale = None
         w._deferred_search_inputs = None
+        w.orig_layer = types.SimpleNamespace(group_size=128)
         return w
 
     def test_run_now_and_finalize_assign(self):
@@ -239,16 +249,18 @@ class TestV2DeferralProtocol(unittest.TestCase):
 
         w = self._bare_v2()
         weight = torch.randn(6, 128)
-        imatrix = torch.rand(6, 128) + 0.5
+        imatrix_raw = torch.rand(128) + 0.5  # raw column, as production stages it
         fn = resolve_optimized_init_scale_fn("int", 1e-5)
-        w._deferred_search_inputs = (weight, "int", 4, imatrix, 1e-5, fn)
-        ref = fn(weight, 4, imatrix)
+        w._deferred_search_inputs = (weight, "int", 4, imatrix_raw, 1e-5, fn)
+        from auto_round.data_type.utils import reshape_imatrix_for_weight
+
+        ref = fn(weight, 4, reshape_imatrix_for_weight(imatrix_raw, weight, 128))
         w._run_deferred_search_now()
         self.assertTrue(torch.equal(w.init_scale, ref))
         self.assertIsNone(w._deferred_search_inputs)
 
         w2 = self._bare_v2()
-        w2._deferred_search_inputs = (weight, "int", 4, imatrix, 1e-5, fn)
+        w2._deferred_search_inputs = (weight, "int", 4, imatrix_raw, 1e-5, fn)
         w2.finalize_batched_search(ref)
         self.assertTrue(torch.equal(w2.init_scale, ref))
         self.assertIsNone(w2._deferred_search_inputs)
@@ -451,14 +463,14 @@ class TestWrapperBlockDrivesBatching(unittest.TestCase):
                     w,
                     "int",
                     4,
-                    torch.ones_like(w),
+                    None,  # uniform importance: production stages None, not ones
                     1e-5,
                     resolve_optimized_init_scale_fn("int", 1e-5),
                 )
 
             def _run_deferred_search_now(self):
                 w, _dt, b, im, _th, fn = self._deferred_search_inputs
-                self.init_scale = fn(w, b, im)
+                self.init_scale = fn(w, b, torch.ones_like(w) if im is None else im)
                 self._deferred_search_inputs = None
 
             def finalize_batched_search(self, init_scale):

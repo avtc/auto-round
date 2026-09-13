@@ -186,7 +186,13 @@ def pack_layer(layer_name, model, backend, device=None):
         return
 
     if int(layer.act_bits) <= 8:
-        return pack_qact_layer(layer_name, model)
+        PACK_PHASES["lookup"] += time.perf_counter() - _t_entry
+        PACK_PHASES["count"] += 1
+        _t_pack = time.perf_counter()
+        try:
+            return pack_qact_layer(layer_name, model)
+        finally:
+            PACK_PHASES["pack"] += time.perf_counter() - _t_pack
 
     if not check_to_quantized(layer):
         PACK_PHASES["lookup"] += time.perf_counter() - _t_entry
