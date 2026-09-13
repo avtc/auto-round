@@ -282,8 +282,20 @@ class TestOomCensus(unittest.TestCase):
 
     def test_global_hook_fires_on_uncaught_oom(self):
         import sys
+        import threading
 
         import auto_round.utils.oom as oom_mod
+
+        # The latch and the excepthooks are process-global: an earlier test in
+        # the same process (e.g. the model-free pipeline installs the hook for
+        # real) must not decide this test's outcome. Snapshot the state, start
+        # from pristine hooks, and restore exactly what was there before.
+        self.addCleanup(setattr, sys, "excepthook", sys.excepthook)
+        self.addCleanup(setattr, threading, "excepthook", threading.excepthook)
+        self.addCleanup(setattr, oom_mod, "_OOM_HOOK_INSTALLED", oom_mod._OOM_HOOK_INSTALLED)
+        oom_mod._OOM_HOOK_INSTALLED = False
+        sys.excepthook = sys.__excepthook__
+        threading.excepthook = threading.__excepthook__
 
         installed = oom_mod.install_oom_census_hook()
         self.assertFalse(oom_mod.install_oom_census_hook())  # idempotent
