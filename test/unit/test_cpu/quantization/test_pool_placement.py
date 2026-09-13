@@ -84,6 +84,34 @@ class TestResolvePoolPlacement(unittest.TestCase):
         # layer_activation(3.0) + additional(5.0) GiB + 0.5 GiB reserve
         self.assertEqual(need, int(8.5 * 2**30))
 
+    def test_huge_moe_need_still_shards_onto_peers(self):
+        """Regression: the need constrains the primary alone, never the fleet.
+
+        A MoE block's need runs to hundreds of GiB under the x7 expert
+        multiplier; charging it against total free vetoed every shard plan
+        ('insufficient: total - need < pool'), parking the pools on the
+        busiest device and OOM-ing the next block.
+        """
+        plan = self._resolve(
+            pool=4 * self.GB,
+            need=342 * self.GB,
+            free={"cuda:0": 2 * self.GB, "cuda:1": 10 * self.GB, "cuda:2": 10 * self.GB},
+        )
+        self.assertIsNotNone(plan)
+        counts = plan.counts()
+        self.assertEqual(counts.get("cuda:0", 0), 0)  # need-floor leaves no chunks on the primary
+        self.assertGreater(counts.get("cuda:1", 0), 0)
+        self.assertGreater(counts.get("cuda:2", 0), 0)
+        self.assertEqual(sum(counts.values()), 128)
+
+    def test_zero_peer_capacity_returns_none(self):
+        plan = self._resolve(
+            pool=4 * self.GB,
+            need=2 * self.GB,
+            free={"cuda:0": 1 * self.GB, "cuda:1": 1 * self.GB},
+        )
+        self.assertIsNone(plan)
+
     def test_cpu_primary_returns_none(self):
         self.assertIsNone(self._resolve(primary="cpu"))
 

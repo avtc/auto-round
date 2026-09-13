@@ -316,19 +316,24 @@ def resolve_pool_placement(
         # primary-first: identical to today's behavior, zero peer traffic
         return PoolPlacement([str(primary)], [max(primary_free - need_bytes, 1)], n_chunks)
 
-    total = sum(f for _, f in usable)
-    if total - need_bytes < pool_bytes:
+    # Capacity-aware sharding: the working-set need constrains the PRIMARY
+    # only (that is where tuning compute runs); peers hosting pool chunks pay
+    # nothing for it. Charging it against the whole fleet made every MoE
+    # block's need (hundreds of GiB under the x7 expert multiplier) veto all
+    # sharding, which parked the pools on the busiest device (block-3 OOM).
+    capacities = [max(f - need_bytes, 1) if d == str(primary) else f for d, f in usable]
+    shardable = sum(capacities)
+    if shardable < pool_bytes:
         logger.debug(
-            "[calib-data-device] resolve: none (insufficient: total %.2fGiB - need %.2fGiB < pool %.2fGiB)",
-            total / 2**30,
-            need_bytes / 2**30,
+            "[calib-data-device] resolve: none (peer capacity %.2fGiB < pool %.2fGiB; need %.2fGiB charged to %s only)",
+            shardable / 2**30,
             pool_bytes / 2**30,
+            need_bytes / 2**30,
+            primary,
         )
         return None  # sharding cannot help either: keep today's behavior, real OOM fires
 
-    # capacity-aware sharding: subtract the working-set need from the primary only
     devices = [d for d, _ in usable]
-    capacities = [max(f - need_bytes, 1) if d == str(primary) else f for d, f in usable]
     return PoolPlacement(devices, capacities, n_chunks)
 
 
@@ -352,7 +357,10 @@ def placement_need_bytes(block, pool, batch_size: int) -> int:
         return int((layer_activation_memory + additional_memory) * 2**30) + _RESERVE_BYTES
     except Exception as e:  # pragma: no cover - placement must never break quantization
         logger.warning(
-            "[calib-data-device] working-set estimate failed (%s); using %.1fGiB reserve", e, _RESERVE_BYTES / 2**30
+            "[calib-data-device] working-set estimate failed for %s (%s); using %.1fGiB reserve",
+            type(block).__name__,
+            e,
+            _RESERVE_BYTES / 2**30,
         )
         return _RESERVE_BYTES
 
