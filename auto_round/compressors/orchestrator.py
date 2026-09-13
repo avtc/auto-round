@@ -330,7 +330,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             _perf = bool(getattr(envs, "AR_PERF_COUNTERS", False))
             _t_reload = time.perf_counter()
             disk_streaming = getattr(self.model_context, "_disk_stream_index", None) is not None
-            if self.compress_context.low_gpu_mem_usage or envs.AR_DISK_STREAM_MODEL or disk_streaming:
+            if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL or disk_streaming:
                 if nblocks == 1:
                     self._offloader.reload(model, n)
                 else:
