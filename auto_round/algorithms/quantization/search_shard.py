@@ -122,8 +122,8 @@ def shard_eligible(device_keys):
         try:
             if torch.device(k).type == "cuda":
                 return True
-        except (ValueError, RuntimeError):  # unrecognized labels are simply not cuda
-            logger.debug("[search-shard] device grouping: skipping non-device label")
+        except (ValueError, RuntimeError) as e:  # unrecognized labels are simply not cuda
+            logger.debug("[search-shard] device grouping: label %r is not a device (%s)", k, e)
             continue
     return False
 
@@ -220,15 +220,15 @@ def _fn_key(fn):
         try:
             qualname = fn.func.__qualname__
             module = fn.func.__module__
-        except AttributeError:  # pragma: no cover - exotic callables
-            logger.debug("[search-shard] callable name unavailable; using repr")
+        except AttributeError as e:  # pragma: no cover - exotic callables
+            logger.debug("[search-shard] partial target %r has no qualname (%s); keying by repr", fn.func, e)
             return repr(fn)
         return ("partial", module, qualname, fn.args, kwargs)
     if callable(fn):
         try:
             return ("fn", fn.__module__, fn.__qualname__)
-        except AttributeError:  # pragma: no cover - exotic callables
-            logger.debug("[search-shard] callable name unavailable; using repr")
+        except AttributeError as e:  # pragma: no cover - exotic callables
+            logger.debug("[search-shard] callable %r has no qualname (%s); keying by repr", fn, e)
             return repr(fn)
     return repr(fn)
 
@@ -255,7 +255,7 @@ def _probe_usable_bytes(device_key):
         free += torch.cuda.memory_reserved(dev.index) - torch.cuda.memory_allocated(dev.index)
         return max(free, 0)
     except (ValueError, RuntimeError, AttributeError) as e:
-        logger.debug("[search-shard] free-memory probe unavailable (%s)", e)
+        logger.debug("[search-shard] free-memory probe failed for %s (%s)", device_key, e)
         return None
 
 

@@ -46,7 +46,7 @@ def _group_tensors_by_shape(objs) -> tuple:
         try:
             return tuple(int(d) for d in shape)
         except Exception as e:  # symbolic dims (SymInt) or exotic shapes: stringify
-            logger.debug("[oom] census shape key fell back to str (%s)", e)
+            logger.debug("[oom] census shape key fell back to str for %s (%s)", type(shape).__name__, e)
             return (str(tuple(shape)),)
 
     skipped = 0
@@ -139,7 +139,7 @@ def _attr_name_of(owner, target):
                 if v is target:
                     return str(k)
     except Exception as e:
-        logger.debug("[oom] census attr-name scan failed (%s)", e)
+        logger.debug("[oom] census attr-name scan failed for owner %s (%s)", type(owner).__name__, e)
     return None
 
 
@@ -228,7 +228,7 @@ def _dump_census(gc):
                     torch.cuda.memory_reserved(idx) / 2**30,
                 )
         except Exception as e:  # pragma: no cover - allocator stats are cuda-only
-            logger.debug("[oom] allocator stats unavailable (%s)", e)
+            logger.debug("[oom] allocator stats unavailable for cuda:%s (%s)", idx, e)
         objs = gc.get_objects()
         per_device: dict = {}
         top, _skipped = _group_tensors_by_shape(objs)
