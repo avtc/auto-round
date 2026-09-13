@@ -216,12 +216,13 @@ _WRAP_BATCH_MAX_ELEMS = 2**28  # ~1 GiB fp32 stacked weights per batched call (m
 
 
 def _wrap_batch_max_elems():
-    """Element budget per stacked batch; AR_SEARCH_BATCH_GB overrides in GiB of fp32 weights."""
-    try:
-        gb = float(envs.AR_SEARCH_BATCH_GB)
-    except (TypeError, ValueError):
-        gb = None
-    if gb is not None and gb > 0:
+    """Element budget per stacked batch; AR_SEARCH_BATCH_GB overrides in GiB of fp32 weights.
+
+    Invalid values raise (the env parser's ValueError) instead of silently
+    falling back to the default budget.
+    """
+    gb = envs.AR_SEARCH_BATCH_GB
+    if gb is not None:
         return max(int(gb * 2**30 // 4), 1)
     return _WRAP_BATCH_MAX_ELEMS
 

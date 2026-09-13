@@ -192,15 +192,22 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
         for f in fakes:
             self.assertIsNotNone(f.init_scale)
 
-    def test_env_gb_override_invalid_falls_back(self):
-        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
+    def test_env_gb_override_invalid_raises(self):
+        import os
+
+        from auto_round import envs as envs_mod
 
         fakes = [FakeDeferred(seed=i) for i in range(4)]
-        with mock.patch.object(dispatch_mod.envs, "AR_SEARCH_BATCH_GB", "not-a-number"):
-            handled = run_batched_wrap_search(fakes)
-        self.assertTrue(handled)  # default budget applies, no crash
-        for f in fakes:
-            self.assertIsNotNone(f.init_scale)
+        # through the real parser (module __getattr__ -> lambda raises)
+        os.environ["AR_SEARCH_BATCH_GB"] = "not-a-number"
+        try:
+            with self.assertRaises(ValueError):
+                run_batched_wrap_search(fakes)
+        finally:
+            os.environ.pop("AR_SEARCH_BATCH_GB", None)
+            # sibling patch.object tests may leave a static module attr behind
+            if "AR_SEARCH_BATCH_GB" in vars(envs_mod):
+                delattr(envs_mod, "AR_SEARCH_BATCH_GB")
 
     def test_kill_switch_disables(self):
         fakes = [FakeDeferred(seed=i) for i in range(3)]
@@ -624,6 +631,93 @@ class TestBatchedRtnSearchParity(unittest.TestCase):
             self.assertEqual(tuple(got.weight.data.shape), (nx, nf))  # Conv1D layout restored
             if isinstance(ref_scale, torch.Tensor):
                 self.assertTrue(torch.equal(got.scale, ref_scale), f"scale mismatch module {i}")
+
+    def _run_kwargs_mix(self, mutate):
+        # two same-shape modules whose per-layer quant kwargs differ must NOT
+        # share a stacked chunk (chunk[0]'s kwargs would silently apply to
+        # both), and each must still match its serial result bit-for-bit
+        from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+
+        with torch.no_grad():
+            serial = []
+            for i in range(2):
+                layer = self._layer(seed=i, sym=True, with_imatrix=False)
+                mutate(layer, i)
+                w = self._make_wrapper(layer)
+                out = w.unwrapper({})
+                serial.append(out.weight.data.clone())
+        import torch.nn as nn
+
+        model = nn.Module()
+        staged = []
+        for i in range(2):
+            layer = self._layer(seed=i, sym=True, with_imatrix=False)
+            mutate(layer, i)
+            setattr(model, f"k{i}", layer)
+            staged.append((f"k{i}", self._make_wrapper(layer)))
+        stacks = []
+        real_stack = torch.stack
+
+        def spy_stack(tensors, *a, **k):
+            stacks.append(len(tensors))
+            return real_stack(tensors, *a, **k)
+
+        with mock.patch.object(torch, "stack", side_effect=spy_stack):
+            run_batched_rtn_search(model, staged)
+        self.assertEqual(stacks, [])  # no stacked call: differing kwargs -> per-module
+        for i in range(2):
+            got = getattr(model, f"k{i}")
+            self.assertTrue(torch.equal(got.weight.data, serial[i]), f"weight mismatch module {i}")
+
+    def test_mixed_scale_dtype_never_shares_batch(self):
+        def mutate(layer, i):
+            layer.scale_dtype = torch.float16 if i == 0 else torch.bfloat16
+
+        self._run_kwargs_mix(mutate)
+
+    def test_super_bits_on_one_layer_never_shares_batch(self):
+        def mutate(layer, i):
+            if i == 1:
+                layer.super_bits = 2
+                layer.super_group_size = 16
+
+        self._run_kwargs_mix(mutate)
+
+    def test_global_scale_difference_never_shares_batch(self):
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+
+        with torch.no_grad():
+            serial = []
+            for i in range(2):
+                layer = self._layer(seed=i, sym=True, with_imatrix=False)
+                w = self._make_wrapper(layer)
+                w.weight_global_scale = torch.tensor(1.0 + i)
+                out = w.unwrapper({})
+                serial.append(out.weight.data.clone())
+
+        model = nn.Module()
+        staged = []
+        for i in range(2):
+            layer = self._layer(seed=i, sym=True, with_imatrix=False)
+            w = self._make_wrapper(layer)
+            w.weight_global_scale = torch.tensor(1.0 + i)
+            setattr(model, f"g{i}", layer)
+            staged.append((f"g{i}", w))
+        stacks = []
+        real_stack = torch.stack
+
+        def spy_stack(tensors, *a, **k):
+            stacks.append(len(tensors))
+            return real_stack(tensors, *a, **k)
+
+        with mock.patch.object(torch, "stack", side_effect=spy_stack):
+            run_batched_rtn_search(model, staged)
+        self.assertEqual(stacks, [])
+        for i in range(2):
+            got = getattr(model, f"g{i}")
+            self.assertTrue(torch.equal(got.weight.data, serial[i]), f"weight mismatch module {i}")
 
     def test_parity_conv1d_square(self):
         self._run_conv1d(nf=64, nx=64)

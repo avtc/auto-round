@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-import time
 from math import ceil
 
 import torch

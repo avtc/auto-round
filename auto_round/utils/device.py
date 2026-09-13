@@ -789,8 +789,12 @@ def _allocate_layers_to_devices(
     sorted_layers = sorted(remaining.items(), key=lambda x: (-x[1]["param_memory"], -layer_order[x[0]]))
     num_devices = len(gpu_devices)
 
-    def find_best_device(layer_name, estimated_memory, layer_idx):
-        """Find the best device for a layer."""
+    def find_best_device(layer_name, estimated_memory, layer_idx, strict=False):
+        """Find the best device for a layer.
+
+        strict=True returns None when no device has budget left (used by the
+        atomic-group allocator, which must fail loudly instead of overcommitting).
+        """
         # Phase 1: Direct assign largest layers to higher-index devices first
         if layer_idx < num_devices - 1:
             return gpu_devices[-(layer_idx + 1)]
@@ -822,6 +826,8 @@ def _allocate_layers_to_devices(
                 best_device = device
 
         # Fallback: device with most available memory
+        if best_device is None and strict:
+            return None
         return best_device or max(gpu_devices, key=lambda d: device_memory[d])
 
     # Allocate the remaining (non-preassigned) layers in ATOMIC GROUPS: leaves under the
@@ -849,7 +855,7 @@ def _allocate_layers_to_devices(
     for layer_idx, (key, unit_param_memory, _order) in enumerate(grouped_units):
         members = _groups[key]
         estimated_memory = unit_param_memory * mem_per_param
-        best_device = find_best_device(members[0], estimated_memory, layer_idx)
+        best_device = find_best_device(members[0], estimated_memory, layer_idx, strict=True)
         if best_device is None:  # not even one device fits the unit: fail loudly
             raise RuntimeError(f"atomic module group '{key}' ({estimated_memory:.2f} GB) fits no device budget")
         for layer_name in members:

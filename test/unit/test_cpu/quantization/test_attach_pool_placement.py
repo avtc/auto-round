@@ -74,12 +74,9 @@ class TestAttachPoolPlacement(unittest.TestCase):
         cls, self_, runner = _fake_orchestrator(cache_device="cuda:0", mode="auto")
         placement = _FakePlacement(("cuda:0",))
         pools = self._pools()[0]
-        expected_pool_bytes = sum(t.numel() * t.element_size() for t in pools) * 2  # chains=1 -> x1?
         with mock.patch(
             "auto_round.utils.pool_placement.resolve_placement_for_pool", return_value=placement
-        ) as resolve, mock.patch(
-            "auto_round.utils.pool_placement.consolidate_pool_onto"
-        ) as cons:
+        ) as resolve, mock.patch("auto_round.utils.pool_placement.consolidate_pool_onto") as cons:
             cls._attach_pool_placement(self_, object(), pools)
         cons.assert_called_once()
         _, target, _block, _bs = cons.call_args.args[:4]
@@ -87,7 +84,6 @@ class TestAttachPoolPlacement(unittest.TestCase):
         self.assertEqual(target, "cuda:0")
         # chains=1 (need_quanted_input False): reserve equals the pool bytes
         self.assertEqual(reserved, sum(t.numel() * t.element_size() for t in pools))
-        _ = expected_pool_bytes  # kept for readability of the assertion above
         self.assertIs(runner.pool_placement, placement)
         resolve.assert_called_once()
 

@@ -269,8 +269,8 @@ class BlockForwardRunner:
     def _gather_same_device(values, target_device):
         """Ensure per-sample tensors are same-device before torch.cat.
 
-        With sharded calibration-data placement (--calibration_data_device /
-        --calibration_data_device) a selected batch can span several park
+        With sharded calibration-data placement (--calibration_data_device)
+        a selected batch can span several park
         devices; gather onto ``target_device`` (the compute device) in that
         case. Uniform-device selections are returned untouched -- byte-identical
         to the single-device behavior.

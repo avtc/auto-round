@@ -72,6 +72,12 @@ def _staged_imatrix(wrapper, weight):
 
 def _staged_key(wrapper, weight, imatrix):
     layer = wrapper.orig_layer
+    # The stacked call assembles quant kwargs once from chunk[0], so every
+    # per-layer kwarg _quant_call_kwargs injects must be part of the key:
+    # modules differing in any of them never share a batch (nv-fp4 computes
+    # weight_global_scale per layer; scale_dtype/super_* come from
+    # per-layer config pins). imatrix is passed as a stacked override.
+    global_scale = getattr(wrapper, "weight_global_scale", None)
     return (
         str(weight.device),
         tuple(weight.shape),
@@ -82,6 +88,10 @@ def _staged_key(wrapper, weight, imatrix):
         float(getattr(wrapper, "q_scale_thresh", 1e-5)),
         imatrix is not None,
         _fn_key(wrapper.weight_quant_func),
+        str(getattr(layer, "scale_dtype", None)),
+        getattr(layer, "super_bits", None),
+        getattr(layer, "super_group_size", None),
+        None if global_scale is None else float(global_scale),
     )
 
 
@@ -159,12 +169,35 @@ def run_batched_rtn_search(model, staged, max_batch=None):
                 return str(wk)
         return str(chunk[0]["weight"].device)  # not found (should not happen): stay home
 
+    def _swap_to_eager(wrapper):
+        """Point weight_quant_func at the eager original (returns restore fn or None).
+
+        unwrapper({}) -> _qdq_weight calls the (possibly torch.compile-wrapped)
+        weight_quant_func itself; on worker threads that first call would race
+        dynamo's trace lock, exactly like the stacked path.
+        """
+        fn = wrapper.weight_quant_func
+        orig = getattr(fn, "_torchdynamo_orig_callable", None)
+        if orig is None:
+            return None
+        wrapper.weight_quant_func = orig
+
+        def _restore():
+            wrapper.weight_quant_func = fn
+
+        return _restore
+
     def _run_chunk(chunk, worker, threaded=False):
         w0 = chunk[0]["w"]
         dev = str(chunk[0]["weight"].device)
         worker = str(worker)
         if len(chunk) == 1:
-            layer = chunk[0]["w"].unwrapper({})
+            _restore = _swap_to_eager(chunk[0]["w"]) if (threaded or worker != dev) else None
+            try:
+                layer = chunk[0]["w"].unwrapper({})
+            finally:
+                if _restore is not None:
+                    _restore()
             set_module(model, chunk[0]["name"], layer)
             return
         weights = [e["weight"] for e in chunk]
@@ -197,7 +230,12 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             )
             dump_oom_tensor_census_("rtn batched search")
             for e in chunk:
-                layer = e["w"].unwrapper({})
+                _restore = _swap_to_eager(e["w"]) if (threaded or worker != dev) else None
+                try:
+                    layer = e["w"].unwrapper({})
+                finally:
+                    if _restore is not None:
+                        _restore()
                 set_module(model, e["name"], layer)
             return
         n = len(chunk)

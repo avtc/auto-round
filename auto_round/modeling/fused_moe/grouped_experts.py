@@ -1076,7 +1076,9 @@ def _run_routes(
             out_g = _grouped_linear(x_g, w, counts, offsets)
             if out_buf is None:
                 out_buf = torch.zeros(num_valid, out_g.size(-1), device=inp.device, dtype=out_g.dtype)
-            out_buf.index_copy_(0, rows.to(inp.device), out_g.to(inp.device))
+            # device-only .to() would crash on cross-group dtype mixes; the
+            # buffer dtype is the first group's expert-output dtype by design
+            out_buf.index_copy_(0, rows.to(inp.device), out_g.to(device=inp.device, dtype=out_buf.dtype))
         return out_buf
 
     up_out = _run_slot("up_proj", up_groups, x_all)
