@@ -311,13 +311,13 @@ class TestOomCensus(unittest.TestCase):
         t = torch.randn(4, 4)
         with mock.patch.object(type(t), "shape", new_callable=lambda *a: property(lambda self: (UnhashableDim(),))):
             groups = oom_mod._group_tensors_by_shape([t])
-        self.assertEqual(groups, [])  # cpu tensor anyway excluded; symbolic shape did not raise
+        self.assertEqual(groups, ([], 0))  # cpu tensor excluded; symbolic shape did not raise
 
         class ExplodingTensor:
             pass
 
         groups = oom_mod._group_tensors_by_shape([ExplodingTensor(), torch.randn(4, 4)])
-        self.assertEqual(groups, [])
+        self.assertEqual(groups, ([], 0))
 
     def test_cpu_tensors_excluded_from_census_groups(self):
         # cpu-only box: grouping must not count cpu (or meta) tensors
@@ -325,7 +325,7 @@ class TestOomCensus(unittest.TestCase):
 
         t = torch.randn(4, 4)
         groups = oom_mod._group_tensors_by_shape([t])
-        self.assertEqual(groups, [])
+        self.assertEqual(groups, ([], 0))
 
     def test_message_based_oom_triggers_census(self):
         # HPU-class OOMs surface as RuntimeError("... out of memory ...")

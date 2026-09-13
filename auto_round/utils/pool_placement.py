@@ -350,7 +350,10 @@ def placement_need_bytes(block, pool, batch_size: int) -> int:
 
         _, layer_activation_memory, _, additional_memory = estimate_tuning_block_mem(block, pool, batch_size)
         return int((layer_activation_memory + additional_memory) * 2**30) + _RESERVE_BYTES
-    except Exception:  # pragma: no cover - placement must never break quantization
+    except Exception as e:  # pragma: no cover - placement must never break quantization
+        logger.warning(
+            "[calib-data-device] working-set estimate failed (%s); using %.1fGiB reserve", e, _RESERVE_BYTES / 2**30
+        )
         return _RESERVE_BYTES
 
 
@@ -387,6 +390,7 @@ def resolve_placement_for_pool(
             _probe_usable_bytes,
             mode=mode,
         )
-    except Exception:  # pragma: no cover - placement must never break quantization
+    except Exception as e:  # pragma: no cover - placement must never break quantization
+        logger.warning("[calib-data-device] placement resolve failed (%s); keeping single-device behavior", e)
         return None
     return plan

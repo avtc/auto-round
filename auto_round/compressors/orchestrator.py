@@ -238,7 +238,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     primary,
                 ),
             )
-        except Exception:  # pragma: no cover - placement must never break quantization
+        except Exception as e:  # pragma: no cover - placement must never break quantization
+            logger.warning("[calib-data-device] attach failed (%s); keeping single-device behavior", e)
             placement = None
         runner.pool_placement = placement
 
@@ -408,8 +409,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     import torch._dynamo as _dynamo
 
                     _dynamo.reset()
-                except Exception:  # pragma: no cover - never break the block loop
-                    pass
+                except Exception as e:  # pragma: no cover - never break the block loop
+                    logger.warning("dynamo cache reset at block end failed (%s)", e)
             # Belt-and-braces: no module may carry staged batched-search inputs
             # (weight reshape + imatrix copies) across the block boundary; the
             # first block-3 census showed search-stack groups retained into the

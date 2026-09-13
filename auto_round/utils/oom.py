@@ -35,7 +35,7 @@ import torch
 from auto_round.logger import logger
 
 
-def _group_tensors_by_shape(objs) -> list:
+def _group_tensors_by_shape(objs) -> tuple:
     """(device, dtype, shape) -> [count, bytes] over accelerator tensors; sorted by bytes.
 
     Covers every non-cpu accelerator (cuda, hpu, xpu, mps, ...): the census
@@ -48,6 +48,8 @@ def _group_tensors_by_shape(objs) -> list:
         except Exception:  # symbolic dims (SymInt) or exotic shapes: stringify
             return (str(tuple(shape)),)
 
+    skipped = 0
+
     groups: dict = {}
     for obj in objs:
         try:
@@ -56,6 +58,7 @@ def _group_tensors_by_shape(objs) -> list:
             key = (str(obj.device), str(obj.dtype), _shape_key(obj.shape))
             nbytes = int(obj.numel()) * obj.element_size()
         except Exception:  # one unreadable tensor must never kill the census
+            skipped += 1
             continue
         g = groups.get(key)
         if g is None:
@@ -63,7 +66,7 @@ def _group_tensors_by_shape(objs) -> list:
         else:
             g[0] += 1
             g[1] += nbytes
-    return sorted(groups.items(), key=lambda kv: -kv[1][1])
+    return sorted(groups.items(), key=lambda kv: -kv[1][1]), skipped
 
 
 def _representatives(groups, objs):
@@ -222,11 +225,13 @@ def _dump_census(gc):
             pass
         objs = gc.get_objects()
         per_device: dict = {}
-        top = _group_tensors_by_shape(objs)
+        top, _skipped = _group_tensors_by_shape(objs)
         for (_dev, _dt, _shape), (_cnt, _nb) in top:
             per_device[_dev] = per_device.get(_dev, 0) + _nb
         for _dev, _nb in sorted(per_device.items(), key=lambda kv: -kv[1]):
             logger.error("[oom] %s live tensors ≈ %.2fGiB", _dev, _nb / 2**30)
+        if _skipped:
+            logger.error("[oom] census skipped %d unreadable tensors", _skipped)
         for (_dev, _dt, _shape), (_cnt, _nb) in top[:8]:
             logger.error("[oom] %s %s %s x%d = %.2fGiB", _dev, _dt, list(_shape), _cnt, _nb / 2**30)
         # holder attribution runs LAST and fully guarded: it must never cost the
