@@ -45,7 +45,8 @@ def _group_tensors_by_shape(objs) -> tuple:
     def _shape_key(shape) -> tuple:
         try:
             return tuple(int(d) for d in shape)
-        except Exception:  # symbolic dims (SymInt) or exotic shapes: stringify
+        except Exception as e:  # symbolic dims (SymInt) or exotic shapes: stringify
+            logger.debug("[oom] census shape key fell back to str (%s)", e)
             return (str(tuple(shape)),)
 
     skipped = 0
@@ -57,7 +58,8 @@ def _group_tensors_by_shape(objs) -> tuple:
                 continue
             key = (str(obj.device), str(obj.dtype), _shape_key(obj.shape))
             nbytes = int(obj.numel()) * obj.element_size()
-        except Exception:  # one unreadable tensor must never kill the census
+        except Exception as e:  # one unreadable tensor must never kill the census
+            logger.debug("[oom] census skipping unreadable tensor (%s)", e)
             skipped += 1
             continue
         g = groups.get(key)
@@ -78,7 +80,8 @@ def _representatives(groups, objs):
             if not isinstance(obj, torch.Tensor) or obj.device.type in ("cpu", "meta"):
                 continue
             key = (str(obj.device), str(obj.dtype), _shape_key_public(obj.shape))
-        except Exception:
+        except Exception as e:
+            logger.debug("[oom] census representative scan skipped a tensor (%s)", e)
             continue
         if key in wanted and key not in seen:
             seen[key] = obj
@@ -90,7 +93,8 @@ def _representatives(groups, objs):
 def _shape_key_public(shape):
     try:
         return tuple(int(d) for d in shape)
-    except Exception:
+    except Exception as e:
+        logger.debug("[oom] census public shape key fell back to str (%s)", e)
         return (str(tuple(shape)),)
 
 
@@ -117,10 +121,12 @@ def _describe_frame(frame, target):
             try:
                 if v is target or (isinstance(v, list) and len(v) <= 4096 and target in v):
                     names.append(str(k))
-            except Exception:
+            except Exception as e:
+                logger.debug("[oom] census frame-local scan skipped a local (%s)", e)
                 continue
         return where + (f" locals:{','.join(names[:4])}" if names else "")
-    except Exception:
+    except Exception as e:
+        logger.debug("[oom] census frame description fell back to bare 'frame' (%s)", e)
         return "frame"
 
 
@@ -132,8 +138,8 @@ def _attr_name_of(owner, target):
             for k, v in d.items():
                 if v is target:
                     return str(k)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[oom] census attr-name scan failed (%s)", e)
     return None
 
 
@@ -221,8 +227,8 @@ def _dump_census(gc):
                     torch.cuda.memory_allocated(idx) / 2**30,
                     torch.cuda.memory_reserved(idx) / 2**30,
                 )
-        except Exception:  # pragma: no cover - allocator stats are cuda-only
-            pass
+        except Exception as e:  # pragma: no cover - allocator stats are cuda-only
+            logger.debug("[oom] allocator stats unavailable (%s)", e)
         objs = gc.get_objects()
         per_device: dict = {}
         top, _skipped = _group_tensors_by_shape(objs)
@@ -295,8 +301,8 @@ def install_oom_census_hook() -> bool:
         try:
             if _is_oom(val):
                 dump_oom_tensor_census_("uncaught")
-        except Exception:  # pragma: no cover - diagnostics must not mask the error
-            pass
+        except Exception as e:  # pragma: no cover - diagnostics must not mask the error
+            logger.error("[oom] census hook failed while reporting (%s)", e)
         prior_sys(tp, val, tb)
 
     def _the_hook(args):
@@ -304,8 +310,8 @@ def install_oom_census_hook() -> bool:
             if _is_oom(args.exc_value):
                 name = args.thread.name if args.thread is not None else "?"
                 dump_oom_tensor_census_(f"uncaught (thread {name})")
-        except Exception:  # pragma: no cover - diagnostics must not mask the error
-            pass
+        except Exception as e:  # pragma: no cover - diagnostics must not mask the error
+            logger.error("[oom] census hook failed while reporting (%s)", e)
         prior_the(args)
 
     sys.excepthook = _sys_hook
