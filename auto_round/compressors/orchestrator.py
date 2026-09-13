@@ -398,6 +398,18 @@ class CompressionOrchestrator(BaseOrchestrator):
             q_input = new_q_input
 
             # ── Infrastructure: hook removal, device cleanup, logging ─────────
+            # Census-named accumulator: each block's torch.compile tracing
+            # leaves FX-graph example tensors and shape-env TrackedFake entries
+            # pinned in dynamo's caches (~GB-class per block, growing). Blocks
+            # compile fresh wrappers anyway, so the previous block's compiled
+            # artifacts are pure dead weight -- reset the caches at the boundary.
+            if getattr(self.compress_context, "enable_torch_compile", False):
+                try:
+                    import torch._dynamo as _dynamo
+
+                    _dynamo.reset()
+                except Exception:  # pragma: no cover - never break the block loop
+                    pass
             # Belt-and-braces: no module may carry staged batched-search inputs
             # (weight reshape + imatrix copies) across the block boundary; the
             # first block-3 census showed search-stack groups retained into the

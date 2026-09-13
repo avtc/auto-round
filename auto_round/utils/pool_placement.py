@@ -286,6 +286,7 @@ def resolve_pool_placement(
     if mode == "cpu":
         return PoolPlacement(["cpu"], [1], n_chunks)  # explicit host-RAM parking
     if str(primary).startswith("cpu"):
+        logger.debug("[calib-data-device] resolve: none (cpu primary)")
         return None  # low_gpu_mem_usage (or a CPU lane) owns placement here
     forced = None
     if mode not in ("", "auto"):
@@ -307,6 +308,7 @@ def resolve_pool_placement(
     probed = [(d, free_probe(d)) for d in candidates]
     usable = [(d, f) for d, f in probed if f is not None and f > 0]
     if not usable:
+        logger.debug("[calib-data-device] resolve: none (no usable device among %s)", candidates)
         return None
 
     primary_free = dict(usable).get(str(primary), 0)
@@ -316,6 +318,12 @@ def resolve_pool_placement(
 
     total = sum(f for _, f in usable)
     if total - need_bytes < pool_bytes:
+        logger.debug(
+            "[calib-data-device] resolve: none (insufficient: total %.2fGiB - need %.2fGiB < pool %.2fGiB)",
+            total / 2**30,
+            need_bytes / 2**30,
+            pool_bytes / 2**30,
+        )
         return None  # sharding cannot help either: keep today's behavior, real OOM fires
 
     # capacity-aware sharding: subtract the working-set need from the primary only
