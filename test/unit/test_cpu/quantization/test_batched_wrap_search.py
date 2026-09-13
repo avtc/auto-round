@@ -19,8 +19,8 @@ from unittest import mock
 
 import torch
 
-import auto_round.algorithms.quantization.search_shard as search_shard
-from auto_round.algorithms.quantization.search_shard import run_batched_wrap_search
+import auto_round.algorithms.quantization.search_dispatch as search_dispatch
+from auto_round.algorithms.quantization.search_dispatch import run_batched_wrap_search
 
 
 def _mk_inputs(seed=0, shape=(6, 128), dtype="int", bits=4, thresh=1e-5, device="cpu"):
@@ -160,10 +160,10 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
             calls.append(len(tensors))
             return real_stack(tensors, *a, **k)
 
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
         with mock.patch.object(torch, "stack", side_effect=spy_stack), mock.patch.object(
-            shard_mod, "_probe_usable_bytes", return_value=2**40
+            dispatch_mod, "_probe_usable_bytes", return_value=2**40
         ):
             run_batched_wrap_search(fakes)
         # 2**28 // (2 * 1024 * 128) = 1024 -> all 6 in one batch (probe cap 64 governs); then a huge probe
@@ -171,7 +171,7 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
         self.assertTrue(all(c == 6 for c in calls))
 
     def test_env_gb_override_caps_batches(self):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
         # tiny modules (0.26M elems each): 1 GiB budget would allow ~1000 -> force 2 per batch via GB override
         fakes = [FakeDeferred(seed=i, shape=(1024, 128)) for i in range(4)]
@@ -182,7 +182,7 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
             calls.append(len(tensors))
             return real_stack(tensors, *a, **k)
 
-        with mock.patch.object(shard_mod.envs, "AR_WRAP_SEARCH_BATCH_GB", 0.001), mock.patch.object(
+        with mock.patch.object(dispatch_mod.envs, "AR_SEARCH_BATCH_GB", 0.001), mock.patch.object(
             torch, "stack", side_effect=spy_stack
         ):
             run_batched_wrap_search(fakes)
@@ -193,10 +193,10 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
             self.assertIsNotNone(f.init_scale)
 
     def test_env_gb_override_invalid_falls_back(self):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
         fakes = [FakeDeferred(seed=i) for i in range(4)]
-        with mock.patch.object(shard_mod.envs, "AR_WRAP_SEARCH_BATCH_GB", "not-a-number"):
+        with mock.patch.object(dispatch_mod.envs, "AR_SEARCH_BATCH_GB", "not-a-number"):
             handled = run_batched_wrap_search(fakes)
         self.assertTrue(handled)  # default budget applies, no crash
         for f in fakes:
@@ -204,7 +204,7 @@ class TestRunBatchedWrapSearch(unittest.TestCase):
 
     def test_kill_switch_disables(self):
         fakes = [FakeDeferred(seed=i) for i in range(3)]
-        with mock.patch.object(search_shard.envs, "AR_DISABLE_SEARCH_SHARD", True):
+        with mock.patch.object(search_dispatch.envs, "AR_DISABLE_BATCHED_SEARCH", True):
             handled = run_batched_wrap_search(fakes)
         self.assertFalse(handled)
         self.assertIsNone(fakes[0].init_scale)  # inputs untouched: caller runs them per module
@@ -359,12 +359,12 @@ class TestKwargRelocation(unittest.TestCase):
 
 class TestSearchWorkerPicking(unittest.TestCase):
     def _pick(self, working_set, free_map, home="cuda:0"):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
         with mock.patch.object(torch.cuda, "device_count", return_value=len(free_map)), mock.patch.object(
-            shard_mod, "_probe_usable_bytes", side_effect=lambda k: free_map.get(k)
+            dispatch_mod, "_probe_usable_bytes", side_effect=lambda k: free_map.get(k)
         ):
-            return shard_mod.pick_search_worker_devices(working_set, home_device=home)
+            return dispatch_mod.pick_search_worker_devices(working_set, home_device=home)
 
     def test_full_home_goes_to_idle_devices(self):
         free = {"cuda:0": 1 * 2**30, "cuda:1": 12 * 2**30, "cuda:2": 12 * 2**30}
@@ -380,16 +380,16 @@ class TestSearchWorkerPicking(unittest.TestCase):
         self.assertEqual(self._pick(2 * 2**30, free), ["cuda:0", "cuda:1"])
 
     def test_kill_switch_pins_home(self):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
-        with mock.patch.object(shard_mod.envs, "AR_DISABLE_SEARCH_OFFLOAD", True):
-            self.assertEqual(shard_mod.pick_search_worker_devices(4 * 2**30, home_device="cuda:3"), ["cuda:3"])
+        with mock.patch.object(dispatch_mod.envs, "AR_DISABLE_MULTIGPU_SEARCH", True):
+            self.assertEqual(dispatch_mod.pick_search_worker_devices(4 * 2**30, home_device="cuda:3"), ["cuda:3"])
 
     def test_no_cuda_returns_home(self):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
         with mock.patch.object(torch.cuda, "device_count", return_value=0):
-            self.assertEqual(shard_mod.pick_search_worker_devices(4 * 2**30, home_device="cpu"), ["cpu"])
+            self.assertEqual(dispatch_mod.pick_search_worker_devices(4 * 2**30, home_device="cpu"), ["cpu"])
 
     def test_rtn_driver_offloads_to_viable_worker(self):
         # CPU-only: workers = [home] so behavior is the parity path already covered;
@@ -405,7 +405,7 @@ class TestSearchWorkerPicking(unittest.TestCase):
             setattr(model, f"l{i}", layer)
             staged.append((f"l{i}", TestBatchedRtnSearchParity()._make_wrapper(layer)))
         with mock.patch(
-            "auto_round.algorithms.quantization.search_shard.pick_search_worker_devices",
+            "auto_round.algorithms.quantization.search_dispatch.pick_search_worker_devices",
             return_value=["cpu"],
         ):
             leftovers = run_batched_rtn_search(model, staged)
@@ -471,7 +471,7 @@ class TestWrapperBlockDrivesBatching(unittest.TestCase):
             self.assertIsNotNone(m.init_scale)
 
     def test_kill_switch_runs_per_module(self):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
         import auto_round.wrapper as wrapper_mod
 
         stats = {"inline": 0, "now": 0}
@@ -499,7 +499,7 @@ class TestWrapperBlockDrivesBatching(unittest.TestCase):
                 raise AssertionError("must not batch under the kill switch")
 
         block = self._fake_block()
-        with mock.patch.object(shard_mod.envs, "AR_DISABLE_SEARCH_SHARD", True):
+        with mock.patch.object(dispatch_mod.envs, "AR_DISABLE_BATCHED_SEARCH", True):
             wrapper_mod.wrapper_block(
                 block, False, False, enable_torch_compile=False, device="cpu", wrapper_cls=FakeBatched
             )

@@ -100,7 +100,7 @@ def run_items_by_device(groups, fn, use_cuda_ctx=True):
     for device_key, indexed_items in groups.items():
         if not indexed_items:
             continue
-        t = threading.Thread(target=_worker, args=(device_key, indexed_items), name=f"search-shard-{device_key}")
+        t = threading.Thread(target=_worker, args=(device_key, indexed_items), name=f"search-dispatch-{device_key}")
         t.start()
         threads.append(t)
     for t in threads:
@@ -109,9 +109,9 @@ def run_items_by_device(groups, fn, use_cuda_ctx=True):
         raise first_error[0]
 
 
-def search_offload_disabled():
+def multigpu_search_disabled():
     """Kill switch for running batched searches on idle devices."""
-    return bool(envs.AR_DISABLE_SEARCH_OFFLOAD)
+    return bool(envs.AR_DISABLE_MULTIGPU_SEARCH)
 
 
 def pick_search_worker_devices(working_set_bytes, home_device=None, margin_bytes=512 * 2**20):
@@ -124,7 +124,7 @@ def pick_search_worker_devices(working_set_bytes, home_device=None, margin_bytes
     fits, the home device is returned so the caller keeps today's behavior and
     relies on the per-chunk OOM fallback.
     """
-    if search_offload_disabled():
+    if multigpu_search_disabled():
         return [home_device] if home_device is not None else []
     try:
         count = torch.cuda.device_count()
@@ -148,7 +148,7 @@ _ENGAGED_LOGGED = set()
 
 
 def log_engaged_once(label):
-    """Log the sharding engagement once per process (INFO, no counters).
+    """Log the batching engagement once per process (INFO, no counters).
 
     Detailed per-block counters are intentionally not emitted here; they belong
     to the perf-counter infrastructure of the parallel-tuning work.
@@ -156,12 +156,12 @@ def log_engaged_once(label):
     if label in _ENGAGED_LOGGED:
         return
     _ENGAGED_LOGGED.add(label)
-    logger.info("[search-shard] %s: running weight-local searches with one worker per device", label)
+    logger.info("[batched-search] %s: running weight-local searches with one worker per device", label)
 
 
-def shard_disabled_by_env():
-    """Kill switch for the per-device search sharding."""
-    return bool(envs.AR_DISABLE_SEARCH_SHARD)
+def batched_search_disabled():
+    """Kill switch for the batched search machinery (stacking + per-device workers)."""
+    return bool(envs.AR_DISABLE_BATCHED_SEARCH)
 
 
 def _wrap_batch_device_of(inputs):
@@ -186,14 +186,14 @@ def _fn_key(fn):
             qualname = fn.func.__qualname__
             module = fn.func.__module__
         except AttributeError as e:  # pragma: no cover - exotic callables
-            logger.debug("[search-shard] partial target %r has no qualname (%s); keying by repr", fn.func, e)
+            logger.debug("[batched-search] partial target %r has no qualname (%s); keying by repr", fn.func, e)
             return repr(fn)
         return ("partial", module, qualname, fn.args, kwargs)
     if callable(fn):
         try:
             return ("fn", fn.__module__, fn.__qualname__)
         except AttributeError as e:  # pragma: no cover - exotic callables
-            logger.debug("[search-shard] callable %r has no qualname (%s); keying by repr", fn, e)
+            logger.debug("[batched-search] callable %r has no qualname (%s); keying by repr", fn, e)
             return repr(fn)
     return repr(fn)
 
@@ -220,7 +220,7 @@ def _probe_usable_bytes(device_key):
         free += torch.cuda.memory_reserved(dev.index) - torch.cuda.memory_allocated(dev.index)
         return max(free, 0)
     except (ValueError, RuntimeError, AttributeError) as e:
-        logger.debug("[search-shard] free-memory probe failed for %s (%s)", device_key, e)
+        logger.debug("[batched-search] free-memory probe failed for %s (%s)", device_key, e)
         return None
 
 
@@ -228,9 +228,9 @@ _WRAP_BATCH_MAX_ELEMS = 2**28  # ~1 GiB fp32 stacked weights per batched call (m
 
 
 def _wrap_batch_max_elems():
-    """Element budget per stacked batch; AR_WRAP_SEARCH_BATCH_GB overrides in GiB of fp32 weights."""
+    """Element budget per stacked batch; AR_SEARCH_BATCH_GB overrides in GiB of fp32 weights."""
     try:
-        gb = float(envs.AR_WRAP_SEARCH_BATCH_GB)
+        gb = float(envs.AR_SEARCH_BATCH_GB)
     except (TypeError, ValueError):
         gb = None
     if gb is not None and gb > 0:
@@ -271,11 +271,11 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
     budget on the group's device; groups on different devices run on one worker
     thread per device; singleton groups take the identical per-module call.
 
-    Returns True when the inputs were consumed; False when sharding is disabled
-    by AR_DISABLE_SEARCH_SHARD (the caller then runs the searches per module).
+    Returns True when the inputs were consumed; False when batching is disabled
+    by AR_DISABLE_BATCHED_SEARCH (the caller then runs the searches per module).
     """
     del batch_vram_budget  # budget derived per device in _batch_cap
-    if shard_disabled_by_env():
+    if batched_search_disabled():
         return False
     if not deferred_wrappers:
         return False
@@ -322,9 +322,9 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
                     results = search_fn(stacked_w, _bits, stacked_im)
                 except torch.OutOfMemoryError:
                     logger.warning(
-                        "[search-shard] stacked wrap search OOM (%d modules); finishing this chunk "
-                        "per-module (shrink batches with AR_WRAP_SEARCH_BATCH_GB or disable with "
-                        "AR_DISABLE_SEARCH_SHARD=1)",
+                        "[batched-search] stacked wrap search OOM (%d modules); finishing this chunk "
+                        "per-module (shrink batches with AR_SEARCH_BATCH_GB or disable with "
+                        "AR_DISABLE_BATCHED_SEARCH=1)",
                         len(chunk),
                     )
                     dump_oom_tensor_census_("wrap search")
@@ -354,7 +354,7 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
     _n_single = sum(st["singletons"] for st in stats.values())
     per_device = " ".join(f"{dev}={st.get('wall', 0.0):.2f}s" for dev, st in stats.items())
     logger.debug(
-        "[search-shard] wrap search: %d modules, %d batch + %d singleton search calls, "
+        "[batched-search] wrap search: %d modules, %d batch + %d singleton search calls, "
         "%.2fs device-wall (%.2fs summed) [%s]",
         _n_mod,
         _n_batch,

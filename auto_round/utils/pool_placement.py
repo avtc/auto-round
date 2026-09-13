@@ -222,7 +222,7 @@ def consolidate_pool_onto(objs, target: str, block, batch_size: int, reserved_by
     """
     if not str(target).startswith("cuda"):
         return "spread"
-    from auto_round.algorithms.quantization.search_shard import _probe_usable_bytes
+    from auto_round.algorithms.quantization.search_dispatch import _probe_usable_bytes
 
     total = sum(_tensor_bytes(o) for o in objs if o is not None)
     if total <= 0:
@@ -392,7 +392,7 @@ def resolve_placement_for_pool(
     pool of the same size will also be produced for the block. ``block`` feeds
     the per-block working-set estimate.
     """
-    from auto_round.algorithms.quantization.search_shard import _probe_usable_bytes
+    from auto_round.algorithms.quantization.search_dispatch import _probe_usable_bytes
 
     pool_bytes = _tensor_bytes(pool) * max(int(chains), 1)
     n_chunks = _pool_chunk_count(pool)

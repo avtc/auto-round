@@ -37,10 +37,10 @@ if TYPE_CHECKING:
     AR_FORCE_MOE_ROUTING_ALL_EXPERTS: bool = False
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
     AR_ALLOW_W8_ASYM: bool = False
-    AR_DISABLE_SEARCH_SHARD: bool = False
+    AR_DISABLE_BATCHED_SEARCH: bool = False
     AR_PERF_COUNTERS: bool = False
-    AR_WRAP_SEARCH_BATCH_GB: Optional[float] = None
-    AR_DISABLE_SEARCH_OFFLOAD: bool = False
+    AR_SEARCH_BATCH_GB: Optional[float] = None
+    AR_DISABLE_MULTIGPU_SEARCH: bool = False
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -142,15 +142,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of restarting the whole tuning pass from block 0 after a
     # crash/kill. See auto_round/utils/resume.py.
     "AR_RESUME_DIR": lambda: os.getenv("AR_RESUME_DIR", None),
-    "AR_DISABLE_SEARCH_SHARD": lambda: os.getenv("AR_DISABLE_SEARCH_SHARD", "False").strip().lower()
+    "AR_DISABLE_BATCHED_SEARCH": lambda: os.getenv("AR_DISABLE_BATCHED_SEARCH", "False").strip().lower()
     in ("1", "true", "yes"),
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "False").strip().lower() in ("1", "true", "yes"),
-    "AR_WRAP_SEARCH_BATCH_GB": lambda: (
+    "AR_SEARCH_BATCH_GB": lambda: (
         (lambda v: v if v is None else (float(v) if v.replace(".", "", 1).replace("-", "", 1).isdigit() else None))(
-            os.getenv("AR_WRAP_SEARCH_BATCH_GB", "").strip() or None
+            os.getenv("AR_SEARCH_BATCH_GB", "").strip() or None
         )
     ),
-    "AR_DISABLE_SEARCH_OFFLOAD": lambda: os.getenv("AR_DISABLE_SEARCH_OFFLOAD", "False").strip().lower()
+    "AR_DISABLE_MULTIGPU_SEARCH": lambda: os.getenv("AR_DISABLE_MULTIGPU_SEARCH", "False").strip().lower()
     in ("1", "true", "yes"),
     # When enabled, MoE routing can be overridden in selected model wrappers
     # to rotate token assignments across all experts for calibration coverage.

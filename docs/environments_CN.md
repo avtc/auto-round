@@ -241,14 +241,14 @@ export AR_DISK_STREAM_MODEL=1
 AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --format auto_round
 ```
 
-### AR_DISABLE_SEARCH_SHARD
-- **描述**：禁用仅依赖权重的封装期搜索优化：SignRoundV2 init-scale 搜索的同形状堆叠批量搜索（设备/形状/配置相同的模块在一次调用中完成搜索，逐模块结果比特级一致），以及 optimized-RTN iters=0 搜索的按设备并行执行。每个搜索只读取自身模块的权重与逐模块统计量。设置该变量可回退到完全逐模块串行的搜索循环（例如用于调试）。
-- **默认值**：`0`（权重跨多个 CUDA 设备时启用分片）
+### AR_DISABLE_BATCHED_SEARCH
+- **描述**：禁用批量量化搜索机制：iters>0 的封装期 init-scale 搜索（SignRoundV2/GGUF DQ）与 iters=0 的 optimized-RTN 搜索都将完全串行、逐模块地在权重所在设备上执行。批量化将设备/形状/配置相同的模块堆叠为一次调用，逐模块结果比特级一致；设置该变量可回退到串行循环（例如用于调试，或二分定位疑似与批量化相关的差异）。堆叠也会改变瞬态显存占用（见 `AR_SEARCH_BATCH_GB`）。
+- **默认值**：`0`（启用批量化）
 - **有效取值**：`0` / `1`
-- **用法**：按设备搜索并行化的开关。
+- **用法**：批量/并行搜索机制的总开关。
 
 ```bash
-AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
+AR_DISABLE_BATCHED_SEARCH=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
 ### AR_PERF_COUNTERS
@@ -261,24 +261,24 @@ AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
 AR_PERF_COUNTERS=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
-### AR_WRAP_SEARCH_BATCH_GB
-- **描述**：以 GiB（每次批量调用的堆叠 fp32 权重大小）覆盖封装期批量搜索的元素预算（默认约 1 GiB，与专家批量搜索使用的固定预算一致）。该搜索受带宽限制，更大的批次通常不会缩短耗时；仅在显存紧张的卡上缩小瞬态占用或实验批次大小时使用。
+### AR_SEARCH_BATCH_GB
+- **描述**：以 GiB（每次批量调用的堆叠 fp32 权重大小）覆盖批量量化搜索的元素预算（默认约 1 GiB，与专家批量搜索使用的固定预算一致）。同时作用于两条 lane：iters=0 的 optimized-RTN 搜索与 iters>0 的封装期 init 搜索（二者共享批次上限）。该搜索受带宽限制，更大的批次通常不会缩短耗时；仅在显存紧张的卡上缩小瞬态占用或实验批次大小时使用。
 - **默认值**：未设置（固定约 1 GiB 预算）
 - **有效取值**：正浮点数（GiB）
 - **用法**：在显存紧张的多设备运行中缩小批次。
 
 ```bash
-AR_WRAP_SEARCH_BATCH_GB=0.5 python -m auto_round --model ... --device_map 0,1
+AR_SEARCH_BATCH_GB=0.5 python -m auto_round --model ... --device_map 0,1
 ```
 
-### AR_DISABLE_SEARCH_OFFLOAD
-- **描述**：禁用在空闲设备上运行批量化的仅依赖权重的搜索。此类搜索只读取自身模块的权重与逐模块统计量，因此堆叠批次可以在任何有瞬态工作集余量的 GPU 上执行——尤其是零样本（iters=0）单设备 lane 中原本空闲的 GPU。工作设备由修正后的空闲显存探针选择；当没有设备放得下时，批次留在权重所在设备并依赖逐批次的 OOM 回退。
-- **默认值**：`0`（启用卸载，探针门控）
+### AR_DISABLE_MULTIGPU_SEARCH
+- **描述**：让批量搜索批次留在权重所在设备上，不再使用其他 GPU。不设置该变量时，堆叠批次可以在任何有瞬态工作集余量的 CUDA 设备上执行（由带余量的空闲显存探针选择），因为此类搜索只读取自身模块的权重与逐模块统计量——从不读取校准激活。主要受益者是零样本（iters=0）lane：整个 block 位于单 GPU 上时，其余显卡原本空闲。该机制与 MoE 无关（任何堆叠批次都可以迁移执行）。以下情况设为 `1`：机架 GPU 与其他任务共享（空闲显存探针无法看到其他任务的占用）、调试跨设备行为、或 PCIe 传输开销超过搜索收益的主机。当没有设备放得下时，批次留在权重所在设备并依赖逐批次的 OOM 回退。
+- **默认值**：`0`（启用多 GPU 搜索，探针门控）
 - **有效取值**：`0` / `1`
-- **用法**：当机架上的 GPU 不应接收搜索流量时的开关。
+- **用法**：将搜索流量固定在权重所在设备。
 
 ```bash
-AR_DISABLE_SEARCH_OFFLOAD=1 python -m auto_round --model ... --iters 0
+AR_DISABLE_MULTIGPU_SEARCH=1 python -m auto_round --model ... --iters 0
 ```
 
 ### AR_RESUME_DIR

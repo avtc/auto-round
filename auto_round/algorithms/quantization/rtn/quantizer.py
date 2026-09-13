@@ -147,7 +147,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
         # block whose layers sit on several devices the searches run in
         # parallel, one worker per device.
         import auto_round.envs as _envs
-        from auto_round.algorithms.quantization import search_shard
+        from auto_round.algorithms.quantization import search_dispatch
 
         _perf = bool(getattr(_envs, "AR_PERF_COUNTERS", False))
         _t_norm = _ptime.perf_counter()
@@ -176,7 +176,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             _n += 1
             return name, w
 
-        if not search_shard.shard_disabled_by_env():
+        if not search_dispatch.batched_search_disabled():
             from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
 
             staged = []
@@ -188,7 +188,7 @@ class OptimizedRTNQuantizer(RTNQuantizer):
             for _name, w in leftovers:
                 layer = w.unwrapper({})
                 set_module(self.model, _name, layer)
-            search_shard.log_engaged_once("batched rtn search")
+            search_dispatch.log_engaged_once("batched rtn search")
         else:
             for m in work:
                 _quantize_counted(m)

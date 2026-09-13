@@ -846,10 +846,10 @@ def wrapper_block(
         elif enable_norm_bias_tuning and "norm" in m.__class__.__name__.lower():
             work.append((n, m, "norm"))
 
-    from auto_round.algorithms.quantization import search_shard
+    from auto_round.algorithms.quantization import search_dispatch
 
     _defer_batch = (
-        bool(getattr(wrapper_cls, "supports_batched_search", False)) and not search_shard.shard_disabled_by_env()
+        bool(getattr(wrapper_cls, "supports_batched_search", False)) and not search_dispatch.batched_search_disabled()
     )
     deferred_wrappers = []
 
@@ -891,7 +891,7 @@ def wrapper_block(
     if _defer_batch and deferred_wrappers:
         # stacked same-shape batches per (device, shape, config, search fn);
         # singletons and the kill-switch fall back to the identical per-module call
-        if not search_shard.run_batched_wrap_search(deferred_wrappers):
+        if not search_dispatch.run_batched_wrap_search(deferred_wrappers):
             for w in deferred_wrappers:
                 w._run_deferred_search_now()
 

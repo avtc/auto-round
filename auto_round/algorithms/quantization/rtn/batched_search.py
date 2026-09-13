@@ -29,7 +29,7 @@ from collections import OrderedDict
 
 import torch
 
-from auto_round.algorithms.quantization.search_shard import (
+from auto_round.algorithms.quantization.search_dispatch import (
     _batch_cap,
     _fn_key,
     dump_oom_tensor_census_,
@@ -195,7 +195,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         except torch.OutOfMemoryError:
             logger.warning(
                 "[rtn-batch] stacked search OOM (%d modules); finishing this chunk per-module "
-                "(shrink batches with AR_WRAP_SEARCH_BATCH_GB or disable with AR_DISABLE_SEARCH_SHARD=1)",
+                "(shrink batches with AR_SEARCH_BATCH_GB or disable with AR_DISABLE_BATCHED_SEARCH=1)",
                 len(chunk),
             )
             dump_oom_tensor_census_("rtn batched search")

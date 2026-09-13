@@ -243,7 +243,7 @@ class BaseQuantizer(BaseAlgorithm):
                 return layer
             layer = layer.unwrapper({})
         except torch.OutOfMemoryError:
-            from auto_round.algorithms.quantization.search_shard import dump_oom_tensor_census_
+            from auto_round.algorithms.quantization.search_dispatch import dump_oom_tensor_census_
 
             dump_oom_tensor_census_("rtn layer search")
             cuda_error_msg = traceback.format_exc()

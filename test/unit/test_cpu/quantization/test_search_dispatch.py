@@ -16,8 +16,8 @@ from unittest import mock
 
 import torch
 
-import auto_round.algorithms.quantization.search_shard as search_shard
-from auto_round.algorithms.quantization.search_shard import group_items_by_device, run_items_by_device
+import auto_round.algorithms.quantization.search_dispatch as search_dispatch
+from auto_round.algorithms.quantization.search_dispatch import group_items_by_device, run_items_by_device
 
 
 def _linear(out=8, inn=8):
@@ -150,7 +150,7 @@ class TestRtnSearchShard(unittest.TestCase):
         m.global_name = "m0"
         m.tuning_device = "cpu"
         block.m0 = m
-        with mock.patch.object(search_shard, "shard_disabled_by_env", return_value=True):
+        with mock.patch.object(search_dispatch, "batched_search_disabled", return_value=True):
             q.quantize_block(block, None, None, None, None, None)
         self.assertEqual(calls, [caller])
 
@@ -252,19 +252,19 @@ class TestOomCensus(unittest.TestCase):
                     raise RuntimeError("shape mismatch")
         census.assert_not_called()
 
-    def test_reexport_from_search_shard(self):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+    def test_reexport_from_search_dispatch(self):
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
         import auto_round.utils.oom as oom_mod
 
-        self.assertIs(shard_mod.dump_oom_tensor_census_, oom_mod.dump_oom_tensor_census_)
+        self.assertIs(dispatch_mod.dump_oom_tensor_census_, oom_mod.dump_oom_tensor_census_)
 
     def test_census_never_masks_and_never_raises(self):
-        import auto_round.algorithms.quantization.search_shard as shard_mod
+        import auto_round.algorithms.quantization.search_dispatch as dispatch_mod
 
         # CPU-only box: the census must swallow its own failures and return cleanly
-        shard_mod.dump_oom_tensor_census_("test")
+        dispatch_mod.dump_oom_tensor_census_("test")
         with mock.patch("auto_round.utils.oom._group_tensors_by_shape", side_effect=RuntimeError("boom")):
-            shard_mod.dump_oom_tensor_census_("test")  # diagnostics failure swallowed
+            dispatch_mod.dump_oom_tensor_census_("test")  # diagnostics failure swallowed
 
 
 class TestTunePhaseLine(unittest.TestCase):

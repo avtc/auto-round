@@ -230,7 +230,7 @@ class TestConsolidate(unittest.TestCase):
         return (
             mock.patch.object(pp, "placement_need_bytes", return_value=int(need_gib * 2**30)),
             mock.patch(
-                "auto_round.algorithms.quantization.search_shard._probe_usable_bytes",
+                "auto_round.algorithms.quantization.search_dispatch._probe_usable_bytes",
                 return_value=int(free_gib * 2**30),
             ),
         )

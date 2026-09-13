@@ -552,7 +552,7 @@ class SignRoundQuantizer(BaseQuantizer):
             if any(t.device != _ld for t in fp_outputs):
                 _pool_b = sum(t.numel() * t.element_size() for t in fp_outputs)
                 try:
-                    from auto_round.algorithms.quantization.search_shard import _probe_usable_bytes
+                    from auto_round.algorithms.quantization.search_dispatch import _probe_usable_bytes
 
                     _free = _probe_usable_bytes(str(_ld))
                 except Exception as e:  # pragma: no cover - diagnostics only
@@ -995,7 +995,7 @@ class SignRoundQuantizer(BaseQuantizer):
         try:
             scale_loss.backward()
         except torch.OutOfMemoryError:
-            from auto_round.algorithms.quantization.search_shard import dump_oom_tensor_census_
+            from auto_round.algorithms.quantization.search_dispatch import dump_oom_tensor_census_
 
             dump_oom_tensor_census_("tune backward")
             raise
