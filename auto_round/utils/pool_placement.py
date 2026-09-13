@@ -188,6 +188,68 @@ def _pool_chunk_count(obj) -> int:
     return 0
 
 
+def _move_pool_to(obj, target: str):
+    """Recursively move a pool's tensors onto ``target`` in place (skip locals)."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(target) if str(obj.device) != target else obj
+    if isinstance(obj, list):
+        for i in range(len(obj)):
+            obj[i] = _move_pool_to(obj[i], target)
+        return obj
+    if isinstance(obj, tuple):
+        return tuple(_move_pool_to(v, target) for v in obj)
+    if isinstance(obj, dict):
+        for k in list(obj.keys()):
+            obj[k] = _move_pool_to(obj[k], target)
+        return obj
+    return obj
+
+
+def consolidate_pool_onto(objs, target: str, block, batch_size: int) -> str:
+    """Consolidate the incoming calibration pools onto the compute device.
+
+    Returns ``'local'`` (already on target), ``'consolidated'`` (moved in one
+    bulk pass), or ``'spread'`` (the pools do not fit next to the block's
+    working set -- consumers keep fetching batch-by-batch instead). This is the
+    fits-home rung of the ladder: fit-primary / fit-home -> single device,
+    oversized pool -> spread + per-batch gather.
+    """
+    if not str(target).startswith("cuda"):
+        return "spread"
+    from auto_round.algorithms.quantization.search_shard import _probe_usable_bytes
+
+    total = sum(_tensor_bytes(o) for o in objs if o is not None)
+    if total <= 0:
+        return "local"
+    free = _probe_usable_bytes(target)
+    if free is None:
+        return "spread"
+    need = placement_need_bytes(block, objs[0], batch_size)
+    if free - need < total:
+        return "spread"
+    devices = set()
+
+    def _collect(o):
+        if isinstance(o, torch.Tensor):
+            devices.add(str(o.device))
+        elif isinstance(o, dict):
+            for v in o.values():
+                _collect(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                _collect(v)
+
+    for o in objs:
+        if o is not None:
+            _collect(o)
+    if devices <= {target}:
+        return "local"
+    for o in objs:
+        if o is not None:
+            _move_pool_to(o, target)
+    return "consolidated"
+
+
 def resolve_pool_placement(
     pool_bytes: int,
     n_chunks: int,

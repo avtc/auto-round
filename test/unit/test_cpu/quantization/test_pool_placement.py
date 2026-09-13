@@ -177,6 +177,57 @@ class TestCalibDataLine(unittest.TestCase):
         self.assertIn("'0': 1.00GB", line2)
 
 
+class TestConsolidate(unittest.TestCase):
+    class _OnDevice(torch.Tensor):
+        # real tensor (bytes/isinstance work) with an overridden device view
+        @property
+        def device(self):
+            return torch.device(self._fake_device)
+
+    def _tensor_on(self, dev):
+        t = torch.zeros(2).as_subclass(self._OnDevice)
+        t._fake_device = dev
+        return t
+
+    def _ctx(self, free_gib, need_gib):
+        return (
+            mock.patch.object(pp, "placement_need_bytes", return_value=int(need_gib * 2**30)),
+            mock.patch(
+                "auto_round.algorithms.quantization.search_shard._probe_usable_bytes",
+                return_value=int(free_gib * 2**30),
+            ),
+        )
+
+    def test_local_when_already_on_target(self):
+        pool = [self._tensor_on("cuda:0") for _ in range(3)]
+        with self._ctx(10, 0)[0], self._ctx(10, 0)[1]:
+            with mock.patch.object(pp, "_move_pool_to") as mv:
+                self.assertEqual(pp.consolidate_pool_onto([pool], "cuda:0", object(), 8), "local")
+        mv.assert_not_called()
+
+    def test_consolidated_moves_in_place(self):
+        pool = [self._tensor_on("cuda:1"), self._tensor_on("cuda:2")]
+        with self._ctx(10, 0)[0], self._ctx(10, 0)[1]:
+            with mock.patch.object(pp, "_move_pool_to") as mv:
+                self.assertEqual(pp.consolidate_pool_onto([pool], "cuda:0", object(), 8), "consolidated")
+        mv.assert_any_call(pool, "cuda:0")
+
+    def test_spread_when_not_fitting(self):
+        pool = [self._tensor_on("cuda:1")]
+        with self._ctx(10, 9)[0], self._ctx(10, 9)[1]:
+            with mock.patch.object(pp, "_tensor_bytes", return_value=5 * 2**30), mock.patch.object(
+                pp, "_move_pool_to"
+            ) as mv:
+                self.assertEqual(pp.consolidate_pool_onto([pool], "cuda:0", object(), 8), "spread")
+        mv.assert_not_called()
+
+    def test_non_cuda_target_spread(self):
+        self.assertEqual(pp.consolidate_pool_onto([[torch.zeros(1)]], "cpu", object(), 8), "spread")
+
+    def test_empty_is_local(self):
+        self.assertEqual(pp.consolidate_pool_onto([None, []], "cuda:0", object(), 8), "local")
+
+
 class TestRunnerRouting(unittest.TestCase):
     def _runner(self):
         r = BlockForwardRunner(batch_dim=0, batch_size=2, device="cpu", cache_device="cpu", enable_torch_compile=False)

@@ -449,8 +449,10 @@ class AlgorithmComposer:
                 update_block_global_scale_if_needed(block, data_type, group_size)
 
         if q_inputs is not None and fp_inputs is not q_inputs:
-            clear_memory(fp_inputs)
-        else:
+            # Release the fp pool at its last use (before tuning): the q pool is
+            # the tuning input and the fp pool is already consumed into
+            # reference_output. Freed earlier, not later.
+            fp_inputs = None
             clear_memory()
         # ── Step 4: quantize_block ──────────────────────────────────────────────
         # When quantized input is available from the previous block, use it;

@@ -188,7 +188,19 @@ class CompressionOrchestrator(BaseOrchestrator):
                 _pool_chunk_count,
                 _tensor_bytes,
                 calib_data_line,
+                consolidate_pool_onto,
                 resolve_placement_for_pool,
+            )
+
+            # Fits-home rung: when the incoming (possibly sharded) pools fit on
+            # the compute device next to the block's working set, consolidate
+            # them there once -- the whole block (collection + every tuning
+            # iteration) then reads locally and the per-batch gather is a no-op.
+            consolidate_pool_onto(
+                [input_ids, q_input, input_others],
+                str(getattr(runner, "device", self.compress_context.cache_device)),
+                block,
+                self.calibration_context.batch_size,
             )
 
             chains = 2 if self.alg_composer.need_quanted_input() else 1
