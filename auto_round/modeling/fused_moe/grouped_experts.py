@@ -104,12 +104,25 @@ GROUPED_LINEAR_SLICED_IMPL = "linear_grouped_sliced"
 # Set once if the native grouped_mm kernel raises; afterwards we always use the sliced loop.
 _NATIVE_GROUPED_MM_DISABLED = False
 _LOGGED_FALLBACK_REASONS: set[str] = set()
+# Bumped whenever the plan-building path changes; logged once per process so a
+# log unambiguously identifies which grouped implementation produced it.
+GROUPED_PLANS_VERSION = "per-device-v2-traced"
+_LOGGED_VERSION = False
 
 
-def _log_fallback_once(reason: str) -> None:
-    if reason not in _LOGGED_FALLBACK_REASONS:
-        _LOGGED_FALLBACK_REASONS.add(reason)
-        logger.debug(f"[MoE grouped] falling back to linear_loop: {reason}")
+def _log_fallback_once(reason: str, detail: str = "") -> None:
+    global _LOGGED_VERSION
+    if not _LOGGED_VERSION:
+        _LOGGED_VERSION = True
+        logger.debug(f"[MoE grouped] plans version {GROUPED_PLANS_VERSION}")
+    if reason not in _LOGGED_FALLBACK_REASONS or detail:
+        msg = f"[MoE grouped] falling back to linear_loop: {reason}"
+        if detail:
+            _LOGGED_FALLBACK_REASONS.add(reason)
+            msg = f"{msg} ({detail})"
+        elif reason not in _LOGGED_FALLBACK_REASONS:
+            _LOGGED_FALLBACK_REASONS.add(reason)
+        logger.debug(msg)
 
 
 # --------------------------------------------------------------------------------------
@@ -829,7 +842,11 @@ def _build_plan(module: nn.Module, active_ids: list[int]) -> _GroupedPlan | None
                 device = proj_device
                 output_device = _output_device(projection)
             elif proj_device != device:
-                _log_fallback_once("experts live on different devices")
+                _log_fallback_once(
+                    "experts live on different devices",
+                    detail=f"expert {expert_id} slot {slot}: {proj_device} vs group {device}"
+                    f" (up_proj said {_compute_device(expert.up_proj)})",
+                )
                 return None
 
             # Mixed-bit MoE: bail out instead of batching differently-quantized experts.
@@ -1145,6 +1162,14 @@ def _run_routes(
         if plan is None:
             return None  # reason already logged; fall the whole layer back
         plans.append((plan, positions))
+    _trace_key = f"grouped-trace-{id(module)}"
+    if _trace_key not in _LOGGED_FALLBACK_REASONS:
+        _LOGGED_FALLBACK_REASONS.add(_trace_key)
+        logger.debug(
+            "[MoE grouped] %d device group(s): %s",
+            len(plans),
+            ", ".join(f"{p.device}: {len(pos)} experts, {sum(active_counts[q] for q in pos)} rows" for p, pos in plans),
+        )
 
     perm_valid = perm[:num_valid]
     # Shared combine buffer on the input device: each group scatters its weighted rows.
