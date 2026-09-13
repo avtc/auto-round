@@ -54,7 +54,7 @@ def _group_tensors_by_shape(objs) -> list:
             if not isinstance(obj, torch.Tensor) or obj.device.type in ("cpu", "meta"):
                 continue
             key = (str(obj.device), str(obj.dtype), _shape_key(obj.shape))
-            nbytes = obj.numel() * obj.element_size()
+            nbytes = int(obj.numel()) * obj.element_size()
         except Exception:  # one unreadable tensor must never kill the census
             continue
         g = groups.get(key)
@@ -233,7 +233,7 @@ def _dump_census(gc):
         # inventory above (a symbolic-shape failure here previously ate the totals)
         try:
             skip = {id(objs), id(top)}
-            for rep, ((_dev, _dt, _shape), (_cnt, _nb)) in _representatives(top[:3], objs):
+            for rep, ((_dev, _dt, _shape), (_cnt, _nb)) in _representatives(top[:6], objs):
                 for desc in _describe_referrers(rep, skip):
                     logger.error("[oom]   %s %s held by: %s", _dev, list(_shape), desc)
         except Exception as e:  # pragma: no cover - must not cost the inventory

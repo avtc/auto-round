@@ -192,17 +192,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 resolve_placement_for_pool,
             )
 
-            # Fits-home rung: when the incoming (possibly sharded) pools fit on
-            # the compute device next to the block's working set, consolidate
-            # them there once -- the whole block (collection + every tuning
-            # iteration) then reads locally and the per-batch gather is a no-op.
-            consolidate_pool_onto(
-                [input_ids, q_input, input_others],
-                str(getattr(runner, "device", self.compress_context.cache_device)),
-                block,
-                self.calibration_context.batch_size,
-            )
-
             chains = 2 if self.alg_composer.need_quanted_input() else 1
             pool_bytes = _tensor_bytes(input_ids) * chains
             n_chunks = _pool_chunk_count(input_ids)
@@ -215,6 +204,28 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block=block,
                 batch_size=self.calibration_context.batch_size,
                 mode=getattr(self.compress_context, "calibration_data_device", "auto"),
+            )
+
+            # Fits-home rung: when the incoming (possibly sharded) pools fit on
+            # the compute device next to the block's working set AND next to the
+            # outputs this block will place there, consolidate them -- the whole
+            # block then reads locally and the per-batch gather is a no-op. The
+            # reserved-bytes gate exists because the inputs-only budget was the
+            # exact cause of the first block-3 OOM.
+            target = str(getattr(runner, "device", primary))
+            if placement is None:
+                reserved = pool_bytes if target == primary else 0
+            elif len(placement.devices) == 1:
+                reserved = pool_bytes if placement.devices[0] == target else 0
+            else:
+                per_chunk = pool_bytes / max(n_chunks, 1)
+                reserved = int(placement.counts().get(target, 0) * per_chunk)
+            consolidate_pool_onto(
+                [input_ids, q_input, input_others],
+                target,
+                block,
+                self.calibration_context.batch_size,
+                reserved_bytes=reserved,
             )
             logger.debug(
                 "[calib-data-device] %s",
@@ -387,6 +398,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             q_input = new_q_input
 
             # ── Infrastructure: hook removal, device cleanup, logging ─────────
+            # Belt-and-braces: no module may carry staged batched-search inputs
+            # (weight reshape + imatrix copies) across the block boundary; the
+            # first block-3 census showed search-stack groups retained into the
+            # next block's collection (~GB-class growth per block).
+            for _mn, _mm in m.named_modules():
+                if getattr(_mm, "_deferred_search_inputs", None) is not None:
+                    _mm._deferred_search_inputs = None
             if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
                 accelerate.hooks.remove_hook_from_submodules(m)
             mv_module_from_gpu(m)

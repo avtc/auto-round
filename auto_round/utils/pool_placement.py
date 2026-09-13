@@ -100,7 +100,7 @@ def _bytes_by_device(obj) -> tuple:
     def _walk(o):
         if isinstance(o, torch.Tensor):
             key = str(o.device)
-            per_device[key] = per_device.get(key, 0) + o.numel() * o.element_size()
+            per_device[key] = per_device.get(key, 0) + int(o.numel()) * o.element_size()
         elif isinstance(o, dict):
             for v in o.values():
                 _walk(v)
@@ -152,16 +152,22 @@ def calib_data_line(inputs, aux, plan, outputs_bytes: int, n_chunks: int, primar
     devs = ", ".join(
         f"'{_short_device_key(d)}': {b / 2**30:.2f}GB" for d, b in sorted(per_device.items(), key=lambda kv: -kv[1])
     )
+    if plan is None:
+        place = "none->primary"
+    elif len(plan.devices) == 1:
+        place = "single"
+    else:
+        place = "spread"
     return (
         f"'input': {input_total / 2**30:.2f}GB, 'output': {outputs_bytes / 2**30:.2f}GB, "
-        f"'aux': {aux_total / 2**30:.2f}GB, 'per_device': {{{devs}}}"
+        f"'aux': {aux_total / 2**30:.2f}GB, 'plan': '{place}', 'per_device': {{{devs}}}"
     )
 
 
 def _tensor_bytes(obj) -> int:
     """Total bytes of tensor leaves in a nested list/tuple/dict pool object."""
     if isinstance(obj, torch.Tensor):
-        return obj.numel() * obj.element_size()
+        return int(obj.numel()) * obj.element_size()
     if isinstance(obj, dict):
         return sum(_tensor_bytes(v) for v in obj.values())
     if isinstance(obj, (list, tuple)):
@@ -205,7 +211,7 @@ def _move_pool_to(obj, target: str):
     return obj
 
 
-def consolidate_pool_onto(objs, target: str, block, batch_size: int) -> str:
+def consolidate_pool_onto(objs, target: str, block, batch_size: int, reserved_bytes: int = 0) -> str:
     """Consolidate the incoming calibration pools onto the compute device.
 
     Returns ``'local'`` (already on target), ``'consolidated'`` (moved in one
@@ -225,7 +231,12 @@ def consolidate_pool_onto(objs, target: str, block, batch_size: int) -> str:
     if free is None:
         return "spread"
     need = placement_need_bytes(block, objs[0], batch_size)
-    if free - need < total:
+    # ``reserved_bytes``: output pools that will share the target this block.
+    # The first GPU validation showed the inputs-only budget was optimistic --
+    # consolidating 4GiB of inputs onto the busiest device while the outputs
+    # were also headed there produced exactly the OOM the policy exists to
+    # prevent. Consolidate only when BOTH fit beside the working set.
+    if free - need - reserved_bytes < total:
         return "spread"
     devices = set()
 
