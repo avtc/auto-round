@@ -444,6 +444,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             # "cpu") in the packers), so VRAM pressure stays one-module-sized.
             _pack_call = 0.0
             _pack_scaffold = 0.0
+            _t_cpu0 = time.process_time()
+            _t_the0 = time.thread_time()
             _t_loop = time.perf_counter()
             if self.compress_context.is_immediate_packing:
                 for _n, _mod in m.named_modules():
@@ -461,6 +463,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _pack_call += time.perf_counter() - _t_call
                         _t_loop = time.perf_counter()
             _pack_scaffold += time.perf_counter() - _t_loop
+            _pack_cpu = time.process_time() - _t_cpu0
+            _pack_the = time.thread_time() - _t_the0
             _marks["post.pack"] = time.perf_counter()
 
             mv_module_from_gpu(m)
@@ -537,7 +541,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                             f" fmt={_pw['fmt']:.2f}s lookup={_pp['lookup']:.2f}s"
                             f" ctor={_pp['ctor']:.2f}s pack={_pp['pack']:.2f}s"
                             f" moves={_pp['moves']:.2f}s call={_pack_call:.2f}s"
-                            f" scaffold={_pack_scaffold:.2f}s]"
+                            f" scaffold={_pack_scaffold:.2f}s"
+                            f" cpu={_pack_cpu:.2f}s thr={_pack_the:.2f}s]"
                         )
                         for _k in _pp:
                             _pp[_k] = 0.0
