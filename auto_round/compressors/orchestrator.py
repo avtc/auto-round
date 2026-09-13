@@ -14,6 +14,7 @@
 import copy
 import gc
 import os
+import sys
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -444,6 +445,11 @@ class CompressionOrchestrator(BaseOrchestrator):
             # "cpu") in the packers), so VRAM pressure stays one-module-sized.
             _pack_call = 0.0
             _pack_scaffold = 0.0
+            _pack_stack = bool(getattr(envs, "AR_PACK_STACK", False))
+            if _pack_stack:
+                import faulthandler
+
+                faulthandler.dump_traceback_later(5.0, repeat=True, file=sys.stderr)
             _t_cpu0 = time.process_time()
             _t_the0 = time.thread_time()
             _t_loop = time.perf_counter()
@@ -463,6 +469,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _pack_call += time.perf_counter() - _t_call
                         _t_loop = time.perf_counter()
             _pack_scaffold += time.perf_counter() - _t_loop
+            if _pack_stack:
+                faulthandler.cancel_dump_traceback_later()
             _pack_cpu = time.process_time() - _t_cpu0
             _pack_the = time.thread_time() - _t_the0
             _marks["post.pack"] = time.perf_counter()
