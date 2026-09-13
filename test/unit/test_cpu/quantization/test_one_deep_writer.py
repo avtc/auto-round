@@ -55,3 +55,64 @@ class TestOneDeepWriter(unittest.TestCase):
     def test_join_without_dispatch_is_noop(self):
         w = _OneDeepWriter()
         w.join()  # must not raise
+
+
+class TestBackgroundResumeMark(unittest.TestCase):
+    """The one-deep discipline keeps mark_block_done's order-assert valid."""
+
+    def _fake_state(self):
+        import types
+
+        state = types.SimpleNamespace(completed_blocks=[], calls=[])
+
+        def mark_block_done(block_name, q_input, input_ids):
+            expected = ["b0", "b1", "b2"][len(state.completed_blocks)]
+            assert block_name == expected, f"out of order: expected {expected}, got {block_name}"
+            state.calls.append((block_name, q_input, input_ids))
+            state.completed_blocks.append(block_name)
+
+        state.mark_block_done = mark_block_done
+        return state
+
+    def test_marks_run_in_order_through_the_writer(self):
+        from auto_round.compressors.orchestrator import _OneDeepWriter
+
+        state = self._fake_state()
+        w = _OneDeepWriter()
+        w.dispatch(lambda: state.mark_block_done("b0", None, "i0"))
+        w.dispatch(lambda: state.mark_block_done("b1", None, "i1"))  # joins b0 first
+        w.dispatch(lambda: state.mark_block_done("b2", None, "i2"))
+        w.join()
+        self.assertEqual(state.completed_blocks, ["b0", "b1", "b2"])
+        self.assertEqual([c[2] for c in state.calls], ["i0", "i1", "i2"])
+
+    def test_worker_exception_surfaces_at_next_dispatch(self):
+        from auto_round.compressors.orchestrator import _OneDeepWriter
+
+        state = self._fake_state()
+        w = _OneDeepWriter()
+        w.dispatch(lambda: state.mark_block_done("b0", None, "i0"))
+
+        def boom():
+            raise RuntimeError("resume save failed")
+
+        w.dispatch(boom)  # joins b0 (ok), then starts boom
+        with self.assertRaisesRegex(RuntimeError, "resume save failed"):
+            w.join()
+
+
+class TestSnapshotPoolRefs(unittest.TestCase):
+    def test_skeleton_frozen_tensors_by_reference(self):
+        import torch
+
+        from auto_round.utils.resume import snapshot_pool_refs
+
+        t = torch.zeros(4)
+        pool = {"hidden_states": [t, t], "aux": ({"inner": t},)}
+        snap = snapshot_pool_refs(pool)
+        self.assertIsNot(snap, pool)
+        self.assertIsNot(snap["hidden_states"], pool["hidden_states"])
+        self.assertIs(snap["hidden_states"][0], t)  # tensors passed by ref
+        # mutating the original container afterwards must not affect the snap
+        pool["hidden_states"].append(torch.ones(4))
+        self.assertEqual(len(snap["hidden_states"]), 2)

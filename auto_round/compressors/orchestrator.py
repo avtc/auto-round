@@ -342,6 +342,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         input_ids, input_others = self._preprocess_block_inputs(inputs)
         _bg_writer = _OneDeepWriter()
+        _bg_resume = _OneDeepWriter()
         if resume_input_ids is not None:
             input_ids = resume_input_ids
 
@@ -566,8 +567,21 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # `input_ids` was already reassigned to `next_input_ids`
                 # above -- it now holds the value the *next* block should use
                 # as its chained hidden-state input, which is exactly what
-                # needs to be persisted here.
-                resume_state.mark_block_done(n, q_input, input_ids)
+                # needs to be persisted here. The tensor serialization
+                # (cross-device copies + torch.save, ~GB-class) runs on the
+                # one-deep writer: the container skeleton is frozen
+                # synchronously (snapshot_pool_refs) because the next block's
+                # pool placement mutates the containers, while the tensors
+                # themselves are immutable-by-convention and copyable
+                # concurrently. One-deep join keeps mark_block_done's
+                # order-assert valid (worker N+1 only starts after N appended),
+                # and the manifest only claims a block after its tensors are
+                # durable -- identical crash semantics to the inline call.
+                from auto_round.utils.resume import snapshot_pool_refs
+
+                _resume_q = snapshot_pool_refs(q_input)
+                _resume_i = snapshot_pool_refs(input_ids)
+                _bg_resume.dispatch(lambda _n=n, _q=_resume_q, _i=_resume_i: resume_state.mark_block_done(_n, _q, _i))
             if _perf:
                 _marks["post.write"] = time.perf_counter()
                 _order = [
@@ -631,6 +645,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _attach_note,
                 )
             _bg_writer.join()  # flush the last block before the model-level cleanup
+        _bg_resume.join()  # durable resume manifest for the last block
         if pbar is not None:
             pbar.update(1)
 
