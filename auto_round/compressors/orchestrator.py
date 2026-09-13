@@ -14,6 +14,7 @@
 import copy
 import gc
 import os
+import threading
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -65,6 +66,46 @@ if TYPE_CHECKING:
 
 
 # TODO wenhuach align all the API args
+ATTACH_PHASES = {"walks": 0.0, "resolve": 0.0, "consolidate": 0.0, "line": 0.0}
+
+
+class _OneDeepWriter:
+    """One-deep background task pipeline (used for the shard write/flush).
+
+    ``dispatch`` joins any previous task first (fail-visible: its exception is
+    re-raised on the caller thread), then starts the next on a single daemon
+    worker. ``join`` blocks until the current task completes and re-raises any
+    error it captured. Tasks must touch only their own arguments (host-resident
+    tensors; no VRAM) so they can overlap the main thread's GPU work.
+    """
+
+    def __init__(self):
+        self._t = None
+        self._exc = None
+
+    def dispatch(self, fn):
+        self.join()
+        self._exc = None
+
+        def _run():
+            try:
+                fn()
+            except BaseException as e:  # noqa: B036 - re-raised in join()
+                self._exc = e
+
+        self._t = threading.Thread(target=_run, name="one-deep-writer", daemon=True)
+        self._t.start()
+
+    def join(self):
+        if self._t is None:
+            return
+        t, self._t = self._t, None
+        t.join()
+        if self._exc is not None:
+            exc, self._exc = self._exc, None
+            raise exc
+
+
 class CompressionOrchestrator(BaseOrchestrator):
 
     def __init__(
@@ -193,10 +234,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
 
             chains = 2 if self.alg_composer.need_quanted_input() else 1
+            import time as _time
+
+            _ta = _time.perf_counter()
             pool_bytes = _tensor_bytes(input_ids) * chains
             n_chunks = _pool_chunk_count(input_ids)
+            ATTACH_PHASES["walks"] += _time.perf_counter() - _ta
             primary = str(self.compress_context.cache_device)
             _iters = int(getattr(getattr(self.alg_composer, "block_quantizer", None), "iters", 0) or 0)
+            _ta = _time.perf_counter()
             placement = resolve_placement_for_pool(
                 input_ids,
                 chains,
@@ -208,6 +254,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 iters=_iters,
             )
 
+            ATTACH_PHASES["resolve"] += _time.perf_counter() - _ta
             # Fits-home rung: when the incoming (possibly sharded) pools fit on
             # the compute device next to the block's working set AND next to the
             # outputs this block will place there, consolidate them -- the whole
@@ -222,6 +269,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             else:
                 per_chunk = pool_bytes / max(n_chunks, 1)
                 reserved = int(placement.counts().get(target, 0) * per_chunk)
+            _ta = _time.perf_counter()
             consolidate_pool_onto(
                 [input_ids, q_input, input_others],
                 target,
@@ -230,6 +278,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 reserved_bytes=reserved,
                 iters=_iters,
             )
+            ATTACH_PHASES["consolidate"] += _time.perf_counter() - _ta
+            _ta = _time.perf_counter()
             logger.debug(
                 "[calib-data-device] %s",
                 calib_data_line(
@@ -241,6 +291,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     primary,
                 ),
             )
+            ATTACH_PHASES["line"] += _time.perf_counter() - _ta
         except Exception as e:  # pragma: no cover - placement must never break quantization
             logger.warning("[calib-data-device] attach failed (%s); keeping single-device behavior", e)
             placement = None
@@ -290,6 +341,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             m.requires_grad_(False)
 
         input_ids, input_others = self._preprocess_block_inputs(inputs)
+        _bg_writer = _OneDeepWriter()
         if resume_input_ids is not None:
             input_ids = resume_input_ids
 
@@ -481,18 +533,21 @@ class CompressionOrchestrator(BaseOrchestrator):
             input_ids = next_input_ids
 
             if self.compress_context.is_immediate_saving:
-                self.shard_writer.write(m, is_finalize=False)
-                # ShardWriter only actually flushes to disk once its
-                # shard-size budget is reached (`_flush_shard`, private but
-                # there's no public equivalent) -- `write()` above may just
-                # buffer this block's tensors in memory. Force a flush here
-                # whenever resumability is active, since marking a block
-                # "done" in the resume manifest is a lie if a crash before
-                # the next natural flush would lose its tensors entirely.
-                # Only pay this extra small-shard-fragmentation cost when
-                # AR_RESUME_DIR is actually set.
+                # Background one-deep writer: the shard write/flush serializes
+                # host-resident packed tensors (no VRAM) and can hide under the
+                # next block's GPU work. One worker, joined before the NEXT
+                # dispatch (and immediately under AR_RESUME_DIR, where
+                # mark_block_done below must only fire on durable writes).
+                _bg_write_m = m
+
+                def _bg_write(_m=_bg_write_m):
+                    self.shard_writer.write(_m, is_finalize=False)
+                    if resume_state is not None:
+                        self.shard_writer._flush_shard()
+
+                _bg_writer.dispatch(_bg_write)
                 if resume_state is not None:
-                    self.shard_writer._flush_shard()
+                    _bg_writer.join()  # durability before the manifest mark
 
             if self.compress_context.low_cpu_mem_usage and not self.compress_context.is_immediate_saving:
                 if nblocks == 1:
@@ -554,13 +609,28 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _pw["fmt"] = 0.0
                 except Exception as e:  # pragma: no cover - diagnostics only
                     logger.warning("pack phase accounting unavailable (%s)", e)
+                _attach_note = ""
+                try:
+                    if any(ATTACH_PHASES.values()):
+                        _attach_note = (
+                            f" | attach[walks={ATTACH_PHASES['walks']:.2f}s"
+                            f" resolve={ATTACH_PHASES['resolve']:.2f}s"
+                            f" cons={ATTACH_PHASES['consolidate']:.2f}s"
+                            f" line={ATTACH_PHASES['line']:.2f}s]"
+                        )
+                        for _k in ATTACH_PHASES:
+                            ATTACH_PHASES[_k] = 0.0
+                except Exception as e:  # pragma: no cover - diagnostics only
+                    logger.warning("attach phase accounting unavailable (%s)", e)
                 logger.info(
-                    "[perf] block %s phases: %s total=%.2fs%s",
+                    "[perf] block %s phases: %s total=%.2fs%s%s",
                     n,
                     " ".join(_parts),
                     _marks["post.write"] - _marks["reload"],
                     _pack_note,
+                    _attach_note,
                 )
+            _bg_writer.join()  # flush the last block before the model-level cleanup
         if pbar is not None:
             pbar.update(1)
 
