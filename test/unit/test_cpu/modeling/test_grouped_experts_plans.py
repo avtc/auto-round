@@ -146,3 +146,51 @@ class TestRunRoutesMultiDeviceCUDA(unittest.TestCase):
                 h = nn.functional.silu(e.gate_proj(xt)) * e.up_proj(xt)
                 ref[t] += (w[t, k] * e.down_proj(h).to(x.device)).to(x.device)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+
+class TestAtomicPlacement(unittest.TestCase):
+    """The allocator must never split one expert's projections across devices."""
+
+    def _layer_dict(self, n_experts=6):
+        d = {}
+        for i in range(n_experts):
+            for slot in ("gate_proj", "up_proj", "down_proj"):
+                d[f"mlp.experts.{i}.{slot}"] = {"param_memory": 1.0, "is_moe_expert": True}
+        d["self_attn.q_proj"] = {"param_memory": 1.0, "is_moe_expert": False}
+        d["mlp.shared_experts.gate_proj"] = {"param_memory": 1.0, "is_moe_expert": False}
+        return d
+
+    def test_preassign_keeps_experts_atomic_and_spreads(self):
+        from auto_round.utils.device import _preassign_moe_experts
+
+        layer_dict = self._layer_dict(8)
+        budgets = {"cuda:0": 12.0, "cuda:1": 12.0}
+        assigned = _preassign_moe_experts(layer_dict, budgets, ["cuda:0", "cuda:1"], mem_per_param=1.0)
+        self.assertTrue(assigned)
+        # every expert's three slots share one device
+        for i in range(8):
+            devs = {assigned[f"mlp.experts.{i}.{s}"] for s in ("gate_proj", "up_proj", "down_proj")}
+            self.assertEqual(len(devs), 1, f"expert {i} split: {devs}")
+        # spread across both devices
+        self.assertEqual({d for d in assigned.values()}, {"cuda:0", "cuda:1"})
+
+    def test_preassign_shrinks_chunk_on_overflow(self):
+        from auto_round.utils.device import _preassign_moe_experts
+
+        # budgets so tight that a 16-expert chunk cannot fit, but single experts can
+        layer_dict = self._layer_dict(6)
+        budgets = {"cuda:0": 3.5, "cuda:1": 3.5}
+        assigned = _preassign_moe_experts(layer_dict, budgets, ["cuda:0", "cuda:1"], mem_per_param=1.0)
+        for i in range(6):
+            devs = {assigned.get(f"mlp.experts.{i}.{s}") for s in ("gate_proj", "up_proj", "down_proj")}
+            self.assertEqual(len(devs), 1, f"expert {i} split or unplaced: {devs}")
+
+    def test_balancer_groups_experts_atomically(self):
+        from auto_round.utils.device import _allocate_layers_to_devices
+
+        layer_dict = self._layer_dict(4)
+        budgets = {"cuda:0": 100.0, "cuda:1": 100.0}
+        device_map, _names = _allocate_layers_to_devices(layer_dict, budgets, ["cuda:0", "cuda:1"], 1.0)
+        for i in range(4):
+            devs = {device_map[f"mlp.experts.{i}.{s}"] for s in ("gate_proj", "up_proj", "down_proj")}
+            self.assertEqual(len(devs), 1, f"expert {i} split by balancer: {devs}")

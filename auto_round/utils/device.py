@@ -708,15 +708,28 @@ def _preassign_moe_experts(
         # Spread chunk-aligned groups across cards: each group stays whole on one device (so a
         # chunk's grouped GEMM is single-device) but different groups balance across GPUs.
         # ``chunk <= 0`` ("fuse everything") keeps the whole container as one group.
+        # On overflow the chunk SHRINKS (halving, floor 1 = a single expert whole) instead of
+        # dropping to the per-Linear balancer: dropped chunks are what scatter one expert's
+        # gate/up/down across devices and force the grouped path to fall back to the loop.
         step = len(idxs) if chunk <= 0 else chunk
-        for start in range(0, len(idxs), step):
-            group_items = [item for i in idxs[start : start + step] for item in by_idx[i]]
+        start = 0
+        while start < len(idxs):
+            take = min(step, len(idxs) - start)
+            group_items = [item for i in idxs[start : start + take] for item in by_idx[i]]
             group_mem = mem_of(group_items)
             group_device = best_fit(group_mem)
             if group_device is None:
-                continue  # Overflow: leave for the general balancer
+                if take <= 1:
+                    logger.debug(
+                        "[moe-prepass] single expert of %s fits no device budget; leaving for the balancer", container
+                    )
+                    start += 1
+                    continue
+                step = max(1, step // 2)
+                continue
             place(group_items, group_device)
             device_memory[group_device] -= group_mem
+            start += take
 
     return assigned
 
@@ -797,12 +810,37 @@ def _allocate_layers_to_devices(
         # Fallback: device with most available memory
         return best_device or max(gpu_devices, key=lambda d: device_memory[d])
 
-    # Allocate the remaining (non-preassigned) layers
-    for layer_idx, (layer_name, mem_info) in enumerate(sorted_layers):
-        names.append(layer_name)
-        estimated_memory = mem_info["param_memory"] * mem_per_param
-        best_device = find_best_device(layer_name, estimated_memory, layer_idx)
-        device_map[layer_name] = best_device
+    # Allocate the remaining (non-preassigned) layers in ATOMIC GROUPS: leaves under the
+    # same indexed container (e.g. ``experts.7.gate/up/down``) are one indivisible unit —
+    # the streaming lane's ``_atomic_groups`` pattern — so the balancer can never split an
+    # expert across devices even when the MoE pre-pass left it behind.
+    import re as _re
+
+    _indexed = _re.compile(r"^(.*)\.(\d+)\.[^.]+$")
+    _groups: dict = {}
+    _group_order: list = []
+    for layer_name in remaining:
+        m = _indexed.match(layer_name)
+        key = f"{m.group(1)}.{m.group(2)}" if m else layer_name
+        if key not in _groups:
+            _groups[key] = []
+            _group_order.append(key)
+        _groups[key].append(layer_name)
+    grouped_units = [
+        (key, sum(remaining[n]["param_memory"] for n in _groups[key]), min(layer_order[n] for n in _groups[key]))
+        for key in _group_order
+    ]
+    grouped_units.sort(key=lambda u: (-u[1], -u[2]))
+
+    for layer_idx, (key, unit_param_memory, _order) in enumerate(grouped_units):
+        members = _groups[key]
+        estimated_memory = unit_param_memory * mem_per_param
+        best_device = find_best_device(members[0], estimated_memory, layer_idx)
+        if best_device is None:  # not even one device fits the unit: fail loudly
+            raise RuntimeError(f"atomic module group '{key}' ({estimated_memory:.2f} GB) fits no device budget")
+        for layer_name in members:
+            names.append(layer_name)
+            device_map[layer_name] = best_device
         device_memory[best_device] -= estimated_memory
 
     # Restore original order
@@ -963,7 +1001,13 @@ def estimate_tuning_block_mem(block: torch.nn.Module, input_ids: Any, batch_size
 
             if has_moe:
                 pparent_module = get_module(block, layer_name.rsplit(".", 2)[0]) if "." in layer_name else block
-                is_moe_expert = "expert" in layer_name.lower() and isinstance(pparent_module, torch.nn.ModuleList)
+                # Our unfuse builds the experts module as a plain nn.Module with numbered
+                # _ExpertContainer children (checkpoint-format keys), NOT an nn.ModuleList;
+                # the num_experts attribute identifies it just as well.
+                is_experts_container = isinstance(pparent_module, torch.nn.ModuleList) or hasattr(
+                    pparent_module, "num_experts"
+                )
+                is_moe_expert = "expert" in layer_name.lower() and is_experts_container
             else:
                 is_moe_expert = False
 

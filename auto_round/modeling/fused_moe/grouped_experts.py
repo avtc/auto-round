@@ -106,7 +106,7 @@ _NATIVE_GROUPED_MM_DISABLED = False
 _LOGGED_FALLBACK_REASONS: set[str] = set()
 # Bumped whenever the plan-building path changes; logged once per process so a
 # log unambiguously identifies which grouped implementation produced it.
-GROUPED_PLANS_VERSION = "per-device-v2-traced"
+GROUPED_PLANS_VERSION = "slot-stage-v3"
 _LOGGED_VERSION = False
 
 
@@ -1144,85 +1144,115 @@ def _run_routes(
     if num_valid == 0:
         return torch.zeros_like(hidden_states)
 
-    # Per-device plans: mapped placement spreads one layer's experts across GPUs; each
-    # home device gets its own plan and its own grouped GEMM over the same token/expert
-    # pair stream. (token, top_k) pairs are unique, so per-group index_copy into one
-    # shared buffer combines exactly, and the final sum(dim=1) is unchanged.
-    by_device: dict[torch.device, list[int]] = {}
-    for pos, expert_id in enumerate(active_ids):
-        expert = getattr(module, str(expert_id), None)
-        if expert is None or not hasattr(expert, "up_proj"):
-            _log_fallback_once("expert container missing")
-            return None
-        by_device.setdefault(_compute_device(expert.up_proj), []).append(pos)
+    # Slot-stage plans: the balancer scatters projections independently, so one
+    # expert's gate/up/down can live on different devices. Each SLOT partitions its
+    # active experts by that slot's home device and runs one grouped GEMM per group;
+    # full pair-indexed buffers carry intermediates between stages. (token, top_k)
+    # pairs are unique, so per-group index_copy_ into shared buffers is exact and
+    # the final sum(dim=1) combine is unchanged.
+    def _slot_groups(slot_name: str) -> list[tuple[torch.device, list[int]]]:
+        groups: dict[torch.device, list[int]] = {}
+        for pos, expert_id in enumerate(active_ids):
+            expert = getattr(module, str(expert_id), None)
+            proj = getattr(expert, slot_name, None) if expert is not None else None
+            if proj is None:
+                _log_fallback_once("expert container missing", detail=f"expert {expert_id} slot {slot_name}")
+                return []
+            groups.setdefault(_compute_device(proj), []).append(pos)
+        return list(groups.items())
 
-    plans = []
-    for positions in by_device.values():
-        plan = _build_plan(module, [active_ids[p] for p in positions])
-        if plan is None:
-            return None  # reason already logged; fall the whole layer back
-        plans.append((plan, positions))
-    _trace_key = f"grouped-trace-{id(module)}"
-    if _trace_key not in _LOGGED_FALLBACK_REASONS:
-        _LOGGED_FALLBACK_REASONS.add(_trace_key)
-        logger.debug(
-            "[MoE grouped] %d device group(s): %s",
-            len(plans),
-            ", ".join(f"{p.device}: {len(pos)} experts, {sum(active_counts[q] for q in pos)} rows" for p, pos in plans),
-        )
+    has_gate = hasattr(getattr(module, str(active_ids[0]), None), "gate_proj")
+    gate_groups = _slot_groups("gate_proj") if has_gate else []
+    up_groups = _slot_groups("up_proj")
+    down_groups = _slot_groups("down_proj")
+    if not up_groups or not down_groups or (has_gate and not gate_groups):
+        return None
+
+    # Per-slot-group validation: projections supported; within a group (batched
+    # together) quant signatures and weight layouts must agree. gate/up activation
+    # settings must match per expert (they quantize the same input tensor).
+    for slot_name, groups in (("up_proj", up_groups), ("gate_proj", gate_groups), ("down_proj", down_groups)):
+        for _, positions in groups:
+            sig = layout = None
+            for p in positions:
+                proj = getattr(getattr(module, str(active_ids[p])), slot_name)
+                if not _projection_is_supported(proj):
+                    _log_fallback_once(f"unsupported projection type {type(proj).__name__}")
+                    return None
+                cur_sig = _quant_signature(proj)
+                if sig is None:
+                    sig = cur_sig
+                elif sig != cur_sig:
+                    _log_fallback_once("mixed quantization schemes across experts in a device group")
+                    return None
+                cur_layout = _weight_layout(proj)
+                if layout is None:
+                    layout = cur_layout
+                elif layout != cur_layout:
+                    _log_fallback_once("experts have different weight shape/dtype in a device group")
+                    return None
+    if has_gate:
+        for expert_id in active_ids:
+            expert = getattr(module, str(expert_id))
+            gate_act = _act_signature(expert.gate_proj) if _is_wrapper_linear(expert.gate_proj) else None
+            up_act = _act_signature(expert.up_proj) if _is_wrapper_linear(expert.up_proj) else None
+            gate_enabled = bool(getattr(expert.gate_proj, "enable_act_quant", False))
+            up_enabled = bool(getattr(expert.up_proj, "enable_act_quant", False))
+            if gate_enabled != up_enabled or (gate_enabled and gate_act != up_act):
+                _log_fallback_once("gate_proj/up_proj activation quantization differ")
+                return None
 
     perm_valid = perm[:num_valid]
-    # Shared combine buffer on the input device: each group scatters its weighted rows.
+    token_idx = torch.div(perm_valid, num_top_k, rounding_mode="floor")
+    x_all = hidden_states.index_select(0, token_idx)  # (num_valid, hidden) on input device
+
+    # Contiguous sorted-order row range for each active position.
+    ranges = []
+    start = 0
+    for c in active_counts:
+        ranges.append((start, start + c))
+        start += c
+
+    def _run_slot(slot_name: str, groups, inp: torch.Tensor) -> torch.Tensor:
+        """Grouped GEMM for one slot; returns a full (num_valid, out) buffer on the input device."""
+        out_buf = None
+        for dev, positions in groups:
+            counts = [active_counts[p] for p in positions]
+            rows = torch.cat(
+                [
+                    torch.arange(ranges[p][0], ranges[p][1], device=perm.device, dtype=torch.int64)
+                    for p in positions
+                ]
+            )
+            x_g = inp.index_select(0, rows).to(dev)
+            offsets = torch.tensor(counts, device=dev, dtype=torch.int32).cumsum(0).to(torch.int32)
+            experts_g = [getattr(module, str(active_ids[p])) for p in positions]
+            x_g = _quantize_activation(getattr(experts_g[0], slot_name), x_g)
+            batched = all(_supports_batched_qdq(getattr(e, slot_name)) for e in experts_g)
+            w = _slot_weights([getattr(e, slot_name) for e in experts_g], batched)
+            out_g = _grouped_linear(x_g, w, counts, offsets)
+            if out_buf is None:
+                out_buf = torch.zeros(num_valid, out_g.size(-1), device=inp.device, dtype=out_g.dtype)
+            out_buf.index_copy_(0, rows.to(inp.device), out_g.to(inp.device))
+        return out_buf
+
+    up_out = _run_slot("up_proj", up_groups, x_all)
+    if has_gate:
+        gate_out = _run_slot("gate_proj", gate_groups, x_all)
+        if hasattr(module, "_apply_gate"):
+            hidden_mid = module._apply_gate(torch.cat([gate_out, up_out], dim=-1))
+        else:
+            hidden_mid = module.act_fn(gate_out) * up_out
+    else:
+        hidden_mid = module.act_fn(up_out)
+
+    out = _run_slot("down_proj", down_groups, hidden_mid)
+    sample_weights_out = sample_weights.index_select(0, perm_valid).to(device=out.device, dtype=out.dtype)
+    out = out * sample_weights_out.unsqueeze(-1)
+
+    # Scatter the weighted rows into the shared (token, top_k) buffer.
     out_per_sample = torch.zeros(num_pairs, hidden_dim, device=device, dtype=hidden_states.dtype)
-
-    for plan, positions in plans:
-        counts = [active_counts[p] for p in positions]
-        if len(positions) == len(active_ids):
-            perm_g = perm_valid  # single group: today's exact path
-        else:
-            ranges = []
-            start = 0
-            for c in active_counts:
-                ranges.append((start, start + c))
-                start += c
-            perm_g = torch.cat([perm_valid[ranges[p][0] : ranges[p][1]] for p in positions])
-        token_idx = torch.div(perm_g, num_top_k, rounding_mode="floor")
-        x = hidden_states.index_select(0, token_idx).to(plan.device)
-
-        offsets = torch.tensor(counts, device=plan.device, dtype=torch.int32).cumsum(0).to(torch.int32)
-
-        # --- input projections (gate / up) ---------------------------------------------
-        x = _quantize_activation(plan.experts[0].up_proj, x)
-
-        up = _slot_weights([e.up_proj for e in plan.experts], plan.batched_qdq.get("up_proj", False))
-        up_out = _grouped_linear(x, up, counts, offsets)
-
-        if plan.has_gate:
-            gate = _slot_weights([e.gate_proj for e in plan.experts], plan.batched_qdq.get("gate_proj", False))
-            gate_out = _grouped_linear(x, gate, counts, offsets)
-            if hasattr(module, "_apply_gate"):
-                # Keep the module's own gating (clamping, alpha, ...) and its [gate; up] layout,
-                # exactly as linear_loop_experts_forward does.
-                hidden = module._apply_gate(torch.cat([gate_out, up_out], dim=-1))
-            else:
-                hidden = module.act_fn(gate_out) * up_out
-        else:
-            hidden = module.act_fn(up_out)
-
-        # --- down projection -------------------------------------------------------------
-        hidden = _quantize_activation(plan.experts[0].down_proj, hidden)
-        down = _slot_weights([e.down_proj for e in plan.experts], plan.batched_qdq.get("down_proj", False))
-        out = _grouped_linear(hidden, down, counts, offsets)
-
-        out = out.to(plan.output_device)
-        # ``sample_weights``/``perm_g`` live on the input device, which can differ from the
-        # experts' device in multi-GPU tuning. Align to ``out`` before the multiply.
-        sample_weights_out = sample_weights.index_select(0, perm_g).to(device=out.device, dtype=out.dtype)
-        out = out * sample_weights_out.unsqueeze(-1)
-
-        # Scatter this group's rows into the shared (token, top_k) buffer.
-        out_per_sample.index_copy_(0, perm_g.to(device), out.to(device))
-
+    out_per_sample.index_copy_(0, perm_valid.to(device), out.to(device))
     return out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
 
 
