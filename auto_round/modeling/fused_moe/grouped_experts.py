@@ -1219,10 +1219,7 @@ def _run_routes(
         for dev, positions in groups:
             counts = [active_counts[p] for p in positions]
             rows = torch.cat(
-                [
-                    torch.arange(ranges[p][0], ranges[p][1], device=perm.device, dtype=torch.int64)
-                    for p in positions
-                ]
+                [torch.arange(ranges[p][0], ranges[p][1], device=perm.device, dtype=torch.int64) for p in positions]
             )
             x_g = inp.index_select(0, rows).to(dev)
             offsets = torch.tensor(counts, device=dev, dtype=torch.int32).cumsum(0).to(torch.int32)
@@ -1250,8 +1247,11 @@ def _run_routes(
     sample_weights_out = sample_weights.index_select(0, perm_valid).to(device=out.device, dtype=out.dtype)
     out = out * sample_weights_out.unsqueeze(-1)
 
-    # Scatter the weighted rows into the shared (token, top_k) buffer.
-    out_per_sample = torch.zeros(num_pairs, hidden_dim, device=device, dtype=hidden_states.dtype)
+    # Scatter the weighted rows into the shared (token, top_k) buffer. The buffer
+    # carries the EXPERT OUTPUT dtype (bf16 weights produce bf16 rows even when the
+    # input chain is fp32 -- the GDN lanes); the original single-device path used
+    # out.dtype for exactly this reason.
+    out_per_sample = torch.zeros(num_pairs, hidden_dim, device=device, dtype=out.dtype)
     out_per_sample.index_copy_(0, perm_valid.to(device), out.to(device))
     return out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
 
