@@ -445,6 +445,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             # "cpu") in the packers), so VRAM pressure stays one-module-sized.
             _pack_call = 0.0
             _pack_scaffold = 0.0
+            # Hoist the layer-config read out of the module loop: the property
+            # rebuilds a copy of the whole compression plan per access (~50ms on
+            # a 300B-class plan -- the entire invisible pack wall).
+            _layer_cfg = self.layer_config
             _pack_stack = bool(getattr(envs, "AR_PACK_STACK", False))
             if _pack_stack:
                 import faulthandler
@@ -465,7 +469,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                             continue
                         _pack_scaffold += time.perf_counter() - _t_loop
                         _t_call = time.perf_counter()
-                        _immediate_pack(module_name, self.layer_config)
+                        _immediate_pack(module_name, _layer_cfg)
                         _pack_call += time.perf_counter() - _t_call
                         _t_loop = time.perf_counter()
             _pack_scaffold += time.perf_counter() - _t_loop
@@ -662,6 +666,7 @@ class CompressionOrchestrator(BaseOrchestrator):
 
                 update_block_global_scale_if_needed(block, self.data_type, self.group_size)
                 self.alg_composer.compress_block(block, fp_inputs=None, input_others={}, block_ctx=ctx)
+                _layer_cfg_free = self.layer_config  # hoisted: property rebuilds per read
                 if self.compress_context.is_immediate_packing:
                     for _n, _mod in block.named_modules():
                         if hasattr(_mod, "bits") and check_to_quantized(_mod):
@@ -672,7 +677,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                                 module_name = f"{block.global_name}.{_n}"
                             if module_name is None:
                                 continue
-                            _immediate_pack(module_name, self.layer_config)
+                            _immediate_pack(module_name, _layer_cfg_free)
 
                 # ── Infrastructure: shard write / device cleanup ──────────
                 if self.compress_context.is_immediate_saving:
@@ -1070,8 +1075,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                     input_ids=token_ids,
                 )
                 layer_names.remove(layer_name)
+                _layer_cfg_names = self.layer_config  # hoisted: property rebuilds per read
                 if self.compress_context.is_immediate_packing:
-                    immediate_pack(layer_name, self.layer_config)
+                    immediate_pack(layer_name, _layer_cfg_names)
 
                 if self.compress_context.is_immediate_saving:
                     m = get_module(self.model, layer_name)
@@ -1113,8 +1119,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 q_inputs=q_layer_input,
                 input_ids=token_ids,
             )
+            _layer_cfg_names = self.layer_config  # hoisted: property rebuilds per read
             if self.compress_context.is_immediate_packing:
-                immediate_pack(layer_name, self.layer_config)
+                immediate_pack(layer_name, _layer_cfg_names)
 
             if self.compress_context.is_immediate_saving:
                 m = get_module(self.model, layer_name)
