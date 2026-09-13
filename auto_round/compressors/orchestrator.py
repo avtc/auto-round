@@ -385,13 +385,25 @@ class CompressionOrchestrator(BaseOrchestrator):
             # blocks for these formats.
             _perf = bool(getattr(envs, "AR_PERF_COUNTERS", False))
             _t_reload = time.perf_counter()
+            self._t_prev_reload_start = time.perf_counter()
             disk_streaming = getattr(self.model_context, "_disk_stream_index", None) is not None
             if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL or disk_streaming:
                 if nblocks == 1:
                     self._offloader.reload(model, n)
                 else:
                     self._offloader.reload(model, names)
+            _t_reload_mark = time.perf_counter()
             _marks = {"reload": time.perf_counter()}
+            # reload duration sits BEFORE the marks' reference point and was dropped
+            # from the summary during the single-line refactor; true block walls
+            # (inter-finish deltas) showed a ~54s unmeasured gap in the
+            # atomic-placement era -- reload is the prime suspect, now visible.
+            if _perf:
+                logger.info(
+                    "[perf] block %s reload-phase=%.2fs",
+                    n,
+                    _t_reload_mark - getattr(self, "_t_prev_reload_start", _t_reload_mark),
+                )
 
             block_name_or_names = n if nblocks == 1 else names
 
