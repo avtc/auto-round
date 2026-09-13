@@ -432,14 +432,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
                 accelerate.hooks.remove_hook_from_submodules(m)
             _marks["post.hooks"] = time.perf_counter()
-            mv_module_from_gpu(m)
-            _marks["post.mv"] = time.perf_counter()
-            clear_memory(device_list=device_manager.device_list)
-            _marks["post.clear"] = time.perf_counter()
-            memory_monitor.log_summary()
-            _marks["post.monitor"] = time.perf_counter()
 
             # ── Infrastructure: immediate_pack / shard write ──────────────────
+            # Pack BEFORE draining the block off the GPUs: pack_layer resolves
+            # the math device from layer.weight.device (orig_device), so packing
+            # after mv_module_from_gpu drops every module into the CPU packing
+            # regime -- a Python per-column qzeros loop at ~50ms/module, ~30s
+            # per MoE block (measured on hy3). With weights still on their tune
+            # devices the math runs on GPU (~2.3ms/module) and the packed
+            # artifacts land on host by construction (qweight/qzeros are .to(
+            # "cpu") in the packers), so VRAM pressure stays one-module-sized.
             if self.compress_context.is_immediate_packing:
                 for _n, _mod in m.named_modules():
                     if hasattr(_mod, "bits") and check_to_quantized(_mod):
@@ -451,9 +453,16 @@ class CompressionOrchestrator(BaseOrchestrator):
                         if module_name is None:
                             continue
                         _immediate_pack(module_name, self.layer_config)
+            _marks["post.pack"] = time.perf_counter()
+
+            mv_module_from_gpu(m)
+            _marks["post.mv"] = time.perf_counter()
+            clear_memory(device_list=device_manager.device_list)
+            _marks["post.clear"] = time.perf_counter()
+            memory_monitor.log_summary()
+            _marks["post.monitor"] = time.perf_counter()
 
             input_ids = next_input_ids
-            _marks["post.pack"] = time.perf_counter()
 
             if self.compress_context.is_immediate_saving:
                 self.shard_writer.write(m, is_finalize=False)
@@ -498,10 +507,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                     "post.dynamo",
                     "post.sweep",
                     "post.hooks",
+                    "post.pack",
                     "post.mv",
                     "post.clear",
                     "post.monitor",
-                    "post.pack",
                     "post.write",
                 ]
                 _parts = []
