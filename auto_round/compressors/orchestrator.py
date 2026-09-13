@@ -196,6 +196,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             pool_bytes = _tensor_bytes(input_ids) * chains
             n_chunks = _pool_chunk_count(input_ids)
             primary = str(self.compress_context.cache_device)
+            _iters = int(getattr(getattr(self.alg_composer, "block_quantizer", None), "iters", 0) or 0)
             placement = resolve_placement_for_pool(
                 input_ids,
                 chains,
@@ -204,6 +205,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block=block,
                 batch_size=self.calibration_context.batch_size,
                 mode=getattr(self.compress_context, "calibration_data_device", "auto"),
+                iters=_iters,
             )
 
             # Fits-home rung: when the incoming (possibly sharded) pools fit on
@@ -226,6 +228,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 block,
                 self.calibration_context.batch_size,
                 reserved_bytes=reserved,
+                iters=_iters,
             )
             logger.debug(
                 "[calib-data-device] %s",

@@ -211,7 +211,7 @@ def _move_pool_to(obj, target: str):
     return obj
 
 
-def consolidate_pool_onto(objs, target: str, block, batch_size: int, reserved_bytes: int = 0) -> str:
+def consolidate_pool_onto(objs, target: str, block, batch_size: int, reserved_bytes: int = 0, iters: int = 0) -> str:
     """Consolidate the incoming calibration pools onto the compute device.
 
     Returns ``'local'`` (already on target), ``'consolidated'`` (moved in one
@@ -230,7 +230,7 @@ def consolidate_pool_onto(objs, target: str, block, batch_size: int, reserved_by
     free = _probe_usable_bytes(target)
     if free is None:
         return "spread"
-    need = placement_need_bytes(block, objs[0], batch_size)
+    need = placement_need_bytes(block, objs[0], batch_size, iters=iters, primary=target)
     # ``reserved_bytes``: output pools that will share the target this block.
     # The first GPU validation showed the inputs-only budget was optimistic --
     # consolidating 4GiB of inputs onto the busiest device while the outputs
@@ -340,21 +340,30 @@ def resolve_pool_placement(
 _RESERVE_BYTES = int(0.5 * 2**30)  # flat allocator reserve (24 GiB-class cards)
 
 
-def placement_need_bytes(block, pool, batch_size: int) -> int:
-    """Primary working-set need: the streaming branch's per-block accounting.
+def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: str = None) -> int:
+    """Primary working-set need for the placement gate, from first principles.
 
-    Ports the card-0 accounting of ``set_auto_device_map_for_block_with_tuning``
-    (mapped-placement era): ``layer_activation_memory + additional_memory`` from
-    ``estimate_tuning_block_mem``, computed from THIS block's module tree (never
-    the previous block's measurements), plus a flat 0.5 GiB allocator reserve.
+    The earlier port reused ``estimate_tuning_block_mem`` (mapped-placement
+    card-0 accounting), whose MoE term prices a hy3 block at ~343GiB: every
+    module's batch activation counted with a x2 grad multiplier stacked with
+    the x6 routing fudge, all assumed simultaneously live. That vetoed every
+    primary residency for every MoE block. This instead budgets what the gate
+    actually guards:
+
+    - the fp32 forward retention window: ~2 pool generations observed as the
+      window-2 chain retention in the block-3 census (``2 * pool bytes``);
+    - at iters>0 only, the per-parameter tuning state that materializes on
+      each weight's home device (fp32 value + fp32 grad + best-params
+      snapshot + bf16 copy = 14 B/param), charged for parameters homed on
+      the primary alone -- peers host their own state and pay nothing;
+    - the flat 0.5 GiB allocator reserve.
     """
-    if block is None:
-        return _RESERVE_BYTES
     try:
-        from auto_round.utils.device import estimate_tuning_block_mem
-
-        _, layer_activation_memory, _, additional_memory = estimate_tuning_block_mem(block, pool, batch_size)
-        return int((layer_activation_memory + additional_memory) * 2**30) + _RESERVE_BYTES
+        need = 2 * _tensor_bytes(pool) + _RESERVE_BYTES
+        if iters > 0 and block is not None and primary is not None:
+            state_bytes = sum(p.numel() for p in block.parameters() if str(p.device) == str(primary)) * 14
+            need += state_bytes
+        return int(need)
     except Exception as e:  # pragma: no cover - placement must never break quantization
         logger.warning(
             "[calib-data-device] working-set estimate failed for %s (%s); using %.1fGiB reserve",
@@ -373,6 +382,7 @@ def resolve_placement_for_pool(
     block=None,
     batch_size: int = 8,
     mode: str = "auto",
+    iters: int = 0,
 ) -> Optional[PoolPlacement]:
     """Resolve placement from a live pool object (orchestrator entry point).
 
@@ -393,7 +403,7 @@ def resolve_placement_for_pool(
             pool_bytes,
             n_chunks,
             primary,
-            placement_need_bytes(block, pool, batch_size),
+            placement_need_bytes(block, pool, batch_size, iters=iters, primary=primary),
             candidate_devices,
             _probe_usable_bytes,
             mode=mode,

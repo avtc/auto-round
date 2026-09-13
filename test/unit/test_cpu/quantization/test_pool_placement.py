@@ -73,16 +73,25 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertEqual(plan.devices, ["cpu"])
         self.assertEqual(plan.counts(), {"cpu": 128})
 
-    def test_need_estimator_floor_and_growth(self):
-        floor = pp.placement_need_bytes(None, None, 8)
-        self.assertGreaterEqual(floor, int(0.5 * 2**30))
-        with mock.patch(
-            "auto_round.utils.device.estimate_tuning_block_mem",
-            return_value=({}, 3.0, 4.0, 5.0),
-        ):
-            need = pp.placement_need_bytes(object(), [], 8)
-        # layer_activation(3.0) + additional(5.0) GiB + 0.5 GiB reserve
-        self.assertEqual(need, int(8.5 * 2**30))
+    def test_need_estimator_first_principles(self):
+        """Need = 2x pool (window-2 fp32 retention) + reserve; iters>0 adds
+        14B/param of tuning state for primary-homed parameters only."""
+        reserve = int(0.5 * 2**30)
+        pool = torch.zeros(64, dtype=torch.float32)  # 256 B
+        # no block: window + reserve only
+        need0 = pp.placement_need_bytes(None, pool, 8)
+        self.assertEqual(need0, 2 * pool.numel() * 4 + reserve)
+        # iters=0 with a block: same (no tuning state at zero-shot)
+        need0b = pp.placement_need_bytes(object(), pool, 8, iters=0, primary="cuda:0")
+        self.assertEqual(need0b, need0)
+        # iters>0: +14 B per primary-homed parameter; peers' params ignored
+        m = torch.nn.Linear(4, 4)  # 16 weights + 4 bias = 20 params, all on CPU
+        dev = str(next(m.parameters()).device)
+        need1 = pp.placement_need_bytes(m, pool, 8, iters=20, primary=dev)
+        self.assertEqual(need1, need0 + 20 * 14)
+        # primary mismatch: parameters are not homed there -> no state charge
+        need2 = pp.placement_need_bytes(m, pool, 8, iters=20, primary="cuda:7")
+        self.assertEqual(need2, need0)
 
     def test_huge_moe_need_still_shards_onto_peers(self):
         """Regression: the need constrains the primary alone, never the fleet.
