@@ -327,12 +327,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             # `low_cpu_mem_usage` is False -- see the `is_immediate_saving`-adjacent
             # offload call further down), matching upstream's own choice not to cycle
             # blocks for these formats.
+            _perf = bool(getattr(envs, "AR_PERF_COUNTERS", False))
+            _t_reload = time.perf_counter()
             disk_streaming = getattr(self.model_context, "_disk_stream_index", None) is not None
-            if self.compress_context.low_cpu_mem_usage or envs.AR_DISK_STREAM_MODEL or disk_streaming:
+            if self.compress_context.low_gpu_mem_usage or envs.AR_DISK_STREAM_MODEL or disk_streaming:
                 if nblocks == 1:
                     self._offloader.reload(model, n)
                 else:
                     self._offloader.reload(model, names)
+            if _perf:
+                logger.info("[perf] block %s reload=%.2fs", n, time.perf_counter() - _t_reload)
 
             block_name_or_names = n if nblocks == 1 else names
 
@@ -369,9 +373,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             # primary cache device when it fits (today's behavior, zero peer
             # traffic), or sharded across free GPUs when it does not. Placement is
             # pure memory behavior -- chunk values are bit-identical.
+            _t_attach = time.perf_counter()
             self._attach_pool_placement(m, input_ids, q_input, input_others)
+            if _perf:
+                logger.info("[perf] block %s attach(pool placement)=%.2fs", n, time.perf_counter() - _t_attach)
 
             # ── Run block pipeline (calibration → quantization → collection) ──
+            _t_compress = time.perf_counter()
             new_q_input, reference_output = self.alg_composer.compress_block(
                 m,
                 input_ids,
@@ -380,11 +388,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                 q_inputs=q_input,
                 input_ids=token_ids,
             )
+            if _perf:
+                logger.info("[perf] block %s compress(fwd+quant)=%.2fs", n, time.perf_counter() - _t_compress)
 
             # ── Infrastructure: memory management ─────────────────────────────
             # Mirrors the original q_input-swap + end-of-loop clear_memory semantics:
             # clear the FP input when a quantized input was used, then clear the old
             # q_input (effective_input) before advancing to the next block.
+            _t_post = time.perf_counter()
             if q_input is not None:
                 if input_ids is not q_input:
                     clear_memory(input_ids)
@@ -438,6 +449,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _immediate_pack(module_name, self.layer_config)
 
             input_ids = next_input_ids
+            if _perf:
+                logger.info("[perf] block %s post(mem+hooks)=%.2fs", n, time.perf_counter() - _t_post)
 
             if self.compress_context.is_immediate_saving:
                 self.shard_writer.write(m, is_finalize=False)
@@ -472,6 +485,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # as its chained hidden-state input, which is exactly what
                 # needs to be persisted here.
                 resume_state.mark_block_done(n, q_input, input_ids)
+            if _perf:
+                logger.info("[perf] block %s post(write+offload+mark)=%.2fs", n, time.perf_counter() - _t_post)
         if pbar is not None:
             pbar.update(1)
 
