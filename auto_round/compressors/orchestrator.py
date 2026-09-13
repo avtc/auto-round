@@ -338,8 +338,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     self._offloader.reload(model, n)
                 else:
                     self._offloader.reload(model, names)
-            if _perf:
-                logger.info("[perf] block %s reload=%.2fs", n, time.perf_counter() - _t_reload)
+            _marks = {"reload": time.perf_counter()}
 
             block_name_or_names = n if nblocks == 1 else names
 
@@ -376,13 +375,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             # primary cache device when it fits (today's behavior, zero peer
             # traffic), or sharded across free GPUs when it does not. Placement is
             # pure memory behavior -- chunk values are bit-identical.
-            _t_attach = time.perf_counter()
             self._attach_pool_placement(m, input_ids, q_input, input_others)
-            if _perf:
-                logger.info("[perf] block %s attach(pool placement)=%.2fs", n, time.perf_counter() - _t_attach)
+            _marks["attach"] = time.perf_counter()
 
             # ── Run block pipeline (calibration → quantization → collection) ──
-            _t_compress = time.perf_counter()
             new_q_input, reference_output = self.alg_composer.compress_block(
                 m,
                 input_ids,
@@ -391,14 +387,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 q_inputs=q_input,
                 input_ids=token_ids,
             )
-            if _perf:
-                logger.info("[perf] block %s compress(fwd+quant)=%.2fs", n, time.perf_counter() - _t_compress)
+            _marks["compress"] = time.perf_counter()
 
             # ── Infrastructure: memory management ─────────────────────────────
             # Mirrors the original q_input-swap + end-of-loop clear_memory semantics:
             # clear the FP input when a quantized input was used, then clear the old
             # q_input (effective_input) before advancing to the next block.
-            _t_post = time.perf_counter()
             if q_input is not None:
                 if input_ids is not q_input:
                     clear_memory(input_ids)
@@ -411,6 +405,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 clear_memory(input_ids if input_ids is not next_input_ids else None)
 
             q_input = new_q_input
+            _marks["post.swap"] = time.perf_counter()
 
             # ── Infrastructure: hook removal, device cleanup, logging ─────────
             # Census-named accumulator: each block's torch.compile tracing
@@ -425,6 +420,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _dynamo.reset()
                 except Exception as e:  # pragma: no cover - never break the block loop
                     logger.warning("dynamo cache reset at block end failed (%s)", e)
+            _marks["post.dynamo"] = time.perf_counter()
             # Belt-and-braces: no module may carry staged batched-search inputs
             # (weight reshape + imatrix copies) across the block boundary; the
             # first block-3 census showed search-stack groups retained into the
@@ -432,11 +428,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             for _mn, _mm in m.named_modules():
                 if getattr(_mm, "_deferred_search_inputs", None) is not None:
                     _mm._deferred_search_inputs = None
+            _marks["post.sweep"] = time.perf_counter()
             if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
                 accelerate.hooks.remove_hook_from_submodules(m)
+            _marks["post.hooks"] = time.perf_counter()
             mv_module_from_gpu(m)
+            _marks["post.mv"] = time.perf_counter()
             clear_memory(device_list=device_manager.device_list)
+            _marks["post.clear"] = time.perf_counter()
             memory_monitor.log_summary()
+            _marks["post.monitor"] = time.perf_counter()
 
             # ── Infrastructure: immediate_pack / shard write ──────────────────
             if self.compress_context.is_immediate_packing:
@@ -452,8 +453,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         _immediate_pack(module_name, self.layer_config)
 
             input_ids = next_input_ids
-            if _perf:
-                logger.info("[perf] block %s post(mem+hooks)=%.2fs", n, time.perf_counter() - _t_post)
+            _marks["post.pack"] = time.perf_counter()
 
             if self.compress_context.is_immediate_saving:
                 self.shard_writer.write(m, is_finalize=False)
@@ -489,7 +489,32 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # needs to be persisted here.
                 resume_state.mark_block_done(n, q_input, input_ids)
             if _perf:
-                logger.info("[perf] block %s post(write+offload+mark)=%.2fs", n, time.perf_counter() - _t_post)
+                _marks["post.write"] = time.perf_counter()
+                _order = [
+                    "reload",
+                    "attach",
+                    "compress",
+                    "post.swap",
+                    "post.dynamo",
+                    "post.sweep",
+                    "post.hooks",
+                    "post.mv",
+                    "post.clear",
+                    "post.monitor",
+                    "post.pack",
+                    "post.write",
+                ]
+                _parts = []
+                _prev = _marks[_order[0]]
+                for _k in _order[1:]:
+                    _parts.append(f"{_k.rsplit('.', 1)[-1]}={_marks[_k] - _prev:.2f}s")
+                    _prev = _marks[_k]
+                logger.info(
+                    "[perf] block %s phases: %s total=%.2fs",
+                    n,
+                    " ".join(_parts),
+                    _marks["post.write"] - _marks["reload"],
+                )
         if pbar is not None:
             pbar.update(1)
 
