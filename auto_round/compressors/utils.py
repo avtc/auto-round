@@ -577,7 +577,13 @@ def _get_save_folder_name(format, *args, **kwargs) -> str:
     return compress_context.output_dir
 
 
+PACK_WRAP = {"pre": 0.0, "fmt": 0.0}
+
+
 def immediate_pack(name: str, layer_config: dict):
+    import time as _time
+
+    _t0 = _time.perf_counter()
     from auto_round.context.compress import CompressContext
     from auto_round.context.model import ModelContext
 
@@ -586,6 +592,8 @@ def immediate_pack(name: str, layer_config: dict):
 
     if not compress_context.is_immediate_packing:
         return
+    PACK_WRAP["pre"] += _time.perf_counter() - _t0
+    _t1 = _time.perf_counter()
     compress_context.formats[0].immediate_pack(
         name=name,
         model=model_context.model,
@@ -598,3 +606,4 @@ def immediate_pack(name: str, layer_config: dict):
         image_processor=getattr(model_context, "image_processor", None),
         quant_nontext_module=getattr(model_context, "quant_nontext_module", False),
     )
+    PACK_WRAP["fmt"] += _time.perf_counter() - _t1

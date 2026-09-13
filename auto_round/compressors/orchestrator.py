@@ -528,16 +528,21 @@ class CompressionOrchestrator(BaseOrchestrator):
                     _prev = _marks[_k]
                 _pack_note = ""
                 try:
+                    from auto_round.compressors.utils import PACK_WRAP as _pw
                     from auto_round.export.export_to_autoround.export import PACK_PHASES as _pp
 
                     if _pp["count"]:
                         _pack_note = (
-                            f" | pack[{_pp['count']} mods: ctor={_pp['ctor']:.2f}s"
-                            f" pack={_pp['pack']:.2f}s moves={_pp['moves']:.2f}s"
-                            f" call={_pack_call:.2f}s scaffold={_pack_scaffold:.2f}s]"
+                            f" | pack[{_pp['count']} mods: pre={_pw['pre']:.2f}s"
+                            f" fmt={_pw['fmt']:.2f}s lookup={_pp['lookup']:.2f}s"
+                            f" ctor={_pp['ctor']:.2f}s pack={_pp['pack']:.2f}s"
+                            f" moves={_pp['moves']:.2f}s call={_pack_call:.2f}s"
+                            f" scaffold={_pack_scaffold:.2f}s]"
                         )
                         for _k in _pp:
                             _pp[_k] = 0.0
+                        _pw["pre"] = 0.0
+                        _pw["fmt"] = 0.0
                 except Exception as e:  # pragma: no cover - diagnostics only
                     logger.warning("pack phase accounting unavailable (%s)", e)
                 logger.info(
