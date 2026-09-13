@@ -152,28 +152,29 @@ class TestCalibDataLine(unittest.TestCase):
         self.assertEqual(per_dev, {"cpu": 104})  # 'm' references a again
         self.assertEqual(total, 104)
 
-    def test_line_format_kinds_devices_and_outputs(self):
-        fp = [torch.zeros(64)]  # 256B
-        q = [torch.zeros(32)]  # 128B
-        plan = pp.PoolPlacement(["d0", "d1"], [1, 1], 4)
-        line = pp.calib_data_line({"fp": fp, "q": q, "aux": None}, plan, 512, 4, "d0")
-        self.assertIn("inputs: fp 0.00GiB, q 0.00GiB", line)
-        self.assertIn("outputs: 0.00GiB", line)
-        self.assertIn("per device:", line)
-        # no kind-per-device matrix: device section names devices only
-        devs = line.split("per device: ")[1]
-        self.assertNotIn("fp", devs)
-        self.assertNotIn("q", devs)
+    def test_monitor_grammar(self):
+        fp = [torch.zeros(1, 64, 64) for _ in range(4)]  # 64KiB
+        q = [torch.zeros(1, 64, 64) for _ in range(4)]
+        plan = pp.PoolPlacement(["cpu", "cpu"], [1, 1], 8)
+        line = pp.calib_data_line([fp, q], None, plan, 64 * 64 * 4 * 8, 8, "cpu")
+        self.assertIn("'input': 0.00GB", line)
+        self.assertIn("'output': 0.00GB", line)
+        self.assertIn("'aux': 0.00GB", line)
+        self.assertIn("'per_device': {'cpu':", line)
+        self.assertNotIn("cuda", line)
 
-    def test_line_without_plan_falls_back_to_primary(self):
-        fp = [torch.zeros(64)]
-        line = pp.calib_data_line({"fp": fp}, None, 256, 1, "cuda:0")
-        self.assertIn("cuda:0", line)
-        self.assertIn("outputs:", line)
+    def test_short_device_keys(self):
+        self.assertEqual(pp._short_device_key("cuda:3"), "3")
+        self.assertEqual(pp._short_device_key("cpu"), "cpu")
 
-    def test_line_empty_inputs(self):
-        line = pp.calib_data_line({}, None, 0, 0, "cpu")
-        self.assertIn("inputs: none", line)
+    def test_plan_devices_short_keys_and_fallback(self):
+        plan = pp.PoolPlacement(["cuda:0", "cuda:1"], [1, 1], 2)
+        line = pp.calib_data_line([], None, plan, 4 * 2**30, 2, "cuda:0")
+        self.assertIn("'0':", line)
+        self.assertIn("'1':", line)
+        # no plan -> outputs land on the primary
+        line2 = pp.calib_data_line([], None, None, 2**30, 1, "cuda:0")
+        self.assertIn("'0': 1.00GB", line2)
 
 
 class TestRunnerRouting(unittest.TestCase):

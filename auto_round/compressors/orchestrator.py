@@ -207,7 +207,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.debug(
                 "[calib-data-device] %s",
                 calib_data_line(
-                    {"fp": input_ids, "q": q_input, "aux": input_others},
+                    [input_ids, q_input],
+                    input_others,
                     placement,
                     pool_bytes,
                     n_chunks,

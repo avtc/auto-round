@@ -112,25 +112,36 @@ def _bytes_by_device(obj) -> tuple:
     return per_device, sum(per_device.values())
 
 
-def calib_data_line(input_kinds: dict, plan, outputs_bytes: int, n_chunks: int, primary: str) -> str:
-    """One-line calibration-data summary (per user format):
+def _short_device_key(dev: str) -> str:
+    """'cuda:0' -> '0', 'cpu' -> 'cpu' (memory-monitor grammar)."""
+    d = str(dev)
+    if d.startswith("cuda:"):
+        return d.split(":", 1)[1]
+    return d
 
-    ``inputs: fp 4.00GiB, q 4.00GiB, aux 0.12GiB | outputs: 8.00GiB | per device: c0 6.12GiB, c1 6.00GiB``
 
-    Inputs/aux are ground truth (walked from the live tensors' devices); outputs
-    are this block's planned placement (the plan, or all-primary when the policy
-    resolved to today's behavior). Per-device totals combine parked + planned.
+def calib_data_line(inputs, aux, plan, outputs_bytes: int, n_chunks: int, primary: str) -> str:
+    """One-line calibration-data summary in the memory-monitor format:
+
+    ``'input': 8.12GB, 'output': 8.12GB, 'aux': 0.12GB, 'per_device': {'0': 2.03GB, '1': 2.03GB, 'cpu': 0.12GB}``
+
+    ``inputs`` is the list of live input pool objects (fp and q chains merged --
+    the dual chain is upstream's qon architecture; during collection both pools
+    coexist, which is the peak the placement accounts for). Input/aux devices
+    are ground truth (walked from the tensors); output bytes are this block's
+    planned placement (the plan, or all-primary under today's behavior).
+    Per-device totals combine parked + planned.
     """
     per_device: dict = {}
-    parts = []
-    for label, obj in input_kinds.items():
+    input_total = 0
+    for obj in inputs:
         by_dev, total = _bytes_by_device(obj)
-        if total <= 0:
-            continue
-        parts.append(f"{label} {total / 2**30:.2f}GiB")
+        input_total += total
         for d, b in by_dev.items():
             per_device[d] = per_device.get(d, 0) + b
-    inputs_part = ", ".join(parts) if parts else "none"
+    by_dev, aux_total = _bytes_by_device(aux)
+    for d, b in by_dev.items():
+        per_device[d] = per_device.get(d, 0) + b
     if outputs_bytes > 0:
         if plan is not None:
             per_chunk = outputs_bytes / max(n_chunks, 1)
@@ -138,8 +149,13 @@ def calib_data_line(input_kinds: dict, plan, outputs_bytes: int, n_chunks: int, 
                 per_device[dev] = per_device.get(dev, 0) + int(cnt * per_chunk)
         else:
             per_device[str(primary)] = per_device.get(str(primary), 0) + outputs_bytes
-    devs = ", ".join(f"{d} {b / 2**30:.2f}GiB" for d, b in sorted(per_device.items(), key=lambda kv: -kv[1]))
-    return f"inputs: {inputs_part} | outputs: {outputs_bytes / 2**30:.2f}GiB | per device: {devs}"
+    devs = ", ".join(
+        f"'{_short_device_key(d)}': {b / 2**30:.2f}GB" for d, b in sorted(per_device.items(), key=lambda kv: -kv[1])
+    )
+    return (
+        f"'input': {input_total / 2**30:.2f}GB, 'output': {outputs_bytes / 2**30:.2f}GB, "
+        f"'aux': {aux_total / 2**30:.2f}GB, 'per_device': {{{devs}}}"
+    )
 
 
 def _tensor_bytes(obj) -> int:
