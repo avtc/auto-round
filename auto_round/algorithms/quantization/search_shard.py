@@ -109,25 +109,6 @@ def run_items_by_device(groups, fn, use_cuda_ctx=True):
         raise first_error[0]
 
 
-def shard_eligible(device_keys):
-    """Return True when the device mix justifies threading the search loop.
-
-    Sharding engages only for multi-device (cuda-containing) mixes: on a single
-    device the serial loop is already optimal and stays bit-for-bit unchanged.
-    """
-    keys = {str(k) for k in device_keys}
-    if len(keys) < 2:
-        return False
-    for k in keys:
-        try:
-            if torch.device(k).type == "cuda":
-                return True
-        except (ValueError, RuntimeError) as e:  # unrecognized labels are simply not cuda
-            logger.debug("[search-shard] device grouping: label %r is not a device (%s)", k, e)
-            continue
-    return False
-
-
 def search_offload_disabled():
     """Kill switch for running batched searches on idle devices."""
     return bool(envs.AR_DISABLE_SEARCH_OFFLOAD)
@@ -181,22 +162,6 @@ def log_engaged_once(label):
 def shard_disabled_by_env():
     """Kill switch for the per-device search sharding."""
     return bool(envs.AR_DISABLE_SEARCH_SHARD)
-
-
-def wrap_shard_enabled():
-    """Opt-in gate for threading the wrapper-time searches.
-
-    Measured on a 300B MoE block spanning 8 GPUs, threading the per-module
-    wrapper searches made the wrap phase SLOWER (+32 s per block). The
-    serialization mechanism is not yet profiled; torch.compile is NOT a wrap-
-    phase factor (compile_func only lazily binds the callable -- actual
-    compilation happens at each wrapper's first tune-loop call), so the
-    leading unmeasured candidates are GIL contention on the many short
-    python-dominated searches and allocator/dispatch contention. The
-    optimized-RTN iters=0 searches (fewer, much longer searches) measured
-    2.7x faster when threaded and stay enabled by default.
-    """
-    return bool(envs.AR_ENABLE_WRAP_SEARCH_SHARD)
 
 
 def _wrap_batch_device_of(inputs):

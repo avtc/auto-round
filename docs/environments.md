@@ -251,16 +251,6 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
-### AR_ENABLE_WRAP_SEARCH_SHARD
-- **Description**: Opt-in parallel execution of the wrapper-time quantization searches (SignRoundV2 init-scale, GGUF DQ scale) across the devices hosting the sharded weights. Disabled by default: on blocks with many small per-module searches (e.g. 300B MoE blocks with 583 wrapped modules) the threaded wrap measured slower than the serial loop (+32 s per block); the exact serialization mechanism (leading candidates: GIL contention and allocator/dispatch contention; torch.compile is not a wrap-phase factor because compile_func only lazily binds the callable) is not yet profiled. The optimized-RTN iters=0 searches are not affected by this switch (their per-search cost is much larger and they shard by default when weights span multiple CUDA devices).
-- **Default**: `0` (serial wrapper searches)
-- **Valid Values**: `0` / `1`
-- **Usage**: Experiment switch for blocks whose wrapper searches are long enough to benefit from threading.
-
-```bash
-AR_ENABLE_WRAP_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
-```
-
 ### AR_PERF_COUNTERS
 - **Description**: Emits one per-block `[perf] tune phases` INFO line with the wall time of each tuning phase (wrap / prepare / loop / tail) and, inside the loop, the sampler draw, best-params snapshots, gradient sync + optimizer step, rest, and the serial forward+loss+backward time. Intended for performance attribution of large multi-device quantization runs; adds negligible overhead.
 - **Default**: `0` (disabled)

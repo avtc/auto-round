@@ -251,16 +251,6 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 AR_DISABLE_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
 ```
 
-### AR_ENABLE_WRAP_SEARCH_SHARD
-- **描述**：按权重所在设备并行执行封装期量化搜索（SignRoundV2 init-scale、GGUF DQ scale）的实验开关。默认关闭：在包含大量小型逐模块搜索的 block 上（例如 583 个封装模块的 300B MoE block），线程化封装搜索实测慢于串行循环（每 block +32 秒）；具体的串行化机制（主要候选：GIL 争用与分配器/分发争用；torch.compile 并非封装阶段因素，因为 compile_func 仅惰性绑定可调用对象）尚未剖析。optimized-RTN iters=0 搜索不受此开关影响（其单次搜索开销大得多，且在权重跨多个 CUDA 设备时默认分片）。
-- **默认值**：`0`（串行封装搜索）
-- **有效取值**：`0` / `1`
-- **用法**：用于封装搜索足够长、可从线程化中受益的 block 的实验开关。
-
-```bash
-AR_ENABLE_WRAP_SEARCH_SHARD=1 python -m auto_round --model ... --device_map 0,1,2,3
-```
-
 ### AR_PERF_COUNTERS
 - **描述**：为每个 block 输出一行 `[perf] tune phases` INFO 日志，包含各调优阶段（wrap / prepare / loop / tail）的耗时，以及循环内部的采样器抽取、最优参数快照、梯度同步 + 优化器步进、剩余时间和串行 forward+loss+backward 时间。用于大型多设备量化运行的性能归因；开销可忽略。
 - **默认值**：`0`（关闭）

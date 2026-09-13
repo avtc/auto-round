@@ -811,15 +811,6 @@ class WrapperMultiblock(torch.nn.Module):
         return hidden_states
 
 
-def _wrap_item_device(m, device):
-    """Device where this module's wrap-time search math will run (its weight device)."""
-    w = getattr(m, "weight", None)
-    if isinstance(w, torch.Tensor):
-        return str(w.device)
-    td = getattr(m, "tuning_device", None)
-    return str(td) if td is not None else str(device)
-
-
 def wrapper_block(
     block,
     enable_minmax_tuning,
@@ -846,10 +837,8 @@ def wrapper_block(
 
     # Wrap-time searches (SignRoundV2 init-scale, GGUF DQ scale) read only the
     # module's own weight plus per-module statistics, never calibration
-    # activations. On a block whose weights are sharded across devices the
-    # searches therefore run in parallel, one worker per weight device; results
-    # are keyed by work index so the returned lists keep the original
-    # ``named_modules`` order on every path.
+    # activations; eligible searches run later in one stacked batched call per
+    # (device, shape, config, search fn).
     work = []
     for n, m in block.named_modules():
         if type(m) in SUPPORTED_LAYER_TYPES:
@@ -897,23 +886,7 @@ def wrapper_block(
             deferred_wrappers.append(new_m)
         return "q"
 
-    groups = search_shard.group_items_by_device(work, device_of=lambda it: _wrap_item_device(it[1], device))
-    if (
-        search_shard.shard_eligible(groups.keys())
-        and search_shard.wrap_shard_enabled()
-        and not search_shard.shard_disabled_by_env()
-    ):
-        outcomes = {}
-
-        def _wrap_indexed(idx, item):
-            n, m, kind = item
-            outcomes[idx] = _wrap_one(n, m, kind)
-
-        search_shard.run_items_by_device(groups, _wrap_indexed)
-        search_shard.log_engaged_once("wrapper search")
-        results = [outcomes.get(i) for i in range(len(work))]
-    else:
-        results = [_wrap_one(n, m, kind) for n, m, kind in work]
+    results = [_wrap_one(n, m, kind) for n, m, kind in work]
 
     if _defer_batch and deferred_wrappers:
         # stacked same-shape batches per (device, shape, config, search fn);
@@ -921,6 +894,7 @@ def wrapper_block(
         if not search_shard.run_batched_wrap_search(deferred_wrappers):
             for w in deferred_wrappers:
                 w._run_deferred_search_now()
+
     quantized_layers = [n for (n, _m, _k), r in zip(work, results) if r == "q"]
     unquantized_layers = [n for (n, _m, _k), r in zip(work, results) if r == "u"]
     return quantized_layers, unquantized_layers

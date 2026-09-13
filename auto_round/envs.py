@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
     AR_ALLOW_W8_ASYM: bool = False
     AR_DISABLE_SEARCH_SHARD: bool = False
-    AR_ENABLE_WRAP_SEARCH_SHARD: bool = False
     AR_PERF_COUNTERS: bool = False
     AR_WRAP_SEARCH_BATCH_GB: Optional[float] = None
     AR_DISABLE_SEARCH_OFFLOAD: bool = False
@@ -144,8 +143,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # crash/kill. See auto_round/utils/resume.py.
     "AR_RESUME_DIR": lambda: os.getenv("AR_RESUME_DIR", None),
     "AR_DISABLE_SEARCH_SHARD": lambda: os.getenv("AR_DISABLE_SEARCH_SHARD", "False").strip().lower()
-    in ("1", "true", "yes"),
-    "AR_ENABLE_WRAP_SEARCH_SHARD": lambda: os.getenv("AR_ENABLE_WRAP_SEARCH_SHARD", "False").strip().lower()
     in ("1", "true", "yes"),
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "False").strip().lower() in ("1", "true", "yes"),
     "AR_WRAP_SEARCH_BATCH_GB": lambda: (
