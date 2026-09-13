@@ -207,6 +207,43 @@ class TestRunnerRouting(unittest.TestCase):
         out = r.forward(object(), inputs, {}, indices=torch.tensor([0, 1]))
         self.assertEqual(out.device.type, "cpu")
 
+    def test_mixed_device_batch_gathers_before_cat(self):
+        # regression: _select_batch cat'd per-sample tensors on their (mixed)
+        # park devices before the compute-device move -> torch.cat crash.
+        # Duck-typed tensors (a CPU box has no second real device; meta cannot
+        # be copied out of).
+        r = self._runner()
+
+        class _FakeT:
+            def __init__(self, dev):
+                self.device = torch.device(dev)
+                self.moved_to = None
+
+            def to(self, target):
+                self.moved_to = target
+                return torch.zeros(2, 1)
+
+        mixed = [_FakeT("cpu"), _FakeT("meta"), _FakeT("cpu")]
+        out = r._gather_same_device(mixed, torch.device("cpu"))
+        self.assertTrue(all(t.moved_to == torch.device("cpu") for t in mixed))
+        self.assertTrue(all(o.device.type == "cpu" for o in out))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a real second device")
+    def test_mixed_device_batch_select_integration(self):
+        r = self._runner()
+        r.device = "cuda:0"
+        inputs = [torch.zeros(2, 1, device="cpu")] * 2 + [torch.zeros(2, 1, device="cuda:0")] * 2
+        sel = r._select_batch(inputs, {"m": [torch.zeros(2, 1) for _ in range(4)]}, torch.tensor([0, 1, 2, 3]))
+        self.assertEqual(sel[0].device.type, "cuda")
+        self.assertEqual(sel[0].shape[0], 4)
+
+    def test_uniform_device_batch_untouched(self):
+        r = self._runner()
+        a = torch.zeros(2, 1)
+        inputs = [a, a.clone(), a.clone(), a.clone()]
+        out = r._gather_same_device(inputs, torch.device("meta"))
+        self.assertIs(out[0], a)  # same objects, no copies
+
     def test_explicit_cache_device_call_overrides_placement(self):
         r = self._runner()
         r.pool_placement = pp.PoolPlacement(["meta", "cpu"], [1, 1], 4)
