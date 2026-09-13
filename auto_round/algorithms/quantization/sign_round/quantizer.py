@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 import torch
 from torch import autocast
 
+from auto_round.algorithms.block_runner import BlockForwardRunner
 from auto_round.algorithms.quantization.base import BaseQuantizer
 from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
 from auto_round.algorithms.quantization.sign_round.sign_sgd import SignSGD
@@ -541,6 +542,38 @@ class SignRoundQuantizer(BaseQuantizer):
         if _tune_perf is not None:
             _tune_perf["prepare"] = _ptime.perf_counter() - _tp1
             _tp2 = _ptime.perf_counter()
+        # Bulk local-pull of the reference pool (same strategy as iters=0):
+        # when the whole fp_outputs pool fits on the loss/compute device beside
+        # a conservative reserve for the loop's working set, move it ONCE so
+        # every iteration reads locally; otherwise it stays sharded and the
+        # per-batch gather below covers mixed-device selections.
+        if fp_outputs and loss_device is not None:
+            _ld = torch.device(loss_device)
+            if any(t.device != _ld for t in fp_outputs):
+                _pool_b = sum(t.numel() * t.element_size() for t in fp_outputs)
+                try:
+                    from auto_round.algorithms.quantization.search_shard import _probe_usable_bytes
+
+                    _free = _probe_usable_bytes(str(_ld))
+                except Exception as e:  # pragma: no cover - diagnostics only
+                    logger.warning("[tune] free-memory probe failed for %s (%s); keeping pool sharded", _ld, e)
+                    _free = None
+                if _free is not None and _free - (4 << 30) >= _pool_b:
+                    fp_outputs = [t.to(_ld) for t in fp_outputs]
+                    logger.debug(
+                        "[tune] reference pool pulled to %s (%.2f GiB, free %.2f GiB)",
+                        _ld,
+                        _pool_b / 2**30,
+                        _free / 2**30,
+                    )
+                elif _free is not None:
+                    logger.debug(
+                        "[tune] reference pool stays sharded (pool %.2f GiB + reserve vs free %.2f GiB on %s)",
+                        _pool_b / 2**30,
+                        _free / 2**30,
+                        _ld,
+                    )
+
         try:
             for i in range(self.iters):
                 # Auto observes a complete forward/backward/optimizer iteration
@@ -577,7 +610,16 @@ class SignRoundQuantizer(BaseQuantizer):
                         _sf_t0 = _ptime.perf_counter()
                     staged = tuning_cache.get(indices) if tuning_cache is not None else None
                     if staged is None:
-                        ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
+                        # fp_outputs may be sharded across park devices
+                        # (--calibration_data_device): gather onto one device
+                        # before cat. Uniform-device selections are returned
+                        # untouched (byte-identical to the single-device path);
+                        # tensors are immutable, so concurrent gather is safe.
+                        _sel = [fp_outputs[i] for i in indices]
+                        _gather = BlockForwardRunner._gather_same_device(
+                            _sel, str(loss_device) if loss_device is not None else str(_sel[0].device)
+                        )
+                        ref_output = torch.cat(_gather, dim=0).to(loss_device)
                         pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
                     else:
                         ref_output = staged[2]

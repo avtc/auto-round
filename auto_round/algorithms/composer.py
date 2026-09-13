@@ -84,6 +84,26 @@ class BlockContext:
 # ---------------------------------------------------------------------------
 # AlgorithmComposer
 # ---------------------------------------------------------------------------
+def _release_pool_inplace(obj):
+    """Release a calibration pool's tensors by mutating its containers in place.
+
+    The pool object is shared with the orchestrator (which holds it as the
+    block's ``input_ids``), so dropping a local reference frees nothing. The
+    containers are the same objects on both sides; setting their entries to
+    None drops the last strong references to the tensors (hooks are removed
+    and the tuning loop reads the q pool, so nothing re-reads this pool).
+    Immutable containers (tuples) are skipped: their tensors stay alive until
+    the block-end release, matching the pre-existing behavior.
+    """
+    if isinstance(obj, list):
+        for i in range(len(obj)):
+            obj[i] = None
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _release_pool_inplace(v)
+    return obj
+
+
 class AlgorithmComposer:
     """An ordered composition of pre-processors + one block quantizer, built from
     a list of algorithm config objects and an optional compressor.
@@ -451,7 +471,13 @@ class AlgorithmComposer:
         if q_inputs is not None and fp_inputs is not q_inputs:
             # Release the fp pool at its last use (before tuning): the q pool is
             # the tuning input and the fp pool is already consumed into
-            # reference_output. Freed earlier, not later.
+            # reference_output. The release is IN PLACE -- the orchestrator
+            # holds the same container object as its ``input_ids``, so merely
+            # dropping this local reference freed nothing and the pool stayed
+            # resident through the whole tune loop. Freed VRAM here directly
+            # widens the tune-loop's local-pull decision (hot pools on the
+            # compute device when they fit).
+            _release_pool_inplace(fp_inputs)
             fp_inputs = None
             clear_memory()
         # ── Step 4: quantize_block ──────────────────────────────────────────────
