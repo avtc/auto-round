@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     AR_DISABLE_SEARCH_SHARD: bool = False
     AR_ENABLE_WRAP_SEARCH_SHARD: bool = False
     AR_PERF_COUNTERS: bool = False
-    AR_PACK_STACK: bool = False
     AR_WRAP_SEARCH_BATCH_GB: Optional[float] = None
     AR_DISABLE_SEARCH_OFFLOAD: bool = False
 
@@ -149,7 +148,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_ENABLE_WRAP_SEARCH_SHARD": lambda: os.getenv("AR_ENABLE_WRAP_SEARCH_SHARD", "False").strip().lower()
     in ("1", "true", "yes"),
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "False").strip().lower() in ("1", "true", "yes"),
-    "AR_PACK_STACK": lambda: os.getenv("AR_PACK_STACK", "False").strip().lower() in ("1", "true", "yes"),
     "AR_WRAP_SEARCH_BATCH_GB": lambda: (
         (lambda v: v if v is None else (float(v) if v.replace(".", "", 1).replace("-", "", 1).isdigit() else None))(
             os.getenv("AR_WRAP_SEARCH_BATCH_GB", "").strip() or None
