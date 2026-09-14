@@ -53,7 +53,75 @@ def _tuning_state_bytes(block, target_dev):
     return sum(p.numel() for p in block.parameters() if str(p.device) == str(target_dev) and id(p) not in tuning) * 14
 
 
-def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
+def _block_activation_bytes(block, tensors, batch_size):
+    """The block's per-iteration activation bytes from ACTUAL data.
+
+    MoE blocks use the routed-buffer budget proven on the mapped-streaming
+    lane (300B A21B, iters20, 4x24GB): the experts loop materializes
+    ``tokens * top_k`` hidden rows as input AND output accumulators, and the
+    backward materializes a same-sized grad for the routed set -- x6 total,
+    each factor a real tensor (the 2GiB backward ask of the observed OOM;
+    fp32-vs-bf16 folded in the safe direction). Tokens are batch_size x the
+    actual row length of the pool tensors; top_k from the model config (same
+    attribute set as the estimator's moe ratio). On the measured 4-GPU hy3
+    lane this reproduces the observed loop retention (12.9 vs 12.7 GiB of
+    batch cats + routed caches) from data alone.
+
+    Non-MoE blocks fall back to the mapped-placement estimator's per-module
+    output accounting (batch x seq x out_features, real element sizes, x2
+    for activation grads). Returns None when neither can be computed
+    (callers decline the pull).
+    """
+    try:
+        from auto_round.utils.device import get_first_available_attr, get_moe_memory_ratio
+        from auto_round.utils.model import is_moe_layer
+
+        _ratio, has_moe = get_moe_memory_ratio(block)
+        if has_moe:
+            config = getattr(block, "config", None)
+            top_k = None
+            if config is not None:
+                top_k = get_first_available_attr(config, ["num_experts_per_tok", "moe_num_active_primary_experts"])
+                if top_k is None:
+                    moe_topk = getattr(config, "moe_topk", None)  # HunYuan MoE V1
+                    if isinstance(moe_topk, (list, tuple)) and moe_topk:
+                        top_k = moe_topk[0]
+            if top_k is None:
+                for _name, module in block.named_modules():
+                    if is_moe_layer(module):
+                        top_k = getattr(module, "top_k", None) or getattr(module, "num_experts_per_tok", None)
+                        if top_k is not None:
+                            break
+            if top_k is None:
+                return None
+            # row length and element size from the actual pool tensors
+            ref = (
+                tensors[0]
+                if isinstance(tensors, list) and tensors
+                else next(
+                    (t for t in (tensors.values() if isinstance(tensors, dict) else []) if isinstance(t, torch.Tensor)),
+                    None,
+                )
+            )
+            if ref is None or ref.ndim < 2:
+                return None
+            row_len = int(ref.shape[-2]) if ref.ndim >= 3 else int(ref.shape[0])
+            hidden_bytes = int(ref.shape[-1]) * ref.element_size()
+            tokens = max(1, int(batch_size)) * max(1, row_len)
+            return int(tokens * int(top_k) * hidden_bytes * 6)
+        # dense: per-module output accounting from the estimator (actual shapes)
+        from auto_round.utils.device import estimate_tuning_block_mem
+
+        _layer_dict, layer_activation_gib, _io_gib, _additional_gib = estimate_tuning_block_mem(
+            block, tensors, batch_size
+        )
+        return int(layer_activation_gib * 2**30)
+    except Exception as e:  # pragma: no cover - placement must never break tuning
+        logger.warning("[tune] activation estimate failed (%s); treating as unknown", e)
+        return None
+
+
+def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge_activation=False):
     """Bulk-move a whole tune-loop pool onto the device that reads it every iteration.
 
     iters>0 strategy only (loop-amortized): ``active_inputs`` -> the entry
@@ -68,9 +136,18 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
     same state density without the pool). The loss side has no per-iteration
     graph retention (one cat per iteration, freed after the loss -- validated
     by the full 80-block pull run).
+
+    ``charge_activation`` adds the block's ACTUAL activation accounting
+    (per-module output shapes, MoE-ratio scaled -- see
+    ``_block_activation_bytes``) and is set only for the input pull: the
+    entry device carries the loop's forward graph (batch cats + routed-row
+    caches materialize along the hidden flow regardless of weight homes).
     """
     if pool is None or target_dev is None:
         return pool
+    _act_bytes = _block_activation_bytes(block, pool, batch_size) if charge_activation else 0
+    if charge_activation and _act_bytes is None:
+        return pool  # unknown activation cost: never pull blind
     _tgt = torch.device(target_dev)
     try:
         tensors = pool if isinstance(pool, list) else None
@@ -79,6 +156,8 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
         if all(t.device == _tgt for t in tensors):
             return pool
         pool_b = sum(t.numel() * t.element_size() for t in tensors)
+        if charge_activation:
+            pool_b += _act_bytes
         try:
             from auto_round.utils.device import probe_usable_bytes
 
@@ -623,14 +702,28 @@ class SignRoundQuantizer(BaseQuantizer):
             _tune_perf["prepare"] = _ptime.perf_counter() - _tp1
             _tp2 = _ptime.perf_counter()
         # iters>0 hot-pool strategy (loop-amortized; the iters=0 lane streams
-        # its pools once and never reaches this pull): the fp reference pool
-        # moves in bulk onto the loss device that reads it every iteration.
-        # The INPUT pool deliberately keeps its per-batch gather: the entry
-        # device accumulates the loop's forward retention (batch cats +
-        # linear_loop route caches, measured ~3.2x pool bytes on hy3), and
-        # input pulls OOMed two server runs exactly pool_bytes over the
-        # no-pull profile; the gather costs a measured ~1-2 s/block.
+        # its pools once and never reaches these pulls): each pool moves in
+        # bulk onto the device that reads it every iteration -- the input
+        # pool onto the entry device (BlockForwardRunner.device, where the
+        # forward gathers each batch), the fp reference pool onto the loss
+        # device. Both gates charge ACTUAL data: exact tuning state from the
+        # wrapper walker, and (input pull) the routed-buffer budget proven on
+        # the mapped-streaming lane -- tokens x top_k hidden rows as in/out
+        # accumulators plus the backward grad (x6), which reproduces the
+        # measured 12.7 GiB loop retention on hy3 from shapes alone. Declined
+        # pulls keep the per-batch gather (measured ~1-2 s/block).
         if (getattr(self, "iters", 0) or 0) > 0:
+            _entry_dev = str(getattr(block_fwd, "device", device)) if block_fwd is not None else str(device)
+            if isinstance(active_inputs, list):
+                active_inputs = _pull_pool_if_fits(
+                    active_inputs,
+                    _entry_dev,
+                    block,
+                    batch_size,
+                    self.iters,
+                    "tune] block input activations [",
+                    charge_activation=True,
+                )
             if fp_outputs and loss_device is not None:
                 fp_outputs = _pull_pool_if_fits(
                     fp_outputs, str(loss_device), block, batch_size, self.iters, "tune] fp reference outputs ["

@@ -80,6 +80,41 @@ class TestPullPoolIfFits(unittest.TestCase):
         self.assertIs(out, pool)
         self.assertTrue(all(t.moved_to is None for t in pool))
 
+    def test_input_pull_charges_routed_budget(self):
+        # the OOMed 4-GPU lane: entry free ~15.9 GiB, pool 4, routed budget
+        # 12 GiB (tokens x top_k x hidden x 6, from the pr/streaming formula)
+        # -> declines; with no MoE activation cost the same numbers pull
+        with mock.patch(
+            "auto_round.algorithms.quantization.sign_round.quantizer._block_activation_bytes",
+            return_value=int(12 * _GIB),
+        ):
+            pool = [_FakeTensor("cuda:2", numel=_GIB // 4) for _ in range(4)]
+            block = _FakeBlock([])
+            out = _run(pool, block, free=15.9 * _GIB, target="cuda:0", label="tune-input", charge_activation=True)
+            self.assertTrue(all(t.moved_to is None for t in out))
+        with mock.patch(
+            "auto_round.algorithms.quantization.sign_round.quantizer._block_activation_bytes", return_value=0
+        ):
+            pool2 = [_FakeTensor("cuda:2", numel=_GIB // 4) for _ in range(4)]
+            out2 = _run(pool2, block, free=15.9 * _GIB, target="cuda:0", label="tune-input", charge_activation=True)
+            self.assertTrue(all(t.moved_to == torch.device("cuda:0") for t in out2))
+
+    def test_routed_budget_formula_reproduces_measured_lane(self):
+        # hy3: batch 8 x seq 2048 x top_k 8 x hidden 4096 x fp32 x 6 ~= 12.0 GiB
+        # (measured loop retention: 12.7 GiB of batch cats + routed caches)
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        ref = torch.zeros(1, 2048, 4096)  # fp32 pool sample
+        block = nn.Linear(4, 4)
+        block.config = type("C", (), {"num_experts_per_tok": 8})()
+        with mock.patch("auto_round.utils.device.get_moe_memory_ratio", return_value=(8 / 192, True)), mock.patch(
+            "auto_round.utils.model.is_moe_layer", return_value=False
+        ):
+            got = q._block_activation_bytes(block, [ref], 8)
+        self.assertAlmostEqual(got / _GIB, 12.0, delta=0.05)
+
     def test_state_charged_only_for_params_on_target(self):
         pool = [_FakeTensor("cuda:0", numel=_GIB // 4)]
         block = _FakeBlock([_FakeParam("cuda:2", numel=int(4 * _GIB))])
