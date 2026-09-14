@@ -256,10 +256,11 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertGreater(counts.get("cuda:2", 0), 0)
         self.assertEqual(sum(counts.values()), 128)
 
-    def test_zero_peer_capacity_falls_back_to_uncharged_split(self):
+    def test_zero_peer_capacity_even_over_commit(self):
         # Old contract returned None (-> primary concentration, the worse
-        # failure). Now: fully-charged sharding that cannot hold the pool
-        # falls back to the UNCHARGED proportional split -- the placement that
+        # failure). Now: when the charged headrooms cannot hold the pool,
+        # the water-fill spreads the over-commitment EVENLY (same level t
+        # below every device's charged headroom) -- the placement that
         # demonstrably completed blocks on the 95%-utilization lane.
         plan = self._resolve(
             pool=4 * self.GB,
@@ -351,10 +352,11 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertGreater(counts.get("cuda:1", 0), counts.get("cuda:0", 0))
         self.assertAlmostEqual(plan.level_bytes / self.GB, 3.5, delta=0.05)
 
-    def test_insufficient_capacity_falls_back_to_uncharged_split(self):
+    def test_insufficient_capacity_even_over_commit(self):
         # No silent CPU fallback ever; and instead of None (whose caller-side
         # default concentrates the pool on the primary), an over-fleet pool
-        # takes the uncharged proportional split with the charges logged.
+        # is spread by the water-fill with the over-commitment shared evenly
+        # across charged headrooms (charges shape the split in both regimes).
         plan = self._resolve(
             pool=100 * self.GB,
             free={"cuda:0": 8 * self.GB, "cuda:1": 10 * self.GB, "cuda:2": 10 * self.GB},

@@ -964,9 +964,7 @@ def get_moe_memory_ratio(block: torch.nn.Module, config=None) -> float:
     return 1.0, False  # Default ratio for non-MoE models
 
 
-def estimate_tuning_block_mem(
-    block: torch.nn.Module, input_ids: Any, batch_size: int, config=None
-) -> tuple[dict, float]:
+def estimate_tuning_block_mem(block: torch.nn.Module, input_ids: Any, batch_size: int, config=None) -> tuple:
     """
     Calculates the memory consumption of a specific block in the model.
 
@@ -977,12 +975,16 @@ def estimate_tuning_block_mem(
         batch_size (int): Number of samples to consider for memory estimation.
 
     Returns:
-        tuple: A tuple containing the following:
+        tuple: A 6-tuple containing:
             - layer_memory_dict (dict): A dictionary mapping layer names to their memory consumption (in GB).
                 Format: {layer_name: {"param_memory": float, "output_memory": float}}
+            - layer_activation_memory (float): Sum of per-layer output memory (GB), expert outputs
+                ratio-scaled by active/total experts.
             - input_output_memory (float): The memory consumption (in GB) for input and output
                 tensors of the block.
             - additional_memory (float): Additional memory overhead (in GB) for operations like attention.
+            - per_device_activation (dict): {device: GB} of output+grad charges bucketed by weight home.
+            - per_device_experts (dict): {device: count} of routed-expert leaves homed per device.
     """
     # Calculate all block parameters memory and build layer-wise memory dict
     from auto_round.utils.model import get_layer_features, is_moe_layer
@@ -1059,7 +1061,11 @@ def estimate_tuning_block_mem(
                             isinstance(_mod, torch.nn.ModuleList) or hasattr(_mod, "num_experts") or is_moe_layer(_mod)
                         ):
                             is_experts_container = True
-                is_moe_expert = "expert" in layer_name.lower() and is_experts_container
+                # shared experts are plain modules outside the dispatch (same
+                # exclusion the repo's is_moe_expert predicate applies)
+                is_moe_expert = (
+                    "expert" in layer_name.lower() and "shared" not in layer_name.lower() and is_experts_container
+                )
             else:
                 is_moe_expert = False
 

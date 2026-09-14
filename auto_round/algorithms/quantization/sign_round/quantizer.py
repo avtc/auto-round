@@ -43,14 +43,7 @@ def _tuning_state_bytes(block, target_dev):
     Wrapper tuning tensors are identified by identity (any ``.params``
     dict on a module) and excluded; the original weights carry the charge.
     """
-    tuning = set()
-    for m in block.modules():
-        _p = getattr(m, "params", None)
-        if isinstance(_p, dict):
-            for _v in _p.values():
-                if torch.is_tensor(_v):
-                    tuning.add(id(_v))
-    return sum(p.numel() for p in block.parameters() if str(p.device) == str(target_dev) and id(p) not in tuning) * 14
+    return _logical_state_by_device(block).get(str(target_dev), 0)
 
 
 def _logical_state_by_device(block):
@@ -94,6 +87,7 @@ def _ensure_routed_shape_recorders_(block):
     from auto_round.utils.model import is_moe_layer
 
     def _record(module, args):
+        recorded = False
         try:
             tensors = [a for a in args if torch.is_tensor(a)]
             if len(tensors) < 2:
@@ -102,27 +96,54 @@ def _ensure_routed_shape_recorders_(block):
             if hidden.ndim < 2 or index.ndim < 1:
                 return
             module._routed_shape_rec_ = (int(index.shape[-1]), int(index.numel()))
+            recorded = True
+            logger.debug(
+                "[routed-shape] recorded top_k=%d routed_rows=%d",
+                module._routed_shape_rec_[0],
+                module._routed_shape_rec_[1],
+            )
         except Exception as e:  # pragma: no cover - diagnostics only, never break the forward
             logger.debug("[routed-shape] recorder skipped (%s)", e)
         finally:
-            for handle in list(getattr(module, "_routed_rec_handles_", [])):
-                handle.remove()
-            module._routed_rec_handles_ = []
+            if recorded:
+                # self-remove ONLY on a successful record: removing on a
+                # miss (non-dispatch arg shapes) silently disarms the
+                # recorder before it ever sees a natural dispatch
+                for handle in list(getattr(module, "_routed_rec_handles_", [])):
+                    handle.remove()
+                module._routed_rec_handles_ = []
 
-    for _name, module in block.named_modules():
-        if (is_moe_layer(module) or isinstance(getattr(module, "num_experts", None), int)) and not hasattr(
-            module, "_routed_shape_rec_"
+    def _is_experts_container(name, module):
+        # container may carry the marker itself, expose num_experts, be a
+        # ModuleList, or carry the MoE marker only on an ANCESTOR
+        # (HYV3Experts: none of the former)
+        if is_moe_layer(module) or isinstance(getattr(module, "num_experts", None), int):
+            return True
+        stem = name
+        while "." in stem:
+            stem = stem.rsplit(".", 1)[0]
+            mod = mods.get(stem)
+            if mod is not None and (is_moe_layer(mod) or isinstance(getattr(mod, "num_experts", None), int)):
+                return True
+        return False
+
+    mods = dict(block.named_modules())
+    for _name, module in mods.items():
+        if (
+            "expert" in _name.lower()
+            and _is_experts_container(_name, module)
+            and not hasattr(module, "_routed_shape_rec_")
         ):
             module._routed_rec_handles_ = [module.register_forward_pre_hook(_record)]
 
 
-def _grouped_stack_bytes(block, device):
+def _grouped_stack_bytes(block, device, config=None):
     """Qdq-stack bytes the grouped experts modes materialize on ``device``."""
-    d = _grouped_stack_bytes_detail(block, device)
+    d = _grouped_stack_bytes_detail(block, device, config=config)
     return d["retention"] + d["transient"]
 
 
-def _grouped_stack_bytes_detail(block, device):
+def _grouped_stack_bytes_detail(block, device, config=None):
     """Per-term split of :func:`_grouped_stack_bytes` (retention + transient).
 
     Two chunk-aware terms (retention is chunk-independent; transient is
@@ -138,13 +159,20 @@ def _grouped_stack_bytes_detail(block, device):
       same source the grouped path uses (_qdq_chunk_size: AR_MOE_CHUNK or
       the auto working-set budget; 0 = fuse everything = all-experts chunk).
 
-    Mode-set-but-loop-ran fallbacks can only overcharge -- safe direction.
+    Mode resolution matches the dispatch: an EXPLICIT env value governs,
+    otherwise ``config._experts_implementation`` (so gates stay consistent
+    with a mid-run auto switch to linear_loop instead of charging stacks
+    for a lane that no longer stacks any). Mode-set-but-loop-ran fallbacks
+    can only overcharge -- safe direction.
     """
     import auto_round.envs as _envs
+    from auto_round.modeling.fused_moe.moe_experts_interface import GROUPED_LINEAR_IMPL
 
     mode = str(getattr(_envs, "AR_MOE_EXPERTS_IMPL", "auto") or "auto").lower()
+    if mode in ("", "auto"):
+        mode = str(getattr(config, "_experts_implementation", GROUPED_LINEAR_IMPL) or GROUPED_LINEAR_IMPL)
     if mode not in ("", "auto", "linear_grouped", "linear_grouped_sliced"):
-        return 0
+        return {"retention": 0, "transient": 0}
     retention = 0
     transient = 0
     try:
@@ -158,7 +186,10 @@ def _grouped_stack_bytes_detail(block, device):
             # former -- a name-only walk returned 0 stacks on the real lane
             # and silently disabled the activation charge and the auto
             # linear_loop pick)
-            if "expert" not in name.lower():
+            if "expert" not in name.lower() or "shared" in name.lower():
+                # shared experts are plain modules outside the dispatch (the
+                # repo's own is_moe_expert predicate excludes them); stacking
+                # or routing charges on them are phantom bytes
                 return False
             stem = name
             while "." in stem:
@@ -204,7 +235,8 @@ def _grouped_stack_bytes_detail(block, device):
             retention += elems * 6  # fp32 value stack + bf16 qdq output
             try:
                 chunk = _qdq_chunk_size([l for l, _w in local_pairs])  # env/budget-aware; 0 = all
-            except Exception:
+            except Exception as e:
+                logger.debug("[tune] chunk sizing failed for slot %r on %s (%s); using 16", _slot, device, e)
                 chunk = 16
             per_leaf = elems // max(1, len(local_pairs))
             chunk_elems = elems if chunk <= 0 else min(elems, chunk * per_leaf)
@@ -306,13 +338,21 @@ def _activation_bytes_by_device(block, tensors, batch_size, config=None):
 
         est_by_dev = {}
         expert_counts = {}
+        est_failed = False
         has_moe = any(is_moe_layer(m) or isinstance(getattr(m, "num_experts", None), int) for m in block.modules())
         try:
             _ld, _la, _io, _ad, est_by_dev, expert_counts = estimate_tuning_block_mem(
                 block, tensors, batch_size, config
             )
-        except Exception as e:  # per-module accounting is best-effort
-            logger.debug("[tune] per-module activation estimate unavailable (%s)", e)
+        except Exception as e:  # per-module accounting is best-effort for dense
+            logger.warning("[tune] per-module activation estimate unavailable (%s)", e)
+            est_failed = True
+        if est_failed and has_moe:
+            # an MoE block without the estimator loses the expert homes that
+            # attribute routed bytes and stacks to devices; the composed
+            # charge would collapse toward state-only and keep an
+            # over-budget grouped lane -- decline instead
+            return None
         if not has_moe:
             expert_counts = {}
 
@@ -325,7 +365,9 @@ def _activation_bytes_by_device(block, tensors, batch_size, config=None):
         # weight-side retention arrives via the stacks term. Charging both
         # on a grouped lane double-charged ~3 GiB and falsely switched the
         # measured-working 5x3090 lane to linear_loop.
-        stacks_any = any(_grouped_stack_bytes(block, d) > 0 for d in set(est_by_dev) | set(expert_counts))
+        stacks_any = any(
+            _grouped_stack_bytes(block, d, config=config) > 0 for d in set(est_by_dev) | set(expert_counts)
+        )
         if has_moe and not stacks_any:
             routed_total = _routed_budget_bytes(block, tensors, batch_size, config)
         total_experts = sum(expert_counts.values())
@@ -359,7 +401,7 @@ def _activation_bytes_by_device(block, tensors, batch_size, config=None):
         for d in set(est_by_dev) | set(routed_by_dev):
             # est split is GiB floats (estimator), routed split is bytes
             m = max(int(est_by_dev.get(d, 0.0) * 2**30), int(routed_by_dev.get(d, 0)))
-            out[d] = m + _grouped_stack_bytes(block, d)
+            out[d] = m + _grouped_stack_bytes(block, d, config=config)
         return out or None
     except Exception as e:  # pragma: no cover - placement must never break tuning
         logger.warning("[tune] activation estimate failed (%s); treating as unknown", e)
@@ -377,6 +419,7 @@ def _block_activation_bytes(block, tensors, batch_size, config=None, device=None
 
 
 _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = False
+_MOE_IMPL_AUTO_DONE_KEY = None  # id of the run's config; a new run re-decides
 
 
 def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config, model):
@@ -387,14 +430,21 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
     in-loop tuning state; when a device cannot hold both beside the reserve,
     the first backward OOMs only after a wasted grouped_mm attempt plus a
     sliced-fallback re-staging (the 4x3090 hy3 failure mode). The charges are
-    the same ones the placement gates use: per-device tuning state (values
-    already resident at this point -- charged at 10 of the 14 B/param layout)
-    plus the per-device activation budget (routed transients + grouped
-    stacks). Any expert-homing device over budget -> switch the WHOLE run to
+    the same ones the placement gates use: per-device tuning state charged
+    at 6 of the 14 B/param layout (grads + bf16 are guaranteed in-loop; the
+    values are already inside the probed free and the best-params snapshot
+    parks to host under pressure) plus the per-device activation budget
+    (routed transients on loop lanes, grouped stacks on grouped lanes).
+    Any expert-homing device over budget -> switch the WHOLE run to
     linear_loop once, loudly. Explicit AR_MOE_EXPERTS_IMPL choices are never
     overridden.
     """
-    global _MOE_IMPL_AUTO_LINEAR_LOOP_DONE
+    global _MOE_IMPL_AUTO_LINEAR_LOOP_DONE, _MOE_IMPL_AUTO_DONE_KEY
+    key = id(config) if config is not None else id(model)
+    if _MOE_IMPL_AUTO_DONE_KEY != key:
+        # a second quantization run in the same process re-decides
+        _MOE_IMPL_AUTO_DONE_KEY = key
+        _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = False
     if _MOE_IMPL_AUTO_LINEAR_LOOP_DONE or iters is None or int(iters) <= 0:
         return
     from auto_round import envs as _envs_mod
@@ -473,6 +523,15 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
                 ac / 2**30,
                 LINEAR_LOOP_IMPL,
             )
+            seen_cfg = {id(c) for c in candidates}
+            _nm = getattr(block, "named_modules", None)
+            for _n, m in (_nm() if callable(_nm) else []):
+                # some archs deepcopy the config per layer; the dispatch
+                # reads each module's own config, so switch those too
+                c = getattr(m, "config", None)
+                if c is not None and id(c) not in seen_cfg:
+                    candidates.append(c)
+                    seen_cfg.add(id(c))
             for c in candidates:
                 c._experts_implementation = LINEAR_LOOP_IMPL
         elif max_ratio_dev is not None:

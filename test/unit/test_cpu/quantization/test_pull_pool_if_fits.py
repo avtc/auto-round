@@ -150,6 +150,140 @@ class TestPullPoolIfFits(unittest.TestCase):
         detail = q._grouped_stack_bytes_detail(blk, "cuda:1")
         self.assertLess(detail["retention"], 480)
 
+    def test_stacks_mode_gate_returns_dict_under_linear_loop_env(self):
+        # explicit linear_loop env: the detail walk returns the zero DICT
+        # (a bare 0 here raised TypeError inside _grouped_stack_bytes and the
+        # broad except silently killed the whole activation model)
+        from types import SimpleNamespace
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+        from auto_round import envs
+
+        blk = SimpleNamespace(modules=lambda: iter([]), named_modules=lambda: iter([]))
+        with mock.patch.object(envs, "AR_MOE_EXPERTS_IMPL", "linear_loop"):
+            detail = q._grouped_stack_bytes_detail(blk, "cuda:1")
+            total = q._grouped_stack_bytes(blk, "cuda:1")
+        self.assertEqual(detail, {"retention": 0, "transient": 0})
+        self.assertEqual(total, 0)
+
+    def test_stacks_follow_config_after_auto_switch(self):
+        # after the auto pick switches the run to linear_loop, the gates must
+        # charge the LOOP composition (no stacks, routed re-engaged), not the
+        # env-stale grouped one
+        from types import SimpleNamespace
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+        from auto_round import envs
+
+        blk = SimpleNamespace(modules=lambda: iter([]), named_modules=lambda: iter([]))
+        cfg = type("C", (), {})()
+        cfg._experts_implementation = "linear_loop"
+        with mock.patch.object(envs, "AR_MOE_EXPERTS_IMPL", "auto"):
+            self.assertEqual(q._grouped_stack_bytes(blk, "cuda:1", config=cfg), 0)
+
+    def test_shared_experts_not_charged_as_routed(self):
+        # shared experts are plain modules outside the dispatch; stacking or
+        # routing charges on them are phantom bytes
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        class _MoeMLP(nn.Module):
+
+            pass
+
+        class _Experts(nn.Module):
+
+            pass
+
+        blk = nn.Module()
+        mlp = _MoeMLP()
+        experts = _Experts()
+        shared = _Experts()
+        for i in range(2):
+            leaf = nn.Module()
+            object.__setattr__(
+                leaf,
+                "weight",
+                SimpleNamespace(numel=lambda: 16, device="cuda:1", nbytes=64, shape=(4, 4)),
+            )
+            setattr(experts, str(i), leaf)
+        shared_leaf = nn.Module()
+        object.__setattr__(
+            shared_leaf, "weight", SimpleNamespace(numel=lambda: 16, device="cuda:1", nbytes=64, shape=(4, 4))
+        )
+        shared.gate_proj = shared_leaf
+        mlp.experts = experts
+        mlp.shared_expert = shared
+        blk.mlp = mlp
+
+        got = q._grouped_stack_bytes(blk, "cuda:1")
+        # only the two routed leaves: 2 x 16 x 6 = 192 B minimum
+        self.assertGreaterEqual(got, 192)
+        detail = q._grouped_stack_bytes_detail(blk, "cuda:1")
+        self.assertLess(detail["retention"], 192 + 192)  # shared would add 96 more
+
+    def test_routed_recorder_self_removes_only_on_record(self):
+        # a miss (non-dispatch arg shapes) must NOT disarm the recorder;
+        # a successful natural dispatch records and removes the hook
+        import torch
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        class _MoeMLP(nn.Module):
+
+            pass
+
+        class _HYV3Experts(nn.Module):  # no num_experts, not a ModuleList
+
+            def forward(self, *args):
+                return args
+
+        blk = nn.Module()
+        mlp = _MoeMLP()
+        experts = _HYV3Experts()
+        mlp.experts = experts
+        blk.mlp = mlp
+
+        q._ensure_routed_shape_recorders_(blk)
+        self.assertTrue(experts._routed_rec_handles_, "recorder must attach on the HYV3-style container")
+
+        # miss: two tensors but index ndim 0 -> no record, hook stays
+        experts(torch.zeros(2, 4), torch.zeros(()))
+        self.assertFalse(hasattr(experts, "_routed_shape_rec_"))
+        self.assertTrue(experts._routed_rec_handles_)
+
+        # natural dispatch: (hidden [B,T,H], index [N,K]) -> record + remove
+        experts(torch.zeros(2, 4, 8), torch.zeros(16, 8))
+        self.assertEqual(experts._routed_shape_rec_, (8, 128))
+        self.assertFalse(experts._routed_rec_handles_)
+
+    def test_logical_state_walk_dedups_wrapper_values(self):
+        # real-structure form of the a2414b42 fix: a module with a .params
+        # dict carrying an fp32 value PLUS the original weight must be
+        # charged once (14 B logical), not twice
+        import torch
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        blk = nn.Module()
+        lin = nn.Linear(4, 4)  # weight 16 + bias 4 = 20 elems on cpu
+        wrapper = nn.Module()
+        wrapper.value = nn.Parameter(torch.zeros(4, 4))  # registered fp32 value
+        wrapper.params = {"value": wrapper.value}  # same object, as the real wrappers do
+        blk.lin = lin
+        blk.wrap = wrapper
+        got = q._logical_state_by_device(blk)
+        # deduped: the registered value is identified by identity via .params
+        # and excluded; only the original 20 elems carry the 14 B charge
+        self.assertEqual(got.get("cpu", 0), 20 * 14)
+        # without dedup the walk would see 36 elems (504 bytes)
+        self.assertLess(got.get("cpu", 0), 36 * 14)
+
     def test_routed_budget_dropped_when_grouped_stacks_present(self):
         # grouped mode builds no per-expert route caches (linear_loop
         # calibration); charging routed x6 ALONGSIDE stacks double-charged
@@ -164,7 +298,7 @@ class TestPullPoolIfFits(unittest.TestCase):
         with mock.patch.object(dev_mod, "estimate_tuning_block_mem", return_value=est):
             with mock.patch.object(q, "_routed_budget_bytes", return_value=8 * _GB):
                 with mock.patch.object(
-                    q, "_grouped_stack_bytes", side_effect=lambda b, d: 2 * _GB if d == "cuda:1" else 0
+                    q, "_grouped_stack_bytes", side_effect=lambda b, d, config=None: 2 * _GB if d == "cuda:1" else 0
                 ):
                     got = q._activation_bytes_by_device(blk, [], 8, None)
         self.assertIn("cuda:1", got)

@@ -39,12 +39,15 @@ class TestAutoLinearLoop(unittest.TestCase):
         with _envs_auto():
             with mock.patch.object(q, "_logical_state_by_device", return_value=self.state):
                 with mock.patch.object(q, "_activation_bytes_by_device", return_value=self.act):
-                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1 if stacks else 0):
+                    with mock.patch.object(
+                        q, "_grouped_stack_bytes", side_effect=lambda b, d, config=None: 1 if stacks else 0
+                    ):
                         with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
                             q._maybe_auto_linear_loop_for_tuning(object(), [object()], 8, iters, self.cfg, None)
 
     def test_over_lane_switches_before_the_loop(self):
-        # demand on cuda:1 = 14*10/14 + 12 + 0.25 = 22.25 GiB > free 16
+        # demand on cuda:1 = 14*6/14 (grads+bf16; snapshot parks) + 12 + 0.25
+        # = 20.25 GiB > free 16 (guaranteed in-loop terms only)
         self._run()
         self.assertEqual(self.cfg._experts_implementation, "linear_loop")
         self.assertTrue(self.q._MOE_IMPL_AUTO_LINEAR_LOOP_DONE)
@@ -78,7 +81,7 @@ class TestAutoLinearLoop(unittest.TestCase):
         with _envs_auto():
             with mock.patch.object(q, "_logical_state_by_device", return_value=self.state):
                 with mock.patch.object(q, "_activation_bytes_by_device", return_value=self.act):
-                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1):
+                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d, config=None: 1):
                         with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
                             q._maybe_auto_linear_loop_for_tuning(object(), [object()], 8, 20, ctx_cfg, model)
         self.assertEqual(self.cfg._experts_implementation, "linear_loop")
@@ -93,10 +96,24 @@ class TestAutoLinearLoop(unittest.TestCase):
         with _envs_auto():
             with mock.patch.object(q, "_logical_state_by_device", return_value=state):
                 with mock.patch.object(q, "_activation_bytes_by_device", return_value=act):
-                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1):
+                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d, config=None: 1):
                         with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
                             q._maybe_auto_linear_loop_for_tuning(object(), [object()], 8, 20, self.cfg, None)
         self.assertEqual(self.cfg._experts_implementation, "linear_grouped")
+
+    def test_second_run_same_process_re_decides(self):
+        # the done-flag is keyed by the run's config: a second model
+        # quantized in the same process must get its own auto decision
+        q = self.q
+        q._MOE_IMPL_AUTO_LINEAR_LOOP_DONE = True  # a previous run finished
+        cfg2 = _Cfg()
+        with _envs_auto():
+            with mock.patch.object(q, "_logical_state_by_device", return_value=self.state):
+                with mock.patch.object(q, "_activation_bytes_by_device", return_value=self.act):
+                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d, config=None: 1):
+                        with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
+                            q._maybe_auto_linear_loop_for_tuning(object(), [object()], 8, 20, cfg2, None)
+        self.assertEqual(cfg2._experts_implementation, "linear_loop")  # decided, not skipped
 
     def test_dense_block_no_stacks_no_decision(self):
         # no grouped stacks homed: not the decision point, flag stays unset

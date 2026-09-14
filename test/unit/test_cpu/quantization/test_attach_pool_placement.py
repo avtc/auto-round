@@ -100,7 +100,11 @@ class TestAttachPoolPlacement(unittest.TestCase):
         # quantizer without a loss device: runner device fallback (== primary
         # on real multi-GPU lanes, so the retarget stays unset there)
         cls, self_, runner = _fake_orchestrator(cache_device="cuda:0", mode="auto", iters=20, runner_device="cuda:1")
-        self.assertEqual(resolve.call_args.kwargs.get("consumer"), "cuda:1")
+        with mock.patch(
+            "auto_round.utils.pool_placement.resolve_placement_for_pool", return_value=None
+        ) as resolve2, mock.patch("auto_round.utils.pool_placement.consolidate_pool_onto"):
+            cls._attach_pool_placement(self_, object(), self._pools()[0])
+        self.assertEqual(resolve2.call_args.kwargs.get("consumer"), "cuda:1")
 
         # iters=0: no tune loop, outputs follow the cache primary as before
         cls, self_, runner = _fake_orchestrator(cache_device="cuda:0", mode="auto", iters=0, runner_device="cuda:1")

@@ -16,22 +16,21 @@
 
 Policy (user rulings, Sep-13):
 
-* primary-first: when the block input/output pools fit the primary cache device
-  (free minus the estimated forward working set minus a flat 0.5 GiB allocator
-  reserve), every chunk stays there -- byte-identical to today's behavior, zero
-  peer traffic. The working-set estimate reuses the same per-block accounting
-  the streaming branch's block placement used (``estimate_tuning_block_mem``:
-  ``layer_activation_memory + additional_memory``), computed from each block's
-  own module tree, never from the previous block.
-* otherwise shard: chunks spread over the candidate devices proportionally to
-  free capacity (the primary included), and are consumed chunk-wise by the
-  existing per-batch ``.to(compute_device)`` in the block forward path, so only
-  the at-rest placement changes.
+* single-device-first: when the consumer device (per-block loss device on
+  iters>0 lanes, else the cache primary) holds the pool beside its full charge
+  (computed working allowance + flat 0.25 GiB allocator reserve + measured
+  collection-window term + occupied pool bytes + per-device activation
+  charge), every chunk stays there -- zero peer traffic.
+* otherwise water-fill: chunks are placed so every receiving device ends at
+  the SAME predicted headroom level (min-max optimal); when the pool
+  over-commits the fleet the over-commitment is spread evenly across the
+  charged headrooms. Charges: per-device tuning state (14 B/param logical,
+  deduped), per-device activation budget (estimator + routed/stacks split by
+  expert homes), the consumer's need model, and resident pool bytes.
 * ``cpu`` mode parks the pools on host RAM explicitly (forwards still run on
   the GPUs) -- the pool-scoped equivalent of ``low_gpu_mem_usage`` without its
-  other side effects. ``auto`` never falls back to CPU silently: when sharding
-  cannot hold the pools either, ``None`` is returned so the caller keeps
-  today's behavior and the genuine OOM fires (with the census diagnostics).
+  other side effects. ``auto`` never falls back to CPU silently: over-
+  commitment is spread, never parked on the host unasked.
 
 ``calibration_data_device`` parameter (CLI ``--calibration_data_device`` / API
 keyword): ``auto`` (default) | ``off`` | ``cpu`` | explicit csv (``cuda:1,cuda:2``).
@@ -307,8 +306,9 @@ def resolve_pool_placement(
     block's resolve sees less free and spreads, the next one singles again.
 
     Returns ``None`` when the caller should keep today's behavior (policy off,
-    CPU-parked lane, or sharding cannot hold the pool -- the genuine OOM then
-    fires loudly per the no-silent-CPU ruling).
+    CPU-parked lane, or no usable probed device). Capacity shortfalls do NOT
+    return None: the water-fill spreads the pool and, on over-commit, spreads
+    the over-commitment evenly across charged headrooms.
     """
     mode = (mode or "auto").strip().lower()
     if mode == "off":
@@ -363,9 +363,13 @@ def resolve_pool_placement(
 
     eff = consumer if consumer is not None else str(primary)
     primary_free = dict(usable).get(eff, 0)
-    if primary_free - need_bytes - occupied_bytes >= pool_bytes:
-        # single-device-first: identical to today's behavior, zero peer traffic
-        return PoolPlacement([eff], [max(primary_free - need_bytes - occupied_bytes, 1)], n_chunks)
+    _act = activation_bytes or {}
+    _eff_charge = need_bytes + occupied_bytes + _act.get(eff, 0)
+    if primary_free - _eff_charge >= pool_bytes:
+        # single-device-first: identical to today's behavior, zero peer
+        # traffic; the activation charge matches the water-fill rung below
+        # (without it the rung takes a single plan the loop cannot hold)
+        return PoolPlacement([eff], [max(primary_free - _eff_charge, 1)], n_chunks)
 
     # Water-fill placement with full charges: place the pool so every
     # receiving device ends at the SAME predicted headroom level t --
@@ -472,7 +476,8 @@ def _dominant_param_esize(block) -> int:
     try:
         for p in block.parameters():
             counts[p.element_size()] = counts.get(p.element_size(), 0) + p.numel()
-    except Exception:  # pragma: no cover - exotic modules: fall back to bf16-ish
+    except Exception as e:  # pragma: no cover - exotic modules: fall back to bf16-ish
+        logger.debug("[calib-data-device] dominant-esize walk failed on %r (%s); assuming 2", block, e)
         return 2
     return max(counts, key=lambda k: counts[k]) if counts else 2
 
@@ -578,7 +583,8 @@ def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: 
       homed on the candidate device alone -- peers host their own state and
       pay nothing. Wrap-phase coexistence (pools + state) is what makes this
       term real even though state materializes after collection;
-    - the flat 0.5 GiB allocator reserve.
+    - the flat 0.25 GiB allocator reserve (a fragmentation pad does not scale
+      with card size; the free-memory probe is the primary capacity signal).
     """
     try:
         need = _working_allowance_bytes(block, pool, batch_size) + _RESERVE_BYTES
