@@ -181,7 +181,7 @@ def _block_activation_bytes(block, tensors, batch_size, config=None, device=None
         est_bytes = None
         try:
             _layer_dict, layer_activation_gib, _io_gib, _additional_gib = estimate_tuning_block_mem(
-                block, tensors, batch_size
+                block, tensors, batch_size, config
             )
             est_bytes = int(layer_activation_gib * 2**30)
         except Exception as e:  # per-module accounting is best-effort

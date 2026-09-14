@@ -286,6 +286,7 @@ def resolve_pool_placement(
     mode: str = "auto",
     consumer: Optional[str] = None,
     occupied_bytes: int = 0,
+    peer_state_bytes: Optional[dict] = None,
 ) -> Optional[PoolPlacement]:
     """Decide per-chunk output placement for a calibration pool.
 
@@ -367,11 +368,18 @@ def resolve_pool_placement(
 
     # Capacity-aware sharding: the working-set need (and the incoming pool
     # bytes already resident there) constrain the SINGLE-DEVICE CANDIDATE only
-    # (that is where tuning compute runs); peers hosting pool chunks pay
-    # nothing for it. Charging it against the whole fleet made every MoE
-    # block's need (hundreds of GiB under the x7 expert multiplier) veto all
-    # sharding, which parked the pools on the busiest device (block-3 OOM).
-    capacities = [max(f - need_bytes - occupied_bytes, 1) if d == eff else f for d, f in usable]
+    # (that is where tuning compute runs). Charging the FULL need against the
+    # whole fleet made every MoE block's need veto all sharding (block-3
+    # OOM). Peers are not free either though: each pays its OWN in-loop tuning
+    # state (params homed there x 14 B, materializing after this probe --
+    # values at wrap, grads/snapshots in the loop; the observed 24 MiB
+    # snapshot OOM at 5.5 MiB free on a "free" peer). Card-size differences
+    # need no explicit handling: the probe already reads each card's actual
+    # usable free.
+    peer_state = peer_state_bytes or {}
+    capacities = [
+        max(f - need_bytes - occupied_bytes, 1) if d == eff else max(f - peer_state.get(d, 0), 1) for d, f in usable
+    ]
     shardable = sum(capacities)
     if shardable < pool_bytes:
         logger.debug(
@@ -397,6 +405,28 @@ def resolve_pool_placement(
 _RESERVE_BYTES = int(0.25 * 2**30)
 # Floor for the computed working allowance (tiny blocks / degenerate reads)
 _WORKING_FLOOR_BYTES = int(0.125 * 2**30)
+
+
+def _state_bytes_by_device(block) -> dict:
+    """In-loop tuning state per device: params homed there x 14 B (actual walk).
+
+    Same layout constant as :func:`placement_need_bytes` (fp32 value + grad +
+    best-params snapshot + bf16 copy), computed for EVERY device so pool
+    placement can charge peers too. At attach time (when pools are placed)
+    none of it exists yet: values materialize at wrap, grads and snapshots
+    during the loop -- which is exactly why peer devices left at their full
+    probed free over-fill by the first snapshot write (observed: 24 MiB
+    snapshot ask failing at 5.5 MiB free on a card the resolve gate had
+    treated as empty).
+    """
+    out: dict = {}
+    try:
+        for p in block.parameters():
+            out[str(p.device)] = out.get(str(p.device), 0) + p.numel() * 14
+    except Exception as e:  # pragma: no cover - placement must never break
+        logger.debug("[calib-data-device] per-device state walk failed (%s)", e)
+        return {}
+    return out
 
 
 def _dominant_param_esize(block) -> int:
@@ -589,6 +619,7 @@ def resolve_placement_for_pool(
             mode=mode,
             consumer=consumer,
             occupied_bytes=occupied,
+            peer_state_bytes=_state_bytes_by_device(block) if iters > 0 else None,
         )
     except Exception as e:  # pragma: no cover - placement must never break quantization
         logger.warning("[calib-data-device] placement resolve failed (%s); keeping single-device behavior", e)

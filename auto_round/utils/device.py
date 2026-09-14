@@ -890,7 +890,7 @@ def get_first_available_attr(obj, attr_names: list[str], default=None):
     return default
 
 
-def get_moe_memory_ratio(block: torch.nn.Module) -> float:
+def get_moe_memory_ratio(block: torch.nn.Module, config=None) -> float:
     """
     Calculate the memory ratio for MoE (Mixture of Experts) models.
 
@@ -899,6 +899,10 @@ def get_moe_memory_ratio(block: torch.nn.Module) -> float:
 
     Args:
         block (torch.nn.Module): The model block to analyze.
+        config: Model config to read when the block itself carries none
+            (block-wise tuning blocks have no ``.config``; without this the
+            ratio silently falls back to 1.0 and prices ALL experts' outputs
+            at full width -- the ~170 GiB inflation observed on hy3).
 
     Returns:
         float: Memory ratio (num_experts_per_tok / num_experts).
@@ -916,8 +920,14 @@ def get_moe_memory_ratio(block: torch.nn.Module) -> float:
         if not is_moe_layer(module):
             continue
 
-        config = getattr(block, "config", None)
+        config = config if config is not None else getattr(block, "config", None)
         if config is None:
+            # container-attr fallback before giving up: expert count from the
+            # container itself, active count from its top_k-ish attrs
+            num_experts = getattr(module, "num_experts", None)
+            active = getattr(module, "num_experts_per_tok", None) or getattr(module, "top_k", None)
+            if isinstance(num_experts, int) and num_experts > 0 and isinstance(active, int) and active > 0:
+                return active / num_experts, True
             break
 
         # Try to get num_experts_per_tok (active experts count)
@@ -956,7 +966,9 @@ def get_moe_memory_ratio(block: torch.nn.Module) -> float:
     return 1.0, False  # Default ratio for non-MoE models
 
 
-def estimate_tuning_block_mem(block: torch.nn.Module, input_ids: Any, batch_size: int) -> tuple[dict, float]:
+def estimate_tuning_block_mem(
+    block: torch.nn.Module, input_ids: Any, batch_size: int, config=None
+) -> tuple[dict, float]:
     """
     Calculates the memory consumption of a specific block in the model.
 
@@ -997,7 +1009,7 @@ def estimate_tuning_block_mem(block: torch.nn.Module, input_ids: Any, batch_size
     seq_len = reference_tensor.shape[1] if reference_tensor is not None and reference_tensor.ndim >= 2 else 1
     element_size = reference_tensor.element_size() if reference_tensor is not None else 2
 
-    moe_ratio, has_moe = get_moe_memory_ratio(block)  # Get MoE memory ratio (1.0 for non-MoE models)
+    moe_ratio, has_moe = get_moe_memory_ratio(block, config)  # ratio 1.0 for non-MoE models
 
     for name, module in block.named_modules():
         if check_to_quantized(module):
