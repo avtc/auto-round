@@ -237,15 +237,14 @@ def run_batched_rtn_search(model, staged, max_batch=None):
     if buckets:
         # len(c) counts MODULES per chunk, len(cs) chunks per worker: print
         # both so the line cannot read as "one chunk per module" when
-        # batching is engaged
+        # batching is engaged; per-worker chunk counts use the memory-monitor
+        # short-device grammar ({"0": 5, ...})
+        from auto_round.utils.pool_placement import _short_device_key
+
         _n_mods = sum(len(c) for cs in buckets.values() for c in cs)
         _n_chunks = sum(len(cs) for cs in buckets.values())
-        logger.debug(
-            "[rtn-batch] %d modules in %d chunks over workers [%s]",
-            _n_mods,
-            _n_chunks,
-            ", ".join(f"{w}:{len(cs)} chunks" for w, cs in buckets.items()),
-        )
+        _workers = ", ".join(f"'{_short_device_key(w)}': {len(cs)}" for w, cs in buckets.items())
+        logger.debug("[rtn-batch] %d modules in %d chunks over workers {%s}", _n_mods, _n_chunks, _workers)
 
     def _worker_of(chunk):
         for wk, cs in buckets.items():

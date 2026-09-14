@@ -404,10 +404,14 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None):
     _n_mod = sum(st["modules"] for st in stats.values())
     _n_batch = sum(st["batches"] for st in stats.values())
     _n_single = sum(st["singletons"] for st in stats.values())
-    per_device = " ".join(f"{dev}={st.get('wall', 0.0):.2f}s" for dev, st in stats.items())
+    from auto_round.utils.pool_placement import _short_device_key
+
+    per_device = (
+        "{" + ", ".join(f"'{_short_device_key(dev)}': {st.get('wall', 0.0):.2f}" for dev, st in stats.items()) + "}"
+    )
     logger.debug(
         "[batched-search] wrap search: %d modules, %d batch + %d singleton search calls, "
-        "%.2fs device-wall (%.2fs summed) [%s]",
+        "%.2fs device-wall (%.2fs summed) walls %s",
         _n_mod,
         _n_batch,
         _n_single,

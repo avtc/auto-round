@@ -66,7 +66,6 @@ if TYPE_CHECKING:
 
 
 # TODO wenhuach align all the API args
-ATTACH_PHASES = {"walks": 0.0, "resolve": 0.0, "consolidate": 0.0, "line": 0.0}
 
 
 class _OneDeepWriter:
@@ -234,12 +233,8 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
 
             chains = 2 if self.alg_composer.need_quanted_input() else 1
-            import time as _time
-
-            _ta = _time.perf_counter()
             pool_bytes = _tensor_bytes(input_ids) * chains
             n_chunks = _pool_chunk_count(input_ids)
-            ATTACH_PHASES["walks"] += _time.perf_counter() - _ta
             primary = str(self.compress_context.cache_device)
             mode = getattr(self.compress_context, "calibration_data_device", "auto")
             _iters = int(getattr(getattr(self.alg_composer, "block_quantizer", None), "iters", 0) or 0)
@@ -254,7 +249,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 if _iters > 0 and _consumer != primary and _consumer.startswith("cuda") and primary.startswith("cuda")
                 else None
             )
-            _ta = _time.perf_counter()
             placement = resolve_placement_for_pool(
                 input_ids,
                 chains,
@@ -266,8 +260,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 iters=_iters,
                 consumer=_consumer,
             )
-
-            ATTACH_PHASES["resolve"] += _time.perf_counter() - _ta
             # Docstring contract: never consolidate when the policy is off, the
             # lane is CPU-parked (low_gpu_mem_usage keeps pools on the host), or
             # the resolved placement itself parks pools on the host (mode=cpu).
@@ -289,7 +281,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             else:
                 per_chunk = pool_bytes / max(n_chunks, 1)
                 reserved = int(placement.counts().get(target, 0) * per_chunk)
-            _ta = _time.perf_counter()
             consolidate_pool_onto(
                 [input_ids, q_input, input_others],
                 target,
@@ -298,8 +289,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 reserved_bytes=reserved,
                 iters=_iters,
             )
-            ATTACH_PHASES["consolidate"] += _time.perf_counter() - _ta
-            _ta = _time.perf_counter()
             logger.debug(
                 "[calib-data-device] %s",
                 calib_data_line(
@@ -311,7 +300,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     primary,
                 ),
             )
-            ATTACH_PHASES["line"] += _time.perf_counter() - _ta
         except Exception as e:  # pragma: no cover - placement must never break quantization
             logger.warning("[calib-data-device] attach failed (%s); keeping single-device behavior", e)
             placement = None
@@ -416,15 +404,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                         self._offloader.reload(model, names)
                 _t_reload_mark = time.perf_counter()
                 _marks = {"reload": time.perf_counter()}
-                # reload duration sits BEFORE the marks' reference point and was dropped
-                # from the summary during the single-line refactor; true block walls
-                # (inter-finish deltas) showed a ~54s unmeasured gap in the
-                # atomic-placement era -- reload is the prime suspect, now visible.
+                # reload duration sits BEFORE the marks' reference point; it is
+                # folded into the end-of-block phases line as its first item so
+                # the line's total covers the whole block (true-wall comparable)
                 block_name_or_names = n if nblocks == 1 else names
-                if _perf:
-                    logger.info(
-                        "[perf] block %s reload-phase=%.2fs", block_name_or_names, _t_reload_mark - _t_reload_start
-                    )
 
                 # ── Infrastructure: materialize, dtype convert, device placement ──
                 materialize_model_(m)
@@ -529,14 +512,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # artifacts land on host by construction (qweight/qzeros are .to(
                 # "cpu") in the packers), so VRAM pressure stays one-module-sized.
                 _pack_call = 0.0
-                _pack_scaffold = 0.0
                 # Hoist the layer-config read out of the module loop: the property
                 # rebuilds a copy of the whole compression plan per access (~50ms on
                 # a 300B-class plan -- the entire invisible pack wall).
                 _layer_cfg = self.layer_config
-                _t_cpu0 = time.process_time()
-                _t_the0 = time.thread_time()
-                _t_loop = time.perf_counter()
                 if self.compress_context.is_immediate_packing:
                     for _n, _mod in m.named_modules():
                         if hasattr(_mod, "bits") and check_to_quantized(_mod):
@@ -547,14 +526,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                                 module_name = f"{n}.{_n}"
                             if module_name is None:
                                 continue
-                            _pack_scaffold += time.perf_counter() - _t_loop
                             _t_call = time.perf_counter()
                             _immediate_pack(module_name, _layer_cfg)
                             _pack_call += time.perf_counter() - _t_call
-                            _t_loop = time.perf_counter()
-                _pack_scaffold += time.perf_counter() - _t_loop
-                _pack_cpu = time.process_time() - _t_cpu0
-                _pack_the = time.thread_time() - _t_the0
                 _marks["post.pack"] = time.perf_counter()
 
                 mv_module_from_gpu(m)
@@ -619,18 +593,17 @@ class CompressionOrchestrator(BaseOrchestrator):
                     )
                 if _perf:
                     _marks["post.write"] = time.perf_counter()
+                    # dynamo/sweep/hooks/monitor stay accumulated in _marks but are
+                    # no longer printed: they were bad-perf-investigation probes that
+                    # read 0.00 in every validated run since
                     _order = [
                         "reload",
                         "attach",
                         "compress",
                         "post.swap",
-                        "post.dynamo",
-                        "post.sweep",
-                        "post.hooks",
                         "post.pack",
                         "post.mv",
                         "post.clear",
-                        "post.monitor",
                         "post.write",
                     ]
                     _parts = []
@@ -644,14 +617,15 @@ class CompressionOrchestrator(BaseOrchestrator):
                         from auto_round.export.export_to_autoround.export import PACK_PHASES as _pp
 
                         if _pp["count"]:
+                            # pre/scaffold/cpu/thr were pack-arc discriminators (the
+                            # 27s layer_config hunt); lookup stays printed as the
+                            # guard for that exact regression class
                             _pack_note = (
-                                f" | pack[{_pp['count']} mods: pre={_pw['pre']:.2f}s"
-                                f" fmt={_pw['fmt']:.2f}s lookup={_pp['lookup']:.2f}s"
+                                f" | pack[{_pp['count']} mods: fmt={_pw['fmt']:.2f}s"
+                                f" lookup={_pp['lookup']:.2f}s"
                                 f" ctor={_pp['ctor']:.2f}s pack={_pp['pack']:.2f}s"
                                 f" dispatch={_pp['dispatch']:.2f}s"
-                                f" moves={_pp['moves']:.2f}s call={_pack_call:.2f}s"
-                                f" scaffold={_pack_scaffold:.2f}s"
-                                f" cpu={_pack_cpu:.2f}s thr={_pack_the:.2f}s]"
+                                f" moves={_pp['moves']:.2f}s call={_pack_call:.2f}s]"
                             )
                             for _k in _pp:
                                 _pp[_k] = 0.0
@@ -659,26 +633,13 @@ class CompressionOrchestrator(BaseOrchestrator):
                             _pw["fmt"] = 0.0
                     except Exception as e:  # pragma: no cover - diagnostics only
                         logger.warning("pack phase accounting unavailable (%s)", e)
-                    _attach_note = ""
-                    try:
-                        if any(ATTACH_PHASES.values()):
-                            _attach_note = (
-                                f" | attach[walks={ATTACH_PHASES['walks']:.2f}s"
-                                f" resolve={ATTACH_PHASES['resolve']:.2f}s"
-                                f" cons={ATTACH_PHASES['consolidate']:.2f}s"
-                                f" line={ATTACH_PHASES['line']:.2f}s]"
-                            )
-                            for _k in ATTACH_PHASES:
-                                ATTACH_PHASES[_k] = 0.0
-                    except Exception as e:  # pragma: no cover - diagnostics only
-                        logger.warning("attach phase accounting unavailable (%s)", e)
                     logger.info(
-                        "[perf] block %s phases: %s total=%.2fs%s%s",
+                        "[perf] block %s phases: reload=%.2fs %s total=%.2fs%s",
                         block_name_or_names,
+                        _t_reload_mark - _t_reload_start,
                         " ".join(_parts),
-                        _marks["post.write"] - _marks["reload"],
+                        _marks["post.write"] - _marks["reload"] + (_t_reload_mark - _t_reload_start),
                         _pack_note,
-                        _attach_note,
                     )
         finally:
             # join the background writers even when a block raises: a daemon killed
