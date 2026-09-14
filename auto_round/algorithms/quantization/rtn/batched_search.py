@@ -235,11 +235,16 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         rr += 1
         buckets.setdefault(str(worker), []).append(chunk)
     if buckets:
-        _n_chunk = sum(len(c) for cs in buckets.values() for c in cs)
+        # len(c) counts MODULES per chunk, len(cs) chunks per worker: print
+        # both so the line cannot read as "one chunk per module" when
+        # batching is engaged
+        _n_mods = sum(len(c) for cs in buckets.values() for c in cs)
+        _n_chunks = sum(len(cs) for cs in buckets.values())
         logger.debug(
-            "[rtn-batch] %d chunks over workers [%s]",
-            _n_chunk,
-            ", ".join(f"{w}:{len(cs)}" for w, cs in buckets.items()),
+            "[rtn-batch] %d modules in %d chunks over workers [%s]",
+            _n_mods,
+            _n_chunks,
+            ", ".join(f"{w}:{len(cs)} chunks" for w, cs in buckets.items()),
         )
 
     def _worker_of(chunk):
