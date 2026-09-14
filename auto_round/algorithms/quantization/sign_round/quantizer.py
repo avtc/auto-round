@@ -32,6 +32,27 @@ from auto_round.compressors.utils import (
 from auto_round.logger import logger
 
 
+def _tuning_state_bytes(block, target_dev):
+    """In-loop tuning state for parameters homed on ``target_dev`` (logical count).
+
+    14 B per logical parameter: fp32 value + fp32 grad (first backward) +
+    best-params snapshot + bf16 copy. At tune time ``block.parameters()``
+    yields BOTH the original weights and the wrappers' registered value
+    params -- counting both would price every wrapped parameter twice
+    (measured: a 34.63 GiB reserve on a lane whose honest state is ~17).
+    Wrapper tuning tensors are identified by identity (any ``.params``
+    dict on a module) and excluded; the original weights carry the charge.
+    """
+    tuning = set()
+    for m in block.modules():
+        _p = getattr(m, "params", None)
+        if isinstance(_p, dict):
+            for _v in _p.values():
+                if torch.is_tensor(_v):
+                    tuning.add(id(_v))
+    return sum(p.numel() for p in block.parameters() if str(p.device) == str(target_dev) and id(p) not in tuning) * 14
+
+
 def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
     """Bulk-move a whole tune-loop pool onto the device that reads it every iteration.
 
@@ -67,7 +88,7 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
             from auto_round.utils.pool_placement import _RESERVE_BYTES, _working_allowance_bytes
 
             reserve = _working_allowance_bytes(block, tensors, batch_size) + _RESERVE_BYTES
-            reserve += sum(p.numel() for p in block.parameters() if str(p.device) == str(_tgt)) * 14
+            reserve += _tuning_state_bytes(block, _tgt)
         except Exception as e:  # pragma: no cover - gate must never break tuning
             logger.warning("[%s] working-set estimate failed (%s); using flat 4GiB reserve", label, e)
             reserve = 4 << 30

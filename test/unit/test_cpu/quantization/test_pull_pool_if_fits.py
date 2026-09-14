@@ -11,7 +11,6 @@ references). The gate arithmetic is exercised with tensor/block fakes and a
 monkeypatched free-memory probe: no real multi-GPU devices are needed.
 """
 
-
 import unittest
 from unittest import mock
 
@@ -51,6 +50,9 @@ class _FakeBlock:  # pylint: disable=too-few-public-methods
 
     def parameters(self):
         return list(self._params)
+
+    def modules(self):
+        return [self]
 
 
 def _run(pool, block, free, target="cuda:1", iters=20, label="tune-reference"):
@@ -101,12 +103,27 @@ class TestPullPoolIfFits(unittest.TestCase):
         pool = [_FakeTensor("cuda:0", numel=_GIB // 4)]
         block = _FakeBlock([])
         # free=None -> decline path (no move); helper never raises
-        with mock.patch(
-            "auto_round.utils.device.probe_usable_bytes", side_effect=RuntimeError("no cuda")
-        ), mock.patch("auto_round.utils.pool_placement._working_allowance_bytes", return_value=0):
+        with mock.patch("auto_round.utils.device.probe_usable_bytes", side_effect=RuntimeError("no cuda")), mock.patch(
+            "auto_round.utils.pool_placement._working_allowance_bytes", return_value=0
+        ):
             out = _pull_pool_if_fits(pool, "cuda:1", block, 8, 20, "tune-reference")
         self.assertIs(out, pool)
         self.assertTrue(all(t.moved_to is None for t in pool))
+
+
+class TestTuningStateBytes(unittest.TestCase):
+    def test_wrapper_params_excluded_from_state(self):
+        import torch.nn as nn
+
+        block = nn.Linear(4, 4)  # 16 + 4 params, any device (cpu here)
+        # wrapper-style tuning tensor: same numel as the weight, registered
+        # nowhere but present in a .params dict; identity-excluded from the count
+        value = torch.zeros_like(block.weight)
+        block.params = {"value": value}
+        from auto_round.algorithms.quantization.sign_round.quantizer import _tuning_state_bytes
+
+        # cpu target: logical params = 20 (weight 16 + bias 4), value excluded
+        self.assertEqual(_tuning_state_bytes(block, "cpu"), 20 * 14)
 
 
 if __name__ == "__main__":
