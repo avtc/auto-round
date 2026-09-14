@@ -387,7 +387,14 @@ def resolve_pool_placement(
     return PoolPlacement(devices, capacities, n_chunks)
 
 
-_RESERVE_BYTES = int(0.5 * 2**30)  # flat allocator reserve (24 GiB-class cards)
+# Minimal fragmentation pad for probe->peak drift. NOT card-proportional:
+# fragmentation does not scale with device size, and the free-memory probe is
+# the primary actual signal this pad only backs up. Observed on 24 GiB cards:
+# the linear_loop tune loop ran at 23.09-23.14 GiB reserved of 23.58 (~98%)
+# without OOM, so the pad needs only cover allocator slack in the last
+# allocations. Proportional ceilings, where wanted, belong to budget ratios
+# (cf. max_mem_ratio/card_0_threshold=0.9 in the mapped-placement path).
+_RESERVE_BYTES = int(0.25 * 2**30)
 # Floor for the computed working allowance (tiny blocks / degenerate reads)
 _WORKING_FLOOR_BYTES = int(0.125 * 2**30)
 

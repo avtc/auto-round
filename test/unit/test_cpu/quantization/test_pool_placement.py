@@ -78,7 +78,7 @@ class TestResolvePoolPlacement(unittest.TestCase):
         projection transient, floor-guarded) + reserve; iters>0 adds 14B/param
         of tuning state for candidate-homed parameters only. Pool bytes beyond
         one batch are NOT part of the need (the gates count them separately)."""
-        reserve = int(0.5 * 2**30)
+        reserve = pp._RESERVE_BYTES
         floor = int(0.125 * 2**30)
         # block with hidden 4 (modal in_features) and widest out 4
         m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
