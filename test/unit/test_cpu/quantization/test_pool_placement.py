@@ -256,13 +256,25 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertGreater(counts.get("cuda:2", 0), 0)
         self.assertEqual(sum(counts.values()), 128)
 
-    def test_zero_peer_capacity_returns_none(self):
+    def test_zero_peer_capacity_falls_back_to_uncharged_split(self):
+        # Old contract returned None (-> primary concentration, the worse
+        # failure). Now: fully-charged sharding that cannot hold the pool
+        # falls back to the UNCHARGED proportional split -- the placement that
+        # demonstrably completed blocks on the 95%-utilization lane.
         plan = self._resolve(
             pool=4 * self.GB,
             need=2 * self.GB,
             free={"cuda:0": 1 * self.GB, "cuda:1": 1 * self.GB},
         )
-        self.assertIsNone(plan)
+        self.assertIsNotNone(plan)
+        counts = plan.counts()
+        self.assertEqual(
+            sum(
+                counts.values(),
+            ),
+            128,
+        )
+        self.assertFalse(any(str(d).startswith("cpu") for d in plan.devices))
 
     def test_cpu_primary_returns_none(self):
         self.assertIsNone(self._resolve(primary="cpu"))
@@ -291,12 +303,18 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertGreater(counts["cuda:2"], counts["cuda:1"])
         self.assertEqual(sum(counts.values()), 128)
 
-    def test_insufficient_capacity_returns_none(self):
+    def test_insufficient_capacity_falls_back_to_uncharged_split(self):
+        # No silent CPU fallback ever; and instead of None (whose caller-side
+        # default concentrates the pool on the primary), an over-fleet pool
+        # takes the uncharged proportional split with the charges logged.
         plan = self._resolve(
             pool=100 * self.GB,
             free={"cuda:0": 8 * self.GB, "cuda:1": 10 * self.GB, "cuda:2": 10 * self.GB},
         )
-        self.assertIsNone(plan)  # no silent CPU fallback: the real OOM fires
+        self.assertIsNotNone(plan)
+        counts = plan.counts()
+        self.assertEqual(sum(counts.values()), 128)
+        self.assertFalse(any(str(d).startswith("cpu") for d in plan.devices))
 
     def test_forced_csv_overrides_candidates(self):
         plan = self._resolve(

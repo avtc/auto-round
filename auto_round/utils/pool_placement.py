@@ -287,6 +287,8 @@ def resolve_pool_placement(
     consumer: Optional[str] = None,
     occupied_bytes: int = 0,
     peer_state_bytes: Optional[dict] = None,
+    entry_device: Optional[str] = None,
+    entry_extra_bytes: int = 0,
 ) -> Optional[PoolPlacement]:
     """Decide per-chunk output placement for a calibration pool.
 
@@ -377,19 +379,34 @@ def resolve_pool_placement(
     # need no explicit handling: the probe already reads each card's actual
     # usable free.
     peer_state = peer_state_bytes or {}
+    entry = str(entry_device) if entry_device is not None else None
     capacities = [
-        max(f - need_bytes - occupied_bytes, 1) if d == eff else max(f - peer_state.get(d, 0), 1) for d, f in usable
+        (
+            max(f - need_bytes - occupied_bytes, 1)
+            if d == eff
+            else max(f - peer_state.get(d, 0) - (entry_extra_bytes if d == entry else 0), 1)
+        )
+        for d, f in usable
     ]
     shardable = sum(capacities)
     if shardable < pool_bytes:
+        # Fully-charged sharding cannot hold the pool. Falling back to
+        # primary-single would concentrate even more, and returning None keeps
+        # today's default which is exactly that concentration. The least-bad
+        # option is the UNCHARGED proportional split -- the placement that
+        # demonstrably completed blocks on the 95%-fleet-utilization lane
+        # (peers park snapshots to host as the pressure valve) -- with the
+        # charges logged for the audit trail.
         logger.debug(
-            "[calib-data-device] resolve: none (peer capacity %.2fGiB < pool %.2fGiB; need %.2fGiB charged to %s only)",
+            "[calib-data-device] resolve: charged capacity %.2fGiB < pool %.2fGiB "
+            "(peer state %s, entry activation %.2fGiB on %s); using uncharged proportional split",
             shardable / 2**30,
             pool_bytes / 2**30,
-            need_bytes / 2**30,
-            primary,
+            {d: round(v / 2**30, 1) for d, v in peer_state.items()},
+            entry_extra_bytes / 2**30,
+            entry,
         )
-        return None  # sharding cannot help either: keep today's behavior, real OOM fires
+        capacities = [max(f - (need_bytes + occupied_bytes if d == eff else 0), 1) for d, f in usable]
 
     devices = [d for d, _ in usable]
     return PoolPlacement(devices, capacities, n_chunks)
@@ -405,6 +422,28 @@ def resolve_pool_placement(
 _RESERVE_BYTES = int(0.25 * 2**30)
 # Floor for the computed working allowance (tiny blocks / degenerate reads)
 _WORKING_FLOOR_BYTES = int(0.125 * 2**30)
+
+
+def _entry_extra_bytes_for(block, pool, batch_size, iters, config, entry_device) -> int:
+    """The entry device's activation budget charged into its spread capacity.
+
+    The tune loop's forward graph materializes on the ENTRY device (batch
+    cats + routed-row caches -- measured 13.7 GiB on a 4-GPU hy3 lane whose
+    pools were then spread onto it by state-only peer charges, OOMing the
+    first backward 6 GiB over the proven split). Composed from the same
+    arch/mode-aware budget the pull gate uses; 0 when unknown (charges
+    nothing -- the fallback split then applies).
+    """
+    if iters <= 0 or entry_device is None:
+        return 0
+    try:
+        from auto_round.algorithms.quantization.sign_round.quantizer import _block_activation_bytes
+
+        got = _block_activation_bytes(block, pool, batch_size, config, str(entry_device))
+        return int(got) if got is not None else 0
+    except Exception as e:  # pragma: no cover - placement must never break
+        logger.debug("[calib-data-device] entry activation budget unavailable (%s)", e)
+        return 0
 
 
 def _state_bytes_by_device(block) -> dict:
@@ -581,6 +620,8 @@ def resolve_placement_for_pool(
     mode: str = "auto",
     iters: int = 0,
     consumer: str = None,
+    config=None,
+    entry_device: str = None,
 ) -> Optional[PoolPlacement]:
     """Resolve placement from a live pool object (orchestrator entry point).
 
@@ -620,6 +661,8 @@ def resolve_placement_for_pool(
             consumer=consumer,
             occupied_bytes=occupied,
             peer_state_bytes=_state_bytes_by_device(block) if iters > 0 else None,
+            entry_device=entry_device,
+            entry_extra_bytes=_entry_extra_bytes_for(block, pool, batch_size, iters, config, entry_device),
         )
     except Exception as e:  # pragma: no cover - placement must never break quantization
         logger.warning("[calib-data-device] placement resolve failed (%s); keeping single-device behavior", e)
