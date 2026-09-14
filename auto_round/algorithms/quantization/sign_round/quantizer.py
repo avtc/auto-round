@@ -419,7 +419,7 @@ def _block_activation_bytes(block, tensors, batch_size, config=None, device=None
 
 
 _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = False
-_MOE_IMPL_AUTO_DONE_KEY = None  # id of the run's config; a new run re-decides
+_MOE_IMPL_AUTO_DONE_REF = None  # weakref to the deciding run's config
 
 
 def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config, model):
@@ -439,11 +439,26 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
     linear_loop once, loudly. Explicit AR_MOE_EXPERTS_IMPL choices are never
     overridden.
     """
-    global _MOE_IMPL_AUTO_LINEAR_LOOP_DONE, _MOE_IMPL_AUTO_DONE_KEY
-    key = id(config) if config is not None else id(model)
-    if _MOE_IMPL_AUTO_DONE_KEY != key:
-        # a second quantization run in the same process re-decides
-        _MOE_IMPL_AUTO_DONE_KEY = key
+    global _MOE_IMPL_AUTO_LINEAR_LOOP_DONE, _MOE_IMPL_AUTO_DONE_REF
+    import weakref
+
+    _key_obj = config if config is not None else model
+    try:
+        _key = ("w", weakref.ref(_key_obj)) if _key_obj is not None else ("n", None)
+    except TypeError:  # non-weakrefable object: fall back to identity
+        _key = ("i", id(_key_obj))
+    _prev = _MOE_IMPL_AUTO_DONE_REF
+    _same = False
+    if _prev is not None and _prev[0] == _key[0]:
+        if _prev[0] == "w":
+            _a, _b = _prev[1](), _key[1]()
+            _same = _a is not None and _a is _b  # dead ref -> re-decide
+        else:
+            _same = _prev[1] == _key[1]
+    if not _same:
+        # a new (or garbage-collected) run's config re-decides: no silent
+        # skip for a second model quantized in the same process
+        _MOE_IMPL_AUTO_DONE_REF = _key
         _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = False
     if _MOE_IMPL_AUTO_LINEAR_LOOP_DONE or iters is None or int(iters) <= 0:
         return

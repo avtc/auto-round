@@ -252,6 +252,35 @@ def run_batched_rtn_search(model, staged, max_batch=None):
                 return str(wk)
         return str(chunk[0]["weight"].device)  # not found (should not happen): stay home
 
+    def _unwrap_with_cpu_fallback(w, name):
+        """unwrapper({}) under the serial lane's OOM->CPU contract.
+
+        The per-module search can OOM on the device exactly like the serial
+        path's own search (base.py); there the run falls back to CPU instead
+        of crashing. The batched lane previously called unwrapper({})
+        unguarded -- a module that OOMed took the whole run down, violating
+        the progressive batched -> per-module -> CPU ladder.
+        """
+        try:
+            return w.unwrapper({})
+        except torch.OutOfMemoryError:
+            from auto_round.algorithms.quantization.search_dispatch import dump_oom_tensor_census_
+            from auto_round.wrapper import WrapperLinear
+
+            dump_oom_tensor_census_("rtn batched unwrapper")
+            logger.warning("[rtn-batch] per-module search OOM for %s; falling back to CPU", name)
+            layer = w.orig_layer if hasattr(w, "orig_layer") else w
+            layer = layer.to("cpu")
+            layer = WrapperLinear(
+                layer,
+                enable_minmax_tuning=False,
+                enable_norm_bias_tuning=False,
+                enable_round_tuning=False,
+                enable_torch_compile=False,
+                iters=0,
+            )
+            return layer.unwrapper({})
+
     def _run_chunk(chunk, worker, threaded=False):
         w0 = chunk[0]["w"]
         dev = str(chunk[0]["weight"].device)
@@ -259,7 +288,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         if len(chunk) == 1:
             _restore = swap_wrapper_callables_to_eager(chunk[0]["w"]) if (threaded or worker != dev) else None
             try:
-                layer = chunk[0]["w"].unwrapper({})
+                layer = _unwrap_with_cpu_fallback(chunk[0]["w"], chunk[0]["name"])
             finally:
                 if _restore is not None:
                     _restore()
@@ -298,7 +327,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             for e in chunk:
                 _restore = swap_wrapper_callables_to_eager(e["w"]) if (threaded or worker != dev) else None
                 try:
-                    layer = e["w"].unwrapper({})
+                    layer = _unwrap_with_cpu_fallback(e["w"], e["name"])
                 finally:
                     if _restore is not None:
                         _restore()

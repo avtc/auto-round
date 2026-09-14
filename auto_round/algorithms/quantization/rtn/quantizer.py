@@ -30,7 +30,6 @@ def _rtn_phase_line(norm, quant, n, mean, max_):
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
     check_to_quantized,
-    set_module,
 )
 
 
