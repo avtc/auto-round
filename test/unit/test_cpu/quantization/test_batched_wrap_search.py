@@ -647,6 +647,102 @@ class TestBatchedRtnSearchParity(unittest.TestCase):
             ref_w = w_ref.unwrapper({}).weight.data.clone()
         self.assertTrue(torch.equal(getattr(model, "l0").weight.data, ref_w))
 
+    def _run_shape_dtype(self, out_f, in_f, gs, dtype):
+        """Batched-vs-serial parity for arbitrary shapes/dtypes with an imatrix
+        (regressions R6-2/R6-3: bf16 weights + fp32 imatrix; in % gs != 0)."""
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+
+        def _layer(seed):
+            import torch.nn as nn
+
+            g = torch.Generator().manual_seed(seed)
+            layer = nn.Linear(in_f, out_f, bias=False)
+            with torch.no_grad():
+                layer.weight.copy_(torch.randn(out_f, in_f, generator=g).to(dtype))
+            layer.data_type = "int"
+            layer.bits = 4
+            layer.sym = False
+            layer.group_size = gs
+            layer.iters = 0
+            layer.act_bits = 16
+            layer.scale_dtype = torch.float32
+            layer.imatrix = (torch.rand(in_f, generator=g) + 0.5).float()  # fp32, like the hook
+            return layer
+
+        with torch.no_grad():
+            serial = []
+            for i in range(3):
+                w = self._make_wrapper(_layer(i))
+                out = w.unwrapper({})
+                serial.append((out.weight.data.clone(), out.scale))
+
+        model = nn.Module()
+        staged = []
+        for i in range(3):
+            layer = _layer(i)
+            setattr(model, f"l{i}", layer)
+            staged.append((f"l{i}", self._make_wrapper(layer)))
+        run_batched_rtn_search(model, staged)
+        for i in range(3):
+            got = getattr(model, f"l{i}")
+            ref_w, ref_scale = serial[i]
+            self.assertTrue(torch.equal(got.weight.data, ref_w), f"weight mismatch module {i}")
+            self.assertTrue(torch.equal(got.scale, ref_scale), f"scale mismatch module {i}")
+
+    def test_parity_bf16_weights_fp32_imatrix(self):
+        self._run_shape_dtype(64, 128, 128, torch.bfloat16)
+
+    def test_parity_fp16_weights_fp32_imatrix(self):
+        self._run_shape_dtype(64, 128, 128, torch.float16)
+
+    def test_parity_group_size_not_dividing_in_features(self):
+        self._run_shape_dtype(3, 10, 4, torch.float32)
+
+    def test_staged_key_normalizes_compiled_quant_fn(self):
+        """Regression (R6-4): with enable_torch_compile, every wrapper carries a
+        UNIQUE torch.compile wrapper around the SHARED eager fn; keying the raw
+        callable collapsed all groups to singletons (batching silently dead)."""
+        from auto_round.algorithms.quantization.rtn.batched_search import _staged_key
+
+        class _Compiled:
+            def __init__(self, orig):
+                self._torchdynamo_orig_callable = orig
+
+            def __call__(self, *a, **k):  # pragma: no cover
+                raise AssertionError("compiled fn must not run here")
+
+        def _shared_eager(w, bits, imatrix):  # pragma: no cover - identity stub
+            return None
+
+        layers, wrappers = [], []
+        for i in range(2):
+            layer = self._layer(seed=i)
+            layers.append(layer)
+            w = self._make_wrapper(layer)
+            w.weight_quant_func = _Compiled(_shared_eager)  # distinct wrappers, shared orig
+            wrappers.append(w)
+        k0 = _staged_key(wrappers[0], wrappers[0].orig_layer.weight, None)
+        k1 = _staged_key(wrappers[1], wrappers[1].orig_layer.weight, None)
+        self.assertEqual(k0, k1)
+
+    def test_quant_call_kwargs_never_relocates_imatrix_to_meta(self):
+        """Regression (R6-1): a meta-resident stored weight must not become the
+        imatrix relocation target."""
+        layer = self._layer(seed=0)
+        layer.imatrix = torch.rand(layer.weight.shape[1]) + 0.5
+        w = self._make_wrapper(layer)
+        # simulate the low-memory lane: stored weight on meta, real data via get_weight
+        real = layer.weight.data.clone()
+        layer.weight = torch.nn.Parameter(torch.empty_like(real, device="meta"), requires_grad=False)
+        layer.get_weight = lambda: real
+        kwargs = w._quant_call_kwargs(torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0))
+        im = kwargs.get("imatrix")
+        self.assertIsNotNone(im)
+        self.assertNotEqual(im.device.type, "meta")
+        self.assertEqual(im.device.type, "cpu")  # wrapper device in these tests
+
     def test_threaded_write_back_swaps_compiled_act_fn_to_eager(self):
         """Regression (review R5-1): on worker threads the unwrapper act tail
         would make its FIRST call to the torch.compile-wrapped act_quant_func

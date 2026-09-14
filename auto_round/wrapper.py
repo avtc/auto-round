@@ -312,11 +312,15 @@ class WrapperLinear(torch.nn.Module):
             quant_kwargs.update(self._extra_quant_kwargs())
         imatrix = imatrix_override
         if imatrix is None:
-            imatrix = (
-                self.orig_layer.imatrix.to(self.orig_layer.weight.device)
-                if hasattr(self.orig_layer, "imatrix")
-                else None
-            )
+            if hasattr(self.orig_layer, "imatrix"):
+                # a meta-resident stored weight (low-memory/offload lanes) must
+                # not become the relocation target -- the imatrix would go meta
+                # too while the weight itself is read through get_weight() onto
+                # the compute device; relocate to the effective compute device
+                _target = self.device if self.orig_layer.weight.device.type == "meta" else self.orig_layer.weight.device
+                imatrix = self.orig_layer.imatrix.to(_target)
+            else:
+                imatrix = None
         return {
             "bits": self.orig_layer.bits,
             "group_size": self.orig_layer.group_size,

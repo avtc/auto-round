@@ -63,13 +63,38 @@ def _staged_imatrix(wrapper, weight):
     return getattr(wrapper.orig_layer, "imatrix", None)
 
 
-def _expand_imatrix(im, weight):
-    """Expand one module's raw imatrix to its full weight shape (chunk-time)."""
+def _expand_imatrix(im, weight, group_size):
+    """Expand one module's raw imatrix to its full weight shape (chunk-time).
+
+    Mirrors the quant funcs' own imatrix handling exactly (data_type/int.py):
+    the raw per-column vector is group-padded (fill 1e-5) BEFORE being row
+    expanded, so the stacked flat layout byte-matches what the serial
+    per-module call produces after its internal flatten-pad-expand. Skipping
+    the pad misplaces the group alignment for every module after the first
+    when ``in % group_size != 0``; casting to the weight dtype (bf16/fp16
+    weights with an fp32 hook-collected imatrix) silently diverges the
+    search loss weighting from the serial path.
+    """
     if im is None:
         return None
-    im = im.to(weight.device, weight.dtype)
+    im = im.to(weight.device)  # device only: keep the collected precision
     if im.dim() == 1 and weight.dim() == 2:
-        return im.unsqueeze(0).expand_as(weight).contiguous()
+        out_f, in_f = weight.shape
+        pad_len = 0
+        if isinstance(group_size, int) and 0 < group_size <= in_f and in_f % group_size != 0:
+            pad_len = ((in_f + group_size - 1) // group_size) * group_size - in_f
+        if pad_len:
+            im = torch.nn.functional.pad(im, (0, pad_len), value=1e-5)
+        return im.unsqueeze(0).expand(out_f, -1).contiguous()
+    if im.dim() == 2 and weight.dim() == 2 and im.shape[0] == 1:
+        # row vector form: same treatment
+        out_f, in_f = weight.shape
+        pad_len = 0
+        if isinstance(group_size, int) and 0 < group_size <= in_f and in_f % group_size != 0:
+            pad_len = ((in_f + group_size - 1) // group_size) * group_size - in_f
+        if pad_len:
+            im = torch.nn.functional.pad(im, (0, pad_len), value=1e-5)
+        return im.expand(out_f, -1).contiguous()
     if im.shape == weight.shape:
         return im.contiguous()
     return im
@@ -105,7 +130,10 @@ def _staged_key(wrapper, weight, imatrix):
         getattr(layer, "sym", None),
         float(getattr(wrapper, "q_scale_thresh", 1e-5)),
         imatrix is not None,
-        _fn_key(wrapper.weight_quant_func),
+        # normalize away per-wrapper torch.compile wrappers: the underlying
+        # eager original is shared per config, while each compiled wrapper is
+        # unique (repr-keyed) and would silently collapse every group to size 1
+        _fn_key(getattr(wrapper.weight_quant_func, "_torchdynamo_orig_callable", None) or wrapper.weight_quant_func),
         str(getattr(layer, "scale_dtype", None)),
         getattr(layer, "super_bits", None),
         getattr(layer, "super_group_size", None),
@@ -241,7 +269,8 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         stacked_w = torch.stack(weights)
         stacked_im = None
         if ims and ims[0] is not None:
-            stacked_im = torch.stack([_expand_imatrix(im, w) for im, w in zip(ims, weights)])
+            _gs = w0.orig_layer.group_size
+            stacked_im = torch.stack([_expand_imatrix(im, w, _gs) for im, w in zip(ims, weights)])
         kwargs = w0._quant_call_kwargs(
             torch.tensor(0.0), torch.tensor(1.0), torch.tensor(1.0), imatrix_override=stacked_im
         )
