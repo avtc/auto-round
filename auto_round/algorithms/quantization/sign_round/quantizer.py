@@ -53,33 +53,144 @@ def _tuning_state_bytes(block, target_dev):
     return sum(p.numel() for p in block.parameters() if str(p.device) == str(target_dev) and id(p) not in tuning) * 14
 
 
-def _block_activation_bytes(block, tensors, batch_size):
-    """The block's per-iteration activation bytes from ACTUAL data.
+def _ensure_routed_shape_recorders_(block):
+    """Attach fire-once recorders on MoE containers for the activation budget.
 
-    MoE blocks use the routed-buffer budget proven on the mapped-streaming
-    lane (300B A21B, iters20, 4x24GB): the experts loop materializes
-    ``tokens * top_k`` hidden rows as input AND output accumulators, and the
-    backward materializes a same-sized grad for the routed set -- x6 total,
-    each factor a real tensor (the 2GiB backward ask of the observed OOM;
-    fp32-vs-bf16 folded in the safe direction). Tokens are batch_size x the
-    actual row length of the pool tensors; top_k from the model config (same
-    attribute set as the estimator's moe ratio). On the measured 4-GPU hy3
-    lane this reproduces the observed loop retention (12.9 vs 12.7 GiB of
-    batch cats + routed caches) from data alone.
+    Records ``top_k = top_k_index.shape[-1]`` and ``routed_rows = index.numel()``
+    from the first NATURAL dispatch (forced all-experts routing -- tracing /
+    warmup -- is skipped: it would record top_k = num_experts and over-reserve).
+    Layout-agnostic: no attribute spellings, only arg shapes. The experts
+    interface passes ``(hidden_states, top_k_index, top_k_weights)``; the
+    recorder reads the two leading tensor args. The hook removes itself after
+    the first record.
+    """
+    from auto_round.modeling.fused_moe.utils import force_all_experts_routing_enabled
 
-    Non-MoE blocks fall back to the mapped-placement estimator's per-module
-    output accounting (batch x seq x out_features, real element sizes, x2
-    for activation grads). Returns None when neither can be computed
-    (callers decline the pull).
+    if force_all_experts_routing_enabled():
+        return
+    from auto_round.utils.model import is_moe_layer
+
+    def _record(module, args):
+        try:
+            tensors = [a for a in args if torch.is_tensor(a)]
+            if len(tensors) < 2:
+                return
+            hidden, index = tensors[0], tensors[1]
+            if hidden.ndim < 2 or index.ndim < 1:
+                return
+            module._routed_shape_rec_ = (int(index.shape[-1]), int(index.numel()))
+        except Exception as e:  # pragma: no cover - diagnostics only, never break the forward
+            logger.debug("[routed-shape] recorder skipped (%s)", e)
+        finally:
+            for handle in list(getattr(module, "_routed_rec_handles_", [])):
+                handle.remove()
+            module._routed_rec_handles_ = []
+
+    for _name, module in block.named_modules():
+        if (is_moe_layer(module) or isinstance(getattr(module, "num_experts", None), int)) and not hasattr(
+            module, "_routed_shape_rec_"
+        ):
+            module._routed_rec_handles_ = [module.register_forward_pre_hook(_record)]
+
+
+def _grouped_stack_bytes(block, device):
+    """Qdq-stack bytes the grouped experts modes materialize on ``device``.
+
+    Two chunk-aware terms for ``auto``/``linear_grouped``/
+    ``linear_grouped_sliced`` (linear_loop stacks nothing):
+
+    - retention (chunk-independent): autograd keeps EVERY chunk's stacked
+      fp32 values (straight-through mask) and qdq output (GEMM backward) --
+      6 B per weight element of the experts HOMED on the device, observed as
+      31 simultaneous 16-expert stacks on the OOMed lane;
+    - transient (chunk-sized): the quant func streams the stacked chunk
+      through several passes (~2x chunk bytes). Chunk size comes from the
+      same source the grouped path uses (_qdq_chunk_size: AR_MOE_CHUNK or
+      the auto working-set budget; 0 = fuse everything = all-experts chunk).
+
+    Mode-set-but-loop-ran fallbacks can only overcharge -- safe direction.
+    """
+    import auto_round.envs as _envs
+
+    mode = str(getattr(_envs, "AR_MOE_EXPERTS_IMPL", "auto") or "auto").lower()
+    if mode not in ("", "auto", "linear_grouped", "linear_grouped_sliced"):
+        return 0
+    retention = 0
+    transient = 0
+    try:
+        from auto_round.modeling.fused_moe.grouped_experts import _qdq_chunk_size
+
+        for m in block.modules():
+            if not isinstance(getattr(m, "num_experts", None), int):
+                continue
+            # group leaves by slot name so per-slot chunking matches the real
+            # grouped path (gate/up/down are chunked independently)
+            by_slot = {}
+            for leaf in m.modules():
+                weight = getattr(leaf, "weight", None)
+                if weight is None or not hasattr(weight, "numel"):
+                    continue
+                by_slot.setdefault(type(leaf).__name__ + "." + getattr(leaf, "slot_tag", ""), []).append(leaf)
+            for _slot, leaves in by_slot.items():
+                local = [l for l in leaves if str(l.weight.device) == str(device)]
+                if not local:
+                    continue
+                elems = sum(int(l.weight.numel()) for l in local)
+                retention += elems * 6  # fp32 value stack + bf16 qdq output
+                try:
+                    chunk = _qdq_chunk_size(local)  # env/budget-aware; 0 = all
+                except Exception:
+                    chunk = 16
+                per_leaf = elems // max(1, len(local))
+                chunk_elems = elems if chunk <= 0 else min(elems, chunk * per_leaf)
+                transient += chunk_elems * 6  # ~2 streaming passes over the chunk
+    except Exception as e:  # pragma: no cover - never break the gate
+        logger.debug("[tune] grouped-stack accounting unavailable (%s)", e)
+        return 0
+    return retention + transient
+
+
+def _block_activation_bytes(block, tensors, batch_size, config=None, device=None):
+    """The block's per-iteration activation bytes from ACTUAL data, max-composed.
+
+    Two arch-agnostic terms (hy3 tensor meta: ``mlp.shared_mlp`` plain MLP,
+    ``mlp.router.gate``, ``mlp.experts.N`` routed container):
+
+    - per-module estimator: every quantized module's output at
+      ``batch x seq x out_features`` with real element sizes, MoE expert
+      outputs scaled by the active ratio, x2 for activation grads. Counts
+      shared experts correctly wherever they are PLAIN modules outside the
+      dispatch (dominant pattern: Qwen3-MoE / DeepSeek / hy3 / Granite).
+    - routed-buffer budget (mapped-streaming calibration): tokens x top_k
+      hidden rows as input AND output accumulators + the backward grad for
+      the routed set (x6, every factor a real tensor). Covers archs that
+      fold shared experts INTO the dispatch (dispatch K includes them).
+
+    Composition is max(), not sum(): the terms overlap on the routed rows
+    (estimator prices them ratio-scaled without the backward grad) --
+    max bounds both failure modes (big shared expert -> estimator wins;
+    grad-heavy routed set -> routed wins) without double-charging.
+    top_k resolution order: config values (maintained spelling list) ->
+    recorded NATURAL-dispatch arg shapes (layout/spelling agnostic) ->
+    container attrs. Neither term computable -> None (callers decline).
     """
     try:
-        from auto_round.utils.device import get_first_available_attr, get_moe_memory_ratio
+        from auto_round.utils.device import estimate_tuning_block_mem, get_first_available_attr
         from auto_round.utils.model import is_moe_layer
 
-        _ratio, has_moe = get_moe_memory_ratio(block)
+        est_bytes = None
+        try:
+            _layer_dict, layer_activation_gib, _io_gib, _additional_gib = estimate_tuning_block_mem(
+                block, tensors, batch_size
+            )
+            est_bytes = int(layer_activation_gib * 2**30)
+        except Exception as e:  # per-module accounting is best-effort
+            logger.debug("[tune] per-module activation estimate unavailable (%s)", e)
+
+        routed_bytes = None
+        has_moe = any(is_moe_layer(m) or isinstance(getattr(m, "num_experts", None), int) for m in block.modules())
         if has_moe:
-            config = getattr(block, "config", None)
-            top_k = None
+            top_k, routed_rows = None, None
             if config is not None:
                 top_k = get_first_available_attr(config, ["num_experts_per_tok", "moe_num_active_primary_experts"])
                 if top_k is None:
@@ -87,41 +198,60 @@ def _block_activation_bytes(block, tensors, batch_size):
                     if isinstance(moe_topk, (list, tuple)) and moe_topk:
                         top_k = moe_topk[0]
             if top_k is None:
+                for m in block.modules():
+                    rec = getattr(m, "_routed_shape_rec_", None)
+                    if rec is not None:
+                        top_k, routed_rows = rec
+                        break
+            if top_k is None:
                 for _name, module in block.named_modules():
-                    if is_moe_layer(module):
+                    if is_moe_layer(module) or isinstance(getattr(module, "num_experts", None), int):
                         top_k = getattr(module, "top_k", None) or getattr(module, "num_experts_per_tok", None)
                         if top_k is not None:
                             break
-            if top_k is None:
-                return None
-            # row length and element size from the actual pool tensors
-            ref = (
-                tensors[0]
-                if isinstance(tensors, list) and tensors
-                else next(
-                    (t for t in (tensors.values() if isinstance(tensors, dict) else []) if isinstance(t, torch.Tensor)),
-                    None,
+            if top_k is not None:
+                ref = (
+                    tensors[0]
+                    if isinstance(tensors, list) and tensors
+                    else next(
+                        (
+                            t
+                            for t in (tensors.values() if isinstance(tensors, dict) else [])
+                            if isinstance(t, torch.Tensor)
+                        ),
+                        None,
+                    )
                 )
-            )
-            if ref is None or ref.ndim < 2:
-                return None
-            row_len = int(ref.shape[-2]) if ref.ndim >= 3 else int(ref.shape[0])
-            hidden_bytes = int(ref.shape[-1]) * ref.element_size()
-            tokens = max(1, int(batch_size)) * max(1, row_len)
-            return int(tokens * int(top_k) * hidden_bytes * 6)
-        # dense: per-module output accounting from the estimator (actual shapes)
-        from auto_round.utils.device import estimate_tuning_block_mem
+                if ref is not None and ref.ndim >= 2:
+                    row_len = int(ref.shape[-2]) if ref.ndim >= 3 else int(ref.shape[0])
+                    hidden_bytes = int(ref.shape[-1]) * ref.element_size()
+                    tune_tokens = max(1, int(batch_size)) * max(1, row_len)
+                    if routed_rows is not None:
+                        # recorded rows scale per-token to this batch's tokens
+                        seen_tokens = max(1, routed_rows // max(1, int(top_k)))
+                        routed_rows = routed_rows * max(1, tune_tokens // seen_tokens)
+                    else:
+                        routed_rows = tune_tokens * int(top_k)
+                    routed_bytes = int(routed_rows * hidden_bytes * 6)
 
-        _layer_dict, layer_activation_gib, _io_gib, _additional_gib = estimate_tuning_block_mem(
-            block, tensors, batch_size
+        composed = (
+            max(est_bytes, routed_bytes)
+            if (est_bytes is not None and routed_bytes is not None)
+            else (est_bytes if est_bytes is not None else routed_bytes)
         )
-        return int(layer_activation_gib * 2**30)
+        if composed is not None and device is not None:
+            # the grouped modes' qdq stacks are ADDITIVE to the row activations
+            # (different tensors entirely): per-chunk value stacks + qdq
+            # outputs for every expert homed on the device, absent only in
+            # linear_loop -- chunk-aware via _qdq_chunk_size
+            composed += _grouped_stack_bytes(block, device)
+        return composed
     except Exception as e:  # pragma: no cover - placement must never break tuning
         logger.warning("[tune] activation estimate failed (%s); treating as unknown", e)
         return None
 
 
-def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge_activation=False):
+def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge_activation=False, config=None):
     """Bulk-move a whole tune-loop pool onto the device that reads it every iteration.
 
     iters>0 strategy only (loop-amortized): ``active_inputs`` -> the entry
@@ -145,7 +275,7 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge
     """
     if pool is None or target_dev is None:
         return pool
-    _act_bytes = _block_activation_bytes(block, pool, batch_size) if charge_activation else 0
+    _act_bytes = _block_activation_bytes(block, pool, batch_size, config, str(target_dev)) if charge_activation else 0
     if charge_activation and _act_bytes is None:
         return pool  # unknown activation cost: never pull blind
     _tgt = torch.device(target_dev)
@@ -723,6 +853,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     self.iters,
                     "tune] block input activations [",
                     charge_activation=True,
+                    config=getattr(getattr(self, "model_context", None), "config", None),
                 )
             if fp_outputs and loss_device is not None:
                 fp_outputs = _pull_pool_if_fits(

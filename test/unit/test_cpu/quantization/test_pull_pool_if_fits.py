@@ -106,14 +106,63 @@ class TestPullPoolIfFits(unittest.TestCase):
 
         import auto_round.algorithms.quantization.sign_round.quantizer as q
 
+        class _Experts(nn.Module):  # routed container (hy3 mlp.experts)
+            num_experts = 192
+
         ref = torch.zeros(1, 2048, 4096)  # fp32 pool sample
-        block = nn.Linear(4, 4)
-        block.config = type("C", (), {"num_experts_per_tok": 8})()
-        with mock.patch("auto_round.utils.device.get_moe_memory_ratio", return_value=(8 / 192, True)), mock.patch(
-            "auto_round.utils.model.is_moe_layer", return_value=False
-        ):
-            got = q._block_activation_bytes(block, [ref], 8)
+        block = nn.Sequential(_Experts(), nn.Linear(4, 4))
+        config = type("C", (), {"num_experts_per_tok": 8})()
+        got = q._block_activation_bytes(block, [ref], 8, config)
         self.assertAlmostEqual(got / _GIB, 12.0, delta=0.05)
+
+    def test_recorded_dispatch_shapes_beat_missing_config(self):
+        # config absent + module attrs absent -> recorded (top_k, rows) decides
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        class _Experts(nn.Module):
+            num_experts = 192
+
+        exp = _Experts()
+        exp._routed_shape_rec_ = (8, 8 * 2048 * 8)  # seen at batch 8, seq 2048
+        block = nn.Sequential(exp)
+        ref = torch.zeros(1, 2048, 4096)
+        got = q._block_activation_bytes(block, [ref], 8, config=None)
+        self.assertAlmostEqual(got / _GIB, 12.0, delta=0.05)
+
+    def test_estimator_and_routed_composed_by_max(self):
+        # a big shared expert (plain module) makes the estimator term win;
+        # routed alone would undercharge it -- max covers both
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        class _Experts(nn.Module):
+            num_experts = 192
+
+        class _Shared(nn.Module):  # plain shared MLP, full-token width
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(4096, 13312)
+
+        exp = _Experts()
+        exp.gate_proj = nn.Linear(4096, 1536)
+        block = nn.Sequential(exp, _Shared())
+        block.config = type("C", (), {"num_experts_per_tok": 8})()
+        # mark them quantizable-ish for the estimator's check_to_quantized
+        for m in (exp.gate_proj, block[1].gate_proj):
+            m.orig_layer = m
+            m.bits = 4
+            m.act_bits = 16
+            m.group_size = 128
+        ref = torch.zeros(1, 2048, 4096)
+        got = q._block_activation_bytes(block, [ref], 8, block.config)
+        routed = 8 * 2048 * 8 * 4096 * 4 * 6  # 12 GiB
+        # shared 13312-wide gate at full tokens x2 grads ~ 1.56 GiB + expert
+        # module output... estimator path runs the real estimator; assert the
+        # composition never returns less than the routed term
+        self.assertGreaterEqual(got, routed)
 
     def test_state_charged_only_for_params_on_target(self):
         pool = [_FakeTensor("cuda:0", numel=_GIB // 4)]

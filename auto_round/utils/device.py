@@ -1001,7 +1001,11 @@ def estimate_tuning_block_mem(block: torch.nn.Module, input_ids: Any, batch_size
 
     for name, module in block.named_modules():
         if check_to_quantized(module):
-            enable_act_quant = module.act_bits <= 8
+            # V2 wrappers keep bits/act_bits on orig_layer (check_to_quantized
+            # reads them there); reading them off the wrapper itself raises
+            enable_act_quant = (
+                getattr(getattr(module, "orig_layer", module), "act_bits", getattr(module, "act_bits", 16)) <= 8
+            )
             layer_name = name
             param_size = module.weight.nbytes
             param_memory_gb = param_size / 1024**3

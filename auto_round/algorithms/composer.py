@@ -412,6 +412,17 @@ class AlgorithmComposer:
         """
         block_forward_fn = self.block_forward
 
+        # Routed-dispatch shape recorders: fire-once pre-hooks on MoE containers
+        # capture (top_k, routed_rows) from the first NATURAL dispatch during
+        # the forwards below, so the iters>0 activation budget can fall back to
+        # pure arg shapes when config spellings are unknown (arch-agnostic).
+        try:
+            from auto_round.algorithms.quantization.sign_round.quantizer import _ensure_routed_shape_recorders_
+
+            _ensure_routed_shape_recorders_(block)
+        except Exception as e:  # pragma: no cover - diagnostics only
+            logger.debug("[routed-shape] recorder setup skipped (%s)", e)
+
         # ── Step 1: Preprocessor calibration (e.g. AWQ activation stats) ──────
         with torch.no_grad():
             pre_hooks = []
