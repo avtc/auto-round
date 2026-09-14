@@ -99,6 +99,51 @@ class TestPullPoolIfFits(unittest.TestCase):
             out2 = _run(pool2, block, free=15.9 * _GIB, target="cuda:0", label="tune-input", charge_activation=True)
             self.assertTrue(all(t.moved_to == torch.device("cuda:0") for t in out2))
 
+    def test_activation_charge_is_per_device(self):
+        # fwd/bwd executes on EVERY device the block spans: each expert's
+        # routed-row caches land on the expert's WEIGHT HOME. The routed
+        # budget must split by homed-expert count, the shared/dense modules
+        # charge their own home -- not everything onto one scalar.
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        GB = 2**30
+
+        def _dev_linear(in_f, out_f, dev):
+            m = nn.Linear(in_f, out_f)
+            # bypass nn.Module's Parameter-only assignment: __dict__ shadow
+            object.__setattr__(m, "weight", SimpleNamespace(nbytes=in_f * out_f * 2, device=dev))
+            m.orig_layer = m
+            m.bits = 4
+            return m
+
+        class _MoeMLP(nn.Module):  # class name carries the MoE marker (hy3 HYV3MoeMLP)
+
+            pass
+
+        blk = nn.Module()
+        # 6 experts over 3 peers (2 each), shared MLP on cuda:0 (hy3 shape)
+        mlp = _MoeMLP()
+        mlp.experts = nn.ModuleList([_dev_linear(4096, 1536, f"cuda:{1 + i % 3}") for i in range(6)])
+        mlp.experts.num_experts = 6
+        blk.mlp = mlp
+        blk.shared = _dev_linear(4096, 13312, "cuda:0")
+        # the ratio walk reads num_experts off the (model) config
+        config = type("C", (), {"num_experts_per_tok": 8, "num_experts": 192})()
+        ref = torch.zeros(1, 2048, 4096)  # fp32: hidden_bytes 16384
+
+        by_dev = q._activation_bytes_by_device(blk, [ref], 8, config)
+        self.assertIsNotNone(by_dev)
+        # routed total = 8*2048 tokens * top_k 8 * 16384 B * 6 = 12.0 GiB,
+        # split by 2/6 homed experts per peer
+        for peer in ("cuda:1", "cuda:2", "cuda:3"):
+            self.assertAlmostEqual(by_dev[peer] / GB, 12.0 / 3, delta=0.1)
+        # cuda:0 hosts only the shared MLP: estimator term, no routed slice
+        self.assertAlmostEqual(by_dev["cuda:0"] / GB, 16384 * 13312 * 4 * 2 / GB, delta=0.1)
+
     def test_routed_budget_formula_reproduces_measured_lane(self):
         # hy3: batch 8 x seq 2048 x top_k 8 x hidden 4096 x fp32 x 6 ~= 12.0 GiB
         # (measured loop retention: 12.7 GiB of batch cats + routed caches)

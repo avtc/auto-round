@@ -1068,6 +1068,9 @@ def estimate_tuning_block_mem(
                 "param_memory": param_memory_gb * 2,
                 "output_memory": output_memory_gb * 2,
                 "is_moe_expert": is_moe_expert,
+                # weight home: fwd/bwd executes where the weight lives, so the
+                # saved output + grad transient lands on this device
+                "device": str(module.weight.device),
             }
 
     # Assuming bfloat16 or float32, input and output
@@ -1077,13 +1080,22 @@ def estimate_tuning_block_mem(
     # For MoE expert layers, multiply activation memory by the ratio of active experts
     # For non-MoE layers (attention, norm, etc.), use full activation memory
     layer_activation_memory = 0.0
+    per_device_activation = {}
+    per_device_experts = {}
     for layer_name, info in layer_memory_dict.items():
         if info.get("is_moe_expert", False):
             # MoE expert layer: only a fraction of experts are active
             layer_activation_memory += info["output_memory"] * moe_ratio
+            per_device_activation[info["device"]] = (
+                per_device_activation.get(info["device"], 0.0) + info["output_memory"] * moe_ratio
+            )
+            per_device_experts[info["device"]] = per_device_experts.get(info["device"], 0) + 1
         else:
             # Non-MoE layer: use full activation memory
             layer_activation_memory += info["output_memory"]
+            per_device_activation[info["device"]] = (
+                per_device_activation.get(info["device"], 0.0) + info["output_memory"]
+            )
 
     # layer_activation_memory considers other ops activation memory
     # 1GB considers norm weight, sdpa, reference_output, etc.
@@ -1095,7 +1107,14 @@ def estimate_tuning_block_mem(
         moe_additional_memory = additional_memory * 6  # GB
         additional_memory += moe_additional_memory
 
-    return layer_memory_dict, layer_activation_memory, block_input_output_memory, additional_memory
+    return (
+        layer_memory_dict,
+        layer_activation_memory,
+        block_input_output_memory,
+        additional_memory,
+        per_device_activation,
+        per_device_experts,
+    )
 
 
 def set_auto_device_map_for_block_with_tuning(
@@ -1169,7 +1188,7 @@ def set_auto_device_map_for_block_with_tuning(
 
     device_0_memory = get_device_memory(device_list[0] if device_list else 0)
     device_1_memory = get_device_memory(device_list[1] if device_list else 1)
-    layer_memory_dict, layer_activation_memory, block_input_output_memory, additional_memory = (
+    layer_memory_dict, layer_activation_memory, block_input_output_memory, additional_memory, _, _ = (
         estimate_tuning_block_mem(block, input_ids, batch_size)
     )
     loss_memory = block_input_output_memory / 2  # GB, rough estimate for loss tensor memory

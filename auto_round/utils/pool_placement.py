@@ -287,8 +287,7 @@ def resolve_pool_placement(
     consumer: Optional[str] = None,
     occupied_bytes: int = 0,
     peer_state_bytes: Optional[dict] = None,
-    entry_device: Optional[str] = None,
-    entry_extra_bytes: int = 0,
+    activation_bytes: Optional[dict] = None,
 ) -> Optional[PoolPlacement]:
     """Decide per-chunk output placement for a calibration pool.
 
@@ -385,12 +384,9 @@ def resolve_pool_placement(
     #             free. There is no ignore-charges branch: the charges
     #             shape the split in both regimes.
     peer_state = peer_state_bytes or {}
-    entry = str(entry_device) if entry_device is not None else None
+    act = activation_bytes or {}
     headroom = [
-        f
-        - (need_bytes + occupied_bytes if d == eff else peer_state.get(d, 0))
-        - (entry_extra_bytes if d == entry and d != eff else 0)
-        for d, f in usable
+        f - (need_bytes + occupied_bytes if d == eff else peer_state.get(d, 0)) - act.get(d, 0) for d, f in usable
     ]
     # solve the level t by binary search on monotone g(t) = sum(max(h-t,0)) - pool
     lo, hi = min(headroom) - pool_bytes, max(headroom)
@@ -427,26 +423,25 @@ _RESERVE_BYTES = int(0.25 * 2**30)
 _WORKING_FLOOR_BYTES = int(0.125 * 2**30)
 
 
-def _entry_extra_bytes_for(block, pool, batch_size, iters, config, entry_device) -> int:
-    """The entry device's activation budget charged into its spread capacity.
+def _activation_bytes_for(block, pool, batch_size, iters, config) -> dict:
+    """Per-device activation budget charged into every device's headroom.
 
-    The tune loop's forward graph materializes on the ENTRY device (batch
-    cats + routed-row caches -- measured 13.7 GiB on a 4-GPU hy3 lane whose
-    pools were then spread onto it by state-only peer charges, OOMing the
-    first backward 6 GiB over the proven split). Composed from the same
-    arch/mode-aware budget the pull gate uses; 0 when unknown (charges
-    nothing -- the fallback split then applies).
+    The tune loop's forward/backward graph executes on EVERY device the
+    block spans: each module's saved output + grad lands on the module's
+    weight home (the entry's batch cats AND the MoE stages' routed-row
+    caches -- the 3.2 GiB/peer that state-only charges left unpriced on the
+    4-GPU hy3 lane). {device: bytes}; {} when unknown (charges nothing).
     """
-    if iters <= 0 or entry_device is None:
-        return 0
+    if iters <= 0:
+        return {}
     try:
-        from auto_round.algorithms.quantization.sign_round.quantizer import _block_activation_bytes
+        from auto_round.algorithms.quantization.sign_round.quantizer import _activation_bytes_by_device
 
-        got = _block_activation_bytes(block, pool, batch_size, config, str(entry_device))
-        return int(got) if got is not None else 0
+        got = _activation_bytes_by_device(block, pool, batch_size, config)
+        return {str(d): int(b) for d, b in got.items()} if got else {}
     except Exception as e:  # pragma: no cover - placement must never break
-        logger.debug("[calib-data-device] entry activation budget unavailable (%s)", e)
-        return 0
+        logger.debug("[calib-data-device] activation budget unavailable (%s)", e)
+        return {}
 
 
 def _state_bytes_by_device(block) -> dict:
@@ -624,7 +619,6 @@ def resolve_placement_for_pool(
     iters: int = 0,
     consumer: str = None,
     config=None,
-    entry_device: str = None,
 ) -> Optional[PoolPlacement]:
     """Resolve placement from a live pool object (orchestrator entry point).
 
@@ -664,8 +658,7 @@ def resolve_placement_for_pool(
             consumer=consumer,
             occupied_bytes=occupied,
             peer_state_bytes=_state_bytes_by_device(block) if iters > 0 else None,
-            entry_device=entry_device,
-            entry_extra_bytes=_entry_extra_bytes_for(block, pool, batch_size, iters, config, entry_device),
+            activation_bytes=_activation_bytes_for(block, pool, batch_size, iters, config) if iters > 0 else None,
         )
     except Exception as e:  # pragma: no cover - placement must never break quantization
         logger.warning("[calib-data-device] placement resolve failed (%s); keeping single-device behavior", e)

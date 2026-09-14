@@ -309,6 +309,36 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertNotIn("cuda:1", counts)
         self.assertEqual(sum(counts.values()), 128)
 
+    def test_activation_charges_shift_pool_off_moe_peers(self):
+        # peers homing experts carry routed transients the state charge never
+        # priced (measured 3.2 GiB/peer): charging them shrinks peer headroom
+        # -> water-fill moves pool bytes onto the (uncharged) entry device
+        from auto_round.utils.pool_placement import resolve_pool_placement
+
+        GB = 2**30
+
+        def _plan(act):
+            return resolve_pool_placement(
+                8 * GB,
+                128,
+                "cuda:0",
+                5 * GB,  # working set: single-device rung declines (12-5 < 8)
+                ["cuda:0", "cuda:2", "cuda:3"],
+                lambda d: {"cuda:0": 12 * GB, "cuda:2": 13 * GB, "cuda:3": 13 * GB}[d],
+                peer_state_bytes={"cuda:2": 4 * GB, "cuda:3": 4 * GB},
+                activation_bytes=act,
+            )
+
+        uncharged = _plan(None)
+        charged = _plan({"cuda:0": 1.6 * GB, "cuda:2": 4.3 * GB, "cuda:3": 4.3 * GB})
+        cu, cc = uncharged.counts(), charged.counts()
+        # uncharged: h = (7, 9, 9) -> level 5.67 -> (1.3, 3.3, 3.3)
+        # charged:   h = (5.4, 2.7, 2.7) -> level 0.93 -> (4.5, 1.8, 1.8)
+        self.assertGreater(cc["cuda:0"], cu["cuda:0"])
+        self.assertLess(cc["cuda:2"], cu["cuda:2"])
+        self.assertLess(cc["cuda:3"], cu["cuda:3"])
+        self.assertEqual(sum(cc.values()), 128)
+
     def test_water_fill_spreads_when_headrooms_comparable(self):
         # frees (8, 10) GiB with the helper's default need=2 charged to the
         # primary: headroom (6, 10), pool 9 (exceeds the primary alone, so the

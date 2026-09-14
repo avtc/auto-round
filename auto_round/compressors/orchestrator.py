@@ -264,7 +264,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 iters=_iters,
                 consumer=_consumer,
                 config=getattr(getattr(self, "model_context", None), "config", None),
-                entry_device=str(getattr(runner, "device")) if _iters > 0 else None,
             )
             # Docstring contract: never consolidate when the policy is off, the
             # lane is CPU-parked (low_gpu_mem_usage keeps pools on the host), or
