@@ -158,6 +158,7 @@ def _routed_budget_bytes(block, tensors, batch_size, config=None):
     container attrs. None when nothing resolves (callers decline).
     """
     from auto_round.utils.device import get_first_available_attr
+    from auto_round.utils.model import is_moe_layer
 
     top_k = None
     if config is not None:
