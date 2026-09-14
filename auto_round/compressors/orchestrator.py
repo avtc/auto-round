@@ -648,6 +648,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                                 f" | pack[{_pp['count']} mods: pre={_pw['pre']:.2f}s"
                                 f" fmt={_pw['fmt']:.2f}s lookup={_pp['lookup']:.2f}s"
                                 f" ctor={_pp['ctor']:.2f}s pack={_pp['pack']:.2f}s"
+                                f" dispatch={_pp['dispatch']:.2f}s"
                                 f" moves={_pp['moves']:.2f}s call={_pack_call:.2f}s"
                                 f" scaffold={_pack_scaffold:.2f}s"
                                 f" cpu={_pack_cpu:.2f}s thr={_pack_the:.2f}s]"

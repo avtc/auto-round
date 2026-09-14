@@ -114,6 +114,38 @@ def _staged_key(wrapper, weight, imatrix):
     )
 
 
+def swap_wrapper_callables_to_eager(wrapper):
+    """Point compiled wrapper callables at their eager originals.
+
+    Returns a restore fn or None. ``unwrapper({})`` may call BOTH the
+    (possibly torch.compile-wrapped) weight_quant_func and -- for
+    act-quantized layers, act_bits <= 8 -- the compiled act_quant_func (the
+    act tail's first-ever call in the iters=0 lane); on worker threads
+    either first call would race dynamo's trace lock, exactly like the
+    stacked path.
+    """
+    restores = []
+
+    for attr in ("weight_quant_func", "act_quant_func"):
+        fn = getattr(wrapper, attr, None)
+        if fn is None:
+            continue
+        orig = getattr(fn, "_torchdynamo_orig_callable", None)
+        if orig is None:
+            continue
+        setattr(wrapper, attr, orig)
+        restores.append((attr, fn))
+
+    if not restores:
+        return None
+
+    def _restore():
+        for attr, fn in restores:
+            setattr(wrapper, attr, fn)
+
+    return _restore
+
+
 @torch.no_grad()
 def run_batched_rtn_search(model, staged, max_batch=None):
     """Finish deferred zero-shot wrappers on stacked same-shape batches.
@@ -188,30 +220,12 @@ def run_batched_rtn_search(model, staged, max_batch=None):
                 return str(wk)
         return str(chunk[0]["weight"].device)  # not found (should not happen): stay home
 
-    def _swap_to_eager(wrapper):
-        """Point weight_quant_func at the eager original (returns restore fn or None).
-
-        unwrapper({}) -> _qdq_weight calls the (possibly torch.compile-wrapped)
-        weight_quant_func itself; on worker threads that first call would race
-        dynamo's trace lock, exactly like the stacked path.
-        """
-        fn = wrapper.weight_quant_func
-        orig = getattr(fn, "_torchdynamo_orig_callable", None)
-        if orig is None:
-            return None
-        wrapper.weight_quant_func = orig
-
-        def _restore():
-            wrapper.weight_quant_func = fn
-
-        return _restore
-
     def _run_chunk(chunk, worker, threaded=False):
         w0 = chunk[0]["w"]
         dev = str(chunk[0]["weight"].device)
         worker = str(worker)
         if len(chunk) == 1:
-            _restore = _swap_to_eager(chunk[0]["w"]) if (threaded or worker != dev) else None
+            _restore = swap_wrapper_callables_to_eager(chunk[0]["w"]) if (threaded or worker != dev) else None
             try:
                 layer = chunk[0]["w"].unwrapper({})
             finally:
@@ -249,7 +263,7 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             )
             dump_oom_tensor_census_("rtn batched search")
             for e in chunk:
-                _restore = _swap_to_eager(e["w"]) if (threaded or worker != dev) else None
+                _restore = swap_wrapper_callables_to_eager(e["w"]) if (threaded or worker != dev) else None
                 try:
                     layer = e["w"].unwrapper({})
                 finally:
@@ -276,10 +290,17 @@ def run_batched_rtn_search(model, staged, max_batch=None):
             # unwrapper tail (bias/meta update, static-act rescale, act
             # metadata, WrapperWALayer attachment) and leave act-quantized
             # layers (act_bits <= 8) silently inconsistent with the serial
-            # path. The injection short-circuits _qdq_weight's recompute, and
-            # no compiled weight_quant_func runs here, so no dynamo race.
-            w._presolved_qdq = (res, scale_parts[i], zp_parts[i])
-            layer = w.unwrapper({})
+            # path. The injection short-circuits _qdq_weight's recompute so
+            # no compiled weight_quant_func runs here; the act tail may still
+            # call its compiled act_quant_func, so swap BOTH callables to
+            # eager on worker threads before unwrapping.
+            _restore = swap_wrapper_callables_to_eager(w) if (threaded or worker != dev) else None
+            try:
+                w._presolved_qdq = (res, scale_parts[i], zp_parts[i])
+                layer = w.unwrapper({})
+            finally:
+                if _restore is not None:
+                    _restore()
             set_module(model, e["name"], layer)
 
     if len(buckets) > 1:

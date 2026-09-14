@@ -647,6 +647,48 @@ class TestBatchedRtnSearchParity(unittest.TestCase):
             ref_w = w_ref.unwrapper({}).weight.data.clone()
         self.assertTrue(torch.equal(getattr(model, "l0").weight.data, ref_w))
 
+    def test_threaded_write_back_swaps_compiled_act_fn_to_eager(self):
+        """Regression (review R5-1): on worker threads the unwrapper act tail
+        would make its FIRST call to the torch.compile-wrapped act_quant_func
+        -- the same dynamo trace-lock race the weight fn had. The threaded
+        write-back must swap BOTH compiled callables (weight AND act) to their
+        eager originals and restore them afterwards."""
+        from auto_round.algorithms.quantization.rtn.batched_search import swap_wrapper_callables_to_eager
+
+        ran_eager = []
+
+        def _fake_eager_act(x, **kwargs):
+            ran_eager.append(True)
+            return x, torch.ones(1), None
+
+        class _Compiled:
+            def __init__(self, orig):
+                self._torchdynamo_orig_callable = orig
+
+            def __call__(self, *a, **k):  # pragma: no cover - must never run on workers
+                raise AssertionError("compiled callable ran while swapped out")
+
+        w = self._make_wrapper(self._layer(0))
+        compiled_w = _Compiled(lambda *a, **k: (None, None, None))
+        compiled_a = _Compiled(_fake_eager_act)
+        w.weight_quant_func = compiled_w
+        w.act_quant_func = compiled_a
+
+        restore = swap_wrapper_callables_to_eager(w)
+        self.assertIsNotNone(restore)
+        # swapped: both attrs now point at the eager originals
+        self.assertIs(w.weight_quant_func, compiled_w._torchdynamo_orig_callable)
+        self.assertIs(w.act_quant_func, _fake_eager_act)
+        w.act_quant_func(None)  # the eager act callable is what runs on the worker
+        restore()
+        # restored: both compiled callables back in place
+        self.assertIs(w.weight_quant_func, compiled_w)
+        self.assertIs(w.act_quant_func, compiled_a)
+
+        # wrappers without compiled callables need no swap
+        w2 = self._make_wrapper(self._layer(1))
+        self.assertIsNone(swap_wrapper_callables_to_eager(w2))
+
     def _conv1d_layer(self, seed, nf, nx):
         from transformers.pytorch_utils import Conv1D
 

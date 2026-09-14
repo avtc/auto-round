@@ -411,7 +411,11 @@ class BlockForwardRunner:
                         batch_vals = self._gather_same_device([val[i] for i in indices], self.device)
                         selected_inputs[key] = torch.cat(batch_vals, dim=batch_dim)
                     elif isinstance(val, torch.Tensor):
-                        selected_inputs[key] = torch.index_select(val, batch_dim, indices)
+                        # relocate indices like the input_others branch below:
+                        # under spread pool placement a sharded tensor key can
+                        # live on a park device while indices stay on the
+                        # sampler's CPU device
+                        selected_inputs[key] = torch.index_select(val, batch_dim, indices.to(device=val.device))
                     else:
                         selected_inputs[key] = val
         else:
