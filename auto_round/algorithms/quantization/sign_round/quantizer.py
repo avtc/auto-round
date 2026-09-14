@@ -119,31 +119,55 @@ def _grouped_stack_bytes(block, device):
     transient = 0
     try:
         from auto_round.modeling.fused_moe.grouped_experts import _qdq_chunk_size
+        from auto_round.utils.model import is_moe_layer
 
-        for m in block.modules():
-            if not isinstance(getattr(m, "num_experts", None), int):
+        def _is_expert_leaf(name, leaf):
+            # expert leaves are named "experts.N.proj" in every unfused layout;
+            # the container may carry num_experts, be a ModuleList, or carry
+            # the MoE marker only on an ANCESTOR (HYV3Experts: none of the
+            # former -- a name-only walk returned 0 stacks on the real lane
+            # and silently disabled the activation charge and the auto
+            # linear_loop pick)
+            if "expert" not in name.lower():
+                return False
+            stem = name
+            while "." in stem:
+                stem = stem.rsplit(".", 1)[0]
+                mod = mods.get(stem)
+                if mod is None:
+                    continue
+                if (
+                    isinstance(mod, torch.nn.ModuleList)
+                    or isinstance(getattr(mod, "num_experts", None), int)
+                    or is_moe_layer(mod)
+                ):
+                    return True
+            return False
+
+        # group leaves by slot name so per-slot chunking matches the real
+        # grouped path (gate/up/down are chunked independently)
+        mods = dict(block.named_modules())
+        by_slot = {}
+        for name, leaf in mods.items():
+            weight = getattr(leaf, "weight", None)
+            if weight is None or not hasattr(weight, "numel"):
                 continue
-            # group leaves by slot name so per-slot chunking matches the real
-            # grouped path (gate/up/down are chunked independently)
-            by_slot = {}
-            for leaf in m.modules():
-                weight = getattr(leaf, "weight", None)
-                if weight is None or not hasattr(weight, "numel"):
-                    continue
-                by_slot.setdefault(type(leaf).__name__ + "." + getattr(leaf, "slot_tag", ""), []).append(leaf)
-            for _slot, leaves in by_slot.items():
-                local = [l for l in leaves if str(l.weight.device) == str(device)]
-                if not local:
-                    continue
-                elems = sum(int(l.weight.numel()) for l in local)
-                retention += elems * 6  # fp32 value stack + bf16 qdq output
-                try:
-                    chunk = _qdq_chunk_size(local)  # env/budget-aware; 0 = all
-                except Exception:
-                    chunk = 16
-                per_leaf = elems // max(1, len(local))
-                chunk_elems = elems if chunk <= 0 else min(elems, chunk * per_leaf)
-                transient += chunk_elems * 6  # ~2 streaming passes over the chunk
+            if not _is_expert_leaf(name, leaf):
+                continue
+            by_slot.setdefault(type(leaf).__name__ + "." + getattr(leaf, "slot_tag", ""), []).append(leaf)
+        for _slot, leaves in by_slot.items():
+            local = [l for l in leaves if str(l.weight.device) == str(device)]
+            if not local:
+                continue
+            elems = sum(int(l.weight.numel()) for l in local)
+            retention += elems * 6  # fp32 value stack + bf16 qdq output
+            try:
+                chunk = _qdq_chunk_size(local)  # env/budget-aware; 0 = all
+            except Exception:
+                chunk = 16
+            per_leaf = elems // max(1, len(local))
+            chunk_elems = elems if chunk <= 0 else min(elems, chunk * per_leaf)
+            transient += chunk_elems * 6  # ~2 streaming passes over the chunk
     except Exception as e:  # pragma: no cover - never break the gate
         logger.debug("[tune] grouped-stack accounting unavailable (%s)", e)
         return 0
@@ -424,11 +448,11 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge
             reserve = 4 << 30
         if free is not None and free - reserve >= pool_b:
             moved = [t.to(_tgt) for t in tensors]
-            logger.debug("[%s] bulk pull -> %s (%.2f GiB, free %.2f GiB)", label, _tgt, pool_b / 2**30, free / 2**30)
+            logger.debug("[%s bulk pull -> %s (%.2f GiB, free %.2f GiB)", label, _tgt, pool_b / 2**30, free / 2**30)
             return moved
         if free is not None:
             logger.debug(
-                "[%s] stays sharded, per-batch gather (data %.2f GiB + reserve %.2f GiB vs free %.2f GiB on %s)",
+                "[%s stays sharded, per-batch gather (data %.2f GiB + reserve %.2f GiB vs free %.2f GiB on %s)",
                 label,
                 pool_b / 2**30,
                 reserve / 2**30,
@@ -436,7 +460,7 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge
                 _tgt,
             )
     except Exception as e:  # pragma: no cover - placement must never break tuning
-        logger.warning("[%s] bulk pull failed (%s); keeping data sharded", label, e)
+        logger.warning("[%s bulk pull failed (%s); keeping data sharded", label, e)
     return pool
 
 

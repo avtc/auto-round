@@ -99,6 +99,44 @@ class TestPullPoolIfFits(unittest.TestCase):
             out2 = _run(pool2, block, free=15.9 * _GIB, target="cuda:0", label="tune-input", charge_activation=True)
             self.assertTrue(all(t.moved_to == torch.device("cuda:0") for t in out2))
 
+    def test_grouped_stacks_detect_hy3_container(self):
+        # HYV3Experts carries NEITHER num_experts NOR ModuleList -- the MoE
+        # marker sits on an ancestor. The old container walk returned 0 stacks
+        # on the real lane, silently disabling the activation charge and the
+        # auto linear_loop pick (4x3090 grouped OOM with no switch).
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        class _MoeMLP(nn.Module):
+
+            pass
+
+        class _HYV3Experts(nn.Module):  # no num_experts, not a ModuleList
+
+            pass
+
+        blk = nn.Module()
+        mlp = _MoeMLP()
+        experts = _HYV3Experts()
+        for i in range(2):
+            leaf = nn.Linear(4, 4)
+            object.__setattr__(
+                leaf, "weight", SimpleNamespace(numel=lambda: 16, device="cuda:1", nbytes=32, shape=(4, 4))
+            )
+            setattr(experts, str(i), leaf)
+        mlp.experts = experts
+        blk.mlp = mlp
+
+        got = q._grouped_stack_bytes(blk, "cuda:1")
+        self.assertGreater(got, 0)
+        # retention 2 leaves x 16 elems x 6 B = 192 B minimum (plus transient)
+        self.assertGreaterEqual(got, 192)
+        # no expert leaves homed elsewhere
+        self.assertEqual(q._grouped_stack_bytes(blk, "cuda:0"), 0)
+
     def test_activation_charge_is_per_device(self):
         # fwd/bwd executes on EVERY device the block spans: each expert's
         # routed-row caches land on the expert's WEIGHT HOME. The routed
