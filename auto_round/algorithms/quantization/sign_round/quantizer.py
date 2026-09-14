@@ -32,6 +32,63 @@ from auto_round.compressors.utils import (
 from auto_round.logger import logger
 
 
+def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
+    """Bulk-move a whole tune-loop pool onto the device that reads it every iteration.
+
+    iters>0 strategy only (loop-amortized): ``active_inputs`` -> the entry
+    device the forward gathers onto (BlockForwardRunner.device, home of the
+    block's starting modules), ``fp_outputs`` -> the loss device. The iters=0
+    lane never calls this -- its pools are single-pass streamed, so a bulk
+    move buys nothing. Declines (pool stays sharded behind the per-batch
+    gather) unless free(target) covers the pool beside the loop transients
+    and the target's own in-loop tuning state (14 B/param), which
+    materializes after this probe -- the term that separates the 8-GPU lane
+    (pulls) from the 4-GPU lane (declines; peers completed the loop at the
+    same state density without the pool).
+    """
+    if pool is None or target_dev is None:
+        return pool
+    _tgt = torch.device(target_dev)
+    try:
+        tensors = pool if isinstance(pool, list) else None
+        if tensors is None or not tensors or not any(hasattr(t, "device") for t in tensors):
+            return pool
+        if all(t.device == _tgt for t in tensors):
+            return pool
+        pool_b = sum(t.numel() * t.element_size() for t in tensors)
+        try:
+            from auto_round.utils.device import probe_usable_bytes
+
+            free = probe_usable_bytes(str(_tgt))
+        except Exception as e:  # pragma: no cover - diagnostics only
+            logger.warning("[%s] free-memory probe failed for %s (%s); keeping pool sharded", label, _tgt, e)
+            free = None
+        try:
+            from auto_round.utils.pool_placement import _RESERVE_BYTES, _working_allowance_bytes
+
+            reserve = _working_allowance_bytes(block, tensors, batch_size) + _RESERVE_BYTES
+            reserve += sum(p.numel() for p in block.parameters() if str(p.device) == str(_tgt)) * 14
+        except Exception as e:  # pragma: no cover - gate must never break tuning
+            logger.warning("[%s] working-set estimate failed (%s); using flat 4GiB reserve", label, e)
+            reserve = 4 << 30
+        if free is not None and free - reserve >= pool_b:
+            moved = [t.to(_tgt) for t in tensors]
+            logger.debug("[%s] pool pulled to %s (%.2f GiB, free %.2f GiB)", label, _tgt, pool_b / 2**30, free / 2**30)
+            return moved
+        if free is not None:
+            logger.debug(
+                "[%s] pool stays sharded (pool %.2f GiB + reserve %.2f GiB vs free %.2f GiB on %s)",
+                label,
+                pool_b / 2**30,
+                reserve / 2**30,
+                free / 2**30,
+                _tgt,
+            )
+    except Exception as e:  # pragma: no cover - placement must never break tuning
+        logger.warning("[%s] bulk pull failed (%s); keeping pool sharded", label, e)
+    return pool
+
+
 def _tune_phase_line(phases: dict, iters: int) -> str:
     """Format the per-block tuning phase breakdown for AR_PERF_COUNTERS.
 
@@ -542,60 +599,23 @@ class SignRoundQuantizer(BaseQuantizer):
         if _tune_perf is not None:
             _tune_perf["prepare"] = _ptime.perf_counter() - _tp1
             _tp2 = _ptime.perf_counter()
-        # Bulk local-pull of the reference pool (same strategy as iters=0):
-        # when the whole fp_outputs pool fits on the loss/compute device beside
-        # a conservative reserve for the loop's working set, move it ONCE so
-        # every iteration reads locally; otherwise it stays sharded and the
-        # per-batch gather below covers mixed-device selections.
-        if fp_outputs and loss_device is not None:
-            _ld = torch.device(loss_device)
-            if any(t.device != _ld for t in fp_outputs):
-                _pool_b = sum(t.numel() * t.element_size() for t in fp_outputs)
-                try:
-                    from auto_round.utils.device import probe_usable_bytes
-
-                    _free = probe_usable_bytes(str(_ld))
-                except Exception as e:  # pragma: no cover - diagnostics only
-                    logger.warning("[tune] free-memory probe failed for %s (%s); keeping pool sharded", _ld, e)
-                    _free = None
-                # Reserve for the pull decision = the loop's not-yet-resident
-                # transients (per-iteration batch IO + widest projection + flat
-                # allocator reserve) PLUS the consumer's own tuning state, which
-                # materializes IN-LOOP after this probe (probe free 19.48 bounds
-                # probe-time allocated at ~4 GiB while the loop runs at 14.5 GiB
-                # on the same device). The state term is what separates lanes:
-                # 8-GPU hy3 (state ~6.4 GiB on the loss device) pulled and
-                # survived at 18.9 GiB peak for 80 blocks; 4-GPU hy3 (state
-                # ~12.9 GiB) OOMed in the first backward exactly 0.5 GiB over
-                # with the 4 GiB pool pulled, while peer devices at the same
-                # state density but WITHOUT the pool completed the loop. The
-                # 2x-pool collection window stays out (that retention is the
-                # attach-time gates' term); the pool being pulled IS the window.
-                try:
-                    from auto_round.utils.pool_placement import _RESERVE_BYTES, _working_allowance_bytes
-
-                    _reserve = _working_allowance_bytes(block, fp_outputs, batch_size) + _RESERVE_BYTES
-                    if (getattr(self, "iters", 0) or 0) > 0:
-                        _reserve += sum(p.numel() for p in block.parameters() if str(p.device) == str(_ld)) * 14
-                except Exception as e:  # pragma: no cover - gate must never break tuning
-                    logger.warning("[tune] working-set estimate failed (%s); using flat 4GiB reserve", e)
-                    _reserve = 4 << 30
-                if _free is not None and _free - _reserve >= _pool_b:
-                    fp_outputs = [t.to(_ld) for t in fp_outputs]
-                    logger.debug(
-                        "[tune] reference pool pulled to %s (%.2f GiB, free %.2f GiB)",
-                        _ld,
-                        _pool_b / 2**30,
-                        _free / 2**30,
-                    )
-                elif _free is not None:
-                    logger.debug(
-                        "[tune] reference pool stays sharded (pool %.2f GiB + reserve %.2f GiB vs free %.2f GiB on %s)",
-                        _pool_b / 2**30,
-                        _reserve / 2**30,
-                        _free / 2**30,
-                        _ld,
-                    )
+        # iters>0 hot-pool strategy (loop-amortized; the iters=0 lane streams
+        # its pools once and never reaches these pulls): each pool moves in
+        # bulk onto the device that reads it every iteration -- the forward
+        # gathers input batches onto the ENTRY device (BlockForwardRunner.device,
+        # where the block's starting modules live), the loss gathers reference
+        # batches onto the loss device. Declined pulls keep the per-batch
+        # gather (measured ~1-2 s/block at iters=20 with spread pools).
+        if (getattr(self, "iters", 0) or 0) > 0:
+            _entry_dev = str(getattr(block_fwd, "device", device)) if block_fwd is not None else str(device)
+            if isinstance(active_inputs, list):
+                active_inputs = _pull_pool_if_fits(
+                    active_inputs, _entry_dev, block, batch_size, self.iters, "tune-input"
+                )
+            if fp_outputs and loss_device is not None:
+                fp_outputs = _pull_pool_if_fits(
+                    fp_outputs, str(loss_device), block, batch_size, self.iters, "tune-reference"
+                )
 
         try:
             for i in range(self.iters):
