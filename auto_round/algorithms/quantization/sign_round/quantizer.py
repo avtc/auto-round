@@ -228,8 +228,10 @@ def _block_activation_bytes(block, tensors, batch_size, config=None, device=None
                     tune_tokens = max(1, int(batch_size)) * max(1, row_len)
                     if routed_rows is not None:
                         # recorded rows scale per-token to this batch's tokens
+                        # (collection may have seen a larger batch; a floor-div
+                        # here silently kept the oversized count)
                         seen_tokens = max(1, routed_rows // max(1, int(top_k)))
-                        routed_rows = routed_rows * max(1, tune_tokens // seen_tokens)
+                        routed_rows = int(routed_rows * tune_tokens / seen_tokens)
                     else:
                         routed_rows = tune_tokens * int(top_k)
                     routed_bytes = int(routed_rows * hidden_bytes * 6)

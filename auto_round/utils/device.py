@@ -1043,8 +1043,14 @@ def estimate_tuning_block_mem(
                 # Our unfuse builds the experts module as a plain nn.Module with numbered
                 # _ExpertContainer children (checkpoint-format keys), NOT an nn.ModuleList;
                 # the num_experts attribute identifies it just as well.
-                is_experts_container = isinstance(pparent_module, torch.nn.ModuleList) or hasattr(
-                    pparent_module, "num_experts"
+                # is_moe_layer covers container classes transformers registers
+                # (HYV3Experts etc.) that are neither ModuleLists nor expose
+                # num_experts; without it every expert priced full-width (the
+                # ~170 GiB est on hy3 with the correct 8/192 ratio logged)
+                is_experts_container = (
+                    isinstance(pparent_module, torch.nn.ModuleList)
+                    or hasattr(pparent_module, "num_experts")
+                    or is_moe_layer(pparent_module)
                 )
                 is_moe_expert = "expert" in layer_name.lower() and is_experts_container
             else:
