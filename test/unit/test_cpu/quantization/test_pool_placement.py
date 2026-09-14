@@ -86,13 +86,14 @@ class TestResolvePoolPlacement(unittest.TestCase):
         esize = 4  # fp32 params
         batch_bytes = 2 * 32 * 4 // 2 * 2  # per-chain 256B, batch 2 of 2 -> 256B
         transient = int((32 * 2 / 4) * 4 * esize * 2)  # tokens=16, widest=4, x2 buffers
-        expected = max(2 * batch_bytes + transient, floor) + reserve
+        pool_bytes = 2 * 32 * 4  # one chain, both samples
+        expected = max(2 * batch_bytes + transient, floor) + reserve + 2 * pool_bytes  # + window term
         need0 = pp.placement_need_bytes(m, pool, 2)
         self.assertEqual(need0, expected)
         # iters=0: identical (no tuning state at zero-shot)
         self.assertEqual(pp.placement_need_bytes(m, pool, 2, iters=0, primary="cuda:0"), need0)
-        # degenerate reads floor-guard: no block, bare-tensor pool
-        self.assertEqual(pp.placement_need_bytes(None, torch.zeros(4), 2), floor + reserve)
+        # degenerate reads floor-guard + window: no block, bare-tensor pool
+        self.assertEqual(pp.placement_need_bytes(None, torch.zeros(4), 2), floor + reserve + 2 * 4 * 4)
         # iters>0: +14 B per candidate-homed parameter; peers' params ignored
         n_params = sum(p.numel() for p in m.parameters())
         dev = str(next(m.parameters()).device)
@@ -184,6 +185,33 @@ class TestResolvePoolPlacement(unittest.TestCase):
         counts = blocked.counts()
         self.assertLessEqual(counts.get("cuda:1", 0), counts.get("cuda:2", 0))
         self.assertLess(counts.get("cuda:1", 0), counts.get("cuda:0", 0))
+
+    def test_occupied_incoming_pool_blocks_primary_single_too(self):
+        """Regression (server block-2 OOM): a single plan on the cache primary
+        must charge the input pool the PREVIOUS single plan left resident
+        there -- otherwise every other block re-singles the loaded device."""
+        need = int(2.4 * self.GB)
+        pool = 4 * self.GB
+        free_ok = pp.resolve_pool_placement(
+            pool,
+            128,
+            "cuda:0",
+            need,
+            ["cuda:0", "cuda:1", "cuda:2"],
+            _fake_probe({"cuda:0": 13 * self.GB, "cuda:1": 12 * self.GB, "cuda:2": 11 * self.GB}),
+        )
+        self.assertEqual(free_ok.devices, ["cuda:0"])  # 13 - 2.4 >= 4: fits
+        loaded = pp.resolve_pool_placement(
+            pool,
+            128,
+            "cuda:0",
+            need,
+            ["cuda:0", "cuda:1", "cuda:2"],
+            _fake_probe({"cuda:0": 8 * self.GB, "cuda:1": 12 * self.GB, "cuda:2": 11 * self.GB}),
+            occupied_bytes=4 * self.GB,  # previous block's single plan left it here
+        )
+        # 8 - 2.4 - 4 < 4: single vetoed; the primary's spread share is floored
+        self.assertLessEqual(loaded.counts().get("cuda:0", 0), loaded.counts().get("cuda:2", 0))
 
     def test_degenerate_consumer_falls_back_to_primary(self):
         """consumer == primary or non-cuda consumer: primary-first as before."""

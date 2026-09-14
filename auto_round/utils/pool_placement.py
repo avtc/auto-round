@@ -486,9 +486,14 @@ def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: 
     rounds later showed that retention IS the in+out pool pair itself, which
     the gates already count explicitly (``total`` + ``reserved_bytes`` in the
     consolidation gate, ``pool_bytes`` + ``occupied_bytes`` in the resolve
-    gate), so the term double-counted and made attach-time consolidation
-    mathematically unreachable (need ~= 24 GiB on a 23.58 GiB card). What is
-    actually left to charge:
+    gate). A first revision took that reasoning too far and dropped the term
+    from the RESOLVE gate as well -- but there it encodes the MEASURED
+    collection window (retained batch outputs + route caches ~= 2x pool
+    bytes on a single-compute-device MoE block), and dropping it let a
+    block-2 single plan through that OOMed on the first server run. The
+    term is restored, making the need strictly >= the validated formula;
+    the computed allowance below is the additional, tune-loop-accurate
+    part. Total charge:
 
     - the computed batch working allowance (``_working_allowance_bytes``:
       2 batch IO generations + the widest projection's activation buffer,
@@ -503,6 +508,18 @@ def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: 
     """
     try:
         need = _working_allowance_bytes(block, pool, batch_size) + _RESERVE_BYTES
+        # MEASURED collection-window term (window~=2 chain retention + the
+        # linear_loop route caches observed in the block censuses: on a
+        # single-compute-device iters=0 MoE block the live transients ran
+        # to ~3x pool bytes -- 8.25 GiB of retained batch-shaped outputs
+        # plus 4 GiB of selected-hidden next to a 4 GiB pool). An earlier
+        # revision dropped this term as a "double count" and the first
+        # server run OOMed exactly there (block-2 single plan on the
+        # primary); the computed allowance models the TUNE loop's
+        # transients, not the collection forward's. Keeping the term makes
+        # this need strictly >= the previously validated formula, so every
+        # placement decision can only be equal or more conservative.
+        need += 2 * _tensor_bytes(pool)
         if iters > 0 and block is not None and primary is not None:
             state_bytes = sum(p.numel() for p in block.parameters() if str(p.device) == str(primary)) * 14
             need += state_bytes
@@ -545,12 +562,15 @@ def resolve_placement_for_pool(
     if n_chunks <= 0 or pool_bytes <= 0:
         return None
     consumer = str(consumer) if consumer is not None else None
-    occupied = 0
-    if consumer is not None and consumer != str(primary):
-        by_dev, _ = _bytes_by_device(pool)
-        # the q-input pool mirrors the fp pool's placement (same chunk layout),
-        # so the incoming resident bytes scale with the chain multiplier too
-        occupied = int(by_dev.get(consumer, 0) * max(int(chains), 1))
+    by_dev, _ = _bytes_by_device(pool)
+    # occupied = pool bytes already resident on the SINGLE-DEVICE candidate
+    # (consumer when retargeted, else the cache primary). Charging it for
+    # the primary too is what stops the block-N single plan from ignoring
+    # the input pool the block-N-1 single plan left sitting there (the
+    # block-2 OOM: 4 GiB uncharged). The q-input pool mirrors the fp
+    # pool's placement (same chunk layout), so resident bytes scale with
+    # the chain multiplier.
+    occupied = int(by_dev.get(str(consumer if consumer is not None else primary), 0) * max(int(chains), 1))
     try:
         plan = resolve_pool_placement(
             pool_bytes,
