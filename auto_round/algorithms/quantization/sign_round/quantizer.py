@@ -301,6 +301,75 @@ def _block_activation_bytes(block, tensors, batch_size, config=None, device=None
     return by_dev.get(str(device))
 
 
+_MOE_IMPL_AUTO_LINEAR_LOOP_DONE = False
+
+
+def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config, model):
+    """One-shot auto pick: ``linear_loop`` when grouped tuning cannot fit.
+
+    Grouped tuning stacks per-expert fp32 value/grad tensors on every
+    expert-homing device (chunk-INDEPENDENT autograd retention) ON TOP of the
+    in-loop tuning state; when a device cannot hold both beside the reserve,
+    the first backward OOMs only after a wasted grouped_mm attempt plus a
+    sliced-fallback re-staging (the 4x3090 hy3 failure mode). The charges are
+    the same ones the placement gates use: per-device tuning state (values
+    already resident at this point -- charged at 10 of the 14 B/param layout)
+    plus the per-device activation budget (routed transients + grouped
+    stacks). Any expert-homing device over budget -> switch the WHOLE run to
+    linear_loop once, loudly. Explicit AR_MOE_EXPERTS_IMPL choices are never
+    overridden.
+    """
+    global _MOE_IMPL_AUTO_LINEAR_LOOP_DONE
+    if _MOE_IMPL_AUTO_LINEAR_LOOP_DONE or iters is None or int(iters) <= 0:
+        return
+    from auto_round import envs as _envs_mod
+    from auto_round.modeling.fused_moe.moe_experts_interface import GROUPED_LINEAR_IMPL, LINEAR_LOOP_IMPL
+    from auto_round.utils.device import probe_usable_bytes
+    from auto_round.utils.pool_placement import _RESERVE_BYTES, _state_bytes_by_device
+
+    requested = str(getattr(_envs_mod, "AR_MOE_EXPERTS_IMPL", "auto") or "auto").lower()
+    if requested not in ("", "auto"):
+        _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = True  # explicit choice governs
+        return
+    cfg = config if config is not None else getattr(model, "config", None)
+    if cfg is None or str(getattr(cfg, "_experts_implementation", "")) != GROUPED_LINEAR_IMPL:
+        return
+    try:
+        state = _state_bytes_by_device(block) or {}
+        if not state:
+            return
+        act = _activation_bytes_by_device(block, tensors, batch_size, cfg) or {}
+        if not any(_grouped_stack_bytes(block, d) > 0 for d in state):
+            return  # no grouped stacks homed here: not the decision point yet
+        over = []
+        for d, state_bytes in state.items():
+            # values (4 B/param) are already inside the probed free here;
+            # charge the remaining grads+snapshot+bf16 of the 14 B layout
+            remaining_state = state_bytes * 10 // 14
+            demand = remaining_state + act.get(d, 0) + _RESERVE_BYTES
+            free = probe_usable_bytes(d)
+            if free is not None and demand > int(free):
+                over.append((d, demand, int(free), remaining_state, act.get(d, 0)))
+        _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = True
+        if over:
+            d, demand, free, st, ac = over[0]
+            logger.info(
+                "[moe-impl] auto: grouped tuning needs %.1f GiB on %s (free %.1f: state %.1f + "
+                "stacks/transients %.1f + reserve) -- switching this run to %s",
+                demand / 2**30,
+                d,
+                free / 2**30,
+                st / 2**30,
+                ac / 2**30,
+                LINEAR_LOOP_IMPL,
+            )
+            cfg._experts_implementation = LINEAR_LOOP_IMPL
+            if model is not None and getattr(model, "config", None) is not None:
+                model.config._experts_implementation = LINEAR_LOOP_IMPL
+    except Exception as e:  # never break tuning over an advisory auto-pick
+        logger.debug("[moe-impl] auto feasibility check failed (%s); keeping grouped", e)
+
+
 def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge_activation=False, config=None):
     """Bulk-move a whole tune-loop pool onto the device that reads it every iteration.
 
@@ -893,6 +962,14 @@ class SignRoundQuantizer(BaseQuantizer):
         # measured 12.7 GiB loop retention on hy3 from shapes alone. Declined
         # pulls keep the per-batch gather (measured ~1-2 s/block).
         if (getattr(self, "iters", 0) or 0) > 0:
+            _maybe_auto_linear_loop_for_tuning(
+                block,
+                active_inputs,
+                batch_size,
+                self.iters,
+                getattr(getattr(self, "model_context", None), "config", None),
+                getattr(self, "model", None),
+            )
             _entry_dev = str(getattr(block_fwd, "device", device)) if block_fwd is not None else str(device)
             if isinstance(active_inputs, list):
                 active_inputs = _pull_pool_if_fits(
@@ -901,13 +978,18 @@ class SignRoundQuantizer(BaseQuantizer):
                     block,
                     batch_size,
                     self.iters,
-                    "tune] block input activations ",
+                    "tune] block input activations",
                     charge_activation=True,
                     config=getattr(getattr(self, "model_context", None), "config", None),
                 )
             if fp_outputs and loss_device is not None:
                 fp_outputs = _pull_pool_if_fits(
-                    fp_outputs, str(loss_device), block, batch_size, self.iters, "tune] fp reference outputs "
+                    fp_outputs,
+                    str(loss_device),
+                    block,
+                    batch_size,
+                    self.iters,
+                    "tune] fp reference outputs",
                 )
 
         try:
