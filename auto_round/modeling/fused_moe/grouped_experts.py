@@ -822,7 +822,10 @@ def _native_grouped_mm_usable(x: torch.Tensor, weight: torch.Tensor, offsets: to
             return torch.cuda.get_device_capability(weight.device) >= (8, 0)
         except Exception:  # pragma: no cover - defensive
             return False
-    return True
+    # Non-cuda devices (xpu/hpu/cpu): we cannot verify native grouped_mm support
+    # here, and an unsupported F.grouped_mm would raise mid-forward -- degrade
+    # to the sliced/loop fallback instead of gambling on the native path.
+    return False
 
 
 def _native_grouped_mm(x: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:

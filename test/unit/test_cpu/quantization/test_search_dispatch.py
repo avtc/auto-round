@@ -394,3 +394,38 @@ class TestSnapshotRouting(unittest.TestCase):
         block = self._fake_block()
         with self.assertRaisesRegex(RuntimeError, "Invalid device"):
             snapshot_best_params(block, "not-a-device")  # same failure as the historical path
+
+
+class TestNonCudaFamilies(unittest.TestCase):
+    """Non-cuda device coverage: graceful degradation, never a crash."""
+
+    def test_worker_ctx_unknown_and_cpu_keys_run_bare(self):
+        from auto_round.algorithms.quantization.search_dispatch import _device_worker_ctx, _null_ctx
+
+        for key in ["cpu", "bogus-device", "cuda:99"]:  # cuda:99 -> unavailable cuda -> bare
+            ctx = _device_worker_ctx(key)
+            self.assertIsNotNone(ctx)
+
+    def test_run_items_by_device_non_cuda_groups(self):
+        from auto_round.algorithms.quantization.search_dispatch import group_items_by_device, run_items_by_device
+
+        ran = []
+        groups = group_items_by_device(["cpu", "cpu", "meta"], lambda item: item)
+        run_items_by_device(groups, lambda idx, item: ran.append((idx, item)))
+        self.assertEqual(sorted(ran), [(0, "cpu"), (1, "cpu"), (2, "meta")])
+
+    def test_grouped_backstop_degrades_off_cuda(self):
+        import torch
+
+        from auto_round.modeling.fused_moe.grouped_experts import _native_grouped_mm_usable
+
+        x = torch.randn(4, 8)
+        w = torch.randn(2, 8, 8)
+        offs = torch.tensor([2, 4], dtype=torch.int32)
+        # cpu tensors must never gamble on the native path (would raise
+        # mid-forward on families F.grouped_mm does not support); the backstop
+        # is only reached when the transformers helper is unavailable
+        import auto_round.modeling.fused_moe.grouped_experts as ge
+
+        with mock.patch.object(ge, "_transformers_can_use_grouped_mm", None):
+            self.assertFalse(_native_grouped_mm_usable(x, w, offs))

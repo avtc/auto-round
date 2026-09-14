@@ -26,6 +26,7 @@ Searches that depend on activations (e.g. the AWQ clip search) are not
 weight-local and must stay on their serial paths.
 """
 
+import contextlib
 import threading
 import time
 from collections import OrderedDict
@@ -59,6 +60,34 @@ def group_items_by_device(items, device_of, none_key="uncategorized"):
     return groups
 
 
+@contextlib.contextmanager
+def _null_ctx():
+    yield
+
+
+def _device_worker_ctx(key: str):
+    """Launch-context for a worker thread pinned to one accelerator family.
+
+    cuda/xpu workers get the family's device context so ops land on the weight
+    device even when the ambient current device differs; anything else (cpu,
+    unknown families, or a torch build without that context manager) runs
+    bare -- explicit-device ops (``.to(dev)`` / stacked inputs) still land
+    correctly, the context only pins implicit device selection.
+    """
+    try:
+        dev = torch.device(key)
+    except (ValueError, RuntimeError):  # unparsable key: run bare
+        return _null_ctx()
+    if dev.type == "cuda" and torch.cuda.is_available():
+        return torch.cuda.device(dev)
+    if dev.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "device"):
+        try:
+            return torch.xpu.device(dev)
+        except Exception:  # pragma: no cover - defensive
+            return _null_ctx()
+    return _null_ctx()
+
+
 def run_items_by_device(groups, fn, use_cuda_ctx=True):
     """Run ``fn(item)`` for every grouped item, one worker thread per device group.
 
@@ -71,8 +100,9 @@ def run_items_by_device(groups, fn, use_cuda_ctx=True):
         fn: Callable executed as ``fn(index, item)``; must be safe to run
             concurrently across groups (items within one group run serially on
             their worker).
-        use_cuda_ctx: Wrap each cuda worker in ``torch.cuda.device`` so ops land
-            on the weight device even when the ambient current device differs.
+        use_cuda_ctx: Wrap each accelerator worker in its family's device
+            context (cuda/xpu) so ops land on the weight device even when the
+            ambient current device differs; other families run bare.
     """
     if len(groups) <= 1:
         for _idx, item in next(iter(groups.values()), []):
@@ -86,12 +116,7 @@ def run_items_by_device(groups, fn, use_cuda_ctx=True):
     def _worker(device_key, indexed_items):
         try:
             key = str(device_key)
-            need_ctx = use_cuda_ctx and torch.device(key).type == "cuda" and torch.cuda.is_available()
-            if need_ctx:
-                with torch.cuda.device(torch.device(key)):
-                    for _idx, item in indexed_items:
-                        fn(_idx, item)
-            else:
+            with _device_worker_ctx(key) if use_cuda_ctx else _null_ctx():
                 for _idx, item in indexed_items:
                     fn(_idx, item)
         except BaseException as exc:  # noqa: B036 - re-raised below, never swallowed
@@ -131,6 +156,9 @@ def pick_search_worker_devices(working_set_bytes, home_device=None, margin_bytes
     device participates only when it fits like any other candidate; when nothing
     fits, the home device is returned so the caller keeps today's behavior and
     relies on the per-chunk OOM fallback.
+
+    CUDA-only today: the free-memory probe underneath is a cuda API, so
+    non-cuda fleets simply get ``[home_device]`` (no offload, no crash).
     """
     if multigpu_search_disabled():
         return [home_device] if home_device is not None else []

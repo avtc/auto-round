@@ -36,6 +36,10 @@ Policy (user rulings, Sep-13):
 ``calibration_data_device`` parameter (CLI ``--calibration_data_device`` / API
 keyword): ``auto`` (default) | ``off`` | ``cpu`` | explicit csv (``cuda:1,cuda:2``).
 There is deliberately no environment variable for this knob.
+
+CUDA-only today: the free-memory probe underneath is a cuda API, so on other
+accelerator families the resolver returns ``None`` (policy inactive, pools keep
+their today placement) rather than guessing at unprobed capacities.
 """
 
 from typing import Callable, List, Optional, Sequence
