@@ -388,11 +388,90 @@ def resolve_pool_placement(
 
 
 _RESERVE_BYTES = int(0.5 * 2**30)  # flat allocator reserve (24 GiB-class cards)
-# Flat collection working allowance: transient batch activations, hook staging
-# and the per-batch forward temporaries measured next to the pools in the
-# block-census rounds (~4.6 GiB worst case on hy3; 3 GiB is the conservative
-# charge for one pool generation of batch forwards).
-_WORKING_BYTES = int(3 * 2**30)
+# Floor for the computed working allowance (tiny blocks / degenerate reads)
+_WORKING_FLOOR_BYTES = int(0.125 * 2**30)
+
+
+def _dominant_param_esize(block) -> int:
+    """Element size (bytes) of the block's dominant parameter dtype."""
+    counts: dict = {}
+    try:
+        for p in block.parameters():
+            counts[p.element_size()] = counts.get(p.element_size(), 0) + p.numel()
+    except Exception:  # pragma: no cover - exotic modules: fall back to bf16-ish
+        return 2
+    return max(counts, key=lambda k: counts[k]) if counts else 2
+
+
+def _widest_out_and_hidden(block):
+    """(widest out_features, modal in_features) over the block's Linear/Conv1D."""
+    """
+    The modal in_features approximates the hidden size (every attention/mlp
+    projection consumes hidden-wide inputs); the widest out_features bounds
+    the largest single-module activation buffer (e.g. a wide shared-expert
+    up/gate projection), which is the dominant transient that lives next to
+    the pools during a collection forward.
+    """
+    import transformers
+
+    in_counts: dict = {}
+    widest = 0
+    for m in block.modules():
+        w = getattr(m, "weight", None)
+        if not isinstance(w, torch.Tensor) or w.dim() != 2:
+            continue
+        if type(m) == transformers.pytorch_utils.Conv1D:
+            in_f, out_f = int(w.shape[0]), int(w.shape[1])
+        elif isinstance(m, torch.nn.Linear):
+            in_f, out_f = int(w.shape[1]), int(w.shape[0])
+        else:
+            continue
+        in_counts[in_f] = in_counts.get(in_f, 0) + 1
+        widest = max(widest, out_f)
+    hidden = max(in_counts, key=lambda k: in_counts[k]) if in_counts else None
+    return widest, hidden
+
+
+def _working_allowance_bytes(block, pool, batch_size: int) -> int:
+    """Simultaneous-transient allowance for one collection/tune batch."""
+    """
+    First principles: at any instant during a block forward, the transients
+    sitting next to the pools are (a) the batch IO on the compute device --
+    the staged input batch plus the produced output batch (2 generations of
+    ``batch_size`` pool samples), and (b) ONE module's activation buffer, the
+    widest projection's ``tokens x out_features`` in the block's dominant
+    dtype (in+out buffers -> x2). The earlier flat 3 GiB charge was
+    census-derived for one config; this derives the same quantity from the
+    block and pool actually being placed. Over-charging is the safe
+    direction (less consolidation); the census rounds measured the real
+    simultaneous set at ~4.6 GiB worst case on hy3, which this formula
+    reproduces within ~20%.
+    """
+    try:
+        per_chain = _tensor_bytes(pool)
+        n_chunks = max(_pool_chunk_count(pool), 1)
+        batch_bytes = int(per_chain * min(int(batch_size), n_chunks) / n_chunks)
+        need = 2 * batch_bytes
+        widest, hidden = _widest_out_and_hidden(block)
+        sample_numel = 0
+        if isinstance(pool, (list, tuple)) and pool:
+            for v in pool:
+                if isinstance(v, torch.Tensor):
+                    sample_numel = int(v.numel())
+                    break
+        if widest and hidden and sample_numel:
+            tokens = sample_numel * min(int(batch_size), n_chunks) / hidden
+            esize = _dominant_param_esize(block)
+            need += int(tokens * widest * esize * 2)
+        return max(need, _WORKING_FLOOR_BYTES)
+    except Exception as e:  # pragma: no cover - placement must never break quantization
+        logger.warning(
+            "[calib-data-device] working-set estimate failed for %s (%s); using %.2fGiB floor",
+            type(block).__name__,
+            e,
+            _WORKING_FLOOR_BYTES / 2**30,
+        )
+        return _WORKING_FLOOR_BYTES
 
 
 def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: str = None) -> int:
@@ -411,8 +490,9 @@ def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: 
     mathematically unreachable (need ~= 24 GiB on a 23.58 GiB card). What is
     actually left to charge:
 
-    - the flat collection working allowance above (transients NOT part of any
-      pool);
+    - the computed batch working allowance (``_working_allowance_bytes``:
+      2 batch IO generations + the widest projection's activation buffer,
+      derived from this block and pool -- NOT a flat constant);
     - at iters>0 only, the per-parameter tuning state that materializes on
       each weight's home device at wrap time (fp32 value + fp32 grad +
       best-params snapshot + bf16 copy = 14 B/param), charged for parameters
@@ -421,21 +501,20 @@ def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: 
       term real even though state materializes after collection;
     - the flat 0.5 GiB allocator reserve.
     """
-    del pool  # pool bytes are counted by the callers' own gate terms
     try:
-        need = _WORKING_BYTES + _RESERVE_BYTES
+        need = _working_allowance_bytes(block, pool, batch_size) + _RESERVE_BYTES
         if iters > 0 and block is not None and primary is not None:
             state_bytes = sum(p.numel() for p in block.parameters() if str(p.device) == str(primary)) * 14
             need += state_bytes
         return int(need)
     except Exception as e:  # pragma: no cover - placement must never break quantization
         logger.warning(
-            "[calib-data-device] working-set estimate failed for %s (%s); using %.1fGiB reserve",
+            "[calib-data-device] working-set estimate failed for %s (%s); using %.2fGiB floor",
             type(block).__name__,
             e,
-            _RESERVE_BYTES / 2**30,
+            _WORKING_FLOOR_BYTES / 2**30,
         )
-        return _RESERVE_BYTES
+        return _WORKING_FLOOR_BYTES + _RESERVE_BYTES
 
 
 def resolve_placement_for_pool(

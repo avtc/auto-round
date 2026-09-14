@@ -74,28 +74,56 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertEqual(plan.counts(), {"cpu": 128})
 
     def test_need_estimator_first_principles(self):
-        """Need = flat working allowance + reserve; iters>0 adds 14B/param of
-        tuning state for candidate-homed parameters only. Pool bytes are NOT
-        part of the need (the gates count them via their own terms)."""
+        """Need = COMPUTED working allowance (2 batch IO generations + widest
+        projection transient, floor-guarded) + reserve; iters>0 adds 14B/param
+        of tuning state for candidate-homed parameters only. Pool bytes beyond
+        one batch are NOT part of the need (the gates count them separately)."""
         reserve = int(0.5 * 2**30)
-        working = int(3 * 2**30)
-        pool = torch.zeros(64, dtype=torch.float32)  # 256 B -- size must not matter
-        big_pool = torch.zeros(1 << 20, dtype=torch.float32)
-        # no block: working + reserve only; pool size must not change the need
-        need0 = pp.placement_need_bytes(None, pool, 8)
-        self.assertEqual(need0, working + reserve)
-        self.assertEqual(pp.placement_need_bytes(None, big_pool, 8), need0)
-        # iters=0 with a block: same (no tuning state at zero-shot)
-        need0b = pp.placement_need_bytes(object(), pool, 8, iters=0, primary="cuda:0")
-        self.assertEqual(need0b, need0)
+        floor = int(0.125 * 2**30)
+        # block with hidden 4 (modal in_features) and widest out 4
+        m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+        pool = [torch.zeros(8, 4, dtype=torch.float32) for _ in range(2)]  # 2 samples of 32 floats
+        esize = 4  # fp32 params
+        batch_bytes = 2 * 32 * 4 // 2 * 2  # per-chain 256B, batch 2 of 2 -> 256B
+        transient = int((32 * 2 / 4) * 4 * esize * 2)  # tokens=16, widest=4, x2 buffers
+        expected = max(2 * batch_bytes + transient, floor) + reserve
+        need0 = pp.placement_need_bytes(m, pool, 2)
+        self.assertEqual(need0, expected)
+        # iters=0: identical (no tuning state at zero-shot)
+        self.assertEqual(pp.placement_need_bytes(m, pool, 2, iters=0, primary="cuda:0"), need0)
+        # degenerate reads floor-guard: no block, bare-tensor pool
+        self.assertEqual(pp.placement_need_bytes(None, torch.zeros(4), 2), floor + reserve)
         # iters>0: +14 B per candidate-homed parameter; peers' params ignored
-        m = torch.nn.Linear(4, 4)  # 16 weights + 4 bias = 20 params, all on CPU
+        n_params = sum(p.numel() for p in m.parameters())
         dev = str(next(m.parameters()).device)
-        need1 = pp.placement_need_bytes(m, pool, 8, iters=20, primary=dev)
-        self.assertEqual(need1, need0 + 20 * 14)
-        # primary mismatch: parameters are not homed there -> no state charge
-        need2 = pp.placement_need_bytes(m, pool, 8, iters=20, primary="cuda:7")
-        self.assertEqual(need2, need0)
+        self.assertEqual(pp.placement_need_bytes(m, pool, 2, iters=20, primary=dev), need0 + n_params * 14)
+        self.assertEqual(pp.placement_need_bytes(m, pool, 2, iters=20, primary="cuda:7"), need0)
+
+    def test_working_allowance_scales_with_block_and_pool(self):
+        """The allowance is model-derived, not flat: wider projections and
+        bigger batches charge more; tiny blocks sit on the floor."""
+        m_small = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 8))
+        m_wide = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 8), torch.nn.Linear(8, 512))
+        # structural helpers: widest projection + modal hidden detected
+        self.assertEqual(pp._widest_out_and_hidden(m_small), (8, 8))
+        self.assertEqual(pp._widest_out_and_hidden(m_wide), (512, 8))
+        # real-scale case clears the floor: hidden 4096, widest 4096
+        m_big = torch.nn.Sequential(torch.nn.Linear(4096, 4096), torch.nn.Linear(4096, 4096))
+        pool = [torch.zeros(4096, 4096) for _ in range(2)]
+        esize = 4  # fp32 params
+        batch_bytes = 2 * 4096 * 4096 * esize  # per-chain pool = both samples
+        tokens = 4096 * 2
+        transient = int(tokens * 4096 * esize * 2)
+        self.assertEqual(
+            pp._working_allowance_bytes(m_big, pool, 2), max(2 * batch_bytes + transient, pp._WORKING_FLOOR_BYTES)
+        )
+        # half batch: smaller IO + transient terms
+        pool4 = [torch.zeros(4096, 4096) for _ in range(4)]
+        half = pp._working_allowance_bytes(m_big, pool4, 2)
+        full = pp._working_allowance_bytes(m_big, pool4, 4)
+        self.assertGreater(full, half)
+        # tiny block: floor
+        self.assertEqual(pp._working_allowance_bytes(None, [torch.zeros(2)], 1), pp._WORKING_FLOOR_BYTES)
 
     def test_consumer_retargets_single_away_from_cache_primary(self):
         """iters>0: the tune consumer (not the cache primary) is the
