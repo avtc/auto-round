@@ -354,26 +354,51 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
     requested = str(getattr(_envs_mod, "AR_MOE_EXPERTS_IMPL", "auto") or "auto").lower()
     if requested not in ("", "auto"):
         _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = True  # explicit choice governs
+        logger.debug("[moe-impl] auto check skipped: explicit AR_MOE_EXPERTS_IMPL=%s", requested)
         return
-    cfg = config if config is not None else getattr(model, "config", None)
-    if cfg is None or str(getattr(cfg, "_experts_implementation", "")) != GROUPED_LINEAR_IMPL:
+    # The dispatch reads the MODEL's config; model_context.config may be a
+    # separate object that never received _experts_implementation (the exact
+    # silent no-op the 4x3090 lane exposed). Prefer whichever candidate
+    # actually carries the attr; switch ALL of them when we switch.
+    candidates = [c for c in (config, getattr(model, "config", None)) if c is not None]
+    cfg = next((c for c in candidates if getattr(c, "_experts_implementation", None)), None)
+    impl = str(getattr(cfg, "_experts_implementation", GROUPED_LINEAR_IMPL)) if cfg is not None else GROUPED_LINEAR_IMPL
+    if impl != GROUPED_LINEAR_IMPL:
+        logger.debug("[moe-impl] auto check skipped: current impl is %s (not grouped)", impl)
         return
     try:
         state = _state_bytes_by_device(block) or {}
         if not state:
+            logger.debug("[moe-impl] auto check skipped: no per-device tuning state resolved")
             return
         act = _activation_bytes_by_device(block, tensors, batch_size, cfg) or {}
         if not any(_grouped_stack_bytes(block, d) > 0 for d in state):
-            return  # no grouped stacks homed here: not the decision point yet
+            # dense block, loop impl already, or no experts homed: not the
+            # decision point yet -- retry on the next block
+            logger.debug("[moe-impl] auto check deferred: no grouped stacks homed on any state device")
+            return
         over = []
+        max_ratio_dev, max_ratio = None, -1.0
         for d, state_bytes in state.items():
             # values (4 B/param) are already inside the probed free here;
             # charge the remaining grads+snapshot+bf16 of the 14 B layout
             remaining_state = state_bytes * 10 // 14
             demand = remaining_state + act.get(d, 0) + _RESERVE_BYTES
             free = probe_usable_bytes(d)
-            if free is not None and demand > int(free):
-                over.append((d, demand, int(free), remaining_state, act.get(d, 0)))
+            logger.debug(
+                "[moe-impl] auto check %s: demand %.2f GiB (state %.2f + act %.2f + reserve) vs free %.2f GiB",
+                d,
+                demand / 2**30,
+                remaining_state / 2**30,
+                act.get(d, 0) / 2**30,
+                -1.0 if free is None else free / 2**30,
+            )
+            if free is not None:
+                ratio = demand / max(int(free), 1)
+                if ratio > max_ratio:
+                    max_ratio, max_ratio_dev = ratio, d
+                if demand > int(free):
+                    over.append((d, demand, int(free), remaining_state, act.get(d, 0)))
         _MOE_IMPL_AUTO_LINEAR_LOOP_DONE = True
         if over:
             d, demand, free, st, ac = over[0]
@@ -387,9 +412,14 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
                 ac / 2**30,
                 LINEAR_LOOP_IMPL,
             )
-            cfg._experts_implementation = LINEAR_LOOP_IMPL
-            if model is not None and getattr(model, "config", None) is not None:
-                model.config._experts_implementation = LINEAR_LOOP_IMPL
+            for c in candidates:
+                c._experts_implementation = LINEAR_LOOP_IMPL
+        elif max_ratio_dev is not None:
+            logger.debug(
+                "[moe-impl] auto: grouped fits (max demand/free ratio %.2f on %s)",
+                max_ratio,
+                max_ratio_dev,
+            )
     except Exception as e:  # never break tuning over an advisory auto-pick
         logger.debug("[moe-impl] auto feasibility check failed (%s); keeping grouped", e)
 

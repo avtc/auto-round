@@ -41,9 +41,7 @@ class TestAutoLinearLoop(unittest.TestCase):
                 with mock.patch.object(q, "_activation_bytes_by_device", return_value=self.act):
                     with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1 if stacks else 0):
                         with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
-                            q._maybe_auto_linear_loop_for_tuning(
-                                object(), [object()], 8, iters, self.cfg, None
-                            )
+                            q._maybe_auto_linear_loop_for_tuning(object(), [object()], 8, iters, self.cfg, None)
 
     def test_over_lane_switches_before_the_loop(self):
         # demand on cuda:1 = 14*10/14 + 12 + 0.25 = 22.25 GiB > free 16
@@ -66,6 +64,25 @@ class TestAutoLinearLoop(unittest.TestCase):
     def test_iters0_untouched(self):
         self._run(iters=0)
         self.assertEqual(self.cfg._experts_implementation, "linear_grouped")
+
+    def test_model_context_config_without_impl_attr_still_decides(self):
+        # server regression: model_context.config never received
+        # _experts_implementation (prepare writes it on model.config); the
+        # old single-candidate read silently returned and the 4x3090 lane
+        # never switched. The check must fall through to model.config, and
+        # a switch must update BOTH config objects.
+        ctx_cfg = type("CtxCfg", (), {})()  # no _experts_implementation attr
+        model = type("M", (), {})()
+        model.config = self.cfg
+        q = self.q
+        with _envs_auto():
+            with mock.patch("auto_round.utils.pool_placement._state_bytes_by_device", return_value=self.state):
+                with mock.patch.object(q, "_activation_bytes_by_device", return_value=self.act):
+                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1):
+                        with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
+                            q._maybe_auto_linear_loop_for_tuning(object(), [object()], 8, 20, ctx_cfg, model)
+        self.assertEqual(self.cfg._experts_implementation, "linear_loop")
+        self.assertEqual(ctx_cfg._experts_implementation, "linear_loop")
 
     def test_dense_block_no_stacks_no_decision(self):
         # no grouped stacks homed: not the decision point, flag stays unset
