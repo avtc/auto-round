@@ -795,8 +795,11 @@ def _allocate_layers_to_devices(
         strict=True returns None when no device has budget left (used by the
         atomic-group allocator, which must fail loudly instead of overcommitting).
         """
-        # Phase 1: Direct assign largest layers to higher-index devices first
-        if layer_idx < num_devices - 1:
+        # Phase 1: Direct assign largest layers to higher-index devices first.
+        # Skipped under strict: the atomic allocator's fail-loudly contract must
+        # hold for the LARGEST units too, and this shortcut assigns the first
+        # num_devices-1 units to fixed devices without any budget check.
+        if layer_idx < num_devices - 1 and not strict:
             return gpu_devices[-(layer_idx + 1)]
 
         # Phase 2: Choose device with best score (memory + continuity)

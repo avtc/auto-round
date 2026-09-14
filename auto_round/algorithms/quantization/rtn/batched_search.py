@@ -265,13 +265,22 @@ def run_batched_rtn_search(model, staged, max_batch=None):
         for i, e in enumerate(chunk):
             res = qdq[i]
             w = e["w"]
-            # mirror the serial _qdq_weight tail: cast back to the stored dtype
-            # and restore the HF Conv1D [in, out] layout (staging transposed it)
+            # mirror the serial _qdq_weight output contract: cast back to the
+            # stored dtype and restore the HF Conv1D [in, out] layout (staging
+            # transposed it)
             res = res.to(w.orig_layer.weight.dtype)
             if type(w.orig_layer) == transformers.pytorch_utils.Conv1D:
                 res = res.t()
-            w._apply_qdq(res, scale_parts[i], zp_parts[i])
-            set_module(model, e["name"], w.orig_layer)
+            # route the write-back through unwrapper({}) with the precomputed
+            # search result injected: _apply_qdq alone would skip the
+            # unwrapper tail (bias/meta update, static-act rescale, act
+            # metadata, WrapperWALayer attachment) and leave act-quantized
+            # layers (act_bits <= 8) silently inconsistent with the serial
+            # path. The injection short-circuits _qdq_weight's recompute, and
+            # no compiled weight_quant_func runs here, so no dynamo race.
+            w._presolved_qdq = (res, scale_parts[i], zp_parts[i])
+            layer = w.unwrapper({})
+            set_module(model, e["name"], layer)
 
     if len(buckets) > 1:
         keyed = OrderedDict()

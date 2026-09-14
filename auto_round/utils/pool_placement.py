@@ -227,11 +227,15 @@ def consolidate_pool_onto(objs, target: str, block, batch_size: int, reserved_by
     """
     if not str(target).startswith("cuda"):
         return "spread"
-    if any(isinstance(o, tuple) for o in objs if o is not None):
-        # a top-level tuple pool cannot be moved in place (the move helper
-        # returns a NEW tuple for those; reassigning the caller's list would
-        # not rebind the caller's own references) -- leave it and say so
-        logger.warning("[calib-data-device] top-level tuple pool cannot be consolidated in place; leaving it")
+    if any(isinstance(o, (tuple, torch.Tensor)) for o in objs if o is not None):
+        # a top-level tuple or bare-tensor pool cannot be moved in place (the
+        # move helper returns a NEW object for those; reassigning the caller's
+        # list would not rebind the caller's own references) -- leave it and
+        # say so rather than reporting a phantom consolidation
+        logger.warning(
+            "[calib-data-device] top-level %s pool cannot be consolidated in place; leaving it",
+            "tuple" if any(isinstance(o, tuple) for o in objs if o is not None) else "tensor",
+        )
         return "spread"
     from auto_round.utils.device import probe_usable_bytes
 

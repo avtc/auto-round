@@ -345,6 +345,15 @@ class WrapperLinear(torch.nn.Module):
         Returns:
             tuple: Quantized weight, scale, and zero point.
         """
+        presolved = getattr(self, "_presolved_qdq", None)
+        if presolved is not None:
+            # Batched-search write-back: the search already ran on a stacked
+            # tensor; skip the recompute but keep everything downstream of this
+            # method (write-back conventions + the full unwrapper tail --
+            # bias/meta/update, static-act rescale, WrapperWALayer attachment)
+            # identical to the serial path.
+            self._presolved_qdq = None
+            return presolved
         if self.orig_layer.bits >= 16:
             return self.orig_layer.weight, None, None
         min_bound, max_bound = self.minmax_scale_bound

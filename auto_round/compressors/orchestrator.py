@@ -420,10 +420,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # from the summary during the single-line refactor; true block walls
                 # (inter-finish deltas) showed a ~54s unmeasured gap in the
                 # atomic-placement era -- reload is the prime suspect, now visible.
-                if _perf:
-                    logger.info("[perf] block %s reload-phase=%.2fs", n, _t_reload_mark - _t_reload_start)
-
                 block_name_or_names = n if nblocks == 1 else names
+                if _perf:
+                    logger.info(
+                        "[perf] block %s reload-phase=%.2fs", block_name_or_names, _t_reload_mark - _t_reload_start
+                    )
 
                 # ── Infrastructure: materialize, dtype convert, device placement ──
                 materialize_model_(m)
@@ -672,7 +673,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                         logger.warning("attach phase accounting unavailable (%s)", e)
                     logger.info(
                         "[perf] block %s phases: %s total=%.2fs%s%s",
-                        n,
+                        block_name_or_names,
                         " ".join(_parts),
                         _marks["post.write"] - _marks["reload"],
                         _pack_note,
@@ -680,9 +681,20 @@ class CompressionOrchestrator(BaseOrchestrator):
                     )
         finally:
             # join the background writers even when a block raises: a daemon killed
-            # mid torch.save would leave a truncated shard file behind
-            _bg_writer.join()
-            _bg_resume.join()
+            # mid torch.save would leave a truncated shard file behind. join()
+            # re-raises the worker's captured exception, so each join is itself
+            # guarded -- a writer failure must not skip the resume writer's join.
+            _join_err = None
+            for _bg in (_bg_writer, _bg_resume):
+                try:
+                    _bg.join()
+                except BaseException as _e:  # noqa: BLE001 - re-raised below
+                    if _join_err is None:
+                        _join_err = _e
+                    else:
+                        logger.error("[bg-writer] %r also failed during join", _e)
+            if _join_err is not None:
+                raise _join_err
         if pbar is not None:
             pbar.update(1)
 

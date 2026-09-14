@@ -601,6 +601,52 @@ class TestBatchedRtnSearchParity(unittest.TestCase):
     def test_parity_asym_with_imatrix(self):
         self._run(sym=False, with_imatrix=True)
 
+    def test_parity_act_quant_runs_full_unwrapper_tail(self):
+        """Regression (review R4-3): the stacked write-back used _apply_qdq +
+        attach(orig_layer), skipping the unwrapper tail -- act-quantized layers
+        (act_bits <= 8, W4A8/W4A4) silently lost WrapperWALayer and the act
+        metadata the serial and singleton paths attach."""
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.rtn.batched_search import run_batched_rtn_search
+        from auto_round.wrapper import WrapperWALayer
+
+        def _act_layer(seed):
+            layer = self._layer(seed)
+            layer.act_bits = 8  # enables the act tail in unwrapper
+            layer.act_data_type = "int"
+            layer.act_sym = False
+            layer.act_dynamic = False  # static act: the tail computes act_scale
+            layer.act_group_size = -1
+            return layer
+
+        # serial arm: the full tail attaches a WrapperWALayer
+        with torch.no_grad():
+            w = self._make_wrapper(_act_layer(0))
+            serial_out = w.unwrapper({})
+        self.assertIsInstance(serial_out, WrapperWALayer)
+
+        # batched arm: same module type + act metadata + bit-identical weights
+        model = nn.Module()
+        staged = []
+        for i in range(3):
+            layer = _act_layer(seed=i)
+            setattr(model, f"l{i}", layer)
+            staged.append((f"l{i}", self._make_wrapper(layer)))
+        run_batched_rtn_search(model, staged)
+        for i in range(3):
+            got = getattr(model, f"l{i}")
+            self.assertIsInstance(got, WrapperWALayer, f"module {i} lost the act wrapper")
+            self.assertIsNotNone(getattr(got, "act_quant_func", None), f"module {i} missing act_quant_func")
+            # the tail sets static-act attrs on the wrapped orig layer
+            self.assertTrue(hasattr(got.orig_layer, "act_scale"), f"module {i} missing act_scale")
+            self.assertIsNotNone(getattr(got.orig_layer, "scale", None), f"module {i} missing weight scale")
+        ref_w = None
+        with torch.no_grad():
+            w_ref = self._make_wrapper(_act_layer(0))
+            ref_w = w_ref.unwrapper({}).weight.data.clone()
+        self.assertTrue(torch.equal(getattr(model, "l0").weight.data, ref_w))
+
     def _conv1d_layer(self, seed, nf, nx):
         from transformers.pytorch_utils import Conv1D
 
