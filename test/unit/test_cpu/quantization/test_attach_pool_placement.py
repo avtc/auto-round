@@ -84,9 +84,12 @@ class TestAttachPoolPlacement(unittest.TestCase):
         self.assertTrue(set(runner.pool_placement.devices) <= {"cuda:1"})
 
     def test_iters_gt0_consumer_retargets_outputs(self):
-        """iters>0: the output plan consumer is the runner's (loss) device; at
-        iters=0 or single-device lanes the consumer stays unset."""
-        cls, self_, runner = _fake_orchestrator(cache_device="cuda:0", mode="auto", iters=20, runner_device="cuda:1")
+        """iters>0: the output plan consumer is the block quantizer's per-block
+        loss device (falling back to the runner device); at iters=0 or
+        single-device lanes the consumer stays unset."""
+        # loss device set on the quantizer wins over the runner device
+        cls, self_, runner = _fake_orchestrator(cache_device="cuda:0", mode="auto", iters=20, runner_device="cuda:0")
+        self_.alg_composer.block_quantizer._loss_device = "cuda:1"
         with mock.patch(
             "auto_round.utils.pool_placement.resolve_placement_for_pool", return_value=None
         ) as resolve, mock.patch("auto_round.utils.pool_placement.consolidate_pool_onto"):
@@ -94,8 +97,14 @@ class TestAttachPoolPlacement(unittest.TestCase):
         self.assertEqual(resolve.call_args.kwargs.get("consumer"), "cuda:1")
         self.assertEqual(resolve.call_args.kwargs.get("mode"), "auto")
 
+        # quantizer without a loss device: runner device fallback (== primary
+        # on real multi-GPU lanes, so the retarget stays unset there)
+        cls, self_, runner = _fake_orchestrator(cache_device="cuda:0", mode="auto", iters=20, runner_device="cuda:1")
+        self.assertEqual(resolve.call_args.kwargs.get("consumer"), "cuda:1")
+
         # iters=0: no tune loop, outputs follow the cache primary as before
         cls, self_, runner = _fake_orchestrator(cache_device="cuda:0", mode="auto", iters=0, runner_device="cuda:1")
+        self_.alg_composer.block_quantizer._loss_device = "cuda:1"
         with mock.patch(
             "auto_round.utils.pool_placement.resolve_placement_for_pool", return_value=None
         ) as resolve, mock.patch("auto_round.utils.pool_placement.consolidate_pool_onto"):
