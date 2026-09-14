@@ -558,7 +558,18 @@ class SignRoundQuantizer(BaseQuantizer):
                 except Exception as e:  # pragma: no cover - diagnostics only
                     logger.warning("[tune] free-memory probe failed for %s (%s); keeping pool sharded", _ld, e)
                     _free = None
-                if _free is not None and _free - (4 << 30) >= _pool_b:
+                # the reserve is the computed per-block working allowance
+                # (batch IO + widest-projection transient + allocator reserve
+                # + this device's iters>0 tuning state), not a flat constant:
+                # the same gate class as the pool-placement need model
+                try:
+                    from auto_round.utils.pool_placement import placement_need_bytes
+
+                    _reserve = placement_need_bytes(block, fp_outputs, batch_size, iters=self.iters, primary=str(_ld))
+                except Exception as e:  # pragma: no cover - gate must never break tuning
+                    logger.warning("[tune] working-set estimate failed (%s); using flat 4GiB reserve", e)
+                    _reserve = 4 << 30
+                if _free is not None and _free - _reserve >= _pool_b:
                     fp_outputs = [t.to(_ld) for t in fp_outputs]
                     logger.debug(
                         "[tune] reference pool pulled to %s (%.2f GiB, free %.2f GiB)",
@@ -568,8 +579,9 @@ class SignRoundQuantizer(BaseQuantizer):
                     )
                 elif _free is not None:
                     logger.debug(
-                        "[tune] reference pool stays sharded (pool %.2f GiB + reserve vs free %.2f GiB on %s)",
+                        "[tune] reference pool stays sharded (pool %.2f GiB + reserve %.2f GiB vs free %.2f GiB on %s)",
                         _pool_b / 2**30,
+                        _reserve / 2**30,
                         _free / 2**30,
                         _ld,
                     )

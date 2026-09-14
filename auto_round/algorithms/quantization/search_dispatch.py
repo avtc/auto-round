@@ -305,7 +305,7 @@ def _batch_cap(group, device_key, max_batch):
     return max(1, min(probe_cap, elem_cap))
 
 
-def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget=4 * 2**30):
+def run_batched_wrap_search(deferred_wrappers, max_batch=None):
     """Run deferred weight-local wrap searches on stacked same-shape batches.
 
     Wrappers stage ``(weight_reshape, data_type, bits, imatrix, q_scale_thresh,
@@ -324,7 +324,6 @@ def run_batched_wrap_search(deferred_wrappers, max_batch=None, batch_vram_budget
     Returns True when the inputs were consumed; False when batching is disabled
     by AR_DISABLE_BATCHED_SEARCH (the caller then runs the searches per module).
     """
-    del batch_vram_budget  # budget derived per device in _batch_cap
     if batched_search_disabled():
         return False
     if not deferred_wrappers:
