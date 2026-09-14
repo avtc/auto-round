@@ -74,17 +74,21 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertEqual(plan.counts(), {"cpu": 128})
 
     def test_need_estimator_first_principles(self):
-        """Need = 2x pool (window-2 fp32 retention) + reserve; iters>0 adds
-        14B/param of tuning state for primary-homed parameters only."""
+        """Need = flat working allowance + reserve; iters>0 adds 14B/param of
+        tuning state for candidate-homed parameters only. Pool bytes are NOT
+        part of the need (the gates count them via their own terms)."""
         reserve = int(0.5 * 2**30)
-        pool = torch.zeros(64, dtype=torch.float32)  # 256 B
-        # no block: window + reserve only
+        working = int(3 * 2**30)
+        pool = torch.zeros(64, dtype=torch.float32)  # 256 B -- size must not matter
+        big_pool = torch.zeros(1 << 20, dtype=torch.float32)
+        # no block: working + reserve only; pool size must not change the need
         need0 = pp.placement_need_bytes(None, pool, 8)
-        self.assertEqual(need0, 2 * pool.numel() * 4 + reserve)
+        self.assertEqual(need0, working + reserve)
+        self.assertEqual(pp.placement_need_bytes(None, big_pool, 8), need0)
         # iters=0 with a block: same (no tuning state at zero-shot)
         need0b = pp.placement_need_bytes(object(), pool, 8, iters=0, primary="cuda:0")
         self.assertEqual(need0b, need0)
-        # iters>0: +14 B per primary-homed parameter; peers' params ignored
+        # iters>0: +14 B per candidate-homed parameter; peers' params ignored
         m = torch.nn.Linear(4, 4)  # 16 weights + 4 bias = 20 params, all on CPU
         dev = str(next(m.parameters()).device)
         need1 = pp.placement_need_bytes(m, pool, 8, iters=20, primary=dev)
@@ -92,6 +96,89 @@ class TestResolvePoolPlacement(unittest.TestCase):
         # primary mismatch: parameters are not homed there -> no state charge
         need2 = pp.placement_need_bytes(m, pool, 8, iters=20, primary="cuda:7")
         self.assertEqual(need2, need0)
+
+    def test_consumer_retargets_single_away_from_cache_primary(self):
+        """iters>0: the tune consumer (not the cache primary) is the
+        single-device target; the primary demotes to a plain peer."""
+        plan = pp.resolve_pool_placement(
+            8 * self.GB,
+            128,
+            "cuda:0",
+            int(3.5 * self.GB),
+            ["cuda:0", "cuda:1", "cuda:2"],
+            _fake_probe({"cuda:0": 20 * self.GB, "cuda:1": 12 * self.GB, "cuda:2": 11 * self.GB}),
+            consumer="cuda:1",
+        )
+        self.assertEqual(plan.devices, ["cuda:1"])  # 12 - 3.5 >= 8 fits on the consumer
+
+    def test_consumer_needs_headroom_like_the_primary_did(self):
+        """The consumer is charged the working-set need: no room -> spread
+        (with the consumer need-charged, the primary NOT charged)."""
+        plan = pp.resolve_pool_placement(
+            8 * self.GB,
+            128,
+            "cuda:0",
+            int(10 * self.GB),  # consumer cannot host the pool beside its need
+            ["cuda:0", "cuda:1", "cuda:2"],
+            _fake_probe({"cuda:0": 20 * self.GB, "cuda:1": 12 * self.GB, "cuda:2": 11 * self.GB}),
+            consumer="cuda:1",
+        )
+        counts = plan.counts()
+        # need-floor: the consumer's capacity floors at ~zero, so it gets the
+        # smallest share while the primary (now an uncharged peer) leads
+        self.assertLess(counts.get("cuda:1", 0), counts.get("cuda:0", 0))
+        self.assertLessEqual(counts.get("cuda:1", 0), counts.get("cuda:2", 0))
+
+    def test_occupied_incoming_pool_blocks_fake_single_fit(self):
+        """The single-device gate must count pool bytes already resident on the
+        candidate -- without it the plan alternates single/spread across blocks
+        (a single plan loads the device, the next resolve sees less free)."""
+        base = {"cuda:0": 20 * self.GB, "cuda:1": 13 * self.GB, "cuda:2": 11 * self.GB}
+        need = int(3.5 * self.GB)
+        pool = 8 * self.GB
+        free_fit = 13 * self.GB  # 13 - 3.5 >= 8: would look like a fit...
+        with_occupied = pp.resolve_pool_placement(
+            pool, 128, "cuda:0", need, ["cuda:0", "cuda:1", "cuda:2"], _fake_probe(base), consumer="cuda:1"
+        )
+        self.assertEqual(with_occupied.devices, ["cuda:1"])
+        # ...until the incoming input pool (already on the consumer) is charged
+        blocked = pp.resolve_pool_placement(
+            pool,
+            128,
+            "cuda:0",
+            need,
+            ["cuda:0", "cuda:1", "cuda:2"],
+            _fake_probe(base),
+            consumer="cuda:1",
+            occupied_bytes=free_fit - 0,  # charge the resident 13 GiB fully
+        )
+        # 13 - 3.5 - 13 < 8: single vetoed, consumer capacity floored
+        counts = blocked.counts()
+        self.assertLessEqual(counts.get("cuda:1", 0), counts.get("cuda:2", 0))
+        self.assertLess(counts.get("cuda:1", 0), counts.get("cuda:0", 0))
+
+    def test_degenerate_consumer_falls_back_to_primary(self):
+        """consumer == primary or non-cuda consumer: primary-first as before."""
+        plan = pp.resolve_pool_placement(
+            8 * self.GB,
+            128,
+            "cuda:0",
+            int(3.5 * self.GB),
+            ["cuda:0", "cuda:1"],
+            _fake_probe({"cuda:0": 12 * self.GB, "cuda:1": 12 * self.GB}),
+            consumer="cuda:0",  # same as primary
+        )
+        self.assertEqual(plan.devices, ["cuda:0"])
+        plan2 = pp.resolve_pool_placement(
+            8 * self.GB,
+            128,
+            "cuda:0",
+            int(3.5 * self.GB),
+            ["cuda:0", "cuda:1"],
+            _fake_probe({"cuda:0": 12 * self.GB, "cuda:1": 12 * self.GB}),
+            consumer="cpu",  # non-cuda: ignored
+        )
+        self.assertEqual(plan2.devices, ["cuda:0"])
 
     def test_huge_moe_need_still_shards_onto_peers(self):
         """Regression: the need constrains the primary alone, never the fleet.
@@ -257,6 +344,33 @@ class TestConsolidate(unittest.TestCase):
             ) as mv:
                 self.assertEqual(pp.consolidate_pool_onto([pool], "cuda:0", object(), 8), "spread")
         mv.assert_not_called()
+
+    def test_consolidation_reachable_under_first_principles_need(self):
+        """Regression: the old 2x-pool need made attach-time consolidation
+        mathematically unreachable (need ~= 2x pool + reserve always exceeded
+        any free next to the pools it was gating). With pools counted by the
+        gate's own terms, a genuine fit consolidates again."""
+        GBi = 2**30
+        pool = [torch.zeros(1) for _ in range(4)]
+        # 4 GiB of pool tensors, 8 GiB free on the target cuda:0,
+        # need 3.5 GiB (working + reserve)
+        with mock.patch.object(pp, "_tensor_bytes", return_value=4 * GBi), mock.patch.object(
+            pp, "_move_pool_to"
+        ) as mv, mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=8 * GBi), mock.patch.object(
+            pp, "placement_need_bytes", return_value=int(3.5 * GBi)
+        ):
+            self.assertEqual(pp.consolidate_pool_onto([pool], "cuda:0", object(), 8), "consolidated")
+        mv.assert_called()
+        # genuinely tight: free - need < pool -> spread, never moved
+        with mock.patch.object(pp, "_tensor_bytes", return_value=4 * GBi), mock.patch.object(
+            pp, "_move_pool_to"
+        ) as mv2, mock.patch(
+            "auto_round.utils.device.probe_usable_bytes", return_value=int(7 * GBi)
+        ), mock.patch.object(
+            pp, "placement_need_bytes", return_value=int(3.5 * GBi)
+        ):
+            self.assertEqual(pp.consolidate_pool_onto([pool], "cuda:0", object(), 8), "spread")
+        mv2.assert_not_called()
 
     def test_non_cuda_target_spread(self):
         self.assertEqual(pp.consolidate_pool_onto([[torch.zeros(1)]], "cpu", object(), 8), "spread")

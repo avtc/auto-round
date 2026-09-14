@@ -243,6 +243,17 @@ class CompressionOrchestrator(BaseOrchestrator):
             primary = str(self.compress_context.cache_device)
             mode = getattr(self.compress_context, "calibration_data_device", "auto")
             _iters = int(getattr(getattr(self.alg_composer, "block_quantizer", None), "iters", 0) or 0)
+            # iters>0 lane: the tune loop consumes outputs on the runner's
+            # device (the loss device; card_0_in_high_risk deflects it off the
+            # cache primary on multi-GPU MoE lanes) -- prefer that device for
+            # the output pool so the fp-reference bulk pull becomes a no-op
+            # and the primary stops accumulating pool chunks
+            _consumer = str(getattr(runner, "device", primary))
+            _consumer = (
+                _consumer
+                if _iters > 0 and _consumer != primary and _consumer.startswith("cuda") and primary.startswith("cuda")
+                else None
+            )
             _ta = _time.perf_counter()
             placement = resolve_placement_for_pool(
                 input_ids,
@@ -251,7 +262,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 device_manager.device_list,
                 block=block,
                 batch_size=self.calibration_context.batch_size,
+                mode=mode,
                 iters=_iters,
+                consumer=_consumer,
             )
 
             ATTACH_PHASES["resolve"] += _time.perf_counter() - _ta

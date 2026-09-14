@@ -276,12 +276,25 @@ def resolve_pool_placement(
     candidate_devices: Sequence[str],
     free_probe: Callable[[str], Optional[int]],
     mode: str = "auto",
+    consumer: Optional[str] = None,
+    occupied_bytes: int = 0,
 ) -> Optional[PoolPlacement]:
     """Decide per-chunk output placement for a calibration pool.
 
-    ``need_bytes`` is the primary's own forward working-set demand (estimated
+    ``need_bytes`` is the candidate's own forward working-set demand (estimated
     per block via :func:`placement_need_bytes`); the pool must fit in
-    ``free(primary) - need_bytes`` to stay primary-resident.
+    ``free(candidate) - need_bytes`` to stay single-device-resident.
+
+    ``consumer`` (iters>0 lane) retargets the single-device preference from the
+    cache primary to the block's tune consumer (loss/compute device): the fp
+    reference pool is bulk-pulled there anyway, so outputs born on the consumer
+    make that pull a no-op and keep the primary free of pool traffic. The cache
+    primary then participates as a plain peer (no working-set charge).
+
+    ``occupied_bytes`` counts pool bytes that ALREADY sit on the candidate
+    (this block's incoming input pool) against its single-device budget; without
+    it the gate alternates -- one block's single plan loads the device, the next
+    block's resolve sees less free and spreads, the next one singles again.
 
     Returns ``None`` when the caller should keep today's behavior (policy off,
     CPU-parked lane, or sharding cannot hold the pool -- the genuine OOM then
@@ -299,9 +312,21 @@ def resolve_pool_placement(
     if mode not in ("", "auto"):
         forced = [d.strip() for d in mode.split(",") if d.strip()]
 
+    consumer = str(consumer) if consumer is not None else None
+    if consumer is not None and (consumer == str(primary) or not consumer.startswith("cuda")):
+        consumer = None  # degenerate target: fall back to primary-first
     candidates: List[str] = []
     if forced is not None:
         candidates = forced
+    elif consumer is not None:
+        # consumer-first: the cache primary demotes to a plain peer
+        seen = {consumer}
+        candidates = [consumer]
+        for d in [str(primary)] + [str(x) for x in candidate_devices]:
+            if d.startswith("cpu") or d in seen:
+                continue
+            seen.add(d)
+            candidates.append(d)
     else:
         seen = {str(primary)}
         candidates = [str(primary)]
@@ -326,17 +351,19 @@ def resolve_pool_placement(
         logger.debug("[calib-data-device] resolve: none (no usable device among %s)", candidates)
         return None
 
-    primary_free = dict(usable).get(str(primary), 0)
-    if primary_free - need_bytes >= pool_bytes:
-        # primary-first: identical to today's behavior, zero peer traffic
-        return PoolPlacement([str(primary)], [max(primary_free - need_bytes, 1)], n_chunks)
+    eff = consumer if consumer is not None else str(primary)
+    primary_free = dict(usable).get(eff, 0)
+    if primary_free - need_bytes - occupied_bytes >= pool_bytes:
+        # single-device-first: identical to today's behavior, zero peer traffic
+        return PoolPlacement([eff], [max(primary_free - need_bytes - occupied_bytes, 1)], n_chunks)
 
-    # Capacity-aware sharding: the working-set need constrains the PRIMARY
-    # only (that is where tuning compute runs); peers hosting pool chunks pay
+    # Capacity-aware sharding: the working-set need (and the incoming pool
+    # bytes already resident there) constrain the SINGLE-DEVICE CANDIDATE only
+    # (that is where tuning compute runs); peers hosting pool chunks pay
     # nothing for it. Charging it against the whole fleet made every MoE
     # block's need (hundreds of GiB under the x7 expert multiplier) veto all
     # sharding, which parked the pools on the busiest device (block-3 OOM).
-    capacities = [max(f - need_bytes, 1) if d == str(primary) else f for d, f in usable]
+    capacities = [max(f - need_bytes - occupied_bytes, 1) if d == eff else f for d, f in usable]
     shardable = sum(capacities)
     if shardable < pool_bytes:
         logger.debug(
@@ -353,28 +380,42 @@ def resolve_pool_placement(
 
 
 _RESERVE_BYTES = int(0.5 * 2**30)  # flat allocator reserve (24 GiB-class cards)
+# Flat collection working allowance: transient batch activations, hook staging
+# and the per-batch forward temporaries measured next to the pools in the
+# block-census rounds (~4.6 GiB worst case on hy3; 3 GiB is the conservative
+# charge for one pool generation of batch forwards).
+_WORKING_BYTES = int(3 * 2**30)
 
 
 def placement_need_bytes(block, pool, batch_size: int, iters: int = 0, primary: str = None) -> int:
-    """Primary working-set need for the placement gate, from first principles.
+    """Candidate-device working-set need for the placement gates, first principles.
 
     The earlier port reused ``estimate_tuning_block_mem`` (mapped-placement
     card-0 accounting), whose MoE term prices a hy3 block at ~343GiB: every
     module's batch activation counted with a x2 grad multiplier stacked with
     the x6 routing fudge, all assumed simultaneously live. That vetoed every
-    primary residency for every MoE block. This instead budgets what the gate
-    actually guards:
+    primary residency for every MoE block. An intermediate model additionally
+    charged ``2 * pool bytes`` as a "window-2 retention" term -- but the census
+    rounds later showed that retention IS the in+out pool pair itself, which
+    the gates already count explicitly (``total`` + ``reserved_bytes`` in the
+    consolidation gate, ``pool_bytes`` + ``occupied_bytes`` in the resolve
+    gate), so the term double-counted and made attach-time consolidation
+    mathematically unreachable (need ~= 24 GiB on a 23.58 GiB card). What is
+    actually left to charge:
 
-    - the fp32 forward retention window: ~2 pool generations observed as the
-      window-2 chain retention in the block-3 census (``2 * pool bytes``);
+    - the flat collection working allowance above (transients NOT part of any
+      pool);
     - at iters>0 only, the per-parameter tuning state that materializes on
-      each weight's home device (fp32 value + fp32 grad + best-params
-      snapshot + bf16 copy = 14 B/param), charged for parameters homed on
-      the primary alone -- peers host their own state and pay nothing;
+      each weight's home device at wrap time (fp32 value + fp32 grad +
+      best-params snapshot + bf16 copy = 14 B/param), charged for parameters
+      homed on the candidate device alone -- peers host their own state and
+      pay nothing. Wrap-phase coexistence (pools + state) is what makes this
+      term real even though state materializes after collection;
     - the flat 0.5 GiB allocator reserve.
     """
+    del pool  # pool bytes are counted by the callers' own gate terms
     try:
-        need = 2 * _tensor_bytes(pool) + _RESERVE_BYTES
+        need = _WORKING_BYTES + _RESERVE_BYTES
         if iters > 0 and block is not None and primary is not None:
             state_bytes = sum(p.numel() for p in block.parameters() if str(p.device) == str(primary)) * 14
             need += state_bytes
@@ -398,6 +439,7 @@ def resolve_placement_for_pool(
     batch_size: int = 8,
     mode: str = "auto",
     iters: int = 0,
+    consumer: str = None,
 ) -> Optional[PoolPlacement]:
     """Resolve placement from a live pool object (orchestrator entry point).
 
@@ -405,7 +447,9 @@ def resolve_placement_for_pool(
     (``low_gpu_mem_usage``) deactivates the policy so the two mechanisms never
     fight. ``chains`` doubles the byte demand when a second (quantized-input)
     pool of the same size will also be produced for the block. ``block`` feeds
-    the per-block working-set estimate.
+    the per-block working-set estimate. ``consumer`` (iters>0 lane) retargets
+    the single-device preference to the tune consumer device; see
+    :func:`resolve_pool_placement`.
     """
     from auto_round.utils.device import probe_usable_bytes
 
@@ -413,15 +457,24 @@ def resolve_placement_for_pool(
     n_chunks = _pool_chunk_count(pool)
     if n_chunks <= 0 or pool_bytes <= 0:
         return None
+    consumer = str(consumer) if consumer is not None else None
+    occupied = 0
+    if consumer is not None and consumer != str(primary):
+        by_dev, _ = _bytes_by_device(pool)
+        # the q-input pool mirrors the fp pool's placement (same chunk layout),
+        # so the incoming resident bytes scale with the chain multiplier too
+        occupied = int(by_dev.get(consumer, 0) * max(int(chains), 1))
     try:
         plan = resolve_pool_placement(
             pool_bytes,
             n_chunks,
             primary,
-            placement_need_bytes(block, pool, batch_size, iters=iters, primary=primary),
+            placement_need_bytes(block, pool, batch_size, iters=iters, primary=consumer or primary),
             candidate_devices,
             probe_usable_bytes,
             mode=mode,
+            consumer=consumer,
+            occupied_bytes=occupied,
         )
     except Exception as e:  # pragma: no cover - placement must never break quantization
         logger.warning("[calib-data-device] placement resolve failed (%s); keeping single-device behavior", e)
