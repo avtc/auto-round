@@ -558,24 +558,25 @@ class SignRoundQuantizer(BaseQuantizer):
                 except Exception as e:  # pragma: no cover - diagnostics only
                     logger.warning("[tune] free-memory probe failed for %s (%s); keeping pool sharded", _ld, e)
                     _free = None
-                # Marginal-bytes reserve for the pull decision. The earlier reuse
-                # of the attach-time need model (state + 2x-pool window) charged
-                # 24.27 GiB against free 19.48 and killed pulls that the
-                # validated runs always made (pool + in-loop materialized state
-                # + weights coexisted at 18.86 GiB peak on this lane, 80 blocks,
-                # no OOM) -- those terms belong to the attach-time gates that
-                # decide pool placement, not to this marginal decision. Charged
-                # here: only the per-iteration batch IO and widest-projection
-                # transients (not yet resident at probe time) plus the flat
-                # allocator reserve. NB: the tuning state materializes IN-LOOP
-                # (probe free 19.48 bounds probe-time allocated at ~4 GiB, while
-                # the loop runs at 14.5 GiB on the same device); its coexistence
-                # with the pulled pool is the validated empirical fact above,
-                # not something this gate re-derives.
+                # Reserve for the pull decision = the loop's not-yet-resident
+                # transients (per-iteration batch IO + widest projection + flat
+                # allocator reserve) PLUS the consumer's own tuning state, which
+                # materializes IN-LOOP after this probe (probe free 19.48 bounds
+                # probe-time allocated at ~4 GiB while the loop runs at 14.5 GiB
+                # on the same device). The state term is what separates lanes:
+                # 8-GPU hy3 (state ~6.4 GiB on the loss device) pulled and
+                # survived at 18.9 GiB peak for 80 blocks; 4-GPU hy3 (state
+                # ~12.9 GiB) OOMed in the first backward exactly 0.5 GiB over
+                # with the 4 GiB pool pulled, while peer devices at the same
+                # state density but WITHOUT the pool completed the loop. The
+                # 2x-pool collection window stays out (that retention is the
+                # attach-time gates' term); the pool being pulled IS the window.
                 try:
                     from auto_round.utils.pool_placement import _RESERVE_BYTES, _working_allowance_bytes
 
                     _reserve = _working_allowance_bytes(block, fp_outputs, batch_size) + _RESERVE_BYTES
+                    if (getattr(self, "iters", 0) or 0) > 0:
+                        _reserve += sum(p.numel() for p in block.parameters() if str(p.device) == str(_ld)) * 14
                 except Exception as e:  # pragma: no cover - gate must never break tuning
                     logger.warning("[tune] working-set estimate failed (%s); using flat 4GiB reserve", e)
                     _reserve = 4 << 30
