@@ -299,7 +299,17 @@ def _activation_bytes_by_device(block, tensors, batch_size, config=None):
             expert_counts = {}
 
         routed_by_dev = {}
-        routed_total = _routed_budget_bytes(block, tensors, batch_size, config) if has_moe else None
+        routed_total = None
+        # routed x6 was calibrated on a LINEAR_LOOP lane (per-expert route
+        # caches + batch cats, 12.7 GiB measured). Grouped mode builds no
+        # route caches -- its routed working set (sorted flat buffers) is
+        # covered by the estimator's ratio-scaled expert outputs, and the
+        # weight-side retention arrives via the stacks term. Charging both
+        # on a grouped lane double-charged ~3 GiB and falsely switched the
+        # measured-working 5x3090 lane to linear_loop.
+        stacks_any = any(_grouped_stack_bytes(block, d) > 0 for d in set(est_by_dev) | set(expert_counts))
+        if has_moe and not stacks_any:
+            routed_total = _routed_budget_bytes(block, tensors, batch_size, config)
         total_experts = sum(expert_counts.values())
         if routed_total is not None and total_experts > 0:
             routed_by_dev = {d: int(routed_total * c / total_experts) for d, c in expert_counts.items()}
@@ -403,9 +413,13 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
         over = []
         max_ratio_dev, max_ratio = None, -1.0
         for d, state_bytes in state.items():
-            # values (4 B/param) are already inside the probed free here;
-            # charge the remaining grads+snapshot+bf16 of the 14 B layout
-            remaining_state = state_bytes * 10 // 14
+            # values (4 B/param) are already inside the probed free here; of
+            # the remainder, grads (4) + bf16 copy (2) are guaranteed in-loop,
+            # while the best-params snapshot (4) PARKS TO HOST under pressure
+            # (measured on the 5/6-GPU lanes: host RAM spikes as snapshots
+            # stop fitting) -- charging it as guaranteed over-declined the
+            # knife-edge-but-working 5x3090 grouped lane by ~3.5 GiB
+            remaining_state = state_bytes * 6 // 14
             demand = remaining_state + act.get(d, 0) + _RESERVE_BYTES
             free = probe_usable_bytes(d)
             logger.debug(

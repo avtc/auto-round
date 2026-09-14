@@ -18,6 +18,8 @@ import torch
 
 from auto_round.algorithms.quantization.sign_round.quantizer import _pull_pool_if_fits
 
+_GB = 2**30
+
 _GIB = 2**30
 
 
@@ -98,6 +100,28 @@ class TestPullPoolIfFits(unittest.TestCase):
             pool2 = [_FakeTensor("cuda:2", numel=_GIB // 4) for _ in range(4)]
             out2 = _run(pool2, block, free=15.9 * _GIB, target="cuda:0", label="tune-input", charge_activation=True)
             self.assertTrue(all(t.moved_to == torch.device("cuda:0") for t in out2))
+
+    def test_routed_budget_dropped_when_grouped_stacks_present(self):
+        # grouped mode builds no per-expert route caches (linear_loop
+        # calibration); charging routed x6 ALONGSIDE stacks double-charged
+        # the working 5x3090 lane and falsely switched it to linear_loop
+        from types import SimpleNamespace
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+        import auto_round.utils.device as dev_mod
+
+        blk = SimpleNamespace(modules=lambda: iter([SimpleNamespace(num_experts=8)]))
+        est = ({}, 0.0, 0.0, 0.0, {"cuda:1": 1.0, "cuda:0": 0.5}, {"cuda:1": 24})
+        with mock.patch.object(dev_mod, "estimate_tuning_block_mem", return_value=est):
+            with mock.patch.object(q, "_routed_budget_bytes", return_value=8 * _GB):
+                with mock.patch.object(
+                    q, "_grouped_stack_bytes", side_effect=lambda b, d: 2 * _GB if d == "cuda:1" else 0
+                ):
+                    got = q._activation_bytes_by_device(blk, [], 8, None)
+        self.assertIn("cuda:1", got)
+        # with routed charged it would be max(1, 8) + 2 = 10 GiB; honest = 1 + 2
+        self.assertLess(got["cuda:1"], 4 * _GB)
+        self.assertGreaterEqual(got["cuda:1"], 3 * _GB)
 
     def test_grouped_stacks_detect_hy3_container(self):
         # HYV3Experts carries NEITHER num_experts NOR ModuleList -- the MoE

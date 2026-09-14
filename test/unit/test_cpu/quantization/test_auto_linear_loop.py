@@ -84,6 +84,20 @@ class TestAutoLinearLoop(unittest.TestCase):
         self.assertEqual(self.cfg._experts_implementation, "linear_loop")
         self.assertEqual(ctx_cfg._experts_implementation, "linear_loop")
 
+    def test_snapshot_parks_to_host_so_not_charged_as_guaranteed(self):
+        # boundary between the old 10/14 and new 6/14 multipliers: this lane
+        # must KEEP grouped (a working knife-edge lane must not be switched)
+        q = self.q
+        state = {"cuda:1": 20 * GB}  # remaining: 10/14 -> 14.3 (old switch), 6/14 -> 8.6
+        act = {"cuda:1": 5 * GB}
+        with _envs_auto():
+            with mock.patch.object(q, "_logical_state_by_device", return_value=state):
+                with mock.patch.object(q, "_activation_bytes_by_device", return_value=act):
+                    with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1):
+                        with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
+                            q._maybe_auto_linear_loop_for_tuning(object(), [object()], 8, 20, self.cfg, None)
+        self.assertEqual(self.cfg._experts_implementation, "linear_grouped")
+
     def test_dense_block_no_stacks_no_decision(self):
         # no grouped stacks homed: not the decision point, flag stays unset
         self._run(stacks=False)
