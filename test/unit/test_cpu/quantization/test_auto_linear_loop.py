@@ -37,7 +37,7 @@ class TestAutoLinearLoop(unittest.TestCase):
     def _run(self, iters=20, stacks=True):
         q = self.q
         with _envs_auto():
-            with mock.patch("auto_round.utils.pool_placement._state_bytes_by_device", return_value=self.state):
+            with mock.patch.object(q, "_logical_state_by_device", return_value=self.state):
                 with mock.patch.object(q, "_activation_bytes_by_device", return_value=self.act):
                     with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1 if stacks else 0):
                         with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):
@@ -76,7 +76,7 @@ class TestAutoLinearLoop(unittest.TestCase):
         model.config = self.cfg
         q = self.q
         with _envs_auto():
-            with mock.patch("auto_round.utils.pool_placement._state_bytes_by_device", return_value=self.state):
+            with mock.patch.object(q, "_logical_state_by_device", return_value=self.state):
                 with mock.patch.object(q, "_activation_bytes_by_device", return_value=self.act):
                     with mock.patch.object(q, "_grouped_stack_bytes", side_effect=lambda b, d: 1):
                         with mock.patch("auto_round.utils.device.probe_usable_bytes", return_value=16 * GB):

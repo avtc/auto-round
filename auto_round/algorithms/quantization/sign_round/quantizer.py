@@ -53,6 +53,29 @@ def _tuning_state_bytes(block, target_dev):
     return sum(p.numel() for p in block.parameters() if str(p.device) == str(target_dev) and id(p) not in tuning) * 14
 
 
+def _logical_state_by_device(block):
+    """Deduped per-device form of :func:`_tuning_state_bytes` ({device: bytes}).
+
+    ``_state_bytes_by_device`` counts ``block.parameters()`` raw, which at
+    tune time includes BOTH the original weights and the wrappers' fp32
+    value params -- every wrapped parameter priced twice (the 4x3090 auto
+    check logged state 23.3 GiB where the honest logical state is ~12).
+    """
+    tuning = set()
+    for m in block.modules():
+        _p = getattr(m, "params", None)
+        if isinstance(_p, dict):
+            for _v in _p.values():
+                if torch.is_tensor(_v):
+                    tuning.add(id(_v))
+    out = {}
+    for p in block.parameters():
+        if id(p) in tuning:
+            continue
+        out[str(p.device)] = out.get(str(p.device), 0) + p.numel() * 14
+    return out
+
+
 def _ensure_routed_shape_recorders_(block):
     """Attach fire-once recorders on MoE containers for the activation budget.
 
@@ -349,7 +372,7 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
     from auto_round import envs as _envs_mod
     from auto_round.modeling.fused_moe.moe_experts_interface import GROUPED_LINEAR_IMPL, LINEAR_LOOP_IMPL
     from auto_round.utils.device import probe_usable_bytes
-    from auto_round.utils.pool_placement import _RESERVE_BYTES, _state_bytes_by_device
+    from auto_round.utils.pool_placement import _RESERVE_BYTES
 
     requested = str(getattr(_envs_mod, "AR_MOE_EXPERTS_IMPL", "auto") or "auto").lower()
     if requested not in ("", "auto"):
@@ -367,7 +390,7 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
         logger.debug("[moe-impl] auto check skipped: current impl is %s (not grouped)", impl)
         return
     try:
-        state = _state_bytes_by_device(block) or {}
+        state = _logical_state_by_device(block) or {}
         if not state:
             logger.debug("[moe-impl] auto check skipped: no per-device tuning state resolved")
             return
