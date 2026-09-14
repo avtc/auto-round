@@ -80,18 +80,6 @@ class TestPullPoolIfFits(unittest.TestCase):
         self.assertIs(out, pool)
         self.assertTrue(all(t.moved_to is None for t in pool))
 
-    def test_input_pull_charges_forward_window_reference_does_not(self):
-        # the OOMed 4-GPU lane: entry free 15.87 GiB, pool 4, honest state ~5,
-        # window 2x4 -- the input pull must decline; the reference pull with
-        # identical numbers pulls (loss side has no route-cache retention)
-        pool = [_FakeTensor("cuda:2", numel=_GIB // 4) for _ in range(4)]
-        block = _FakeBlock([_FakeParam("cuda:0", numel=int(0.36e9))])
-        out = _run(pool, block, free=15.9 * _GIB, target="cuda:0", label="tune-input", charge_window=True)
-        self.assertTrue(all(t.moved_to is None for t in out))
-        pool2 = [_FakeTensor("cuda:2", numel=_GIB // 4) for _ in range(4)]
-        out2 = _run(pool2, block, free=15.9 * _GIB, target="cuda:0", label="tune-reference")
-        self.assertTrue(all(t.moved_to == torch.device("cuda:0") for t in out2))
-
     def test_state_charged_only_for_params_on_target(self):
         pool = [_FakeTensor("cuda:0", numel=_GIB // 4)]
         block = _FakeBlock([_FakeParam("cuda:2", numel=int(4 * _GIB))])

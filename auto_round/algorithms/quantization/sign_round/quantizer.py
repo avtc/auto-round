@@ -53,7 +53,7 @@ def _tuning_state_bytes(block, target_dev):
     return sum(p.numel() for p in block.parameters() if str(p.device) == str(target_dev) and id(p) not in tuning) * 14
 
 
-def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge_window=False):
+def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
     """Bulk-move a whole tune-loop pool onto the device that reads it every iteration.
 
     iters>0 strategy only (loop-amortized): ``active_inputs`` -> the entry
@@ -65,17 +65,9 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge
     and the target's own in-loop tuning state (14 B/param), which
     materializes after this probe -- the term that separates the 8-GPU lane
     (pulls) from the 4-GPU lane (declines; peers completed the loop at the
-    same state density without the pool).
-
-    ``charge_window`` adds a 2x-pool forward-retention term and is set ONLY
-    for the input pull: the forward side accumulates the loop's batch cats
-    and (on linear_loop MoE lanes) per-expert route caches on the ENTRY
-    device -- measured 4-GPU block: 7.5 GiB of retained batch cats + 5.2 GiB
-    of route caches next to a 4 GiB pool, and pulling that pool onto the
-    entry OOMed the first backward exactly pool_bytes short. The loss side
-    has no such retention (one cat per iteration, freed after the loss --
-    validated by the full 80-block pull run), so the reference pull must
-    NOT charge it.
+    same state density without the pool). The loss side has no per-iteration
+    graph retention (one cat per iteration, freed after the loss -- validated
+    by the full 80-block pull run).
     """
     if pool is None or target_dev is None:
         return pool
@@ -99,8 +91,6 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge
 
             reserve = _working_allowance_bytes(block, tensors, batch_size) + _RESERVE_BYTES
             reserve += _tuning_state_bytes(block, _tgt)
-            if charge_window:
-                reserve += 2 * pool_b
         except Exception as e:  # pragma: no cover - gate must never break tuning
             logger.warning("[%s] working-set estimate failed (%s); using flat 4GiB reserve", label, e)
             reserve = 4 << 30
@@ -633,32 +623,14 @@ class SignRoundQuantizer(BaseQuantizer):
             _tune_perf["prepare"] = _ptime.perf_counter() - _tp1
             _tp2 = _ptime.perf_counter()
         # iters>0 hot-pool strategy (loop-amortized; the iters=0 lane streams
-        # its pools once and never reaches these pulls): each pool moves in
-        # bulk onto the device that reads it every iteration -- the forward
-        # gathers input batches onto the ENTRY device (BlockForwardRunner.device,
-        # where the block's starting modules live), the loss gathers reference
-        # batches onto the loss device. Declined pulls keep the per-batch
-        # gather (measured ~1-2 s/block at iters=20 with spread pools).
+        # its pools once and never reaches this pull): the fp reference pool
+        # moves in bulk onto the loss device that reads it every iteration.
+        # The INPUT pool deliberately keeps its per-batch gather: the entry
+        # device accumulates the loop's forward retention (batch cats +
+        # linear_loop route caches, measured ~3.2x pool bytes on hy3), and
+        # input pulls OOMed two server runs exactly pool_bytes over the
+        # no-pull profile; the gather costs a measured ~1-2 s/block.
         if (getattr(self, "iters", 0) or 0) > 0:
-            _entry_dev = str(getattr(block_fwd, "device", device)) if block_fwd is not None else str(device)
-            # Opt-in (AR_ENABLE_INPUT_POOL_PULL, default off): the entry device
-            # accumulates the loop's forward retention (batch cats + linear_loop
-            # route caches, measured ~3.2x pool bytes on hy3 -- above the 2x
-            # window the gate charges) and two server runs OOMed in the first
-            # backward exactly pool_bytes over the no-pull profile. The default
-            # per-batch gather costs a measured ~1-2 s/block.
-            import auto_round.envs as _envs
-
-            if isinstance(active_inputs, list) and getattr(_envs, "AR_ENABLE_INPUT_POOL_PULL", False):
-                active_inputs = _pull_pool_if_fits(
-                    active_inputs,
-                    _entry_dev,
-                    block,
-                    batch_size,
-                    self.iters,
-                    "tune] block input activations [",
-                    charge_window=True,
-                )
             if fp_outputs and loss_device is not None:
                 fp_outputs = _pull_pool_if_fits(
                     fp_outputs, str(loss_device), block, batch_size, self.iters, "tune] fp reference outputs ["
