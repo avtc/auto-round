@@ -511,7 +511,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # devices the math runs on GPU (~2.3ms/module) and the packed
                 # artifacts land on host by construction (qweight/qzeros are .to(
                 # "cpu") in the packers), so VRAM pressure stays one-module-sized.
-                _pack_call = 0.0
                 # Hoist the layer-config read out of the module loop: the property
                 # rebuilds a copy of the whole compression plan per access (~50ms on
                 # a 300B-class plan -- the entire invisible pack wall).
@@ -526,9 +525,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                                 module_name = f"{n}.{_n}"
                             if module_name is None:
                                 continue
-                            _t_call = time.perf_counter()
                             _immediate_pack(module_name, _layer_cfg)
-                            _pack_call += time.perf_counter() - _t_call
                 _marks["post.pack"] = time.perf_counter()
 
                 mv_module_from_gpu(m)
@@ -611,35 +608,22 @@ class CompressionOrchestrator(BaseOrchestrator):
                     for _k in _order[1:]:
                         _parts.append(f"{_k.rsplit('.', 1)[-1]}={_marks[_k] - _prev:.2f}s")
                         _prev = _marks[_k]
-                    _pack_note = ""
                     try:
-                        from auto_round.compressors.utils import PACK_WRAP as _pw
                         from auto_round.export.export_to_autoround.export import PACK_PHASES as _pp
 
-                        if _pp["count"]:
-                            # pre/scaffold/cpu/thr were pack-arc discriminators (the
-                            # 27s layer_config hunt); lookup stays printed as the
-                            # guard for that exact regression class
-                            _pack_note = (
-                                f" | pack[{_pp['count']} mods: fmt={_pw['fmt']:.2f}s"
-                                f" lookup={_pp['lookup']:.2f}s"
-                                f" ctor={_pp['ctor']:.2f}s pack={_pp['pack']:.2f}s"
-                                f" dispatch={_pp['dispatch']:.2f}s"
-                                f" moves={_pp['moves']:.2f}s call={_pack_call:.2f}s]"
-                            )
-                            for _k in _pp:
-                                _pp[_k] = 0.0
-                            _pw["pre"] = 0.0
-                            _pw["fmt"] = 0.0
+                        # the pack sub-note is no longer printed (pack is stable at
+                        # ~1.2s; the sub-phases were the layer_config-hunt probes);
+                        # reset the accumulators so a future re-enable starts clean
+                        for _k in _pp:
+                            _pp[_k] = 0.0
                     except Exception as e:  # pragma: no cover - diagnostics only
                         logger.warning("pack phase accounting unavailable (%s)", e)
                     logger.info(
-                        "[perf] block %s phases: reload=%.2fs %s total=%.2fs%s",
+                        "[perf] block %s phases: reload=%.2fs %s total=%.2fs",
                         block_name_or_names,
                         _t_reload_mark - _t_reload_start,
                         " ".join(_parts),
                         _marks["post.write"] - _marks["reload"] + (_t_reload_mark - _t_reload_start),
-                        _pack_note,
                     )
         finally:
             # join the background writers even when a block raises: a daemon killed
