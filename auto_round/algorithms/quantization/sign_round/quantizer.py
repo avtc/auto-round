@@ -641,7 +641,15 @@ class SignRoundQuantizer(BaseQuantizer):
         # gather (measured ~1-2 s/block at iters=20 with spread pools).
         if (getattr(self, "iters", 0) or 0) > 0:
             _entry_dev = str(getattr(block_fwd, "device", device)) if block_fwd is not None else str(device)
-            if isinstance(active_inputs, list):
+            # Opt-in (AR_ENABLE_INPUT_POOL_PULL, default off): the entry device
+            # accumulates the loop's forward retention (batch cats + linear_loop
+            # route caches, measured ~3.2x pool bytes on hy3 -- above the 2x
+            # window the gate charges) and two server runs OOMed in the first
+            # backward exactly pool_bytes over the no-pull profile. The default
+            # per-batch gather costs a measured ~1-2 s/block.
+            import auto_round.envs as _envs
+
+            if isinstance(active_inputs, list) and getattr(_envs, "AR_ENABLE_INPUT_POOL_PULL", False):
                 active_inputs = _pull_pool_if_fits(
                     active_inputs,
                     _entry_dev,

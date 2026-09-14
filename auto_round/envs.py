@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     AR_PERF_COUNTERS: bool = False
     AR_SEARCH_BATCH_GB: Optional[float] = None
     AR_DISABLE_MULTIGPU_SEARCH: bool = False
+    AR_ENABLE_INPUT_POOL_PULL: bool = False
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -186,6 +187,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The grouped backend validates the layer and transparently falls back to the loop
     # when the layer is not eligible (Conv1D experts, forward hooks, static/per-tensor
     # activation quantization, mixed devices, ...).
+    # Opt-in bulk pull of the block INPUT activation pool onto the entry device before
+    # the tune loop. Default off: the entry device accumulates the loop's forward
+    # retention (batch cats +, on linear_loop MoE lanes, per-expert route caches --
+    # measured ~3.2x pool bytes, exceeding the 2x window the gate charges), and two
+    # server runs OOMed in the first backward exactly pool_bytes over the no-pull
+    # profile. The per-batch gather it replaces costs a measured ~1-2 s/block.
+    "AR_ENABLE_INPUT_POOL_PULL": lambda: os.getenv("AR_ENABLE_INPUT_POOL_PULL", "False").strip().lower()
+    in ("1", "true", "yes"),
     "AR_MOE_EXPERTS_IMPL": lambda: os.getenv("AR_MOE_EXPERTS_IMPL", "auto").lower(),
     # How many experts the "linear_grouped" backend groups per fused op. This one knob
     # governs BOTH the fake-quant fusion AND the native grouped_mm tiling (when the native
