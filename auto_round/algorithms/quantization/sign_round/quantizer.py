@@ -117,9 +117,16 @@ def _ensure_routed_shape_recorders_(block):
 
 
 def _grouped_stack_bytes(block, device):
-    """Qdq-stack bytes the grouped experts modes materialize on ``device``.
+    """Qdq-stack bytes the grouped experts modes materialize on ``device``."""
+    d = _grouped_stack_bytes_detail(block, device)
+    return d["retention"] + d["transient"]
 
-    Two chunk-aware terms for ``auto``/``linear_grouped``/
+
+def _grouped_stack_bytes_detail(block, device):
+    """Per-term split of :func:`_grouped_stack_bytes` (retention + transient).
+
+    Two chunk-aware terms (retention is chunk-independent; transient is
+    chunk-sized) for ``auto``/``linear_grouped``/
     ``linear_grouped_sliced`` (linear_loop stacks nothing):
 
     - retention (chunk-independent): autograd keeps EVERY chunk's stacked
@@ -193,8 +200,8 @@ def _grouped_stack_bytes(block, device):
             transient += chunk_elems * 6  # ~2 streaming passes over the chunk
     except Exception as e:  # pragma: no cover - never break the gate
         logger.debug("[tune] grouped-stack accounting unavailable (%s)", e)
-        return 0
-    return retention + transient
+        return {"retention": 0, "transient": 0}
+    return {"retention": retention, "transient": transient}
 
 
 def _routed_budget_bytes(block, tensors, batch_size, config=None):
@@ -422,12 +429,18 @@ def _maybe_auto_linear_loop_for_tuning(block, tensors, batch_size, iters, config
             remaining_state = state_bytes * 6 // 14
             demand = remaining_state + act.get(d, 0) + _RESERVE_BYTES
             free = probe_usable_bytes(d)
+            _st = _grouped_stack_bytes_detail(block, d)
+            _est_routed = max(act.get(d, 0) - _st["retention"] - _st["transient"], 0)
             logger.debug(
-                "[moe-impl] auto check %s: demand %.2f GiB (state %.2f + act %.2f + reserve) vs free %.2f GiB",
+                "[moe-impl] auto check %s: demand %.2f GiB (state %.2f + act %.2f "
+                "[stacks retention %.2f + transient %.2f, est/routed %.2f] + reserve) vs free %.2f GiB",
                 d,
                 demand / 2**30,
                 remaining_state / 2**30,
                 act.get(d, 0) / 2**30,
+                _st["retention"] / 2**30,
+                _st["transient"] / 2**30,
+                _est_routed / 2**30,
                 -1.0 if free is None else free / 2**30,
             )
             if free is not None:
