@@ -54,6 +54,22 @@ def _signature(batch):
     return spec, signature
 
 
+def _signature_decline_reason(batch):
+    """First offending leaf that makes :func:`_signature` return None."""
+    leaves, _ = tree_flatten(batch)
+    for pos, value in enumerate(leaves):
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                return f"leaf #{pos}: tensor on {value.device} (cpu required)"
+            if value.layout != torch.strided:
+                return f"leaf #{pos}: non-strided tensor ({value.layout})"
+        elif value is None or isinstance(value, (str, bool, int, float)):
+            continue
+        else:
+            return f"leaf #{pos}: unsupported type {type(value).__name__} = {value!r:.60}"
+    return "unknown"
+
+
 def _nbytes(batch):
     return sum(t.numel() * t.element_size() for t in tree_flatten(batch)[0] if isinstance(t, torch.Tensor))
 
@@ -85,6 +101,10 @@ class DiffusionTuningCache:
         template = cache._select(first)
         cache.signature = _signature(template)
         if cache.signature is None:
+            logger.info(
+                "Diffusion tuning prefetch skipped: batch signature rejected (%s).",
+                _signature_decline_reason(template),
+            )
             return None
         cache.sources = (
             block.params
