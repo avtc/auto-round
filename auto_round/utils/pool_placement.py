@@ -368,48 +368,51 @@ def resolve_pool_placement(
         # single-device-first: identical to today's behavior, zero peer traffic
         return PoolPlacement([eff], [max(primary_free - need_bytes - occupied_bytes, 1)], n_chunks)
 
-    # Capacity-aware sharding: the working-set need (and the incoming pool
-    # bytes already resident there) constrain the SINGLE-DEVICE CANDIDATE only
-    # (that is where tuning compute runs). Charging the FULL need against the
-    # whole fleet made every MoE block's need veto all sharding (block-3
-    # OOM). Peers are not free either though: each pays its OWN in-loop tuning
-    # state (params homed there x 14 B, materializing after this probe --
-    # values at wrap, grads/snapshots in the loop; the observed 24 MiB
-    # snapshot OOM at 5.5 MiB free on a "free" peer). Card-size differences
-    # need no explicit handling: the probe already reads each card's actual
-    # usable free.
+    # Water-fill placement with full charges: place the pool so every
+    # receiving device ends at the SAME predicted headroom level t --
+    # i.e. minimize the maximum predicted VRAM across the fleet,
+    # calculated upfront. Per-device headroom h_i = free_i - charge_i,
+    # where the charge is the device's own in-loop load that materializes
+    # after this probe (tuning state x 14 B/param on every device, the
+    # entry's forward-graph activation budget, the consumer's working set
+    # and resident pool bytes). Allocation a_i = max(h_i - t, 0) with t
+    # solving sum(a_i) = pool_bytes:
+    #   t >= 0  : everything fits; every receiver ends with the common
+    #             margin t (min-max optimal -- nobody is the thin card);
+    #   t <  0  : the pool over-commits the fleet; the over-commitment is
+    #             spread EVENLY (each device exceeds its charged headroom
+    #             by the same -t) instead of piling onto whoever had raw
+    #             free. There is no ignore-charges branch: the charges
+    #             shape the split in both regimes.
     peer_state = peer_state_bytes or {}
     entry = str(entry_device) if entry_device is not None else None
-    capacities = [
-        (
-            max(f - need_bytes - occupied_bytes, 1)
-            if d == eff
-            else max(f - peer_state.get(d, 0) - (entry_extra_bytes if d == entry else 0), 1)
-        )
+    headroom = [
+        f
+        - (need_bytes + occupied_bytes if d == eff else peer_state.get(d, 0))
+        - (entry_extra_bytes if d == entry and d != eff else 0)
         for d, f in usable
     ]
-    shardable = sum(capacities)
-    if shardable < pool_bytes:
-        # Fully-charged sharding cannot hold the pool. Falling back to
-        # primary-single would concentrate even more, and returning None keeps
-        # today's default which is exactly that concentration. The least-bad
-        # option is the UNCHARGED proportional split -- the placement that
-        # demonstrably completed blocks on the 95%-fleet-utilization lane
-        # (peers park snapshots to host as the pressure valve) -- with the
-        # charges logged for the audit trail.
+    # solve the level t by binary search on monotone g(t) = sum(max(h-t,0)) - pool
+    lo, hi = min(headroom) - pool_bytes, max(headroom)
+    for _ in range(64):
+        mid = (lo + hi) / 2
+        if sum(max(h - mid, 0) for h in headroom) > pool_bytes:
+            lo = mid
+        else:
+            hi = mid
+    level = (lo + hi) / 2
+    alloc = [max(h - level, 0) for h in headroom]
+    if sum(alloc) <= 0:  # degenerate: keep the planless default (loud OOM path)
         logger.debug(
-            "[calib-data-device] resolve: charged capacity %.2fGiB < pool %.2fGiB "
-            "(peer state %s, entry activation %.2fGiB on %s); using uncharged proportional split",
-            shardable / 2**30,
+            "[calib-data-device] resolve: none (all candidate headrooms exhausted; pool %.2fGiB)",
             pool_bytes / 2**30,
-            {d: round(v / 2**30, 1) for d, v in peer_state.items()},
-            entry_extra_bytes / 2**30,
-            entry,
         )
-        capacities = [max(f - (need_bytes + occupied_bytes if d == eff else 0), 1) for d, f in usable]
-
-    devices = [d for d, _ in usable]
-    return PoolPlacement(devices, capacities, n_chunks)
+        return None
+    devs = [d for (d, _f), a in zip(usable, alloc) if a > 0]
+    caps = [int(a) for (d, _f), a in zip(usable, alloc) if a > 0]
+    plan_obj = PoolPlacement(devs, caps, n_chunks)
+    plan_obj.level_bytes = int(level)  # common predicted headroom after fill (negative = even over-commit)
+    return plan_obj
 
 
 # Minimal fragmentation pad for probe->peak drift. NOT card-proportional:

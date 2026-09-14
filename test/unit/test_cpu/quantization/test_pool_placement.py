@@ -294,14 +294,32 @@ class TestResolvePoolPlacement(unittest.TestCase):
         self.assertEqual(sum(plan.counts().values()), 128)
         self.assertLessEqual(plan.counts().get("cuda:0", 0), 64)
 
-    def test_shards_proportionally(self):
+    def test_water_fill_minimizes_max_predicted_usage(self):
+        # headroom (8, 10, 30) GiB, pool 8: min-max fills from the deepest
+        # device down to a common level -> everything on cuda:2 (level 22),
+        # cuda:0/1 untouched: all three end with >= 8 GiB predicted headroom
+        # and the fleet's max predicted usage is minimized
         plan = self._resolve(
             pool=8 * self.GB,
             free={"cuda:0": 8 * self.GB, "cuda:1": 10 * self.GB, "cuda:2": 30 * self.GB},
         )
         counts = plan.counts()
-        self.assertGreater(counts["cuda:2"], counts["cuda:1"])
+        self.assertEqual(counts.get("cuda:2", 0), 128)
+        self.assertNotIn("cuda:0", counts)
+        self.assertNotIn("cuda:1", counts)
         self.assertEqual(sum(counts.values()), 128)
+
+    def test_water_fill_spreads_when_headrooms_comparable(self):
+        # frees (8, 10) GiB with the helper's default need=2 charged to the
+        # primary: headroom (6, 10), pool 9 (exceeds the primary alone, so the
+        # single-device rung declines): level = (16-9)/2 = 3.5 -> cuda:1 takes
+        # 6.5, cuda:0 takes 2.5: both end at exactly 3.5 GiB predicted
+        # headroom -- equalized max VRAM by construction
+        plan = self._resolve(pool=9 * self.GB, free={"cuda:0": 8 * self.GB, "cuda:1": 10 * self.GB})
+        counts = plan.counts()
+        self.assertEqual(sum(counts.values()), 128)
+        self.assertGreater(counts.get("cuda:1", 0), counts.get("cuda:0", 0))
+        self.assertAlmostEqual(plan.level_bytes / self.GB, 3.5, delta=0.05)
 
     def test_insufficient_capacity_falls_back_to_uncharged_split(self):
         # No silent CPU fallback ever; and instead of None (whose caller-side
