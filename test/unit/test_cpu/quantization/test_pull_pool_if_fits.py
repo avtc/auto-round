@@ -101,6 +101,55 @@ class TestPullPoolIfFits(unittest.TestCase):
             out2 = _run(pool2, block, free=15.9 * _GIB, target="cuda:0", label="tune-input", charge_activation=True)
             self.assertTrue(all(t.moved_to == torch.device("cuda:0") for t in out2))
 
+    def test_stacks_count_wrapper_and_orig_layer_once(self):
+        # at tune time named_modules yields the wrapper AND its orig_layer
+        # child, each with a same-shape weight -- counting both doubled
+        # retention (10.3 GiB charged where the honest charge is ~5.2)
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as q
+
+        class _MoeMLP(nn.Module):
+
+            pass
+
+        class _Experts(nn.Module):
+
+            pass
+
+        def _mk_w():
+            return SimpleNamespace(numel=lambda: 16, device="cuda:1", nbytes=64, shape=(4, 4))
+
+        blk = nn.Module()
+        mlp = _MoeMLP()
+        experts = _Experts()
+        for i in range(2):
+            leaf = nn.Module()
+            orig = nn.Module()
+            w = _mk_w()
+            object.__setattr__(leaf, "weight", w)
+            object.__setattr__(orig, "weight", w)  # same tensor: id-dedup path
+            leaf.orig_layer = orig
+            setattr(experts, str(i), leaf)
+        # distinct-tensor orig: the .orig_layer name-skip path
+        leaf3 = nn.Module()
+        orig3 = nn.Module()
+        object.__setattr__(leaf3, "weight", _mk_w())
+        object.__setattr__(orig3, "weight", _mk_w())
+        leaf3.orig_layer = orig3
+        experts.extra = leaf3
+        mlp.experts = experts
+        blk.mlp = mlp
+
+        got = q._grouped_stack_bytes(blk, "cuda:1")
+        # 3 logical projections x 16 elems x 6 B = 288 B minimum (plus transient)
+        self.assertGreaterEqual(got, 288)
+        # double-counted form would charge >= 5 x 16 x 6 = 480 retention-only
+        detail = q._grouped_stack_bytes_detail(blk, "cuda:1")
+        self.assertLess(detail["retention"], 480)
+
     def test_routed_budget_dropped_when_grouped_stacks_present(self):
         # grouped mode builds no per-expert route caches (linear_loop
         # calibration); charging routed x6 ALONGSIDE stacks double-charged

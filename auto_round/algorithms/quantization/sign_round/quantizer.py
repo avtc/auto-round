@@ -178,24 +178,35 @@ def _grouped_stack_bytes_detail(block, device):
         # grouped path (gate/up/down are chunked independently)
         mods = dict(block.named_modules())
         by_slot = {}
+        seen_weight_ids = set()
         for name, leaf in mods.items():
+            # at tune time named_modules yields BOTH the wrapper
+            # (...gate_proj) and its orig_layer child (...gate_proj.orig_
+            # layer), each exposing a same-shape weight -- counting both
+            # doubled retention (measured: 10.1-10.3 GiB charged where the
+            # logical 6 B/elem charge is ~5.2)
+            if name.endswith(".orig_layer"):
+                continue
             weight = getattr(leaf, "weight", None)
             if weight is None or not hasattr(weight, "numel"):
                 continue
+            if id(weight) in seen_weight_ids:
+                continue
             if not _is_expert_leaf(name, leaf):
                 continue
-            by_slot.setdefault(type(leaf).__name__ + "." + getattr(leaf, "slot_tag", ""), []).append(leaf)
-        for _slot, leaves in by_slot.items():
-            local = [l for l in leaves if str(l.weight.device) == str(device)]
-            if not local:
+            seen_weight_ids.add(id(weight))
+            by_slot.setdefault(type(leaf).__name__ + "." + getattr(leaf, "slot_tag", ""), []).append((leaf, weight))
+        for _slot, pairs in by_slot.items():
+            local_pairs = [(l, w) for l, w in pairs if str(w.device) == str(device)]
+            if not local_pairs:
                 continue
-            elems = sum(int(l.weight.numel()) for l in local)
+            elems = sum(int(w.numel()) for _l, w in local_pairs)
             retention += elems * 6  # fp32 value stack + bf16 qdq output
             try:
-                chunk = _qdq_chunk_size(local)  # env/budget-aware; 0 = all
+                chunk = _qdq_chunk_size([l for l, _w in local_pairs])  # env/budget-aware; 0 = all
             except Exception:
                 chunk = 16
-            per_leaf = elems // max(1, len(local))
+            per_leaf = elems // max(1, len(local_pairs))
             chunk_elems = elems if chunk <= 0 else min(elems, chunk * per_leaf)
             transient += chunk_elems * 6  # ~2 streaming passes over the chunk
     except Exception as e:  # pragma: no cover - never break the gate
