@@ -53,7 +53,7 @@ def _tuning_state_bytes(block, target_dev):
     return sum(p.numel() for p in block.parameters() if str(p.device) == str(target_dev) and id(p) not in tuning) * 14
 
 
-def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
+def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label, charge_window=False):
     """Bulk-move a whole tune-loop pool onto the device that reads it every iteration.
 
     iters>0 strategy only (loop-amortized): ``active_inputs`` -> the entry
@@ -66,6 +66,16 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
     materializes after this probe -- the term that separates the 8-GPU lane
     (pulls) from the 4-GPU lane (declines; peers completed the loop at the
     same state density without the pool).
+
+    ``charge_window`` adds a 2x-pool forward-retention term and is set ONLY
+    for the input pull: the forward side accumulates the loop's batch cats
+    and (on linear_loop MoE lanes) per-expert route caches on the ENTRY
+    device -- measured 4-GPU block: 7.5 GiB of retained batch cats + 5.2 GiB
+    of route caches next to a 4 GiB pool, and pulling that pool onto the
+    entry OOMed the first backward exactly pool_bytes short. The loss side
+    has no such retention (one cat per iteration, freed after the loss --
+    validated by the full 80-block pull run), so the reference pull must
+    NOT charge it.
     """
     if pool is None or target_dev is None:
         return pool
@@ -89,6 +99,8 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
 
             reserve = _working_allowance_bytes(block, tensors, batch_size) + _RESERVE_BYTES
             reserve += _tuning_state_bytes(block, _tgt)
+            if charge_window:
+                reserve += 2 * pool_b
         except Exception as e:  # pragma: no cover - gate must never break tuning
             logger.warning("[%s] working-set estimate failed (%s); using flat 4GiB reserve", label, e)
             reserve = 4 << 30
@@ -631,7 +643,13 @@ class SignRoundQuantizer(BaseQuantizer):
             _entry_dev = str(getattr(block_fwd, "device", device)) if block_fwd is not None else str(device)
             if isinstance(active_inputs, list):
                 active_inputs = _pull_pool_if_fits(
-                    active_inputs, _entry_dev, block, batch_size, self.iters, "tune] block input activations ["
+                    active_inputs,
+                    _entry_dev,
+                    block,
+                    batch_size,
+                    self.iters,
+                    "tune] block input activations [",
+                    charge_window=True,
                 )
             if fp_outputs and loss_device is not None:
                 fp_outputs = _pull_pool_if_fits(
