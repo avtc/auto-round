@@ -1043,15 +1043,24 @@ def estimate_tuning_block_mem(
                 # Our unfuse builds the experts module as a plain nn.Module with numbered
                 # _ExpertContainer children (checkpoint-format keys), NOT an nn.ModuleList;
                 # the num_experts attribute identifies it just as well.
-                # is_moe_layer covers container classes transformers registers
-                # (HYV3Experts etc.) that are neither ModuleLists nor expose
-                # num_experts; without it every expert priced full-width (the
-                # ~170 GiB est on hy3 with the correct 8/192 ratio logged)
-                is_experts_container = (
-                    isinstance(pparent_module, torch.nn.ModuleList)
-                    or hasattr(pparent_module, "num_experts")
-                    or is_moe_layer(pparent_module)
+                # The experts container itself may be a plain class with a
+                # generic name (HYV3Experts: neither ModuleList nor num_experts,
+                # no "moe" in ITS class name) -- the MoE marker sits on an
+                # ANCESTOR (hy3's MLP class). Walk the chain; a single-parent
+                # check priced every expert full-width (~170 GiB est on hy3
+                # with the correct 8/192 ratio logged).
+                is_experts_container = isinstance(pparent_module, torch.nn.ModuleList) or hasattr(
+                    pparent_module, "num_experts"
                 )
+                if not is_experts_container:
+                    _and = layer_name
+                    while "." in _and and not is_experts_container:
+                        _and = _and.rsplit(".", 1)[0]
+                        _mod = get_module(block, _and) if _and else None
+                        if _mod is not None and (
+                            isinstance(_mod, torch.nn.ModuleList) or hasattr(_mod, "num_experts") or is_moe_layer(_mod)
+                        ):
+                            is_experts_container = True
                 is_moe_expert = "expert" in layer_name.lower() and is_experts_container
             else:
                 is_moe_expert = False
