@@ -73,11 +73,11 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
             reserve = 4 << 30
         if free is not None and free - reserve >= pool_b:
             moved = [t.to(_tgt) for t in tensors]
-            logger.debug("[%s] pool pulled to %s (%.2f GiB, free %.2f GiB)", label, _tgt, pool_b / 2**30, free / 2**30)
+            logger.debug("[%s] bulk pull -> %s (%.2f GiB, free %.2f GiB)", label, _tgt, pool_b / 2**30, free / 2**30)
             return moved
         if free is not None:
             logger.debug(
-                "[%s] pool stays sharded (pool %.2f GiB + reserve %.2f GiB vs free %.2f GiB on %s)",
+                "[%s] stays sharded, per-batch gather (data %.2f GiB + reserve %.2f GiB vs free %.2f GiB on %s)",
                 label,
                 pool_b / 2**30,
                 reserve / 2**30,
@@ -85,7 +85,7 @@ def _pull_pool_if_fits(pool, target_dev, block, batch_size, iters, label):
                 _tgt,
             )
     except Exception as e:  # pragma: no cover - placement must never break tuning
-        logger.warning("[%s] bulk pull failed (%s); keeping pool sharded", label, e)
+        logger.warning("[%s] bulk pull failed (%s); keeping data sharded", label, e)
     return pool
 
 
@@ -610,11 +610,11 @@ class SignRoundQuantizer(BaseQuantizer):
             _entry_dev = str(getattr(block_fwd, "device", device)) if block_fwd is not None else str(device)
             if isinstance(active_inputs, list):
                 active_inputs = _pull_pool_if_fits(
-                    active_inputs, _entry_dev, block, batch_size, self.iters, "tune-input"
+                    active_inputs, _entry_dev, block, batch_size, self.iters, "tune] block input activations ["
                 )
             if fp_outputs and loss_device is not None:
                 fp_outputs = _pull_pool_if_fits(
-                    fp_outputs, str(loss_device), block, batch_size, self.iters, "tune-reference"
+                    fp_outputs, str(loss_device), block, batch_size, self.iters, "tune] fp reference outputs ["
                 )
 
         try:
