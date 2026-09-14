@@ -956,10 +956,8 @@ def get_moe_memory_ratio(block: torch.nn.Module, config=None) -> float:
         if num_experts is not None and num_experts > 0:
             moe_ratio = num_experts_per_tok / num_experts
             logger.debug(
-                f"MoE detected: {num_experts_per_tok}/{num_experts} experts active per token, "
-                f"activation memory ratio: {moe_ratio:.2f}"
+                f"Using MoE memory ratio: {moe_ratio:.4f} ({num_experts_per_tok}/{num_experts} experts active per token)"
             )
-            logger.debug(f"Using MoE memory ratio: {moe_ratio:.4f}")
             return moe_ratio, True
         break  # Only check once per block
 

@@ -853,13 +853,13 @@ class SignRoundQuantizer(BaseQuantizer):
                     block,
                     batch_size,
                     self.iters,
-                    "tune] block input activations [",
+                    "tune] block input activations ",
                     charge_activation=True,
                     config=getattr(getattr(self, "model_context", None), "config", None),
                 )
             if fp_outputs and loss_device is not None:
                 fp_outputs = _pull_pool_if_fits(
-                    fp_outputs, str(loss_device), block, batch_size, self.iters, "tune] fp reference outputs ["
+                    fp_outputs, str(loss_device), block, batch_size, self.iters, "tune] fp reference outputs "
                 )
 
         try:
