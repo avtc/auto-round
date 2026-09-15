@@ -1171,7 +1171,11 @@ class SignRoundQuantizer(BaseQuantizer):
                     charge_activation=True,
                     config=getattr(getattr(self, "model_context", None), "config", None),
                 )
-            if fp_outputs and loss_device is not None:
+            # the diffusion tuning cache requires its pools on the host (it
+            # stages batches to the GPU itself via pinned slots); a bulk pull
+            # onto the loss device would put the cached reference outputs on
+            # cuda and the cache would decline every batch signature
+            if fp_outputs and loss_device is not None and not use_tuning_cache:
                 fp_outputs = _pull_pool_if_fits(
                     fp_outputs,
                     str(loss_device),
