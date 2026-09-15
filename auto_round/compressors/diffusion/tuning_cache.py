@@ -56,17 +56,27 @@ def _signature(batch):
 
 def _signature_decline_reason(batch):
     """First offending leaf that makes :func:`_signature` return None."""
+    try:
+        from torch.utils._pytree import tree_flatten_with_path
+
+        pairs, _ = tree_flatten_with_path(batch)
+    except Exception:  # pragma: no cover - fall back to position-only
+        pairs = None
     leaves, _ = tree_flatten(batch)
     for pos, value in enumerate(leaves):
+        path = ""
+        if pairs is not None:
+            entry = pairs[pos]
+            path = "".join(f"[{k!r}]" if isinstance(k, str) else f"[{k}]" for k in (entry if isinstance(entry, tuple) else (entry,)))
         if isinstance(value, torch.Tensor):
             if value.device.type != "cpu":
-                return f"leaf #{pos}: tensor on {value.device} (cpu required)"
+                return f"leaf #{pos}{path}: tensor on {value.device} (cpu required)"
             if value.layout != torch.strided:
-                return f"leaf #{pos}: non-strided tensor ({value.layout})"
+                return f"leaf #{pos}{path}: non-strided tensor ({value.layout})"
         elif value is None or isinstance(value, (str, bool, int, float)):
             continue
         else:
-            return f"leaf #{pos}: unsupported type {type(value).__name__} = {value!r:.60}"
+            return f"leaf #{pos}{path}: unsupported type {type(value).__name__} = {value!r:.60}"
     return "unknown"
 
 
