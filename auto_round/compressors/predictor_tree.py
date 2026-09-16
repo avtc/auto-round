@@ -81,13 +81,26 @@ def synthesize_predictor_e(input_rows: torch.Tensor, embed=None) -> torch.Tensor
     return torch.cat([input_rows[:, 1:], input_rows[:, -1:]], dim=1)
 
 
+def _resolve_predictor_ref(shell: torch.nn.Module, spec):
+    """Resolve a role ref: module handles pass through, string paths resolve
+    LIVE against the model so wrappers the tuning machinery installs
+    (WrapperLinear replacing the bare Linear) participate in the forward."""
+    if isinstance(spec, str):
+        model = getattr(shell, "_predictor_model", None)
+        if model is None:
+            raise RuntimeError("predictor ref given as a path but no model bound on the shell")
+        return model.get_submodule(spec)
+    return spec
+
+
 def predictor_forward(shell: torch.nn.Module, hidden_states: torch.Tensor, **input_others):
     """Run a materialized predictor tree like a decoder block.
 
     The embedding-side input arrives as the ``_predictor_e`` auxiliary input
     (per-row tensors are concatenated here) or falls back to the value bound
     on the shell; every other keyword input passes through to the layer
-    unchanged.
+    unchanged. Role refs resolve live (see ``_resolve_predictor_ref``) so the
+    concat mixer's WrapperLinear is picked up once installed.
     """
     refs = getattr(shell, "_predictor_refs", None)
     if refs is None:
@@ -103,23 +116,39 @@ def predictor_forward(shell: torch.nn.Module, hidden_states: torch.Tensor, **inp
         e = torch.cat(list(e), dim=0)
     if e.device != hidden_states.device:
         e = e.to(hidden_states.device)
-    x = torch.cat([refs["norm_e"](e), refs["norm_h"](hidden_states)], dim=-1)
-    x = refs["fc"](x)
-    x = refs["layer"](x, **input_others)
+    x = torch.cat(
+        [
+            _resolve_predictor_ref(shell, refs["norm_e"])(e),
+            _resolve_predictor_ref(shell, refs["norm_h"])(hidden_states),
+        ],
+        dim=-1,
+    )
+    x = _resolve_predictor_ref(shell, refs["fc"])(x)
+    x = _resolve_predictor_ref(shell, refs["layer"])(x, **input_others)
     x = x[0] if isinstance(x, (tuple, list)) else x
     final_norm = refs.get("final_norm")
-    return final_norm(x) if final_norm is not None else x
+    return _resolve_predictor_ref(shell, final_norm)(x) if final_norm is not None else x
 
 
-def bind_predictor_forward(shell: torch.nn.Module, refs: dict, e: torch.Tensor = None) -> None:
+def bind_predictor_forward(
+    shell: torch.nn.Module, refs: dict, e: torch.Tensor = None, model: torch.nn.Module = None
+) -> None:
     """Attach the predictor forward and role refs to the group shell.
 
-    The ref dict keeps module handles out of ``named_modules`` (the real tree
-    registers them once under their checkpoint paths), and the bound forward
-    lets block-level machinery call the group like any decoder block.
+    ``refs`` maps role names to module handles OR module paths; paths resolve
+    live at forward time so wrappers the tuning machinery installs later are
+    picked up. The ref dict keeps handles out of ``named_modules`` (the real
+    tree registers them once under their checkpoint paths), and the bound
+    forward lets block-level machinery call the group like any decoder block.
+    ``e`` may be bound later, right before the first forward.
     """
     shell._predictor_refs = refs
     shell._predictor_e = e
+    if model is not None:
+        # bypass nn.Module.__setattr__: registering the model as a submodule
+        # would create a reference cycle (model -> shell -> model) that breaks
+        # named_modules/apply with RecursionError
+        object.__setattr__(shell, "_predictor_model", model)
     shell.forward = lambda hidden_states, **input_others: predictor_forward(shell, hidden_states, **input_others)
 
 

@@ -44,8 +44,8 @@ if deepspeed_exists:
 # residents. Blocking is exact: quantization groups never straddle output
 # rows, so the per-block results and gradients equal the full-tensor
 # computation. Typical FFN projections stay on the fast whole-layer path
-# (compiled graph, single GEMM); the threshold is far below their size on
-# purpose.
+# (compiled graph, single GEMM); the threshold sits far above their size on
+# purpose so they never take the blocked path.
 _ROW_BLOCKED_WEIGHT_ELEMS = 2**27
 
 
@@ -282,18 +282,34 @@ class WrapperLinear(torch.nn.Module):
 
         setattr(self, name, p)
 
-    def _qdq_weight_block(self, weight, value, min_scale, max_scale, tensor_min, tensor_max, init_scale=None):
+    def _qdq_weight_block(
+        self, weight, value, min_scale, max_scale, tensor_min, tensor_max, init_scale=None, row_start=None, row_end=None
+    ):
         """Fake-quantize an explicit block of rows (see ``_qdq_weight``).
 
         Split out so the row-blocked forward can bound the fp32 intermediates
         of huge layers; the kwargs are identical to the full-tensor call.
-        ``init_scale`` may be passed pre-sliced by the blocked caller."""
+        ``init_scale`` may be passed pre-sliced by the blocked caller;
+        ``row_start``/``row_end`` slice a per-output-row imatrix to the block
+        (a 1-D per-column imatrix broadcasts over rows and passes through).
+        """
         quant_kwargs = {}
         if hasattr(self.orig_layer, "super_bits"):
             quant_kwargs["super_bits"] = self.orig_layer.super_bits
             quant_kwargs["super_group_size"] = self.orig_layer.super_group_size
         if hasattr(self, "_extra_quant_kwargs"):
             quant_kwargs.update(self._extra_quant_kwargs())
+        imatrix = None
+        if hasattr(self.orig_layer, "imatrix") and self.orig_layer.imatrix is not None:
+            imatrix = self.orig_layer.imatrix.to(weight.device)
+            full_rows = self.orig_layer.weight.shape[0]
+            if (
+                imatrix.dim() == 2
+                and imatrix.shape[0] == full_rows
+                and weight.shape[0] != full_rows
+                and row_start is not None
+            ):
+                imatrix = imatrix[row_start:row_end]
         weight_q, scale, zp = self.weight_quant_func(
             weight,
             bits=self.orig_layer.bits,
@@ -306,7 +322,7 @@ class WrapperLinear(torch.nn.Module):
             tensor_max=tensor_max,
             data_type=self.data_type,
             q_scale_thresh=self.q_scale_thresh,
-            imatrix=self.orig_layer.imatrix.to(weight.device) if hasattr(self.orig_layer, "imatrix") else None,
+            imatrix=imatrix,
             global_scale=getattr(self, "weight_global_scale", None),
             init_scale=init_scale if init_scale is not None else getattr(self, "init_scale", None),
             **quant_kwargs,
@@ -488,14 +504,24 @@ class WrapperLinear(torch.nn.Module):
         min_bound, max_bound = self.minmax_scale_bound
         self.min_scale.data.clamp_(min_bound, max_bound)
         self.max_scale.data.clamp_(min_bound, max_bound)
+        # min/max scales stay scalar when minmax tuning is off - only slice
+        # genuinely per-group parameters (same contract as _slice_tunable)
+        min_scale_arg = (
+            _GradScatterSlice.apply(self.min_scale, g_start, g_end) if self.min_scale.numel() > 1 else self.min_scale
+        )
+        max_scale_arg = (
+            _GradScatterSlice.apply(self.max_scale, g_start, g_end) if self.max_scale.numel() > 1 else self.max_scale
+        )
         weight_q, *_ = self._qdq_weight_block(
             weight[start:end],
             _GradScatterSlice.apply(self.value, g_start, g_end),
-            _GradScatterSlice.apply(self.min_scale, g_start, g_end),
-            _GradScatterSlice.apply(self.max_scale, g_start, g_end),
+            min_scale_arg,
+            max_scale_arg,
             self.weight_min[g_start:g_end] if self.weight_min is not None else None,
             self.weight_max[g_start:g_end] if self.weight_max is not None else None,
             init_scale=block_init_scale,
+            row_start=start,
+            row_end=end,
         )
         return weight_q
 

@@ -50,6 +50,20 @@ if TYPE_CHECKING:
 _OUTSIDE_TUNE_CHUNK_OUT_ELEMS = 2**26
 
 
+def _valid_token_mask_rows(valid_token_mask, indices, device, rows_axis):
+    """Concatenate per-sample valid-token masks into the input's row layout.
+
+    Per-sample masks are ``[1, seq]``. For 3-D inputs (rows on dim 1) the
+    result is ``[n, seq, 1]`` so a chunk slices ``[:, start:end]``; for 2-D
+    inputs (rows concatenated on dim 0) it flattens to ``[total_rows, 1]`` so
+    a chunk slices ``[start:end]``.
+    """
+    m = torch.cat([valid_token_mask[i] for i in indices], dim=0).to(device)
+    if rows_axis == 1:
+        return m.unsqueeze(-1)
+    return m.reshape(-1, 1)
+
+
 def _outside_tune_rows_per_chunk(out_features, sample_rows, budget=_OUTSIDE_TUNE_CHUNK_OUT_ELEMS):
     """Rows of one sample processed per forward/backward slice.
 
@@ -856,9 +870,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     with torch.no_grad():
                         current_output = layer(org_input)
                     if valid_token_mask:
-                        tmp_valid_mask = [valid_token_mask[i] for i in indices]
-                        tmp_valid_mask = torch.cat(tmp_valid_mask, dim=0).to(device)
-                        tmp_valid_mask.unsqueeze_(-1)
+                        tmp_valid_mask = _valid_token_mask_rows(valid_token_mask, indices, device, rows_axis)
 
                         with autocast_ctx:
                             output_q = wrapper_linear(current_input)  # pylint: disable=not-callable
@@ -886,8 +898,7 @@ class SignRoundQuantizer(BaseQuantizer):
                     sum_denom = sample_rows * out_features if mse_reduction == "mean" else 1
                     cat_mask = None
                     if valid_token_mask:
-                        cat_mask = torch.cat([valid_token_mask[i] for i in indices], dim=0).to(device)
-                        cat_mask = cat_mask.unsqueeze(-1)
+                        cat_mask = _valid_token_mask_rows(valid_token_mask, indices, device, rows_axis)
                     # a row-blocked wrapper keeps its autograd graph per output
                     # block, so backward must run per block too: the MSE sum
                     # decomposes over output columns and gradients accumulate,
@@ -921,8 +932,10 @@ class SignRoundQuantizer(BaseQuantizer):
                             for b0, b1 in block_bounds:
                                 # forward, loss, and backward complete per block
                                 # so only one block's autograd graph is ever live
+                                # (bias included: the reference forward keeps it)
+                                _bias = getattr(layer, "bias", None)
                                 with autocast_ctx:
-                                    chunk_q_block = wrapper_linear.forward_rows(chunk_input, b0, b1)
+                                    chunk_q_block = wrapper_linear.forward_rows(chunk_input, b0, b1, bias=_bias)
                                 ref_block = chunk_ref[..., b0:b1]
                                 if cat_mask is not None:
                                     loss = mse_sum_loss(

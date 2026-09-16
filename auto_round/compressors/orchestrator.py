@@ -606,7 +606,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         else:
             logger.info("start to cache block inputs")
         self._prepare_predictor_tuning_(all_blocks)
-        if getattr(self, "_predictor_plan_", None):
+        if self._predictor_overrides_last_cache_():
             # the calibration early-stop at the last cached block aborts every
             # forward before the final norm runs; the predictor tail hook
             # needs those rows, so run the pass to completion (the extra tail
@@ -622,18 +622,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         # Raw token IDs from the tokenizer, cached during calibration for use in quantize_block.
         input_ids_cache = all_inputs.pop("input_ids", None)
         self.inputs = all_inputs
-        if getattr(self, "_predictor_plan_", None):
-            # keep the last block group's auxiliary inputs (attention mask,
-            # position ids) for the predictor-tree stage; values are shared
-            # list references that survive the block loop's pops
-            _last_first = to_cache_block_names[-1] if to_cache_block_names else None
-            _entry = all_inputs.get(_last_first) if _last_first else None
-            if isinstance(_entry, dict):
-                # exclude the block's primary row key under BOTH spellings:
-                # entries are cached as "hidden_states" and renamed to
-                # "input_ids" only later - leaking either into aux would
-                # override the tree's true hidden input
-                self._predictor_tree_aux_ = {k: v for k, v in _entry.items() if k not in ("input_ids", "hidden_states")}
+        self._snapshot_predictor_aux_(all_inputs, to_cache_block_names)
 
         all_q_inputs = None
         # Leave it to gguf itself to handle
@@ -1003,6 +992,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
         if iters <= 0:
             return
+        root_tensor_names = [n for r in roots for n in ckpt if n.startswith(r + ".")]
+        if not self._pins_for_tree_(root_tensor_names):
+            return  # nothing pinned under the trees: keep the early-stop optimization
         norm_name = self._discover_final_norm_(all_blocks)
         if norm_name is None:
             logger.warning(
@@ -1090,9 +1082,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         for attr in scheme_keys:
             if pin.get(attr) is not None:
                 setattr(module, attr, pin[attr])
-        module.act_bits = pin.get("act_bits", 16)
-        module.act_sym = pin.get("act_sym", True)
-        module.act_data_type = pin.get("act_data_type", None)
+        # explicit None must not defeat the defaults (AutoScheme emits None);
+        # same idiom as the base plan application
+        module.act_bits = pin.get("act_bits") or 16
+        module.act_sym = pin.get("act_sym") if pin.get("act_sym") is not None else True
+        module.act_data_type = pin.get("act_data_type") or None
         module.global_name = name
 
     def _attach_pinned_tree_(self, group, ckpt, info, pins, all_blocks, source_dir):
@@ -1107,10 +1101,25 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.warning("predictor tree %s skipped: no sibling layer covers its tensors", group)
             return None
         sibling_name, sibling = picked
+        # remember where the group root attaches so a failed build can detach
+        # the partial tree: a half-materialized group would otherwise satisfy
+        # the export missing-tensors check and silently skip the verbatim copy
+        segs = group.split(".")
+        try:
+            group_parent = (
+                self.model_context.model.get_submodule(".".join(segs[:-1]))
+                if len(segs) > 1
+                else self.model_context.model
+            )
+        except AttributeError:
+            group_parent = None
         try:
             claimed = build_predictor_tree(self.model_context.model, source_dir, ckpt, info, sibling)
         except Exception as e:  # degrade, never die: the export path still handles the group
             logger.warning("predictor tree %s skipped: %s: %s", group, type(e).__name__, e)
+            if group_parent is not None:
+                group_parent._modules.pop(segs[-1], None)
+                logger.info("detached partially materialized predictor tree %s", group)
             return None
         logger.info("tuning predictor tree %s (layer from sibling %s)", group, sibling_name)
         shell = self.model_context.model.get_submodule(group)
@@ -1172,6 +1181,29 @@ class CompressionOrchestrator(BaseOrchestrator):
             if self.compress_context.is_immediate_packing:
                 immediate_pack(path, self.layer_config)
 
+    def _predictor_overrides_last_cache_(self) -> bool:
+        """True when the predictor plan forces calibration to run the full forward.
+
+        The early-stop at the last cached block would otherwise abort every
+        forward before the final norm, and the tail hook would never fire.
+        """
+        return getattr(self, "_predictor_plan_", None) is not None
+
+    def _snapshot_predictor_aux_(self, all_inputs, to_cache_block_names) -> None:
+        """Keep the last block group's auxiliary inputs (attention mask,
+        position ids) for the predictor-tree stage.
+
+        Excludes the block's primary row key under BOTH spellings: entries are
+        cached as "hidden_states" and renamed to "input_ids" only later -
+        leaking either into aux would override the tree's true hidden input.
+        Values are shared list references that survive the block loop's pops.
+        """
+        self._predictor_tree_aux_ = None
+        last_first = to_cache_block_names[-1] if to_cache_block_names else None
+        entry = all_inputs.get(last_first) if last_first else None
+        if isinstance(entry, dict):
+            self._predictor_tree_aux_ = {k: v for k, v in entry.items() if k not in ("input_ids", "hidden_states")}
+
     def _tune_predictor_trees_(self, token_ids) -> None:
         """Materialize and tune pinned checkpoint-only predictor trees (MTP).
 
@@ -1221,23 +1253,26 @@ class CompressionOrchestrator(BaseOrchestrator):
             bind_predictor_forward(
                 shell,
                 {
-                    "norm_e": self.model_context.model.get_submodule(info["norm_e"][: -len(".weight")]),
-                    "norm_h": self.model_context.model.get_submodule(info["norm_h"][: -len(".weight")]),
-                    "fc": self.model_context.model.get_submodule(info["fc"][: -len(".weight")]),
-                    "layer": self.model_context.model.get_submodule(info["layer_root"]),
-                    "final_norm": (
-                        self.model_context.model.get_submodule(info["final_norm"][: -len(".weight")])
-                        if info.get("final_norm")
-                        else None
-                    ),
+                    "norm_e": info["norm_e"][: -len(".weight")],
+                    "norm_h": info["norm_h"][: -len(".weight")],
+                    "fc": info["fc"][: -len(".weight")],
+                    "layer": info["layer_root"],
+                    "final_norm": info["final_norm"][: -len(".weight")] if info.get("final_norm") else None,
                 },
                 e=e_rows[0],
+                model=self.model_context.model,
             )
             aux = dict(self._predictor_tree_aux_ or {})
             aux["_predictor_e"] = e_rows
             _, input_others = self._preprocess_block_inputs({"input_ids": fp_tail, **aux})
             from auto_round.algorithms.composer import BlockContext
 
+            # same infrastructure the block loop applies: materialize meta
+            # tensors, honor the amp dtype policy, and place the tree on the
+            # tuning device (compress_block treats placement as caller's job)
+            materialize_model_(shell)
+            convert_module_to_hp_if_necessary(shell, self.model_context.amp_dtype, device_manager.device)
+            shell = self.alg_composer.dispatch_block(shell, fp_tail, input_others)
             ctx = BlockContext(
                 model=self.model_context.model,
                 block_names=[group],

@@ -14,6 +14,7 @@
 import ctypes
 import functools
 import gc
+import logging
 import os
 import re
 import shutil
@@ -1777,6 +1778,8 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
     """
     import torch
 
+    if not logger.isEnabledFor(logging.DEBUG):
+        return  # the gc walk below is expensive; skip it entirely unless visible
     if device is None:
         device = torch.device("cuda") if torch.cuda.is_available() else None
     if device is None or getattr(device, "type", "cpu") != "cuda":

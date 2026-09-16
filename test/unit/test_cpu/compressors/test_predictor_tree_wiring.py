@@ -93,6 +93,8 @@ _ORCH_METHODS = (
     "_stamp_pin_",
     "_attach_pinned_tree_",
     "_tune_tree_heads_",
+    "_predictor_overrides_last_cache_",
+    "_snapshot_predictor_aux_",
     "_tune_predictor_trees_",
 )
 
@@ -103,7 +105,7 @@ def _orch(model, tmp_path, layer_config=None, iters=10, composer=None):
         setattr(o, name, getattr(CompressionOrchestrator, name).__get__(o))
     if not hasattr(model, "config"):
         model.config = SimpleNamespace(name_or_path=str(tmp_path), hidden_size=HID, text_config=None)
-    o.model_context = SimpleNamespace(model=model)
+    o.model_context = SimpleNamespace(model=model, amp_dtype=torch.float32)
     o.layer_config = layer_config if layer_config is not None else {}
     o.alg_composer = composer or SimpleNamespace(block_quantizer=[SimpleNamespace(iters=iters)])
     o.calibration_context = SimpleNamespace(batch_size=2, nsamples=2)
@@ -176,6 +178,9 @@ class TestTunePredictorTrees:
 
         class _Composer:
             block_quantizer = [SimpleNamespace(iters=10)]
+
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
 
             def compress_block(self, shell, fp, io, block_ctx=None, q_inputs=None, input_ids=None):
                 # run the tree forward once so the test exercises the bound predictor
@@ -266,6 +271,9 @@ class TestTreeFallbacks:
         class _Composer:
             block_quantizer = [SimpleNamespace(iters=10)]
 
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
+
             def compress_block(self, *a, **k):
                 calls["block"].append(1)
 
@@ -290,6 +298,9 @@ class TestTreeFallbacks:
 
         class _Composer:
             block_quantizer = [SimpleNamespace(iters=10)]
+
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
 
             def compress_block(self, *a, **k):
                 calls["block"].append(1)
@@ -327,6 +338,9 @@ class TestImmediatePackingPath:
         class _Composer:
             block_quantizer = [SimpleNamespace(iters=10)]
 
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
+
             def compress_block(self, shell, fp, io, block_ctx=None, q_inputs=None, input_ids=None):
                 return fp, fp
 
@@ -351,3 +365,72 @@ class TestImmediatePackingPath:
         o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
         assert "mtp.fc" in packed  # head packed inside _tune_tree_heads_
         assert any(name.startswith("mtp.") for name in packed)  # tree Linears packed
+
+
+class TestCacheOverrideHelpers:
+    def test_override_flag_tracks_plan(self, tmp_path):
+        _write_ckpt(tmp_path)
+        o = _orch(_Body(), tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        assert o._predictor_overrides_last_cache_() is True
+        o2 = _orch(_Body(), tmp_path)  # no pins, no plan
+        o2._prepare_predictor_tuning_(ALL_BLOCKS)
+        assert o2._predictor_overrides_last_cache_() is False
+
+    def test_aux_snapshot_excludes_both_row_spellings(self, tmp_path):
+        o = _orch(_Body(), tmp_path)
+        rows = [torch.randn(1, 5, HID) for _ in range(2)]
+        masks = [torch.ones(1, 5) for _ in range(2)]
+        # the cache entry before the rename: primary rows under "hidden_states"
+        entry = {"hidden_states": rows, "attention_mask": masks}
+        o._snapshot_predictor_aux_({"blocks.1": entry}, ["blocks.0", "blocks.1"])
+        assert set(o._predictor_tree_aux_.keys()) == {"attention_mask"}
+        assert o._predictor_tree_aux_["attention_mask"] is masks
+        # after the rename the same exclusion must hold
+        entry2 = {"input_ids": rows, "attention_mask": masks}
+        o._snapshot_predictor_aux_({"blocks.1": entry2}, ["blocks.0", "blocks.1"])
+        assert set(o._predictor_tree_aux_.keys()) == {"attention_mask"}
+
+
+class TestLazyRefs:
+    def test_refs_resolve_live_through_wrappers(self, tmp_path):
+        from auto_round.compressors.predictor_tree import bind_predictor_forward
+
+        _write_ckpt(tmp_path)
+        model = _Body()
+        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        model(torch.randint(0, 16, (2, 5)))
+        o._finish_predictor_capture_("fp")
+
+        import auto_round.compressors.predictor_tree as pt
+
+        ckpt = pt.list_checkpoint_tensors(str(tmp_path))
+        info = pt.analyze_predictor_group(ckpt, "mtp", HID)
+        _, sibling = pt.pick_sibling_layer(model, ckpt, info, ALL_BLOCKS)
+        pt.build_predictor_tree(model, str(tmp_path), ckpt, info, sibling)
+        shell = model.get_submodule("mtp")
+        # PATH refs + model: resolve live at forward time
+        bind_predictor_forward(
+            shell,
+            {
+                "norm_e": info["norm_e"][: -len(".weight")],
+                "norm_h": info["norm_h"][: -len(".weight")],
+                "fc": info["fc"][: -len(".weight")],
+                "layer": info["layer_root"],
+                "final_norm": info["final_norm"][: -len(".weight")],
+            },
+            model=model,
+        )
+        h = torch.randn(1, 5, HID)
+        e = torch.randn(1, 5, HID)
+        out1 = shell(h, _predictor_e=e)
+
+        # replace the mixer with a wrapper whose forward is visibly different;
+        # the tree forward must pick the REPLACEMENT up (lazy resolution)
+        doubled = torch.nn.Linear(2 * HID, HID, bias=False)
+        with torch.no_grad():
+            doubled.weight.copy_(model.get_submodule("mtp.eh_proj").weight * 2.0)
+        model.get_submodule("mtp").eh_proj = doubled
+        out2 = shell(h, _predictor_e=e)
+        assert not torch.allclose(out1, out2), "lazy refs must resolve the wrapped module live"
