@@ -501,6 +501,7 @@ def _allgather_doubling(buffers: List[torch.Tensor], transport: str) -> None:
 
 
 _SIGN_LOGGED = False
+_FULLVALUE_LOGGED = False
 _ENGAGED_LOGGED_SIG = None  # module-level init for the global read in resolve_tune_ddp_plan_
 
 
@@ -1106,7 +1107,10 @@ class ReplicaGroup:
             )
             return
         with _stage(prof, "exchange"):
-            if sign_exchange:
+            from auto_round import envs as _envs
+
+            use_sign = sign_exchange and _envs.AR_TUNE_DDP_SIGN_EXCHANGE
+            if use_sign:
                 global _SIGN_LOGGED
                 if not _SIGN_LOGGED:
                     _SIGN_LOGGED = True
@@ -1117,6 +1121,16 @@ class ReplicaGroup:
                     )
                 sign_exchange_allreduce(bufs, transport=self.grad_transport)
             else:
+                global _FULLVALUE_LOGGED
+                if not _FULLVALUE_LOGGED:
+                    _FULLVALUE_LOGGED = True
+                    _reason = "momentum enabled" if _envs.AR_TUNE_DDP_SIGN_EXCHANGE else "AR_TUNE_DDP_SIGN_EXCHANGE=0"
+                    logger.info(
+                        "[tune-ddp] full-value gradient exchange: world=%d transport=%s (%s)",
+                        self.world,
+                        self.grad_transport,
+                        _reason,
+                    )
                 halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
         with _stage(prof, "writeback"):
             for buf, params in zip(bufs, params_per_replica):

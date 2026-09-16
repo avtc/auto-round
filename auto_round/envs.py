@@ -218,6 +218,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional explicit comma-separated replica devices (e.g. "0,1,2,3"); by default
     # the plan picks from the visible CUDA devices with enough free VRAM.
     "AR_TUNE_DDP_DEVICES": lambda: os.getenv("AR_TUNE_DDP_DEVICES", ""),
+    # Gradient-exchange wire dtype for parallel tuning: fp32 | bf16 | int8.
+    # Applies to the reduce-scatter transport of the sign exchange and to the
+    # full-value exchange when the sign exchange is disabled below.
+    "AR_TUNE_DDP_GRAD_TRANSPORT": lambda: os.getenv("AR_TUNE_DDP_GRAD_TRANSPORT", "bf16"),
+    # 1 (default): exchange int8 signs of the averaged gradient (exact for pure
+    # sign-SGD, i.e. momentum disabled). 0: always exchange full averaged values
+    # via the halving-doubling all-reduce (A/B and momentum-enabled runs).
+    "AR_TUNE_DDP_SIGN_EXCHANGE": lambda: os.getenv("AR_TUNE_DDP_SIGN_EXCHANGE", "1") not in ("0", "false", "False"),
 }
 
 

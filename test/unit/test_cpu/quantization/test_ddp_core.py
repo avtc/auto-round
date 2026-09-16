@@ -173,18 +173,75 @@ class TestCatDeviceSafe:
 
 class TestEnvDefaults:
     def test_ddp_defaults_resolve(self, monkeypatch):
-        for name in ("AR_TUNE_DDP_WORLD", "AR_TUNE_DDP_DEVICES"):
+        for name in (
+            "AR_TUNE_DDP_WORLD",
+            "AR_TUNE_DDP_DEVICES",
+            "AR_TUNE_DDP_GRAD_TRANSPORT",
+            "AR_TUNE_DDP_SIGN_EXCHANGE",
+        ):
             monkeypatch.delenv(name, raising=False)
         from auto_round import envs
 
         assert envs.AR_TUNE_DDP_WORLD == 1
         assert envs.AR_TUNE_DDP_DEVICES == ""
+        assert envs.AR_TUNE_DDP_GRAD_TRANSPORT == "bf16"
+        assert envs.AR_TUNE_DDP_SIGN_EXCHANGE is True
 
     def test_world_env_round_trip(self, monkeypatch):
         monkeypatch.setenv("AR_TUNE_DDP_WORLD", "4")
         from auto_round import envs
 
         assert envs.AR_TUNE_DDP_WORLD == 4
+
+
+class TestExchangeSelection:
+    """AR_TUNE_DDP_SIGN_EXCHANGE=0 forces the full-value exchange even when the
+    caller gates the sign exchange on (momentum==0); the A/B switch for
+    full-value fp32/bf16 vs int8-sign exchanges."""
+
+    def _group(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(world=2, grad_transport="fp32")
+
+    def test_env_off_forces_full_value_path(self, monkeypatch):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        monkeypatch.setenv("AR_TUNE_DDP_SIGN_EXCHANGE", "0")
+        calls = []
+        orig_sign, orig_full = dp.sign_exchange_allreduce, dp.halving_doubling_allreduce
+        dp.sign_exchange_allreduce = lambda bufs, transport="fp32": calls.append(("sign", transport))
+        dp.halving_doubling_allreduce = lambda bufs, scale=1.0, transport="fp32": calls.append(("full", transport))
+        try:
+            # params-per-replica with fp32 grads on cpu; buffers build via cat
+            p0 = torch.nn.Parameter(torch.zeros(2))
+            p1 = torch.nn.Parameter(torch.zeros(2))
+            p0.grad, p1.grad = torch.ones(2), torch.ones(2)
+            dp.ReplicaGroup.sync_grads(self._group(), [[p0], [p1]], sign_exchange=True)
+        finally:
+            dp.sign_exchange_allreduce, dp.halving_doubling_allreduce = orig_sign, orig_full
+        assert calls == [("full", "fp32")]
+
+    def test_env_default_keeps_sign_path(self, monkeypatch):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        monkeypatch.delenv("AR_TUNE_DDP_SIGN_EXCHANGE", raising=False)
+        calls = []
+        orig_sign, orig_full = dp.sign_exchange_allreduce, dp.halving_doubling_allreduce
+        dp.sign_exchange_allreduce = lambda bufs, transport="fp32": calls.append(("sign", transport))
+        dp.halving_doubling_allreduce = lambda bufs, scale=1.0, transport="fp32": calls.append(("full", transport))
+        try:
+            p0 = torch.nn.Parameter(torch.zeros(2))
+            p1 = torch.nn.Parameter(torch.zeros(2))
+            p0.grad, p1.grad = torch.ones(2), torch.ones(2)
+            dp.ReplicaGroup.sync_grads(self._group(), [[p0], [p1]], sign_exchange=True)
+        finally:
+            dp.sign_exchange_allreduce, dp.halving_doubling_allreduce = orig_sign, orig_full
+        assert calls == [("sign", "fp32")]
 
 
 class TestTupleKwargSlicing:
