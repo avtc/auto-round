@@ -155,16 +155,6 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
 
 ```bash
 export AR_TUNE_DDP_DEVICES=0,1,2,3
-```### AR_TUNE_DDP_DEVICES
-- **Description**: Optional explicit comma-separated replica devices (e.g. `0,1,2,3`) for
-  `--parallel_quantization` tuning. By default the plan picks from the visible CUDA devices with enough free
-  VRAM for a mirror; each replica holds a full block mirror on its plan device and draws a disjoint calibration
-  shard, so the effective batch matches the serial run's data coverage.
-- **Default**: unset → plan-derived
-- **Valid Values**: comma-separated device indices
-
-```bash
-export AR_TUNE_DDP_DEVICES=0,1,2,3
 ```
 
 ### AR_AUTO_SCHEME_NSAMPLES
