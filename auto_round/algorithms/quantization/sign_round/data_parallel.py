@@ -195,6 +195,21 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         decline.append("non-list reference outputs (diffusion-style pools)")
     if world > 1 and is_distributed():
         decline.append("multi-process torchrun lane is active (AR_TUNE_DDP_WORLD is single-process)")
+    # Parallel tuning tunes whole-block mirrors: every replica, including the
+    # home copy, must sit on ONE device for the tune. A block whose weights
+    # span several CUDA devices (multi-GPU auto placement) is a different
+    # topology (pipeline-style stages), so fail visibly instead of gathering:
+    # the placement itself must be single-device when parallel tuning runs.
+    # CPU-resident tensors are legal alongside the home device (pinned
+    # subtrees such as ngram embedding tables stay on CPU by design).
+    _home_cuda_devs = {p.device for p in block.parameters() if p.device.type == "cuda"}
+    if world > 1 and len(_home_cuda_devs) > 1:
+        decline.append(
+            f"block spans {len(_home_cuda_devs)} CUDA devices; parallel tuning requires "
+            "single-device placement (pass one device via --device_map, or run with "
+            "--parallel_quantization off)"
+        )
+    eligible = eligible and len(_home_cuda_devs) <= 1
 
     plan = DDPPlan(1, [home], len(fp_inputs) if isinstance(fp_inputs, list) else 0)
     if eligible:
@@ -259,46 +274,6 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             )
     quantizer._resolved_ddp_plan = plan
     return plan
-
-
-def gather_block_for_mirroring_(block, home: torch.device) -> bool:
-    """Gather a (possibly module-sharded) block whole onto ``home`` for DDP mirroring.
-
-    The data-driven multi-GPU lane shards a block's leaves across the device
-    list (``set_auto_device_map_for_block_with_tuning``), so the source block
-    may span several devices when the DDP plan resolves. Every replica --
-    including the home -- must sit whole on ONE device for the tune forward,
-    so the gather runs on the source block BEFORE the mirrors are built;
-    mirror fit has already been priced into the plan, so a block that fits a
-    mirror fits its home.
-
-    Preserves CPU-pinned / self-managed subtrees (e.g. ngram embedding
-    tables) and repoints the per-leaf ``tuning_device`` markers (plain
-    strings -- ``_relocate_params`` only sees ``torch.device`` attrs) so
-    wrapper input staging targets the gathered device instead of a stale
-    shard. Returns True when any state actually moved.
-    """
-    moved = False
-    devs = {p.device for p in block.parameters()}
-    if devs and devs != {home}:
-        logger.info(
-            "[tune-ddp] gathering block onto %s before mirroring (source spanned %d device(s): %s)",
-            home,
-            len(devs),
-            sorted(str(d) for d in devs),
-        )
-        from auto_round.utils.model import move_to_device_preserving_cpu_pinned
-
-        move_to_device_preserving_cpu_pinned(block, home)
-        moved = True
-    home_s = str(home)
-    for _n, m in block.named_modules():
-        td = getattr(m, "tuning_device", None)
-        if td is not None and str(td) != home_s:
-            m.tuning_device = home
-            moved = True
-    _relocate_params(block, home)
-    return moved
 
 
 def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:

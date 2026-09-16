@@ -44,7 +44,6 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     block_has_tuning_entries,
     distribute_pool,
     expect_pool_local,
-    gather_block_for_mirroring_,
     pre_wrap_shard_candidate,
     resolve_tune_ddp_plan_,
     run_deferred_wrap_searches,
@@ -248,9 +247,10 @@ class TuneParallelContext:
             logger.info("[tune-ddp] declining: no tuning parameters in this block (all-float pinned); serial path")
             return None
 
-        # the source block must sit whole on the home device before
-        # mirroring (data-driven multi-GPU may have sharded its leaves)
-        gather_block_for_mirroring_(block, plan.devices[0])
+        # Placement contract: the resolver declined (or raised) when the
+        # block's weights span several CUDA devices, so the source block
+        # already sits whole on the home device and every mirror will sit
+        # whole on exactly one device.
         # distributed calibration pool: shard-local tune reads; each
         # device owns a contiguous 1/world slice of the samples
         distribute_pool(active_inputs, plan.devices)

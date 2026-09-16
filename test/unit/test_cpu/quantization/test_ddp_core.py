@@ -28,7 +28,6 @@ from auto_round.algorithms.quantization.sign_round.data_parallel import (
     _encode_transport,
     _transport_segment,
     distribute_pool,
-    gather_block_for_mirroring_,
     resolve_ddp_plan,
 )
 from auto_round.compressors.utils import IndexSampler, shard_samplers
@@ -159,24 +158,6 @@ class TestDistributePool:
         distribute_pool([torch.zeros(2) for _ in range(8)], [torch.device("cpu")] * 4)
         # indivisible / too-small pools are left alone by contract (serial cats handle them)
         distribute_pool([torch.zeros(2)], [torch.device("cpu")] * 4)
-
-
-class TestGatherOnCPU:
-    def test_noop_on_whole_block(self):
-        block = torch.nn.Linear(4, 4)
-        assert gather_block_for_mirroring_(block, torch.device("cpu")) is False
-
-    def test_repoints_stale_tuning_device_strings(self):
-        block = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
-        block[1].tuning_device = "cuda:5"
-        assert gather_block_for_mirroring_(block, torch.device("cpu")) is True
-        assert str(block[1].tuning_device) == "cpu"
-
-    def test_moves_wrapper_dict_state(self):
-        block = torch.nn.Linear(4, 4)
-        block.params = {"v": torch.nn.Parameter(torch.ones(4), requires_grad=True)}
-        gather_block_for_mirroring_(block, torch.device("cpu"))
-        assert block.params["v"].device.type == "cpu"
 
 
 class TestCatDeviceSafe:
@@ -323,6 +304,54 @@ class TestLoggingGlobals:
 
         assert dp._ENGAGED_LOGGED_SIG is None
         assert isinstance(dp._coll_mirror_setup_logged, set)
+
+
+class TestSingleDevicePlacement:
+    """Parallel tuning tunes whole-block mirrors: a block whose weights span
+    several CUDA devices fails the resolver (validation, never a gather)."""
+
+    @staticmethod
+    def _param(dev, n=8):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(device=torch.device(dev), numel=lambda: n, element_size=lambda: 4)
+
+    @staticmethod
+    def _quantizer():
+        from types import SimpleNamespace
+
+        q = SimpleNamespace(iters=10, gradient_accumulate_steps=1, enable_lfq=False, _resolved_ddp_plan=None)
+        q._get_scaler = lambda: None
+        return q
+
+    def test_block_spanning_two_cuda_devices_declines(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        block = SimpleNamespace(parameters=lambda: iter([self._param("cuda:0"), self._param("cuda:1")]))
+        with pytest.raises(RuntimeError, match="spans 2 CUDA devices"):
+            resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)], None, "cuda:0")
+
+    def test_cpu_resident_weights_pass_span_rule(self, monkeypatch):
+        """CPU-pinned subtrees alongside the CUDA home are legal placement."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        block = SimpleNamespace(
+            parameters=lambda: iter([self._param("cpu"), self._param("cuda:0")]),
+            modules=lambda: iter([]),
+        )
+        with pytest.raises(RuntimeError) as excinfo:
+            resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)], None, "cuda:0", log=False)
+        assert "spans" not in str(excinfo.value)
 
 
 class TestRequestedWorldErrors:
