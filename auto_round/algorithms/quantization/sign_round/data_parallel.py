@@ -182,8 +182,8 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
 
     Single source of truth for engagement so the collection pass (composer) and
     the tune (quantizer) can never diverge: both check the same eligibility
-    (world env, CUDA home, no grad scaler, gradient_accumulate_steps=1,
-    no LFQ, list pools, not on the torchrun lane), price the same mirror
+    (world env, accelerator home, no grad scaler, no LFQ, list pools, not on
+    the torchrun lane), price the same mirror
     footprint, apply the same VRAM/explicit-device selection and the same
     power-of-two gate. The resolved plan is cached on the quantizer instance;
     the tune-side caller re-resolves post-wrap (exact wrapper pricing, fresh
@@ -225,7 +225,6 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         world > 1
         and home.type in _SUPPORTED_ACCEL_TYPES
         and _scaler is None
-        and getattr(quantizer, "gradient_accumulate_steps", 1) == 1
         and not getattr(quantizer, "enable_lfq", False)
         and isinstance(fp_inputs, list)
         and (fp_outputs is None or isinstance(fp_outputs, list))
@@ -233,8 +232,6 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
     )
     if world > 1 and _scaler is not None:
         decline.append("a grad scaler is active")
-    if world > 1 and getattr(quantizer, "gradient_accumulate_steps", 1) != 1:
-        decline.append("gradient_accumulate_steps != 1")
     if world > 1 and getattr(quantizer, "enable_lfq", False):
         decline.append("enable_lfq")
     if world > 1 and isinstance(fp_inputs, list) and fp_outputs is not None and not isinstance(fp_outputs, list):

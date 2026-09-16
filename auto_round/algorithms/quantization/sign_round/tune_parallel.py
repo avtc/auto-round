@@ -474,12 +474,17 @@ class TuneParallelContext:
         self.perf["exch"].append(_ptime.perf_counter() - _t0)
         self._pending_sync = False
 
-    def mean_loss(self, losses: Sequence[Optional[torch.Tensor]], num_elm) -> float:
-        """Report the global-batch mean (mean of equal-size shard means ==
-        the serial global mean), normalized by the valid-element count
-        exactly like the serial path."""
+    def mean_loss(self, losses: Sequence[Optional[torch.Tensor]], num_elm, divide_world: bool = True) -> float:
+        """Report the global-batch loss normalized by the valid-element count
+        exactly like the serial path.
+
+        ``divide_world=True`` for mean-reduced per-shard losses (mean of
+        equal-size shard means == the serial global mean); ``False`` for
+        sum-reduced per-shard losses (gradient accumulation): the shard sums
+        add up to the serial global sum, so only the element count divides."""
         _ne = 1 if num_elm <= 0 else num_elm
-        return sum(l.item() for l in losses if l is not None) / self.group.world / _ne
+        total = sum(l.item() for l in losses if l is not None)
+        return total / self.group.world / _ne if divide_world else total / _ne
 
     def step(self, home_step_fn: Callable[[], None]) -> None:
         """Run the home step and every mirror step in parallel threads (home

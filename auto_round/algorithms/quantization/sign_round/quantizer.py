@@ -622,6 +622,9 @@ class SignRoundQuantizer(BaseQuantizer):
                     if valid_token_mask is not None:
                         # same global normalization as the serial path (reporting only)
                         num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
+                    # without a mask, num_elm keeps its pre-loop value (the
+                    # element count over the whole global batch), matching the
+                    # serial accumulation normalization
                     _losses = accel.run_step(_ddp_step, _shards)
                     # sync_grads: cross-replica gradient exchange. sign_exchange:
                     # the update consumes only sign(mean-grad) and weight_decay is
@@ -633,7 +636,10 @@ class SignRoundQuantizer(BaseQuantizer):
                     # means == the serial global mean), normalized by the
                     # valid-element count exactly like the serial path so
                     # best-iter selection and dynamic_max_gap behave identically
-                    total_loss = accel.mean_loss(_losses, num_elm)
+                    # sum-reduced shard losses (accumulation) add up to the
+                    # serial global sum, so only the element count divides;
+                    # mean-reduced shard losses need the mean-of-shard-means
+                    total_loss = accel.mean_loss(_losses, num_elm, divide_world=self.gradient_accumulate_steps == 1)
 
                 else:
                     global_indices = index_sampler.next_batch()

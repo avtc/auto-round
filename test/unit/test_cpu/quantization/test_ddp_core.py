@@ -194,6 +194,82 @@ class TestEnvDefaults:
         assert envs.AR_TUNE_DDP_WORLD == 4
 
 
+class TestAccumulationSupport:
+    """gradient_accumulate_steps > 1 engages: sum-reduced shard losses exchange
+    as values whose sign (and positive-rescaled magnitude) matches the serial
+    accumulated gradient, and mean_loss normalizes without the world divisor."""
+
+    def _quantizer(self, accum):
+        from types import SimpleNamespace
+
+        q = SimpleNamespace(
+            iters=10,
+            gradient_accumulate_steps=accum,
+            enable_lfq=False,
+            _resolved_ddp_plan=None,
+        )
+        q._get_scaler = lambda: None
+        return q
+
+    def test_accumulation_engages(self, monkeypatch):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        from types import SimpleNamespace
+
+        block = SimpleNamespace(
+            parameters=lambda: iter(
+                [SimpleNamespace(device=torch.device("cuda", 0), numel=lambda: 8, element_size=lambda: 4)]
+            ),
+            modules=lambda: iter([]),
+        )
+        plan = resolve_tune_ddp_plan_(self._quantizer(2), block, [torch.zeros(1)] * 2, None, "cuda:0", log=False)
+        # engages with explicit devices; the accumulation gate is gone
+        assert plan.world == 2
+        assert not any("accumulate" in str(n) for n in plan.notes)
+
+    def test_mean_loss_normalization_modes(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.tune_parallel import TuneParallelContext
+
+        ctx = TuneParallelContext()
+        ctx.group = SimpleNamespace(world=2)
+        losses = [torch.tensor(6.0), torch.tensor(10.0)]
+        # mean-reduced: mean of shard means (8 / 2 shards... mean(6,10)=8) / num_elm=2 -> 4.0
+        assert ctx.mean_loss(losses, num_elm=2, divide_world=True) == 4.0
+        # sum-reduced: shard sums add to the global sum (16) / num_elm=2 -> 8.0
+        assert ctx.mean_loss(losses, num_elm=2, divide_world=False) == 8.0
+
+    def test_accumulated_grad_sign_matches_serial(self):
+        """Two replicas, sum-reduced shard losses; the full-value exchange
+        leaves each replica with the averaged gradient -- a positive rescale
+        of the serial accumulated (summed) gradient, so sign-SGD updates and
+        momentum directions match serial."""
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        world = 2
+        # replicas hold the SAME parameters (mirrors); each accumulates the
+        # sum-reduced gradient over its own data shard. Shard grads derived
+        # analytically: grad of (x[shard]**2).sum() lives on the shard slice.
+        x = torch.randn(16, requires_grad=False)
+        grad0 = torch.zeros(16)
+        grad0[:8] = 2 * x[:8]
+        grad1 = torch.zeros(16)
+        grad1[8:] = 2 * x[8:]
+        bufs = [grad0.clone(), grad1.clone()]
+        dp.halving_doubling_allreduce(bufs, scale=1.0 / world, transport="fp32")
+        serial_accumulated = 2 * x  # serial: grads summed over both shards
+        for buf in bufs:
+            # exchanged buffer x world == serial accumulated gradient
+            assert torch.allclose(buf * world, serial_accumulated, atol=1e-6)
+
+
 class TestExchangeSelection:
     """AR_TUNE_DDP_SIGN_EXCHANGE=0 forces the full-value exchange even when the
     caller gates the sign exchange on (momentum==0); the A/B switch for
