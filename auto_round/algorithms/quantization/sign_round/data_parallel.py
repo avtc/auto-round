@@ -206,8 +206,9 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
     if world > 1 and len(_home_cuda_devs) > 1:
         decline.append(
             f"block spans {len(_home_cuda_devs)} CUDA devices; parallel tuning requires "
-            "single-device placement (pass one device via --device_map, or run with "
-            "--parallel_quantization off)"
+            "single-device block placement (run with no --device_map or a single-device "
+            "--device_map; multi-device/auto maps may shard a block across GPUs -- or run "
+            "with --parallel_quantization off)"
         )
     eligible = eligible and len(_home_cuda_devs) <= 1
 
