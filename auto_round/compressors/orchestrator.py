@@ -606,6 +606,12 @@ class CompressionOrchestrator(BaseOrchestrator):
         else:
             logger.info("start to cache block inputs")
         self._prepare_predictor_tuning_(all_blocks)
+        if getattr(self, "_predictor_plan_", None):
+            # the calibration early-stop at the last cached block aborts every
+            # forward before the final norm runs; the predictor tail hook
+            # needs those rows, so run the pass to completion (the extra tail
+            # compute is one norm + lm_head forward per batch)
+            _last_cache_name = None
         all_inputs = self.cache_data(
             to_cache_block_names,
             self.calibration_context.nsamples,
@@ -623,7 +629,11 @@ class CompressionOrchestrator(BaseOrchestrator):
             _last_first = to_cache_block_names[-1] if to_cache_block_names else None
             _entry = all_inputs.get(_last_first) if _last_first else None
             if isinstance(_entry, dict):
-                self._predictor_tree_aux_ = {k: v for k, v in _entry.items() if k != "input_ids"}
+                # exclude the block's primary row key under BOTH spellings:
+                # entries are cached as "hidden_states" and renamed to
+                # "input_ids" only later - leaking either into aux would
+                # override the tree's true hidden input
+                self._predictor_tree_aux_ = {k: v for k, v in _entry.items() if k not in ("input_ids", "hidden_states")}
 
         all_q_inputs = None
         # Leave it to gguf itself to handle
@@ -1040,13 +1050,18 @@ class CompressionOrchestrator(BaseOrchestrator):
         """Remove the hook and store the captured rows as the fp/q tail."""
         hooked = getattr(self, "_predictor_hook_", None)
         self._predictor_hook_ = None
-        if hooked is None or hooked[2] != kind:
+        if hooked is None:
             return
-        handle, storage, _ = hooked
-        handle.remove()
+        handle, storage, hooked_kind = hooked
+        handle.remove()  # always remove, even on kind mismatch - never leak a hook
+        if hooked_kind != kind:
+            return
         rows = storage["rows"]
         if not rows:
             return
+        nsamples = getattr(self.calibration_context, "nsamples", None)
+        if isinstance(nsamples, int) and nsamples > 0 and len(rows) > nsamples:
+            rows = rows[:nsamples]  # calibration OOM retries re-run batches; keep the first pass
         setattr(self, "_predictor_fp_tail_" if kind == "fp" else "_predictor_q_tail_", rows)
 
     def _begin_predictor_q_capture_(self) -> None:
@@ -1065,13 +1080,97 @@ class CompressionOrchestrator(BaseOrchestrator):
         return pins
 
     def _stamp_pin_(self, module, name: str, pin: dict) -> None:
-        for attr in ("bits", "group_size", "sym", "data_type", "scale_dtype", "super_bits", "super_group_size"):
+        # same field set as the canonical plan boundary (apply_plan_to_model)
+        # so future scheme fields reach predictor-tree modules too
+        from dataclasses import fields as dc_fields
+
+        from auto_round.schemes import QuantizationScheme
+
+        scheme_keys = tuple(f.name for f in dc_fields(QuantizationScheme)) + ("scale_dtype",)
+        for attr in scheme_keys:
             if pin.get(attr) is not None:
                 setattr(module, attr, pin[attr])
         module.act_bits = pin.get("act_bits", 16)
         module.act_sym = pin.get("act_sym", True)
         module.act_data_type = pin.get("act_data_type", None)
         module.global_name = name
+
+    def _attach_pinned_tree_(self, group, ckpt, info, pins, all_blocks, source_dir):
+        """Materialize one predictor tree and stamp pins on its Linears.
+
+        Returns ``(shell, pinned_module_names, claimed_tensor_names)`` or None
+        (with a warning logged) when no sibling covers the tree, the build
+        fails, or the pins match no Linear.
+        """
+        picked = pick_sibling_layer(self.model_context.model, ckpt, info, all_blocks)
+        if picked is None:
+            logger.warning("predictor tree %s skipped: no sibling layer covers its tensors", group)
+            return None
+        sibling_name, sibling = picked
+        try:
+            claimed = build_predictor_tree(self.model_context.model, source_dir, ckpt, info, sibling)
+        except Exception as e:  # degrade, never die: the export path still handles the group
+            logger.warning("predictor tree %s skipped: %s: %s", group, type(e).__name__, e)
+            return None
+        logger.info("tuning predictor tree %s (layer from sibling %s)", group, sibling_name)
+        shell = self.model_context.model.get_submodule(group)
+        pinned = []
+        for n, m in shell.named_modules():
+            if not isinstance(m, torch.nn.Linear):
+                continue
+            module_name = f"{group}.{n}" if n else group
+            for key, pin in pins.items():
+                if module_name == key or re.compile(to_standard_regex(key)).search(module_name):
+                    self._stamp_pin_(m, module_name, pin)
+                    self.layer_config[module_name] = pin
+                    pinned.append(module_name)
+                    break
+        if not pinned:
+            logger.warning(
+                "predictor tree %s: pins %s matched no Linear; leaving to the export pass", group, list(pins)
+            )
+            return None
+        return shell, pinned, claimed
+
+    def _tune_tree_heads_(
+        self, group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids
+    ):
+        """Tune remaining pinned 2-D tensors (e.g. the vocab head) on the tree's outputs."""
+        role_names = {info[r] for r in ("fc", "norm_e", "norm_h", "final_norm") if info.get(r)}
+        for n in (n for n in ckpt if n.startswith(group + ".")):
+            if n in claimed or n in role_names or not n.endswith(".weight"):
+                continue
+            shape = ckpt[n][0]
+            if len(shape) != 2:
+                continue
+            if not any(n == key or re.compile(to_standard_regex(key)).search(n) for key in pins):
+                continue
+            path = n[: -len(".weight")]
+            try:
+                self.model_context.model.get_submodule(path)
+            except AttributeError:
+                head = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=False)
+                from auto_round.compressors.predictor_tree import ensure_module_path, load_checkpoint_tensor
+
+                parent = ensure_module_path(self.model_context.model, path)
+                parent.add_module(path.rsplit(".", 1)[-1], head)
+                with torch.no_grad():
+                    head.weight.copy_(load_checkpoint_tensor(source_dir, ckpt, n))
+            mod = self.model_context.model.get_submodule(path)
+            for key, pin in pins.items():
+                if path == key or re.compile(to_standard_regex(key)).search(path):
+                    self._stamp_pin_(mod, path, pin)
+                    self.layer_config[path] = pin
+                    break
+            logger.info("tuning pinned predictor tensor %s on the tree outputs", path)
+            self.alg_composer.compress_layer_outside_block(
+                mod,
+                fp_inputs=reference_output,
+                q_inputs=new_q_output,
+                input_ids=token_ids,
+            )
+            if self.compress_context.is_immediate_packing:
+                immediate_pack(path, self.layer_config)
 
     def _tune_predictor_trees_(self, token_ids) -> None:
         """Materialize and tune pinned checkpoint-only predictor trees (MTP).
@@ -1115,34 +1214,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             if not pins:
                 logger.info("predictor tree %s has no layer-config pins; leaving it to the export pass", group)
                 continue
-            picked = pick_sibling_layer(self.model_context.model, ckpt, info, all_blocks)
-            if picked is None:
-                logger.warning("predictor tree %s skipped: no sibling layer covers its tensors", group)
+            attached = self._attach_pinned_tree_(group, ckpt, info, pins, all_blocks, source_dir)
+            if attached is None:
                 continue
-            sibling_name, sibling = picked
-            try:
-                claimed = build_predictor_tree(self.model_context.model, source_dir, ckpt, info, sibling)
-            except RuntimeError as e:
-                logger.warning("predictor tree %s skipped: %s", group, e)
-                continue
-            logger.info("tuning predictor tree %s (layer from sibling %s)", group, sibling_name)
-            shell = self.model_context.model.get_submodule(group)
-            pinned = []
-            for n, m in shell.named_modules():
-                if not isinstance(m, torch.nn.Linear):
-                    continue
-                module_name = f"{group}.{n}" if n else group
-                for key, pin in pins.items():
-                    if module_name == key or re.compile(to_standard_regex(key)).search(module_name):
-                        self._stamp_pin_(m, module_name, pin)
-                        self.layer_config[module_name] = pin
-                        pinned.append(module_name)
-                        break
-            if not pinned:
-                logger.warning(
-                    "predictor tree %s: pins %s matched no Linear; leaving to the export pass", group, list(pins)
-                )
-                continue
+            shell, pinned, claimed = attached
             bind_predictor_forward(
                 shell,
                 {
@@ -1179,47 +1254,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 q_inputs=self._predictor_q_tail_,
                 input_ids=token_ids,
             )
-            role_names = {info[r] for r in ("fc", "norm_e", "norm_h", "final_norm") if info.get(r)}
-            for n in names_under:
-                if n in claimed or n in role_names or not n.endswith(".weight"):
-                    continue
-                shape = ckpt[n][0]
-                if len(shape) != 2:
-                    continue
-                if not any(n == key or re.compile(to_standard_regex(key)).search(n) for key in pins):
-                    continue
-                path = n[: -len(".weight")]
-                try:
-                    self.model_context.model.get_submodule(path)
-                except AttributeError:
-                    head = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=False)
-                    from auto_round.compressors.predictor_tree import ensure_module_path, load_checkpoint_tensor
-
-                    parent = ensure_module_path(self.model_context.model, path)
-                    parent.add_module(path.rsplit(".", 1)[-1], head)
-                    with torch.no_grad():
-                        head.weight.copy_(load_checkpoint_tensor(source_dir, ckpt, n))
-                mod = self.model_context.model.get_submodule(path)
-                for key, pin in pins.items():
-                    if path == key or re.compile(to_standard_regex(key)).search(path):
-                        self._stamp_pin_(mod, path, pin)
-                        self.layer_config[path] = pin
-                        break
-                logger.info("tuning pinned predictor tensor %s on the tree outputs", path)
-                self.alg_composer.compress_layer_outside_block(
-                    mod,
-                    fp_inputs=reference_output,
-                    q_inputs=new_q_output,
-                    input_ids=token_ids,
-                )
-                if self.compress_context.is_immediate_packing:
-                    from auto_round.compressors.utils import immediate_pack
-
-                    immediate_pack(path, self.layer_config)
+            self._tune_tree_heads_(
+                group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids
+            )
             if self.compress_context.is_immediate_packing:
                 for module_name in pinned:
-                    from auto_round.compressors.utils import immediate_pack
-
                     immediate_pack(module_name, self.layer_config)
             clear_memory()
 

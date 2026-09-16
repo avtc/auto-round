@@ -574,3 +574,88 @@ class TestUnwrapStreaming:
         from auto_round.wrapper import WrapperLinear
 
         return WrapperLinear(layer, enable_minmax_tuning=True, enable_torch_compile=False, device="cpu")
+
+
+class TestMaskedChunkedTune:
+    def test_masked_chunked_tune_matches_single_shot(self, monkeypatch):
+        """3-D rows + a -100-derived valid-token mask must chunk on the sequence axis.
+
+        The mask is [rows, 1] after unsqueeze while 3-D inputs carry rows on
+        dim 1; slicing the wrong axis broadcasts a [chunk, 1] mask against a
+        [1, chunk, out] chunk and crashes - the exact huge-lm_head scenario.
+        """
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as qmod
+
+        torch.manual_seed(3)
+        layer = torch.nn.Linear(16, 5)
+        fp = [torch.randn(1, 13, 16) for _ in range(2)]
+        # every sample's last position is -100 (calibration convention) so the
+        # valid-token mask is real and non-trivial
+        input_ids = [torch.randint(0, 100, (1, 13)) for _ in range(2)]
+        for ids in input_ids:
+            ids[:, -1] = -100
+
+        results = []
+        for cap in (2**26, 2**4):  # single shot vs 3 rows per chunk
+            torch.manual_seed(11)
+            fresh = torch.nn.Linear(16, 5)
+            with torch.no_grad():
+                fresh.weight.copy_(layer.weight)
+                fresh.bias.copy_(layer.bias)
+            fresh.global_name = "lm_head"
+            fresh.bits = 8
+            fresh.group_size = 32
+            fresh.sym = True
+            fresh.data_type = "int"
+            fresh.scale_dtype = None
+            fresh.iters = 3
+            fresh.act_bits = 16
+            fresh.act_sym = True
+            fresh.act_data_type = None
+            fresh.act_group_size = None
+            cfg = type(
+                "C",
+                (),
+                {
+                    "iters": 3,
+                    "lr": 5e-3,
+                    "compute_lr": lambda self, bits: None,
+                    "compute_minmax_lr": lambda self, bits: None,
+                },
+            )()
+            quant = SimpleNamespace(
+                config=cfg,
+                _config=cfg,
+                iters=3,
+                lr=5e-3,
+                minmax_lr=1e-3,
+                lr_scheduler=None,
+                enable_minmax_tuning=False,
+                gradient_accumulate_steps=1,
+                not_use_best_mse=False,
+                dynamic_max_gap=0,
+                optimizer=qmod.SignSGD,
+                lr_is_auto=False,
+                model=torch.nn.Module(),
+                calibration_context=SimpleNamespace(batch_size=1),
+                model_context=SimpleNamespace(amp=False, amp_dtype=torch.bfloat16),
+                compress_context=SimpleNamespace(enable_torch_compile=False, cache_device="cpu"),
+            )
+            for name in (
+                "_get_scaler",
+                "_scale_loss_and_backward",
+                "_step",
+                "_maybe_log_low_bit_lr",
+                "_compute_valid_token_mask",
+            ):
+                setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
+            quant._preallocate_tuning_grads_ = qmod.SignRoundQuantizer._preallocate_tuning_grads_
+            setattr(quant, "_best_param_device", MethodType(qmod.SignRoundQuantizer._best_param_device, quant))
+            quant._logged_low_bit_lr = set()
+            monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", cap, raising=False)
+            qmod.SignRoundQuantizer.quantize_layer_outside_block(
+                quant, fresh, fp_inputs=[t.clone() for t in fp], input_ids=[t.clone() for t in input_ids]
+            )
+            results.append(fresh.weight.detach().clone())
+        assert torch.equal(results[0], results[1]), "masked chunked tune diverged from single-shot"

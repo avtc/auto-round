@@ -91,6 +91,8 @@ _ORCH_METHODS = (
     "_begin_predictor_q_capture_",
     "_pins_for_tree_",
     "_stamp_pin_",
+    "_attach_pinned_tree_",
+    "_tune_tree_heads_",
     "_tune_predictor_trees_",
 )
 
@@ -217,3 +219,135 @@ class TestTunePredictorTrees:
         assert "mtp.eh_proj" in o.layer_config
         assert "mtp.fc" in o.layer_config
         assert getattr(model.get_submodule("mtp.eh_proj"), "bits", None) == 4
+
+
+class TestCaptureLifecycle:
+    def test_q_capture_roundtrip(self, tmp_path):
+        _write_ckpt(tmp_path)
+        model = _Body()
+        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        model(torch.randint(0, 16, (2, 5)))  # fp pass
+        o._finish_predictor_capture_("fp")
+        assert o._predictor_fp_tail_ is not None
+        # second (quantized-chain) pass captures independently
+        o._begin_predictor_q_capture_()
+        model(torch.randint(0, 16, (2, 5)))
+        o._finish_predictor_capture_("q")
+        assert o._predictor_q_tail_ is not None and len(o._predictor_q_tail_) == 2
+        assert len(model.norm._forward_pre_hooks) == 0
+
+    def test_kind_mismatch_still_removes_hook(self, tmp_path):
+        _write_ckpt(tmp_path)
+        model = _Body()
+        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        o._finish_predictor_capture_("q")  # wrong kind: hook must still be removed
+        assert len(model.norm._forward_pre_hooks) == 0
+        assert o._predictor_fp_tail_ is None
+
+    def test_rows_capped_at_nsamples(self, tmp_path):
+        _write_ckpt(tmp_path)
+        model = _Body()
+        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        for _ in range(3):  # simulate calibration retry re-running batches
+            model(torch.randint(0, 16, (2, 5)))
+        o._finish_predictor_capture_("fp")
+        assert len(o._predictor_fp_tail_) == o.calibration_context.nsamples
+
+
+class TestTreeFallbacks:
+    def test_no_pins_leaves_export_path(self, tmp_path, monkeypatch):
+        _write_ckpt(tmp_path)
+        model = _Body()
+        calls = {"block": [], "outside": []}
+
+        class _Composer:
+            block_quantizer = [SimpleNamespace(iters=10)]
+
+            def compress_block(self, *a, **k):
+                calls["block"].append(1)
+
+            def compress_layer_outside_block(self, *a, **k):
+                calls["outside"].append(1)
+
+        o = _orch(
+            model, tmp_path, layer_config={"model.*": {"bits": 4, "group_size": -1, "sym": True}}, composer=_Composer()
+        )
+        monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        model(torch.randint(0, 16, (2, 5)))
+        o._finish_predictor_capture_("fp")
+        o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        assert calls["block"] == [] and calls["outside"] == []
+        assert "mtp" not in [n for n, _ in model.named_modules()]
+
+    def test_build_failure_degrades_to_export_path(self, tmp_path, monkeypatch):
+        _write_ckpt(tmp_path)
+        model = _Body()
+        calls = {"block": []}
+
+        class _Composer:
+            block_quantizer = [SimpleNamespace(iters=10)]
+
+            def compress_block(self, *a, **k):
+                calls["block"].append(1)
+
+            def compress_layer_outside_block(self, *a, **k):
+                pass
+
+        o = _orch(
+            model,
+            tmp_path,
+            layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}},
+            composer=_Composer(),
+        )
+        monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
+
+        import auto_round.compressors.orchestrator as orch_mod
+
+        def _boom(model, source_dir, ckpt, info, sibling):
+            raise RuntimeError("synthetic build failure")
+
+        monkeypatch.setattr(orch_mod, "build_predictor_tree", _boom)
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        model(torch.randint(0, 16, (2, 5)))
+        o._finish_predictor_capture_("fp")
+        o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        assert calls["block"] == []
+
+
+class TestImmediatePackingPath:
+    def test_tree_modules_packed_when_immediate(self, tmp_path, monkeypatch):
+        _write_ckpt(tmp_path)
+        model = _Body()
+        packed = []
+
+        class _Composer:
+            block_quantizer = [SimpleNamespace(iters=10)]
+
+            def compress_block(self, shell, fp, io, block_ctx=None, q_inputs=None, input_ids=None):
+                return fp, fp
+
+            def compress_layer_outside_block(self, *a, **k):
+                pass
+
+        o = _orch(
+            model,
+            tmp_path,
+            layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}},
+            composer=_Composer(),
+        )
+        o.compress_context.is_immediate_packing = True
+        monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
+
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "immediate_pack", lambda name, cfg: packed.append(name))
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        model(torch.randint(0, 16, (2, 5)))
+        o._finish_predictor_capture_("fp")
+        o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        assert "mtp.fc" in packed  # head packed inside _tune_tree_heads_
+        assert any(name.startswith("mtp.") for name in packed)  # tree Linears packed

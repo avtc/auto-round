@@ -89,6 +89,15 @@ class TestSynthesizePredictorE:
         assert torch.allclose(e[0, 1], embed.weight[12])
         assert torch.allclose(e[0, 2], embed.weight[12])  # final position repeats
 
+    def test_negative_ignore_index_never_looks_up(self):
+        # calibration caches mark ignored positions (incl. every last
+        # position) with -100; clamping must keep the embedding lookup valid
+        ids = torch.tensor([[10, 11, -100]])
+        embed = nn.Embedding(20, 4)
+        e = synthesize_predictor_e(ids, embed=embed)
+        assert e.shape == (1, 3, 4)
+        assert torch.allclose(e[0, 2], embed.weight[0])
+
     def test_embedded_rows_shift(self):
         rows = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
         e = synthesize_predictor_e(rows)

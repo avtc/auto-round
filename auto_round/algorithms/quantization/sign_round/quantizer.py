@@ -900,7 +900,10 @@ class SignRoundQuantizer(BaseQuantizer):
                         with torch.no_grad():
                             chunk_ref = layer(chunk_ref_input)
                         if cat_mask is not None:
-                            chunk_mask = cat_mask[start:end]
+                            # rows live on dim 1 for 3-D [batch, seq, out] inputs;
+                            # the mask is [rows, 1] after unsqueeze, so slice the
+                            # matching axis
+                            chunk_mask = cat_mask[:, start:end] if rows_axis == 1 else cat_mask[start:end]
                         if not blockwise:
                             with autocast_ctx:
                                 chunk_q = wrapper_linear(chunk_input)  # pylint: disable=not-callable

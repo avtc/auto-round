@@ -72,6 +72,11 @@ def synthesize_predictor_e(input_rows: torch.Tensor, embed=None) -> torch.Tensor
         if embed is None:
             raise ValueError("token-id rows need the embedding module to build the predictor input")
         shifted = torch.cat([input_rows[:, 1:], input_rows[:, -1:]], dim=1)
+        # calibration caches mark ignored positions with -100 (the standard
+        # ignore index, incl. every sample's last position); those ids are
+        # never valid lookups, so clamp before embedding. Their rows are
+        # excluded from the loss by the valid-token mask.
+        shifted = shifted.clamp_min(0)
         return embed(shifted)
     return torch.cat([input_rows[:, 1:], input_rows[:, -1:]], dim=1)
 
