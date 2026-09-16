@@ -14,6 +14,7 @@
 import copy
 import gc
 import os
+import re
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -29,6 +30,15 @@ from auto_round.calibration.utils import (
     _update_inputs,
 )
 from auto_round.compressors.base import BaseOrchestrator
+from auto_round.compressors.predictor_tree import (
+    analyze_predictor_group,
+    bind_predictor_forward,
+    build_predictor_tree,
+    checkpoint_only_roots,
+    list_checkpoint_tensors,
+    pick_sibling_layer,
+    synthesize_predictor_e,
+)
 from auto_round.compressors.utils import (
     _get_quantized_layer_names_outside_blocks,
     immediate_pack,
@@ -53,6 +63,7 @@ from auto_round.utils import (
     set_amax_for_all_moe_layers,
     set_module,
     to_device,
+    to_standard_regex,
 )
 from auto_round.utils.device import (
     _force_trim_malloc,
@@ -594,15 +605,25 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         else:
             logger.info("start to cache block inputs")
+        self._prepare_predictor_tuning_(all_blocks)
         all_inputs = self.cache_data(
             to_cache_block_names,
             self.calibration_context.nsamples,
             to_cache_layer_names,
             last_cache_name=_last_cache_name,
         )
+        self._finish_predictor_capture_("fp")
         # Raw token IDs from the tokenizer, cached during calibration for use in quantize_block.
         input_ids_cache = all_inputs.pop("input_ids", None)
         self.inputs = all_inputs
+        if getattr(self, "_predictor_plan_", None):
+            # keep the last block group's auxiliary inputs (attention mask,
+            # position ids) for the predictor-tree stage; values are shared
+            # list references that survive the block loop's pops
+            _last_first = to_cache_block_names[-1] if to_cache_block_names else None
+            _entry = all_inputs.get(_last_first) if _last_first else None
+            if isinstance(_entry, dict):
+                self._predictor_tree_aux_ = {k: v for k, v in _entry.items() if k != "input_ids"}
 
         all_q_inputs = None
         # Leave it to gguf itself to handle
@@ -894,6 +915,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         if len(layer_names) == 0:
             memory_monitor.update()
             memory_monitor.log_summary()
+            self._tune_predictor_trees_(token_ids)
             return
         q_layer_inputs = None
         enable_quanted_input = self.alg_composer.need_quanted_input()
@@ -909,7 +931,9 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         if enable_quanted_input:
             logger.info("starting to cache layer inputs for %s, this may be quite slow ", layer_names)
+            self._begin_predictor_q_capture_()
             q_layer_inputs = self.cache_data([], self.calibration_context.nsamples, layer_names=layer_names)
+            self._finish_predictor_capture_("q")
             if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
                 accelerate.hooks.remove_hook_from_submodules(
                     self.model
@@ -937,6 +961,267 @@ class CompressionOrchestrator(BaseOrchestrator):
             del layer_input
             clear_memory(q_layer_input)
             memory_monitor.log_summary()
+
+        self._tune_predictor_trees_(token_ids)
+
+    # ── Predictor-tree (MTP) tuning ─────────────────────────────────────
+
+    def _prepare_predictor_tuning_(self, all_blocks) -> None:
+        """Discover pinned checkpoint-only predictor trees before calibration.
+
+        Reads checkpoint metadata once (tensor names/shapes only); installs a
+        forward-pre hook on the final norm so the calibration pass captures
+        the fp chain tail (the tree's hidden-side input). No-op - and zero
+        cost - when the model has no checkpoint-only groups or no local
+        checkpoint directory.
+        """
+        self._predictor_plan_ = None
+        self._predictor_fp_tail_ = None
+        self._predictor_q_tail_ = None
+        self._predictor_tree_aux_ = None
+        cfg = getattr(self.model_context.model, "config", None)
+        source_dir = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
+        if not source_dir or not os.path.isdir(source_dir):
+            return
+        ckpt = list_checkpoint_tensors(source_dir)
+        roots = checkpoint_only_roots(ckpt, self.model_context.model)
+        if not roots:
+            return
+        quantizers = self.alg_composer.block_quantizer
+        if not isinstance(quantizers, (list, tuple)):
+            quantizers = [quantizers]
+        iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
+        if iters <= 0:
+            return
+        norm_name = self._discover_final_norm_(all_blocks)
+        if norm_name is None:
+            logger.warning(
+                "checkpoint-only groups %s found but no final norm discovered; trees stay on the export path",
+                ", ".join(roots),
+            )
+            return
+        self._predictor_plan_ = {"ckpt": ckpt, "roots": roots, "norm": norm_name}
+        self._begin_predictor_capture_("fp")
+
+    def _discover_final_norm_(self, all_blocks) -> Optional[str]:
+        """Name-agnostic final-norm discovery: the last block-external leaf with one 1-D param."""
+        block_prefixes = [name for block in all_blocks for name in block]
+        best = None
+        for name, m in self.model_context.model.named_modules():
+            if not name:
+                continue
+            if any(name == b or name.startswith(b + ".") for b in block_prefixes):
+                continue
+            if list(m.children()):
+                continue
+            params = list(m.parameters())
+            if len(params) == 1 and params[0].dim() == 1:
+                low = name.lower()
+                if "norm" in low or "ln_f" in low:
+                    best = name
+        return best
+
+    def _begin_predictor_capture_(self, kind: str) -> None:
+        """Install the final-norm pre-hook capturing per-sample chain tails."""
+        norm_name = self._predictor_plan_["norm"]
+        mod = get_module(self.model_context.model, norm_name)
+        storage = {"rows": []}
+
+        def _hook(module, args, kwargs):
+            x = args[0] if args else (kwargs or {}).get("hidden_states")
+            if isinstance(x, torch.Tensor) and x.dim() >= 2:
+                for i in range(x.shape[0]):
+                    storage["rows"].append(x[i].detach().to("cpu", copy=True)[None])
+
+        handle = mod.register_forward_pre_hook(_hook, with_kwargs=True)
+        self._predictor_hook_ = (handle, storage, kind)
+
+    def _finish_predictor_capture_(self, kind: str) -> None:
+        """Remove the hook and store the captured rows as the fp/q tail."""
+        hooked = getattr(self, "_predictor_hook_", None)
+        self._predictor_hook_ = None
+        if hooked is None or hooked[2] != kind:
+            return
+        handle, storage, _ = hooked
+        handle.remove()
+        rows = storage["rows"]
+        if not rows:
+            return
+        setattr(self, "_predictor_fp_tail_" if kind == "fp" else "_predictor_q_tail_", rows)
+
+    def _begin_predictor_q_capture_(self) -> None:
+        if getattr(self, "_predictor_plan_", None):
+            self._begin_predictor_capture_("q")
+
+    def _pins_for_tree_(self, tree_tensor_names) -> dict:
+        """Layer-config entries (exact or regex) matching tree tensor paths."""
+        pins = {}
+        for key, cfg in dict(self.layer_config).items():
+            if not isinstance(cfg, dict) or not check_to_quantized(cfg):
+                continue
+            regex = re.compile(to_standard_regex(key))
+            if key in tree_tensor_names or any(regex.search(n) for n in tree_tensor_names):
+                pins[key] = cfg
+        return pins
+
+    def _stamp_pin_(self, module, name: str, pin: dict) -> None:
+        for attr in ("bits", "group_size", "sym", "data_type", "scale_dtype", "super_bits", "super_group_size"):
+            if pin.get(attr) is not None:
+                setattr(module, attr, pin[attr])
+        module.act_bits = pin.get("act_bits", 16)
+        module.act_sym = pin.get("act_sym", True)
+        module.act_data_type = pin.get("act_data_type", None)
+        module.global_name = name
+
+    def _tune_predictor_trees_(self, token_ids) -> None:
+        """Materialize and tune pinned checkpoint-only predictor trees (MTP).
+
+        Runs after the block loop and the outside-block layer loop: fp/q tails
+        were captured with the final-norm hook; the tree joins as one extra
+        block (fp reference vs quantized chain), then any remaining pinned 2-D
+        tensors (e.g. the vocabulary head) tune layer-wise on the tree's
+        outputs. Trees are attached under checkpoint-spelled paths so pins,
+        packing, saving and the missing-tensors pass see checkpoint names.
+        """
+        plan = getattr(self, "_predictor_plan_", None)
+        if plan is None:
+            return
+        ckpt, roots, norm_name = plan["ckpt"], plan["roots"], plan["norm"]
+        fp_tail = self._predictor_fp_tail_
+        if not fp_tail:
+            logger.warning("predictor trees %s stay on the closed-form path: no final-norm tail captured", roots)
+            return
+        cfg = getattr(self.model_context.model, "config", None)
+        text_cfg = getattr(cfg, "text_config", None) or cfg
+        hidden = getattr(text_cfg, "hidden_size", None)
+        embed_getter = getattr(self.model_context.model, "get_input_embeddings", None)
+        embed = embed_getter() if callable(embed_getter) else None
+        if token_ids and embed is not None:
+            e_rows = [synthesize_predictor_e(ids, embed=embed) for ids in token_ids]
+        else:
+            e_rows = None
+        if e_rows is None:
+            logger.warning("predictor trees %s skipped: no cached token ids for the e-side input", roots)
+            return
+        all_blocks = get_block_names(self.model_context.model)
+        source_dir = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
+        for group in roots:
+            info = analyze_predictor_group(ckpt, group, hidden)
+            if info is None:
+                logger.info("checkpoint-only group %s is not a predictor tree; leaving it to the export pass", group)
+                continue
+            names_under = [n for n in ckpt if n.startswith(group + ".")]
+            pins = self._pins_for_tree_(names_under)
+            if not pins:
+                logger.info("predictor tree %s has no layer-config pins; leaving it to the export pass", group)
+                continue
+            picked = pick_sibling_layer(self.model_context.model, ckpt, info, all_blocks)
+            if picked is None:
+                logger.warning("predictor tree %s skipped: no sibling layer covers its tensors", group)
+                continue
+            sibling_name, sibling = picked
+            try:
+                claimed = build_predictor_tree(self.model_context.model, source_dir, ckpt, info, sibling)
+            except RuntimeError as e:
+                logger.warning("predictor tree %s skipped: %s", group, e)
+                continue
+            logger.info("tuning predictor tree %s (layer from sibling %s)", group, sibling_name)
+            shell = self.model_context.model.get_submodule(group)
+            pinned = []
+            for n, m in shell.named_modules():
+                if not isinstance(m, torch.nn.Linear):
+                    continue
+                module_name = f"{group}.{n}" if n else group
+                for key, pin in pins.items():
+                    if module_name == key or re.compile(to_standard_regex(key)).search(module_name):
+                        self._stamp_pin_(m, module_name, pin)
+                        self.layer_config[module_name] = pin
+                        pinned.append(module_name)
+                        break
+            if not pinned:
+                logger.warning(
+                    "predictor tree %s: pins %s matched no Linear; leaving to the export pass", group, list(pins)
+                )
+                continue
+            bind_predictor_forward(
+                shell,
+                {
+                    "norm_e": self.model_context.model.get_submodule(info["norm_e"][: -len(".weight")]),
+                    "norm_h": self.model_context.model.get_submodule(info["norm_h"][: -len(".weight")]),
+                    "fc": self.model_context.model.get_submodule(info["fc"][: -len(".weight")]),
+                    "layer": self.model_context.model.get_submodule(info["layer_root"]),
+                    "final_norm": (
+                        self.model_context.model.get_submodule(info["final_norm"][: -len(".weight")])
+                        if info.get("final_norm")
+                        else None
+                    ),
+                },
+                e=e_rows[0],
+            )
+            aux = dict(self._predictor_tree_aux_ or {})
+            aux["_predictor_e"] = e_rows
+            _, input_others = self._preprocess_block_inputs({"input_ids": fp_tail, **aux})
+            from auto_round.algorithms.composer import BlockContext
+
+            ctx = BlockContext(
+                model=self.model_context.model,
+                block_names=[group],
+                block_name=group,
+                block_index=len(all_blocks),
+                bs=self.calibration_context.batch_size,
+                block_cnt=len(all_blocks) + 1,
+            )
+            new_q_output, reference_output = self.alg_composer.compress_block(
+                shell,
+                fp_tail,
+                input_others,
+                block_ctx=ctx,
+                q_inputs=self._predictor_q_tail_,
+                input_ids=token_ids,
+            )
+            role_names = {info[r] for r in ("fc", "norm_e", "norm_h", "final_norm") if info.get(r)}
+            for n in names_under:
+                if n in claimed or n in role_names or not n.endswith(".weight"):
+                    continue
+                shape = ckpt[n][0]
+                if len(shape) != 2:
+                    continue
+                if not any(n == key or re.compile(to_standard_regex(key)).search(n) for key in pins):
+                    continue
+                path = n[: -len(".weight")]
+                try:
+                    self.model_context.model.get_submodule(path)
+                except AttributeError:
+                    head = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=False)
+                    from auto_round.compressors.predictor_tree import ensure_module_path, load_checkpoint_tensor
+
+                    parent = ensure_module_path(self.model_context.model, path)
+                    parent.add_module(path.rsplit(".", 1)[-1], head)
+                    with torch.no_grad():
+                        head.weight.copy_(load_checkpoint_tensor(source_dir, ckpt, n))
+                mod = self.model_context.model.get_submodule(path)
+                for key, pin in pins.items():
+                    if path == key or re.compile(to_standard_regex(key)).search(path):
+                        self._stamp_pin_(mod, path, pin)
+                        self.layer_config[path] = pin
+                        break
+                logger.info("tuning pinned predictor tensor %s on the tree outputs", path)
+                self.alg_composer.compress_layer_outside_block(
+                    mod,
+                    fp_inputs=reference_output,
+                    q_inputs=new_q_output,
+                    input_ids=token_ids,
+                )
+                if self.compress_context.is_immediate_packing:
+                    from auto_round.compressors.utils import immediate_pack
+
+                    immediate_pack(path, self.layer_config)
+            if self.compress_context.is_immediate_packing:
+                for module_name in pinned:
+                    from auto_round.compressors.utils import immediate_pack
+
+                    immediate_pack(module_name, self.layer_config)
+            clear_memory()
 
     def _check_compatibility(self) -> None:
         """Checks compatibility of the configurations and model."""
