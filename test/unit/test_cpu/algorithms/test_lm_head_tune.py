@@ -386,6 +386,33 @@ class TestRowBlockedWrapperForward:
         assert all(bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1)), "gaps/overlaps"
         assert len(bounds) > 1, "expected multiple blocks under the tiny budget"
 
+    def test_blocked_with_per_row_imatrix_matches(self, monkeypatch):
+        """A 2-D per-output-row imatrix must slice with the weight block.
+
+        The full-tensor imatrix meeting a block-sized weight crashes the scale
+        search inside the quant function; the blocked path slices per-row
+        layouts and passes per-column layouts through unchanged.
+        """
+        import auto_round.wrapper as wmod
+
+        torch.manual_seed(6)
+        layer = _mk_quant_linear(24, 10, group_size=4)
+        layer.imatrix = torch.rand(24, 10) + 0.1  # per-row layout
+        x = torch.randn(2, 3, 10)
+
+        results = []
+        for cap in (2**26, 60):  # full path vs 4-row blocks
+            torch.manual_seed(21)
+            fresh = _mk_quant_linear(24, 10, group_size=4)
+            fresh.imatrix = layer.imatrix.clone()
+            with torch.no_grad():
+                fresh.weight.copy_(layer.weight)
+            wrapper = self._wrapper(fresh)
+            monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", cap, raising=False)
+            out = wrapper(x)
+            results.append(out.detach().clone())
+        assert torch.allclose(results[0], results[1], atol=1e-6), "per-row imatrix blocked forward diverged"
+
 
 class TestTuningGradBuffers:
     """Outside-block tuning must keep gradient buffers stable in memory."""
@@ -634,9 +661,11 @@ class TestBlockwiseInterleavedLoop:
         for ids in input_ids:
             ids[:, -1] = -100
 
+        imx = torch.rand(5, 16) + 0.1  # per-output-row importance layout
         results = []
         for cap, row_block in ((2**26, 2**27), (2**4, 2**3)):  # single shot vs blockwise+chunked
             quant, fresh = _outside_tune_harness(qmod, layer, cap)
+            fresh.imatrix = imx.clone()  # row-blocked final quantize must slice it too
             monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", cap, raising=False)
             monkeypatch.setattr(wmod, "_ROW_BLOCKED_WEIGHT_ELEMS", row_block, raising=False)
             qmod.SignRoundQuantizer.quantize_layer_outside_block(
@@ -644,3 +673,27 @@ class TestBlockwiseInterleavedLoop:
             )
             results.append(fresh.weight.detach().clone())
         assert torch.equal(results[0], results[1]), "blockwise masked chunked tune diverged from single-shot"
+
+
+class TestMasked2DChunkedTune:
+    def test_masked_2d_rows_chunk_on_dim0(self, monkeypatch):
+        """2-D inputs concatenate samples on dim 0; masks flatten to [rows, 1]."""
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as qmod
+
+        torch.manual_seed(3)
+        layer = torch.nn.Linear(16, 5)
+        fp = [torch.randn(13, 16) for _ in range(2)]  # 2-D: rows on dim 0
+        input_ids = [torch.randint(0, 100, (1, 13)) for _ in range(2)]
+        for ids in input_ids:
+            ids[:, -1] = -100
+
+        results = []
+        for cap in (2**26, 2**4):
+            quant, fresh = _outside_tune_harness(qmod, layer, cap)
+            monkeypatch.setattr(qmod, "_OUTSIDE_TUNE_CHUNK_OUT_ELEMS", cap, raising=False)
+            qmod.SignRoundQuantizer.quantize_layer_outside_block(
+                quant, fresh, fp_inputs=[t.clone() for t in fp], input_ids=[t.clone() for t in input_ids]
+            )
+            results.append(fresh.weight.detach().clone())
+        assert torch.equal(results[0], results[1]), "masked 2-D chunked tune diverged from single-shot"

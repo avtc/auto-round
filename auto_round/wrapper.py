@@ -383,6 +383,8 @@ class WrapperLinear(torch.nn.Module):
                     self._slice_tunable(self.weight_min, g_start, g_end),
                     self._slice_tunable(self.weight_max, g_start, g_end),
                     init_scale=self._sliced_init_scale(g_start, g_end, out_features * groups_per_row),
+                    row_start=b_start,
+                    row_end=b_end,
                 )
                 weight_q_parts.append(wq)
                 scale_parts.append(sc)

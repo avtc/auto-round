@@ -607,11 +607,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.info("start to cache block inputs")
         self._prepare_predictor_tuning_(all_blocks)
         if self._predictor_overrides_last_cache_():
-            # the calibration early-stop at the last cached block aborts every
-            # forward before the final norm runs; the predictor tail hook
-            # needs those rows, so run the pass to completion (the extra tail
-            # compute is one norm + lm_head forward per batch)
-            _last_cache_name = None
+            # the calibration early-stop would otherwise abort every forward at
+            # the last cache target, before the final norm runs; the predictor
+            # tail hook needs those rows. A non-None sentinel is returned
+            # verbatim by _infer_last_cache_name and never equals a module
+            # name (null byte), disabling the early stop entirely - the extra
+            # cost is one norm + lm_head forward per calibration batch.
+            _last_cache_name = "\x00predictor-no-early-stop"
         all_inputs = self.cache_data(
             to_cache_block_names,
             self.calibration_context.nsamples,
@@ -1061,9 +1063,18 @@ class CompressionOrchestrator(BaseOrchestrator):
             self._begin_predictor_capture_("q")
 
     def _pins_for_tree_(self, tree_tensor_names) -> dict:
-        """Layer-config entries (exact or regex) matching tree tensor paths."""
+        """Layer-config entries (exact or regex) matching tree tensor paths.
+
+        Pins for checkpoint-only tensors are popped from ``layer_config`` into
+        ``regex_config`` by the resolver (the modules did not exist at resolve
+        time), so BOTH sources must be consulted or the predictor stage would
+        silently never activate. Exact in-model entries take precedence.
+        """
+        sources = {}
+        sources.update(getattr(self, "regex_config", None) or {})
+        sources.update(dict(self.layer_config))
         pins = {}
-        for key, cfg in dict(self.layer_config).items():
+        for key, cfg in sources.items():
             if not isinstance(cfg, dict) or not check_to_quantized(cfg):
                 continue
             regex = re.compile(to_standard_regex(key))
@@ -1089,6 +1100,24 @@ class CompressionOrchestrator(BaseOrchestrator):
         module.act_data_type = pin.get("act_data_type") or None
         module.global_name = name
 
+    def _detach_tree_(self, group: str) -> None:
+        """Remove a (possibly partial) predictor tree from the model.
+
+        Attached tree tensors would satisfy the export missing-tensors check,
+        silently disabling the verbatim copy the export path would otherwise
+        perform for the group.
+        """
+        segs = group.split(".")
+        try:
+            parent = (
+                self.model_context.model.get_submodule(".".join(segs[:-1]))
+                if len(segs) > 1
+                else self.model_context.model
+            )
+        except AttributeError:
+            return
+        parent._modules.pop(segs[-1], None)
+
     def _attach_pinned_tree_(self, group, ckpt, info, pins, all_blocks, source_dir):
         """Materialize one predictor tree and stamp pins on its Linears.
 
@@ -1101,25 +1130,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.warning("predictor tree %s skipped: no sibling layer covers its tensors", group)
             return None
         sibling_name, sibling = picked
-        # remember where the group root attaches so a failed build can detach
-        # the partial tree: a half-materialized group would otherwise satisfy
-        # the export missing-tensors check and silently skip the verbatim copy
-        segs = group.split(".")
-        try:
-            group_parent = (
-                self.model_context.model.get_submodule(".".join(segs[:-1]))
-                if len(segs) > 1
-                else self.model_context.model
-            )
-        except AttributeError:
-            group_parent = None
         try:
             claimed = build_predictor_tree(self.model_context.model, source_dir, ckpt, info, sibling)
         except Exception as e:  # degrade, never die: the export path still handles the group
             logger.warning("predictor tree %s skipped: %s: %s", group, type(e).__name__, e)
-            if group_parent is not None:
-                group_parent._modules.pop(segs[-1], None)
-                logger.info("detached partially materialized predictor tree %s", group)
+            self._detach_tree_(group)
+            logger.info("detached partially materialized predictor tree %s", group)
             return None
         logger.info("tuning predictor tree %s (layer from sibling %s)", group, sibling_name)
         shell = self.model_context.model.get_submodule(group)
@@ -1138,6 +1154,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             logger.warning(
                 "predictor tree %s: pins %s matched no Linear; leaving to the export pass", group, list(pins)
             )
+            self._detach_tree_(group)
             return None
         return shell, pinned, claimed
 

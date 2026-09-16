@@ -92,6 +92,7 @@ _ORCH_METHODS = (
     "_pins_for_tree_",
     "_stamp_pin_",
     "_attach_pinned_tree_",
+    "_detach_tree_",
     "_tune_tree_heads_",
     "_predictor_overrides_last_cache_",
     "_snapshot_predictor_aux_",
@@ -434,3 +435,72 @@ class TestLazyRefs:
         model.get_submodule("mtp").eh_proj = doubled
         out2 = shell(h, _predictor_e=e)
         assert not torch.allclose(out1, out2), "lazy refs must resolve the wrapped module live"
+
+
+class TestRegexConfigPins:
+    def test_pins_from_regex_config_activate_the_plan(self, tmp_path):
+        """The resolver parks checkpoint-only pins in regex_config, not layer_config."""
+        _write_ckpt(tmp_path)
+        model = _Body()
+        # what the resolver actually produces for safetensor-only targets
+        o = _orch(model, tmp_path, layer_config={})
+        o.regex_config = {"mtp.*": {"bits": 4, "group_size": -1, "sym": True}}
+        o._ORCH_BIND = None
+        from types import MethodType as _MT
+
+        from auto_round.compressors.orchestrator import CompressionOrchestrator as _CO
+
+        # rebind _pins_for_tree_ and _prepare_predictor_tuning_ against this instance
+        o._pins_for_tree_ = _MT(_CO._pins_for_tree_, o)
+        o._prepare_predictor_tuning_ = _MT(_CO._prepare_predictor_tuning_, o)
+        o._predictor_plan_ = None
+        o._predictor_fp_tail_ = None
+        o._predictor_q_tail_ = None
+        o._predictor_tree_aux_ = None
+        o._predictor_hook_ = None
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        assert o._predictor_plan_ is not None, "regex_config pins must activate the predictor plan"
+
+
+class TestNoEarlyStopSentinel:
+    def test_sentinel_is_never_a_module_name(self, tmp_path):
+        from auto_round.calibration.utils import _infer_last_cache_name
+
+        sentinel = "\x00predictor-no-early-stop"
+        # non-None requests are returned verbatim by the inference helper and
+        # never equal a real module name, disabling the early stop
+        assert _infer_last_cache_name(["blocks.0", "blocks.1"], [], sentinel) == sentinel
+        assert all(sentinel != n for n, _ in _Body().named_modules())
+
+
+class TestDetachOnNoPinnedLinear:
+    def test_tree_detached_when_pins_match_nothing(self, tmp_path, monkeypatch):
+        _write_ckpt(tmp_path)
+        model = _Body()
+
+        class _Composer:
+            block_quantizer = [SimpleNamespace(iters=10)]
+
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
+
+            def compress_block(self, *a, **k):
+                raise AssertionError("must not tune when no Linear matched")
+
+            def compress_layer_outside_block(self, *a, **k):
+                pass
+
+        o = _orch(
+            model,
+            tmp_path,
+            # pins match tensors (activates the plan) but no tree Linear is
+            # named fc_only - the group must detach and the run must survive
+            layer_config={"mtp.fc.weight": {"bits": 4, "group_size": -1, "sym": True}},
+            composer=_Composer(),
+        )
+        monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        model(torch.randint(0, 16, (2, 5)))
+        o._finish_predictor_capture_("fp")
+        o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        assert "mtp" not in [n for n, _ in model.named_modules()], "tree must detach when no Linear matched"
