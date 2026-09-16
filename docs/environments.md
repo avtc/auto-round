@@ -157,6 +157,28 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
 export AR_TUNE_DDP_DEVICES=0,1,2,3
 ```
 
+### AR_TUNE_DDP_GRAD_TRANSPORT
+- **Description**: Wire dtype for `--parallel_quantization` gradient exchange — `fp32`, `bf16` (default) or `int8`.
+  Applies to the reduce-scatter transport of the int8-sign exchange and to the full-value exchange when
+  `AR_TUNE_DDP_SIGN_EXCHANGE=0`.
+- **Default**: `bf16`
+- **Valid Values**: `fp32`, `bf16`, `int8`
+
+```bash
+export AR_TUNE_DDP_GRAD_TRANSPORT=fp32
+```
+
+### AR_TUNE_DDP_SIGN_EXCHANGE
+- **Description**: `1` (default) exchanges int8 signs of the averaged gradient (exact for pure sign-SGD, i.e.
+  momentum disabled). `0` forces the full-value halving-doubling exchange regardless of momentum, for A/B
+  comparisons of exchange strategies on the same build.
+- **Default**: `1`
+- **Valid Values**: `0`, `1`
+
+```bash
+export AR_TUNE_DDP_SIGN_EXCHANGE=0
+```
+
 ### AR_AUTO_SCHEME_NSAMPLES
 - **Description**: Controls the default number of calibration samples used by AutoScheme scoring when `AutoScheme.nsamples` is not explicitly set.
 - **Default**: unset → 16

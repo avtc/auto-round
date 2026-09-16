@@ -157,6 +157,26 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
 export AR_TUNE_DDP_DEVICES=0,1,2,3
 ```
 
+### AR_TUNE_DDP_GRAD_TRANSPORT
+- **描述**：`--parallel_quantization` 梯度交换的传输数据类型 —— `fp32`、`bf16`（默认）或 `int8`。
+  作用于 int8 符号交换的 reduce-scatter 传输，以及 `AR_TUNE_DDP_SIGN_EXCHANGE=0` 时的全值交换。
+- **默认值**：`bf16`
+- **取值**：`fp32`、`bf16`、`int8`
+
+```bash
+export AR_TUNE_DDP_GRAD_TRANSPORT=fp32
+```
+
+### AR_TUNE_DDP_SIGN_EXCHANGE
+- **描述**：`1`（默认）交换平均梯度的 int8 符号（对纯 sign-SGD，即关闭 momentum 时是精确的）。
+  `0` 强制使用全值 halving-doubling 交换（不受 momentum 影响），用于在同一构建上 A/B 对比交换策略。
+- **默认值**：`1`
+- **取值**：`0`、`1`
+
+```bash
+export AR_TUNE_DDP_SIGN_EXCHANGE=0
+```
+
 ### AR_AUTO_SCHEME_NSAMPLES
 - **描述**：控制 AutoScheme 评分时使用的校准样本数默认值，仅在 `AutoScheme.nsamples` 未显式设置时生效。
 - **默认值**：未设置 → 16
