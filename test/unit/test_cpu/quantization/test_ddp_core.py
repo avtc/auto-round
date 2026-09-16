@@ -64,7 +64,7 @@ class TestResolveDDPPlan:
             world,
             torch.device("cuda", 0),  # device OBJECTS only -- no CUDA runtime touched
             8,
-            visible_cuda_devices=[0, 1, 2, 3],
+            visible_devices=[0, 1, 2, 3],
             explicit_devices=["0", "1", "2", "3"],  # bare indices: normalized to cuda:N
             vram_free_bytes={torch.device("cuda", i): free[i] for i in range(4)},
             mirror_footprint_bytes=footprint,
@@ -96,7 +96,7 @@ class TestResolveDDPPlan:
             3,
             torch.device("cuda", 0),
             12,
-            visible_cuda_devices=[0, 1, 2, 3],
+            visible_devices=[0, 1, 2, 3],
             explicit_devices=["0", "1", "2"],
             vram_free_bytes={torch.device("cuda", i): 1 << 30 for i in range(3)},
             mirror_footprint_bytes=1,
@@ -145,7 +145,7 @@ class TestDistributePool:
             4,
             torch.device("cuda", 0),
             8,
-            visible_cuda_devices=[0, 1, 2, 3],
+            visible_devices=[0, 1, 2, 3],
             explicit_devices=["0", "1", "2", "3"],  # avoids torch.cuda.device_count() on CUDA-less hosts
             vram_free_bytes={torch.device("cuda", i): 1 << 40 for i in range(4)},
             mirror_footprint_bytes=1,
@@ -393,6 +393,43 @@ class TestSingleDevicePlacement:
         with pytest.raises(RuntimeError, match="spans 2 CUDA devices"):
             resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)], None, "cuda:0")
 
+    def test_non_cuda_accelerator_home_is_eligible(self, monkeypatch):
+        """cuda/xpu/hpu homes are eligible; a fake xpu home with explicit
+        devices resolves a plan on CPU (no xpu runtime touched)."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_ddp_plan
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        free_map = dp._accel_free_bytes_map("xpu")  # None on a box without xpu
+        block = SimpleNamespace(
+            parameters=lambda: iter(
+                [SimpleNamespace(device=torch.device("xpu", 0), numel=lambda: 8, element_size=lambda: 4)]
+            ),
+            modules=lambda: iter([]),
+        )
+        q = SimpleNamespace(iters=10, gradient_accumulate_steps=1, enable_lfq=False, _resolved_ddp_plan=None)
+        q._get_scaler = lambda: None
+        # plan resolution itself works for an xpu home with explicit devices
+        plan = resolve_ddp_plan(
+            2,
+            torch.device("xpu", 0),
+            8,
+            visible_devices=None,
+            explicit_devices=["0", "1"],
+            vram_free_bytes=free_map,  # None: no VRAM filtering
+            mirror_footprint_bytes=None,
+        )
+        assert plan.enabled and plan.world == 2
+        assert all(d.type == "xpu" for d in plan.devices)
+        # the shared resolver accepts the xpu home (probe-less eligibility)
+        resolved = dp.resolve_tune_ddp_plan_(q, block, [torch.zeros(1), torch.zeros(1)], None, "xpu", log=False)
+        assert resolved.world >= 1  # resolves without raising "not a supported accelerator"
+
     def test_cpu_resident_weights_pass_span_rule(self, monkeypatch):
         """CPU-pinned subtrees alongside the CUDA home are legal placement."""
         from types import SimpleNamespace
@@ -451,7 +488,7 @@ class TestRequestedWorldErrors:
         with pytest.raises(RuntimeError) as excinfo:
             resolve_tune_ddp_plan_(q, block, [torch.zeros(1)], None, "cpu")
         assert "iters" not in str(excinfo.value)
-        assert "not CUDA" in str(excinfo.value)
+        assert "not a supported accelerator" in str(excinfo.value)
 
     def test_no_world_set_stays_serial(self, monkeypatch):
         import torch
@@ -691,7 +728,7 @@ class TestResolverRtnSafe:
         monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
         q = SimpleNamespace(iters=0, gradient_accumulate_steps=1, enable_lfq=False, _resolved_ddp_plan=None)
         # no _get_scaler, no calibration_context: must NOT AttributeError
-        with pytest.raises(RuntimeError, match="not CUDA"):
+        with pytest.raises(RuntimeError, match="not a supported accelerator"):
             resolve_tune_ddp_plan_(q, torch.nn.Sequential(torch.nn.Linear(4, 4)), [torch.zeros(1)], None, "cpu")
 
 

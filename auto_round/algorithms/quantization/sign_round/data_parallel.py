@@ -66,19 +66,60 @@ def block_has_tuning_entries(block) -> bool:
     return False
 
 
-def _parse_device_token(tok: str) -> torch.device:
-    """Parse an explicit-device token: ``3`` -> ``cuda:3``, ``cuda:3``/``xpu:3`` as-is."""
+def _parse_device_token(tok: str, dev_type: str = "cuda") -> torch.device:
+    """Parse an explicit-device token: ``3`` -> ``<dev_type>:3``, ``cuda:3``/``xpu:3`` as-is."""
     tok = tok.strip()
     if tok.isdigit():
-        return torch.device("cuda", int(tok))
+        return torch.device(dev_type, int(tok))
     return torch.device(tok)
+
+
+_SUPPORTED_ACCEL_TYPES = ("cuda", "xpu", "hpu")
+
+
+def _accel_device_count(dev_type: str) -> int:
+    """Device count for an accelerator backend, 0 when the backend is absent.
+
+    ``getattr(torch, ...)`` can raise during backend module init on builds
+    compiled without the backend, so the whole probe is guarded.
+    """
+    try:
+        mod = getattr(torch, dev_type, None)
+        fn = getattr(mod, "device_count", None)
+        if callable(fn):
+            return int(fn())
+    except Exception:  # pragma: no cover - backend-specific probe failure
+        pass
+    return 0
+
+
+def _accel_free_bytes_map(dev_type: str):
+    """Per-device free-memory map for the backend, or None when unavailable.
+
+    cuda/xpu expose ``mem_get_info``; other backends (and missing APIs) return
+    None so the plan resolves without VRAM filtering (explicit devices then
+    decide the fleet).
+    """
+    try:
+        mod = getattr(torch, dev_type, None)
+        if mod is not None and getattr(mod, "is_available", lambda: False)():
+            mem = getattr(mod, "mem_get_info", None)
+            if callable(mem):
+                return {torch.device(dev_type, i): mem(i)[0] for i in range(_accel_device_count(dev_type))}
+    except Exception as e:  # pragma: no cover - backend-specific probe failure
+        logger.warning(
+            "[tune-ddp] free-memory probe failed for %s (%s); resolving the plan without VRAM filtering",
+            dev_type,
+            e,
+        )
+    return None
 
 
 def resolve_ddp_plan(
     world: int,
     home: torch.device,
     batch_size: int,
-    visible_cuda_devices: Optional[Sequence[int]] = None,
+    visible_devices: Optional[Sequence[int]] = None,
     explicit_devices: Optional[Sequence] = None,
     vram_free_bytes: Optional[int] = None,
     mirror_footprint_bytes: Optional[int] = None,
@@ -98,8 +139,8 @@ def resolve_ddp_plan(
     notes: List[str] = []
     if world is None or world <= 1:
         return DDPPlan(1, [home], batch_size, notes)
-    if home.type != "cuda":
-        notes.append("home device is not CUDA")
+    if home.type not in _SUPPORTED_ACCEL_TYPES:
+        notes.append(f"home device {home} is not a supported accelerator ({'/'.join(_SUPPORTED_ACCEL_TYPES)})")
         return DDPPlan(1, [home], batch_size, notes)
     world = int(world)
     if batch_size % world != 0:
@@ -107,11 +148,11 @@ def resolve_ddp_plan(
         return DDPPlan(1, [home], batch_size, notes)
 
     if explicit_devices:
-        order = [_parse_device_token(str(d)) for d in explicit_devices]
-    elif visible_cuda_devices:
-        order = [torch.device("cuda", i) for i in sorted(visible_cuda_devices)]
+        order = [_parse_device_token(str(d), home.type) for d in explicit_devices]
+    elif visible_devices:
+        order = [torch.device(home.type, i) for i in sorted(visible_devices)]
     else:
-        order = [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
+        order = [torch.device(home.type, i) for i in range(_accel_device_count(home.type))]
 
     rotated = [home] + [d for d in order if d != home]
     devices: List[torch.device] = []
@@ -162,22 +203,27 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
     if world is None:
         world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
     home = torch.device(home) if not isinstance(home, torch.device) else home
-    if home.type == "cuda" and home.index is None:
-        home = torch.device("cuda", torch.cuda.current_device())
+    if home.type in _SUPPORTED_ACCEL_TYPES and home.index is None:
+        try:
+            _mod = getattr(torch, home.type, None)
+            _cur = getattr(_mod, "current_device", None)
+            home = torch.device(home.type, int(_cur()) if callable(_cur) else 0)
+        except Exception:  # backend module init can assert on builds without it
+            home = torch.device(home.type, 0)
     decline = []
     # NOTE: no iters gate -- the DDP world shards the sharded no-grad
     # collection passes at iters=0 exactly as at iters>0 (the 0-length tune
     # loop simply never runs); this restores the campaign semantics where the
     # env was never iters-gated
-    if world > 1 and home.type != "cuda":
-        decline.append(f"home device {home} is not CUDA")
+    if world > 1 and home.type not in _SUPPORTED_ACCEL_TYPES:
+        decline.append(f"home device {home} is not a supported accelerator ({'/'.join(_SUPPORTED_ACCEL_TYPES)})")
     # not every block quantizer family exposes _get_scaler (e.g. RTN /
     # OptimizedRTN); a missing method means "no scaler" for eligibility
     _scaler_fn = getattr(quantizer, "_get_scaler", None)
     _scaler = _scaler_fn() if callable(_scaler_fn) else None
     eligible = (
         world > 1
-        and home.type == "cuda"
+        and home.type in _SUPPORTED_ACCEL_TYPES
         and _scaler is None
         and getattr(quantizer, "gradient_accumulate_steps", 1) == 1
         and not getattr(quantizer, "enable_lfq", False)
@@ -197,20 +243,21 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         decline.append("multi-process torchrun lane is active (AR_TUNE_DDP_WORLD is single-process)")
     # Parallel tuning tunes whole-block mirrors: every replica, including the
     # home copy, must sit on ONE device for the tune. A block whose weights
-    # span several CUDA devices (multi-GPU auto placement) is a different
-    # topology (pipeline-style stages), so fail visibly instead of gathering:
-    # the placement itself must be single-device when parallel tuning runs.
-    # CPU-resident tensors are legal alongside the home device (pinned
-    # subtrees such as ngram embedding tables stay on CPU by design).
-    _home_cuda_devs = {p.device for p in block.parameters() if p.device.type == "cuda"}
-    if world > 1 and len(_home_cuda_devs) > 1:
+    # span several devices of the home's accelerator type (multi-device auto
+    # placement) is a different topology (pipeline-style stages), so fail
+    # visibly instead of gathering: the placement itself must be single-device
+    # when parallel tuning runs. CPU-resident tensors are legal alongside the
+    # home device (pinned subtrees such as ngram embedding tables stay on CPU
+    # by design).
+    _home_span_devs = {p.device for p in block.parameters() if p.device.type == home.type}
+    if world > 1 and len(_home_span_devs) > 1:
         decline.append(
-            f"block spans {len(_home_cuda_devs)} CUDA devices; parallel tuning requires "
+            f"block spans {len(_home_span_devs)} {home.type.upper()} devices; parallel tuning requires "
             "single-device block placement (run with no --device_map or a single-device "
             "--device_map; multi-device/auto maps may shard a block across GPUs -- or run "
             "with --parallel_quantization off)"
         )
-    eligible = eligible and len(_home_cuda_devs) <= 1
+    eligible = eligible and len(_home_span_devs) <= 1
 
     plan = DDPPlan(1, [home], len(fp_inputs) if isinstance(fp_inputs, list) else 0)
     if eligible:
@@ -224,19 +271,13 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             if hasattr(_m, "orig_layer")
             for pp in _m.params.values()
         )
-        free = None
-        try:
-            free = {
-                torch.device("cuda", idx): torch.cuda.mem_get_info(idx)[0] for idx in range(torch.cuda.device_count())
-            }
-        except Exception as e:  # pragma: no cover - non-CUDA reachability
-            logger.warning("[tune-ddp] free-VRAM probe failed (%s); resolving the plan without VRAM filtering", e)
-            free = None
+        free = _accel_free_bytes_map(home.type)
+        _n_devs = _accel_device_count(home.type)
         plan = resolve_ddp_plan(
             world,
             home,
             global_batch_size,
-            visible_cuda_devices=list(range(torch.cuda.device_count())) if free else None,
+            visible_devices=list(range(_n_devs)) if _n_devs else None,
             explicit_devices=explicit or None,
             vram_free_bytes=free,
             mirror_footprint_bytes=mirror_bytes,
