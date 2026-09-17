@@ -187,6 +187,12 @@ class TuneParallelContext:
         force dynamo graph breaks, leaving the compiled runner as
         python-bound eager sections that GIL-convoy under many threads.
         """
+        if hook_pass and not envs.AR_TUNE_DDP_HOOK_PASS_COMPILE:
+            # perf A/B: run this hook-carrying pass through the uncompiled
+            # forward (hookless passes always stay compiled)
+            raw = getattr(block_forward, "_raw_block_forward", None)
+            if raw is not None:
+                block_forward = raw
         if self.devices is None or not allow_shard:
             return block_forward(block, inputs, input_others, cache_device=out_dev)
         return sharded_nograd_forward(
@@ -197,7 +203,7 @@ class TuneParallelContext:
             out_dev,
             self.devices,
             merge_stats=True,
-            max_devices=(int(envs.AR_TUNE_COLL_HOOK_SHARDS) if hook_pass else 0),
+            max_devices=(int(envs.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES) if hook_pass else 0),
             stats=self.collect_stats,
         )
 

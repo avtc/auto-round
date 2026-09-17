@@ -527,7 +527,7 @@ class TestEngagedLaneE2E:
 
 
 class TestHookShardCapEnv:
-    """AR_TUNE_COLL_HOOK_SHARDS rules the hook-carrying collect concurrency."""
+    """AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES rules the hook-carrying collect concurrency."""
 
     def test_hook_cap_env_forwarded(self, monkeypatch):
         import auto_round.algorithms.quantization.sign_round.tune_parallel as tp
@@ -553,17 +553,59 @@ class TestHookShardCapEnv:
             (8, True, 8),  # raised above the default
             (8, False, 0),  # non-hook passes are never capped
         ]:
-            had = "AR_TUNE_COLL_HOOK_SHARDS" in vars(envs_mod)
-            prev = getattr(envs_mod, "AR_TUNE_COLL_HOOK_SHARDS", 4)
+            had = "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES" in vars(envs_mod)
+            prev = getattr(envs_mod, "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", 4)
             if env_val is None:
-                vars(envs_mod).pop("AR_TUNE_COLL_HOOK_SHARDS", None)
+                vars(envs_mod).pop("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", None)
             else:
-                envs_mod.AR_TUNE_COLL_HOOK_SHARDS = env_val
+                envs_mod.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES = env_val
             try:
                 ctx.collect_forward(lambda blk, ins, others, **kw: [ins[0]], block, inputs, {}, hook_pass=hook_pass)
                 assert captured["max_devices"] == expected, (env_val, hook_pass, captured)
             finally:
                 if had:
-                    envs_mod.AR_TUNE_COLL_HOOK_SHARDS = prev
+                    envs_mod.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES = prev
                 else:
-                    vars(envs_mod).pop("AR_TUNE_COLL_HOOK_SHARDS", None)
+                    vars(envs_mod).pop("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", None)
+
+
+class TestHookPassCompileToggle:
+    """AR_TUNE_DDP_HOOK_PASS_COMPILE=0 routes hook passes to the raw forward."""
+
+    def test_compile_toggle_uses_raw_forward(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.tune_parallel as tp
+        from auto_round import envs as envs_mod
+
+        calls = []
+
+        class _Runner:
+            def __init__(self):
+                self._raw_block_forward = self._raw
+
+            def _raw(self, block, inputs, others, **kw):
+                calls.append("raw")
+                return [inputs[0]]
+
+            def __call__(self, block, inputs, others, **kw):
+                calls.append("compiled")
+                return [inputs[0]]
+
+        ctx = TuneParallelContext()
+        ctx.devices = None  # force the serial fallback inside collect_forward
+        block = torch.nn.Linear(4, 4)
+        inputs = [torch.randn(1, 2, 4)]
+
+        # default: hook pass rides the compiled runner
+        monkeypatch.setattr(tp, "sharded_nograd_forward", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+        monkeypatch.delenv("AR_TUNE_DDP_HOOK_PASS_COMPILE", raising=False)
+        ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=True)
+        assert calls == ["compiled"]
+
+        # opt-out: hook pass rides the raw forward; hookless stays compiled
+        calls.clear()
+        monkeypatch.setenv("AR_TUNE_DDP_HOOK_PASS_COMPILE", "0")
+        ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=True)
+        assert calls == ["raw"]
+        calls.clear()
+        ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=False)
+        assert calls == ["compiled"]

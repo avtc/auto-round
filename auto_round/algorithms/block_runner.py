@@ -160,6 +160,7 @@ class BlockForwardRunner:
         self.enable_torch_compile = enable_torch_compile
         self.last_output_dict = None
         self.block_forward = block_forward
+        self._raw_block_forward = block_forward  # pre-compile callable (perf A/B)
         if self.enable_torch_compile:
             from auto_round.utils import compile_func
 

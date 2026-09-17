@@ -145,7 +145,7 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
   `load/tune/pack/write/clean/offload` in the data-driven loop and per-block
   `mirrors/warmup/fwd/bwd/exch/step/teardown` for `--parallel_quantization` tuning.
 
-### AR_TUNE_COLL_HOOK_SHARDS
+### AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES
 - **Description**: Concurrent mirror shards for hook-carrying collection forwards (e.g. AWQ
   activation statistics, imatrix/act-max passes) under `--parallel_quantization`. Forward hooks
   break the compiled graph into Python-bound sections that convoy under the GIL with many
@@ -155,7 +155,7 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
 - **Valid Values**: non-negative integer
 
 ```bash
-export AR_TUNE_COLL_HOOK_SHARDS=8
+export AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES=8
 ```
 
 ### AR_TUNE_DDP_DEVICES
