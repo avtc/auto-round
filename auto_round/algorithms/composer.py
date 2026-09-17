@@ -30,11 +30,13 @@ Design invariants (see AWQ_REFACTOR_PLAN.md §0.0 and §3.0):
 
 from __future__ import annotations
 
+import time as _ctime
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from auto_round import envs as _envs
 from auto_round.algorithms.block_runner import BlockForwardRunner
 from auto_round.algorithms.config_resolver import (
     get_algorithm_class,
@@ -447,6 +449,14 @@ class AlgorithmComposer:
         """
         self.last_collect_wall = 0.0
         self.last_mirror_setup_wall = 0.0
+        # per-phase walls for the [perf] pipeline line (AR_PERF_COUNTERS)
+        self.last_pipeline_walls = {
+            "pre_calib": 0.0,  # Step 1: preprocessor stats passes (serial today)
+            "pre_quant": 0.0,  # Step 2: weight transforms (AWQ searches etc.)
+            "ref_collect": 0.0,  # Step 3: fp reference + calibration collect
+            "q_collect": 0.0,  # Step 3: q-input calibration collect
+        }
+        _pl = self.last_pipeline_walls
         if getattr(self, "_coll_ctx", None) is not None:
             self._coll_ctx.collect_stats = {}
         block_forward_fn = self.block_forward
@@ -460,6 +470,7 @@ class AlgorithmComposer:
 
         # ── Step 1: Preprocessor calibration (e.g. AWQ activation stats) ──────
         with torch.no_grad():
+            _t0 = _ctime.perf_counter()
             pre_hooks = []
             for pre in self.preprocessors:
                 pre_hooks.extend(pre.register_fp_input_forward_hooks(block))
@@ -476,8 +487,10 @@ class AlgorithmComposer:
                 block_forward_fn(block, q_inputs if q_inputs is not None else fp_inputs, input_others)
             for h in pre_q_hooks:
                 h.remove()
+            _pl["pre_calib"] = _ctime.perf_counter() - _t0
 
         # ── Step 2: pre_quantize_block (stats consolidation + weight transforms) ──
+        _t0 = _ctime.perf_counter()
         for pre in self.preprocessors:
             # attach the engaged lane's shard-and-reduce seam so no-grad
             # searches (AWQ's smoothing grid) can evaluate in parallel; the
@@ -491,11 +504,13 @@ class AlgorithmComposer:
             finally:
                 if hasattr(pre, "set_parallel_reduce"):
                     pre.set_parallel_reduce(None)
+        _pl["pre_quant"] = _ctime.perf_counter() - _t0
 
         reference_next_input = None
         # ── Step 3: Quantizer calibration (act_max, imatrix, etc.) ─────────────
         if fp_inputs is not None:
             with torch.no_grad():
+                _t0 = _ctime.perf_counter()
                 quant_hooks = self._get_fp_act_hooks(block)
                 if reference_output is None:
                     reference_output = self._collect_forward_timed(
@@ -509,8 +524,10 @@ class AlgorithmComposer:
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
                     h.remove()
+                _pl["ref_collect"] = _ctime.perf_counter() - _t0
 
                 if self.block_quantizer.enable_quanted_input:
+                    _t0 = _ctime.perf_counter()
                     q_hooks = self._get_q_act_hooks(block)
                     if q_hooks:
                         self._collect_forward_timed(
@@ -521,6 +538,7 @@ class AlgorithmComposer:
                         )
                         for h in q_hooks:
                             h.remove()
+                    _pl["q_collect"] = _ctime.perf_counter() - _t0
 
             # ── Step 3.5: MoE scale alignment + global scale update ─────────────────
             # Must run after calibration hooks (act_max collected) and before quantize_block.
@@ -567,6 +585,14 @@ class AlgorithmComposer:
         else:
             new_q_input = None
 
+        if getattr(_envs, "AR_PERF_COUNTERS", False):
+            logger.info(
+                "[perf] pipeline phases: pre_calib=%.2fs pre_quant=%.2fs ref_collect=%.2fs q_collect=%.2fs",
+                _pl["pre_calib"],
+                _pl["pre_quant"],
+                _pl["ref_collect"],
+                _pl["q_collect"],
+            )
         return new_q_input, reference_next_input
 
     def compress_layer_outside_block(
