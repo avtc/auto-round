@@ -129,8 +129,9 @@ def resolve_ddp_plan(
 
     Rules (each demotion is recorded in ``notes``):
     - world <= 1 or non-CUDA home -> disabled
-    - batch_size % world != 0 -> disabled (shard means must reproduce the
-      global mean exactly)
+    - batch_size % world != 0 -> demote the world to the largest
+      power-of-two divisor of the batch (>= 2); smaller batches than any
+      power-of-two world disable the lane
     - explicit device list -> use as-is after the home (deduplicated)
     - otherwise home + next devices in ascending visible order
     - per-mirror VRAM guard: skip any device that cannot hold the mirror
@@ -144,8 +145,18 @@ def resolve_ddp_plan(
         return DDPPlan(1, [home], batch_size, notes)
     world = int(world)
     if batch_size % world != 0:
-        notes.append(f"batch_size {batch_size} not divisible by world {world}")
-        return DDPPlan(1, [home], batch_size, notes)
+        # demote the world to the largest power-of-two divisor of the batch
+        # (the halving-doubling exchange needs a power of two anyway) instead
+        # of declining outright -- a smaller world still shards the work
+        _w = world
+        while _w > 1 and batch_size % _w != 0:
+            _w //= 2
+        if _w < 2:
+            notes.append(f"batch_size {batch_size} not divisible by any power-of-two world >= 2")
+            return DDPPlan(1, [home], batch_size, notes)
+        notes.append(f"batch_size {batch_size} not divisible by world {world}; demoted world to {_w}")
+        logger.info("[tune-ddp] %s", notes[-1])
+        world = _w
 
     if explicit_devices:
         order = [_parse_device_token(str(d), home.type) for d in explicit_devices]
@@ -270,6 +281,22 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             if hasattr(_m, "orig_layer")
             for pp in _m.params.values()
         )
+        # charge the per-forward activation working set on top of the mirror:
+        # the existing estimator walks the block's real shapes at the
+        # per-forward batch (the serial micro-batch size -- replicas chunk
+        # their shards to it), so an activation-heavy block cannot silently
+        # pass a weights-only budget
+        try:
+            from auto_round.utils.device import estimate_tuning_block_mem
+
+            _per_fwd = min(int(batch_size), max(1, global_batch_size // max(1, world)))
+            _layer_mem, _io_mem, _add_mem = estimate_tuning_block_mem(block, fp_inputs, _per_fwd)
+            _act_bytes = int((_io_mem + _add_mem) * 2**30)
+            _out_mem = sum(v.get("output_memory", 0.0) for v in _layer_mem.values())
+            _act_bytes += int(_out_mem * 2**30)
+            mirror_bytes += _act_bytes
+        except Exception as e:  # pragma: no cover - estimator is best-effort
+            logger.debug("[tune-ddp] activation pricing skipped (estimator failed: %s)", e)
         free = _accel_free_bytes_map(home.type)
         _n_devs = _accel_device_count(home.type)
         plan = resolve_ddp_plan(

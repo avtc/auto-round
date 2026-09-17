@@ -752,7 +752,18 @@ class AWQTransform(BasePreprocessor):
         # the original weights, so a successful shard skips the serial
         # reference replay entirely (the serial fallback computes it below)
         if use_parent_forward and self._parallel_reduce is not None:
+            _t_shard = time.perf_counter()
             merged = self._sharded_grid_losses(mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix)
+            from auto_round import envs as _penvs
+
+            _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
+            _pl(
+                "[perf] awq grid search: mapping='%s' wall=%.0fms calls=%d grid=%d",
+                mapping.smooth_name,
+                (time.perf_counter() - _t_shard) * 1000,
+                len(parent_kwargs_list),
+                len(grid_params),
+            )
             if merged is not None:
                 losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
                 best = int(torch.argmin(losses))
@@ -1149,7 +1160,17 @@ class AWQTransform(BasePreprocessor):
                     logger.debug("AWQ: skip clip for '%s' (avoid-clipping layer).", name)
                     continue
                 clip_jobs.append((bl, feat, name))
+        _t_clip = time.perf_counter()
         results = self._sharded_clip_results(block_prefix, clip_jobs) or [None] * len(clip_jobs)
+        if clip_jobs:
+            from auto_round import envs as _penvs
+
+            _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
+            _pl(
+                "[perf] awq clip search: wall=%.0fms layers=%d",
+                (time.perf_counter() - _t_clip) * 1000,
+                len(clip_jobs),
+            )
         for (bl, feat, name), clip_range in zip(clip_jobs, results):
             if clip_range is None or (isinstance(clip_range, tuple) and clip_range[0] is None):
                 continue

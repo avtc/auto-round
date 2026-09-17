@@ -500,6 +500,12 @@ class SignRoundQuantizer(BaseQuantizer):
         mse_reduction = "mean"
         if self.gradient_accumulate_steps != 1:
             mse_reduction = "sum"
+        _use_ddp = getattr(self, "_resolved_ddp_plan", None) is not None and self._resolved_ddp_plan.world > 1
+        if _use_ddp:
+            # replicas may chunk their shards into batch_size micro-batches,
+            # so per-forward losses are SUMS everywhere in the lane; the
+            # element count normalizes (partition-invariant)
+            mse_reduction = "sum"
         mse_loss = torch.nn.MSELoss(reduction=mse_reduction).to(device)
         scaler = self._get_scaler()  # pylint: disable=assignment-from-none
         init_loss = None
@@ -553,25 +559,42 @@ class SignRoundQuantizer(BaseQuantizer):
             def _ddp_step(rep, shard, dev_r, rec):
                 expect_pool_local([fp_outputs[j] for j in shard], dev_r, "ddp-ref")
                 ref_r = torch.cat([fp_outputs[j].to(dev_r) for j in shard], dim=0)
-                # always device-local: parking a mirror's output on the
-                # primary GPU would both mismatch the loss and cost a
-                # cross-device copy every iteration
+                # per-forward activations are capped at the serial micro-batch
+                # size: a replica whose shard exceeds batch_size (small world,
+                # accumulated global batch) processes it in batch_size chunks
+                # with a sum-reduced loss per chunk, exactly like the serial
+                # accumulation loop -- grads accumulate across chunks and the
+                # exchange sees the shard's full sum
+                _mb = max(1, int(getattr(self.calibration_context, "batch_size", len(shard)) or len(shard)))
+                chunks = [shard[i : i + _mb] for i in range(0, len(shard), _mb)] if len(shard) > _mb else [shard]
+                loss_total = None
+                _bwd_t = 0.0
                 _t0 = _ptime.perf_counter()
-                pred_r = block_fwd.forward(rep, active_inputs, input_others, shard, dev_r)
-                # the masked loss divides by the shard's ELEMENT count
-                # (reduction="mean"), which is identical across the
-                # equal shards -- so the exchange's mean-of-shard-means
-                # reproduces the serial masked loss exactly
-                loss_r = self._get_loss(pred_r, ref_r, shard, mse_loss, dev_r, valid_token_mask)
-                rec.fwd = _ptime.perf_counter() - _t0
-                _t0 = _ptime.perf_counter()
-                loss_r.backward()
+                for ci, chunk in enumerate(chunks):
+                    pred_c = block_fwd.forward(rep, active_inputs, input_others, chunk, dev_r)
+                    # sum-reduced: the loss is a SUM over the chunk's elements;
+                    # mean_loss normalizes by the global element count, so the
+                    # shard sums add up to the serial global sum regardless of
+                    # how many chunks each replica took
+                    loss_c = self._get_loss(
+                        pred_c, ref_r[ci * _mb : ci * _mb + len(chunk)], chunk, mse_loss, dev_r, valid_token_mask
+                    )
+                    # backward per chunk (like the serial accumulation loop)
+                    # so each chunk's graph frees before the next forward --
+                    # the per-forward activation cap is the whole point
+                    _tb = _ptime.perf_counter()
+                    loss_c.backward()
+                    _bwd_t += _ptime.perf_counter() - _tb
+                    loss_total = loss_c.detach() if loss_total is None else loss_total + loss_c.detach()
+                _all_t = _ptime.perf_counter() - _t0
+                rec.fwd = _all_t - _bwd_t
+                rec.bwd = _bwd_t
+                return loss_total
                 # NB: backward() returns after ENQUEUE; the device
                 # completion is forced by the loss .item() sum and the
                 # exchange's grad reads, so a tail of bwd GPU time
                 # surfaces in the exch wall below
-                rec.bwd = _ptime.perf_counter() - _t0
-                return loss_r
+                return loss_total
 
             # warm-up runs inside the context: serial per replica (dynamo
             # kernel compilation races from worker threads), grads discarded,
@@ -636,10 +659,10 @@ class SignRoundQuantizer(BaseQuantizer):
                     # means == the serial global mean), normalized by the
                     # valid-element count exactly like the serial path so
                     # best-iter selection and dynamic_max_gap behave identically
-                    # sum-reduced shard losses (accumulation) add up to the
-                    # serial global sum, so only the element count divides;
-                    # mean-reduced shard losses need the mean-of-shard-means
-                    total_loss = accel.mean_loss(_losses, num_elm, divide_world=self.gradient_accumulate_steps == 1)
+                    # sum-reduced shard losses always in the lane: they add
+                    # up to the serial global sum, so only the element count
+                    # divides (no world divisor) regardless of accumulation
+                    total_loss = accel.mean_loss(_losses, num_elm, divide_world=not _use_ddp)
 
                 else:
                     global_indices = index_sampler.next_batch()
