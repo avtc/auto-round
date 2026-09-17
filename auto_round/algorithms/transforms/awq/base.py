@@ -744,6 +744,30 @@ class AWQTransform(BasePreprocessor):
         parent_kwargs_list = self._parent_args_cache.get(mapping.parent, [])
         use_parent_forward = len(parent_kwargs_list) > 0
 
+        grid_params = list(self._get_grid_search_params())
+
+        # the sharded path computes its own per-replica reference outputs at
+        # the original weights, so a successful shard skips the serial
+        # reference replay entirely (the serial fallback computes it below)
+        if use_parent_forward and self._parallel_reduce is not None:
+            merged = self._sharded_grid_losses(mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix)
+            if merged is not None:
+                losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
+                best = int(torch.argmin(losses))
+                if torch.isfinite(losses[best]):
+                    best_scales = self._candidate_scales(
+                        x_mean, grid_params[best][0], grid_params[best][1], w_mean, device
+                    ).view(-1)
+                    logger.debug(
+                        "AWQ '%s': sharded grid search best_ratio=%.2f, best_error=%.3e",
+                        mapping.smooth_name,
+                        grid_params[best][0],
+                        float(losses[best]),
+                    )
+                    return best_scales
+                logger.warning("AWQ: sharded grid search failed for '%s': no finite error.", mapping.smooth_name)
+                return None
+
         if use_parent_forward:
             fp16_outputs = self._run_parent_samples(
                 mapping.parent,
@@ -766,31 +790,6 @@ class AWQTransform(BasePreprocessor):
         best_error = float("inf")
         best_scales = None
         best_ratio = -1
-
-        grid_params = list(self._get_grid_search_params())
-
-        if use_parent_forward and self._parallel_reduce is not None:
-            merged = self._sharded_grid_losses(
-                mapping, grid_params, x_mean, w_mean, parent_kwargs_list, fp16_outputs, block_prefix
-            )
-            if merged is not None:
-                losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
-                best = int(torch.argmin(losses))
-                if torch.isfinite(losses[best]):
-                    best_ratio, best_error = float(losses[best]), 0.0  # error exact below
-                    best_scales = self._candidate_scales(
-                        x_mean, grid_params[best][0], grid_params[best][1], w_mean, device
-                    ).view(-1)
-                    best_error = float(losses[best])
-                    logger.debug(
-                        "AWQ '%s': sharded grid search best_ratio=%.2f, best_error=%.3e",
-                        mapping.smooth_name,
-                        grid_params[best][0],
-                        best_error,
-                    )
-                    return best_scales
-                logger.warning("AWQ: sharded grid search failed for '%s': no finite error.", mapping.smooth_name)
-                return None
 
         for ratio, use_duo in grid_params:
             scales = self._candidate_scales(x_mean, ratio, use_duo, w_mean, device).view(-1)
@@ -840,30 +839,32 @@ class AWQTransform(BasePreprocessor):
         logger.debug("AWQ '%s': best_ratio=%.2f, best_error=%.3e", mapping.smooth_name, best_ratio, best_error)
         return best_scales
 
-    def _sharded_grid_losses(
-        self, mapping, grid_params, x_mean, w_mean, parent_kwargs_list, fp16_outputs, block_prefix
-    ):
+    def _sharded_grid_losses(self, mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix):
         """Evaluate the smoothing grid in parallel across the lane's replicas.
 
         Each replica replays its contiguous slice of the cached parent calls
-        with every grid point's quantized candidate weights and returns the
-        per-point loss SUM plus the element count; the engine sums the
-        partials, and dividing by the merged count reproduces the serial
-        per-point loss exactly (up to fp32 summation order). Returns ``None``
-        when the calls cannot shard -- the caller keeps the serial loop.
+        on its own block copy: reference outputs first (the copy starts at
+        the original weights), then every grid point's quantized candidate
+        against them. The replica returns per-point loss SUMS plus the
+        element count; the engine sums the partials, and dividing by the
+        merged count reproduces the serial per-point loss exactly (up to
+        fp32 summation order). Returns ``None`` when the mapping cannot
+        shard -- the caller keeps the serial loop.
         """
         calls = [mc for stored in parent_kwargs_list for mc in self._iter_parent_calls(*stored)]
-        if len(calls) != len(fp16_outputs) or not calls:
+        if not calls:
             return None
         if self._parallel_world > 1 and len(calls) % self._parallel_world != 0:
             # the lane validated nsamples divisibility at engagement, so a
-            # non-divisible call count can only come from microbatching
-            # (smooth_batch_size splitting batches unevenly) -- a setup the
-            # user controls, so stop instead of silently running serial
+            # non-divisible call count comes from the call granularity:
+            # one cached call per calibration batch (ceil(nsamples /
+            # batch_size)), optionally split by smooth_batch_size -- all
+            # user-controlled knobs, so stop instead of running serial
             raise RuntimeError(
                 f"AWQ grid search cannot shard {len(calls)} parent calls across "
-                f"{self._parallel_world} replicas (microbatch splitting produced a non-divisible "
-                "count; adjust smooth_batch_size or nsamples)"
+                f"{self._parallel_world} replicas (one call per calibration batch; "
+                "adjust batch_size, nsamples or smooth_batch_size so the call count divides "
+                "by the world)"
             )
         # the replay needs the parent forward inside the block copy: only
         # mappings whose parent is the block itself or an in-block module
@@ -888,16 +889,23 @@ class AWQTransform(BasePreprocessor):
             logger.debug("AWQ: sharded grid search declined for '%s': block lookup failed (%s)", mapping.smooth_name, e)
             return None
         n_grid = len(grid_params)
-        items = list(zip(calls, fp16_outputs))
+        items = calls
 
         def per_replica(rep, remap, items_slice):
             r_parent = remap(parent)
             r_bls = [remap(bl) for bl in mapping.balance_layers]
             r_dev = r_bls[0].weight.device
+            # reference outputs at the ORIGINAL weights (the copy is pristine)
+            refs = []
+            for call_args, call_kwargs in items_slice:
+                args = tuple(move_to_device(a, r_dev) for a in call_args)
+                kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
+                refs.append(self._normalize_parent_output(r_parent(*args, **kwargs)))
+            out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
+            out[-1] = float(sum(r.numel() for r in refs))
             bl_params = {bl: self._qdq_tool.resolve_params(bl) for bl in r_bls}
             bl_funcs = {bl: self._qdq_tool.resolve_quant_funcs(bl_params[bl]) for bl in r_bls}
             orig = {bl: bl.weight.data.clone() for bl in r_bls}
-            out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
             for gi, (ratio, use_duo) in enumerate(grid_params):
                 scales_view = self._candidate_scales(x_mean, ratio, use_duo, w_mean, r_dev)
                 for bl in r_bls:
@@ -911,14 +919,11 @@ class AWQTransform(BasePreprocessor):
                     )
                     bl.weight.data = (w_qdq / scales_view).to(bl.weight.dtype)
                 loss_sum = torch.zeros((), device=r_dev, dtype=torch.float32)
-                for (call_args, call_kwargs), fp16_out in items_slice:
+                for (call_args, call_kwargs), ref in zip(items_slice, refs):
                     args = tuple(move_to_device(a, r_dev) for a in call_args)
                     kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
                     cand = self._normalize_parent_output(r_parent(*args, **kwargs))
-                    ref = fp16_out.to(r_dev, non_blocking=False)
                     loss_sum = loss_sum + torch.nn.functional.mse_loss(ref.float(), cand.float(), reduction="sum")
-                    if out[-1] == 0:
-                        out[-1] = ref.numel()
                 out[gi] = loss_sum
             for bl in r_bls:
                 bl.weight.data.copy_(orig[bl])
