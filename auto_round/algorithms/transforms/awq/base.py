@@ -263,6 +263,7 @@ class AWQTransform(BasePreprocessor):
         self._parent_args_cache: dict[torch.nn.Module, list[tuple[tuple, dict]]] = {}
         # Parallel-lane shard-and-reduce seam (None = serial searches).
         self._parallel_reduce = None
+        self._parallel_world = 0
         # Per-mapping balance-layer input features captured for the clip search
         # (keyed by smooth_name). Only populated when ``apply_clip`` is set.
         self._clip_input_feat: dict[str, torch.Tensor] = {}
@@ -712,15 +713,17 @@ class AWQTransform(BasePreprocessor):
         scales[torch.isnan(scales)] = 1
         return scales.view(1, -1).to(device)
 
-    def set_parallel_reduce(self, reduce_fn) -> None:
+    def set_parallel_reduce(self, reduce_fn, world: int = 0) -> None:
         """Attach the parallel lane's shard-and-reduce seam (composer wiring).
 
         ``reduce_fn(block, per_replica_fn, items)`` returns the summed partials
         on the home device, or ``None`` when the items cannot shard -- the
         search then keeps its serial loop. The composer attaches the engaged
-        lane's seam before ``pre_quantize_block`` and detaches it after.
+        lane's seam with its device count (for divisibility checks) before
+        ``pre_quantize_block`` and detaches it after.
         """
         self._parallel_reduce = reduce_fn
+        self._parallel_world = world if reduce_fn is not None else 0
 
     def _grid_search_scales(
         self,
@@ -852,14 +855,32 @@ class AWQTransform(BasePreprocessor):
         calls = [mc for stored in parent_kwargs_list for mc in self._iter_parent_calls(*stored)]
         if len(calls) != len(fp16_outputs) or not calls:
             return None
+        if self._parallel_world > 1 and len(calls) % self._parallel_world != 0:
+            # the lane validated nsamples divisibility at engagement, so a
+            # non-divisible call count can only come from microbatching
+            # (smooth_batch_size splitting batches unevenly) -- a setup the
+            # user controls, so stop instead of silently running serial
+            raise RuntimeError(
+                f"AWQ grid search cannot shard {len(calls)} parent calls across "
+                f"{self._parallel_world} replicas (microbatch splitting produced a non-divisible "
+                "count; adjust smooth_batch_size or nsamples)"
+            )
         # the replay needs the parent forward inside the block copy: only
         # mappings whose parent is the block itself or an in-block module
-        # can shard; anything else keeps the serial loop
+        # can shard; a mapping whose parent sits outside the block is a model
+        # topology, not a setup error -- warn and keep the serial loop for it
         parent = mapping.parent
         parent_name = getattr(parent, "global_name", None)
         if not block_prefix or not parent_name:
             return None
         if parent_name != block_prefix and not parent_name.startswith(block_prefix + "."):
+            logger.warning(
+                "AWQ: parent '%s' of mapping '%s' lies outside block '%s'; "
+                "its grid search stays serial while the lane is engaged.",
+                parent_name,
+                mapping.smooth_name,
+                block_prefix,
+            )
             return None
         try:
             block = self.model_context.model.get_submodule(block_prefix)

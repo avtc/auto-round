@@ -236,6 +236,12 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         decline.append("enable_lfq")
     if world > 1 and not isinstance(fp_inputs, list):
         decline.append("non-list calibration inputs (diffusion-style pools)")
+    elif world > 1 and len(fp_inputs) % world != 0:
+        # the lane shards whole samples: the collection passes, the no-grad
+        # searches, and the tune all split the pool into equal contiguous
+        # shards, so a non-divisible sample count would silently degrade
+        # parts of the lane to serial -- stop with the reason instead
+        decline.append(f"nsamples ({len(fp_inputs)}) not divisible by the world ({world})")
     if world > 1 and isinstance(fp_inputs, list) and fp_outputs is not None and not isinstance(fp_outputs, list):
         decline.append("non-list reference outputs (diffusion-style pools)")
     if world > 1 and is_distributed():
@@ -574,6 +580,9 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
         return None
     shard = n // world
     home_dev = _block_device(block)
+    import time as _stime
+
+    _t_mirrors = _stime.perf_counter()
     names = list(name for name, _ in block.named_modules())
     copies: List[torch.nn.Module] = []
     for dev in devices:
@@ -583,6 +592,14 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
             rep = rep.to(dev)
         copies.append(rep)
 
+    _mb = sum(p.numel() * p.element_size() for p in copies[0].parameters())
+    logger.debug(
+        "[tune-ddp] sharded search: world=%d items=%d mirror=%dB/device setup=%.0fms",
+        world,
+        n,
+        _mb,
+        (_stime.perf_counter() - _t_mirrors) * 1000,
+    )
     results: List[Optional[torch.Tensor]] = [None] * world
 
     def _run(r):

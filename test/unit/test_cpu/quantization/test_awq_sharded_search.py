@@ -63,6 +63,7 @@ def _make_transform(n_grid=4, model=None):
     tr._smooth_batch_size = None
     tr._parent_args_cache = {}
     tr._parallel_reduce = None
+    tr._parallel_world = 0
     tr._qdq_tool = QDQTool(bits=4, group_size=-1, sym=True, data_type="int")
     return tr
 
@@ -113,7 +114,7 @@ class TestShardedGridParity:
 
         AWQTransform._sharded_grid_losses = spy
         try:
-            tr.set_parallel_reduce(ctx.reduce)
+            tr.set_parallel_reduce(ctx.reduce, world=2)
             sharded = _run_search(tr, block, mapping, x_mean, calls)
         finally:
             AWQTransform._sharded_grid_losses = orig_sharded
@@ -126,7 +127,12 @@ class TestShardedGridParity:
             ref = block(*args, **kwargs)
         assert torch.isfinite(ref).all()
 
-    def test_reduce_declines_on_uneven_items(self):
+    def test_nondivisible_calls_raise(self):
+        """A non-divisible parent-call count on an engaged lane is a setup
+        error (the nsamples divisibility itself is validated at engagement):
+        the search must stop, never silently fall back to serial."""
+        import pytest
+
         torch.manual_seed(11)
         block = _FakeBlock()
         tr = _make_transform(model=_make_model(block))
@@ -136,14 +142,85 @@ class TestShardedGridParity:
 
         ctx = TuneParallelContext()
         ctx.devices = [torch.device("cpu"), torch.device("cpu")]
-        tr.set_parallel_reduce(ctx.reduce)
-        out = _run_search(tr, block, mapping, x_mean, calls)
-        assert out is not None  # serial fallback still answers
+        tr.set_parallel_reduce(ctx.reduce, world=2)
+        with pytest.raises(RuntimeError, match="cannot shard 3 parent calls"):
+            _run_search(tr, block, mapping, x_mean, calls)
 
     def test_reduce_none_when_lane_disengaged(self):
         ctx = TuneParallelContext()
         assert ctx.devices is None
         assert ctx.reduce(_FakeBlock(), lambda rep, remap, items: torch.zeros(1), [1, 2], op="sum") is None
+
+    def test_nondivisible_microcalls_raise(self):
+        """nsamples divisibility is validated at engagement; a non-divisible
+        PARENT-CALL count is a microbatching setup error -- it must raise,
+        never silently fall back to serial."""
+        import pytest
+
+        torch.manual_seed(3)
+        block = _FakeBlock()
+        tr = _make_transform(model=_make_model(block))
+        tr._smooth_batch_size = 3  # 2-token batches do not split; craft via 3 calls per batch
+        mapping = _make_mapping(block)
+        x_mean = torch.rand(block.lin.in_features) + 0.5
+        g = torch.Generator().manual_seed(1)
+        calls = [((torch.randn(3, block.lin.in_features, generator=g),), {}) for _ in range(3)]
+        tr._parent_args_cache[mapping.parent] = calls
+
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        tr.set_parallel_reduce(ctx.reduce, world=2)
+        with pytest.raises(RuntimeError, match="cannot shard 3 parent calls"):
+            tr._grid_search_scales(mapping, x_mean, block_prefix=block.global_name)
+
+    def test_out_of_block_parent_warns_and_runs_serial(self):
+        torch.manual_seed(5)
+        block = _FakeBlock()
+        model = _make_model(block)
+        outer = nn.Module()
+        outer.model = model  # block still reachable, but the parent sits at root level
+        # parent = a module whose global_name lies outside the block prefix
+        block.global_name = "model.layers.0"
+        block.lin.global_name = "model.layers.0.lin"
+
+        tr = _make_transform(model=_make_model(block))
+        from auto_round.algorithms.transforms.awq.mappings import ResolvedMapping
+
+        class _Outside(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(8, 4, bias=False)
+
+            def forward(self, x):
+                return self.lin(x)
+
+        outside = _Outside()
+        outside.global_name = "outside.holder"
+        tr._BaseAlgorithm__run_ctx = None  # rebuilt below with the outside module in the model
+        from types import SimpleNamespace
+
+        root = _make_model(block)
+        root.outside = outside
+        tr._BaseAlgorithm__run_ctx = SimpleNamespace(model_context=SimpleNamespace(model=root))
+        mapping = ResolvedMapping("s", block.lin, ["n"], [block.lin], "p", outside)
+        calls = [((torch.randn(2, 8),), {}) for _ in range(4)]
+        tr._parent_args_cache[outside] = list(calls)
+        x_mean = torch.rand(block.lin.in_features) + 0.5
+
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        tr.set_parallel_reduce(ctx.reduce, world=2)
+        warned = []
+        import auto_round.algorithms.transforms.awq.base as awq_base
+
+        orig_warn = awq_base.logger.warning
+        awq_base.logger.warning = lambda *a, **kw: warned.append(a[0] % a[1:] if len(a) > 1 else a[0])
+        try:
+            out = tr._grid_search_scales(mapping, x_mean, block_prefix="model.layers.0")
+        finally:
+            awq_base.logger.warning = orig_warn
+        assert out is not None  # serial loop answered
+        assert any("outside block" in w for w in warned)
 
     def test_parallel_reduce_none_by_default(self):
         tr = _make_transform()
