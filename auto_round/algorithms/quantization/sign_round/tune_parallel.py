@@ -286,9 +286,9 @@ class TuneParallelContext:
             return None
 
         # Placement contract: the resolver declined (or raised) when the
-        # block's weights span several CUDA devices, so the source block
-        # already sits whole on the home device and every mirror will sit
-        # whole on exactly one device.
+        # block's weights span several accelerator devices, so the source
+        # block already sits whole on the home device and every mirror will
+        # sit whole on exactly one device.
         # distributed calibration pool: shard-local tune reads; each
         # device owns a contiguous 1/world slice of the samples
         distribute_pool(active_inputs, plan.devices)
@@ -442,8 +442,9 @@ class TuneParallelContext:
             pass
 
     def shards(self, nsamples: int, global_batch_size: int) -> None:
-        """Build per-replica shard samplers when the global batch splits
-        evenly across the world (else the loop falls back to index slicing)."""
+        """Build per-replica shard samplers when the global batch and the
+        sample pool both split evenly across the world (else the loop falls
+        back to global draws + index slicing, with a warn-once note)."""
         self._samplers = None
         if self.group is not None and self.group.world > 1:
             if global_batch_size % self.group.world == 0:

@@ -157,6 +157,16 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
 export AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES=8
 ```
 
+### AR_TUNE_DDP_WORLD
+- **描述**：`--parallel_quantization` world 大小的内部覆盖（CLI 参数才是受支持的入口）。请求的 world 是硬性要求：
+  无法满足时将以 `RuntimeError` 报出阻塞原因并停止，而不是静默退回串行。
+- **默认值**：未设置 → 由 `--parallel_quantization` 推导
+- **取值**：正整数
+
+```bash
+export AR_TUNE_DDP_WORLD=4
+```
+
 ### AR_TUNE_DDP_DEVICES
 - **描述**：`--parallel_quantization` 调参时可选的显式副本设备列表（逗号分隔，例如 `0,1,2,3`）。
   默认由计划从可见的加速器设备（cuda/xpu/hpu）中挑选空闲显存足够容纳镜像的设备；每个副本在其计划设备上持有完整的块镜像，
