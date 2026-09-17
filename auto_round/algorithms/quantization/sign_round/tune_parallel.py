@@ -187,13 +187,6 @@ class TuneParallelContext:
         force dynamo graph breaks, leaving the compiled runner as
         python-bound eager sections that GIL-convoy under many threads.
         """
-        if hook_pass and not envs.AR_TUNE_DDP_HOOK_PASS_COMPILE:
-            # perf A/B: route this hook-carrying pass through the runner's
-            # uncompiled view (hookless passes always stay compiled); the
-            # view keeps the runner's batch loop and cache handling intact
-            view_factory = getattr(block_forward, "uncompiled_view", None)
-            if callable(view_factory):
-                block_forward = view_factory()
         if self.devices is None or not allow_shard:
             return block_forward(block, inputs, input_others, cache_device=out_dev)
         return sharded_nograd_forward(

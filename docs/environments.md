@@ -146,12 +146,11 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
   `mirrors/warmup/fwd/bwd/exch/step/teardown` for `--parallel_quantization` tuning.
 
 ### AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES
-- **Description**: Concurrent mirror shards for hook-carrying collection forwards (e.g. AWQ
-  activation statistics, imatrix/act-max passes) under `--parallel_quantization`. Forward hooks
-  break the compiled graph into Python-bound sections that convoy under the GIL with many
-  threads, so these passes run on at most this many mirrors at once even at a larger world.
-  Tune-loop replicas and search sharding are not affected. Set `0` to disable the cap.
-- **Default**: `4`
+- **Description**: Max mirror devices running a hook-carrying collection forward at once (e.g. AWQ
+  activation statistics, imatrix/act-max passes) under `--parallel_quantization`. The default applies
+  no cap; lower this (e.g. `4`) only on hosts where hook-carrying passes convoy on the GIL with many
+  mirror threads. Tune-loop replicas and search sharding are never affected.
+- **Default**: `0` (no cap)
 - **Valid Values**: non-negative integer
 
 ```bash

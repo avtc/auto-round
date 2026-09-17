@@ -19,8 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     AR_PERF_COUNTERS: bool = False
-    AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES: int = 4
-    AR_TUNE_DDP_HOOK_PASS_COMPILE: bool = True
+    AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES: int = 0
     AR_LOG_LEVEL: str = "INFO"
     AR_USE_MODELSCOPE: bool = "False"
     AR_MODEL_FREE_SHARD_PARALLELISM: Optional[int] = None
@@ -63,10 +62,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Emit [perf] phase-breakdown log lines (per-block load/tune/pack/write/clean/offload
     # in the data-driven loop; per-block mirrors/warmup/fwd/bwd/exch/step/teardown for DDP tuning).
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "0").lower() in ("1", "true", "yes"),
-    # Max mirror devices running a hook-carrying collection forward at once
-    # (GIL-convoy throttle); 0 disables the cap. Tune-loop replicas and search
-    # sharding are not affected. Values above the engaged world are no-ops; the
-    # knee is host-dependent (weaker CPUs convoy earlier).
+    # Max mirror devices running a hook-carrying collection forward at once;
+    # 0 (default) = no cap. Tune-loop replicas and search sharding are never
+    # affected. Only lower this on hosts where hook-carrying passes convoy on
+    # the GIL (observed once on a weaker CPU; not reproduced on the validation
+    # rig up to world=8). Values above the engaged world are no-ops.
     "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES": lambda: (
         lambda v: (
             int(v)
@@ -75,12 +75,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 ValueError(f"AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES must be a non-negative integer, got {v!r}")
             )
         )
-    )(os.getenv("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", "4")),
-    # EXPERIMENTAL, UNDOCUMENTED perf A/B: run hook-carrying collection forwards
-    # through the uncompiled block forward ("0"). Hookless passes always stay
-    # compiled; default keeps the pre-existing behavior (compiled).
-    "AR_TUNE_DDP_HOOK_PASS_COMPILE": lambda: os.getenv("AR_TUNE_DDP_HOOK_PASS_COMPILE", "1").lower()
-    in ("1", "true", "yes"),
+    )(os.getenv("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", "0")),
     "AR_USE_MODELSCOPE": lambda: os.getenv("AR_USE_MODELSCOPE", "False").lower() in ["1", "true"],
     "AR_WORK_SPACE": lambda: os.getenv("AR_WORK_SPACE", "ar_work_space").lower(),
     "AR_ENABLE_UNIFY_MOE_INPUT_SCALE": lambda: os.getenv("AR_ENABLE_UNIFY_MOE_INPUT_SCALE", "False").lower()

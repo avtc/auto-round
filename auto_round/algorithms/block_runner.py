@@ -162,35 +162,10 @@ class BlockForwardRunner:
         import threading
 
         self.block_forward = block_forward
-        self._raw_block_forward = block_forward  # pre-compile callable (perf A/B)
-        self._use_raw_inner = threading.local()  # per-thread: mirror threads share the runner
         if self.enable_torch_compile:
             from auto_round.utils import compile_func
 
             self.block_forward = compile_func(self.block_forward, device)
-
-    def uncompiled_view(self):
-        """A callable that runs this runner's forward path uncompiled.
-
-        Used by the collection seam for the hook-pass compile A/B
-        (AR_TUNE_DDP_HOOK_PASS_COMPILE=0). The switch is thread-local: mirror
-        threads share one runner, and only calls entering through this view
-        dispatch to the raw callable.
-        """
-
-        class _UncompiledView:
-            def __init__(self, runner):
-                self._runner = runner
-
-            def __call__(self, *args, **kwargs):
-                self._runner._use_raw_inner.on = True
-                try:
-                    return self._runner(*args, **kwargs)
-                finally:
-                    self._runner._use_raw_inner.on = False
-
-        self._uncompiled_view = getattr(self, "_uncompiled_view", None) or _UncompiledView(self)
-        return self._uncompiled_view
 
     # ── Factory ──────────────────────────────────────────────────────────────
 
@@ -368,10 +343,7 @@ class BlockForwardRunner:
         if torch.is_tensor(hidden_states) and hidden_states.device != fwd_device:
             hidden_states = hidden_states.to(fwd_device)
         batch_others = to_device(batch_others, fwd_device)
-        inner = self.block_forward
-        if getattr(self._use_raw_inner, "on", False):
-            inner = self._raw_block_forward  # perf A/B: uncompiled dispatch
-        return inner(
+        return self.block_forward(
             block,
             hidden_states,
             batch_others,

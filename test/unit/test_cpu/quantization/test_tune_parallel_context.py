@@ -548,7 +548,8 @@ class TestHookShardCapEnv:
         inputs = [torch.randn(1, 2, 4)]
 
         for env_val, hook_pass, expected in [
-            (None, True, 4),  # default cap
+            (None, True, 0),  # default: no cap
+            (4, True, 4),  # explicit cap still honored
             (0, True, 0),  # cap disabled
             (8, True, 8),  # raised above the default
             (8, False, 0),  # non-hook passes are never capped
@@ -567,57 +568,3 @@ class TestHookShardCapEnv:
                     envs_mod.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES = prev
                 else:
                     vars(envs_mod).pop("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", None)
-
-
-class TestHookPassCompileToggle:
-    """AR_TUNE_DDP_HOOK_PASS_COMPILE=0 routes hook passes to the raw forward."""
-
-    def test_compile_toggle_uses_raw_forward(self, monkeypatch):
-        import auto_round.algorithms.quantization.sign_round.tune_parallel as tp
-
-        calls = []
-
-        class _Runner:
-            """Real-view-shaped fake: uncompiled_view() flips a thread-local."""
-
-            def __init__(self):
-                import threading
-
-                self._use_raw_inner = threading.local()
-
-            def uncompiled_view(self):
-                runner = self
-
-                class _View:
-                    def __call__(self, *args, **kwargs):
-                        runner._use_raw_inner.on = True
-                        try:
-                            return runner(*args, **kwargs)
-                        finally:
-                            runner._use_raw_inner.on = False
-
-                return _View()
-
-            def __call__(self, block, inputs, others, cache_device=None, **kw):
-                calls.append("raw" if getattr(self._use_raw_inner, "on", False) else "compiled")
-                return [inputs[0]]
-
-        ctx = TuneParallelContext()
-        ctx.devices = None  # force the serial fallback inside collect_forward
-        block = torch.nn.Linear(4, 4)
-        inputs = [torch.randn(1, 2, 4)]
-
-        # default: hook pass rides the compiled runner
-        monkeypatch.setattr(tp, "sharded_nograd_forward", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
-        monkeypatch.delenv("AR_TUNE_DDP_HOOK_PASS_COMPILE", raising=False)
-        ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=True)
-        assert calls == ["compiled"]
-
-        # opt-out: hook pass rides the view; hookless stays compiled
-        calls.clear()
-        monkeypatch.setenv("AR_TUNE_DDP_HOOK_PASS_COMPILE", "0")
-        ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=True)
-        assert calls == ["raw"]
-        calls.clear()
-        ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=False)
-        assert calls == ["compiled"]
