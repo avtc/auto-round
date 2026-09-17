@@ -234,6 +234,8 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         decline.append("a grad scaler is active")
     if world > 1 and getattr(quantizer, "enable_lfq", False):
         decline.append("enable_lfq")
+    if world > 1 and not isinstance(fp_inputs, list):
+        decline.append("non-list calibration inputs (diffusion-style pools)")
     if world > 1 and isinstance(fp_inputs, list) and fp_outputs is not None and not isinstance(fp_outputs, list):
         decline.append("non-list reference outputs (diffusion-style pools)")
     if world > 1 and is_distributed():
