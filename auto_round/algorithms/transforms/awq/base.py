@@ -353,6 +353,12 @@ class AWQTransform(BasePreprocessor):
         Hooks are registered on the *current block's* smooth sources and
         parent modules. Returns hook handles that the caller must remove.
         """
+        # Park captured parent-args in host RAM only under the declared
+        # low-VRAM budget; otherwise the args stay on their capture device
+        # (a mirror device when Step 1 shards) until the search consumes
+        # them -- saves the D2H at capture and turns the replay staging
+        # into device-local or GPU-to-GPU moves
+        self._park_capture = bool(getattr(self.compress_context, "low_gpu_mem_usage", False) or False)
         # Need block_name from the block's global_name attribute
         block_name = getattr(block, "global_name", "")
         block_mappings = self._block_mappings.get(block_name, [])
@@ -552,7 +558,9 @@ class AWQTransform(BasePreprocessor):
                             v = v.detach()
                             if w_dtype and v.is_floating_point() and v.dtype != w_dtype:
                                 v = v.to(w_dtype)
-                            return v.to("cpu", non_blocking=False)
+                            if self._park_capture:
+                                return v.to("cpu", non_blocking=False)
+                            return v
                         if isinstance(v, tuple):
                             return tuple(_proc(t) for t in v)
                         if isinstance(v, list):
