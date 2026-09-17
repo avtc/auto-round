@@ -378,8 +378,8 @@ class AWQTransform(BasePreprocessor):
             )
         if not active_mappings:
             return
-        self._grid_perf = {"wall": 0.0, "mappings": 0, "calls": 0, "grid": 0}
-        self._clip_perf = {"wall": 0.0, "layers": 0}
+        self._grid_perf = {"wall": 0.0}
+        self._clip_perf = {"wall": 0.0}
         self._smooth_block(block_name, active_mappings)
         if self.apply_clip:
             self._clip_block(block_name, active_mappings)
@@ -387,14 +387,9 @@ class AWQTransform(BasePreprocessor):
 
         if getattr(_penvs, "AR_PERF_COUNTERS", False):
             logger.info(
-                "[perf] awq searches: block='%s' grid=%.0fms (mappings=%d calls=%d grid=%d) clip=%.0fms (layers=%d)",
-                block_name,
-                self._grid_perf["wall"] * 1000,
-                self._grid_perf["mappings"],
-                self._grid_perf["calls"],
-                self._grid_perf["grid"],
-                self._clip_perf["wall"] * 1000,
-                self._clip_perf["layers"],
+                "[perf] awq searches: grid=%.2fs clip=%.2fs",
+                self._grid_perf["wall"],
+                self._clip_perf["wall"],
             )
         modified = []
         for mapping in active_mappings:
@@ -772,9 +767,6 @@ class AWQTransform(BasePreprocessor):
             _perf = getattr(self, "_grid_perf", None)
             if _perf is not None:
                 _perf["wall"] += time.perf_counter() - _t_shard
-                _perf["mappings"] += 1
-                _perf["calls"] = max(_perf["calls"], len(parent_kwargs_list))
-                _perf["grid"] = max(_perf["grid"], len(grid_params))
             if merged is not None:
                 losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
                 best = int(torch.argmin(losses))
@@ -1176,7 +1168,6 @@ class AWQTransform(BasePreprocessor):
         _perf = getattr(self, "_clip_perf", None)
         if _perf is not None and clip_jobs:
             _perf["wall"] += time.perf_counter() - _t_clip
-            _perf["layers"] += len(clip_jobs)
         for (bl, feat, name), clip_range in zip(clip_jobs, results):
             if clip_range is None or (isinstance(clip_range, tuple) and clip_range[0] is None):
                 continue
