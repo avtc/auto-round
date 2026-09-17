@@ -158,23 +158,24 @@ export AR_TUNE_DDP_DEVICES=0,1,2,3
 ```
 
 ### AR_TUNE_DDP_GRAD_TRANSPORT
-- **描述**：`--parallel_quantization` 梯度交换的传输数据类型 —— `fp32`、`bf16`（默认）或 `int8`。
-  作用于 int8 符号交换的 reduce-scatter 传输，以及 `AR_TUNE_DDP_SIGN_EXCHANGE=0` 时的全值交换。
-- **默认值**：`bf16`
+- **描述**：`--parallel_quantization` 梯度交换的传输数据类型 —— `fp32`（默认）、`bf16` 或 `int8`。
+  作用于全值交换（默认路径）以及 int8 符号交换（`AR_TUNE_DDP_SIGN_EXCHANGE=1`）的 reduce-scatter 传输。
+  `fp32` 无损；更窄的数据类型以交换保真度换取传输字节数。
+- **默认值**：`fp32`
 - **取值**：`fp32`、`bf16`、`int8`
 
 ```bash
-export AR_TUNE_DDP_GRAD_TRANSPORT=fp32
+export AR_TUNE_DDP_GRAD_TRANSPORT=bf16
 ```
 
 ### AR_TUNE_DDP_SIGN_EXCHANGE
-- **描述**：`1`（默认）交换平均梯度的 int8 符号（对纯 sign-SGD，即关闭 momentum 时是精确的）。
-  `0` 强制使用全值 halving-doubling 交换（不受 momentum 影响），用于在同一构建上 A/B 对比交换策略。
-- **默认值**：`1`
+- **描述**：`1` 交换平均梯度的 int8 符号（对纯 sign-SGD，即关闭 momentum 时是精确的），代替全值交换。
+  `0`（默认）保持全值交换 —— 对任意 momentum 设置都正确，且与多进程 torchrun 运行的 fp32 all-reduce 一致。
+- **默认值**：`0`
 - **取值**：`0`、`1`
 
 ```bash
-export AR_TUNE_DDP_SIGN_EXCHANGE=0
+export AR_TUNE_DDP_SIGN_EXCHANGE=1
 ```
 
 ### AR_AUTO_SCHEME_NSAMPLES

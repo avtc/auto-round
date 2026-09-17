@@ -158,25 +158,25 @@ export AR_TUNE_DDP_DEVICES=0,1,2,3
 ```
 
 ### AR_TUNE_DDP_GRAD_TRANSPORT
-- **Description**: Wire dtype for `--parallel_quantization` gradient exchange — `fp32`, `bf16` (default) or `int8`.
-  Applies to the reduce-scatter transport of the int8-sign exchange and to the full-value exchange when
-  `AR_TUNE_DDP_SIGN_EXCHANGE=0`.
-- **Default**: `bf16`
+- **Description**: Wire dtype for `--parallel_quantization` gradient exchange — `fp32` (default), `bf16` or `int8`.
+  Applies to the full-value exchange (the default) and to the reduce-scatter transport of the int8-sign exchange
+  (`AR_TUNE_DDP_SIGN_EXCHANGE=1`). `fp32` is lossless; the narrower dtypes trade exchange fidelity for wire bytes.
+- **Default**: `fp32`
 - **Valid Values**: `fp32`, `bf16`, `int8`
 
 ```bash
-export AR_TUNE_DDP_GRAD_TRANSPORT=fp32
+export AR_TUNE_DDP_GRAD_TRANSPORT=bf16
 ```
 
 ### AR_TUNE_DDP_SIGN_EXCHANGE
-- **Description**: `1` (default) exchanges int8 signs of the averaged gradient (exact for pure sign-SGD, i.e.
-  momentum disabled). `0` forces the full-value halving-doubling exchange regardless of momentum, for A/B
-  comparisons of exchange strategies on the same build.
-- **Default**: `1`
+- **Description**: `1` exchanges int8 signs of the averaged gradient (exact for pure sign-SGD, i.e. momentum
+  disabled) instead of full values. `0` (default) keeps the full-value exchange, which is correct for any
+  momentum setting and matches the fp32 all-reduce a multi-process torchrun run performs.
+- **Default**: `0`
 - **Valid Values**: `0`, `1`
 
 ```bash
-export AR_TUNE_DDP_SIGN_EXCHANGE=0
+export AR_TUNE_DDP_SIGN_EXCHANGE=1
 ```
 
 ### AR_AUTO_SCHEME_NSAMPLES

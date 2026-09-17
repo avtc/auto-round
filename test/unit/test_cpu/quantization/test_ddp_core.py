@@ -184,8 +184,8 @@ class TestEnvDefaults:
 
         assert envs.AR_TUNE_DDP_WORLD == 1
         assert envs.AR_TUNE_DDP_DEVICES == ""
-        assert envs.AR_TUNE_DDP_GRAD_TRANSPORT == "bf16"
-        assert envs.AR_TUNE_DDP_SIGN_EXCHANGE is True
+        assert envs.AR_TUNE_DDP_GRAD_TRANSPORT == "fp32"
+        assert envs.AR_TUNE_DDP_SIGN_EXCHANGE is False
 
     def test_world_env_round_trip(self, monkeypatch):
         monkeypatch.setenv("AR_TUNE_DDP_WORLD", "4")
@@ -300,12 +300,31 @@ class TestExchangeSelection:
             dp.sign_exchange_allreduce, dp.halving_doubling_allreduce = orig_sign, orig_full
         assert calls == [("full", "fp32")]
 
-    def test_env_default_keeps_sign_path(self, monkeypatch):
+    def test_env_default_keeps_full_value_path(self, monkeypatch):
         import torch
 
         from auto_round.algorithms.quantization.sign_round import data_parallel as dp
 
         monkeypatch.delenv("AR_TUNE_DDP_SIGN_EXCHANGE", raising=False)
+        calls = []
+        orig_sign, orig_full = dp.sign_exchange_allreduce, dp.halving_doubling_allreduce
+        dp.sign_exchange_allreduce = lambda bufs, transport="fp32": calls.append(("sign", transport))
+        dp.halving_doubling_allreduce = lambda bufs, scale=1.0, transport="fp32": calls.append(("full", transport))
+        try:
+            p0 = torch.nn.Parameter(torch.zeros(2))
+            p1 = torch.nn.Parameter(torch.zeros(2))
+            p0.grad, p1.grad = torch.ones(2), torch.ones(2)
+            dp.ReplicaGroup.sync_grads(self._group(), [[p0], [p1]], sign_exchange=True)
+        finally:
+            dp.sign_exchange_allreduce, dp.halving_doubling_allreduce = orig_sign, orig_full
+        assert calls == [("full", "fp32")]
+
+    def test_env_on_keeps_sign_path(self, monkeypatch):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        monkeypatch.setenv("AR_TUNE_DDP_SIGN_EXCHANGE", "1")
         calls = []
         orig_sign, orig_full = dp.sign_exchange_allreduce, dp.halving_doubling_allreduce
         dp.sign_exchange_allreduce = lambda bufs, transport="fp32": calls.append(("sign", transport))
@@ -505,6 +524,24 @@ class TestSingleDevicePlacement:
         # the shared resolver accepts the xpu home (probe-less eligibility)
         resolved = dp.resolve_tune_ddp_plan_(q, block, [torch.zeros(1), torch.zeros(1)], None, "xpu", log=False)
         assert resolved.world >= 1  # resolves without raising "not a supported accelerator"
+
+    def test_dict_inputs_stop_with_reason(self, monkeypatch):
+        """Diffusion-style dict pools with the flag set must stop with a reason,
+        never silently fall back to serial (fail-visibility contract)."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        block = SimpleNamespace(
+            parameters=lambda: iter([self._param("cuda:0")]),
+            modules=lambda: iter([]),
+        )
+        with pytest.raises(RuntimeError, match="non-list calibration inputs"):
+            resolve_tune_ddp_plan_(self._quantizer(), block, {"hidden_states": [torch.zeros(1)]}, None, "cuda:0")
 
     def test_cpu_resident_weights_pass_span_rule(self, monkeypatch):
         """CPU-pinned subtrees alongside the CUDA home are legal placement."""
