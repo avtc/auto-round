@@ -236,12 +236,6 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
         decline.append("enable_lfq")
     if world > 1 and not isinstance(fp_inputs, list):
         decline.append("non-list calibration inputs (diffusion-style pools)")
-    elif world > 1 and len(fp_inputs) % world != 0:
-        # the lane shards whole samples: the collection passes, the no-grad
-        # searches, and the tune all split the pool into equal contiguous
-        # shards, so a non-divisible sample count would silently degrade
-        # parts of the lane to serial -- stop with the reason instead
-        decline.append(f"nsamples ({len(fp_inputs)}) not divisible by the world ({world})")
     if world > 1 and isinstance(fp_inputs, list) and fp_outputs is not None and not isinstance(fp_outputs, list):
         decline.append("non-list reference outputs (diffusion-style pools)")
     if world > 1 and is_distributed():
@@ -556,14 +550,16 @@ _MERGEABLE_STATS = {
 }
 
 
-def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]):
+def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device], collect: bool = False):
     """Shard a no-grad per-item evaluation across ``devices`` and sum-merge.
 
     The no-grad search seam (published as the engine's shard-and-reduce):
     ``items`` is a list of per-sample payloads the algorithm owns;
     ``per_replica_fn(replica_block, remap, items_slice)`` returns a 1-D
     tensor of partial sums for its contiguous slice (any length, identical
-    across replicas). Every shard -- including the home slot -- runs on its
+    across replicas), or -- with ``collect=True`` -- a list with one result
+    per item of its slice (map semantics; the results concatenate in shard
+    order). Every shard -- including the home slot -- runs on its
     OWN deepcopy of the block, because search evaluations may mutate replica
     weights in place (AWQ's grid walk writes quantized candidates); mirrors
     die afterwards, so home state is never touched. ``remap(home_module)``
@@ -610,7 +606,7 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
         _mb,
         (_stime.perf_counter() - _t_mirrors) * 1000,
     )
-    results: List[Optional[torch.Tensor]] = [None] * world
+    results: List[Optional[Any]] = [None] * world
 
     def _run(r):
         rep = copies[r]
@@ -627,6 +623,10 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
     run_threaded_spawn([lambda r=r: _run(r) for r in range(world)])
     if any(res is None for res in results):
         return None
+    if collect:
+        # map semantics: per-item results, concatenated in shard order -- no
+        # merge (each item's answer is independent, e.g. a per-module search)
+        return [res for chunk in results for res in chunk]
     merged = results[0].to(home_dev)
     for res in results[1:]:
         merged = merged + res.to(home_dev)
@@ -696,23 +696,27 @@ def expect_pool_local(pieces, device, site: str) -> None:
 def distribute_pool(pool: List[torch.Tensor], devices: List[torch.device]) -> None:
     """Scatter a per-sample calibration pool across ``devices`` (in place).
 
-    Device r owns samples [r*shard, (r+1)*shard) -- the same boundaries the
-    DDP tune shards and the sharded collection use -- so shard-local reads
-    (ref_r build, _select_batch for shard r, per-replica collections) never
-    cross devices. Pieces already on their target device are untouched
-    (idempotent; a pool produced by the previous block's sharded collection
-    on the same group costs nothing). Pools smaller than / indivisible by
-    the world are left alone (serial consumers handle them via move-on-demand
-    cats).
+    Device r owns its contiguous ceil/floor slice -- the same boundaries the
+    sharded collection split uses -- so shard-local reads (ref_r build,
+    _select_batch for shard r, per-replica collections) never cross devices.
+    Pieces already on their target device are untouched (idempotent; a pool
+    produced by the previous block's sharded collection on the same group
+    costs nothing). Pools smaller than the world are left alone (serial
+    consumers handle them via move-on-demand cats).
     """
     n = len(pool)
     world = len(devices)
-    if world < 2 or n < world or n % world != 0:
+    if world < 2 or n < world:
         return
-    shard = n // world
+    # ceil/floor boundaries matching the sharded collection split, so pool
+    # placement and shard reads stay aligned for any sample count
+    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
+    bounds = [0]
+    for _sz in sizes:
+        bounds.append(bounds[-1] + _sz)
     for r, dev in enumerate(devices):
         dev = torch.device(dev)
-        for i in range(r * shard, (r + 1) * shard):
+        for i in range(bounds[r], bounds[r + 1]):
             if pool[i].device != dev:
                 pool[i] = pool[i].to(dev)
 
@@ -758,10 +762,18 @@ def sharded_nograd_forward(
         )
         devices = list(devices)[:max_devices]
         world = max_devices
-    if world < 2 or n < world or n % world != 0:
+    # ceil/floor contiguous split (same tolerance the search seam applies):
+    # any sample count shards -- a remainder lands on an earlier replica and
+    # the wall is the largest slice; nothing is dropped or run serially
+    world = max(1, min(world, n))
+    if len(devices) < 2 or world < 2:
         return runner(block, inputs, input_others, cache_device=out_device)
-    shard = n // world
-    shards = [list(range(r * shard, (r + 1) * shard)) for r in range(world)]
+    devices = list(devices)[:world]
+    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
+    bounds = [0]
+    for _sz in sizes:
+        bounds.append(bounds[-1] + _sz)
+    shards = [list(range(bounds[r], bounds[r + 1])) for r in range(world)]
     # the input pool typically arrives pooled on the primary device; without
     # re-placement every shard pulls its pieces cross-device from that ONE
     # source -- measured at world=8: uniformly 2.3-2.8 s of shard-forward

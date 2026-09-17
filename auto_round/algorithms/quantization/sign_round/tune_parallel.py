@@ -214,6 +214,22 @@ class TuneParallelContext:
 
         return sharded_map_reduce(block, per_replica_fn, items, self.devices)
 
+    def map(self, block, per_replica_fn, items) -> Optional[list]:
+        """Shard independent per-item evaluations over the lane devices.
+
+        The map side of the seam: ``per_replica_fn(replica, remap, items_slice)``
+        returns one result per item of its slice and the engine concatenates
+        the results in shard order (no merge -- each item is independent,
+        e.g. a per-module clip search). Returns ``None`` when the lane is not
+        engaged or fewer than two items can shard -- the caller keeps its
+        serial loop.
+        """
+        if self.devices is None:
+            return None
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_map_reduce
+
+        return sharded_map_reduce(block, per_replica_fn, items, self.devices, collect=True)
+
     # ── P1: tune phase (quantizer-owned) ─────────────────────────────────────
 
     @staticmethod

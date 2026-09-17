@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -263,6 +264,7 @@ class AWQTransform(BasePreprocessor):
         self._parent_args_cache: dict[torch.nn.Module, list[tuple[tuple, dict]]] = {}
         # Parallel-lane shard-and-reduce seam (None = serial searches).
         self._parallel_reduce = None
+        self._parallel_map = None
         # Per-mapping balance-layer input features captured for the clip search
         # (keyed by smooth_name). Only populated when ``apply_clip`` is set.
         self._clip_input_feat: dict[str, torch.Tensor] = {}
@@ -712,15 +714,18 @@ class AWQTransform(BasePreprocessor):
         scales[torch.isnan(scales)] = 1
         return scales.view(1, -1).to(device)
 
-    def set_parallel_reduce(self, reduce_fn) -> None:
+    def set_parallel_reduce(self, reduce_fn, map_fn=None) -> None:
         """Attach the parallel lane's shard-and-reduce seam (composer wiring).
 
         ``reduce_fn(block, per_replica_fn, items)`` returns the summed partials
         on the home device, or ``None`` when the items cannot shard -- the
-        search then keeps its serial loop. The composer attaches the engaged
-        lane's seam before ``pre_quantize_block`` and detaches it after.
+        search then keeps its serial loop. ``map_fn`` is the per-item variant
+        (one result per item, concatenated in shard order). The composer
+        attaches the engaged lane's seams before ``pre_quantize_block`` and
+        detaches them after.
         """
         self._parallel_reduce = reduce_fn
+        self._parallel_map = map_fn
 
     def _grid_search_scales(
         self,
@@ -1074,6 +1079,36 @@ class AWQTransform(BasePreprocessor):
         return any(token in local for token in self._AVOID_CLIP_TOKENS)
 
     @torch.no_grad()
+    def _sharded_clip_results(self, block_prefix, clip_jobs):
+        """Evaluate the per-layer clip searches, in parallel when the lane is
+        engaged (map semantics: one result per layer) or serially otherwise."""
+        if not clip_jobs:
+            return []
+        if self._parallel_map is None:
+            return [self._compute_best_clip(bl, feat) for bl, feat, _ in clip_jobs]
+
+        def per_replica(rep, remap, jobs):
+            out = []
+            for bl, feat, _name in jobs:
+                r_bl = remap(bl)
+                r_feat = feat.to(r_bl.weight.device)
+                res = self._compute_best_clip(r_bl, r_feat)
+                out.append(None if res is None else (res[0].to("cpu"), res[1].to("cpu")))
+            return out
+
+        try:
+            block = self.model_context.model.get_submodule(block_prefix)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("AWQ: sharded clip search declined: block lookup failed (%s)", e)
+            return [self._compute_best_clip(bl, feat) for bl, feat, _ in clip_jobs]
+        merged = self._parallel_map(block, per_replica, clip_jobs)
+        if merged is None:
+            return [self._compute_best_clip(bl, feat) for bl, feat, _ in clip_jobs]
+        return [
+            None if res is None else (res[0].to(bl.weight.device), res[1].to(bl.weight.device))
+            for (bl, _, _n), res in zip(clip_jobs, merged)
+        ]
+
     def _clip_block(self, block_prefix: str, block_mappings: list) -> None:
         """Search per-group weight clip thresholds for one block.
 
@@ -1093,6 +1128,13 @@ class AWQTransform(BasePreprocessor):
           then tunes ``min_scale``/``max_scale`` on top.
         """
         clip_store = getattr(self.model_context, "awq_clip_values", None)
+        # Layer-parallel clip search over the lane's replicas: each balance
+        # layer's search is independent (weight + cached features), so the map
+        # seam evaluates whole layers per replica and the results apply on
+        # home exactly as the serial loop would. MoE blocks with hundreds of
+        # expert linears dominate the serial cost, which is why this rides
+        # the seam whenever the lane is engaged.
+        clip_jobs = []
         for mapping in block_mappings:
             feat = self._clip_input_feat.get(mapping.smooth_name)
             if feat is None:
@@ -1106,26 +1148,28 @@ class AWQTransform(BasePreprocessor):
                 if self._should_skip_clip(name):
                     logger.debug("AWQ: skip clip for '%s' (avoid-clipping layer).", name)
                     continue
-                clip_range = self._compute_best_clip(bl, feat)
-                if clip_range is None:
-                    continue
-                min_val, max_val = clip_range
-                key = getattr(bl, "global_name", None) or name
-                if clip_store is not None:
-                    if torch.allclose(min_val, -max_val):
-                        clip_store[key] = max_val.detach().to("cpu")
-                    else:
-                        clip_store[key] = {
-                            "min": min_val.detach().to("cpu"),
-                            "max": max_val.detach().to("cpu"),
-                        }
-                if self.clip_as_init:
-                    # Keep the weights intact; hand the clip to the block
-                    # quantizer as the initialization of its weight range.
-                    bl.awq_clip_min = min_val.detach()
-                    bl.awq_clip_max = max_val.detach()
+                clip_jobs.append((bl, feat, name))
+        results = self._sharded_clip_results(block_prefix, clip_jobs) or [None] * len(clip_jobs)
+        for (bl, feat, name), clip_range in zip(clip_jobs, results):
+            if clip_range is None or (isinstance(clip_range, tuple) and clip_range[0] is None):
+                continue
+            min_val, max_val = clip_range
+            key = getattr(bl, "global_name", None) or name
+            if clip_store is not None:
+                if torch.allclose(min_val, -max_val):
+                    clip_store[key] = max_val.detach().to("cpu")
                 else:
-                    self._apply_clip(bl, min_val, max_val)
+                    clip_store[key] = {
+                        "min": min_val.detach().to("cpu"),
+                        "max": max_val.detach().to("cpu"),
+                    }
+            if self.clip_as_init:
+                # Keep the weights intact; hand the clip to the block
+                # quantizer as the initialization of its weight range.
+                bl.awq_clip_min = min_val.detach()
+                bl.awq_clip_max = max_val.detach()
+            else:
+                self._apply_clip(bl, min_val, max_val)
 
     @torch.no_grad()
     def _compute_best_clip(

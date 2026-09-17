@@ -221,6 +221,39 @@ class TestShardedGridParity:
         assert out is not None  # serial loop answered
         assert any("outside block" in w for w in warned)
 
+    def test_clip_search_sharded_matches_serial(self):
+        """The clip search rides the map seam: per-layer results, concatenated
+        in shard order, identical to the serial per-layer search."""
+        torch.manual_seed(17)
+        block = _FakeBlock()
+        model = _make_model(block)
+        block.global_name = "model.layers.0"
+        block.lin.global_name = "model.layers.0.lin"
+        tr = _make_transform(model=model)
+        tr._clip_input_feat = {}
+        tr.clip_n_sample_token = 512
+        tr.clip_n_grid = 20
+        tr.clip_max_shrink = 0.5
+        from auto_round.algorithms.transforms.awq.qdq import QDQTool
+
+        tr._qdq_tool = QDQTool(bits=4, group_size=-1, sym=True, data_type="int")
+        g = torch.Generator().manual_seed(2)
+        feats = [torch.randn(64, block.lin.in_features, generator=g) for _ in range(4)]
+        lins = [block.lin] + [torch.nn.Linear(block.lin.in_features, 4, bias=False) for _ in range(3)]
+        jobs = [(lin, feat, f"name{i}") for i, (lin, feat) in enumerate(zip(lins, feats))]
+
+        serial = [tr._compute_best_clip(lin, feat) for lin, feat, _ in jobs]
+
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        tr.set_parallel_reduce(ctx.reduce, map_fn=ctx.map)
+        sharded = tr._sharded_clip_results("model.layers.0", jobs)
+        assert sharded is not None
+        for set, par in zip(serial, sharded):
+            assert set is not None and par is not None
+            assert torch.allclose(set[0], par[0], atol=1e-6)
+            assert torch.allclose(set[1], par[1], atol=1e-6)
+
     def test_parallel_reduce_none_by_default(self):
         tr = _make_transform()
         assert tr._parallel_reduce is None
