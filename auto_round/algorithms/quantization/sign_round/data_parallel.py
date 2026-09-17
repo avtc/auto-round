@@ -293,10 +293,11 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             from auto_round.utils.device import estimate_tuning_block_mem
 
             _per_fwd = min(int(batch_size), max(1, global_batch_size // max(1, world)))
-            _layer_mem, _io_mem, _add_mem = estimate_tuning_block_mem(block, fp_inputs, _per_fwd)
-            _act_bytes = int((_io_mem + _add_mem) * 2**30)
-            _out_mem = sum(v.get("output_memory", 0.0) for v in _layer_mem.values())
-            _act_bytes += int(_out_mem * 2**30)
+            _layer_mem, _act_mem, _io_mem, _add_mem = estimate_tuning_block_mem(block, fp_inputs, _per_fwd)
+            # ``_act_mem`` already sums the per-layer ``output_memory``
+            # (grad-doubled) with the MoE ratio applied -- do not re-sum the
+            # dict on top of it
+            _act_bytes = int((_act_mem + _io_mem + _add_mem) * 2**30)
             mirror_bytes += _act_bytes
         except Exception as e:  # pragma: no cover - estimator is best-effort
             logger.debug("[tune-ddp] activation pricing skipped (estimator failed: %s)", e)
