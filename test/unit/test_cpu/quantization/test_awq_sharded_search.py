@@ -333,8 +333,9 @@ class TestGridSplitPerfLine:
             envs.AR_PERF_COUNTERS = True
             _run_search(tr, block, mapping, x_mean, _make_calls(block))
             lines = [r for r in records if "awq grid split" in r]
-            assert len(lines) == 1, lines
-            assert "mode=sharded" in lines[0]
+            assert len(lines) == 2, lines  # sharded buckets + coordinator final
+            assert "mode=sharded" in lines[0] and "prep=" in lines[0]
+            assert "mode=final" in lines[1]
         finally:
             # a real module attr would shadow the dynamic env-var lookup
             if had_attr:

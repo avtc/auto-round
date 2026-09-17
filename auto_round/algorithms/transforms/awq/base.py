@@ -784,14 +784,21 @@ class AWQTransform(BasePreprocessor):
         # the original weights, so a successful shard skips the serial
         # reference replay entirely (the serial fallback computes it below)
         if use_parent_forward and self._parallel_reduce is not None:
+            _t_final = time.perf_counter()
             merged = self._sharded_grid_losses(mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix)
             if merged is not None:
+                # the reduce + argmin below force the stream syncs the
+                # per-replica enqueue timers deliberately skip -- this is
+                # where the sharded GPU execution wall surfaces
                 losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
                 best = int(torch.argmin(losses))
                 if torch.isfinite(losses[best]):
                     best_scales = self._candidate_scales(
                         x_mean, grid_params[best][0], grid_params[best][1], w_mean, device
                     ).view(-1)
+                    _t_final = time.perf_counter() - _t_final
+                    if getattr(_penvs, "AR_PERF_COUNTERS", False):
+                        logger.info("[perf] awq grid split: mode=final final=%.2fs", _t_final)
                     logger.debug(
                         "AWQ '%s': sharded grid search best_ratio=%.2f, best_error=%.3e",
                         mapping.smooth_name,
@@ -932,11 +939,19 @@ class AWQTransform(BasePreprocessor):
         n_grid = len(grid_params)
         items = calls
         _split_by_rep = {}
+        _perf_on = bool(getattr(_penvs, "AR_PERF_COUNTERS", False))
+
+        def _bucket_sync(dev):
+            # under the perf gate only: bucket boundaries become true GPU
+            # walls (the default keeps stream overlap intact)
+            if _perf_on and dev.type == "cuda":
+                torch.cuda.synchronize(dev)
 
         def per_replica(rep, remap, items_slice):
             r_parent = remap(parent)
             r_bls = [remap(bl) for bl in mapping.balance_layers]
             r_dev = r_bls[0].weight.device
+            _t0 = time.perf_counter()
             # stage each call's args on the replica device ONCE (refs + every
             # grid point reuse them; re-moving per point re-uploaded the
             # CPU-parked capture 21x per item)
@@ -946,16 +961,18 @@ class AWQTransform(BasePreprocessor):
                 kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
                 staged.append((args, kwargs))
             # reference outputs at the ORIGINAL weights (the copy is pristine)
-            _t_refs = time.perf_counter()
             refs = []
-            for args, kwargs in staged:
-                refs.append(self._normalize_parent_output(r_parent(*args, **kwargs)))
-            _t_refs = time.perf_counter() - _t_refs
-            out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
-            out[-1] = float(sum(r.numel() for r in refs))
             bl_params = {bl: self._qdq_tool.resolve_params(bl) for bl in r_bls}
             bl_funcs = {bl: self._qdq_tool.resolve_quant_funcs(bl_params[bl]) for bl in r_bls}
             orig = {bl: bl.weight.data.clone() for bl in r_bls}
+            _t_prep = time.perf_counter() - _t0
+            _t_refs = time.perf_counter()
+            for args, kwargs in staged:
+                refs.append(self._normalize_parent_output(r_parent(*args, **kwargs)))
+            _bucket_sync(r_dev)
+            _t_refs = time.perf_counter() - _t_refs
+            out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
+            out[-1] = float(sum(r.numel() for r in refs))
             _t_qdq = 0.0
             _t_replay = 0.0
             for gi, (ratio, use_duo) in enumerate(grid_params):
@@ -971,26 +988,30 @@ class AWQTransform(BasePreprocessor):
                         imatrix=getattr(bl, "imatrix", None),
                     )
                     bl.weight.data = (w_qdq / scales_view).to(bl.weight.dtype)
+                _bucket_sync(r_dev)
                 _t_qdq += time.perf_counter() - _t0
                 _t0 = time.perf_counter()
                 loss_sum = torch.zeros((), device=r_dev, dtype=torch.float32)
                 for (args, kwargs), ref in zip(staged, refs):
                     cand = self._normalize_parent_output(r_parent(*args, **kwargs))
                     loss_sum = loss_sum + torch.nn.functional.mse_loss(ref.float(), cand.float(), reduction="sum")
+                _bucket_sync(r_dev)
                 out[gi] = loss_sum
                 _t_replay += time.perf_counter() - _t0
             for bl in r_bls:
                 bl.weight.data.copy_(orig[bl])
-            _split_by_rep[rep] = ("refs", _t_refs, "qdq", _t_qdq, "replay", _t_replay)
+            _split_by_rep[rep] = (_t_prep, _t_refs, _t_qdq, _t_replay)
             return out
 
         merged = self._parallel_reduce(block, per_replica, items)
-        if _split_by_rep and getattr(_penvs, "AR_PERF_COUNTERS", False):
+        if _split_by_rep and _perf_on:
+            prep_w = max(v[0] for v in _split_by_rep.values())
             refs_w = max(v[1] for v in _split_by_rep.values())
-            qdq_w = max(v[3] for v in _split_by_rep.values())
-            replay_w = max(v[5] for v in _split_by_rep.values())
+            qdq_w = max(v[2] for v in _split_by_rep.values())
+            replay_w = max(v[3] for v in _split_by_rep.values())
             logger.info(
-                "[perf] awq grid split: mode=sharded refs=%.2fs qdq=%.2fs replay=%.2fs",
+                "[perf] awq grid split: mode=sharded prep=%.2fs refs=%.2fs qdq=%.2fs replay=%.2fs",
+                prep_w,
                 refs_w,
                 qdq_w,
                 replay_w,
