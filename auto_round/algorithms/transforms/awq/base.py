@@ -263,7 +263,6 @@ class AWQTransform(BasePreprocessor):
         self._parent_args_cache: dict[torch.nn.Module, list[tuple[tuple, dict]]] = {}
         # Parallel-lane shard-and-reduce seam (None = serial searches).
         self._parallel_reduce = None
-        self._parallel_world = 0
         # Per-mapping balance-layer input features captured for the clip search
         # (keyed by smooth_name). Only populated when ``apply_clip`` is set.
         self._clip_input_feat: dict[str, torch.Tensor] = {}
@@ -713,17 +712,15 @@ class AWQTransform(BasePreprocessor):
         scales[torch.isnan(scales)] = 1
         return scales.view(1, -1).to(device)
 
-    def set_parallel_reduce(self, reduce_fn, world: int = 0) -> None:
+    def set_parallel_reduce(self, reduce_fn) -> None:
         """Attach the parallel lane's shard-and-reduce seam (composer wiring).
 
         ``reduce_fn(block, per_replica_fn, items)`` returns the summed partials
         on the home device, or ``None`` when the items cannot shard -- the
         search then keeps its serial loop. The composer attaches the engaged
-        lane's seam with its device count (for divisibility checks) before
-        ``pre_quantize_block`` and detaches it after.
+        lane's seam before ``pre_quantize_block`` and detaches it after.
         """
         self._parallel_reduce = reduce_fn
-        self._parallel_world = world if reduce_fn is not None else 0
 
     def _grid_search_scales(
         self,
@@ -854,18 +851,10 @@ class AWQTransform(BasePreprocessor):
         calls = [mc for stored in parent_kwargs_list for mc in self._iter_parent_calls(*stored)]
         if not calls:
             return None
-        if self._parallel_world > 1 and len(calls) % self._parallel_world != 0:
-            # the lane validated nsamples divisibility at engagement, so a
-            # non-divisible call count comes from the call granularity:
-            # one cached call per calibration batch (ceil(nsamples /
-            # batch_size)), optionally split by smooth_batch_size -- all
-            # user-controlled knobs, so stop instead of running serial
-            raise RuntimeError(
-                f"AWQ grid search cannot shard {len(calls)} parent calls across "
-                f"{self._parallel_world} replicas (one call per calibration batch; "
-                "adjust batch_size, nsamples or smooth_batch_size so the call count divides "
-                "by the world)"
-            )
+        # NOTE: no divisibility requirement -- the engine's ceil/floor split
+        # tolerates any call count (one call per calibration batch, optionally
+        # split by smooth_batch_size) because sum-merging is
+        # partition-invariant; every call is kept
         # the replay needs the parent forward inside the block copy: only
         # mappings whose parent is the block itself or an in-block module
         # can shard; a mapping whose parent sits outside the block is a model

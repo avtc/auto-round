@@ -475,7 +475,7 @@ class AlgorithmComposer:
             # search keeps its serial loop
             coll_ctx = getattr(self, "_coll_ctx", None)
             if hasattr(pre, "set_parallel_reduce") and coll_ctx is not None and coll_ctx.devices:
-                pre.set_parallel_reduce(coll_ctx.reduce, world=len(coll_ctx.devices))
+                pre.set_parallel_reduce(coll_ctx.reduce)
             try:
                 pre.pre_quantize_block(block_ctx)
             finally:

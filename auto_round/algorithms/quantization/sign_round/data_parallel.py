@@ -570,20 +570,24 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
     resolves the replica's counterpart of an in-block module (name-based),
     and hands the module itself back for anything outside the block.
 
+    The split tolerates leftovers: sum-merging is partition-invariant, so
+    shards are contiguous ceil/floor slices (a remainder call simply lands
+    on an earlier replica and the wall is the largest slice) -- no
+    divisibility requirement and no sample is ever dropped.
     Returns the summed tensor on the home device, or ``None`` when the
-    evaluation cannot shard (fewer than two devices, or the item count does
-    not divide) -- callers fall back to the serial loop unchanged.
+    evaluation cannot shard (fewer than two usable replicas) -- callers
+    fall back to the serial loop unchanged.
     """
-    world = len(devices)
+    world = max(1, min(len(devices), len(items)))
     n = len(items)
-    if world < 2 or n < world or n % world != 0:
+    if len(devices) < 2 or world < 2:
         return None
-    shard = n // world
     home_dev = _block_device(block)
     import time as _stime
 
     _t_mirrors = _stime.perf_counter()
     names = list(name for name, _ in block.named_modules())
+    devices = list(devices)[:world]
     copies: List[torch.nn.Module] = []
     for dev in devices:
         rep = copy.deepcopy(block)
@@ -591,6 +595,12 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
             _relocate_params(rep, dev)
             rep = rep.to(dev)
         copies.append(rep)
+    # contiguous ceil/floor slices: the first (n % world) replicas take one
+    # extra item, keeping every item and preserving order
+    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
+    bounds = [0]
+    for sz in sizes:
+        bounds.append(bounds[-1] + sz)
 
     _mb = sum(p.numel() * p.element_size() for p in copies[0].parameters())
     logger.debug(
@@ -612,7 +622,7 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
                     return lookup[name]
             return home_module  # outside the block: shared, caller gated
 
-        results[r] = per_replica_fn(rep, remap, items[r * shard : (r + 1) * shard])
+        results[r] = per_replica_fn(rep, remap, items[bounds[r] : bounds[r + 1]])
 
     run_threaded_spawn([lambda r=r: _run(r) for r in range(world)])
     if any(res is None for res in results):

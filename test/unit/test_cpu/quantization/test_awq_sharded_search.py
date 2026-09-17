@@ -63,7 +63,6 @@ def _make_transform(n_grid=4, model=None):
     tr._smooth_batch_size = None
     tr._parent_args_cache = {}
     tr._parallel_reduce = None
-    tr._parallel_world = 0
     tr._qdq_tool = QDQTool(bits=4, group_size=-1, sym=True, data_type="int")
     return tr
 
@@ -114,7 +113,7 @@ class TestShardedGridParity:
 
         AWQTransform._sharded_grid_losses = spy
         try:
-            tr.set_parallel_reduce(ctx.reduce, world=2)
+            tr.set_parallel_reduce(ctx.reduce)
             sharded = _run_search(tr, block, mapping, x_mean, calls)
         finally:
             AWQTransform._sharded_grid_losses = orig_sharded
@@ -127,51 +126,51 @@ class TestShardedGridParity:
             ref = block(*args, **kwargs)
         assert torch.isfinite(ref).all()
 
-    def test_nondivisible_calls_raise(self):
-        """A non-divisible parent-call count on an engaged lane is a setup
-        error (the nsamples divisibility itself is validated at engagement):
-        the search must stop, never silently fall back to serial."""
-        import pytest
-
+    def test_uneven_calls_shard_and_match_serial(self):
+        """3 calls over 2 replicas: ceil/floor split, every call kept, the
+        merged losses reproduce the serial choice (sum-merge is
+        partition-invariant)."""
         torch.manual_seed(11)
         block = _FakeBlock()
-        tr = _make_transform(model=_make_model(block))
+        serial_tr = _make_transform(model=_make_model(block))
         mapping = _make_mapping(block)
-        calls = _make_calls(block, n=3)  # not divisible by world=2
+        calls = _make_calls(block, n=3)
         x_mean = torch.rand(block.lin.in_features) + 0.5
+        serial = _run_search(serial_tr, block, mapping, x_mean, calls)
 
         ctx = TuneParallelContext()
         ctx.devices = [torch.device("cpu"), torch.device("cpu")]
-        tr.set_parallel_reduce(ctx.reduce, world=2)
-        with pytest.raises(RuntimeError, match="cannot shard 3 parent calls"):
-            _run_search(tr, block, mapping, x_mean, calls)
+        tr = _make_transform(model=_make_model(block))
+        engaged = {"merged": None}
+        orig_sharded = AWQTransform._sharded_grid_losses
 
-    def test_reduce_none_when_lane_disengaged(self):
-        ctx = TuneParallelContext()
-        assert ctx.devices is None
-        assert ctx.reduce(_FakeBlock(), lambda rep, remap, items: torch.zeros(1), [1, 2], op="sum") is None
+        def spy(self, *a, **kw):
+            engaged["merged"] = orig_sharded(self, *a, **kw)
+            return engaged["merged"]
 
-    def test_nondivisible_microcalls_raise(self):
-        """nsamples divisibility is validated at engagement; a non-divisible
-        PARENT-CALL count is a microbatching setup error -- it must raise,
-        never silently fall back to serial."""
-        import pytest
+        AWQTransform._sharded_grid_losses = spy
+        try:
+            tr.set_parallel_reduce(ctx.reduce)
+            sharded = _run_search(tr, block, mapping, x_mean, calls)
+        finally:
+            AWQTransform._sharded_grid_losses = orig_sharded
 
-        torch.manual_seed(3)
+        assert engaged["merged"] is not None, "uneven split must shard, not decline"
+        assert serial is not None and sharded is not None
+        assert torch.allclose(serial, sharded, atol=1e-6)
+
+    def test_single_call_declines_to_serial(self):
+        torch.manual_seed(13)
         block = _FakeBlock()
         tr = _make_transform(model=_make_model(block))
-        tr._smooth_batch_size = 3  # 2-token batches do not split; craft via 3 calls per batch
         mapping = _make_mapping(block)
+        calls = _make_calls(block, n=1)
         x_mean = torch.rand(block.lin.in_features) + 0.5
-        g = torch.Generator().manual_seed(1)
-        calls = [((torch.randn(3, block.lin.in_features, generator=g),), {}) for _ in range(3)]
-        tr._parent_args_cache[mapping.parent] = calls
-
         ctx = TuneParallelContext()
         ctx.devices = [torch.device("cpu"), torch.device("cpu")]
-        tr.set_parallel_reduce(ctx.reduce, world=2)
-        with pytest.raises(RuntimeError, match="cannot shard 3 parent calls"):
-            tr._grid_search_scales(mapping, x_mean, block_prefix=block.global_name)
+        tr.set_parallel_reduce(ctx.reduce)
+        out = _run_search(tr, block, mapping, x_mean, calls)
+        assert out is not None  # serial answered
 
     def test_out_of_block_parent_warns_and_runs_serial(self):
         torch.manual_seed(5)
@@ -209,7 +208,7 @@ class TestShardedGridParity:
 
         ctx = TuneParallelContext()
         ctx.devices = [torch.device("cpu"), torch.device("cpu")]
-        tr.set_parallel_reduce(ctx.reduce, world=2)
+        tr.set_parallel_reduce(ctx.reduce)
         warned = []
         import auto_round.algorithms.transforms.awq.base as awq_base
 
