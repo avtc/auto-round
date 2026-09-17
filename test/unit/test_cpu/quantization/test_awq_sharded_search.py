@@ -335,7 +335,8 @@ class TestGridSplitPerfLine:
             lines = [r for r in records if "awq grid split" in r]
             assert len(lines) == 2, lines  # sharded buckets + coordinator final
             assert "mode=sharded" in lines[0] and "prep=" in lines[0]
-            assert "mode=final" in lines[1]
+            assert "name=" in lines[0]
+            assert "mode=final" in lines[1] and "name=" in lines[1]
         finally:
             # a real module attr would shadow the dynamic env-var lookup
             if had_attr:
@@ -439,3 +440,29 @@ class TestCaptureParkingGate:
         # same values, decision attribute reflects the gate
         for (cargs, _), (oargs, _) in zip(captured, calls):
             assert torch.equal(cargs[0], oargs[0].detach())
+
+    def test_explicit_park_overrides_vram_allowance(self):
+        """The composer's serial-lane park_capture=True wins over low_gpu_mem=False."""
+        from types import SimpleNamespace
+
+        torch.manual_seed(29)
+        block = _FakeBlock()
+        tr = _make_transform(model=_make_model(block))
+        tr._block_mappings = {"model.layers.0": [_make_mapping(block)]}
+        tr._activation_stats = {}
+        tr._clip_input_feat = {}
+        tr.apply_clip = False
+        tr._BaseAlgorithm__run_ctx = SimpleNamespace(
+            model_context=SimpleNamespace(model=_make_model(block)),
+            compress_context=SimpleNamespace(low_gpu_mem_usage=False),
+        )
+        calls = _make_calls(block, n=1)
+        handles = tr.register_fp_input_forward_hooks(block, park_capture=True)
+        try:
+            for args, kwargs in calls:
+                block(*args, **kwargs)
+        finally:
+            for h in handles:
+                h.remove()
+        cargs, _ = tr._parent_args_cache[_make_mapping(block).parent][0]
+        assert cargs[0].device.type == "cpu"

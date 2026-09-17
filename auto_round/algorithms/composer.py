@@ -472,8 +472,22 @@ class AlgorithmComposer:
         with torch.no_grad():
             _t0 = _ctime.perf_counter()
             pre_hooks = []
+            # serial Step-1 capture would stack the whole block's parent-args on
+            # the single home device (observed OOM in the following passes on
+            # 24GB cards) -- park unless the sharded lane spreads the capture
+            # over mirror devices; low_gpu_mem always parks
+            import inspect
+
+            _park = self._coll_ctx.devices is None
+
+            def _register_fp(pre):
+                fn = pre.register_fp_input_forward_hooks
+                if "park_capture" in inspect.signature(fn).parameters:
+                    return fn(block, park_capture=_park or None)
+                return fn(block)
+
             for pre in self.preprocessors:
-                pre_hooks.extend(pre.register_fp_input_forward_hooks(block))
+                pre_hooks.extend(_register_fp(pre))
             if pre_hooks:
                 # route through the collection seam so the stats pass shards
                 # over the lane mirrors like Step 3 does; the preprocessor

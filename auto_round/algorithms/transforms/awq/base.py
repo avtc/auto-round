@@ -221,6 +221,19 @@ def _iter_block_names_for_mapping(model: torch.nn.Module) -> list[str]:
 _HOOK_STATE_LOCK = threading.Lock()
 
 
+def _sync_device(dev) -> None:
+    """Synchronize one accelerator stream (cuda/xpu/hpu), best-effort."""
+    try:
+        if dev.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(dev)
+        elif dev.type == "xpu" and getattr(torch, "xpu", None) is not None and torch.xpu.is_available():
+            torch.xpu.synchronize(dev)
+        elif dev.type == "hpu" and getattr(torch, "hpu", None) is not None and torch.hpu.is_available():
+            torch.hpu.synchronize(dev)
+    except Exception as e:  # pragma: no cover - instrumentation must never fail the search
+        logger.debug("AWQ: perf bucket sync failed on %s (%s)", dev, e)
+
+
 @register_pipeline_member(AWQConfig)
 class AWQTransform(BasePreprocessor):
     """AWQ transform: activation-aware weight smoothing pre-processor.
@@ -347,18 +360,22 @@ class AWQTransform(BasePreprocessor):
         )
         self._finalized = False
 
-    def register_fp_input_forward_hooks(self, block) -> list:
+    def register_fp_input_forward_hooks(self, block, park_capture: bool | None = None) -> list:
         """Register AWQ activation-stats and parent-kwargs hooks.
 
         Hooks are registered on the *current block's* smooth sources and
         parent modules. Returns hook handles that the caller must remove.
+
+        ``park_capture``: keep captured parent-args in host RAM. ``None``
+        defers to the declared low-VRAM budget; the composer passes ``True``
+        when the collection lane is NOT engaged (serial Step 1 captures on
+        the single home device, where several GB of on-device args can OOM
+        the following passes -- the sharded lane captures on mirror devices
+        that spread the residency).
         """
-        # Park captured parent-args in host RAM only under the declared
-        # low-VRAM budget; otherwise the args stay on their capture device
-        # (a mirror device when Step 1 shards) until the search consumes
-        # them -- saves the D2H at capture and turns the replay staging
-        # into device-local or GPU-to-GPU moves
-        self._park_capture = bool(getattr(self.compress_context, "low_gpu_mem_usage", False) or False)
+        if park_capture is None:
+            park_capture = bool(getattr(self.compress_context, "low_gpu_mem_usage", False) or False)
+        self._park_capture = park_capture
         # Need block_name from the block's global_name attribute
         block_name = getattr(block, "global_name", "")
         block_mappings = self._block_mappings.get(block_name, [])
@@ -798,7 +815,11 @@ class AWQTransform(BasePreprocessor):
                     ).view(-1)
                     _t_final = time.perf_counter() - _t_final
                     if getattr(_penvs, "AR_PERF_COUNTERS", False):
-                        logger.info("[perf] awq grid split: mode=final final=%.2fs", _t_final)
+                        logger.info(
+                            "[perf] awq grid split: mode=final name=%s final=%.2fs",
+                            mapping.smooth_name,
+                            _t_final,
+                        )
                     logger.debug(
                         "AWQ '%s': sharded grid search best_ratio=%.2f, best_error=%.3e",
                         mapping.smooth_name,
@@ -887,7 +908,8 @@ class AWQTransform(BasePreprocessor):
 
         if getattr(_penvs, "AR_PERF_COUNTERS", False):
             logger.info(
-                "[perf] awq grid split: mode=serial refs=%.2fs qdq=%.2fs replay=%.2fs",
+                "[perf] awq grid split: mode=serial name=%s refs=%.2fs qdq=%.2fs replay=%.2fs",
+                mapping.smooth_name,
                 _serial_split["refs"],
                 _serial_split["qdq"],
                 _serial_split["replay"],
@@ -944,8 +966,8 @@ class AWQTransform(BasePreprocessor):
         def _bucket_sync(dev):
             # under the perf gate only: bucket boundaries become true GPU
             # walls (the default keeps stream overlap intact)
-            if _perf_on and dev.type == "cuda":
-                torch.cuda.synchronize(dev)
+            if _perf_on:
+                _sync_device(dev)
 
         def per_replica(rep, remap, items_slice):
             r_parent = remap(parent)
@@ -1010,7 +1032,8 @@ class AWQTransform(BasePreprocessor):
             qdq_w = max(v[2] for v in _split_by_rep.values())
             replay_w = max(v[3] for v in _split_by_rep.values())
             logger.info(
-                "[perf] awq grid split: mode=sharded prep=%.2fs refs=%.2fs qdq=%.2fs replay=%.2fs",
+                "[perf] awq grid split: mode=sharded name=%s prep=%.2fs refs=%.2fs qdq=%.2fs replay=%.2fs",
+                mapping.smooth_name,
                 prep_w,
                 refs_w,
                 qdq_w,
