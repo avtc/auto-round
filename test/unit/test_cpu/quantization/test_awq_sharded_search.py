@@ -257,3 +257,77 @@ class TestShardedGridParity:
     def test_parallel_reduce_none_by_default(self):
         tr = _make_transform()
         assert tr._parallel_reduce is None
+
+
+class TestGridSplitPerfLine:
+    """AR_PERF_COUNTERS-gated qdq/replay split for both grid-search modes."""
+
+    def _capture(self):
+        import logging as _logging
+
+        from auto_round.logger import logger as ar_logger
+
+        records = []
+
+        class _Handler(_logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _Handler(level=_logging.INFO)
+        ar_logger.addHandler(handler)
+        try:
+            yield records
+        finally:
+            ar_logger.removeHandler(handler)
+
+    def test_serial_split_line_gated(self):
+        import auto_round.envs as envs
+
+        torch.manual_seed(11)
+        block = _FakeBlock()
+        tr = _make_transform(model=_make_model(block))
+        mapping = _make_mapping(block)
+        x_mean = torch.rand(block.lin.in_features) + 0.5
+
+        gen = self._capture()
+        records = next(gen)
+        try:
+            prev = getattr(envs, "AR_PERF_COUNTERS", False)
+            envs.AR_PERF_COUNTERS = False
+            _run_search(tr, block, mapping, x_mean, _make_calls(block))
+            assert not any("awq grid split" in r for r in records)
+
+            envs.AR_PERF_COUNTERS = True
+            _run_search(tr, block, mapping, x_mean, _make_calls(block))
+            lines = [r for r in records if "awq grid split" in r]
+            assert len(lines) == 1, lines
+            assert "mode=serial" in lines[0]
+            for key in ("refs=", "qdq=", "replay="):
+                assert key in lines[0]
+        finally:
+            envs.AR_PERF_COUNTERS = prev
+
+    def test_sharded_split_line_gated(self):
+        import auto_round.envs as envs
+
+        torch.manual_seed(13)
+        block = _FakeBlock()
+        tr = _make_transform(model=_make_model(block))
+        mapping = _make_mapping(block)
+        x_mean = torch.rand(block.lin.in_features) + 0.5
+
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        tr.set_parallel_reduce(ctx.reduce)
+
+        gen = self._capture()
+        records = next(gen)
+        try:
+            prev = getattr(envs, "AR_PERF_COUNTERS", False)
+            envs.AR_PERF_COUNTERS = True
+            _run_search(tr, block, mapping, x_mean, _make_calls(block))
+            lines = [r for r in records if "awq grid split" in r]
+            assert len(lines) == 1, lines
+            assert "mode=sharded" in lines[0]
+        finally:
+            envs.AR_PERF_COUNTERS = prev

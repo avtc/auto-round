@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from auto_round import envs as _penvs
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.algorithms.transforms.awq.config import AWQConfig
 from auto_round.algorithms.transforms.awq.mappings import (
@@ -383,7 +384,6 @@ class AWQTransform(BasePreprocessor):
         self._smooth_block(block_name, active_mappings)
         if self.apply_clip:
             self._clip_block(block_name, active_mappings)
-        from auto_round import envs as _penvs
 
         if getattr(_penvs, "AR_PERF_COUNTERS", False):
             logger.info(
@@ -785,13 +785,17 @@ class AWQTransform(BasePreprocessor):
                 return None
 
         if use_parent_forward:
+            _t0 = time.perf_counter()
             fp16_outputs = self._run_parent_samples(
                 mapping.parent,
                 parent_kwargs_list,
                 offload_to_cpu=self._smooth_batch_size is not None,
             )
+            _serial_split = {"refs": time.perf_counter() - _t0, "qdq": 0.0, "replay": 0.0}
             if not fp16_outputs or all(f.numel() == 0 for f in fp16_outputs):
                 use_parent_forward = False
+        else:
+            _serial_split = {"refs": 0.0, "qdq": 0.0, "replay": 0.0}
 
         orig_state = {bl: bl.weight.data.clone() for bl in mapping.balance_layers}
         if not use_parent_forward:
@@ -815,6 +819,7 @@ class AWQTransform(BasePreprocessor):
                 # Quantize each balance layer's smoothed weight and write the
                 # de-smoothed result back, so the parent forward below sees the
                 # weights the layer would actually compute with.
+                _t0 = time.perf_counter()
                 for bl in mapping.balance_layers:
                     quant_func, opt_quant_func = bl_quant_funcs[bl]
                     w_qdq = self._qdq_tool.qdq(
@@ -825,8 +830,11 @@ class AWQTransform(BasePreprocessor):
                         imatrix=getattr(bl, "imatrix", None),
                     )
                     bl.weight.data = (w_qdq / scales_view).to(bl.weight.dtype)
+                _serial_split["qdq"] += time.perf_counter() - _t0
 
+                _t0 = time.perf_counter()
                 total_loss = self._compute_parent_loss(mapping.parent, parent_kwargs_list, fp16_outputs)
+                _serial_split["replay"] += time.perf_counter() - _t0
                 for bl in mapping.balance_layers:
                     bl.weight.data.copy_(orig_state[bl])
             else:
@@ -852,6 +860,13 @@ class AWQTransform(BasePreprocessor):
             logger.warning("AWQ: grid search failed for '%s': no finite error.", mapping.smooth_name)
             return None
 
+        if getattr(_penvs, "AR_PERF_COUNTERS", False):
+            logger.info(
+                "[perf] awq grid split: mode=serial refs=%.2fs qdq=%.2fs replay=%.2fs",
+                _serial_split["refs"],
+                _serial_split["qdq"],
+                _serial_split["replay"],
+            )
         logger.debug("AWQ '%s': best_ratio=%.2f, best_error=%.3e", mapping.smooth_name, best_ratio, best_error)
         return best_scales
 
@@ -898,23 +913,29 @@ class AWQTransform(BasePreprocessor):
             return None
         n_grid = len(grid_params)
         items = calls
+        _split_by_rep = {}
 
         def per_replica(rep, remap, items_slice):
             r_parent = remap(parent)
             r_bls = [remap(bl) for bl in mapping.balance_layers]
             r_dev = r_bls[0].weight.device
             # reference outputs at the ORIGINAL weights (the copy is pristine)
+            _t_refs = time.perf_counter()
             refs = []
             for call_args, call_kwargs in items_slice:
                 args = tuple(move_to_device(a, r_dev) for a in call_args)
                 kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
                 refs.append(self._normalize_parent_output(r_parent(*args, **kwargs)))
+            _t_refs = time.perf_counter() - _t_refs
             out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
             out[-1] = float(sum(r.numel() for r in refs))
             bl_params = {bl: self._qdq_tool.resolve_params(bl) for bl in r_bls}
             bl_funcs = {bl: self._qdq_tool.resolve_quant_funcs(bl_params[bl]) for bl in r_bls}
             orig = {bl: bl.weight.data.clone() for bl in r_bls}
+            _t_qdq = 0.0
+            _t_replay = 0.0
             for gi, (ratio, use_duo) in enumerate(grid_params):
+                _t0 = time.perf_counter()
                 scales_view = self._candidate_scales(x_mean, ratio, use_duo, w_mean, r_dev)
                 for bl in r_bls:
                     quant_func, opt_quant_func = bl_funcs[bl]
@@ -926,6 +947,8 @@ class AWQTransform(BasePreprocessor):
                         imatrix=getattr(bl, "imatrix", None),
                     )
                     bl.weight.data = (w_qdq / scales_view).to(bl.weight.dtype)
+                _t_qdq += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
                 loss_sum = torch.zeros((), device=r_dev, dtype=torch.float32)
                 for (call_args, call_kwargs), ref in zip(items_slice, refs):
                     args = tuple(move_to_device(a, r_dev) for a in call_args)
@@ -933,11 +956,24 @@ class AWQTransform(BasePreprocessor):
                     cand = self._normalize_parent_output(r_parent(*args, **kwargs))
                     loss_sum = loss_sum + torch.nn.functional.mse_loss(ref.float(), cand.float(), reduction="sum")
                 out[gi] = loss_sum
+                _t_replay += time.perf_counter() - _t0
             for bl in r_bls:
                 bl.weight.data.copy_(orig[bl])
+            _split_by_rep[rep] = ("refs", _t_refs, "qdq", _t_qdq, "replay", _t_replay)
             return out
 
-        return self._parallel_reduce(block, per_replica, items)
+        merged = self._parallel_reduce(block, per_replica, items)
+        if _split_by_rep and getattr(_penvs, "AR_PERF_COUNTERS", False):
+            refs_w = max(v[1] for v in _split_by_rep.values())
+            qdq_w = max(v[3] for v in _split_by_rep.values())
+            replay_w = max(v[5] for v in _split_by_rep.values())
+            logger.info(
+                "[perf] awq grid split: mode=sharded refs=%.2fs qdq=%.2fs replay=%.2fs",
+                refs_w,
+                qdq_w,
+                replay_w,
+            )
+        return merged
 
     def _iter_parent_calls(self, stored_args: tuple, stored_kwargs: dict):
         """Yield full or microbatched parent-call args from one cached calibration batch."""
