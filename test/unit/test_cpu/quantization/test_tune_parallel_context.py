@@ -180,15 +180,20 @@ class TestCollectionContext:
             "bf", "blk", "inp", "oth", None, ctx.devices, merge_stats=True, max_devices=0, stats=ANY
         )
 
-    def test_collect_forward_hook_pass_caps_at_four(self):
+    def test_collect_forward_hook_pass_cap_default_and_env(self):
         ctx = TuneParallelContext()
         ctx.devices = [torch.device("cpu")] * 8
         with mock.patch(
             "auto_round.algorithms.quantization.sign_round.tune_parallel.sharded_nograd_forward",
             return_value="sharded",
         ) as snf:
+            # default: no cap
             ctx.collect_forward("bf", "blk", "inp", "oth", hook_pass=True)
-        assert snf.call_args.kwargs["max_devices"] == 4
+            assert snf.call_args.kwargs["max_devices"] == 0
+            # explicit cap honored
+            with mock.patch("auto_round.envs.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", 4):
+                ctx.collect_forward("bf", "blk", "inp", "oth", hook_pass=True)
+            assert snf.call_args.kwargs["max_devices"] == 4
 
     def test_distribute_pools_noop_without_devices(self):
         ctx = TuneParallelContext()
