@@ -82,7 +82,7 @@ class TestReplicaGroupFromSingleDeviceSource:
     def test_mirrors_are_single_device_and_consistent(self):
         block = _make_whole_block()
         plan = DDPPlan(world=2, devices=[torch.device("cuda:0"), torch.device("cuda:1")], shard_size=1)
-        group = ReplicaGroup(block, plan, grad_transport="bf16")
+        group = ReplicaGroup(block, plan)
         try:
             assert group.world == 2
             home_dev = torch.device("cuda:0")

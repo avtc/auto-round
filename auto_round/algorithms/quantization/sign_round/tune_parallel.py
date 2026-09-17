@@ -257,12 +257,7 @@ class TuneParallelContext:
         distribute_pool(fp_outputs, plan.devices)
 
         _t0 = _ptime.perf_counter()
-        from auto_round import envs as _envs
-
-        _transport = str(_envs.AR_TUNE_DDP_GRAD_TRANSPORT or "bf16").strip().lower()
-        if _transport not in ("fp32", "bf16", "int8"):
-            raise RuntimeError(f"AR_TUNE_DDP_GRAD_TRANSPORT must be fp32|bf16|int8, got {_transport!r}")
-        group = ReplicaGroup(block, plan, grad_transport=_transport)
+        group = ReplicaGroup(block, plan)
         ctx = cls()
         ctx.quantizer = quantizer
         ctx.block = block
