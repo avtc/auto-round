@@ -648,6 +648,12 @@ class SignRoundQuantizer(BaseQuantizer):
                     if valid_token_mask is not None:
                         # same global normalization as the serial path (reporting only)
                         num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
+                        if self.gradient_accumulate_steps == 1:
+                            # serial keeps MEAN reduction at accumulation==1,
+                            # so its masked report is mean/valid-count (a
+                            # double normalization the lane must reproduce:
+                            # its per-forward losses are always sums)
+                            num_elm *= sum(int(active_inputs[j].numel()) for j in global_indices)
                     # without a mask, num_elm keeps its pre-loop value (the
                     # element count over the whole global batch), matching the
                     # serial accumulation normalization

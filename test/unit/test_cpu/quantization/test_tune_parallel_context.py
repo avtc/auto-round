@@ -295,6 +295,7 @@ class TestEngagedLaneE2E:
             config = None
             block_forward = None
             _config = None
+            enable_quanted_input = False  # read on the valid-token-mask path
 
             def __init__(self):
                 pass  # bypass config init; only exercise quantize_block plumbing
@@ -652,6 +653,86 @@ class TestEngagedLaneE2E:
             set_v = dict(block_set.named_modules())[name].params["v"]
             dp_v = dict(block_dp.named_modules())[name].params["v"]
             assert _t.equal(set_v, dp_v), f"{name}: serial-vs-dp tuned values diverged"
+
+    def test_masked_loss_report_parity_accum1(self, monkeypatch, _autoround_log_propagate):
+        """Masked lane loss report must equal the serial report at accum==1.
+
+        Serial keeps MEAN reduction there, so its masked report is
+        mean/valid-count (a double normalization). The lane always sums;
+        its num_elm must absorb the batch element count to match (the R2-1
+        regression: a factor numel_all divergence in init/best-loss logs).
+        The mask flows the production way: input_ids with -100 positions.
+        """
+        import torch as _t
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as v1
+        import auto_round.algorithms.quantization.sign_round.tune_parallel as tp
+
+        class _FixedSampler:
+            def __init__(self, draws):
+                self._draws = list(draws)
+                self._i = 0
+
+            def next_batch(self):
+                out = self._draws[self._i]
+                self._i += 1
+                return out
+
+        monkeypatch.setattr(
+            tp, "shard_samplers", lambda ns, world, bpr: [_FixedSampler([[0], [1]]), _FixedSampler([[2], [3]])]
+        )
+        monkeypatch.setattr(v1, "IndexSampler", lambda nsamples, batch: _FixedSampler([[0, 2], [1, 3]]))
+
+        # production shapes: [1, S=4, H=2] samples; sample 3 fully padded
+        # (-100 positions) so the mask bites on iteration 2's draw [1, 3]
+        gen = _t.Generator().manual_seed(0)
+        fp_inputs = [_t.randn(1, 4, 2, generator=gen) for _ in range(4)]
+        with _t.no_grad():
+            fp_outputs = [(x * 3.0 + 1.0) for x in fp_inputs]
+        input_ids = [_t.ones(1, 4, dtype=_t.long) for _ in range(3)] + [_t.full((1, 4), -100, dtype=_t.long)]
+        masks = [(ids != -100).to(_t.long) for ids in input_ids]
+
+        serial_recs = []
+
+        def _serial_spy(pred, ref, indices, mse_loss, dev, m):
+            val = mse_loss(pred, ref)  # MEAN reduction at accum==1
+            serial_recs.append((tuple(indices), val.item()))
+            return val
+
+        monkeypatch.setattr(v1, "collect_best_params", lambda block, cache_device: {})
+        monkeypatch.setattr(v1, "unwrapper_block", lambda block, best_params: None)
+        block_ctx = type("BC", (), {"block_index": 0, "block_cnt": 1, "block_name": "b0"})()
+
+        # serial lane: mean-reduced records, divide by per-iter valid count
+        q_set = self._quantizer()
+        q_set._get_loss = _serial_spy
+        block_set = self._block()
+        n0 = len(serial_recs)
+        q_set.quantize_block(block_set, fp_inputs, {}, fp_outputs, None, block_ctx, input_ids)
+        set_recs = serial_recs[n0:]
+        assert [idx for idx, _ in set_recs] == [(0, 2), (1, 3)]
+        serial_expected = [v / sum(int(masks[j].sum().item()) for j in idx) for (idx, v) in set_recs]
+
+        # engaged lane: spy mean_loss to capture (num_elm, divide_world, result)
+        self._engage_plan(monkeypatch)
+        mean_loss_calls = []
+        _orig_mean_loss = tp.TuneParallelContext.mean_loss
+
+        def _spy_mean_loss(ctx_self, losses, num_elm, divide_world=True):
+            out = _orig_mean_loss(ctx_self, losses, num_elm, divide_world)
+            mean_loss_calls.append((num_elm, divide_world, out))
+            return out
+
+        monkeypatch.setattr(tp.TuneParallelContext, "mean_loss", _spy_mean_loss)
+        q_dp = self._quantizer()
+        block_dp = self._block()
+        q_dp.quantize_block(block_dp, fp_inputs, {}, fp_outputs, None, block_ctx, input_ids)
+        assert len(mean_loss_calls) >= 2
+        for i, (num_elm, divide_world, lane_val) in enumerate(mean_loss_calls[:2]):
+            assert divide_world is False
+            assert (
+                abs(lane_val - serial_expected[i]) < 1e-6
+            ), f"iter {i}: masked lane report {lane_val} vs serial {serial_expected[i]} (num_elm={num_elm})"
 
 
 class TestHookShardCapEnv:

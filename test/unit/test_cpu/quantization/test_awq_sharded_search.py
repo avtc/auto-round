@@ -517,16 +517,19 @@ class TestCaptureParkingGate:
             for h in handles:
                 h.remove()
         captured = tr._parent_args_cache[mapping.parent]
-        return captured, calls
+        return captured, calls, tr
 
     def test_parks_when_low_gpu_mem(self):
-        captured, calls = self._capture_with(low_gpu_mem=True)
+        captured, calls, tr = self._capture_with(low_gpu_mem=True)
+        # the DECISION is pinned (device.type is tautological on a CPU host)
+        assert tr._park_capture is True
         assert len(captured) == len(calls)
         for (cargs, _), (oargs, _) in zip(captured, calls):
             assert cargs[0].device.type == "cpu"
 
     def test_keeps_on_device_when_vram_allowed(self):
-        captured, calls = self._capture_with(low_gpu_mem=False)
+        captured, calls, tr = self._capture_with(low_gpu_mem=False)
+        assert tr._park_capture is False
         assert len(captured) == len(calls)
         # same values, decision attribute reflects the gate
         for (cargs, _), (oargs, _) in zip(captured, calls):

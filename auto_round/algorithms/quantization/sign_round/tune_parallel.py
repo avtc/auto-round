@@ -444,21 +444,25 @@ class TuneParallelContext:
     def shards(self, nsamples: int, global_batch_size: int) -> None:
         """Build per-replica shard samplers when the global batch splits
         evenly across the world (else the loop falls back to index slicing)."""
-        if self.group is not None and global_batch_size % self.group.world == 0:
-            self._samplers = shard_samplers(nsamples, self.group.world, global_batch_size // self.group.world)
-        elif self.group is not None and self.group.world > 1:
-            # indivisible global batch: the pool-aligned samplers cannot be
-            # built, so the loop falls back to a global shuffled draw -- every
-            # iteration then pays cross-device pool reads in the replicas.
-            # Perf-only (grads are exchanged globally either way); warn once.
-            if not getattr(self, "_uneven_sampler_warned", False):
-                self._uneven_sampler_warned = True
-                logger.info(
-                    "[tune-ddp] global batch %d not divisible by world %d: "
-                    "using the global sampler (cross-device pool reads per iteration)",
-                    global_batch_size,
-                    self.group.world,
-                )
+        self._samplers = None
+        if self.group is not None and self.group.world > 1:
+            if global_batch_size % self.group.world == 0:
+                self._samplers = shard_samplers(nsamples, self.group.world, global_batch_size // self.group.world)
+            if self._samplers is None:
+                # pool-aligned samplers cannot be built (indivisible global
+                # batch or pool), so the loop falls back to a global shuffled
+                # draw -- every iteration then pays cross-device pool reads in
+                # the replicas. Perf-only (grads are exchanged globally
+                # either way); warn once per context.
+                if not getattr(self, "_uneven_sampler_warned", False):
+                    self._uneven_sampler_warned = True
+                    logger.info(
+                        "[tune-ddp] pool-aligned samplers unavailable (nsamples=%d, global batch %d, world %d): "
+                        "using the global sampler (cross-device pool reads per iteration)",
+                        nsamples,
+                        global_batch_size,
+                        self.group.world,
+                    )
 
     def next_shards(self, index_sampler) -> Tuple[List[List[int]], List[int]]:
         """Draw the next global batch and split it into per-replica shards.

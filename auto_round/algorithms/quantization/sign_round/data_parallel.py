@@ -108,8 +108,8 @@ def _accel_device_count(dev_type: str) -> int:
         fn = getattr(mod, "device_count", None)
         if callable(fn):
             return int(fn())
-    except Exception:  # pragma: no cover - backend-specific probe failure
-        pass
+    except Exception as e:  # pragma: no cover - backend-specific probe failure
+        logger.debug("[tune-ddp] device-count probe failed for %s (%s); treating as absent", dev_type, e)
     return 0
 
 
@@ -664,7 +664,12 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
                     return lookup[name]
             return home_module  # outside the block: shared, caller gated
 
-        results[r] = per_replica_fn(rep, remap, items[bounds[r] : bounds[r + 1]])
+        # no-grad seam: grad mode is thread-local, so an outer no_grad
+        # never reaches these spawn workers -- wrap here or every forward
+        # builds a retained graph (n_grid x activation VRAM on paths
+        # that never froze params, e.g. the single-block quantize)
+        with torch.no_grad():
+            results[r] = per_replica_fn(rep, remap, items[bounds[r] : bounds[r + 1]])
 
     run_threaded_spawn([lambda r=r: _run(r) for r in range(world)])
     if any(res is None for res in results):
@@ -785,12 +790,13 @@ def sharded_nograd_forward(
 
     The collection passes (reference outputs, quantized-output cascade) are
     plain forwards over the whole sample pool on one GPU while the mirrors
-    idle. Here the pool is split into equal disjoint shards; an ephemeral
-    copy of the block on each device forwards its shard in a parallel thread;
-    per-shard outputs are parked on ``out_device`` and concatenated in order.
-    Bit-identical to the serial pass: rows are sample-independent and the
-    module copies carry identical weights. Falls back to the serial runner
-    call when the pool is not divisible or fewer than two devices are given.
+    idle. Here the pool is split into contiguous ceil/floor shards; an
+    ephemeral copy of the block on each device forwards its shard in a
+    parallel thread; per-shard outputs are parked on ``out_device`` and
+    concatenated in order. Bit-identical to the serial pass: rows are
+    sample-independent and the module copies carry identical weights. Falls
+    back to the serial runner call for fewer than two devices (any sample
+    count shards -- a remainder lands on an earlier replica).
     Mirrors are dropped (freed) afterwards. Returned pieces stay on the
     device that computed them (distributed pool); consumers either read
     shard-locally or use device-safe cats.
