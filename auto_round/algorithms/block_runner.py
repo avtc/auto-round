@@ -159,7 +159,6 @@ class BlockForwardRunner:
         self.output_config = output_config if output_config is not None else ["hidden_states"]
         self.enable_torch_compile = enable_torch_compile
         self.last_output_dict = None
-        import threading
 
         self.block_forward = block_forward
         if self.enable_torch_compile:

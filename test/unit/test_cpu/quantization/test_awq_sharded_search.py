@@ -63,8 +63,29 @@ def _make_transform(n_grid=4, model=None):
     tr._smooth_batch_size = None
     tr._parent_args_cache = {}
     tr._parallel_reduce = None
+    tr._parallel_map = None
     tr._qdq_tool = QDQTool(bits=4, group_size=-1, sym=True, data_type="int")
     return tr
+
+
+def test_fake_transform_covers_ctor_attr_surface():
+    """Canary: the __new__ fake must carry every attribute the real ctor sets.
+
+    The fake bypasses ``AWQTransform.__init__``; when the ctor grows a new
+    ``self._x`` the fake silently lacks it and later tests hit AttributeError
+    (or worse, skip paths). Any drift fails HERE first with the attr name.
+    """
+    import re as _re
+
+    import auto_round.algorithms.transforms.awq.base as awq_base
+
+    src = open(awq_base.__file__, encoding="utf-8").read()
+    init = _re.search(r"class AWQTransform.*?\n    def __init__.*?(?=\n    def )", src, _re.DOTALL)
+    assert init is not None, "AWQTransform.__init__ source block not found"
+    assigned = set(_re.findall(r"self\.(\w+)\s*=", init.group(0)))
+    fake = _make_transform(model=_make_model(_FakeBlock()))
+    missing = sorted(a for a in assigned if not hasattr(fake, a))
+    assert not missing, f"fake transform lacks ctor attrs: {missing}"
 
 
 def _make_mapping(block):
@@ -88,6 +109,73 @@ def _run_search(tr, block, mapping, x_mean, calls):
 def _make_calls(block, n=4, seed=0):
     g = torch.Generator().manual_seed(seed)
     return [((torch.randn(2, block.lin.in_features, generator=g),), {}) for _ in range(n)]
+
+
+class TestHookStateLockBehavioral:
+    """Mirror threads share the transform state: concurrent hook writes must
+    merge exactly like the sequential run (no lost updates)."""
+
+    def _hooked_transform(self, block):
+        import torch as _t
+
+        tr = _make_transform(model=_make_model(block))
+        tr._activation_stats = {}
+        tr._clip_input_feat = {}
+        tr.apply_clip = False
+        tr._awq_seqlen = None
+        tr._park_capture = False
+        mapping = _make_mapping(block)
+        tr._block_mappings = {block.global_name: [mapping]}
+        handles = tr._register_awq_hooks(tr._BaseAlgorithm__run_ctx.model_context.model, block, block.global_name)
+        return tr, handles
+
+    def test_concurrent_hook_writes_match_sequential(self):
+        import threading
+
+        import torch as _t
+
+        # fixed input sequence so the sequential reference is deterministic
+        g = _t.Generator().manual_seed(3)
+        seq = [_t.randn(1, 8, generator=g) for _ in range(64)]
+
+        # sequential reference
+        ref_block = _FakeBlock()
+        ref_tr, ref_h = self._hooked_transform(ref_block)
+        with _t.no_grad():
+            for x in seq:
+                ref_block(x)
+        for h in ref_h:
+            h.remove()
+
+        # concurrent: 8 threads, disjoint halves of the same sequence
+        conc_block = _FakeBlock()
+        conc_tr, conc_h = self._hooked_transform(conc_block)
+        with _t.no_grad():
+            threads = []
+
+            def _run(chunk):
+                for x in chunk:
+                    conc_block(x)
+
+            for t_i in range(8):
+                th = threading.Thread(target=_run, args=(seq[t_i::8],))
+                threads.append(th)
+                th.start()
+            for th in threads:
+                th.join()
+        for h in conc_h:
+            h.remove()
+
+        name = _make_mapping(ref_block).smooth_name
+        ref_sum, ref_cnt = ref_tr._activation_stats[name]
+        conc_sum, conc_cnt = conc_tr._activation_stats[name]
+        # the count is an integer accumulator: EXACT equality proves no lost
+        # updates (the race the lock prevents); the float sum may differ in
+        # the last ulp by summation ORDER, so allclose there
+        assert conc_cnt == ref_cnt, f"lost updates: concurrent count {conc_cnt} != {ref_cnt}"
+        assert _t.allclose(
+            conc_sum, ref_sum, rtol=1e-5, atol=1e-5
+        ), "concurrent stats diverged from the sequential reference"
 
 
 class TestShardedGridParity:
@@ -121,10 +209,13 @@ class TestShardedGridParity:
         assert engaged["merged"] is not None, "sharded path silently declined"
         assert serial is not None and sharded is not None
         assert torch.allclose(serial, sharded, atol=1e-6)
-        # home weights untouched by the sharded walk
+        # home weights untouched by the sharded walk: bit-for-bit against a
+        # pre-search snapshot (finiteness alone would miss a mutation)
+        home_snapshot = {n: p.detach().clone() for n, p in block.named_parameters()}
         for args, kwargs in calls:
-            ref = block(*args, **kwargs)
-        assert torch.isfinite(ref).all()
+            block(*args, **kwargs)
+        for n, p in block.named_parameters():
+            assert torch.equal(p, home_snapshot[n]), f"home weight {n} mutated by the sharded search"
 
     def test_uneven_calls_shard_and_match_serial(self):
         """3 calls over 2 replicas: ceil/floor split, every call kept, the

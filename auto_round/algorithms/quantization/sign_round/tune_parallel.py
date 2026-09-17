@@ -43,6 +43,7 @@ from auto_round import envs
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
     ReplicaGroup,
     block_has_tuning_entries,
+    contiguous_shard_bounds,
     distribute_pool,
     expect_pool_local,
     pre_wrap_shard_candidate,
@@ -183,9 +184,9 @@ class TuneParallelContext:
         Mergeable stats (imatrix, act_max) are folded from the mirrors back
         into the home, so those hook passes may shard.
 
-        ``hook_pass=True`` caps the concurrent shards at 4: forward hooks
-        force dynamo graph breaks, leaving the compiled runner as
-        python-bound eager sections that GIL-convoy under many threads.
+        ``hook_pass=True`` may additionally cap the concurrent shards via
+        ``AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES`` (default: no cap) on
+        hosts where hooked compiled passes GIL-convoy under many threads.
         """
         if self.devices is None or not allow_shard:
             return block_forward(block, inputs, input_others, cache_device=out_dev)
@@ -208,7 +209,7 @@ class TuneParallelContext:
         returns a 1-D tensor of partial sums for its slice and the engine sums
         the partials on the home device (``op="sum"`` is the only merge today:
         every sharded search is an additive statistic). Returns ``None`` when
-        the lane is not engaged or the items cannot divide -- the caller keeps
+        the lane is not engaged or fewer than two items remain -- the caller keeps
         its serial loop. Evaluations run on per-shard deepcopies, so in-place
         candidate writes (AWQ's grid walk) never touch home state.
         """
@@ -367,12 +368,13 @@ class TuneParallelContext:
         quantizer = self.quantizer
         try:
             _t0 = _ptime.perf_counter()
-            _pool_shard = max(1, self.nsamples // self.group.world)
+            # shared ceil/floor bounds (must match distribute_pool's slices)
+            _bounds = contiguous_shard_bounds(self.nsamples, self.group.world)
             for r, rep in enumerate(self.group.replicas):
                 # warm only one batch's worth (shard_size samples) at the
                 # head of this replica's pool shard -- warming the whole
                 # shard would materialize its full activations on the mirror
-                _warm = list(range(r * _pool_shard, r * _pool_shard + self.plan.shard_size))
+                _warm = list(range(_bounds[r], min(_bounds[r] + self.plan.shard_size, _bounds[r + 1])))
                 _dev_r = next(rep.parameters()).device
                 with _device_scope(_dev_r):
                     step_fn(rep, _warm, _dev_r, _StepRecord())
@@ -444,6 +446,19 @@ class TuneParallelContext:
         evenly across the world (else the loop falls back to index slicing)."""
         if self.group is not None and global_batch_size % self.group.world == 0:
             self._samplers = shard_samplers(nsamples, self.group.world, global_batch_size // self.group.world)
+        elif self.group is not None and self.group.world > 1:
+            # indivisible global batch: the pool-aligned samplers cannot be
+            # built, so the loop falls back to a global shuffled draw -- every
+            # iteration then pays cross-device pool reads in the replicas.
+            # Perf-only (grads are exchanged globally either way); warn once.
+            if not getattr(self, "_uneven_sampler_warned", False):
+                self._uneven_sampler_warned = True
+                logger.info(
+                    "[tune-ddp] global batch %d not divisible by world %d: "
+                    "using the global sampler (cross-device pool reads per iteration)",
+                    global_batch_size,
+                    self.group.world,
+                )
 
     def next_shards(self, index_sampler) -> Tuple[List[List[int]], List[int]]:
         """Draw the next global batch and split it into per-replica shards.
@@ -460,10 +475,7 @@ class TuneParallelContext:
         # ceil/floor split: sum-reduced losses make uneven shards exact, so
         # any global batch size shards -- a remainder sample lands on an
         # earlier replica and every sample is kept
-        sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
-        bounds = [0]
-        for _sz in sizes:
-            bounds.append(bounds[-1] + _sz)
+        bounds = contiguous_shard_bounds(n, world)
         shards = [global_indices[bounds[r] : bounds[r + 1]] for r in range(world)]
         return shards, global_indices
 

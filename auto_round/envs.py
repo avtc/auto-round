@@ -41,6 +41,18 @@ if TYPE_CHECKING:
     AR_ALLOW_W8_ASYM: bool = False
 
 
+def _get_non_negative_int_env(name: str, default: int) -> int:
+    """Read a non-negative integer env var; fail fast on malformed values."""
+
+    def _read() -> int:
+        v = os.getenv(name, str(default))
+        if not v.isdigit():
+            raise ValueError(f"{name} must be a non-negative integer, got {v!r}")
+        return int(v)
+
+    return _read()
+
+
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
     """Read an optional env var that must be a positive integer when set."""
     raw = os.getenv(name)
@@ -67,15 +79,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # affected. Only lower this on hosts where hook-carrying passes convoy on
     # the GIL (observed once on a weaker CPU; not reproduced on the validation
     # rig up to world=8). Values above the engaged world are no-ops.
-    "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES": lambda: (
-        lambda v: (
-            int(v)
-            if v.isdigit()
-            else (_ for _ in ()).throw(
-                ValueError(f"AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES must be a non-negative integer, got {v!r}")
-            )
-        )
-    )(os.getenv("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", "0")),
+    "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES": lambda: _get_non_negative_int_env(
+        "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", 0
+    ),
     "AR_USE_MODELSCOPE": lambda: os.getenv("AR_USE_MODELSCOPE", "False").lower() in ["1", "true"],
     "AR_WORK_SPACE": lambda: os.getenv("AR_WORK_SPACE", "ar_work_space").lower(),
     "AR_ENABLE_UNIFY_MOE_INPUT_SCALE": lambda: os.getenv("AR_ENABLE_UNIFY_MOE_INPUT_SCALE", "False").lower()
@@ -231,7 +237,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shards, so the effective batch matches the serial run's data coverage.
     "AR_TUNE_DDP_WORLD": lambda: int(os.getenv("AR_TUNE_DDP_WORLD", "1") or 1),
     # Optional explicit comma-separated replica devices (e.g. "0,1,2,3"); by default
-    # the plan picks from the visible CUDA devices with enough free VRAM.
+    # the plan picks from the visible accelerator devices (cuda/xpu/hpu) with enough free VRAM.
     "AR_TUNE_DDP_DEVICES": lambda: os.getenv("AR_TUNE_DDP_DEVICES", ""),
 }
 

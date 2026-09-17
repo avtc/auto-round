@@ -30,12 +30,14 @@ Design invariants (see AWQ_REFACTOR_PLAN.md §0.0 and §3.0):
 
 from __future__ import annotations
 
+import inspect
 import time as _ctime
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+import auto_round.algorithms.quantization.sign_round.data_parallel as data_parallel
 from auto_round import envs as _envs
 from auto_round.algorithms.block_runner import BlockForwardRunner
 from auto_round.algorithms.config_resolver import (
@@ -364,8 +366,6 @@ class AlgorithmComposer:
 
     def _collect_forward_timed(self, *args, **kwargs):
         """_collect_forward with wall accumulation into self.last_collect_wall."""
-        import time as _ctime
-
         _t0 = _ctime.perf_counter()
         try:
             return self._collect_forward(*args, **kwargs)
@@ -375,7 +375,7 @@ class AlgorithmComposer:
             if _ctx is not None:
                 self.last_mirror_setup_wall = (
                     getattr(self, "last_mirror_setup_wall", 0.0)
-                    + _ctx.collect_stats.get("mirror_setup_ms", 0.0) / 1000.0
+                    + _ctx.collect_stats.get(data_parallel.MIRROR_SETUP_MS_KEY, 0.0) / 1000.0
                 )
                 _ctx.collect_stats = {}
 
@@ -391,9 +391,9 @@ class AlgorithmComposer:
         Mergeable stats (imatrix, act_max) are folded from the mirrors back
         into the home, so those hook passes may shard.
 
-        ``hook_pass=True`` caps the concurrent shards at 4: forward hooks
-        force dynamo graph breaks, leaving the compiled runner as
-        python-bound eager sections that GIL-convoy under many threads.
+        ``hook_pass=True`` may additionally cap the concurrent shards via
+        ``AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES`` (default: no cap) on
+        hosts where hooked compiled passes GIL-convoy under many threads.
         """
         if self._coll_ctx is None:
             from auto_round.algorithms.quantization.sign_round.tune_parallel import TuneParallelContext
@@ -476,8 +476,6 @@ class AlgorithmComposer:
             # the single home device (observed OOM in the following passes on
             # 24GB cards) -- park unless the sharded lane spreads the capture
             # over mirror devices; low_gpu_mem always parks
-            import inspect
-
             _park = self._coll_ctx.devices is None
 
             def _register_fp(pre):
@@ -492,7 +490,7 @@ class AlgorithmComposer:
                 # route through the collection seam so the stats pass shards
                 # over the lane mirrors like Step 3 does; the preprocessor
                 # hooks are additive/append-mergeable by contract, so mirror
-                # writes fold back (hook_pass also caps concurrency at 4)
+                # writes fold back (hook_pass may cap concurrency via env)
                 self._coll_ctx.collect_forward(
                     block_forward_fn,
                     block,

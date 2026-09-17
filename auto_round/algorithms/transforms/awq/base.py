@@ -219,6 +219,8 @@ def _iter_block_names_for_mapping(model: torch.nn.Module) -> list[str]:
 # transform state must hold this lock: read-modify-write on the stats
 # tensors and the per-parent cache appends are not atomic across shards.
 _HOOK_STATE_LOCK = threading.Lock()
+# out-of-block parents already warned about (per-parent dedup, not per mapping/block)
+_OUT_OF_BLOCK_PARENTS = set()
 
 
 def _sync_device(dev) -> None:
@@ -803,7 +805,11 @@ class AWQTransform(BasePreprocessor):
         if use_parent_forward and self._parallel_reduce is not None:
             _t_final = time.perf_counter()
             merged = self._sharded_grid_losses(mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix)
-            if merged is not None:
+            if merged is not None and merged[-1] > 0:
+                # merged[-1] is the replayed element count: zero means no
+                # parent reference survived anywhere -- decline so the serial
+                # path takes over (its all-empty fallback switches to the
+                # weight-space loss; argmin over 0/0 is not a best)
                 # the reduce + argmin below force the stream syncs the
                 # per-replica enqueue timers deliberately skip -- this is
                 # where the sharded GPU execution wall surfaces
@@ -917,6 +923,7 @@ class AWQTransform(BasePreprocessor):
         logger.debug("AWQ '%s': best_ratio=%.2f, best_error=%.3e", mapping.smooth_name, best_ratio, best_error)
         return best_scales
 
+    @torch.no_grad()
     def _sharded_grid_losses(self, mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix):
         """Evaluate the smoothing grid in parallel across the lane's replicas.
 
@@ -945,13 +952,16 @@ class AWQTransform(BasePreprocessor):
         if not block_prefix or not parent_name:
             return None
         if parent_name != block_prefix and not parent_name.startswith(block_prefix + "."):
-            logger.warning(
-                "AWQ: parent '%s' of mapping '%s' lies outside block '%s'; "
-                "its grid search stays serial while the lane is engaged.",
-                parent_name,
-                mapping.smooth_name,
-                block_prefix,
-            )
+            # a model topology, not a setup error: warn once per parent,
+            # not per mapping per block (hundreds of repeats on such models)
+            if parent_name not in _OUT_OF_BLOCK_PARENTS:
+                _OUT_OF_BLOCK_PARENTS.add(parent_name)
+                logger.warning(
+                    "AWQ: parent '%s' (or sibling mappings of it) lies outside block '%s'; "
+                    "such grid searches stay serial while the lane is engaged.",
+                    parent_name,
+                    block_prefix,
+                )
             return None
         try:
             block = self.model_context.model.get_submodule(block_prefix)
@@ -1200,8 +1210,12 @@ class AWQTransform(BasePreprocessor):
         engaged (map semantics: one result per layer) or serially otherwise."""
         if not clip_jobs:
             return []
-        if self._parallel_map is None:
+
+        def _serial():
             return [self._compute_best_clip(bl, feat) for bl, feat, _ in clip_jobs]
+
+        if self._parallel_map is None:
+            return _serial()
 
         def per_replica(rep, remap, jobs):
             out = []
@@ -1216,10 +1230,10 @@ class AWQTransform(BasePreprocessor):
             block = self.model_context.model.get_submodule(block_prefix)
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("AWQ: sharded clip search declined: block lookup failed (%s)", e)
-            return [self._compute_best_clip(bl, feat) for bl, feat, _ in clip_jobs]
+            return _serial()
         merged = self._parallel_map(block, per_replica, clip_jobs)
         if merged is None:
-            return [self._compute_best_clip(bl, feat) for bl, feat, _ in clip_jobs]
+            return _serial()
         return [
             None if res is None else (res[0].to(bl.weight.device), res[1].to(bl.weight.device))
             for (bl, _, _n), res in zip(clip_jobs, merged)

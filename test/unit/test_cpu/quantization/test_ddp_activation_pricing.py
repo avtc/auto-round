@@ -18,25 +18,8 @@ silently skipped activation pricing on every block.
 import torch
 import torch.nn as nn
 
+import auto_round.algorithms.quantization.sign_round.data_parallel as data_parallel
 from auto_round.utils.device import estimate_tuning_block_mem
-
-
-class _FakeSelf:
-    """Minimal carrier so the helper can be exercised standalone."""
-
-    def __init__(self, world, global_batch, batch_size):
-        self._world = world
-        self._global_batch = global_batch
-        self._batch_size = batch_size
-
-
-def _pricing_bytes(block, fp_inputs, world, global_batch, batch_size):
-    """Replica of the data_parallel.py pricing body (kept in sync by test)."""
-    from auto_round.utils.device import estimate_tuning_block_mem as est
-
-    _per_fwd = min(int(batch_size), max(1, global_batch // max(1, world)))
-    _layer_mem, _act_mem, _io_mem, _add_mem = est(block, fp_inputs, _per_fwd)
-    return int((_act_mem + _io_mem + _add_mem) * 2**30)
 
 
 def test_estimator_returns_four_values():
@@ -46,18 +29,56 @@ def test_estimator_returns_four_values():
     assert isinstance(result, tuple) and len(result) == 4, result
 
 
-def test_pricing_consuming_estimator_does_not_raise():
+def test_real_call_site_prices_with_the_estimator(monkeypatch):
+    """The resolver's pricing path must actually run the real estimator.
+
+    Runs resolve_tune_ddp_plan_ with a controlled 4-tuple estimator: the
+    monkeypatched estimator must be CALLED with the real block/inputs (not
+    silently skipped by the best-effort except), and a 4-tuple must flow
+    through the unpack without error. Mirrors are never built during
+    resolve (planning only), so this is safe on any host.
+    """
+    from types import SimpleNamespace
+
+    import auto_round.utils.device as dev_mod
+
+    calls = []
+
+    def _fake_est(block, fp_inputs, per_fwd):
+        calls.append((id(block), len(fp_inputs), per_fwd))
+        return (1.0, 2.0, 0.5, 0.25)  # (layer, act, io, additional) GiB
+
+    monkeypatch.setattr(dev_mod, "estimate_tuning_block_mem", _fake_est)
+
+    q = SimpleNamespace(
+        iters=2,
+        gradient_accumulate_steps=1,
+        enable_lfq=False,
+        _resolved_ddp_plan=None,
+        _get_scaler=lambda: None,
+    )
     block = nn.Sequential(nn.Linear(64, 128), nn.Linear(128, 64))
-    inputs = [torch.randn(2, 16, 64)]
-    total = _pricing_bytes(block, inputs, world=4, global_batch=8, batch_size=2)
-    assert total > 0
+    fp_inputs = [torch.randn(2, 16, 64)] * 2
+    # a requested world that cannot be satisfied raises AFTER pricing (no
+    # mirror device passes the guard on CUDA-less hosts) -- the raise itself
+    # proves execution reached past the pricing block; on hosts with enough
+    # devices the call returns a plan instead, so accept both outcomes
+    import pytest
+
+    try:
+        data_parallel.resolve_tune_ddp_plan_(
+            q, block, fp_inputs, [torch.zeros(1)] * 2, torch.device("cuda", 0), world=2, log=False
+        )
+    except RuntimeError:
+        pass
+    assert calls and calls[0][0] == id(block), "estimator never ran against the real block"
 
 
 def test_call_site_unpack_matches_estimator_width():
     """The inline pricing in data_parallel.py must unpack exactly what the estimator returns."""
     import re
 
-    src_path = "auto_round/algorithms/quantization/sign_round/data_parallel.py"
+    src_path = data_parallel.__file__
     src = open(src_path, encoding="utf-8").read()
     m = re.search(r"_layer_mem, _act_mem, _io_mem, _add_mem = estimate_tuning_block_mem\(", src)
     assert m is not None, "pricing unpack drifted from the 4-tuple estimator return"

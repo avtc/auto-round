@@ -515,8 +515,12 @@ class SignRoundQuantizer(BaseQuantizer):
         global_batch_size = batch_size * self.gradient_accumulate_steps
         global_batch_size = min(nsamples, global_batch_size)
         # Compute num_elm once before the loop (used to normalise the accumulated loss).
-        # We assume the block input and output shape is same
-        if self.gradient_accumulate_steps != 1 and not valid_token_mask:
+        # We assume the block input and output shape is same. The DDP lane needs it
+        # even at accumulation==1: its per-forward losses are always SUMS, so without
+        # the element count the reported lane loss is the raw global sum (element-count
+        # times the serial mean) -- gradient signs are unaffected but best-iter
+        # logging and any serial-vs-lane comparison would silently diverge in scale.
+        if (self.gradient_accumulate_steps != 1 or _use_ddp) and not valid_token_mask:
             whole_indices = torch.arange(global_batch_size)
             if isinstance(active_inputs, list):  # dict for diffusion, tricky setting, not sure whether it's correct
                 num_elm = sum(active_inputs[i.item()].numel() for i in whole_indices)
@@ -589,7 +593,6 @@ class SignRoundQuantizer(BaseQuantizer):
                 _all_t = _ptime.perf_counter() - _t0
                 rec.fwd = _all_t - _bwd_t
                 rec.bwd = _bwd_t
-                return loss_total
                 # NB: backward() returns after ENQUEUE; the device
                 # completion is forced by the loss .item() sum and the
                 # exchange's grad reads, so a tail of bwd GPU time

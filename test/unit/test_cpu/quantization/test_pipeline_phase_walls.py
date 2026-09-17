@@ -167,3 +167,91 @@ def test_awq_hook_writes_hold_state_lock():
     # both hook write sites hold the lock (the guarded stats block and the
     # parent-cache append)
     assert src.count("with _HOOK_STATE_LOCK:") >= 2, src.count("with _HOOK_STATE_LOCK:")
+
+
+class _ParkAwarePreprocessor(_FakePreprocessor):
+    """Records the park_capture kwarg the composer passes (park-aware API)."""
+
+    def __init__(self):
+        self.park_calls = []
+
+    def register_fp_input_forward_hooks(self, block, park_capture=None):
+        self.park_calls.append(park_capture)
+        return super().register_fp_input_forward_hooks(block)
+
+    def set_parallel_reduce(self, reduce_fn, map_fn=None):
+        self.seam_calls = getattr(self, "seam_calls", []) + [(reduce_fn, map_fn)]
+
+
+def test_capture_park_forced_when_lane_not_engaged():
+    """The serial lane (no collection context) must force park_capture=True.
+
+    At world=1 there are no mirrors to spread the capture; several GB of
+    on-device parent args stacked on the single home device OOM the later
+    passes (the ddp1 regression) -- so the composer parks unless the sharded
+    lane is engaged.
+    """
+    composer = _make_composer()
+    pre = _ParkAwarePreprocessor()
+    composer.preprocessors = [pre]
+    composer._coll_ctx = None  # lane NOT engaged
+    _invoke(composer)
+    assert pre.park_calls == [True], pre.park_calls
+
+
+def test_capture_park_defers_when_lane_engaged():
+    """Engaged lane: park_capture stays None (mirrors spread the capture)."""
+    composer = _make_composer()
+    pre = _ParkAwarePreprocessor()
+    composer.preprocessors = [pre]
+
+    class _SeamCtx:
+        devices = [torch.device("cpu"), torch.device("cpu")]
+        collect_stats = {}
+
+        def collect_forward(self, block_forward, block, inputs, input_others, out_dev=None, **kw):
+            return block_forward(block, inputs, input_others)
+
+        def distribute_pools(self, *a, **kw):
+            return None
+
+        def reduce(self, *a, **kw):
+            return None
+
+        def map(self, *a, **kw):
+            return None
+
+    composer._collection_context = lambda block, fp_inputs: _SeamCtx()
+    _invoke(composer)
+    assert pre.park_calls == [None], pre.park_calls
+
+
+def test_step2_attaches_and_detaches_parallel_seam():
+    """The composer wires set_parallel_reduce before pre_quantize_block and
+    resets both seams after it (engaged lane only)."""
+    composer = _make_composer()
+    pre = _ParkAwarePreprocessor()
+    composer.preprocessors = [pre]
+
+    class _SeamCtx:
+        devices = [torch.device("cpu"), torch.device("cpu")]
+        collect_stats = {}
+
+        def collect_forward(self, block_forward, block, inputs, input_others, out_dev=None, **kw):
+            return block_forward(block, inputs, input_others)
+
+        def distribute_pools(self, *a, **kw):
+            return None
+
+        def reduce(self, *a, **kw):
+            return None
+
+        def map(self, *a, **kw):
+            return None
+
+    composer._collection_context = lambda block, fp_inputs: _SeamCtx()
+    _invoke(composer)
+    # attached once with both fns, then detached once with (None, None)
+    assert len(pre.seam_calls) == 2, pre.seam_calls
+    assert pre.seam_calls[0][0] is not None and pre.seam_calls[0][1] is not None
+    assert pre.seam_calls[1] == (None, None)

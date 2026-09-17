@@ -30,12 +30,32 @@ from __future__ import annotations
 import copy
 import queue
 import threading
+import time as _ptime
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
 from auto_round.logger import logger
+
+# perf-rollup key shared with the orchestrator's [perf] block line (ms)
+MIRROR_SETUP_MS_KEY = "mirror_setup_ms"
+
+
+def contiguous_shard_bounds(n: int, world: int) -> List[int]:
+    """Contiguous ceil/floor split bounds over ``n`` items for ``world`` shards.
+
+    The first ``n % world`` shards take one extra item (remainder on the
+    EARLIER shards). This exact idiom is a cross-component invariant: pool
+    placement, collection shards, tune shards and warm-up windows must all
+    slice identically or pools and shards silently mis-align -- every site
+    must call this helper instead of re-deriving the bounds.
+    """
+    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
+    bounds = [0]
+    for sz in sizes:
+        bounds.append(bounds[-1] + sz)
+    return bounds
 
 
 @dataclass
@@ -128,7 +148,7 @@ def resolve_ddp_plan(
     """Pick mirror devices for ``world``-way data parallelism of one block.
 
     Rules (each demotion is recorded in ``notes``):
-    - world <= 1 or non-CUDA home -> disabled
+    - world <= 1 or home not on a supported accelerator (cuda/xpu/hpu) -> disabled
     - batch smaller than the world -> demote the world to the largest
       power of two <= the batch (sum-reduced losses make uneven shards
       exact); a batch of 1 runs serial (logged, not fatal)
@@ -222,7 +242,8 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             _mod = getattr(torch, home.type, None)
             _cur = getattr(_mod, "current_device", None)
             home = torch.device(home.type, int(_cur()) if callable(_cur) else 0)
-        except Exception:  # backend module init can assert on builds without it
+        except Exception as e:  # backend module init can assert on builds without it
+            logger.debug("[tune-ddp] current-device probe for %s failed (%s); using index 0", home.type, e)
             home = torch.device(home.type, 0)
     decline = []
     # NOTE: no iters gate -- the DDP world shards the sharded no-grad
@@ -300,7 +321,7 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             _act_bytes = int((_act_mem + _io_mem + _add_mem) * 2**30)
             mirror_bytes += _act_bytes
         except Exception as e:  # pragma: no cover - estimator is best-effort
-            logger.debug("[tune-ddp] activation pricing skipped (estimator failed: %s)", e)
+            logger.info("[tune-ddp] activation pricing skipped (estimator failed: %s)", e)
         free = _accel_free_bytes_map(home.type)
         _n_devs = _accel_device_count(home.type)
         plan = resolve_ddp_plan(
@@ -441,10 +462,8 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0) 
     the all-gather phase re-exchanges owned chunks until every rank holds
     the fully reduced buffer. Per-rank traffic is 2*(W-1)/W*bytes, same as a
     ring. Cross-device ``to()`` copies use P2P when available. ``scale`` is
-    applied at the end (pass ``1/world`` to average).
-    the exchange dtype: fp32 (exact), bf16 (half wire bytes) or int8
-    (quarter wire bytes, symmetric per-segment amax scaling); accumulation
-    stays fp32. Requires a power-of-two world (the resolver guarantees it).
+    applied at the end (pass ``1/world`` to average). Requires a
+    power-of-two world (the resolver guarantees it).
     """
     world = len(buffers)
     if world < 2:
@@ -610,9 +629,8 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
     if len(devices) < 2 or world < 2:
         return None
     home_dev = _block_device(block)
-    import time as _stime
 
-    _t_mirrors = _stime.perf_counter()
+    _t_mirrors = _ptime.perf_counter()
     names = list(name for name, _ in block.named_modules())
     devices = list(devices)[:world]
     copies: List[torch.nn.Module] = []
@@ -624,10 +642,7 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
         copies.append(rep)
     # contiguous ceil/floor slices: the first (n % world) replicas take one
     # extra item, keeping every item and preserving order
-    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
-    bounds = [0]
-    for sz in sizes:
-        bounds.append(bounds[-1] + sz)
+    bounds = contiguous_shard_bounds(n, world)
 
     _mb = sum(p.numel() * p.element_size() for p in copies[0].parameters())
     logger.debug(
@@ -635,7 +650,7 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
         world,
         n,
         _mb,
-        (_stime.perf_counter() - _t_mirrors) * 1000,
+        (_ptime.perf_counter() - _t_mirrors) * 1000,
     )
     results: List[Optional[Any]] = [None] * world
 
@@ -740,10 +755,7 @@ def distribute_pool(pool: List[torch.Tensor], devices: List[torch.device]) -> No
         return
     # ceil/floor boundaries matching the sharded collection split, so pool
     # placement and shard reads stay aligned for any sample count
-    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
-    bounds = [0]
-    for _sz in sizes:
-        bounds.append(bounds[-1] + _sz)
+    bounds = contiguous_shard_bounds(n, world)
     for r, dev in enumerate(devices):
         dev = torch.device(dev)
         for i in range(bounds[r], bounds[r + 1]):
@@ -800,10 +812,7 @@ def sharded_nograd_forward(
     if len(devices) < 2 or world < 2:
         return runner(block, inputs, input_others, cache_device=out_device)
     devices = list(devices)[:world]
-    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
-    bounds = [0]
-    for _sz in sizes:
-        bounds.append(bounds[-1] + _sz)
+    bounds = contiguous_shard_bounds(n, world)
     shards = [list(range(bounds[r], bounds[r + 1])) for r in range(world)]
     # the input pool typically arrives pooled on the primary device; without
     # re-placement every shard pulls its pieces cross-device from that ONE
@@ -819,9 +828,8 @@ def sharded_nograd_forward(
         and (sample_count is None or sample_count == len(inputs))
     ):
         distribute_pool(inputs, devices)
-    import time as _time
 
-    _t_mirrors = _time.perf_counter()
+    _t_mirrors = _ptime.perf_counter()
     home_dev = _block_device(block)
     mirrors: List[torch.nn.Module] = []
     reps: List[torch.nn.Module] = []
@@ -834,11 +842,11 @@ def sharded_nograd_forward(
             _relocate_params(m, dev)
             reps.append(m)
             mirrors.append(m)
-    _t_setup_ms = (_time.perf_counter() - _t_mirrors) * 1000
+    _t_setup_ms = (_ptime.perf_counter() - _t_mirrors) * 1000
     if stats is not None and world > 1:
         # per-block perf rollup: the [perf] block line reports the mirror
         # setup wall inside its collect figure instead of a separate line
-        stats["mirror_setup_ms"] = stats.get("mirror_setup_ms", 0.0) + _t_setup_ms
+        stats[MIRROR_SETUP_MS_KEY] = stats.get(MIRROR_SETUP_MS_KEY, 0.0) + _t_setup_ms
     parts: List = [None] * world
     fwd_walls = [0.0] * world  # per-thread stores at distinct indices: race-free
     evs: List = [None] * world
@@ -846,7 +854,7 @@ def sharded_nograd_forward(
     def _run(r):
         rep = reps[r]
         dev_r = _block_device(rep)
-        t_r = _time.perf_counter()
+        t_r = _ptime.perf_counter()
         ev = None
         if dev_r.type == "cuda":
             ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -861,7 +869,7 @@ def sharded_nograd_forward(
         if ev is not None:
             ev[1].record()
             evs[r] = ev
-        fwd_walls[r] = (_time.perf_counter() - t_r) * 1000
+        fwd_walls[r] = (_ptime.perf_counter() - t_r) * 1000
 
     # spawn path, not the ReplicaGroup pool: this bare helper instance has no
     # lifecycle and would leak pool workers (collection passes are twice per
@@ -878,7 +886,7 @@ def sharded_nograd_forward(
             except RuntimeError as e:  # a broken pair must never kill the pass
                 logger.warning_once("[perf] sharded-collect GPU wall unavailable for a pair (%s)", e)
                 fwd_gpu[r] = float("nan")
-    _t_split = _time.perf_counter()
+    _t_split = _ptime.perf_counter()
     # Return the SERIAL structure: a per-sample list ([1, S, H] pieces from
     # split_outputs), NOT one flat/batched tensor -- downstream consumers cat
     # per-sample refs along dim 0 (tune loss) and iterate the list for the
@@ -891,7 +899,7 @@ def sharded_nograd_forward(
     # shard's rows); the serial text path leaves it unset so callers fall back
     # to the returned list -- clear the residue to keep that contract.
     runner.last_output_dict = None
-    _t_merge = _time.perf_counter()
+    _t_merge = _ptime.perf_counter()
     if merge_stats:
         _merge_mirror_stats(block, mirrors)
     mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
@@ -919,7 +927,7 @@ def sharded_nograd_forward(
         _gpus[len(_gpus) // 2],
         _gpus[-1],
         (_t_merge - _t_split) * 1000,
-        (_time.perf_counter() - _t_merge) * 1000,
+        (_ptime.perf_counter() - _t_merge) * 1000,
     )
     return pieces
 

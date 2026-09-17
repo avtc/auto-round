@@ -86,6 +86,15 @@ class TestNextShards:
         ctx.shards(nsamples=8, global_batch_size=3)
         assert ctx._samplers is None
 
+    def test_fallback_uneven_split_remainder_on_earlier_replica(self):
+        # 3 samples, world 2 -> shards [[0, 1], [2]]: the ceil/floor split
+        # keeps every sample, remainder lands on the earlier replica
+        ctx = _make_tune_ctx(world=2)
+        sampler = mock.Mock(next_batch=mock.Mock(return_value=[0, 1, 2]))
+        shards, gidx = ctx.next_shards(index_sampler=sampler)
+        assert shards == [[0, 1], [2]]
+        assert gidx == [0, 1, 2]
+
 
 class TestMeanLoss:
     def test_world_normalized_accounting(self):
@@ -368,6 +377,12 @@ class TestEngagedLaneE2E:
         plan = DDPPlan(world=2, devices=[_t.device("cpu"), _t.device("cpu")], shard_size=1)
 
         def _resolve(quantizer, block, fp_inputs, fp_outputs, home, world=None, log=True):
+            # mirror the REAL resolver's caching side effect: it sets
+            # quantizer._resolved_ddp_plan (data_parallel resolve_tune_ddp_plan_),
+            # and quantize_block keys its reduction mode off that attribute --
+            # skipping it here silently ran the OLD mean-reduction mode in
+            # every engaged e2e test while production always runs sum-reduction
+            quantizer._resolved_ddp_plan = plan
             return plan
 
         monkeypatch.setattr(tp, "resolve_tune_ddp_plan_", _resolve)
@@ -459,9 +474,10 @@ class TestEngagedLaneE2E:
         The dp/serial loss gap seen on real runs comes from DISJOINT random
         draws (each replica samples its own shard). With the draw sequences
         pinned to the same global indices per iteration, the two lanes must
-        produce the same per-iteration losses up to float rounding: mean of
-        equal-size shard MSE-means == MSE over the concatenated batch, and
-        SignSGD consumes signs of the identical mean gradient, so both lanes
+        produce the same per-iteration losses up to float rounding: the lane
+        sum-reduces (its per-forward losses are element SUMS) and normalizes
+        by the global element count exactly like mean_loss does, and
+        SignSGD consumes signs of the identical gradient, so both lanes
         evolve identical parameters and stay on the same loss trajectory.
         """
         import torch as _t
@@ -525,10 +541,117 @@ class TestEngagedLaneE2E:
         dp_iters = [dp_records[2:4], dp_records[4:6]]
         assert {idx for idx, _ in dp_iters[0]} == {(0,), (2,)}
         assert {idx for idx, _ in dp_iters[1]} == {(1,), (3,)}
-        dp_iter_losses = [sum(v for _, v in it) / 2 for it in dp_iters]
+
+        # the engaged lane runs PRODUCTION sum-reduction (the fake resolver
+        # mirrors the real caching side effect, so _use_ddp is True): each
+        # record is an element SUM; normalize by the iteration's global
+        # element count -- the same arithmetic mean_loss applies
+        def _elems(indices):
+            return sum(pools[0][j].numel() for j in indices)
+
+        dp_iter_losses = [sum(v for _, v in it) / sum(_elems(idx) for idx, _ in it) for it in dp_iters]
 
         for i, ((_, set_val), dp_val) in enumerate(zip(set_records, dp_iter_losses)):
             assert abs(set_val - dp_val) < 1e-6, f"iter {i}: serial {set_val} vs dp {dp_val}"
+
+    def test_chunked_shard_accumulation_parity(self, monkeypatch, _autoround_log_propagate):
+        """Shards larger than batch_size chunk into micro-batches whose grads
+        accumulate to the serial accumulated gradient (accumulation>1 lane).
+
+        batch_size=1 with gradient_accumulate_steps=4 gives a global batch of
+        4; world=2 shards it into two 2-sample shards, each processed as two
+        batch_size chunks with sum-reduced losses. With pinned draws the two
+        lanes must produce identical per-iteration losses AND bit-identical
+        tuned values (SignSGD on identical gradients).
+        """
+        import torch as _t
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as v1
+        import auto_round.algorithms.quantization.sign_round.tune_parallel as tp
+
+        loss_records = []
+
+        class _FixedSampler:
+            def __init__(self, draws):
+                self._draws = list(draws)
+                self._i = 0
+
+            def next_batch(self):
+                out = self._draws[self._i]
+                self._i += 1
+                return out
+
+        # dp: rep0 draws shard [0,1] twice; rep1 draws [2,3] twice (iters=2)
+        monkeypatch.setattr(
+            tp,
+            "shard_samplers",
+            lambda ns, world, bpr: [_FixedSampler([[0, 1], [0, 1]]), _FixedSampler([[2, 3], [2, 3]])],
+        )
+        # serial: global batches of 4 (batch 1 x accum 4), same sample sets
+        monkeypatch.setattr(v1, "IndexSampler", lambda nsamples, batch: _FixedSampler([[0, 1, 2, 3], [0, 1, 2, 3]]))
+
+        def _loss_spy(pred, ref, indices, mse_loss, dev, mask):
+            val = mse_loss(pred, ref)
+            loss_records.append((tuple(indices), val.item()))
+            return val
+
+        monkeypatch.setattr(v1, "collect_best_params", lambda block, cache_device: {})
+        monkeypatch.setattr(v1, "unwrapper_block", lambda block, best_params: None)
+        block_ctx = type("BC", (), {"block_index": 0, "block_cnt": 1, "block_name": "b0"})()
+
+        def _run(q):
+            q._get_loss = _loss_spy
+            block = self._block()
+            pools = self._pools()
+            q.quantize_block(block, pools[0], {}, pools[1], None, block_ctx, None)
+            return block
+
+        def _quantizer(**over):
+            q = self._quantizer()
+            # batch_size=1, accum=4 -> global 4; chunking engages when a
+            # replica's 2-sample shard exceeds the 1-sample batch
+            q.calibration_context = type("CC", (), {"batch_size": 1})()
+            q.gradient_accumulate_steps = 4
+            for k, val in over.items():
+                setattr(q, k, val)
+            return q
+
+        # serial first (real resolver declines on CPU-only hosts)
+        q_set = _quantizer()
+        n0 = len(loss_records)
+        block_set = _run(q_set)
+        set_records = loss_records[n0:]
+        # serial: 2 iterations x 4 micro-batches of 1 sample
+        assert [idx for idx, _ in set_records] == [(0,), (1,), (2,), (3,)] * 2
+
+        # engaged lane: same draws through the samplers
+        self._engage_plan(monkeypatch)
+        q_dp = _quantizer()
+        n1 = len(loss_records)
+        block_dp = _run(q_dp)
+        dp_records = loss_records[n1:]
+        # warm-up (2 single-sample calls) + 2 iterations x 2 replicas x 2 chunks
+        assert len(dp_records) == 10
+        loop = dp_records[2:]
+        assert all(len(idx) == 1 for idx, _ in loop), "chunking did not engage: batch-size chunks expected"
+
+        def _elems(indices):
+            pools = self._pools()
+            return sum(pools[0][j].numel() for j in indices)
+
+        set_iters = [set_records[0:4], set_records[4:8]]
+        dp_iters = [loop[0:4], loop[4:8]]
+        for i, (set_it, dp_it) in enumerate(zip(set_iters, dp_iters)):
+            set_norm = sum(v for _, v in set_it) / sum(_elems(idx) for idx, _ in set_it)
+            dp_norm = sum(v for _, v in dp_it) / sum(_elems(idx) for idx, _ in dp_it)
+            assert abs(set_norm - dp_norm) < 1e-6, f"iter {i}: serial {set_norm} vs dp {dp_norm}"
+
+        # gradient parity: identical draws + identical math -> identical
+        # tuned values across the two lanes (SignSGD is deterministic)
+        for name in ("l0", "l1"):
+            set_v = dict(block_set.named_modules())[name].params["v"]
+            dp_v = dict(block_dp.named_modules())[name].params["v"]
+            assert _t.equal(set_v, dp_v), f"{name}: serial-vs-dp tuned values diverged"
 
 
 class TestHookShardCapEnv:
@@ -573,3 +696,15 @@ class TestHookShardCapEnv:
                     envs_mod.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES = prev
                 else:
                     vars(envs_mod).pop("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", None)
+
+
+class TestShardCapEnvValidation:
+    def test_invalid_env_raises_on_read(self, monkeypatch):
+        import pytest as _pytest
+
+        from auto_round import envs as envs_mod
+
+        for bad in ("abc", "-1", "2.5", ""):
+            monkeypatch.setenv("AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", bad)
+            with _pytest.raises(ValueError, match="non-negative integer"):
+                _ = envs_mod.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES

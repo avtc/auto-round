@@ -104,6 +104,39 @@ class TestResolveDDPPlan:
         assert plan.world == 3 and plan.enabled
 
 
+class TestWorldDemotion:
+    """batch < world demotes the world to the largest power-of-two divisor."""
+
+    def test_demotion_table(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_ddp_plan
+
+        def _resolve(batch, world):
+            return resolve_ddp_plan(
+                world,
+                torch.device("cuda", 0),
+                batch,
+                visible_devices=[0, 1, 2, 3],
+                explicit_devices=["0", "1", "2", "3"],
+                vram_free_bytes={torch.device("cuda", i): 1 << 40 for i in range(4)},
+                mirror_footprint_bytes=1,
+                margin_bytes=0,
+            )
+
+        # batch 1 cannot shard: serial (world collapses to 1; the reason is
+        # logged, not carried in notes)
+        p = _resolve(1, 4)
+        assert p.world == 1
+        # batch 3, world 4 -> halved to 2 (3 >= 2, one replica gets 2 samples)
+        p = _resolve(3, 4)
+        assert p.world == 2 and any("demoted world to 2" in str(n) for n in p.notes)
+        # batch 6, world 4 -> no demotion (6 >= 4)
+        p = _resolve(6, 4)
+        assert p.world == 4
+        # batch divisible by world stays
+        p = _resolve(8, 4)
+        assert p.world == 4
+
+
 class TestTransportMath:
     def test_fp32_passthrough(self):
         t = torch.randn(16)
@@ -136,6 +169,19 @@ class TestDistributePool:
         # indivisible / too-small pools are left alone by contract (serial cats handle them)
         distribute_pool([torch.zeros(2)], [torch.device("cpu")] * 4)
 
+    @pytest.mark.parametrize("n", [5, 6, 7])
+    def test_uneven_pool_slices_match_shared_bounds(self, n):
+        # ceil/floor boundaries: device r owns [bounds[r], bounds[r+1]) --
+        # a remainder sample lands on the EARLIER devices, and the union of
+        # slices covers the pool exactly with no overlap
+        from auto_round.algorithms.quantization.sign_round.data_parallel import contiguous_shard_bounds
+
+        world = 4
+        bounds = contiguous_shard_bounds(n, world)
+        sizes = [bounds[r + 1] - bounds[r] for r in range(world)]
+        assert sum(sizes) == n and max(sizes) - min(sizes) <= 1
+        assert all(sizes[r] >= sizes[r + 1] for r in range(world - 1)), "remainder must sit on earlier shards"
+
 
 class TestCatDeviceSafe:
     def test_same_device_is_plain_cat(self):
@@ -146,6 +192,82 @@ class TestCatDeviceSafe:
     def test_empty_selection_raises(self):
         with pytest.raises(ValueError):
             _cat_device_safe([], dim=0)
+
+
+class TestShardedNogradForward:
+    """Execute the sharded collection core for real (it is only mocked elsewhere).
+
+    CPU devices, a tiny linear block and a minimal runner: pins the ceil/floor
+    split, the world>n demotion, the hook-pass cap truncation and the stats
+    rollup key.
+    """
+
+    def _run(self, n, devices, max_devices=0):
+        import torch as _t
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        block = _t.nn.Linear(2, 2, bias=False)
+        calls = []
+
+        def runner(rep, inputs, input_others, indices=None, cache_device=None):
+            if indices is None:  # serial fallback path: all samples
+                indices = list(range(len(inputs)))
+            calls.append((id(rep), tuple(indices)))
+            # return ONE batched tensor like the real runner; the engine
+            # splits it into per-sample pieces itself
+            return rep(_t.cat([inputs[i] for i in indices], dim=0))
+
+        inputs = [_t.randn(1, 2) for _ in range(n)]
+        stats = {}
+        out = dp.sharded_nograd_forward(
+            runner,
+            block,
+            inputs,
+            {},
+            torch.device("cpu"),
+            devices,
+            sample_count=n,
+            stats=stats,
+            max_devices=max_devices,
+        )
+        return out, calls, stats
+
+    def test_even_split_and_order(self):
+        out, calls, _ = self._run(4, [torch.device("cpu")] * 2)
+        # shards are contiguous and ordered; outputs concatenate in shard order
+        assert [idx for _, idx in calls] == [(0, 1), (2, 3)]
+        assert len(out) == 4
+
+    def test_uneven_split_remainder_on_earlier_replica(self):
+        out, calls, _ = self._run(5, [torch.device("cpu")] * 2)
+        assert [idx for _, idx in calls] == [(0, 1, 2), (3, 4)]
+        assert len(out) == 5
+
+    def test_world_larger_than_pool_demotes(self):
+        out, calls, _ = self._run(2, [torch.device("cpu")] * 4)
+        # world collapses to n: two replicas run one sample each (extra
+        # devices unused, no empty shards)
+        assert [idx for _, idx in calls] == [(0,), (1,)]
+        assert len(out) == 2
+
+    def test_single_item_runs_serial_fallback(self):
+        out, calls, _ = self._run(1, [torch.device("cpu")] * 2)
+        assert [idx for _, idx in calls] == [(0,)]
+        assert len(out) == 1
+
+    def test_max_devices_truncates_to_first_k(self):
+        # 8 devices, cap 2: only the FIRST two devices run shards
+        out, calls, _ = self._run(4, [torch.device("cpu")] * 8, max_devices=2)
+        assert len(calls) == 2
+        assert {id(c) for c, _ in calls[0:1]}  # distinct replicas used
+        assert len(out) == 4
+
+    def test_stats_gain_mirror_setup_key(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import MIRROR_SETUP_MS_KEY
+
+        _, _, stats = self._run(4, [torch.device("cpu")] * 2)
+        assert MIRROR_SETUP_MS_KEY in stats
 
 
 class TestEnvDefaults:
@@ -487,19 +609,27 @@ class TestSingleDevicePlacement:
 
         import torch
 
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp_mod
         from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
 
         monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        # stub the accelerator probes (host-independent): 2 usable cuda
+        # devices, both with ample free VRAM -> the plan must ENGAGE
+        monkeypatch.setattr(dp_mod, "_accel_device_count", lambda dev_type: 2)
+        monkeypatch.setattr(
+            dp_mod,
+            "_accel_free_bytes_map",
+            lambda dev_type: {torch.device("cuda", i): 1 << 40 for i in range(2)},
+        )
         block = SimpleNamespace(
             parameters=lambda: iter([self._param("cpu"), self._param("cuda:0")]),
             modules=lambda: iter([]),
         )
-        # batch 2 shards across world 2; on this CPU box the plan then fails
-        # at device selection -- the CPU-pinned subtree never triggers a span
-        # refusal (the raise, whatever its reason, must not mention spans)
-        with pytest.raises(RuntimeError) as excinfo:
-            resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)] * 2, None, "cuda:0", log=False)
-        assert "spans" not in str(excinfo.value)
+        # batch 2 shards across world 2; the CPU-pinned subtree alongside the
+        # CUDA home is legal placement -- the plan resolves (no span refusal)
+        plan = resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)] * 2, None, "cuda:0", log=False)
+        assert plan.world == 2, f"CPU-pinned subtree wrongly refused: {plan.notes}"
 
 
 class TestRequestedWorldErrors:
