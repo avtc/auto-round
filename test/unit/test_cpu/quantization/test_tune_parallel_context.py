@@ -524,3 +524,46 @@ class TestEngagedLaneE2E:
 
         for i, ((_, set_val), dp_val) in enumerate(zip(set_records, dp_iter_losses)):
             assert abs(set_val - dp_val) < 1e-6, f"iter {i}: serial {set_val} vs dp {dp_val}"
+
+
+class TestHookShardCapEnv:
+    """AR_TUNE_DDP_HOOK_SHARDS rules the hook-carrying collect concurrency."""
+
+    def test_hook_cap_env_forwarded(self, monkeypatch):
+        import auto_round.algorithms.quantization.sign_round.tune_parallel as tp
+        from auto_round import envs as envs_mod
+
+        captured = {}
+
+        def fake_sharded_nograd_forward(*args, **kwargs):
+            captured["max_devices"] = kwargs.get("max_devices")
+            # behave like the serial fallback so the call returns quickly
+            return args[0](args[1], args[2], args[3])
+
+        monkeypatch.setattr(tp, "sharded_nograd_forward", fake_sharded_nograd_forward)
+
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        block = torch.nn.Linear(4, 4)
+        inputs = [torch.randn(1, 2, 4)]
+
+        for env_val, hook_pass, expected in [
+            (None, True, 4),  # default cap
+            (0, True, 0),  # cap disabled
+            (8, True, 8),  # raised above the default
+            (8, False, 0),  # non-hook passes are never capped
+        ]:
+            had = "AR_TUNE_DDP_HOOK_SHARDS" in vars(envs_mod)
+            prev = getattr(envs_mod, "AR_TUNE_DDP_HOOK_SHARDS", 4)
+            if env_val is None:
+                vars(envs_mod).pop("AR_TUNE_DDP_HOOK_SHARDS", None)
+            else:
+                envs_mod.AR_TUNE_DDP_HOOK_SHARDS = env_val
+            try:
+                ctx.collect_forward(lambda blk, ins, others, **kw: [ins[0]], block, inputs, {}, hook_pass=hook_pass)
+                assert captured["max_devices"] == expected, (env_val, hook_pass, captured)
+            finally:
+                if had:
+                    envs_mod.AR_TUNE_DDP_HOOK_SHARDS = prev
+                else:
+                    vars(envs_mod).pop("AR_TUNE_DDP_HOOK_SHARDS", None)

@@ -145,6 +145,19 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
   `load/tune/pack/write/clean/offload` in the data-driven loop and per-block
   `mirrors/warmup/fwd/bwd/exch/step/teardown` for `--parallel_quantization` tuning.
 
+### AR_TUNE_DDP_HOOK_SHARDS
+- **Description**: Concurrent mirror shards for hook-carrying collection forwards (e.g. AWQ
+  activation statistics, imatrix/act-max passes) under `--parallel_quantization`. Forward hooks
+  break the compiled graph into Python-bound sections that convoy under the GIL with many
+  threads, so these passes run on at most this many mirrors at once even at a larger world.
+  Tune-loop replicas and search sharding are not affected. Set `0` to disable the cap.
+- **Default**: `4`
+- **Valid Values**: non-negative integer
+
+```bash
+export AR_TUNE_DDP_HOOK_SHARDS=8
+```
+
 ### AR_TUNE_DDP_DEVICES
 - **Description**: Optional explicit comma-separated replica devices (e.g. `0,1,2,3`) for
   `--parallel_quantization` tuning. By default the plan picks from the visible CUDA devices with enough free

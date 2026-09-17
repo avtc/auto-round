@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     AR_PERF_COUNTERS: bool = False
+    AR_TUNE_DDP_HOOK_SHARDS: int = 4
     AR_LOG_LEVEL: str = "INFO"
     AR_USE_MODELSCOPE: bool = "False"
     AR_MODEL_FREE_SHARD_PARALLELISM: Optional[int] = None
@@ -61,6 +62,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Emit [perf] phase-breakdown log lines (per-block load/tune/pack/write/clean/offload
     # in the data-driven loop; per-block mirrors/warmup/fwd/bwd/exch/step/teardown for DDP tuning).
     "AR_PERF_COUNTERS": lambda: os.getenv("AR_PERF_COUNTERS", "0").lower() in ("1", "true", "yes"),
+    # Concurrent mirror shards for hook-carrying collection forwards (GIL-convoy
+    # throttle); 0 disables the cap. Tune-loop replicas and searches are not
+    # affected. Raise it when the host can keep more hook-carrying shards busy.
+    "AR_TUNE_DDP_HOOK_SHARDS": lambda: int(os.getenv("AR_TUNE_DDP_HOOK_SHARDS", "4")),
     "AR_USE_MODELSCOPE": lambda: os.getenv("AR_USE_MODELSCOPE", "False").lower() in ["1", "true"],
     "AR_WORK_SPACE": lambda: os.getenv("AR_WORK_SPACE", "ar_work_space").lower(),
     "AR_ENABLE_UNIFY_MOE_INPUT_SCALE": lambda: os.getenv("AR_ENABLE_UNIFY_MOE_INPUT_SCALE", "False").lower()

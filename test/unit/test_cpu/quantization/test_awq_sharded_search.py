@@ -466,3 +466,64 @@ class TestCaptureParkingGate:
                 h.remove()
         cargs, _ = tr._parent_args_cache[_make_mapping(block).parent][0]
         assert cargs[0].device.type == "cpu"
+
+
+class TestGridLossParityControlled:
+    """Per-point grid losses must match serial vs sharded on identical inputs.
+
+    AWQ's analog of the tune lane's controlled-draws parity test: with the data
+    pinned (same block, same cached calls), the only difference between the two
+    lanes is the fp32 summation split across shard partials.
+    """
+
+    def test_per_point_losses_match_serial(self):
+        torch.manual_seed(37)
+        block = _FakeBlock()
+        mapping = _make_mapping(block)
+        x_mean = torch.rand(block.lin.in_features) + 0.5
+        calls = _make_calls(block, n=4)
+
+        # serial: record each grid point's loss via _compute_parent_loss spy
+        serial_losses = []
+        orig_cpl = AWQTransform._compute_parent_loss
+
+        def cpl_spy(self, parent, kwargs_list, fp16_outputs):
+            val = orig_cpl(self, parent, kwargs_list, fp16_outputs)
+            serial_losses.append(float(val))
+            return val
+
+        serial_tr = _make_transform(model=_make_model(block))
+        AWQTransform._compute_parent_loss = cpl_spy
+        try:
+            serial_scales = _run_search(serial_tr, block, mapping, x_mean, calls)
+        finally:
+            AWQTransform._compute_parent_loss = orig_cpl
+        assert serial_losses and all(v != float("inf") for v in serial_losses)
+
+        # sharded: capture the merged per-point sums + count
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        tr = _make_transform(model=_make_model(block))
+        engaged = {"merged": None}
+        orig_sharded = AWQTransform._sharded_grid_losses
+
+        def spy(self, *a, **kw):
+            engaged["merged"] = orig_sharded(self, *a, **kw)
+            return engaged["merged"]
+
+        AWQTransform._sharded_grid_losses = spy
+        try:
+            tr.set_parallel_reduce(ctx.reduce)
+            sharded_scales = _run_search(tr, block, mapping, x_mean, calls)
+        finally:
+            AWQTransform._sharded_grid_losses = orig_sharded
+
+        merged = engaged["merged"]
+        assert merged is not None
+        n_grid = len(serial_losses)
+        per_point = (merged[:n_grid] / merged[-1].clamp(min=1)).tolist()
+        for s_val, p_val in zip(serial_losses, per_point):
+            assert abs(s_val - p_val) <= 1e-6 + 1e-5 * abs(s_val), (s_val, p_val)
+
+        # the chosen candidate is the same point in both lanes
+        assert torch.allclose(serial_scales, sharded_scales, atol=1e-6)

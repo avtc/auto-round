@@ -146,6 +146,17 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
   以及 `--parallel_quantization` 调优的每块 `mirrors/warmup/fwd/bwd/exch/step/teardown`。
 - **默认**：关闭
 
+### AR_TUNE_DDP_HOOK_SHARDS
+- **描述**：`--parallel_quantization` 下携带前向钩子的采集类前向（如 AWQ 激活统计、imatrix/act-max 采集）的并发镜像分片数上限。
+  前向钩子会使编译图退化为受 GIL 约束的 Python 段，线程过多时相互拥堵，因此这类前向即使在更大的 world 下也最多同时在这么多镜像上运行。
+  调参循环的副本数与搜索分片不受影响。设为 `0` 可关闭该上限。
+- **默认值**：`4`
+- **取值**：非负整数
+
+```bash
+export AR_TUNE_DDP_HOOK_SHARDS=8
+```
+
 ### AR_TUNE_DDP_DEVICES
 - **描述**：`--parallel_quantization` 调参时可选的显式副本设备列表（逗号分隔，例如 `0,1,2,3`）。
   默认由计划从可见的 CUDA 设备中挑选空闲显存足够容纳镜像的设备；每个副本在其计划设备上持有完整的块镜像，

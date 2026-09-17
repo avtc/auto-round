@@ -39,6 +39,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
+from auto_round import envs
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
     ReplicaGroup,
     block_has_tuning_entries,
@@ -196,7 +197,7 @@ class TuneParallelContext:
             out_dev,
             self.devices,
             merge_stats=True,
-            max_devices=4 if hook_pass else 0,
+            max_devices=(int(envs.AR_TUNE_DDP_HOOK_SHARDS) if hook_pass else 0),
             stats=self.collect_stats,
         )
 
