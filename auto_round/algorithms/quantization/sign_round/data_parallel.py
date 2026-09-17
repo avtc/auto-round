@@ -129,9 +129,9 @@ def resolve_ddp_plan(
 
     Rules (each demotion is recorded in ``notes``):
     - world <= 1 or non-CUDA home -> disabled
-    - batch_size % world != 0 -> demote the world to the largest
-      power-of-two divisor of the batch (>= 2); smaller batches than any
-      power-of-two world disable the lane
+    - batch smaller than the world -> demote the world to the largest
+      power of two <= the batch (sum-reduced losses make uneven shards
+      exact); a batch of 1 runs serial (logged, not fatal)
     - explicit device list -> use as-is after the home (deduplicated)
     - otherwise home + next devices in ascending visible order
     - per-mirror VRAM guard: skip any device that cannot hold the mirror
@@ -144,18 +144,21 @@ def resolve_ddp_plan(
         notes.append(f"home device {home} is not a supported accelerator ({'/'.join(_SUPPORTED_ACCEL_TYPES)})")
         return DDPPlan(1, [home], batch_size, notes)
     world = int(world)
-    if batch_size % world != 0:
-        # demote the world to the largest power-of-two divisor of the batch
-        # (the halving-doubling exchange needs a power of two anyway) instead
-        # of declining outright -- a smaller world still shards the work
+    if batch_size < world:
+        # sum-reduced losses make uneven shards exact, so the batch no longer
+        # needs to divide -- only the exchange world itself must stay a power
+        # of two, and a replica needs at least one sample. Cap the world by
+        # the batch; below two usable replicas the lane runs serial (logged,
+        # not fatal -- a tiny batch is a legitimate configuration)
         _w = world
-        while _w > 1 and batch_size % _w != 0:
+        while _w > 1 and batch_size < _w:
             _w //= 2
         if _w < 2:
-            notes.append(f"batch_size {batch_size} not divisible by any power-of-two world >= 2")
+            logger.info("[tune-ddp] batch %d too small for any power-of-two world; running serial", batch_size)
             return DDPPlan(1, [home], batch_size, notes)
-        notes.append(f"batch_size {batch_size} not divisible by world {world}; demoted world to {_w}")
-        logger.info("[tune-ddp] %s", notes[-1])
+        if _w < world:
+            notes.append(f"batch {batch_size} smaller than world {world}; demoted world to {_w}")
+            logger.info("[tune-ddp] %s", notes[-1])
         world = _w
 
     if explicit_devices:

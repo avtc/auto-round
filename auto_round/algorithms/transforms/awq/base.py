@@ -378,9 +378,24 @@ class AWQTransform(BasePreprocessor):
             )
         if not active_mappings:
             return
+        self._grid_perf = {"wall": 0.0, "mappings": 0, "calls": 0, "grid": 0}
+        self._clip_perf = {"wall": 0.0, "layers": 0}
         self._smooth_block(block_name, active_mappings)
         if self.apply_clip:
             self._clip_block(block_name, active_mappings)
+        from auto_round import envs as _penvs
+
+        _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
+        _pl(
+            "[perf] awq searches: block='%s' grid=%.0fms (mappings=%d calls=%d grid=%d) clip=%.0fms (layers=%d)",
+            block_name,
+            self._grid_perf["wall"] * 1000,
+            self._grid_perf["mappings"],
+            self._grid_perf["calls"],
+            self._grid_perf["grid"],
+            self._clip_perf["wall"] * 1000,
+            self._clip_perf["layers"],
+        )
         modified = []
         for mapping in active_mappings:
             modified.extend(mapping.balance_names)
@@ -754,16 +769,12 @@ class AWQTransform(BasePreprocessor):
         if use_parent_forward and self._parallel_reduce is not None:
             _t_shard = time.perf_counter()
             merged = self._sharded_grid_losses(mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix)
-            from auto_round import envs as _penvs
-
-            _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
-            _pl(
-                "[perf] awq grid search: mapping='%s' wall=%.0fms calls=%d grid=%d",
-                mapping.smooth_name,
-                (time.perf_counter() - _t_shard) * 1000,
-                len(parent_kwargs_list),
-                len(grid_params),
-            )
+            _perf = getattr(self, "_grid_perf", None)
+            if _perf is not None:
+                _perf["wall"] += time.perf_counter() - _t_shard
+                _perf["mappings"] += 1
+                _perf["calls"] = max(_perf["calls"], len(parent_kwargs_list))
+                _perf["grid"] = max(_perf["grid"], len(grid_params))
             if merged is not None:
                 losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
                 best = int(torch.argmin(losses))
@@ -1162,15 +1173,10 @@ class AWQTransform(BasePreprocessor):
                 clip_jobs.append((bl, feat, name))
         _t_clip = time.perf_counter()
         results = self._sharded_clip_results(block_prefix, clip_jobs) or [None] * len(clip_jobs)
-        if clip_jobs:
-            from auto_round import envs as _penvs
-
-            _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
-            _pl(
-                "[perf] awq clip search: wall=%.0fms layers=%d",
-                (time.perf_counter() - _t_clip) * 1000,
-                len(clip_jobs),
-            )
+        _perf = getattr(self, "_clip_perf", None)
+        if _perf is not None and clip_jobs:
+            _perf["wall"] += time.perf_counter() - _t_clip
+            _perf["layers"] += len(clip_jobs)
         for (bl, feat, name), clip_range in zip(clip_jobs, results):
             if clip_range is None or (isinstance(clip_range, tuple) and clip_range[0] is None):
                 continue

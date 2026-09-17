@@ -451,8 +451,16 @@ class TuneParallelContext:
             global_indices = [j for sh in shards for j in sh]
             return shards, global_indices
         global_indices = index_sampler.next_batch()
-        _shard = len(global_indices) // self.group.world
-        shards = [global_indices[r * _shard : (r + 1) * _shard] for r in range(self.group.world)]
+        n = len(global_indices)
+        world = self.group.world
+        # ceil/floor split: sum-reduced losses make uneven shards exact, so
+        # any global batch size shards -- a remainder sample lands on an
+        # earlier replica and every sample is kept
+        sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
+        bounds = [0]
+        for _sz in sizes:
+            bounds.append(bounds[-1] + _sz)
+        shards = [global_indices[bounds[r] : bounds[r + 1]] for r in range(world)]
         return shards, global_indices
 
     def run_step(self, step_fn: Callable, shards: Sequence[Sequence[int]]) -> List[Optional[torch.Tensor]]:

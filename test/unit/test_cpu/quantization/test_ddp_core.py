@@ -495,8 +495,11 @@ class TestSingleDevicePlacement:
             parameters=lambda: iter([self._param("cpu"), self._param("cuda:0")]),
             modules=lambda: iter([]),
         )
+        # batch 2 shards across world 2; on this CPU box the plan then fails
+        # at device selection -- the CPU-pinned subtree never triggers a span
+        # refusal (the raise, whatever its reason, must not mention spans)
         with pytest.raises(RuntimeError) as excinfo:
-            resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)], None, "cuda:0", log=False)
+            resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)] * 2, None, "cuda:0", log=False)
         assert "spans" not in str(excinfo.value)
 
 
