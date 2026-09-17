@@ -159,6 +159,7 @@ class BlockForwardRunner:
         self.output_config = output_config if output_config is not None else ["hidden_states"]
         self.enable_torch_compile = enable_torch_compile
         self.last_output_dict = None
+
         self.block_forward = block_forward
         if self.enable_torch_compile:
             from auto_round.utils import compile_func

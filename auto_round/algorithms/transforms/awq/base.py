@@ -31,10 +31,13 @@ from __future__ import annotations
 
 import inspect
 import re
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from auto_round import envs as _penvs
 from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.algorithms.transforms.awq.config import AWQConfig
 from auto_round.algorithms.transforms.awq.mappings import (
@@ -211,6 +214,28 @@ def _iter_block_names_for_mapping(model: torch.nn.Module) -> list[str]:
     return sorted((name for name in flatten_list(get_block_names(model)) if name), key=len, reverse=True)
 
 
+# Mirror threads share the transform instance through the hook closures
+# (deepcopy treats functions as atomic), so every hook-side write to
+# transform state must hold this lock: read-modify-write on the stats
+# tensors and the per-parent cache appends are not atomic across shards.
+_HOOK_STATE_LOCK = threading.Lock()
+# out-of-block parents already warned about (per-parent dedup, not per mapping/block)
+_OUT_OF_BLOCK_PARENTS = set()
+
+
+def _sync_device(dev) -> None:
+    """Synchronize one accelerator stream (cuda/xpu/hpu), best-effort."""
+    try:
+        if dev.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(dev)
+        elif dev.type == "xpu" and getattr(torch, "xpu", None) is not None and torch.xpu.is_available():
+            torch.xpu.synchronize(dev)
+        elif dev.type == "hpu" and getattr(torch, "hpu", None) is not None and torch.hpu.is_available():
+            torch.hpu.synchronize(dev)
+    except Exception as e:  # pragma: no cover - instrumentation must never fail the search
+        logger.debug("AWQ: perf bucket sync failed on %s (%s)", dev, e)
+
+
 @register_pipeline_member(AWQConfig)
 class AWQTransform(BasePreprocessor):
     """AWQ transform: activation-aware weight smoothing pre-processor.
@@ -261,6 +286,9 @@ class AWQTransform(BasePreprocessor):
 
         self._activation_stats: dict[str, list] = {}
         self._parent_args_cache: dict[torch.nn.Module, list[tuple[tuple, dict]]] = {}
+        # Parallel-lane shard-and-reduce seam (None = serial searches).
+        self._parallel_reduce = None
+        self._parallel_map = None
         # Per-mapping balance-layer input features captured for the clip search
         # (keyed by smooth_name). Only populated when ``apply_clip`` is set.
         self._clip_input_feat: dict[str, torch.Tensor] = {}
@@ -334,12 +362,22 @@ class AWQTransform(BasePreprocessor):
         )
         self._finalized = False
 
-    def register_fp_input_forward_hooks(self, block) -> list:
+    def register_fp_input_forward_hooks(self, block, park_capture: bool | None = None) -> list:
         """Register AWQ activation-stats and parent-kwargs hooks.
 
         Hooks are registered on the *current block's* smooth sources and
         parent modules. Returns hook handles that the caller must remove.
+
+        ``park_capture``: keep captured parent-args in host RAM. ``None``
+        defers to the declared low-VRAM budget; the composer passes ``True``
+        when the collection lane is NOT engaged (serial Step 1 captures on
+        the single home device, where several GB of on-device args can OOM
+        the following passes -- the sharded lane captures on mirror devices
+        that spread the residency).
         """
+        if park_capture is None:
+            park_capture = bool(getattr(self.compress_context, "low_gpu_mem_usage", False) or False)
+        self._park_capture = park_capture
         # Need block_name from the block's global_name attribute
         block_name = getattr(block, "global_name", "")
         block_mappings = self._block_mappings.get(block_name, [])
@@ -374,9 +412,18 @@ class AWQTransform(BasePreprocessor):
             )
         if not active_mappings:
             return
+        self._grid_perf = {"wall": 0.0}
+        self._clip_perf = {"wall": 0.0}
         self._smooth_block(block_name, active_mappings)
         if self.apply_clip:
             self._clip_block(block_name, active_mappings)
+
+        if getattr(_penvs, "AR_PERF_COUNTERS", False):
+            logger.info(
+                "[perf] awq searches: grid=%.2fs clip=%.2fs",
+                self._grid_perf["wall"],
+                self._clip_perf["wall"],
+            )
         modified = []
         for mapping in active_mappings:
             modified.extend(mapping.balance_names)
@@ -479,26 +526,27 @@ class AWQTransform(BasePreprocessor):
 
                     channel_sum = feat.float().abs().sum(dim=0).cpu()
                     count = feat.shape[0]
-                    if smooth_name not in self._activation_stats:
-                        self._activation_stats[smooth_name] = [
-                            torch.zeros_like(channel_sum),
-                            0,
-                        ]
-                    self._activation_stats[smooth_name][0] += channel_sum
-                    self._activation_stats[smooth_name][1] += count
+                    with _HOOK_STATE_LOCK:
+                        if smooth_name not in self._activation_stats:
+                            self._activation_stats[smooth_name] = [
+                                torch.zeros_like(channel_sum),
+                                0,
+                            ]
+                        self._activation_stats[smooth_name][0] += channel_sum
+                        self._activation_stats[smooth_name][1] += count
 
-                    if self.apply_clip:
-                        clip_feat = feat
-                        # Subsample tokens to bound memory.
-                        if clip_feat.shape[0] > self.clip_n_sample_token:
-                            step = max(1, clip_feat.shape[0] // self.clip_n_sample_token)
-                            clip_feat = clip_feat[::step]
-                        clip_feat = clip_feat.float().cpu()
-                        prev = self._clip_input_feat.get(smooth_name)
-                        if prev is None:
-                            self._clip_input_feat[smooth_name] = clip_feat
-                        else:
-                            self._clip_input_feat[smooth_name] = torch.cat([prev, clip_feat], dim=0)
+                        if self.apply_clip:
+                            clip_feat = feat
+                            # Subsample tokens to bound memory.
+                            if clip_feat.shape[0] > self.clip_n_sample_token:
+                                step = max(1, clip_feat.shape[0] // self.clip_n_sample_token)
+                                clip_feat = clip_feat[::step]
+                            clip_feat = clip_feat.float().cpu()
+                            prev = self._clip_input_feat.get(smooth_name)
+                            if prev is None:
+                                self._clip_input_feat[smooth_name] = clip_feat
+                            else:
+                                self._clip_input_feat[smooth_name] = torch.cat([prev, clip_feat], dim=0)
 
                 return hook_fn
 
@@ -529,7 +577,9 @@ class AWQTransform(BasePreprocessor):
                             v = v.detach()
                             if w_dtype and v.is_floating_point() and v.dtype != w_dtype:
                                 v = v.to(w_dtype)
-                            return v.to("cpu", non_blocking=False)
+                            if self._park_capture:
+                                return v.to("cpu", non_blocking=False)
+                            return v
                         if isinstance(v, tuple):
                             return tuple(_proc(t) for t in v)
                         if isinstance(v, list):
@@ -543,7 +593,8 @@ class AWQTransform(BasePreprocessor):
 
                     if self._awq_seqlen is not None:
                         proc_args, proc_kwargs = _truncate_args_kwargs(proc_args, proc_kwargs, self._awq_seqlen)
-                    self._parent_args_cache[parent_module].append((proc_args, proc_kwargs))
+                    with _HOOK_STATE_LOCK:
+                        self._parent_args_cache[parent_module].append((proc_args, proc_kwargs))
 
                 return hook_fn
 
@@ -644,7 +695,11 @@ class AWQTransform(BasePreprocessor):
                 x_mean = (act_sum / act_count).to(torch.float32)
                 del act_sum
 
-                best_scales = self._grid_search_scales(mapping, x_mean)
+                _t_gs = time.perf_counter()
+                best_scales = self._grid_search_scales(mapping, x_mean, block_prefix)
+                _perf = getattr(self, "_grid_perf", None)
+                if _perf is not None:
+                    _perf["wall"] += time.perf_counter() - _t_gs
                 if best_scales is not None:
                     self._apply_scales(mapping, best_scales)
 
@@ -695,11 +750,39 @@ class AWQTransform(BasePreprocessor):
         w_scale = revert_tensor_by_pad(w_scale, orig_shape=org_shape, pad_len=pad_len)
         return w_scale.mean(0)
 
-    @torch.no_grad()
+    @staticmethod
+    def _candidate_scales(
+        x_mean: torch.Tensor, ratio: float, use_duo: bool, w_mean: torch.Tensor | None, device
+    ) -> torch.Tensor:
+        """Derive one grid point's smoothing scales (shared by the serial and
+        sharded search paths so the derivation cannot drift)."""
+        if use_duo:
+            scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
+        else:
+            scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+        scales = scales / (scales.max() * scales.min()).sqrt()
+        scales[torch.isinf(scales)] = 1
+        scales[torch.isnan(scales)] = 1
+        return scales.view(1, -1).to(device)
+
+    def set_parallel_reduce(self, reduce_fn, map_fn=None) -> None:
+        """Attach the parallel lane's shard-and-reduce seam (composer wiring).
+
+        ``reduce_fn(block, per_replica_fn, items)`` returns the summed partials
+        on the home device, or ``None`` when the items cannot shard -- the
+        search then keeps its serial loop. ``map_fn`` is the per-item variant
+        (one result per item, concatenated in shard order). The composer
+        attaches the engaged lane's seams before ``pre_quantize_block`` and
+        detaches them after.
+        """
+        self._parallel_reduce = reduce_fn
+        self._parallel_map = map_fn
+
     def _grid_search_scales(
         self,
         mapping: ResolvedMapping,
         x_mean: torch.Tensor,
+        block_prefix: str | None = None,
     ) -> torch.Tensor | None:
         """Find the best scaling ratio for *mapping* via output-based loss."""
         device = mapping.balance_layers[0].weight.device
@@ -707,20 +790,64 @@ class AWQTransform(BasePreprocessor):
 
         bl_params = {bl: self._qdq_tool.resolve_params(bl) for bl in mapping.balance_layers}
         group_size = self._normalize_group_size(bl_params[mapping.balance_layers[0]]["group_size"], -1)
+        w_mean = None
         if self.duo_scaling is not False:
             w_mean = self._compute_layer_means(mapping.balance_layers, group_size).to(device)
 
         parent_kwargs_list = self._parent_args_cache.get(mapping.parent, [])
         use_parent_forward = len(parent_kwargs_list) > 0
 
+        grid_params = list(self._get_grid_search_params())
+
+        # the sharded path computes its own per-replica reference outputs at
+        # the original weights, so a successful shard skips the serial
+        # reference replay entirely (the serial fallback computes it below)
+        if use_parent_forward and self._parallel_reduce is not None:
+            _t_final = time.perf_counter()
+            merged = self._sharded_grid_losses(mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix)
+            if merged is not None and merged[-1] > 0:
+                # merged[-1] is the replayed element count: zero means no
+                # parent reference survived anywhere -- decline so the serial
+                # path takes over (its all-empty fallback switches to the
+                # weight-space loss; argmin over 0/0 is not a best)
+                # the reduce + argmin below force the stream syncs the
+                # per-replica enqueue timers deliberately skip -- this is
+                # where the sharded GPU execution wall surfaces
+                losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
+                best = int(torch.argmin(losses))
+                if torch.isfinite(losses[best]):
+                    best_scales = self._candidate_scales(
+                        x_mean, grid_params[best][0], grid_params[best][1], w_mean, device
+                    ).view(-1)
+                    _t_final = time.perf_counter() - _t_final
+                    if getattr(_penvs, "AR_PERF_COUNTERS", False):
+                        logger.info(
+                            "[perf] awq grid split: mode=final name=%s final=%.2fs",
+                            mapping.smooth_name,
+                            _t_final,
+                        )
+                    logger.debug(
+                        "AWQ '%s': sharded grid search best_ratio=%.2f, best_error=%.3e",
+                        mapping.smooth_name,
+                        grid_params[best][0],
+                        float(losses[best]),
+                    )
+                    return best_scales
+                logger.warning("AWQ: sharded grid search failed for '%s': no finite error.", mapping.smooth_name)
+                return None
+
         if use_parent_forward:
+            _t0 = time.perf_counter()
             fp16_outputs = self._run_parent_samples(
                 mapping.parent,
                 parent_kwargs_list,
                 offload_to_cpu=self._smooth_batch_size is not None,
             )
+            _serial_split = {"refs": time.perf_counter() - _t0, "qdq": 0.0, "replay": 0.0}
             if not fp16_outputs or all(f.numel() == 0 for f in fp16_outputs):
                 use_parent_forward = False
+        else:
+            _serial_split = {"refs": 0.0, "qdq": 0.0, "replay": 0.0}
 
         orig_state = {bl: bl.weight.data.clone() for bl in mapping.balance_layers}
         if not use_parent_forward:
@@ -736,20 +863,15 @@ class AWQTransform(BasePreprocessor):
         best_scales = None
         best_ratio = -1
 
-        for ratio, use_duo in self._get_grid_search_params():
-            if use_duo:
-                scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
-            else:
-                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
-            scales[torch.isinf(scales)] = 1
-            scales[torch.isnan(scales)] = 1
-            scales_view = scales.view(1, -1).to(device)
+        for ratio, use_duo in grid_params:
+            scales = self._candidate_scales(x_mean, ratio, use_duo, w_mean, device).view(-1)
+            scales_view = scales.view(1, -1)
 
             if use_parent_forward:
                 # Quantize each balance layer's smoothed weight and write the
                 # de-smoothed result back, so the parent forward below sees the
                 # weights the layer would actually compute with.
+                _t0 = time.perf_counter()
                 for bl in mapping.balance_layers:
                     quant_func, opt_quant_func = bl_quant_funcs[bl]
                     w_qdq = self._qdq_tool.qdq(
@@ -760,8 +882,11 @@ class AWQTransform(BasePreprocessor):
                         imatrix=getattr(bl, "imatrix", None),
                     )
                     bl.weight.data = (w_qdq / scales_view).to(bl.weight.dtype)
+                _serial_split["qdq"] += time.perf_counter() - _t0
 
+                _t0 = time.perf_counter()
                 total_loss = self._compute_parent_loss(mapping.parent, parent_kwargs_list, fp16_outputs)
+                _serial_split["replay"] += time.perf_counter() - _t0
                 for bl in mapping.balance_layers:
                     bl.weight.data.copy_(orig_state[bl])
             else:
@@ -787,8 +912,144 @@ class AWQTransform(BasePreprocessor):
             logger.warning("AWQ: grid search failed for '%s': no finite error.", mapping.smooth_name)
             return None
 
+        if getattr(_penvs, "AR_PERF_COUNTERS", False):
+            logger.info(
+                "[perf] awq grid split: mode=serial name=%s refs=%.2fs qdq=%.2fs replay=%.2fs",
+                mapping.smooth_name,
+                _serial_split["refs"],
+                _serial_split["qdq"],
+                _serial_split["replay"],
+            )
         logger.debug("AWQ '%s': best_ratio=%.2f, best_error=%.3e", mapping.smooth_name, best_ratio, best_error)
         return best_scales
+
+    @torch.no_grad()
+    def _sharded_grid_losses(self, mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix):
+        """Evaluate the smoothing grid in parallel across the lane's replicas.
+
+        Each replica replays its contiguous slice of the cached parent calls
+        on its own block copy: reference outputs first (the copy starts at
+        the original weights), then every grid point's quantized candidate
+        against them. The replica returns per-point loss SUMS plus the
+        element count; the engine sums the partials, and dividing by the
+        merged count reproduces the serial per-point loss exactly (up to
+        fp32 summation order). Returns ``None`` when the mapping cannot
+        shard -- the caller keeps the serial loop.
+        """
+        calls = [mc for stored in parent_kwargs_list for mc in self._iter_parent_calls(*stored)]
+        if not calls:
+            return None
+        # NOTE: no divisibility requirement -- the engine's ceil/floor split
+        # tolerates any call count (one call per calibration batch, optionally
+        # split by smooth_batch_size) because sum-merging is
+        # partition-invariant; every call is kept
+        # the replay needs the parent forward inside the block copy: only
+        # mappings whose parent is the block itself or an in-block module
+        # can shard; a mapping whose parent sits outside the block is a model
+        # topology, not a setup error -- warn and keep the serial loop for it
+        parent = mapping.parent
+        parent_name = getattr(parent, "global_name", None)
+        if not block_prefix or not parent_name:
+            return None
+        if parent_name != block_prefix and not parent_name.startswith(block_prefix + "."):
+            # a model topology, not a setup error: warn once per parent,
+            # not per mapping per block (hundreds of repeats on such models)
+            if parent_name not in _OUT_OF_BLOCK_PARENTS:
+                _OUT_OF_BLOCK_PARENTS.add(parent_name)
+                logger.warning(
+                    "AWQ: parent '%s' (or sibling mappings of it) lies outside block '%s'; "
+                    "such grid searches stay serial while the lane is engaged.",
+                    parent_name,
+                    block_prefix,
+                )
+            return None
+        try:
+            block = self.model_context.model.get_submodule(block_prefix)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("AWQ: sharded grid search declined for '%s': block lookup failed (%s)", mapping.smooth_name, e)
+            return None
+        n_grid = len(grid_params)
+        items = calls
+        _split_by_rep = {}
+        _perf_on = bool(getattr(_penvs, "AR_PERF_COUNTERS", False))
+
+        def _bucket_sync(dev):
+            # under the perf gate only: bucket boundaries become true GPU
+            # walls (the default keeps stream overlap intact)
+            if _perf_on:
+                _sync_device(dev)
+
+        def per_replica(rep, remap, items_slice):
+            r_parent = remap(parent)
+            r_bls = [remap(bl) for bl in mapping.balance_layers]
+            r_dev = r_bls[0].weight.device
+            _t0 = time.perf_counter()
+            # stage each call's args on the replica device ONCE (refs + every
+            # grid point reuse them; re-moving per point re-uploaded the
+            # CPU-parked capture 21x per item)
+            staged = []
+            for call_args, call_kwargs in items_slice:
+                args = tuple(move_to_device(a, r_dev) for a in call_args)
+                kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
+                staged.append((args, kwargs))
+            # reference outputs at the ORIGINAL weights (the copy is pristine)
+            refs = []
+            bl_params = {bl: self._qdq_tool.resolve_params(bl) for bl in r_bls}
+            bl_funcs = {bl: self._qdq_tool.resolve_quant_funcs(bl_params[bl]) for bl in r_bls}
+            orig = {bl: bl.weight.data.clone() for bl in r_bls}
+            _t_prep = time.perf_counter() - _t0
+            _t_refs = time.perf_counter()
+            for args, kwargs in staged:
+                refs.append(self._normalize_parent_output(r_parent(*args, **kwargs)))
+            _bucket_sync(r_dev)
+            _t_refs = time.perf_counter() - _t_refs
+            out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
+            out[-1] = float(sum(r.numel() for r in refs))
+            _t_qdq = 0.0
+            _t_replay = 0.0
+            for gi, (ratio, use_duo) in enumerate(grid_params):
+                _t0 = time.perf_counter()
+                scales_view = self._candidate_scales(x_mean, ratio, use_duo, w_mean, r_dev)
+                for bl in r_bls:
+                    quant_func, opt_quant_func = bl_funcs[bl]
+                    w_qdq = self._qdq_tool.qdq(
+                        orig[bl] * scales_view,
+                        bl_params[bl],
+                        quant_func=quant_func,
+                        opt_quant_func=opt_quant_func,
+                        imatrix=getattr(bl, "imatrix", None),
+                    )
+                    bl.weight.data = (w_qdq / scales_view).to(bl.weight.dtype)
+                _bucket_sync(r_dev)
+                _t_qdq += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
+                loss_sum = torch.zeros((), device=r_dev, dtype=torch.float32)
+                for (args, kwargs), ref in zip(staged, refs):
+                    cand = self._normalize_parent_output(r_parent(*args, **kwargs))
+                    loss_sum = loss_sum + torch.nn.functional.mse_loss(ref.float(), cand.float(), reduction="sum")
+                _bucket_sync(r_dev)
+                out[gi] = loss_sum
+                _t_replay += time.perf_counter() - _t0
+            for bl in r_bls:
+                bl.weight.data.copy_(orig[bl])
+            _split_by_rep[rep] = (_t_prep, _t_refs, _t_qdq, _t_replay)
+            return out
+
+        merged = self._parallel_reduce(block, per_replica, items)
+        if _split_by_rep and _perf_on:
+            prep_w = max(v[0] for v in _split_by_rep.values())
+            refs_w = max(v[1] for v in _split_by_rep.values())
+            qdq_w = max(v[2] for v in _split_by_rep.values())
+            replay_w = max(v[3] for v in _split_by_rep.values())
+            logger.info(
+                "[perf] awq grid split: mode=sharded name=%s prep=%.2fs refs=%.2fs qdq=%.2fs replay=%.2fs",
+                mapping.smooth_name,
+                prep_w,
+                refs_w,
+                qdq_w,
+                replay_w,
+            )
+        return merged
 
     def _iter_parent_calls(self, stored_args: tuple, stored_kwargs: dict):
         """Yield full or microbatched parent-call args from one cached calibration batch."""
@@ -944,6 +1205,40 @@ class AWQTransform(BasePreprocessor):
         return any(token in local for token in self._AVOID_CLIP_TOKENS)
 
     @torch.no_grad()
+    def _sharded_clip_results(self, block_prefix, clip_jobs):
+        """Evaluate the per-layer clip searches, in parallel when the lane is
+        engaged (map semantics: one result per layer) or serially otherwise."""
+        if not clip_jobs:
+            return []
+
+        def _serial():
+            return [self._compute_best_clip(bl, feat) for bl, feat, _ in clip_jobs]
+
+        if self._parallel_map is None:
+            return _serial()
+
+        def per_replica(rep, remap, jobs):
+            out = []
+            for bl, feat, _name in jobs:
+                r_bl = remap(bl)
+                r_feat = feat.to(r_bl.weight.device)
+                res = self._compute_best_clip(r_bl, r_feat)
+                out.append(None if res is None else (res[0].to("cpu"), res[1].to("cpu")))
+            return out
+
+        try:
+            block = self.model_context.model.get_submodule(block_prefix)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("AWQ: sharded clip search declined: block lookup failed (%s)", e)
+            return _serial()
+        merged = self._parallel_map(block, per_replica, clip_jobs)
+        if merged is None:
+            return _serial()
+        return [
+            None if res is None else (res[0].to(bl.weight.device), res[1].to(bl.weight.device))
+            for (bl, _, _n), res in zip(clip_jobs, merged)
+        ]
+
     def _clip_block(self, block_prefix: str, block_mappings: list) -> None:
         """Search per-group weight clip thresholds for one block.
 
@@ -963,6 +1258,13 @@ class AWQTransform(BasePreprocessor):
           then tunes ``min_scale``/``max_scale`` on top.
         """
         clip_store = getattr(self.model_context, "awq_clip_values", None)
+        # Layer-parallel clip search over the lane's replicas: each balance
+        # layer's search is independent (weight + cached features), so the map
+        # seam evaluates whole layers per replica and the results apply on
+        # home exactly as the serial loop would. MoE blocks with hundreds of
+        # expert linears dominate the serial cost, which is why this rides
+        # the seam whenever the lane is engaged.
+        clip_jobs = []
         for mapping in block_mappings:
             feat = self._clip_input_feat.get(mapping.smooth_name)
             if feat is None:
@@ -976,26 +1278,32 @@ class AWQTransform(BasePreprocessor):
                 if self._should_skip_clip(name):
                     logger.debug("AWQ: skip clip for '%s' (avoid-clipping layer).", name)
                     continue
-                clip_range = self._compute_best_clip(bl, feat)
-                if clip_range is None:
-                    continue
-                min_val, max_val = clip_range
-                key = getattr(bl, "global_name", None) or name
-                if clip_store is not None:
-                    if torch.allclose(min_val, -max_val):
-                        clip_store[key] = max_val.detach().to("cpu")
-                    else:
-                        clip_store[key] = {
-                            "min": min_val.detach().to("cpu"),
-                            "max": max_val.detach().to("cpu"),
-                        }
-                if self.clip_as_init:
-                    # Keep the weights intact; hand the clip to the block
-                    # quantizer as the initialization of its weight range.
-                    bl.awq_clip_min = min_val.detach()
-                    bl.awq_clip_max = max_val.detach()
+                clip_jobs.append((bl, feat, name))
+        _t_clip = time.perf_counter()
+        results = self._sharded_clip_results(block_prefix, clip_jobs) or [None] * len(clip_jobs)
+        _perf = getattr(self, "_clip_perf", None)
+        if _perf is not None and clip_jobs:
+            _perf["wall"] += time.perf_counter() - _t_clip
+        for (bl, feat, name), clip_range in zip(clip_jobs, results):
+            if clip_range is None or (isinstance(clip_range, tuple) and clip_range[0] is None):
+                continue
+            min_val, max_val = clip_range
+            key = getattr(bl, "global_name", None) or name
+            if clip_store is not None:
+                if torch.allclose(min_val, -max_val):
+                    clip_store[key] = max_val.detach().to("cpu")
                 else:
-                    self._apply_clip(bl, min_val, max_val)
+                    clip_store[key] = {
+                        "min": min_val.detach().to("cpu"),
+                        "max": max_val.detach().to("cpu"),
+                    }
+            if self.clip_as_init:
+                # Keep the weights intact; hand the clip to the block
+                # quantizer as the initialization of its weight range.
+                bl.awq_clip_min = min_val.detach()
+                bl.awq_clip_max = max_val.detach()
+            else:
+                self._apply_clip(bl, min_val, max_val)
 
     @torch.no_grad()
     def _compute_best_clip(

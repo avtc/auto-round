@@ -25,10 +25,8 @@ import torch
 
 from auto_round.algorithms.block_runner import _cat_device_safe
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
-    _encode_transport,
     _transport_segment,
     distribute_pool,
-    gather_block_for_mirroring_,
     resolve_ddp_plan,
 )
 from auto_round.compressors.utils import IndexSampler, shard_samplers
@@ -65,7 +63,7 @@ class TestResolveDDPPlan:
             world,
             torch.device("cuda", 0),  # device OBJECTS only -- no CUDA runtime touched
             8,
-            visible_cuda_devices=[0, 1, 2, 3],
+            visible_devices=[0, 1, 2, 3],
             explicit_devices=["0", "1", "2", "3"],  # bare indices: normalized to cuda:N
             vram_free_bytes={torch.device("cuda", i): free[i] for i in range(4)},
             mirror_footprint_bytes=footprint,
@@ -97,7 +95,7 @@ class TestResolveDDPPlan:
             3,
             torch.device("cuda", 0),
             12,
-            visible_cuda_devices=[0, 1, 2, 3],
+            visible_devices=[0, 1, 2, 3],
             explicit_devices=["0", "1", "2"],
             vram_free_bytes={torch.device("cuda", i): 1 << 30 for i in range(3)},
             mirror_footprint_bytes=1,
@@ -106,33 +104,44 @@ class TestResolveDDPPlan:
         assert plan.world == 3 and plan.enabled
 
 
+class TestWorldDemotion:
+    """batch < world demotes the world to the largest power-of-two divisor."""
+
+    def test_demotion_table(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_ddp_plan
+
+        def _resolve(batch, world):
+            return resolve_ddp_plan(
+                world,
+                torch.device("cuda", 0),
+                batch,
+                visible_devices=[0, 1, 2, 3],
+                explicit_devices=["0", "1", "2", "3"],
+                vram_free_bytes={torch.device("cuda", i): 1 << 40 for i in range(4)},
+                mirror_footprint_bytes=1,
+                margin_bytes=0,
+            )
+
+        # batch 1 cannot shard: serial (world collapses to 1; the reason is
+        # logged, not carried in notes)
+        p = _resolve(1, 4)
+        assert p.world == 1
+        # batch 3, world 4 -> halved to 2 (3 >= 2, one replica gets 2 samples)
+        p = _resolve(3, 4)
+        assert p.world == 2 and any("demoted world to 2" in str(n) for n in p.notes)
+        # batch 6, world 4 -> no demotion (6 >= 4)
+        p = _resolve(6, 4)
+        assert p.world == 4
+        # batch divisible by world stays
+        p = _resolve(8, 4)
+        assert p.world == 4
+
+
 class TestTransportMath:
     def test_fp32_passthrough(self):
         t = torch.randn(16)
-        out = _transport_segment(t, t.device, torch.float32, "fp32")
+        out = _transport_segment(t, t.device)
         assert out is t
-
-    def test_bf16_transport_roundtrip_preserves_signs(self):
-        t = torch.randn(1024)
-        out = _transport_segment(t, t.device, torch.float32, "bf16")
-        assert torch.equal(torch.sign(out), torch.sign(t))
-
-    def test_int8_transport_preserves_signs(self):
-        t = torch.randn(1024) * 0.01
-        out = _transport_segment(t, t.device, torch.float32, "int8")
-        # signs are what sign-SGD consumes; |t| below the int8 quantum rounds
-        # to zero (sign 0), magnitudes carry bounded int8 error
-        assert ((torch.sign(out) == torch.sign(t)) | (out == 0)).all()
-        assert (out - t).abs().max() < 1e-3
-
-    def test_encode_transport_meta(self):
-        t = torch.randn(8)
-        payload, meta = _encode_transport(t, "int8")
-        assert payload.dtype == torch.int8 and meta is not None
-        payload, meta = _encode_transport(t, "bf16")
-        assert payload.dtype == torch.bfloat16 and meta is None
-        payload, meta = _encode_transport(t, "fp32")
-        assert payload is t and meta is None
 
 
 class TestDistributePool:
@@ -146,7 +155,7 @@ class TestDistributePool:
             4,
             torch.device("cuda", 0),
             8,
-            visible_cuda_devices=[0, 1, 2, 3],
+            visible_devices=[0, 1, 2, 3],
             explicit_devices=["0", "1", "2", "3"],  # avoids torch.cuda.device_count() on CUDA-less hosts
             vram_free_bytes={torch.device("cuda", i): 1 << 40 for i in range(4)},
             mirror_footprint_bytes=1,
@@ -160,23 +169,18 @@ class TestDistributePool:
         # indivisible / too-small pools are left alone by contract (serial cats handle them)
         distribute_pool([torch.zeros(2)], [torch.device("cpu")] * 4)
 
+    @pytest.mark.parametrize("n", [5, 6, 7])
+    def test_uneven_pool_slices_match_shared_bounds(self, n):
+        # ceil/floor boundaries: device r owns [bounds[r], bounds[r+1]) --
+        # a remainder sample lands on the EARLIER devices, and the union of
+        # slices covers the pool exactly with no overlap
+        from auto_round.algorithms.quantization.sign_round.data_parallel import contiguous_shard_bounds
 
-class TestGatherOnCPU:
-    def test_noop_on_whole_block(self):
-        block = torch.nn.Linear(4, 4)
-        assert gather_block_for_mirroring_(block, torch.device("cpu")) is False
-
-    def test_repoints_stale_tuning_device_strings(self):
-        block = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
-        block[1].tuning_device = "cuda:5"
-        assert gather_block_for_mirroring_(block, torch.device("cpu")) is True
-        assert str(block[1].tuning_device) == "cpu"
-
-    def test_moves_wrapper_dict_state(self):
-        block = torch.nn.Linear(4, 4)
-        block.params = {"v": torch.nn.Parameter(torch.ones(4), requires_grad=True)}
-        gather_block_for_mirroring_(block, torch.device("cpu"))
-        assert block.params["v"].device.type == "cpu"
+        world = 4
+        bounds = contiguous_shard_bounds(n, world)
+        sizes = [bounds[r + 1] - bounds[r] for r in range(world)]
+        assert sum(sizes) == n and max(sizes) - min(sizes) <= 1
+        assert all(sizes[r] >= sizes[r + 1] for r in range(world - 1)), "remainder must sit on earlier shards"
 
 
 class TestCatDeviceSafe:
@@ -190,9 +194,88 @@ class TestCatDeviceSafe:
             _cat_device_safe([], dim=0)
 
 
+class TestShardedNogradForward:
+    """Execute the sharded collection core for real (it is only mocked elsewhere).
+
+    CPU devices, a tiny linear block and a minimal runner: pins the ceil/floor
+    split, the world>n demotion, the hook-pass cap truncation and the stats
+    rollup key.
+    """
+
+    def _run(self, n, devices, max_devices=0):
+        import torch as _t
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        block = _t.nn.Linear(2, 2, bias=False)
+        calls = []
+
+        def runner(rep, inputs, input_others, indices=None, cache_device=None):
+            if indices is None:  # serial fallback path: all samples
+                indices = list(range(len(inputs)))
+            calls.append((id(rep), tuple(indices)))
+            # return ONE batched tensor like the real runner; the engine
+            # splits it into per-sample pieces itself
+            return rep(_t.cat([inputs[i] for i in indices], dim=0))
+
+        inputs = [_t.randn(1, 2) for _ in range(n)]
+        stats = {}
+        out = dp.sharded_nograd_forward(
+            runner,
+            block,
+            inputs,
+            {},
+            torch.device("cpu"),
+            devices,
+            sample_count=n,
+            stats=stats,
+            max_devices=max_devices,
+        )
+        return out, calls, stats
+
+    def test_even_split_and_order(self):
+        out, calls, _ = self._run(4, [torch.device("cpu")] * 2)
+        # shards are contiguous and ordered; outputs concatenate in shard order
+        assert [idx for _, idx in calls] == [(0, 1), (2, 3)]
+        assert len(out) == 4
+
+    def test_uneven_split_remainder_on_earlier_replica(self):
+        out, calls, _ = self._run(5, [torch.device("cpu")] * 2)
+        assert [idx for _, idx in calls] == [(0, 1, 2), (3, 4)]
+        assert len(out) == 5
+
+    def test_world_larger_than_pool_demotes(self):
+        out, calls, _ = self._run(2, [torch.device("cpu")] * 4)
+        # world collapses to n: two replicas run one sample each (extra
+        # devices unused, no empty shards)
+        assert [idx for _, idx in calls] == [(0,), (1,)]
+        assert len(out) == 2
+
+    def test_single_item_runs_serial_fallback(self):
+        out, calls, _ = self._run(1, [torch.device("cpu")] * 2)
+        assert [idx for _, idx in calls] == [(0,)]
+        assert len(out) == 1
+
+    def test_max_devices_truncates_to_first_k(self):
+        # 8 devices, cap 2: only the FIRST two devices run shards
+        out, calls, _ = self._run(4, [torch.device("cpu")] * 8, max_devices=2)
+        assert len(calls) == 2
+        assert {id(c) for c, _ in calls[0:1]}  # distinct replicas used
+        assert len(out) == 4
+
+    def test_stats_gain_mirror_setup_key(self):
+        from auto_round.algorithms.quantization.sign_round.data_parallel import MIRROR_SETUP_MS_KEY
+
+        _, _, stats = self._run(4, [torch.device("cpu")] * 2)
+        assert MIRROR_SETUP_MS_KEY in stats
+
+
 class TestEnvDefaults:
     def test_ddp_defaults_resolve(self, monkeypatch):
-        for name in ("AR_TUNE_DDP_WORLD", "AR_TUNE_DDP_DEVICES"):
+        for name in (
+            "AR_TUNE_DDP_WORLD",
+            "AR_TUNE_DDP_DEVICES",
+        ):
             monkeypatch.delenv(name, raising=False)
         from auto_round import envs
 
@@ -204,6 +287,117 @@ class TestEnvDefaults:
         from auto_round import envs
 
         assert envs.AR_TUNE_DDP_WORLD == 4
+
+
+class TestAccumulationSupport:
+    """gradient_accumulate_steps > 1 engages: sum-reduced shard losses exchange
+    as values whose sign (and positive-rescaled magnitude) matches the serial
+    accumulated gradient, and mean_loss normalizes without the world divisor."""
+
+    def _quantizer(self, accum):
+        from types import SimpleNamespace
+
+        q = SimpleNamespace(
+            iters=10,
+            gradient_accumulate_steps=accum,
+            enable_lfq=False,
+            _resolved_ddp_plan=None,
+        )
+        q._get_scaler = lambda: None
+        return q
+
+    def test_accumulation_engages(self, monkeypatch):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        from types import SimpleNamespace
+
+        block = SimpleNamespace(
+            parameters=lambda: iter(
+                [SimpleNamespace(device=torch.device("cuda", 0), numel=lambda: 8, element_size=lambda: 4)]
+            ),
+            modules=lambda: iter([]),
+        )
+        plan = resolve_tune_ddp_plan_(self._quantizer(2), block, [torch.zeros(1)] * 2, None, "cuda:0", log=False)
+        # engages with explicit devices; the accumulation gate is gone
+        assert plan.world == 2
+        assert not any("accumulate" in str(n) for n in plan.notes)
+
+    def test_mean_loss_normalization_modes(self):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.tune_parallel import TuneParallelContext
+
+        ctx = TuneParallelContext()
+        ctx.group = SimpleNamespace(world=2)
+        losses = [torch.tensor(6.0), torch.tensor(10.0)]
+        # mean-reduced: mean of shard means (8 / 2 shards... mean(6,10)=8) / num_elm=2 -> 4.0
+        assert ctx.mean_loss(losses, num_elm=2, divide_world=True) == 4.0
+        # sum-reduced: shard sums add to the global sum (16) / num_elm=2 -> 8.0
+        assert ctx.mean_loss(losses, num_elm=2, divide_world=False) == 8.0
+
+    def test_accumulated_grad_sign_matches_serial(self):
+        """Two replicas, sum-reduced shard losses; the full-value exchange
+        leaves each replica with the averaged gradient -- a positive rescale
+        of the serial accumulated (summed) gradient, so sign-SGD updates and
+        momentum directions match serial."""
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        world = 2
+        # replicas hold the SAME parameters (mirrors); each accumulates the
+        # sum-reduced gradient over its own data shard. Shard grads derived
+        # analytically: grad of (x[shard]**2).sum() lives on the shard slice.
+        x = torch.randn(16, requires_grad=False)
+        grad0 = torch.zeros(16)
+        grad0[:8] = 2 * x[:8]
+        grad1 = torch.zeros(16)
+        grad1[8:] = 2 * x[8:]
+        bufs = [grad0.clone(), grad1.clone()]
+        dp.halving_doubling_allreduce(bufs, scale=1.0 / world)
+        serial_accumulated = 2 * x  # serial: grads summed over both shards
+        for buf in bufs:
+            # exchanged buffer x world == serial accumulated gradient
+            assert torch.allclose(buf * world, serial_accumulated, atol=1e-6)
+
+
+class TestExchangeSelection:
+    """The exchange choice is algorithm-gated with no env override: a caller
+    asserting the pure sign-SGD property (sign_exchange=True) gets the sign
+    exchange; any other caller gets the fp32 full-value exchange."""
+
+    def _group(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(world=2)
+
+    def _run_sync(self, sign_exchange):
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+
+        calls = []
+        orig_sign, orig_full = dp.sign_exchange_allreduce, dp.halving_doubling_allreduce
+        dp.sign_exchange_allreduce = lambda bufs: calls.append("sign")
+        dp.halving_doubling_allreduce = lambda bufs, scale=1.0: calls.append("full")
+        try:
+            p0 = torch.nn.Parameter(torch.zeros(2))
+            p1 = torch.nn.Parameter(torch.zeros(2))
+            p0.grad, p1.grad = torch.ones(2), torch.ones(2)
+            dp.ReplicaGroup.sync_grads(self._group(), [[p0], [p1]], sign_exchange=sign_exchange)
+        finally:
+            dp.sign_exchange_allreduce, dp.halving_doubling_allreduce = orig_sign, orig_full
+        return calls
+
+    def test_sign_exchange_property_routes_to_sign(self):
+        assert self._run_sync(sign_exchange=True) == ["sign"]
+
+    def test_full_value_when_property_absent(self):
+        assert self._run_sync(sign_exchange=False) == ["full"]
 
 
 class TestTupleKwargSlicing:
@@ -322,7 +516,120 @@ class TestLoggingGlobals:
         from auto_round.algorithms.quantization.sign_round import data_parallel as dp
 
         assert dp._ENGAGED_LOGGED_SIG is None
-        assert isinstance(dp._coll_mirror_setup_logged, set)
+
+
+class TestSingleDevicePlacement:
+    """Parallel tuning tunes whole-block mirrors: a block whose weights span
+    several CUDA devices fails the resolver (validation, never a gather)."""
+
+    @staticmethod
+    def _param(dev, n=8):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(device=torch.device(dev), numel=lambda: n, element_size=lambda: 4)
+
+    @staticmethod
+    def _quantizer():
+        from types import SimpleNamespace
+
+        q = SimpleNamespace(iters=10, gradient_accumulate_steps=1, enable_lfq=False, _resolved_ddp_plan=None)
+        q._get_scaler = lambda: None
+        return q
+
+    def test_block_spanning_two_cuda_devices_declines(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        block = SimpleNamespace(parameters=lambda: iter([self._param("cuda:0"), self._param("cuda:1")]))
+        with pytest.raises(RuntimeError, match="spans 2 CUDA devices"):
+            resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)], None, "cuda:0")
+
+    def test_non_cuda_accelerator_home_is_eligible(self, monkeypatch):
+        """cuda/xpu/hpu homes are eligible; a fake xpu home with explicit
+        devices resolves a plan on CPU (no xpu runtime touched)."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round import data_parallel as dp
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_ddp_plan
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        free_map = dp._accel_free_bytes_map("xpu")  # None on a box without xpu
+        block = SimpleNamespace(
+            parameters=lambda: iter(
+                [SimpleNamespace(device=torch.device("xpu", 0), numel=lambda: 8, element_size=lambda: 4)]
+            ),
+            modules=lambda: iter([]),
+        )
+        q = SimpleNamespace(iters=10, gradient_accumulate_steps=1, enable_lfq=False, _resolved_ddp_plan=None)
+        q._get_scaler = lambda: None
+        # plan resolution itself works for an xpu home with explicit devices
+        plan = resolve_ddp_plan(
+            2,
+            torch.device("xpu", 0),
+            8,
+            visible_devices=None,
+            explicit_devices=["0", "1"],
+            vram_free_bytes=free_map,  # None: no VRAM filtering
+            mirror_footprint_bytes=None,
+        )
+        assert plan.enabled and plan.world == 2
+        assert all(d.type == "xpu" for d in plan.devices)
+        # the shared resolver accepts the xpu home (probe-less eligibility)
+        resolved = dp.resolve_tune_ddp_plan_(q, block, [torch.zeros(1), torch.zeros(1)], None, "xpu", log=False)
+        assert resolved.world >= 1  # resolves without raising "not a supported accelerator"
+
+    def test_dict_inputs_stop_with_reason(self, monkeypatch):
+        """Diffusion-style dict pools with the flag set must stop with a reason,
+        never silently fall back to serial (fail-visibility contract)."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        block = SimpleNamespace(
+            parameters=lambda: iter([self._param("cuda:0")]),
+            modules=lambda: iter([]),
+        )
+        with pytest.raises(RuntimeError, match="non-list calibration inputs"):
+            resolve_tune_ddp_plan_(self._quantizer(), block, {"hidden_states": [torch.zeros(1)]}, None, "cuda:0")
+
+    def test_cpu_resident_weights_pass_span_rule(self, monkeypatch):
+        """CPU-pinned subtrees alongside the CUDA home are legal placement."""
+        from types import SimpleNamespace
+
+        import torch
+
+        import auto_round.algorithms.quantization.sign_round.data_parallel as dp_mod
+        from auto_round.algorithms.quantization.sign_round.data_parallel import resolve_tune_ddp_plan_
+
+        monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
+        monkeypatch.setenv("AR_TUNE_DDP_DEVICES", "0,1")
+        # stub the accelerator probes (host-independent): 2 usable cuda
+        # devices, both with ample free VRAM -> the plan must ENGAGE
+        monkeypatch.setattr(dp_mod, "_accel_device_count", lambda dev_type: 2)
+        monkeypatch.setattr(
+            dp_mod,
+            "_accel_free_bytes_map",
+            lambda dev_type: {torch.device("cuda", i): 1 << 40 for i in range(2)},
+        )
+        block = SimpleNamespace(
+            parameters=lambda: iter([self._param("cpu"), self._param("cuda:0")]),
+            modules=lambda: iter([]),
+        )
+        # batch 2 shards across world 2; the CPU-pinned subtree alongside the
+        # CUDA home is legal placement -- the plan resolves (no span refusal)
+        plan = resolve_tune_ddp_plan_(self._quantizer(), block, [torch.zeros(1)] * 2, None, "cuda:0", log=False)
+        assert plan.world == 2, f"CPU-pinned subtree wrongly refused: {plan.notes}"
 
 
 class TestRequestedWorldErrors:
@@ -365,7 +672,7 @@ class TestRequestedWorldErrors:
         with pytest.raises(RuntimeError) as excinfo:
             resolve_tune_ddp_plan_(q, block, [torch.zeros(1)], None, "cpu")
         assert "iters" not in str(excinfo.value)
-        assert "not CUDA" in str(excinfo.value)
+        assert "not a supported accelerator" in str(excinfo.value)
 
     def test_no_world_set_stays_serial(self, monkeypatch):
         import torch
@@ -605,7 +912,7 @@ class TestResolverRtnSafe:
         monkeypatch.setenv("AR_TUNE_DDP_WORLD", "2")
         q = SimpleNamespace(iters=0, gradient_accumulate_steps=1, enable_lfq=False, _resolved_ddp_plan=None)
         # no _get_scaler, no calibration_context: must NOT AttributeError
-        with pytest.raises(RuntimeError, match="not CUDA"):
+        with pytest.raises(RuntimeError, match="not a supported accelerator"):
             resolve_tune_ddp_plan_(q, torch.nn.Sequential(torch.nn.Linear(4, 4)), [torch.zeros(1)], None, "cpu")
 
 

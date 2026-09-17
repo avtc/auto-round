@@ -30,11 +30,15 @@ Design invariants (see AWQ_REFACTOR_PLAN.md §0.0 and §3.0):
 
 from __future__ import annotations
 
+import inspect
+import time as _ctime
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+import auto_round.algorithms.quantization.sign_round.data_parallel as data_parallel
+from auto_round import envs as _envs
 from auto_round.algorithms.block_runner import BlockForwardRunner
 from auto_round.algorithms.config_resolver import (
     get_algorithm_class,
@@ -362,13 +366,18 @@ class AlgorithmComposer:
 
     def _collect_forward_timed(self, *args, **kwargs):
         """_collect_forward with wall accumulation into self.last_collect_wall."""
-        import time as _ctime
-
         _t0 = _ctime.perf_counter()
         try:
             return self._collect_forward(*args, **kwargs)
         finally:
             self.last_collect_wall = getattr(self, "last_collect_wall", 0.0) + (_ctime.perf_counter() - _t0)
+            _ctx = getattr(self, "_coll_ctx", None)
+            if _ctx is not None:
+                self.last_mirror_setup_wall = (
+                    getattr(self, "last_mirror_setup_wall", 0.0)
+                    + _ctx.collect_stats.get(data_parallel.MIRROR_SETUP_MS_KEY, 0.0) / 1000.0
+                )
+                _ctx.collect_stats = {}
 
     def _collect_forward(
         self, block, inputs, input_others, out_dev=None, allow_shard: bool = True, hook_pass: bool = False
@@ -382,9 +391,9 @@ class AlgorithmComposer:
         Mergeable stats (imatrix, act_max) are folded from the mirrors back
         into the home, so those hook passes may shard.
 
-        ``hook_pass=True`` caps the concurrent shards at 4: forward hooks
-        force dynamo graph breaks, leaving the compiled runner as
-        python-bound eager sections that GIL-convoy under many threads.
+        ``hook_pass=True`` may additionally cap the concurrent shards via
+        ``AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES`` (default: no cap) on
+        hosts where hooked compiled passes GIL-convoy under many threads.
         """
         if self._coll_ctx is None:
             from auto_round.algorithms.quantization.sign_round.tune_parallel import TuneParallelContext
@@ -439,6 +448,17 @@ class AlgorithmComposer:
             - *reference_output*: FP reference output collected before optimization.
         """
         self.last_collect_wall = 0.0
+        self.last_mirror_setup_wall = 0.0
+        # per-phase walls for the [perf] pipeline line (AR_PERF_COUNTERS)
+        self.last_pipeline_walls = {
+            "pre_calib": 0.0,  # Step 1: preprocessor stats passes (serial today)
+            "pre_quant": 0.0,  # Step 2: weight transforms (AWQ searches etc.)
+            "ref_collect": 0.0,  # Step 3: fp reference + calibration collect
+            "q_collect": 0.0,  # Step 3: q-input calibration collect
+        }
+        _pl = self.last_pipeline_walls
+        if getattr(self, "_coll_ctx", None) is not None:
+            self._coll_ctx.collect_stats = {}
         block_forward_fn = self.block_forward
         from auto_round.algorithms.quantization.sign_round.tune_parallel import TuneParallelContext
 
@@ -450,11 +470,34 @@ class AlgorithmComposer:
 
         # ── Step 1: Preprocessor calibration (e.g. AWQ activation stats) ──────
         with torch.no_grad():
+            _t0 = _ctime.perf_counter()
             pre_hooks = []
+            # serial Step-1 capture would stack the whole block's parent-args on
+            # the single home device (observed OOM in the following passes on
+            # 24GB cards) -- park unless the sharded lane spreads the capture
+            # over mirror devices; low_gpu_mem always parks
+            _park = self._coll_ctx.devices is None
+
+            def _register_fp(pre):
+                fn = pre.register_fp_input_forward_hooks
+                if "park_capture" in inspect.signature(fn).parameters:
+                    return fn(block, park_capture=_park or None)
+                return fn(block)
+
             for pre in self.preprocessors:
-                pre_hooks.extend(pre.register_fp_input_forward_hooks(block))
+                pre_hooks.extend(_register_fp(pre))
             if pre_hooks:
-                block_forward_fn(block, fp_inputs, input_others)
+                # route through the collection seam so the stats pass shards
+                # over the lane mirrors like Step 3 does; the preprocessor
+                # hooks are additive/append-mergeable by contract, so mirror
+                # writes fold back (hook_pass may cap concurrency via env)
+                self._coll_ctx.collect_forward(
+                    block_forward_fn,
+                    block,
+                    fp_inputs,
+                    input_others,
+                    hook_pass=True,
+                )
             for h in pre_hooks:
                 h.remove()
 
@@ -463,18 +506,39 @@ class AlgorithmComposer:
                 if hasattr(pre, "register_qinput_forward_hooks"):
                     pre_q_hooks.extend(pre.register_qinput_forward_hooks(block))
             if pre_q_hooks:
-                block_forward_fn(block, q_inputs if q_inputs is not None else fp_inputs, input_others)
+                self._coll_ctx.collect_forward(
+                    block_forward_fn,
+                    block,
+                    q_inputs if q_inputs is not None else fp_inputs,
+                    input_others,
+                    hook_pass=True,
+                )
             for h in pre_q_hooks:
                 h.remove()
+            _pl["pre_calib"] = _ctime.perf_counter() - _t0
 
         # ── Step 2: pre_quantize_block (stats consolidation + weight transforms) ──
+        _t0 = _ctime.perf_counter()
         for pre in self.preprocessors:
-            pre.pre_quantize_block(block_ctx)
+            # attach the engaged lane's shard-and-reduce seam so no-grad
+            # searches (AWQ's smoothing grid) can evaluate in parallel; the
+            # seam returns None whenever sharding does not apply, and the
+            # search keeps its serial loop
+            coll_ctx = getattr(self, "_coll_ctx", None)
+            if hasattr(pre, "set_parallel_reduce") and coll_ctx is not None and coll_ctx.devices:
+                pre.set_parallel_reduce(coll_ctx.reduce, map_fn=coll_ctx.map)
+            try:
+                pre.pre_quantize_block(block_ctx)
+            finally:
+                if hasattr(pre, "set_parallel_reduce"):
+                    pre.set_parallel_reduce(None)
+        _pl["pre_quant"] = _ctime.perf_counter() - _t0
 
         reference_next_input = None
         # ── Step 3: Quantizer calibration (act_max, imatrix, etc.) ─────────────
         if fp_inputs is not None:
             with torch.no_grad():
+                _t0 = _ctime.perf_counter()
                 quant_hooks = self._get_fp_act_hooks(block)
                 if reference_output is None:
                     reference_output = self._collect_forward_timed(
@@ -488,8 +552,10 @@ class AlgorithmComposer:
                 reference_next_input = getattr(block_forward_fn, "last_output_dict", None) or reference_output
                 for h in quant_hooks:
                     h.remove()
+                _pl["ref_collect"] = _ctime.perf_counter() - _t0
 
                 if self.block_quantizer.enable_quanted_input:
+                    _t0 = _ctime.perf_counter()
                     q_hooks = self._get_q_act_hooks(block)
                     if q_hooks:
                         self._collect_forward_timed(
@@ -500,6 +566,7 @@ class AlgorithmComposer:
                         )
                         for h in q_hooks:
                             h.remove()
+                    _pl["q_collect"] = _ctime.perf_counter() - _t0
 
             # ── Step 3.5: MoE scale alignment + global scale update ─────────────────
             # Must run after calibration hooks (act_max collected) and before quantize_block.
@@ -546,6 +613,14 @@ class AlgorithmComposer:
         else:
             new_q_input = None
 
+        if getattr(_envs, "AR_PERF_COUNTERS", False):
+            logger.info(
+                "[perf] pipeline phases: pre_calib=%.2fs pre_quant=%.2fs ref_collect=%.2fs q_collect=%.2fs",
+                _pl["pre_calib"],
+                _pl["pre_quant"],
+                _pl["ref_collect"],
+                _pl["q_collect"],
+            )
         return new_q_input, reference_next_input
 
     def compress_layer_outside_block(

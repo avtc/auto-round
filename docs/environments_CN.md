@@ -146,18 +146,30 @@ export AR_MODEL_FREE_SHARD_PARALLELISM=4
   以及 `--parallel_quantization` 调优的每块 `mirrors/warmup/fwd/bwd/exch/step/teardown`。
 - **默认**：关闭
 
-### AR_TUNE_DDP_DEVICES
-- **描述**：`--parallel_quantization` 调参时可选的显式副本设备列表（逗号分隔，例如 `0,1,2,3`）。
-  默认由计划从可见的 CUDA 设备中挑选空闲显存足够容纳镜像的设备；每个副本在其计划设备上持有完整的块镜像，
-  并抽取互不重叠的校准分片，因此等效 batch 与串行运行的数据覆盖一致。
-- **默认值**：未设置 → 由计划推导
-- **取值**：逗号分隔的设备编号
+### AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES
+- **描述**：`--parallel_quantization` 下携带前向钩子的采集类前向（如 AWQ 激活统计、imatrix/act-max 采集）的最大并发镜像设备数。
+  默认不设上限；仅当主机上多镜像线程导致此类前向因 GIL 拥堵变慢时才需要调低（例如 `4`）。
+  调参循环的副本数与搜索分片不受影响。
+- **默认值**：`0`（不设上限）
+- **取值**：非负整数
 
 ```bash
-export AR_TUNE_DDP_DEVICES=0,1,2,3
-```### AR_TUNE_DDP_DEVICES
+export AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES=8
+```
+
+### AR_TUNE_DDP_WORLD
+- **描述**：`--parallel_quantization` world 大小的内部覆盖（CLI 参数才是受支持的入口）。请求的 world 是硬性要求：
+  无法满足时将以 `RuntimeError` 报出阻塞原因并停止，而不是静默退回串行。
+- **默认值**：未设置 → 由 `--parallel_quantization` 推导
+- **取值**：正整数
+
+```bash
+export AR_TUNE_DDP_WORLD=4
+```
+
+### AR_TUNE_DDP_DEVICES
 - **描述**：`--parallel_quantization` 调参时可选的显式副本设备列表（逗号分隔，例如 `0,1,2,3`）。
-  默认由计划从可见的 CUDA 设备中挑选空闲显存足够容纳镜像的设备；每个副本在其计划设备上持有完整的块镜像，
+  默认由计划从可见的加速器设备（cuda/xpu/hpu）中挑选空闲显存足够容纳镜像的设备；每个副本在其计划设备上持有完整的块镜像，
   并抽取互不重叠的校准分片，因此等效 batch 与串行运行的数据覆盖一致。
 - **默认值**：未设置 → 由计划推导
 - **取值**：逗号分隔的设备编号

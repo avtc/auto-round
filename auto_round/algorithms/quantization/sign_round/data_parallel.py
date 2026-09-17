@@ -30,12 +30,32 @@ from __future__ import annotations
 import copy
 import queue
 import threading
+import time as _ptime
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
 from auto_round.logger import logger
+
+# perf-rollup key shared with the orchestrator's [perf] block line (ms)
+MIRROR_SETUP_MS_KEY = "mirror_setup_ms"
+
+
+def contiguous_shard_bounds(n: int, world: int) -> List[int]:
+    """Contiguous ceil/floor split bounds over ``n`` items for ``world`` shards.
+
+    The first ``n % world`` shards take one extra item (remainder on the
+    EARLIER shards). This exact idiom is a cross-component invariant: pool
+    placement, collection shards, tune shards and warm-up windows must all
+    slice identically or pools and shards silently mis-align -- every site
+    must call this helper instead of re-deriving the bounds.
+    """
+    sizes = [n // world + (1 if r < n % world else 0) for r in range(world)]
+    bounds = [0]
+    for sz in sizes:
+        bounds.append(bounds[-1] + sz)
+    return bounds
 
 
 @dataclass
@@ -66,19 +86,60 @@ def block_has_tuning_entries(block) -> bool:
     return False
 
 
-def _parse_device_token(tok: str) -> torch.device:
-    """Parse an explicit-device token: ``3`` -> ``cuda:3``, ``cuda:3``/``xpu:3`` as-is."""
+def _parse_device_token(tok: str, dev_type: str = "cuda") -> torch.device:
+    """Parse an explicit-device token: ``3`` -> ``<dev_type>:3``, ``cuda:3``/``xpu:3`` as-is."""
     tok = tok.strip()
     if tok.isdigit():
-        return torch.device("cuda", int(tok))
+        return torch.device(dev_type, int(tok))
     return torch.device(tok)
+
+
+_SUPPORTED_ACCEL_TYPES = ("cuda", "xpu", "hpu")
+
+
+def _accel_device_count(dev_type: str) -> int:
+    """Device count for an accelerator backend, 0 when the backend is absent.
+
+    ``getattr(torch, ...)`` can raise during backend module init on builds
+    compiled without the backend, so the whole probe is guarded.
+    """
+    try:
+        mod = getattr(torch, dev_type, None)
+        fn = getattr(mod, "device_count", None)
+        if callable(fn):
+            return int(fn())
+    except Exception as e:  # pragma: no cover - backend-specific probe failure
+        logger.debug("[tune-ddp] device-count probe failed for %s (%s); treating as absent", dev_type, e)
+    return 0
+
+
+def _accel_free_bytes_map(dev_type: str):
+    """Per-device free-memory map for the backend, or None when unavailable.
+
+    cuda/xpu expose ``mem_get_info``; other backends (and missing APIs) return
+    None so the plan resolves without VRAM filtering (explicit devices then
+    decide the fleet).
+    """
+    try:
+        mod = getattr(torch, dev_type, None)
+        if mod is not None and getattr(mod, "is_available", lambda: False)():
+            mem = getattr(mod, "mem_get_info", None)
+            if callable(mem):
+                return {torch.device(dev_type, i): mem(i)[0] for i in range(_accel_device_count(dev_type))}
+    except Exception as e:  # pragma: no cover - backend-specific probe failure
+        logger.warning(
+            "[tune-ddp] free-memory probe failed for %s (%s); resolving the plan without VRAM filtering",
+            dev_type,
+            e,
+        )
+    return None
 
 
 def resolve_ddp_plan(
     world: int,
     home: torch.device,
     batch_size: int,
-    visible_cuda_devices: Optional[Sequence[int]] = None,
+    visible_devices: Optional[Sequence[int]] = None,
     explicit_devices: Optional[Sequence] = None,
     vram_free_bytes: Optional[int] = None,
     mirror_footprint_bytes: Optional[int] = None,
@@ -87,9 +148,10 @@ def resolve_ddp_plan(
     """Pick mirror devices for ``world``-way data parallelism of one block.
 
     Rules (each demotion is recorded in ``notes``):
-    - world <= 1 or non-CUDA home -> disabled
-    - batch_size % world != 0 -> disabled (shard means must reproduce the
-      global mean exactly)
+    - world <= 1 or home not on a supported accelerator (cuda/xpu/hpu) -> disabled
+    - batch smaller than the world -> demote the world to the largest
+      power of two <= the batch (sum-reduced losses make uneven shards
+      exact); a batch of 1 runs serial (logged, not fatal)
     - explicit device list -> use as-is after the home (deduplicated)
     - otherwise home + next devices in ascending visible order
     - per-mirror VRAM guard: skip any device that cannot hold the mirror
@@ -98,20 +160,33 @@ def resolve_ddp_plan(
     notes: List[str] = []
     if world is None or world <= 1:
         return DDPPlan(1, [home], batch_size, notes)
-    if home.type != "cuda":
-        notes.append("home device is not CUDA")
+    if home.type not in _SUPPORTED_ACCEL_TYPES:
+        notes.append(f"home device {home} is not a supported accelerator ({'/'.join(_SUPPORTED_ACCEL_TYPES)})")
         return DDPPlan(1, [home], batch_size, notes)
     world = int(world)
-    if batch_size % world != 0:
-        notes.append(f"batch_size {batch_size} not divisible by world {world}")
-        return DDPPlan(1, [home], batch_size, notes)
+    if batch_size < world:
+        # sum-reduced losses make uneven shards exact, so the batch no longer
+        # needs to divide -- only the exchange world itself must stay a power
+        # of two, and a replica needs at least one sample. Cap the world by
+        # the batch; below two usable replicas the lane runs serial (logged,
+        # not fatal -- a tiny batch is a legitimate configuration)
+        _w = world
+        while _w > 1 and batch_size < _w:
+            _w //= 2
+        if _w < 2:
+            logger.info("[tune-ddp] batch %d too small for any power-of-two world; running serial", batch_size)
+            return DDPPlan(1, [home], batch_size, notes)
+        if _w < world:
+            notes.append(f"batch {batch_size} smaller than world {world}; demoted world to {_w}")
+            logger.info("[tune-ddp] %s", notes[-1])
+        world = _w
 
     if explicit_devices:
-        order = [_parse_device_token(str(d)) for d in explicit_devices]
-    elif visible_cuda_devices:
-        order = [torch.device("cuda", i) for i in sorted(visible_cuda_devices)]
+        order = [_parse_device_token(str(d), home.type) for d in explicit_devices]
+    elif visible_devices:
+        order = [torch.device(home.type, i) for i in sorted(visible_devices)]
     else:
-        order = [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
+        order = [torch.device(home.type, i) for i in range(_accel_device_count(home.type))]
 
     rotated = [home] + [d for d in order if d != home]
     devices: List[torch.device] = []
@@ -141,8 +216,8 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
 
     Single source of truth for engagement so the collection pass (composer) and
     the tune (quantizer) can never diverge: both check the same eligibility
-    (world env, CUDA home, no grad scaler, gradient_accumulate_steps=1,
-    no LFQ, list pools, not on the torchrun lane), price the same mirror
+    (world env, accelerator home, no grad scaler, no LFQ, list pools, not on
+    the torchrun lane), price the same mirror
     footprint, apply the same VRAM/explicit-device selection and the same
     power-of-two gate. The resolved plan is cached on the quantizer instance;
     the tune-side caller re-resolves post-wrap (exact wrapper pricing, fresh
@@ -162,24 +237,29 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
     if world is None:
         world = int(getattr(_envs, "AR_TUNE_DDP_WORLD", 1) or 1)
     home = torch.device(home) if not isinstance(home, torch.device) else home
-    if home.type == "cuda" and home.index is None:
-        home = torch.device("cuda", torch.cuda.current_device())
+    if home.type in _SUPPORTED_ACCEL_TYPES and home.index is None:
+        try:
+            _mod = getattr(torch, home.type, None)
+            _cur = getattr(_mod, "current_device", None)
+            home = torch.device(home.type, int(_cur()) if callable(_cur) else 0)
+        except Exception as e:  # backend module init can assert on builds without it
+            logger.debug("[tune-ddp] current-device probe for %s failed (%s); using index 0", home.type, e)
+            home = torch.device(home.type, 0)
     decline = []
     # NOTE: no iters gate -- the DDP world shards the sharded no-grad
     # collection passes at iters=0 exactly as at iters>0 (the 0-length tune
     # loop simply never runs); this restores the campaign semantics where the
     # env was never iters-gated
-    if world > 1 and home.type != "cuda":
-        decline.append(f"home device {home} is not CUDA")
+    if world > 1 and home.type not in _SUPPORTED_ACCEL_TYPES:
+        decline.append(f"home device {home} is not a supported accelerator ({'/'.join(_SUPPORTED_ACCEL_TYPES)})")
     # not every block quantizer family exposes _get_scaler (e.g. RTN /
     # OptimizedRTN); a missing method means "no scaler" for eligibility
     _scaler_fn = getattr(quantizer, "_get_scaler", None)
     _scaler = _scaler_fn() if callable(_scaler_fn) else None
     eligible = (
         world > 1
-        and home.type == "cuda"
+        and home.type in _SUPPORTED_ACCEL_TYPES
         and _scaler is None
-        and getattr(quantizer, "gradient_accumulate_steps", 1) == 1
         and not getattr(quantizer, "enable_lfq", False)
         and isinstance(fp_inputs, list)
         and (fp_outputs is None or isinstance(fp_outputs, list))
@@ -187,14 +267,31 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
     )
     if world > 1 and _scaler is not None:
         decline.append("a grad scaler is active")
-    if world > 1 and getattr(quantizer, "gradient_accumulate_steps", 1) != 1:
-        decline.append("gradient_accumulate_steps != 1")
     if world > 1 and getattr(quantizer, "enable_lfq", False):
         decline.append("enable_lfq")
+    if world > 1 and not isinstance(fp_inputs, list):
+        decline.append("non-list calibration inputs (diffusion-style pools)")
     if world > 1 and isinstance(fp_inputs, list) and fp_outputs is not None and not isinstance(fp_outputs, list):
         decline.append("non-list reference outputs (diffusion-style pools)")
     if world > 1 and is_distributed():
         decline.append("multi-process torchrun lane is active (AR_TUNE_DDP_WORLD is single-process)")
+    # Parallel tuning tunes whole-block mirrors: every replica, including the
+    # home copy, must sit on ONE device for the tune. A block whose weights
+    # span several devices of the home's accelerator type (multi-device auto
+    # placement) is a different topology (pipeline-style stages), so fail
+    # visibly instead of gathering: the placement itself must be single-device
+    # when parallel tuning runs. CPU-resident tensors are legal alongside the
+    # home device (pinned subtrees such as ngram embedding tables stay on CPU
+    # by design).
+    _home_span_devs = {p.device for p in block.parameters() if p.device.type == home.type}
+    if world > 1 and len(_home_span_devs) > 1:
+        decline.append(
+            f"block spans {len(_home_span_devs)} {home.type.upper()} devices; parallel tuning requires "
+            "single-device block placement (run with no --device_map or a single-device "
+            "--device_map; multi-device/auto maps may shard a block across GPUs -- or run "
+            "with --parallel_quantization off)"
+        )
+    eligible = eligible and len(_home_span_devs) <= 1
 
     plan = DDPPlan(1, [home], len(fp_inputs) if isinstance(fp_inputs, list) else 0)
     if eligible:
@@ -208,19 +305,30 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             if hasattr(_m, "orig_layer")
             for pp in _m.params.values()
         )
-        free = None
+        # charge the per-forward activation working set on top of the mirror:
+        # the existing estimator walks the block's real shapes at the
+        # per-forward batch (the serial micro-batch size -- replicas chunk
+        # their shards to it), so an activation-heavy block cannot silently
+        # pass a weights-only budget
         try:
-            free = {
-                torch.device("cuda", idx): torch.cuda.mem_get_info(idx)[0] for idx in range(torch.cuda.device_count())
-            }
-        except Exception as e:  # pragma: no cover - non-CUDA reachability
-            logger.warning("[tune-ddp] free-VRAM probe failed (%s); resolving the plan without VRAM filtering", e)
-            free = None
+            from auto_round.utils.device import estimate_tuning_block_mem
+
+            _per_fwd = min(int(batch_size), max(1, global_batch_size // max(1, world)))
+            _layer_mem, _act_mem, _io_mem, _add_mem = estimate_tuning_block_mem(block, fp_inputs, _per_fwd)
+            # ``_act_mem`` already sums the per-layer ``output_memory``
+            # (grad-doubled) with the MoE ratio applied -- do not re-sum the
+            # dict on top of it
+            _act_bytes = int((_act_mem + _io_mem + _add_mem) * 2**30)
+            mirror_bytes += _act_bytes
+        except Exception as e:  # pragma: no cover - estimator is best-effort
+            logger.info("[tune-ddp] activation pricing skipped (estimator failed: %s)", e)
+        free = _accel_free_bytes_map(home.type)
+        _n_devs = _accel_device_count(home.type)
         plan = resolve_ddp_plan(
             world,
             home,
             global_batch_size,
-            visible_cuda_devices=list(range(torch.cuda.device_count())) if free else None,
+            visible_devices=list(range(_n_devs)) if _n_devs else None,
             explicit_devices=explicit or None,
             vram_free_bytes=free,
             mirror_footprint_bytes=mirror_bytes,
@@ -259,46 +367,6 @@ def resolve_tune_ddp_plan_(quantizer, block, fp_inputs, fp_outputs, home, world=
             )
     quantizer._resolved_ddp_plan = plan
     return plan
-
-
-def gather_block_for_mirroring_(block, home: torch.device) -> bool:
-    """Gather a (possibly module-sharded) block whole onto ``home`` for DDP mirroring.
-
-    The data-driven multi-GPU lane shards a block's leaves across the device
-    list (``set_auto_device_map_for_block_with_tuning``), so the source block
-    may span several devices when the DDP plan resolves. Every replica --
-    including the home -- must sit whole on ONE device for the tune forward,
-    so the gather runs on the source block BEFORE the mirrors are built;
-    mirror fit has already been priced into the plan, so a block that fits a
-    mirror fits its home.
-
-    Preserves CPU-pinned / self-managed subtrees (e.g. ngram embedding
-    tables) and repoints the per-leaf ``tuning_device`` markers (plain
-    strings -- ``_relocate_params`` only sees ``torch.device`` attrs) so
-    wrapper input staging targets the gathered device instead of a stale
-    shard. Returns True when any state actually moved.
-    """
-    moved = False
-    devs = {p.device for p in block.parameters()}
-    if devs and devs != {home}:
-        logger.info(
-            "[tune-ddp] gathering block onto %s before mirroring (source spanned %d device(s): %s)",
-            home,
-            len(devs),
-            sorted(str(d) for d in devs),
-        )
-        from auto_round.utils.model import move_to_device_preserving_cpu_pinned
-
-        move_to_device_preserving_cpu_pinned(block, home)
-        moved = True
-    home_s = str(home)
-    for _n, m in block.named_modules():
-        td = getattr(m, "tuning_device", None)
-        if td is not None and str(td) != home_s:
-            m.tuning_device = home
-            moved = True
-    _relocate_params(block, home)
-    return moved
 
 
 def _relocate_params(module: torch.nn.Module, device: torch.device) -> None:
@@ -370,27 +438,10 @@ def _write_back_grads(buf: Optional[torch.Tensor], params: List[torch.nn.Paramet
         offset += n
 
 
-def _transport_segment(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype, transport: str) -> torch.Tensor:
-    """Move a peer's segment onto ``dev`` in the requested transport dtype.
+def _transport_segment(seg: torch.Tensor, dev: torch.device) -> torch.Tensor:
+    """Move a peer's segment onto ``dev`` (fp32 wire, lossless).
 
-    Transport ORDER matters: a combined ``.to(device, dtype)`` cross-device
-    copy casts on the SOURCE first and then memcpys -- with an fp32
-    destination the wire carried full fp32 bytes and the bf16 transport was
-    a no-op on payload (measured: bf16 allreduce time == fp32 on a
-    half-duplex-per-link fabric). Cast down on the source, move the reduced
-    bytes, cast back up on the receiver instead.
-
-    int8 uses symmetric per-segment scaling: one amax per exchanged segment
-    rides along as an fp32 scalar. The step size stays relative to the
-    segment max, and the averaged-gradient signs SignSGD consumes are only
-    perturbed inside a band far below typical |grad| magnitudes. All int8
-    arithmetic stays fp32: the first implementation routed the quantize /
-    dequantize through fp64, whose temporaries carry 2x fp32 traffic and
-    made the exchange SLOWER than plain fp32 wire (measured 360-390 ms vs
-    ~243 fp32 per tune iteration at world=4), on top of ~2.5 GB of extra
-    peak VRAM.
-
-    The wire hop itself uses non_blocking=True: the measured allreduce is
+    The wire hop uses non_blocking=True: the measured allreduce is
     payload-independent across fp32/bf16 (~243/~231 ms), i.e. dominated by
     the per-exchange HOST blocking of a synchronous copy rather than wire
     bytes. Cross-device copy_ is stream-ordered on both endpoints (it
@@ -399,39 +450,10 @@ def _transport_segment(seg: torch.Tensor, dev: torch.device, dtype: torch.dtype,
     current stream in issue order, so dropping the host block lets the
     exchange chain execute back-to-back on the GPUs without races.
     """
-    if transport == "fp32":
-        return seg.to(dev, non_blocking=True)
-    if transport == "bf16":
-        return seg.to(torch.bfloat16).to(dev, non_blocking=True).to(dtype)
-    if transport == "int8":
-        with torch.no_grad():
-            src = seg.detach()
-            amax = src.abs().amax()
-            inv = 127.0 / amax.clamp_min(torch.finfo(src.dtype).tiny)
-            q = torch.round(src * inv).clamp_(-127.0, 127.0).to(torch.int8)
-            q = q.to(dev, non_blocking=True)
-            scale = amax.to(dev, non_blocking=True) / 127.0
-            return q.to(dtype).mul_(scale)
-    raise ValueError(f"unknown gradient transport {transport!r} (fp32|bf16|int8)")
+    return seg.to(dev, non_blocking=True)
 
 
-def _encode_transport(t: torch.Tensor, transport: str):
-    """Encode a gradient tensor for wire transport.
-
-    Returns ``(payload, meta)``: the wire tensor (int8 / bfloat16 / fp32) and
-    the int8 per-bucket amax scalar (``None`` for fp32 / bf16). fp32 returns
-    the tensor itself (read-only alias -- callers must not mutate it).
-    """
-    if transport == "int8":
-        amax = t.abs().amax()
-        inv = 127.0 / amax.clamp_min(torch.finfo(t.dtype).tiny)
-        return torch.round(t * inv).clamp_(-127.0, 127.0).to(torch.int8), amax
-    if transport == "bf16":
-        return t.to(torch.bfloat16), None
-    return t, None
-
-
-def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, transport: str = "fp32") -> None:
+def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0) -> None:
     """In-place all-reduce across device-resident buffers (single process).
 
     Chunked recursive halving-doubling: the flat space is split into W
@@ -440,10 +462,8 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
     the all-gather phase re-exchanges owned chunks until every rank holds
     the fully reduced buffer. Per-rank traffic is 2*(W-1)/W*bytes, same as a
     ring. Cross-device ``to()`` copies use P2P when available. ``scale`` is
-    applied at the end (pass ``1/world`` to average). ``transport`` selects
-    the exchange dtype: fp32 (exact), bf16 (half wire bytes) or int8
-    (quarter wire bytes, symmetric per-segment amax scaling); accumulation
-    stays fp32. Requires a power-of-two world (the resolver guarantees it).
+    applied at the end (pass ``1/world`` to average). Requires a
+    power-of-two world (the resolver guarantees it).
     """
     world = len(buffers)
     if world < 2:
@@ -456,19 +476,19 @@ def halving_doubling_allreduce(buffers: List[torch.Tensor], scale: float = 1.0, 
     numel = buffers[0].numel()
     chunk = (numel + world - 1) // world
 
-    _reduce_scatter_halving(buffers, transport)
-    _allgather_doubling(buffers, transport)
+    _reduce_scatter_halving(buffers)
+    _allgather_doubling(buffers)
 
     for buf in buffers:
         buf.mul_(scale)
 
 
-def _reduce_scatter_halving(buffers: List[torch.Tensor], transport: str) -> None:
+def _reduce_scatter_halving(buffers: List[torch.Tensor]) -> None:
     """Recursive-halving reduce-scatter across device-resident buffers.
 
     The flat space is split into W chunks; the working block per rank halves
-    each step (each rank keeps one half, adding the partner's transport-
-    rounded copy of it). Rank r ends up owning reduced chunk r; the other
+    each step (each rank keeps one half, adding the partner's copy of
+    it). Rank r ends up owning reduced chunk r; the other
     chunks hold partial garbage. Accumulation stays fp32 on the receiver.
     Requires a power-of-two world.
     """
@@ -484,24 +504,24 @@ def _reduce_scatter_halving(buffers: List[torch.Tensor], transport: str) -> None
             if rank % length < half:
                 partner = rank + half  # keep [base, mid)
                 seg = buffers[partner][chunk * base : chunk * mid]
-                seg = _transport_segment(seg, buffers[rank].device, buffers[rank].dtype, transport)
+                seg = _transport_segment(seg, buffers[rank].device)
                 buffers[rank][chunk * base : chunk * mid].add_(seg)
             else:
                 partner = rank - half  # keep [mid, hi)
                 seg = buffers[partner][chunk * mid : chunk * hi]
-                seg = _transport_segment(seg, buffers[rank].device, buffers[rank].dtype, transport)
+                seg = _transport_segment(seg, buffers[rank].device)
                 buffers[rank][chunk * mid : chunk * hi].add_(seg)
         length = half
 
 
-def _allgather_doubling(buffers: List[torch.Tensor], transport: str) -> None:
+def _allgather_doubling(buffers: List[torch.Tensor]) -> None:
     """Recursive-doubling all-gather of per-rank owned chunks.
 
     Mirrors the reduce-scatter block structure: the working block per rank
     doubles each step; ranks exchange the chunks the partner owns (copies,
-    no adds). Every rank ends holding every chunk -- bitwise identical when
-    the transport is lossless for the buffer dtype (fp32 buffers with fp32
-    transport, int8 buffers with fp32 transport).
+    no adds). Every rank ends holding every chunk -- bitwise identical
+    (same-device fp32 copies for gradient buffers, plain int8 copies for
+    the sign buffers).
     """
     world = len(buffers)
     numel = buffers[0].numel()
@@ -516,33 +536,31 @@ def _allgather_doubling(buffers: List[torch.Tensor], transport: str) -> None:
                 partner = rank + half
                 src = buffers[partner][chunk * mid : chunk * hi]
                 dst = buffers[rank][chunk * mid : chunk * hi]
-                dst.copy_(_transport_segment(src, dst.device, dst.dtype, transport))
+                dst.copy_(_transport_segment(src, dst.device))
             else:
                 partner = rank - half
                 src = buffers[partner][chunk * base : chunk * mid]
                 dst = buffers[rank][chunk * base : chunk * mid]
-                dst.copy_(_transport_segment(src, dst.device, dst.dtype, transport))
+                dst.copy_(_transport_segment(src, dst.device))
         length *= 2
 
 
 _SIGN_LOGGED = False
+_FULLVALUE_LOGGED = False
 _ENGAGED_LOGGED_SIG = None  # module-level init for the global read in resolve_tune_ddp_plan_
 
 
-def sign_exchange_allreduce(buffers: List[torch.Tensor], transport: str = "fp32") -> None:
+def sign_exchange_allreduce(buffers: List[torch.Tensor]) -> None:
     """In-place sign all-reduce for SignSGD gradients (single process).
 
     The SignRound optimizer consumes ONLY torch.sign(grad) (weight_decay is
     always 0), so the averaged gradient's magnitude never reaches the
     update. This exchanges exactly what the step needs: a recursive-halving
-    reduce-scatter (identical transport rounding of the partials as
-    halving-doubling) leaves rank r owning the reduced chunk r; each rank
+    reduce-scatter leaves rank r owning the reduced chunk r; each rank
     then computes torch.sign() ONCE on its exact fp32 chunk and the signs
     are all-gathered as int8 -- a lossless wire format 4x smaller than
-    fp32. Compared to a full halving-doubling allreduce this REMOVES the
-    all-gather's transport rounding (bf16 rounding can zero out tiny
-    averaged gradients, losing their sign), so the signs every rank applies
-    are bitwise identical and at least as faithful to the true fp32 mean.
+    fp32. The signs every rank applies are bitwise identical and exactly
+    faithful to the true fp32 mean.
 
     Valid only when the optimizer is pure sign-SGD: a momentum buffer or
     weight decay would mix magnitudes back into the update, so callers must
@@ -556,7 +574,7 @@ def sign_exchange_allreduce(buffers: List[torch.Tensor], transport: str = "fp32"
     if world & (world - 1):
         raise ValueError(f"sign_exchange_allreduce needs a power-of-two world, got {world}")
 
-    _reduce_scatter_halving(buffers, transport)
+    _reduce_scatter_halving(buffers)
 
     numel = buffers[0].numel()
     chunk = (numel + world - 1) // world
@@ -567,8 +585,8 @@ def sign_exchange_allreduce(buffers: List[torch.Tensor], transport: str = "fp32"
         signs[lo:hi] = torch.sign(buf[lo:hi]).to(torch.int8)
         sign_bufs.append(signs)
 
-    # fp32 transport on int8 buffers = plain device copies, lossless
-    _allgather_doubling(sign_bufs, "fp32")
+    # int8 payload over plain device copies, lossless
+    _allgather_doubling(sign_bufs)
 
     for buf, signs in zip(buffers, sign_bufs):
         buf.copy_(signs)  # int8 -> fp32: -1.0 / 0.0 / 1.0
@@ -580,6 +598,90 @@ _MERGEABLE_STATS = {
     "imatrix": "sum",  # module.imatrix += sum(x^2) per shard
     "act_max": "max",  # element-wise running max
 }
+
+
+def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device], collect: bool = False):
+    """Shard a no-grad per-item evaluation across ``devices`` and sum-merge.
+
+    The no-grad search seam (published as the engine's shard-and-reduce):
+    ``items`` is a list of per-sample payloads the algorithm owns;
+    ``per_replica_fn(replica_block, remap, items_slice)`` returns a 1-D
+    tensor of partial sums for its contiguous slice (any length, identical
+    across replicas), or -- with ``collect=True`` -- a list with one result
+    per item of its slice (map semantics; the results concatenate in shard
+    order). Every shard -- including the home slot -- runs on its
+    OWN deepcopy of the block, because search evaluations may mutate replica
+    weights in place (AWQ's grid walk writes quantized candidates); mirrors
+    die afterwards, so home state is never touched. ``remap(home_module)``
+    resolves the replica's counterpart of an in-block module (name-based),
+    and hands the module itself back for anything outside the block.
+
+    The split tolerates leftovers: sum-merging is partition-invariant, so
+    shards are contiguous ceil/floor slices (a remainder call simply lands
+    on an earlier replica and the wall is the largest slice) -- no
+    divisibility requirement and no sample is ever dropped.
+    Returns the summed tensor on the home device, or ``None`` when the
+    evaluation cannot shard (fewer than two usable replicas) -- callers
+    fall back to the serial loop unchanged.
+    """
+    world = max(1, min(len(devices), len(items)))
+    n = len(items)
+    if len(devices) < 2 or world < 2:
+        return None
+    home_dev = _block_device(block)
+
+    _t_mirrors = _ptime.perf_counter()
+    names = list(name for name, _ in block.named_modules())
+    devices = list(devices)[:world]
+    copies: List[torch.nn.Module] = []
+    for dev in devices:
+        rep = copy.deepcopy(block)
+        if _block_device(rep) != dev:
+            _relocate_params(rep, dev)
+            rep = rep.to(dev)
+        copies.append(rep)
+    # contiguous ceil/floor slices: the first (n % world) replicas take one
+    # extra item, keeping every item and preserving order
+    bounds = contiguous_shard_bounds(n, world)
+
+    _mb = sum(p.numel() * p.element_size() for p in copies[0].parameters())
+    logger.debug(
+        "[tune-ddp] sharded search: world=%d items=%d mirror=%dB/device setup=%.0fms",
+        world,
+        n,
+        _mb,
+        (_ptime.perf_counter() - _t_mirrors) * 1000,
+    )
+    results: List[Optional[Any]] = [None] * world
+
+    def _run(r):
+        rep = copies[r]
+        lookup = {name: rep.get_submodule(name) for name in names}
+
+        def remap(home_module):
+            for name, m in block.named_modules():
+                if m is home_module:
+                    return lookup[name]
+            return home_module  # outside the block: shared, caller gated
+
+        # no-grad seam: grad mode is thread-local, so an outer no_grad
+        # never reaches these spawn workers -- wrap here or every forward
+        # builds a retained graph (n_grid x activation VRAM on paths
+        # that never froze params, e.g. the single-block quantize)
+        with torch.no_grad():
+            results[r] = per_replica_fn(rep, remap, items[bounds[r] : bounds[r + 1]])
+
+    run_threaded_spawn([lambda r=r: _run(r) for r in range(world)])
+    if any(res is None for res in results):
+        return None
+    if collect:
+        # map semantics: per-item results, concatenated in shard order -- no
+        # merge (each item's answer is independent, e.g. a per-module search)
+        return [res for chunk in results for res in chunk]
+    merged = results[0].to(home_dev)
+    for res in results[1:]:
+        merged = merged + res.to(home_dev)
+    return merged
 
 
 def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -> None:
@@ -615,7 +717,6 @@ def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -
 
 
 _pool_move_warned: set = set()
-_coll_mirror_setup_logged: set = set()
 
 
 def expect_pool_local(pieces, device, site: str) -> None:
@@ -645,23 +746,24 @@ def expect_pool_local(pieces, device, site: str) -> None:
 def distribute_pool(pool: List[torch.Tensor], devices: List[torch.device]) -> None:
     """Scatter a per-sample calibration pool across ``devices`` (in place).
 
-    Device r owns samples [r*shard, (r+1)*shard) -- the same boundaries the
-    DDP tune shards and the sharded collection use -- so shard-local reads
-    (ref_r build, _select_batch for shard r, per-replica collections) never
-    cross devices. Pieces already on their target device are untouched
-    (idempotent; a pool produced by the previous block's sharded collection
-    on the same group costs nothing). Pools smaller than / indivisible by
-    the world are left alone (serial consumers handle them via move-on-demand
-    cats).
+    Device r owns its contiguous ceil/floor slice -- the same boundaries the
+    sharded collection split uses -- so shard-local reads (ref_r build,
+    _select_batch for shard r, per-replica collections) never cross devices.
+    Pieces already on their target device are untouched (idempotent; a pool
+    produced by the previous block's sharded collection on the same group
+    costs nothing). Pools smaller than the world are left alone (serial
+    consumers handle them via move-on-demand cats).
     """
     n = len(pool)
     world = len(devices)
-    if world < 2 or n < world or n % world != 0:
+    if world < 2 or n < world:
         return
-    shard = n // world
+    # ceil/floor boundaries matching the sharded collection split, so pool
+    # placement and shard reads stay aligned for any sample count
+    bounds = contiguous_shard_bounds(n, world)
     for r, dev in enumerate(devices):
         dev = torch.device(dev)
-        for i in range(r * shard, (r + 1) * shard):
+        for i in range(bounds[r], bounds[r + 1]):
             if pool[i].device != dev:
                 pool[i] = pool[i].to(dev)
 
@@ -676,6 +778,7 @@ def sharded_nograd_forward(
     sample_count: Optional[int] = None,
     merge_stats: bool = False,
     max_devices: int = 0,
+    stats: Optional[dict] = None,
 ):
     """Parallelize a no-grad collection forward across ``devices``.
 
@@ -687,12 +790,13 @@ def sharded_nograd_forward(
 
     The collection passes (reference outputs, quantized-output cascade) are
     plain forwards over the whole sample pool on one GPU while the mirrors
-    idle. Here the pool is split into equal disjoint shards; an ephemeral
-    copy of the block on each device forwards its shard in a parallel thread;
-    per-shard outputs are parked on ``out_device`` and concatenated in order.
-    Bit-identical to the serial pass: rows are sample-independent and the
-    module copies carry identical weights. Falls back to the serial runner
-    call when the pool is not divisible or fewer than two devices are given.
+    idle. Here the pool is split into contiguous ceil/floor shards; an
+    ephemeral copy of the block on each device forwards its shard in a
+    parallel thread; per-shard outputs are parked on ``out_device`` and
+    concatenated in order. Bit-identical to the serial pass: rows are
+    sample-independent and the module copies carry identical weights. Falls
+    back to the serial runner call for fewer than two devices (any sample
+    count shards -- a remainder lands on an earlier replica).
     Mirrors are dropped (freed) afterwards. Returned pieces stay on the
     device that computed them (distributed pool); consumers either read
     shard-locally or use device-safe cats.
@@ -707,10 +811,15 @@ def sharded_nograd_forward(
         )
         devices = list(devices)[:max_devices]
         world = max_devices
-    if world < 2 or n < world or n % world != 0:
+    # ceil/floor contiguous split (same tolerance the search seam applies):
+    # any sample count shards -- a remainder lands on an earlier replica and
+    # the wall is the largest slice; nothing is dropped or run serially
+    world = max(1, min(world, n))
+    if len(devices) < 2 or world < 2:
         return runner(block, inputs, input_others, cache_device=out_device)
-    shard = n // world
-    shards = [list(range(r * shard, (r + 1) * shard)) for r in range(world)]
+    devices = list(devices)[:world]
+    bounds = contiguous_shard_bounds(n, world)
+    shards = [list(range(bounds[r], bounds[r + 1])) for r in range(world)]
     # the input pool typically arrives pooled on the primary device; without
     # re-placement every shard pulls its pieces cross-device from that ONE
     # source -- measured at world=8: uniformly 2.3-2.8 s of shard-forward
@@ -725,9 +834,8 @@ def sharded_nograd_forward(
         and (sample_count is None or sample_count == len(inputs))
     ):
         distribute_pool(inputs, devices)
-    import time as _time
 
-    _t_mirrors = _time.perf_counter()
+    _t_mirrors = _ptime.perf_counter()
     home_dev = _block_device(block)
     mirrors: List[torch.nn.Module] = []
     reps: List[torch.nn.Module] = []
@@ -740,18 +848,11 @@ def sharded_nograd_forward(
             _relocate_params(m, dev)
             reps.append(m)
             mirrors.append(m)
-    global _coll_mirror_setup_logged
-    if world > 1 and "_coll" not in _coll_mirror_setup_logged:
-        _coll_mirror_setup_logged.add("_coll")
-        from auto_round import envs as _penvs
-
-        _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
-        _pl(
-            "[tune-ddp] collection mirror setup: %.0f ms per pass (world=%d) -- included in ref_collect/post_collect",
-            (_time.perf_counter() - _t_mirrors) * 1000,
-            world,
-        )
-    _t_setup_ms = (_time.perf_counter() - _t_mirrors) * 1000
+    _t_setup_ms = (_ptime.perf_counter() - _t_mirrors) * 1000
+    if stats is not None and world > 1:
+        # per-block perf rollup: the [perf] block line reports the mirror
+        # setup wall inside its collect figure instead of a separate line
+        stats[MIRROR_SETUP_MS_KEY] = stats.get(MIRROR_SETUP_MS_KEY, 0.0) + _t_setup_ms
     parts: List = [None] * world
     fwd_walls = [0.0] * world  # per-thread stores at distinct indices: race-free
     evs: List = [None] * world
@@ -759,7 +860,7 @@ def sharded_nograd_forward(
     def _run(r):
         rep = reps[r]
         dev_r = _block_device(rep)
-        t_r = _time.perf_counter()
+        t_r = _ptime.perf_counter()
         ev = None
         if dev_r.type == "cuda":
             ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -774,7 +875,7 @@ def sharded_nograd_forward(
         if ev is not None:
             ev[1].record()
             evs[r] = ev
-        fwd_walls[r] = (_time.perf_counter() - t_r) * 1000
+        fwd_walls[r] = (_ptime.perf_counter() - t_r) * 1000
 
     # spawn path, not the ReplicaGroup pool: this bare helper instance has no
     # lifecycle and would leak pool workers (collection passes are twice per
@@ -791,7 +892,7 @@ def sharded_nograd_forward(
             except RuntimeError as e:  # a broken pair must never kill the pass
                 logger.warning_once("[perf] sharded-collect GPU wall unavailable for a pair (%s)", e)
                 fwd_gpu[r] = float("nan")
-    _t_split = _time.perf_counter()
+    _t_split = _ptime.perf_counter()
     # Return the SERIAL structure: a per-sample list ([1, S, H] pieces from
     # split_outputs), NOT one flat/batched tensor -- downstream consumers cat
     # per-sample refs along dim 0 (tune loss) and iterate the list for the
@@ -804,7 +905,7 @@ def sharded_nograd_forward(
     # shard's rows); the serial text path leaves it unset so callers fall back
     # to the returned list -- clear the residue to keep that contract.
     runner.last_output_dict = None
-    _t_merge = _time.perf_counter()
+    _t_merge = _ptime.perf_counter()
     if merge_stats:
         _merge_mirror_stats(block, mirrors)
     mirrors.clear()  # drop mirror refs; the caching allocator reclaims them
@@ -832,7 +933,7 @@ def sharded_nograd_forward(
         _gpus[len(_gpus) // 2],
         _gpus[-1],
         (_t_merge - _t_split) * 1000,
-        (_time.perf_counter() - _t_merge) * 1000,
+        (_ptime.perf_counter() - _t_merge) * 1000,
     )
     return pieces
 
@@ -1059,9 +1160,8 @@ def _enforce_mirror_device_(mirror: torch.nn.Module, dev: torch.device) -> List[
 class ReplicaGroup:
     """Persistent mirrors of a wrapped block for the iteration loop."""
 
-    def __init__(self, block, plan: DDPPlan, grad_transport: str = "bf16") -> None:
+    def __init__(self, block, plan: DDPPlan) -> None:
         self.plan = plan
-        self.grad_transport = grad_transport
         self.home = block
         self.mirrors: List[torch.nn.Module] = []
         for dev in plan.devices[1:]:  # plan.devices[0] is the home by construction
@@ -1131,18 +1231,26 @@ class ReplicaGroup:
             )
             return
         with _stage(prof, "exchange"):
+            # the algorithm states the exchange property (sign_exchange is
+            # gated to pure sign-SGD at the caller); no env override exists
             if sign_exchange:
                 global _SIGN_LOGGED
                 if not _SIGN_LOGGED:
                     _SIGN_LOGGED = True
                     logger.info(
-                        "[tune-ddp] sign-cast exchange engaged: world=%d transport=%s (int8 sign allgather)",
+                        "[tune-ddp] sign-cast exchange engaged: world=%d (int8 sign allgather)",
                         self.world,
-                        self.grad_transport,
                     )
-                sign_exchange_allreduce(bufs, transport=self.grad_transport)
+                sign_exchange_allreduce(bufs)
             else:
-                halving_doubling_allreduce(bufs, scale=1.0 / self.world, transport=self.grad_transport)
+                global _FULLVALUE_LOGGED
+                if not _FULLVALUE_LOGGED:
+                    _FULLVALUE_LOGGED = True
+                    logger.info(
+                        "[tune-ddp] full-value gradient exchange: world=%d (fp32, momentum enabled)",
+                        self.world,
+                    )
+                halving_doubling_allreduce(bufs, scale=1.0 / self.world)
         with _stage(prof, "writeback"):
             for buf, params in zip(bufs, params_per_replica):
                 _write_back_grads(buf, params)

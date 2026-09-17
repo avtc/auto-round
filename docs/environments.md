@@ -141,23 +141,38 @@ export AR_DYNAMO_CACHE_SIZE_LIMIT=32
 export AR_MODEL_FREE_SHARD_PARALLELISM=4
 ```
 
-#- `AR_PERF_COUNTERS` (default off): emit `[perf]` phase-breakdown log lines -- per-block
+### AR_PERF_COUNTERS
+- **Description**: Emit `[perf]` phase-breakdown log lines -- per-block
   `load/tune/pack/write/clean/offload` in the data-driven loop and per-block
   `mirrors/warmup/fwd/bwd/exch/step/teardown` for `--parallel_quantization` tuning.
+- **Default**: off
+
+### AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES
+- **Description**: Max mirror devices running a hook-carrying collection forward at once (e.g. AWQ
+  activation statistics, imatrix/act-max passes) under `--parallel_quantization`. The default applies
+  no cap; lower this (e.g. `4`) only on hosts where hook-carrying passes convoy on the GIL with many
+  mirror threads. Tune-loop replicas and search sharding are never affected.
+- **Default**: `0` (no cap)
+- **Valid Values**: non-negative integer
+
+```bash
+export AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES=8
+```
+
+### AR_TUNE_DDP_WORLD
+- **Description**: Internal override of the `--parallel_quantization` world size (the CLI flag is
+  the supported interface). The requested world is a hard requirement: an infeasible request stops
+  with a `RuntimeError` naming the blocking condition rather than silently running serial.
+- **Default**: unset → derived from `--parallel_quantization`
+- **Valid Values**: positive integer
+
+```bash
+export AR_TUNE_DDP_WORLD=4
+```
 
 ### AR_TUNE_DDP_DEVICES
 - **Description**: Optional explicit comma-separated replica devices (e.g. `0,1,2,3`) for
-  `--parallel_quantization` tuning. By default the plan picks from the visible CUDA devices with enough free
-  VRAM for a mirror; each replica holds a full block mirror on its plan device and draws a disjoint calibration
-  shard, so the effective batch matches the serial run's data coverage.
-- **Default**: unset → plan-derived
-- **Valid Values**: comma-separated device indices
-
-```bash
-export AR_TUNE_DDP_DEVICES=0,1,2,3
-```### AR_TUNE_DDP_DEVICES
-- **Description**: Optional explicit comma-separated replica devices (e.g. `0,1,2,3`) for
-  `--parallel_quantization` tuning. By default the plan picks from the visible CUDA devices with enough free
+  `--parallel_quantization` tuning. By default the plan picks from the visible accelerator devices (cuda/xpu/hpu) with enough free
   VRAM for a mirror; each replica holds a full block mirror on its plan device and draws a disjoint calibration
   shard, so the effective batch matches the serial run's data coverage.
 - **Default**: unset → plan-derived

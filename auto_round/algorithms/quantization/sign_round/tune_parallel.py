@@ -39,12 +39,13 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
+from auto_round import envs
 from auto_round.algorithms.quantization.sign_round.data_parallel import (
     ReplicaGroup,
     block_has_tuning_entries,
+    contiguous_shard_bounds,
     distribute_pool,
     expect_pool_local,
-    gather_block_for_mirroring_,
     pre_wrap_shard_candidate,
     resolve_tune_ddp_plan_,
     run_deferred_wrap_searches,
@@ -92,6 +93,8 @@ class TuneParallelContext:
     def __init__(self) -> None:
         # collection flavor
         self.devices: Optional[List[torch.device]] = None
+        # per-block rollup sink for the collection passes (mirror setup etc.)
+        self.collect_stats: dict = {}
         # tune flavor
         self.group: Optional[ReplicaGroup] = None
         self.plan: Any = None
@@ -181,9 +184,9 @@ class TuneParallelContext:
         Mergeable stats (imatrix, act_max) are folded from the mirrors back
         into the home, so those hook passes may shard.
 
-        ``hook_pass=True`` caps the concurrent shards at 4: forward hooks
-        force dynamo graph breaks, leaving the compiled runner as
-        python-bound eager sections that GIL-convoy under many threads.
+        ``hook_pass=True`` may additionally cap the concurrent shards via
+        ``AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES`` (default: no cap) on
+        hosts where hooked compiled passes GIL-convoy under many threads.
         """
         if self.devices is None or not allow_shard:
             return block_forward(block, inputs, input_others, cache_device=out_dev)
@@ -195,8 +198,42 @@ class TuneParallelContext:
             out_dev,
             self.devices,
             merge_stats=True,
-            max_devices=4 if hook_pass else 0,
+            max_devices=(int(envs.AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES) if hook_pass else 0),
+            stats=self.collect_stats,
         )
+
+    def reduce(self, block, per_replica_fn, items, op: str = "sum") -> Optional[torch.Tensor]:
+        """Shard-and-reduce a no-grad search evaluation over the lane devices.
+
+        The no-grad search seam: ``per_replica_fn(replica, remap, items_slice)``
+        returns a 1-D tensor of partial sums for its slice and the engine sums
+        the partials on the home device (``op="sum"`` is the only merge today:
+        every sharded search is an additive statistic). Returns ``None`` when
+        the lane is not engaged or fewer than two items remain -- the caller keeps
+        its serial loop. Evaluations run on per-shard deepcopies, so in-place
+        candidate writes (AWQ's grid walk) never touch home state.
+        """
+        if self.devices is None or op != "sum":
+            return None
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_map_reduce
+
+        return sharded_map_reduce(block, per_replica_fn, items, self.devices)
+
+    def map(self, block, per_replica_fn, items) -> Optional[list]:
+        """Shard independent per-item evaluations over the lane devices.
+
+        The map side of the seam: ``per_replica_fn(replica, remap, items_slice)``
+        returns one result per item of its slice and the engine concatenates
+        the results in shard order (no merge -- each item is independent,
+        e.g. a per-module clip search). Returns ``None`` when the lane is not
+        engaged or fewer than two items can shard -- the caller keeps its
+        serial loop.
+        """
+        if self.devices is None:
+            return None
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_map_reduce
+
+        return sharded_map_reduce(block, per_replica_fn, items, self.devices, collect=True)
 
     # ── P1: tune phase (quantizer-owned) ─────────────────────────────────────
 
@@ -248,9 +285,10 @@ class TuneParallelContext:
             logger.info("[tune-ddp] declining: no tuning parameters in this block (all-float pinned); serial path")
             return None
 
-        # the source block must sit whole on the home device before
-        # mirroring (data-driven multi-GPU may have sharded its leaves)
-        gather_block_for_mirroring_(block, plan.devices[0])
+        # Placement contract: the resolver declined (or raised) when the
+        # block's weights span several accelerator devices, so the source
+        # block already sits whole on the home device and every mirror will
+        # sit whole on exactly one device.
         # distributed calibration pool: shard-local tune reads; each
         # device owns a contiguous 1/world slice of the samples
         distribute_pool(active_inputs, plan.devices)
@@ -330,12 +368,13 @@ class TuneParallelContext:
         quantizer = self.quantizer
         try:
             _t0 = _ptime.perf_counter()
-            _pool_shard = max(1, self.nsamples // self.group.world)
+            # shared ceil/floor bounds (must match distribute_pool's slices)
+            _bounds = contiguous_shard_bounds(self.nsamples, self.group.world)
             for r, rep in enumerate(self.group.replicas):
                 # warm only one batch's worth (shard_size samples) at the
                 # head of this replica's pool shard -- warming the whole
                 # shard would materialize its full activations on the mirror
-                _warm = list(range(r * _pool_shard, r * _pool_shard + self.plan.shard_size))
+                _warm = list(range(_bounds[r], min(_bounds[r] + self.plan.shard_size, _bounds[r + 1])))
                 _dev_r = next(rep.parameters()).device
                 with _device_scope(_dev_r):
                     step_fn(rep, _warm, _dev_r, _StepRecord())
@@ -403,10 +442,28 @@ class TuneParallelContext:
             pass
 
     def shards(self, nsamples: int, global_batch_size: int) -> None:
-        """Build per-replica shard samplers when the global batch splits
-        evenly across the world (else the loop falls back to index slicing)."""
-        if self.group is not None and global_batch_size % self.group.world == 0:
-            self._samplers = shard_samplers(nsamples, self.group.world, global_batch_size // self.group.world)
+        """Build per-replica shard samplers when the global batch and the
+        sample pool both split evenly across the world (else the loop falls
+        back to global draws + index slicing, with a warn-once note)."""
+        self._samplers = None
+        if self.group is not None and self.group.world > 1:
+            if global_batch_size % self.group.world == 0:
+                self._samplers = shard_samplers(nsamples, self.group.world, global_batch_size // self.group.world)
+            if self._samplers is None:
+                # pool-aligned samplers cannot be built (indivisible global
+                # batch or pool), so the loop falls back to a global shuffled
+                # draw -- every iteration then pays cross-device pool reads in
+                # the replicas. Perf-only (grads are exchanged globally
+                # either way); warn once per context.
+                if not getattr(self, "_uneven_sampler_warned", False):
+                    self._uneven_sampler_warned = True
+                    logger.info(
+                        "[tune-ddp] pool-aligned samplers unavailable (nsamples=%d, global batch %d, world %d): "
+                        "using the global sampler (cross-device pool reads per iteration)",
+                        nsamples,
+                        global_batch_size,
+                        self.group.world,
+                    )
 
     def next_shards(self, index_sampler) -> Tuple[List[List[int]], List[int]]:
         """Draw the next global batch and split it into per-replica shards.
@@ -418,8 +475,13 @@ class TuneParallelContext:
             global_indices = [j for sh in shards for j in sh]
             return shards, global_indices
         global_indices = index_sampler.next_batch()
-        _shard = len(global_indices) // self.group.world
-        shards = [global_indices[r * _shard : (r + 1) * _shard] for r in range(self.group.world)]
+        n = len(global_indices)
+        world = self.group.world
+        # ceil/floor split: sum-reduced losses make uneven shards exact, so
+        # any global batch size shards -- a remainder sample lands on an
+        # earlier replica and every sample is kept
+        bounds = contiguous_shard_bounds(n, world)
+        shards = [global_indices[bounds[r] : bounds[r + 1]] for r in range(world)]
         return shards, global_indices
 
     def run_step(self, step_fn: Callable, shards: Sequence[Sequence[int]]) -> List[Optional[torch.Tensor]]:
@@ -469,12 +531,17 @@ class TuneParallelContext:
         self.perf["exch"].append(_ptime.perf_counter() - _t0)
         self._pending_sync = False
 
-    def mean_loss(self, losses: Sequence[Optional[torch.Tensor]], num_elm) -> float:
-        """Report the global-batch mean (mean of equal-size shard means ==
-        the serial global mean), normalized by the valid-element count
-        exactly like the serial path."""
+    def mean_loss(self, losses: Sequence[Optional[torch.Tensor]], num_elm, divide_world: bool = True) -> float:
+        """Report the global-batch loss normalized by the valid-element count
+        exactly like the serial path.
+
+        ``divide_world=True`` for mean-reduced per-shard losses (mean of
+        equal-size shard means == the serial global mean); ``False`` for
+        sum-reduced per-shard losses (gradient accumulation): the shard sums
+        add up to the serial global sum, so only the element count divides."""
         _ne = 1 if num_elm <= 0 else num_elm
-        return sum(l.item() for l in losses if l is not None) / self.group.world / _ne
+        total = sum(l.item() for l in losses if l is not None)
+        return total / self.group.world / _ne if divide_world else total / _ne
 
     def step(self, home_step_fn: Callable[[], None]) -> None:
         """Run the home step and every mirror step in parallel threads (home
