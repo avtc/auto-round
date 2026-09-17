@@ -574,20 +574,32 @@ class TestHookPassCompileToggle:
 
     def test_compile_toggle_uses_raw_forward(self, monkeypatch):
         import auto_round.algorithms.quantization.sign_round.tune_parallel as tp
-        from auto_round import envs as envs_mod
 
         calls = []
 
         class _Runner:
+            """Real-view-shaped fake: uncompiled_view() flips a thread-local."""
+
             def __init__(self):
-                self._raw_block_forward = self._raw
+                import threading
 
-            def _raw(self, block, inputs, others, **kw):
-                calls.append("raw")
-                return [inputs[0]]
+                self._use_raw_inner = threading.local()
 
-            def __call__(self, block, inputs, others, **kw):
-                calls.append("compiled")
+            def uncompiled_view(self):
+                runner = self
+
+                class _View:
+                    def __call__(self, *args, **kwargs):
+                        runner._use_raw_inner.on = True
+                        try:
+                            return runner(*args, **kwargs)
+                        finally:
+                            runner._use_raw_inner.on = False
+
+                return _View()
+
+            def __call__(self, block, inputs, others, cache_device=None, **kw):
+                calls.append("raw" if getattr(self._use_raw_inner, "on", False) else "compiled")
                 return [inputs[0]]
 
         ctx = TuneParallelContext()
@@ -601,7 +613,7 @@ class TestHookPassCompileToggle:
         ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=True)
         assert calls == ["compiled"]
 
-        # opt-out: hook pass rides the raw forward; hookless stays compiled
+        # opt-out: hook pass rides the view; hookless stays compiled
         calls.clear()
         monkeypatch.setenv("AR_TUNE_DDP_HOOK_PASS_COMPILE", "0")
         ctx.collect_forward(_Runner(), block, inputs, {}, hook_pass=True)
