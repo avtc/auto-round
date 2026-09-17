@@ -31,7 +31,7 @@ import copy
 import queue
 import threading
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -636,7 +636,7 @@ def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]
         _mb,
         (_stime.perf_counter() - _t_mirrors) * 1000,
     )
-    results: List[Optional[torch.Tensor]] = [None] * world
+    results: List[Optional[Any]] = [None] * world
 
     def _run(r):
         rep = copies[r]
