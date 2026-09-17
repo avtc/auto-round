@@ -293,6 +293,7 @@ class TestGridSplitPerfLine:
         records = next(gen)
         try:
             prev = getattr(envs, "AR_PERF_COUNTERS", False)
+            had_attr = "AR_PERF_COUNTERS" in vars(envs)
             envs.AR_PERF_COUNTERS = False
             _run_search(tr, block, mapping, x_mean, _make_calls(block))
             assert not any("awq grid split" in r for r in records)
@@ -305,7 +306,11 @@ class TestGridSplitPerfLine:
             for key in ("refs=", "qdq=", "replay="):
                 assert key in lines[0]
         finally:
-            envs.AR_PERF_COUNTERS = prev
+            # a real module attr would shadow the dynamic env-var lookup
+            if had_attr:
+                envs.AR_PERF_COUNTERS = prev
+            else:
+                delattr(envs, "AR_PERF_COUNTERS")
 
     def test_sharded_split_line_gated(self):
         import auto_round.envs as envs
@@ -324,13 +329,18 @@ class TestGridSplitPerfLine:
         records = next(gen)
         try:
             prev = getattr(envs, "AR_PERF_COUNTERS", False)
+            had_attr = "AR_PERF_COUNTERS" in vars(envs)
             envs.AR_PERF_COUNTERS = True
             _run_search(tr, block, mapping, x_mean, _make_calls(block))
             lines = [r for r in records if "awq grid split" in r]
             assert len(lines) == 1, lines
             assert "mode=sharded" in lines[0]
         finally:
-            envs.AR_PERF_COUNTERS = prev
+            # a real module attr would shadow the dynamic env-var lookup
+            if had_attr:
+                envs.AR_PERF_COUNTERS = prev
+            else:
+                delattr(envs, "AR_PERF_COUNTERS")
 
 
 class TestShardedReplayStaging:

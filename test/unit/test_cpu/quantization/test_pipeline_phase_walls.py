@@ -118,12 +118,17 @@ def test_perf_line_gated():
         assert not any("[perf] pipeline phases:" in r for r in records)  # gate off by default
 
         prev = getattr(envs, "AR_PERF_COUNTERS", False)
+        had_attr = "AR_PERF_COUNTERS" in vars(envs)
         envs.AR_PERF_COUNTERS = True
         try:
             _invoke(composer)
             assert any("[perf] pipeline phases: pre_calib=" in r and "ref_collect=" in r for r in records)
         finally:
-            envs.AR_PERF_COUNTERS = prev
+            # a real module attr would shadow the dynamic env-var lookup
+            if had_attr:
+                envs.AR_PERF_COUNTERS = prev
+            else:
+                delattr(envs, "AR_PERF_COUNTERS")
     finally:
         ar_logger.removeHandler(handler)
 
