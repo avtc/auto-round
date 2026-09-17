@@ -658,7 +658,11 @@ class AWQTransform(BasePreprocessor):
                 x_mean = (act_sum / act_count).to(torch.float32)
                 del act_sum
 
+                _t_gs = time.perf_counter()
                 best_scales = self._grid_search_scales(mapping, x_mean, block_prefix)
+                _perf = getattr(self, "_grid_perf", None)
+                if _perf is not None:
+                    _perf["wall"] += time.perf_counter() - _t_gs
                 if best_scales is not None:
                     self._apply_scales(mapping, best_scales)
 
@@ -762,11 +766,7 @@ class AWQTransform(BasePreprocessor):
         # the original weights, so a successful shard skips the serial
         # reference replay entirely (the serial fallback computes it below)
         if use_parent_forward and self._parallel_reduce is not None:
-            _t_shard = time.perf_counter()
             merged = self._sharded_grid_losses(mapping, grid_params, x_mean, w_mean, parent_kwargs_list, block_prefix)
-            _perf = getattr(self, "_grid_perf", None)
-            if _perf is not None:
-                _perf["wall"] += time.perf_counter() - _t_shard
             if merged is not None:
                 losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
                 best = int(torch.argmin(losses))
