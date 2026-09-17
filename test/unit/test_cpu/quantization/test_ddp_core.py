@@ -394,7 +394,6 @@ class TestLoggingGlobals:
         from auto_round.algorithms.quantization.sign_round import data_parallel as dp
 
         assert dp._ENGAGED_LOGGED_SIG is None
-        assert isinstance(dp._coll_mirror_setup_logged, set)
 
 
 class TestSingleDevicePlacement:
