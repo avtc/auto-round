@@ -336,6 +336,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             _perf["tune"] = time.perf_counter() - _perf_t0
             _perf["collect"] = getattr(self.alg_composer, "last_collect_wall", 0.0)
+            _perf["mirror"] = getattr(self.alg_composer, "last_mirror_setup_wall", 0.0)
 
             # ── Infrastructure: memory management ─────────────────────────────
             _perf_t0 = time.perf_counter()
@@ -430,13 +431,14 @@ class CompressionOrchestrator(BaseOrchestrator):
                     )  # collect lives inside tune
                 )
                 logger.info(
-                    "[perf] block %s: total %.1fs load %.1fs tune %.1fs (collect %.1fs incl.) pack %.1fs "
+                    "[perf] block %s: total %.1fs load %.1fs tune %.1fs (collect %.1fs%s incl.) pack %.1fs "
                     "write %.1fs clean %.1fs memmgmt %.1fs offload %.1fs other %.1fs gap %.1fs gc %.1fs",
                     current_block_name,
                     _perf["total"],
                     _perf["load"],
                     _perf["tune"],
                     _perf["collect"],
+                    (", mirror %.1fs" % _perf["mirror"]) if _perf.get("mirror", 0.0) > 0.0 else "",
                     _perf["pack"],
                     _perf["write"],
                     _perf["clean"],

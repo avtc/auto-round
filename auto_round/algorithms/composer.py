@@ -369,6 +369,13 @@ class AlgorithmComposer:
             return self._collect_forward(*args, **kwargs)
         finally:
             self.last_collect_wall = getattr(self, "last_collect_wall", 0.0) + (_ctime.perf_counter() - _t0)
+            _ctx = getattr(self, "_coll_ctx", None)
+            if _ctx is not None:
+                self.last_mirror_setup_wall = (
+                    getattr(self, "last_mirror_setup_wall", 0.0)
+                    + _ctx.collect_stats.get("mirror_setup_ms", 0.0) / 1000.0
+                )
+                _ctx.collect_stats = {}
 
     def _collect_forward(
         self, block, inputs, input_others, out_dev=None, allow_shard: bool = True, hook_pass: bool = False
@@ -439,6 +446,9 @@ class AlgorithmComposer:
             - *reference_output*: FP reference output collected before optimization.
         """
         self.last_collect_wall = 0.0
+        self.last_mirror_setup_wall = 0.0
+        if getattr(self, "_coll_ctx", None) is not None:
+            self._coll_ctx.collect_stats = {}
         block_forward_fn = self.block_forward
         from auto_round.algorithms.quantization.sign_round.tune_parallel import TuneParallelContext
 

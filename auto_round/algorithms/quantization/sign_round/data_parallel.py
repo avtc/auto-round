@@ -696,7 +696,6 @@ def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -
 
 
 _pool_move_warned: set = set()
-_coll_mirror_setup_logged: set = set()
 
 
 def expect_pool_local(pieces, device, site: str) -> None:
@@ -761,6 +760,7 @@ def sharded_nograd_forward(
     sample_count: Optional[int] = None,
     merge_stats: bool = False,
     max_devices: int = 0,
+    stats: Optional[dict] = None,
 ):
     """Parallelize a no-grad collection forward across ``devices``.
 
@@ -833,18 +833,11 @@ def sharded_nograd_forward(
             _relocate_params(m, dev)
             reps.append(m)
             mirrors.append(m)
-    global _coll_mirror_setup_logged
-    if world > 1 and "_coll" not in _coll_mirror_setup_logged:
-        _coll_mirror_setup_logged.add("_coll")
-        from auto_round import envs as _penvs
-
-        _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
-        _pl(
-            "[tune-ddp] collection mirror setup: %.0f ms per pass (world=%d) -- included in ref_collect/post_collect",
-            (_time.perf_counter() - _t_mirrors) * 1000,
-            world,
-        )
     _t_setup_ms = (_time.perf_counter() - _t_mirrors) * 1000
+    if stats is not None and world > 1:
+        # per-block perf rollup: the [perf] block line reports the mirror
+        # setup wall inside its collect figure instead of a separate line
+        stats["mirror_setup_ms"] = stats.get("mirror_setup_ms", 0.0) + _t_setup_ms
     parts: List = [None] * world
     fwd_walls = [0.0] * world  # per-thread stores at distinct indices: race-free
     evs: List = [None] * world

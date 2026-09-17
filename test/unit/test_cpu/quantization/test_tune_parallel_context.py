@@ -22,6 +22,7 @@ resolver is covered by test_ddp_core on the live quantize_block path.
 
 import logging
 from unittest import mock
+from unittest.mock import ANY
 
 import pytest
 import torch
@@ -175,7 +176,9 @@ class TestCollectionContext:
             return_value="sharded",
         ) as snf:
             assert ctx.collect_forward("bf", "blk", "inp", "oth") == "sharded"
-        snf.assert_called_once_with("bf", "blk", "inp", "oth", None, ctx.devices, merge_stats=True, max_devices=0)
+        snf.assert_called_once_with(
+            "bf", "blk", "inp", "oth", None, ctx.devices, merge_stats=True, max_devices=0, stats=ANY
+        )
 
     def test_collect_forward_hook_pass_caps_at_four(self):
         ctx = TuneParallelContext()

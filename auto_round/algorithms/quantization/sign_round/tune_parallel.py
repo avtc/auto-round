@@ -91,6 +91,8 @@ class TuneParallelContext:
     def __init__(self) -> None:
         # collection flavor
         self.devices: Optional[List[torch.device]] = None
+        # per-block rollup sink for the collection passes (mirror setup etc.)
+        self.collect_stats: dict = {}
         # tune flavor
         self.group: Optional[ReplicaGroup] = None
         self.plan: Any = None
@@ -195,6 +197,7 @@ class TuneParallelContext:
             self.devices,
             merge_stats=True,
             max_devices=4 if hook_pass else 0,
+            stats=self.collect_stats,
         )
 
     def reduce(self, block, per_replica_fn, items, op: str = "sum") -> Optional[torch.Tensor]:
