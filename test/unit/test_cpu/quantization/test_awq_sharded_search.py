@@ -331,3 +331,56 @@ class TestGridSplitPerfLine:
             assert "mode=sharded" in lines[0]
         finally:
             envs.AR_PERF_COUNTERS = prev
+
+
+class TestShardedReplayStaging:
+    """Per-replica args staging: one move per item, reused across all grid points."""
+
+    def test_moves_args_once_per_item(self, monkeypatch):
+        import auto_round.algorithms.transforms.awq.base as awq_base
+
+        torch.manual_seed(17)
+        block = _FakeBlock()
+        tr = _make_transform(model=_make_model(block))
+        mapping = _make_mapping(block)
+        x_mean = torch.rand(block.lin.in_features) + 0.5
+        calls = _make_calls(block, n=4)
+
+        moved = {"n": 0}
+        orig_move = awq_base.move_to_device
+
+        def counting_move(v, dev):
+            if isinstance(v, torch.Tensor):
+                moved["n"] += 1
+            return orig_move(v, dev)
+
+        monkeypatch.setattr(awq_base, "move_to_device", counting_move)
+
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        tr.set_parallel_reduce(ctx.reduce)
+        tr.n_grid = 4  # 4 points -> without the hoist: 4 points x n calls + refs
+
+        _run_search(tr, block, mapping, x_mean, calls)
+
+        # one call arg per item, moved exactly once (refs + 4 points reuse it)
+        assert moved["n"] == len(calls), moved["n"]
+
+    def test_parity_holds_after_staging(self):
+        torch.manual_seed(19)
+        block = _FakeBlock()
+        serial_tr = _make_transform(model=_make_model(block))
+        mapping = _make_mapping(block)
+        x_mean = torch.rand(block.lin.in_features) + 0.5
+        calls = _make_calls(block)
+
+        serial = _run_search(serial_tr, block, mapping, x_mean, calls)
+
+        ctx = TuneParallelContext()
+        ctx.devices = [torch.device("cpu"), torch.device("cpu")]
+        tr = _make_transform(model=_make_model(block))
+        tr.set_parallel_reduce(ctx.reduce)
+        sharded = _run_search(tr, block, mapping, x_mean, calls)
+
+        assert serial is not None and sharded is not None
+        assert torch.allclose(serial, sharded, atol=1e-6)

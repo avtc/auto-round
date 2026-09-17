@@ -475,7 +475,17 @@ class AlgorithmComposer:
             for pre in self.preprocessors:
                 pre_hooks.extend(pre.register_fp_input_forward_hooks(block))
             if pre_hooks:
-                block_forward_fn(block, fp_inputs, input_others)
+                # route through the collection seam so the stats pass shards
+                # over the lane mirrors like Step 3 does; the preprocessor
+                # hooks are additive/append-mergeable by contract, so mirror
+                # writes fold back (hook_pass also caps concurrency at 4)
+                self._coll_ctx.collect_forward(
+                    block_forward_fn,
+                    block,
+                    fp_inputs,
+                    input_others,
+                    hook_pass=True,
+                )
             for h in pre_hooks:
                 h.remove()
 
@@ -484,7 +494,13 @@ class AlgorithmComposer:
                 if hasattr(pre, "register_qinput_forward_hooks"):
                     pre_q_hooks.extend(pre.register_qinput_forward_hooks(block))
             if pre_q_hooks:
-                block_forward_fn(block, q_inputs if q_inputs is not None else fp_inputs, input_others)
+                self._coll_ctx.collect_forward(
+                    block_forward_fn,
+                    block,
+                    q_inputs if q_inputs is not None else fp_inputs,
+                    input_others,
+                    hook_pass=True,
+                )
             for h in pre_q_hooks:
                 h.remove()
             _pl["pre_calib"] = _ctime.perf_counter() - _t0

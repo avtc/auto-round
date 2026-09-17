@@ -126,3 +126,39 @@ def test_perf_line_gated():
             envs.AR_PERF_COUNTERS = prev
     finally:
         ar_logger.removeHandler(handler)
+
+
+def test_step1_routes_through_collection_seam():
+    """The preprocessor stats pass must go through collect_forward (shardable)."""
+    calls = []
+
+    class _SeamCtx:
+        devices = [torch.device("cpu")]
+        collect_stats = {}
+
+        def collect_forward(self, block_forward, block, inputs, input_others, out_dev=None, **kw):
+            calls.append((kw.get("hook_pass"), len(inputs)))
+            return block_forward(block, inputs, input_others)
+
+        def distribute_pools(self, *a, **kw):
+            return None
+
+    composer = _make_composer()
+    composer._collection_context = lambda block, fp_inputs: _SeamCtx()
+    _invoke(composer)
+    assert calls[0] == (True, 1), calls  # Step-1 stats pass, sharded seam, hook-aware
+    assert all(c[0] is False for c in calls[1:]) or len(calls) == 1, calls
+
+
+def test_awq_hook_writes_hold_state_lock():
+    """AWQ hook bodies must hold _HOOK_STATE_LOCK (mirror threads share state)."""
+    import re as _re
+
+    import auto_round.algorithms.transforms.awq.base as awq_base
+
+    src_path = awq_base.__file__
+    src = open(src_path, encoding="utf-8").read()
+    assert "_HOOK_STATE_LOCK = threading.Lock()" in src
+    # both hook write sites hold the lock (the guarded stats block and the
+    # parent-cache append)
+    assert src.count("with _HOOK_STATE_LOCK:") >= 2, src.count("with _HOOK_STATE_LOCK:")

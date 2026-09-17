@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -211,6 +212,13 @@ def _iter_block_names_for_mapping(model: torch.nn.Module) -> list[str]:
     from auto_round.utils.model import get_block_names
 
     return sorted((name for name in flatten_list(get_block_names(model)) if name), key=len, reverse=True)
+
+
+# Mirror threads share the transform instance through the hook closures
+# (deepcopy treats functions as atomic), so every hook-side write to
+# transform state must hold this lock: read-modify-write on the stats
+# tensors and the per-parent cache appends are not atomic across shards.
+_HOOK_STATE_LOCK = threading.Lock()
 
 
 @register_pipeline_member(AWQConfig)
@@ -493,26 +501,27 @@ class AWQTransform(BasePreprocessor):
 
                     channel_sum = feat.float().abs().sum(dim=0).cpu()
                     count = feat.shape[0]
-                    if smooth_name not in self._activation_stats:
-                        self._activation_stats[smooth_name] = [
-                            torch.zeros_like(channel_sum),
-                            0,
-                        ]
-                    self._activation_stats[smooth_name][0] += channel_sum
-                    self._activation_stats[smooth_name][1] += count
+                    with _HOOK_STATE_LOCK:
+                        if smooth_name not in self._activation_stats:
+                            self._activation_stats[smooth_name] = [
+                                torch.zeros_like(channel_sum),
+                                0,
+                            ]
+                        self._activation_stats[smooth_name][0] += channel_sum
+                        self._activation_stats[smooth_name][1] += count
 
-                    if self.apply_clip:
-                        clip_feat = feat
-                        # Subsample tokens to bound memory.
-                        if clip_feat.shape[0] > self.clip_n_sample_token:
-                            step = max(1, clip_feat.shape[0] // self.clip_n_sample_token)
-                            clip_feat = clip_feat[::step]
-                        clip_feat = clip_feat.float().cpu()
-                        prev = self._clip_input_feat.get(smooth_name)
-                        if prev is None:
-                            self._clip_input_feat[smooth_name] = clip_feat
-                        else:
-                            self._clip_input_feat[smooth_name] = torch.cat([prev, clip_feat], dim=0)
+                        if self.apply_clip:
+                            clip_feat = feat
+                            # Subsample tokens to bound memory.
+                            if clip_feat.shape[0] > self.clip_n_sample_token:
+                                step = max(1, clip_feat.shape[0] // self.clip_n_sample_token)
+                                clip_feat = clip_feat[::step]
+                            clip_feat = clip_feat.float().cpu()
+                            prev = self._clip_input_feat.get(smooth_name)
+                            if prev is None:
+                                self._clip_input_feat[smooth_name] = clip_feat
+                            else:
+                                self._clip_input_feat[smooth_name] = torch.cat([prev, clip_feat], dim=0)
 
                 return hook_fn
 
@@ -557,7 +566,8 @@ class AWQTransform(BasePreprocessor):
 
                     if self._awq_seqlen is not None:
                         proc_args, proc_kwargs = _truncate_args_kwargs(proc_args, proc_kwargs, self._awq_seqlen)
-                    self._parent_args_cache[parent_module].append((proc_args, proc_kwargs))
+                    with _HOOK_STATE_LOCK:
+                        self._parent_args_cache[parent_module].append((proc_args, proc_kwargs))
 
                 return hook_fn
 
@@ -919,12 +929,18 @@ class AWQTransform(BasePreprocessor):
             r_parent = remap(parent)
             r_bls = [remap(bl) for bl in mapping.balance_layers]
             r_dev = r_bls[0].weight.device
-            # reference outputs at the ORIGINAL weights (the copy is pristine)
-            _t_refs = time.perf_counter()
-            refs = []
+            # stage each call's args on the replica device ONCE (refs + every
+            # grid point reuse them; re-moving per point re-uploaded the
+            # CPU-parked capture 21x per item)
+            staged = []
             for call_args, call_kwargs in items_slice:
                 args = tuple(move_to_device(a, r_dev) for a in call_args)
                 kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
+                staged.append((args, kwargs))
+            # reference outputs at the ORIGINAL weights (the copy is pristine)
+            _t_refs = time.perf_counter()
+            refs = []
+            for args, kwargs in staged:
                 refs.append(self._normalize_parent_output(r_parent(*args, **kwargs)))
             _t_refs = time.perf_counter() - _t_refs
             out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
@@ -950,9 +966,7 @@ class AWQTransform(BasePreprocessor):
                 _t_qdq += time.perf_counter() - _t0
                 _t0 = time.perf_counter()
                 loss_sum = torch.zeros((), device=r_dev, dtype=torch.float32)
-                for (call_args, call_kwargs), ref in zip(items_slice, refs):
-                    args = tuple(move_to_device(a, r_dev) for a in call_args)
-                    kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
+                for (args, kwargs), ref in zip(staged, refs):
                     cand = self._normalize_parent_output(r_parent(*args, **kwargs))
                     loss_sum = loss_sum + torch.nn.functional.mse_loss(ref.float(), cand.float(), reduction="sum")
                 out[gi] = loss_sum
