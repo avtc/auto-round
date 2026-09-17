@@ -385,17 +385,17 @@ class AWQTransform(BasePreprocessor):
             self._clip_block(block_name, active_mappings)
         from auto_round import envs as _penvs
 
-        _pl = logger.info if getattr(_penvs, "AR_PERF_COUNTERS", False) else logger.debug
-        _pl(
-            "[perf] awq searches: block='%s' grid=%.0fms (mappings=%d calls=%d grid=%d) clip=%.0fms (layers=%d)",
-            block_name,
-            self._grid_perf["wall"] * 1000,
-            self._grid_perf["mappings"],
-            self._grid_perf["calls"],
-            self._grid_perf["grid"],
-            self._clip_perf["wall"] * 1000,
-            self._clip_perf["layers"],
-        )
+        if getattr(_penvs, "AR_PERF_COUNTERS", False):
+            logger.info(
+                "[perf] awq searches: block='%s' grid=%.0fms (mappings=%d calls=%d grid=%d) clip=%.0fms (layers=%d)",
+                block_name,
+                self._grid_perf["wall"] * 1000,
+                self._grid_perf["mappings"],
+                self._grid_perf["calls"],
+                self._grid_perf["grid"],
+                self._clip_perf["wall"] * 1000,
+                self._clip_perf["layers"],
+            )
         modified = []
         for mapping in active_mappings:
             modified.extend(mapping.balance_names)
