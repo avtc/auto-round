@@ -469,7 +469,18 @@ class AlgorithmComposer:
 
         # ── Step 2: pre_quantize_block (stats consolidation + weight transforms) ──
         for pre in self.preprocessors:
-            pre.pre_quantize_block(block_ctx)
+            # attach the engaged lane's shard-and-reduce seam so no-grad
+            # searches (AWQ's smoothing grid) can evaluate in parallel; the
+            # seam returns None whenever sharding does not apply, and the
+            # search keeps its serial loop
+            coll_ctx = getattr(self, "_coll_ctx", None)
+            if hasattr(pre, "set_parallel_reduce") and coll_ctx is not None and coll_ctx.devices:
+                pre.set_parallel_reduce(coll_ctx.reduce)
+            try:
+                pre.pre_quantize_block(block_ctx)
+            finally:
+                if hasattr(pre, "set_parallel_reduce"):
+                    pre.set_parallel_reduce(None)
 
         reference_next_input = None
         # ── Step 3: Quantizer calibration (act_max, imatrix, etc.) ─────────────

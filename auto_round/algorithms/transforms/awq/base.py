@@ -261,6 +261,8 @@ class AWQTransform(BasePreprocessor):
 
         self._activation_stats: dict[str, list] = {}
         self._parent_args_cache: dict[torch.nn.Module, list[tuple[tuple, dict]]] = {}
+        # Parallel-lane shard-and-reduce seam (None = serial searches).
+        self._parallel_reduce = None
         # Per-mapping balance-layer input features captured for the clip search
         # (keyed by smooth_name). Only populated when ``apply_clip`` is set.
         self._clip_input_feat: dict[str, torch.Tensor] = {}
@@ -644,7 +646,7 @@ class AWQTransform(BasePreprocessor):
                 x_mean = (act_sum / act_count).to(torch.float32)
                 del act_sum
 
-                best_scales = self._grid_search_scales(mapping, x_mean)
+                best_scales = self._grid_search_scales(mapping, x_mean, block_prefix)
                 if best_scales is not None:
                     self._apply_scales(mapping, best_scales)
 
@@ -695,11 +697,36 @@ class AWQTransform(BasePreprocessor):
         w_scale = revert_tensor_by_pad(w_scale, orig_shape=org_shape, pad_len=pad_len)
         return w_scale.mean(0)
 
-    @torch.no_grad()
+    @staticmethod
+    def _candidate_scales(
+        x_mean: torch.Tensor, ratio: float, use_duo: bool, w_mean: torch.Tensor | None, device
+    ) -> torch.Tensor:
+        """Derive one grid point's smoothing scales (shared by the serial and
+        sharded search paths so the derivation cannot drift)."""
+        if use_duo:
+            scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
+        else:
+            scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+        scales = scales / (scales.max() * scales.min()).sqrt()
+        scales[torch.isinf(scales)] = 1
+        scales[torch.isnan(scales)] = 1
+        return scales.view(1, -1).to(device)
+
+    def set_parallel_reduce(self, reduce_fn) -> None:
+        """Attach the parallel lane's shard-and-reduce seam (composer wiring).
+
+        ``reduce_fn(block, per_replica_fn, items)`` returns the summed partials
+        on the home device, or ``None`` when the items cannot shard -- the
+        search then keeps its serial loop. The composer attaches the engaged
+        lane's seam before ``pre_quantize_block`` and detaches it after.
+        """
+        self._parallel_reduce = reduce_fn
+
     def _grid_search_scales(
         self,
         mapping: ResolvedMapping,
         x_mean: torch.Tensor,
+        block_prefix: str | None = None,
     ) -> torch.Tensor | None:
         """Find the best scaling ratio for *mapping* via output-based loss."""
         device = mapping.balance_layers[0].weight.device
@@ -707,6 +734,7 @@ class AWQTransform(BasePreprocessor):
 
         bl_params = {bl: self._qdq_tool.resolve_params(bl) for bl in mapping.balance_layers}
         group_size = self._normalize_group_size(bl_params[mapping.balance_layers[0]]["group_size"], -1)
+        w_mean = None
         if self.duo_scaling is not False:
             w_mean = self._compute_layer_means(mapping.balance_layers, group_size).to(device)
 
@@ -736,15 +764,34 @@ class AWQTransform(BasePreprocessor):
         best_scales = None
         best_ratio = -1
 
-        for ratio, use_duo in self._get_grid_search_params():
-            if use_duo:
-                scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
-            else:
-                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
-            scales[torch.isinf(scales)] = 1
-            scales[torch.isnan(scales)] = 1
-            scales_view = scales.view(1, -1).to(device)
+        grid_params = list(self._get_grid_search_params())
+
+        if use_parent_forward and self._parallel_reduce is not None:
+            merged = self._sharded_grid_losses(
+                mapping, grid_params, x_mean, w_mean, parent_kwargs_list, fp16_outputs, block_prefix
+            )
+            if merged is not None:
+                losses = merged[: len(grid_params)] / merged[-1].clamp(min=1)
+                best = int(torch.argmin(losses))
+                if torch.isfinite(losses[best]):
+                    best_ratio, best_error = float(losses[best]), 0.0  # error exact below
+                    best_scales = self._candidate_scales(
+                        x_mean, grid_params[best][0], grid_params[best][1], w_mean, device
+                    ).view(-1)
+                    best_error = float(losses[best])
+                    logger.debug(
+                        "AWQ '%s': sharded grid search best_ratio=%.2f, best_error=%.3e",
+                        mapping.smooth_name,
+                        grid_params[best][0],
+                        best_error,
+                    )
+                    return best_scales
+                logger.warning("AWQ: sharded grid search failed for '%s': no finite error.", mapping.smooth_name)
+                return None
+
+        for ratio, use_duo in grid_params:
+            scales = self._candidate_scales(x_mean, ratio, use_duo, w_mean, device).view(-1)
+            scales_view = scales.view(1, -1)
 
             if use_parent_forward:
                 # Quantize each balance layer's smoothed weight and write the
@@ -789,6 +836,74 @@ class AWQTransform(BasePreprocessor):
 
         logger.debug("AWQ '%s': best_ratio=%.2f, best_error=%.3e", mapping.smooth_name, best_ratio, best_error)
         return best_scales
+
+    def _sharded_grid_losses(
+        self, mapping, grid_params, x_mean, w_mean, parent_kwargs_list, fp16_outputs, block_prefix
+    ):
+        """Evaluate the smoothing grid in parallel across the lane's replicas.
+
+        Each replica replays its contiguous slice of the cached parent calls
+        with every grid point's quantized candidate weights and returns the
+        per-point loss SUM plus the element count; the engine sums the
+        partials, and dividing by the merged count reproduces the serial
+        per-point loss exactly (up to fp32 summation order). Returns ``None``
+        when the calls cannot shard -- the caller keeps the serial loop.
+        """
+        calls = [mc for stored in parent_kwargs_list for mc in self._iter_parent_calls(*stored)]
+        if len(calls) != len(fp16_outputs) or not calls:
+            return None
+        # the replay needs the parent forward inside the block copy: only
+        # mappings whose parent is the block itself or an in-block module
+        # can shard; anything else keeps the serial loop
+        parent = mapping.parent
+        parent_name = getattr(parent, "global_name", None)
+        if not block_prefix or not parent_name:
+            return None
+        if parent_name != block_prefix and not parent_name.startswith(block_prefix + "."):
+            return None
+        try:
+            block = self.model_context.model.get_submodule(block_prefix)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("AWQ: sharded grid search declined for '%s': block lookup failed (%s)", mapping.smooth_name, e)
+            return None
+        n_grid = len(grid_params)
+        items = list(zip(calls, fp16_outputs))
+
+        def per_replica(rep, remap, items_slice):
+            r_parent = remap(parent)
+            r_bls = [remap(bl) for bl in mapping.balance_layers]
+            r_dev = r_bls[0].weight.device
+            bl_params = {bl: self._qdq_tool.resolve_params(bl) for bl in r_bls}
+            bl_funcs = {bl: self._qdq_tool.resolve_quant_funcs(bl_params[bl]) for bl in r_bls}
+            orig = {bl: bl.weight.data.clone() for bl in r_bls}
+            out = torch.zeros(n_grid + 1, device=r_dev, dtype=torch.float32)
+            for gi, (ratio, use_duo) in enumerate(grid_params):
+                scales_view = self._candidate_scales(x_mean, ratio, use_duo, w_mean, r_dev)
+                for bl in r_bls:
+                    quant_func, opt_quant_func = bl_funcs[bl]
+                    w_qdq = self._qdq_tool.qdq(
+                        orig[bl] * scales_view,
+                        bl_params[bl],
+                        quant_func=quant_func,
+                        opt_quant_func=opt_quant_func,
+                        imatrix=getattr(bl, "imatrix", None),
+                    )
+                    bl.weight.data = (w_qdq / scales_view).to(bl.weight.dtype)
+                loss_sum = torch.zeros((), device=r_dev, dtype=torch.float32)
+                for (call_args, call_kwargs), fp16_out in items_slice:
+                    args = tuple(move_to_device(a, r_dev) for a in call_args)
+                    kwargs = {k: move_to_device(v, r_dev) for k, v in call_kwargs.items()}
+                    cand = self._normalize_parent_output(r_parent(*args, **kwargs))
+                    ref = fp16_out.to(r_dev, non_blocking=False)
+                    loss_sum = loss_sum + torch.nn.functional.mse_loss(ref.float(), cand.float(), reduction="sum")
+                    if out[-1] == 0:
+                        out[-1] = ref.numel()
+                out[gi] = loss_sum
+            for bl in r_bls:
+                bl.weight.data.copy_(orig[bl])
+            return out
+
+        return self._parallel_reduce(block, per_replica, items)
 
     def _iter_parent_calls(self, stored_args: tuple, stored_kwargs: dict):
         """Yield full or microbatched parent-call args from one cached calibration batch."""

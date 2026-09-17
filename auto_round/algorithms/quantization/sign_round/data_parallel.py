@@ -550,6 +550,62 @@ _MERGEABLE_STATS = {
 }
 
 
+def sharded_map_reduce(block, per_replica_fn, items, devices: List[torch.device]):
+    """Shard a no-grad per-item evaluation across ``devices`` and sum-merge.
+
+    The no-grad search seam (published as the engine's shard-and-reduce):
+    ``items`` is a list of per-sample payloads the algorithm owns;
+    ``per_replica_fn(replica_block, remap, items_slice)`` returns a 1-D
+    tensor of partial sums for its contiguous slice (any length, identical
+    across replicas). Every shard -- including the home slot -- runs on its
+    OWN deepcopy of the block, because search evaluations may mutate replica
+    weights in place (AWQ's grid walk writes quantized candidates); mirrors
+    die afterwards, so home state is never touched. ``remap(home_module)``
+    resolves the replica's counterpart of an in-block module (name-based),
+    and hands the module itself back for anything outside the block.
+
+    Returns the summed tensor on the home device, or ``None`` when the
+    evaluation cannot shard (fewer than two devices, or the item count does
+    not divide) -- callers fall back to the serial loop unchanged.
+    """
+    world = len(devices)
+    n = len(items)
+    if world < 2 or n < world or n % world != 0:
+        return None
+    shard = n // world
+    home_dev = _block_device(block)
+    names = list(name for name, _ in block.named_modules())
+    copies: List[torch.nn.Module] = []
+    for dev in devices:
+        rep = copy.deepcopy(block)
+        if _block_device(rep) != dev:
+            _relocate_params(rep, dev)
+            rep = rep.to(dev)
+        copies.append(rep)
+
+    results: List[Optional[torch.Tensor]] = [None] * world
+
+    def _run(r):
+        rep = copies[r]
+        lookup = {name: rep.get_submodule(name) for name in names}
+
+        def remap(home_module):
+            for name, m in block.named_modules():
+                if m is home_module:
+                    return lookup[name]
+            return home_module  # outside the block: shared, caller gated
+
+        results[r] = per_replica_fn(rep, remap, items[r * shard : (r + 1) * shard])
+
+    run_threaded_spawn([lambda r=r: _run(r) for r in range(world)])
+    if any(res is None for res in results):
+        return None
+    merged = results[0].to(home_dev)
+    for res in results[1:]:
+        merged = merged + res.to(home_dev)
+    return merged
+
+
 def _merge_mirror_stats(home: torch.nn.Module, mirrors: List[torch.nn.Module]) -> None:
     """Fold hook-written statistics from mirror copies back into the home.
 

@@ -197,6 +197,23 @@ class TuneParallelContext:
             max_devices=4 if hook_pass else 0,
         )
 
+    def reduce(self, block, per_replica_fn, items, op: str = "sum") -> Optional[torch.Tensor]:
+        """Shard-and-reduce a no-grad search evaluation over the lane devices.
+
+        The no-grad search seam: ``per_replica_fn(replica, remap, items_slice)``
+        returns a 1-D tensor of partial sums for its slice and the engine sums
+        the partials on the home device (``op="sum"`` is the only merge today:
+        every sharded search is an additive statistic). Returns ``None`` when
+        the lane is not engaged or the items cannot divide -- the caller keeps
+        its serial loop. Evaluations run on per-shard deepcopies, so in-place
+        candidate writes (AWQ's grid walk) never touch home state.
+        """
+        if self.devices is None or op != "sum":
+            return None
+        from auto_round.algorithms.quantization.sign_round.data_parallel import sharded_map_reduce
+
+        return sharded_map_reduce(block, per_replica_fn, items, self.devices)
+
     # ── P1: tune phase (quantizer-owned) ─────────────────────────────────────
 
     @staticmethod
