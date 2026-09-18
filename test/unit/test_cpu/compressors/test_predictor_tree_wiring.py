@@ -423,7 +423,13 @@ class TestOOMCensusInContainment:
         import auto_round.utils.device as _dev
 
         _orig_census = _dev.log_cuda_memory_census
-        _dev.log_cuda_memory_census = lambda tag, *a, **k: events.append(f"census:{tag}")
+        census_calls = []
+
+        def _census(tag, *a, **k):
+            events.append(f"census:{tag}")
+            census_calls.append((tag, a, k))
+
+        _dev.log_cuda_memory_census = _census
         try:
             o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
         finally:
@@ -431,6 +437,13 @@ class TestOOMCensusInContainment:
             _dev.log_cuda_memory_census = _orig_census
         assert "census:predictor tree mtp OOM (at failure)" in events  # before the fallback clear
         assert events.index("census:predictor tree mtp OOM (at failure)") < events.index("tune") + 2
+        # a device must be passed explicitly: the census's default
+        # torch.device("cuda") never equals a tensor's "cuda:0", so the
+        # default silently hides every tensor from the walk (observed live:
+        # 0 tensor groups while 20.06 GiB was allocated)
+        for tag, a, k in census_calls:
+            dev = k.get("device") or (a[0] if a else None)
+            assert dev is not None, f"census {tag!r} called without a device"
 
 
 class TestImmediatePackingPath:

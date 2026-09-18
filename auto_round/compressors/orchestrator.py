@@ -1537,9 +1537,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         # going into the tree tune (DEBUG-gated; no-op without it).
         from auto_round.utils.device import log_cuda_memory_census
 
-        log_cuda_memory_census("predictor-tree entry (pre-clear)")
+        log_cuda_memory_census("predictor-tree entry (pre-clear)", device_manager.device)
         clear_memory()
-        log_cuda_memory_census("predictor-tree entry (post-clear)")
+        log_cuda_memory_census("predictor-tree entry (post-clear)", device_manager.device)
         for group in roots:
             info = analyze_predictor_group(ckpt, group, hidden)
             if info is None:
@@ -1562,7 +1562,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     # the entry censuses fire before the tune's allocations
                     # exist; this is the only vantage that sees the working
                     # set that failed (DEBUG-gated like the others)
-                    log_cuda_memory_census(f"predictor tree {group} OOM (at failure)")
+                    log_cuda_memory_census(f"predictor tree {group} OOM (at failure)", device_manager.device)
                 logger.warning(
                     "predictor tree %s tuning failed (%s: %s); leaving it to the export path",
                     group,
