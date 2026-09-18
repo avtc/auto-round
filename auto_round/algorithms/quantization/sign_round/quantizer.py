@@ -36,6 +36,7 @@ from auto_round.utils import (
 from auto_round.utils.device import clear_memory_if_reached_threshold, log_cuda_memory_census
 from auto_round.utils.device_manager import device_manager
 from auto_round.utils.distributed import setup_ddp_if_needed_
+from auto_round.utils.snapshot_parking import select_snapshot_device
 from auto_round.wrapper import WrapperLinear, unwrapper_block, unwrapper_layer, wrapper_block
 
 if TYPE_CHECKING:
@@ -658,15 +659,20 @@ class SignRoundQuantizer(BaseQuantizer):
                 total / 1024**3,
             )
 
-    def _best_param_device(self, value_elements: int):
+    def _best_param_device(self, value_elements: int, wrapper: Optional[torch.nn.Module] = None):
         """Where to park the best-parameters snapshot.
 
         A huge layer's snapshot is as large as its rounding parameter; keeping
         a second copy on the GPU alongside the live parameters, gradients, and
         block transients overflows a 24GB card on the first improving
-        iteration, so it always parks on the host."""
+        iteration. The snapshot parks on the cheapest device that provably
+        fits — the layer's own device when half its free pool covers it, else
+        an idle CUDA peer (a peer-to-peer copy replaces the multi-second host
+        round trip on every improving iteration), else the host."""
         if value_elements > _OUTSIDE_TUNE_CHUNK_OUT_ELEMS:
-            return torch.device("cpu")
+            if wrapper is None:
+                return torch.device("cpu")
+            return select_snapshot_device(wrapper)
         return self.compress_context.cache_device
 
     def quantize_layer_outside_block(
@@ -956,10 +962,14 @@ class SignRoundQuantizer(BaseQuantizer):
             if total_loss < best_loss:
                 best_loss = total_loss
                 if not self.not_use_best_mse:
-                    best_params = collect_best_params(wrapper_linear, self._best_param_device(value_elements))
+                    best_params = collect_best_params(
+                        wrapper_linear, self._best_param_device(value_elements, wrapper_linear)
+                    )
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
-                best_params = collect_best_params(wrapper_linear, self._best_param_device(value_elements))
+                best_params = collect_best_params(
+                    wrapper_linear, self._best_param_device(value_elements, wrapper_linear)
+                )
 
             if not self.not_use_best_mse:
                 if 0 < self.dynamic_max_gap <= i - last_best_iter:
