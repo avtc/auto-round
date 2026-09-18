@@ -30,6 +30,7 @@ from auto_round.export.formats.backends.gguf import (
     get_layer_config_by_gguf_format,
     gguf_type_fallback,
 )
+from auto_round.logger import logger
 from auto_round.schemes import BackendDataType  # re-exported: qlinear_fp/qlinear_int import it from here
 from auto_round.schemes import (
     QuantizationScheme,
@@ -226,6 +227,159 @@ def collect_best_params(block, cache_device="cpu"):
                 for key in m.params.keys():
                     params[n][key] = m.params[key].data.to(cache_device, copy=True)
     return params
+
+
+def collect_best_params_local(block):
+    """Best-params snapshot duplicated on each parameter's own device.
+
+    With a CPU cache device this is not used (host parking is the point of
+    ``low_gpu_mem_usage``). With a non-CPU cache device the historical path
+    copied every parameter to that single device -- concentrating all devices'
+    snapshot bytes on one GPU and paying cross-device copies on every improving
+    iteration. Duplicating each parameter on the device that already hosts it
+    keeps the footprint spread like the weights themselves, removes the
+    cross-device traffic, and makes the unwrap copy-back local. Values and the
+    restore path are unchanged. Falls back to a host snapshot (with a warning)
+    when a local copy fails.
+    """
+    params = {}
+    try:
+        if hasattr(block, "orig_layer"):
+            for key, p_ in block.params.items():
+                params[key] = p_.data.to(p_.data.device, copy=True)
+        else:
+            for n, m in block.named_modules():
+                if hasattr(m, "orig_layer"):
+                    params[n] = {key: p_.data.to(p_.data.device, copy=True) for key, p_ in m.params.items()}
+        return params
+    except RuntimeError as e:
+        logger.warning("[snapshot] local copy failed (%s); parking the snapshot on host", e)
+        return collect_best_params(block, "cpu")
+
+
+def snapshot_best_params(block, cache_device="cpu"):
+    """Collect the best-params snapshot, keeping multi-device blocks on-device.
+
+    A CPU ``cache_device`` (``low_gpu_mem_usage``) keeps the historical host
+    snapshot. A non-CPU ``cache_device`` means VRAM was budgeted for caching;
+    each parameter is then duplicated on its own device instead of gathering
+    every device's copies onto one cache device. Single-device blocks are
+    unaffected either way (the cache device already equals each parameter's
+    device).
+    """
+    try:
+        non_cpu = torch.device(str(cache_device)).type != "cpu"
+    except (ValueError, RuntimeError):
+        non_cpu = False  # unrecognized label: keep the historical path (it will raise as before)
+    if non_cpu:
+        return collect_best_params_local(block)
+    return collect_best_params(block, cache_device)
+
+
+def snapshot_window_floor_bytes(wrapper) -> int:
+    """Minimum free bytes the row-window machinery needs beside the snapshot.
+
+    ``WrapperLinear.row_block_bounds`` never shrinks a window below 1024 rows
+    and keeps about six fp32 row-block-sized arrays live in the quantize and
+    backward math, so a home-resident snapshot must leave that working set
+    room. Both anchors come from the row-block machinery itself; the value is
+    computed from the layer's real shapes.
+    """
+    params = getattr(wrapper, "params", None)
+    value = params.get("value") if params else None
+    if not isinstance(value, torch.Tensor) or value.dim() < 2:
+        return 0
+    in_features = value.shape[-1]
+    return int(1024 * in_features * 4 * 6)
+
+
+def select_snapshot_device(wrapper) -> torch.device:
+    """Device for a huge layer's best-params snapshot; host fallback.
+
+    Ladder: the layer's own device when the snapshot provably fits beside the
+    row-window floor (``free - snapshot >= window floor``) -- the row windows
+    then size themselves against the reduced free pool, trading window size
+    for keeping the snapshot on-device; otherwise an idle CUDA peer with
+    headroom (peer-to-peer refreshes replace the host round trip); otherwise
+    the host, the previously shipped behavior. Never raises.
+    """
+    need = sum(t.numel() * t.element_size() for t in getattr(wrapper, "params", {}).values())
+    home = getattr(wrapper, "device", None)
+    if not isinstance(home, torch.device):
+        value = getattr(wrapper, "params", {}).get("value")
+        home = value.device if isinstance(value, torch.Tensor) else None
+    if need <= 0 or home is None or home.type != "cuda":
+        return torch.device("cpu")
+
+    try:
+        free, _total = torch.cuda.mem_get_info(home)
+        floor = snapshot_window_floor_bytes(wrapper)
+        if free - need >= floor:
+            return home
+    except (RuntimeError, ValueError):  # pragma: no cover - exotic devices
+        pass
+
+    try:
+        count = torch.cuda.device_count()
+    except (RuntimeError, ValueError):  # pragma: no cover
+        count = 0
+    for index in range(count):
+        candidate = torch.device("cuda", index)
+        if candidate == home:
+            continue
+        try:
+            peer_free, _peer_total = torch.cuda.mem_get_info(candidate)
+        except (RuntimeError, ValueError):  # pragma: no cover
+            continue
+        # an idle peer carries a CUDA context and allocator fragmentation;
+        # leave a tenth of its free memory untouched
+        if peer_free * 0.9 >= need:
+            return candidate
+
+    return torch.device("cpu")
+
+
+class BestParamsSlot:
+    """Pre-reserved best-params snapshot for a huge tuning layer.
+
+    Reserved BEFORE the tune loop starts, so the row-window machinery's
+    per-forward free-memory probe sees the reduced pool from iteration 0 and
+    windows shrink in favor of keeping the snapshot -- instead of sizing
+    windows on the full pool and overflowing on the first improving
+    iteration. Refreshing an on-device slot is a copy into existing buffers
+    (an intra-device blip, or a peer-to-peer transfer on a parked peer);
+    the host fallback keeps the historical collect-per-improvement path.
+    """
+
+    def __init__(self, wrapper):
+        self.device = select_snapshot_device(wrapper)
+        self.buffers = None
+        if self.device.type == "cuda":
+            try:
+                self.buffers = {
+                    key: torch.empty_like(t.data, device=self.device)
+                    for key, t in getattr(wrapper, "params", {}).items()
+                }
+            except RuntimeError as e:  # pragma: no cover - reservation OOM
+                logger.warning("[snapshot] slot reservation on %s failed (%s); using the host", self.device, e)
+                self.device = torch.device("cpu")
+                self.buffers = None
+        if self.device.type == "cuda":
+            need = sum(t.numel() * t.element_size() for t in self.buffers.values())
+            logger.info(
+                "[snapshot] best-params slot reserved on %s (%.2f GiB); "
+                "row windows size against the reduced free pool",
+                self.device,
+                need / 2**30,
+            )
+
+    def refresh(self, wrapper):
+        """Copy the current best parameters into the slot; returns the snapshot."""
+        if self.buffers is not None:
+            for key, tensor in self.buffers.items():
+                tensor.copy_(wrapper.params[key].data)
+            return self.buffers
+        return collect_best_params(wrapper, "cpu")
 
 
 def infer_bits_by_data_type(data_type: str):

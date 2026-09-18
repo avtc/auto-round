@@ -105,7 +105,6 @@ def _outside_tune_harness(qmod, layer, cap):
     ):
         setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
     quant._preallocate_tuning_grads_ = qmod.SignRoundQuantizer._preallocate_tuning_grads_
-    setattr(quant, "_best_param_device", MethodType(qmod.SignRoundQuantizer._best_param_device, quant))
     quant._logged_low_bit_lr = set()
     return quant, fresh
 
@@ -203,7 +202,6 @@ class TestOutsideTuneChunking:
         for name in ("_get_scaler", "_scale_loss_and_backward", "_step", "_maybe_log_low_bit_lr"):
             setattr(quant, name, MethodType(getattr(qmod.SignRoundQuantizer, name), quant))
         quant._preallocate_tuning_grads_ = qmod.SignRoundQuantizer._preallocate_tuning_grads_
-        setattr(quant, "_best_param_device", MethodType(qmod.SignRoundQuantizer._best_param_device, quant))
         quant._logged_low_bit_lr = set()
         fp = [torch.randn(1, 7, 16) for _ in range(2)]
 
@@ -577,12 +575,14 @@ class TestBestParamSnapshotDevice:
     def test_device_selection(self):
         import torch
 
-        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+        from auto_round.compressors.utils import BestParamsSlot, select_snapshot_device
 
-        q = SimpleNamespace(compress_context=SimpleNamespace(cache_device=torch.device("cuda:0")))
-        fn = SignRoundQuantizer._best_param_device
-        assert fn(q, 2**28) == torch.device("cpu"), "vocabulary-head snapshots must park on the host"
-        assert fn(q, 1024) == torch.device("cuda:0"), "small layers keep the context cache device"
+        # a CPU test box cannot honor a cuda home, so the ladder's host fallback
+        # is the observable contract here; device-level ladder cases live in
+        # test_best_params_slot.py
+        wrapper = SimpleNamespace(device=torch.device("cpu"), orig_layer=None, params={"value": torch.zeros(4, 4)})
+        assert select_snapshot_device(wrapper) == torch.device("cpu")
+        assert BestParamsSlot(wrapper).refresh(wrapper)["value"].device.type == "cpu"
 
 
 class TestUnwrapStreaming:
