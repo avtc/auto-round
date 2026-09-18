@@ -381,6 +381,8 @@ class TestTreeStageMemoryHygiene:
         assert events.index("clear") < events.index("tune")
         assert events.index("census:predictor-tree entry (pre-clear)") < events.index("clear")
         assert events.index("census:predictor-tree entry (post-clear)") > events.index("clear")
+        # tree-ready census mirrors the lm_head lane's wrapper-ready vantage
+        assert events.index("census:predictor tree ready mtp") < events.index("tune")
 
 
 class TestImmediatePackingPath:

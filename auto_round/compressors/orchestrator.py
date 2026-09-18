@@ -1603,6 +1603,13 @@ class CompressionOrchestrator(BaseOrchestrator):
         materialize_model_(shell)
         convert_module_to_hp_if_necessary(shell, self.model_context.amp_dtype, device_manager.device)
         shell = self.alg_composer.dispatch_block(shell, fp_tail, input_others)
+        # mirrors the lm_head lane's wrapper-ready census (quantizer.py,
+        # quantize_layer_outside_block): the tree block tunes via compress_block,
+        # which carries no census of its own - this is the last clean vantage
+        # before the tune's value/grad/activation allocations begin
+        from auto_round.utils.device import log_cuda_memory_census
+
+        log_cuda_memory_census(f"predictor tree ready {group}", device_manager.device)
         ctx = BlockContext(
             model=self.model_context.model,
             block_names=[group],
