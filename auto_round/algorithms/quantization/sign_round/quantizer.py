@@ -361,6 +361,7 @@ class SignRoundQuantizer(BaseQuantizer):
 
             if not logger.isEnabledFor(_logging.DEBUG):
                 return
+            from auto_round.utils.model import check_to_quantized
             from auto_round.utils.tune_memory import predict_block_tune_peak
 
             wrapper_cls = getattr(self, "wrapper_block", None)
@@ -372,9 +373,11 @@ class SignRoundQuantizer(BaseQuantizer):
             ]
             free_b = None
             try:
-                from auto_round.utils.device import get_device_memory
+                from auto_round.compressors.utils import _accel_mem_get_info_
 
-                free_b = int(get_device_memory(device_manager.device) or 0)
+                _info = _accel_mem_get_info_(device_manager.device)
+                if _info is not None:
+                    free_b = int(_info[0])
             except Exception:  # pylint: disable=broad-except
                 pass
             out = predict_block_tune_peak(
@@ -449,6 +452,10 @@ class SignRoundQuantizer(BaseQuantizer):
                 snapshot_on_host=act_floor_bytes is not None,
             )
             if out["saved"] is None:
+                logger.warning(
+                    "[tune-mem] cannot measure this wrapper class's saved-for-backward footprint; "
+                    "tuning the block in one pass"
+                )
                 return False, "saved term unknown (probe failed)"
             incremental = out["saved"] + out["act"] + out["snapshot"] + self._TWO_PASS_FRAG_BUDGET
             engaged = incremental > free_b
@@ -922,7 +929,7 @@ class SignRoundQuantizer(BaseQuantizer):
         logger.info(f"quantizing layer {layer_name}")
         # Layer is already on the correct device (placed by the caller / AlgorithmComposer).
         device = layer.weight.device if hasattr(layer, "weight") else device_manager.device
-        log_cuda_memory_census(f"outside-block tune start {layer_name}", device)
+        log_cuda_memory_census(f"outside-block tune start {layer_name}", device, walk=False)
         for i in range(len(fp_inputs)):
             fp_inputs[i] = fp_inputs[i].to(layer.weight.dtype)
             if q_inputs is not None:
@@ -1158,7 +1165,7 @@ class SignRoundQuantizer(BaseQuantizer):
                                 self._scale_loss_and_backward(scaler, loss)
             if i == 0:
                 init_loss = total_loss
-                log_cuda_memory_census(f"outside-block first backward done {layer_name}", device)
+                log_cuda_memory_census(f"outside-block first backward done {layer_name}", device, walk=False)
             current_lr = optimizer.param_groups[0]["lr"]
             logger.debug("iter %d loss: %.3e lr: %s", i, total_loss, current_lr)
 

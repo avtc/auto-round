@@ -552,7 +552,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             _ar = get_current_device_manager()
             if _ar.is_available():
                 _ar.empty_cache()
-            log_cuda_memory_census(f"outside-block loop entry {name}")
+            log_cuda_memory_census(f"outside-block loop entry {name}", walk=False)
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.

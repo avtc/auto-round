@@ -101,3 +101,39 @@ class TestPredict:
         )
         assert out["snapshot"] == 0
         assert out["saved"] is None and out["total"] is None  # unknown, not zero
+
+
+class TestPredictionLineAtDebug:
+    def test_prediction_line_runs_at_debug_without_unavailable(self, caplog):
+        """The prediction helper executes its full body under DEBUG logging.
+
+        Guards the class of bug where a missing import inside the helper
+        surfaces only when DEBUG is enabled (the server run hit
+        NameError: check_to_quantized and logged 'prediction unavailable')."""
+        import logging
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        layer = nn.Linear(64, 32, bias=False)
+        layer.bits, layer.group_size, layer.sym, layer.data_type = 4, 128, True, "int"
+        layer.super_bits = layer.super_group_size = None
+        layer.scale_dtype = None
+        layer.act_bits, layer.act_sym, layer.act_data_type, layer.act_dynamic = 16, True, None, None
+        block = nn.Sequential(layer)
+
+        from auto_round.logger import logger as ar_logger
+
+        with caplog.at_level(logging.DEBUG, logger="autoround"):
+            # the autoround logger does not propagate; attach the capture handler directly
+            ar_logger.addHandler(caplog.handler)
+            try:
+                SignRoundQuantizer._log_tune_peak_prediction_(
+                    SimpleNamespace(enable_minmax_tuning=False), block, None, 1, None
+                )
+            finally:
+                ar_logger.removeHandler(caplog.handler)
+        assert "[tune-mem]" in caplog.text
+        assert "unavailable" not in caplog.text
