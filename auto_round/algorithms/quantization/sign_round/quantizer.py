@@ -26,6 +26,7 @@ from auto_round.compressors.utils import (
     BestParamsSlot,
     IndexSampler,
     collect_best_params,
+    snapshot_best_params,
 )
 from auto_round.logger import logger
 from auto_round.utils import (
@@ -346,6 +347,24 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         return loss
 
+    @staticmethod
+    def _snapshot_act_floor_(block, inputs, batch_size):
+        """Free-VRAM floor a home-resident best-params snapshot must leave.
+
+        The tune's remaining per-iteration working set (saved activations plus
+        attention workspace) from the same shape-based estimator the block
+        placement uses. A snapshot clone that eats this room kills the next
+        backward (observed: the predictor-tree tune died at iter 1 after the
+        iter-0 clone fit). Advisory: ``None`` keeps the historical snapshot
+        behavior when the estimate is unavailable."""
+        try:
+            from auto_round.utils.device import estimate_tuning_block_mem
+
+            _layers, act_gb, _io_gb, add_gb = estimate_tuning_block_mem(block, inputs, batch_size)
+            return int((act_gb + add_gb) * 1024**3)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
     def quantize_block(
         self,
         block,
@@ -480,6 +499,7 @@ class SignRoundQuantizer(BaseQuantizer):
         best_params = {}
         total_loss = 0
         batch_size = self.calibration_context.batch_size
+        act_floor = self._snapshot_act_floor_(block, active_inputs, batch_size)
         global_batch_size = batch_size * self.gradient_accumulate_steps
         global_batch_size = min(nsamples, global_batch_size)
         # Compute num_elm once before the loop (used to normalise the accumulated loss).
@@ -588,14 +608,16 @@ class SignRoundQuantizer(BaseQuantizer):
                         best_params = (
                             tuning_cache.collect_best_params()
                             if tuning_cache is not None and tuning_cache.best is not None
-                            else collect_best_params(block, self.compress_context.cache_device)
+                            else snapshot_best_params(
+                                block, self.compress_context.cache_device, act_floor_bytes=act_floor
+                            )
                         )
                         last_best_iter = i
                 if self.not_use_best_mse and i == self.iters - 1:
                     best_params = (
                         tuning_cache.collect_best_params()
                         if tuning_cache is not None and tuning_cache.best is not None
-                        else collect_best_params(block, self.compress_context.cache_device)
+                        else snapshot_best_params(block, self.compress_context.cache_device, act_floor_bytes=act_floor)
                     )
 
                 if not self.not_use_best_mse:

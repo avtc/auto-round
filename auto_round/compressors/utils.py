@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 import random
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from torch.amp import autocast
@@ -257,7 +257,50 @@ def collect_best_params_local(block):
         return collect_best_params(block, "cpu")
 
 
-def snapshot_best_params(block, cache_device="cpu"):
+def _snapshot_param_needs(block) -> list[tuple[torch.device, int]]:
+    """Per-device snapshot need (bytes) across the block's wrappers."""
+    needs = {}
+
+    def _add(params):
+        for tensor in params.values():
+            if isinstance(tensor, torch.Tensor):
+                home = tensor.device
+                needs[home] = needs.get(home, 0) + tensor.numel() * tensor.element_size()
+
+    if hasattr(block, "orig_layer"):
+        _add(block.params)
+    else:
+        for _, module in block.named_modules():
+            if hasattr(module, "orig_layer"):
+                _add(module.params)
+    return sorted(needs.items(), key=lambda kv: str(kv[0]))
+
+
+def _idle_peer_for_(need_bytes, home) -> Optional[torch.device]:
+    """An idle CUDA peer with headroom for ``need_bytes``, or ``None``.
+
+    Shared by the snapshot ladders (the huge-layer wrapper path and the
+    block path). An idle peer still carries a CUDA context and allocator
+    fragmentation; a tenth of its free memory stays untouched.
+    """
+    try:
+        count = torch.cuda.device_count()
+    except (RuntimeError, ValueError):  # pragma: no cover - exotic devices
+        return None
+    for index in range(count):
+        candidate = torch.device("cuda", index)
+        if home is not None and candidate == home:
+            continue
+        try:
+            peer_free, _peer_total = torch.cuda.mem_get_info(candidate)
+        except (RuntimeError, ValueError):  # pragma: no cover
+            continue
+        if peer_free * 0.9 >= need_bytes:
+            return candidate
+    return None
+
+
+def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
     """Collect the best-params snapshot, keeping multi-device blocks on-device.
 
     A CPU ``cache_device`` (``low_gpu_mem_usage``) keeps the historical host
@@ -266,14 +309,59 @@ def snapshot_best_params(block, cache_device="cpu"):
     every device's copies onto one cache device. Single-device blocks are
     unaffected either way (the cache device already equals each parameter's
     device).
+
+    ``act_floor_bytes`` applies the same ladder the huge-layer path uses
+    (``select_snapshot_device``): a snapshot may only stay beside the weights
+    when every host device keeps ``act_floor_bytes`` free after the clone -
+    that floor is the tune's remaining activation working set (the shape-based
+    estimate), so the clone cannot take the room the next backward needs.
+    Otherwise: an idle peer with headroom, else the host - always loud, never
+    raising.
     """
     try:
         non_cpu = torch.device(str(cache_device)).type != "cpu"
     except (ValueError, RuntimeError):
         non_cpu = False  # unrecognized label: keep the historical path (it will raise as before)
-    if non_cpu:
+    if not non_cpu:
+        return collect_best_params(block, cache_device)
+
+    per_home = _snapshot_param_needs(block)
+    if act_floor_bytes is None:
+        try:
+            return collect_best_params_local(block)
+        except RuntimeError as e:  # last-ditch: the clone itself failed
+            logger.warning("[snapshot] local copy failed (%s); parking the snapshot on host", e)
+            return collect_best_params(block, "cpu")
+
+    homes = [home for home, _need in per_home if home.type != "cpu"] or [torch.device(str(cache_device))]
+    need_by_home = dict(per_home)
+    total_need = sum(need for _home, need in per_home) or 0
+    gather_device = None  # None: beside-weights local copies
+    for home in homes:
+        need_home = need_by_home.get(home, 0)
+        try:
+            free, _total = torch.cuda.mem_get_info(home)
+        except (RuntimeError, ValueError):
+            gather_device = "cpu"
+            break
+        if free - need_home < act_floor_bytes:
+            gather_device = _idle_peer_for_(total_need, home) or "cpu"
+            break
+    if gather_device == "cpu":
+        logger.warning(
+            "[snapshot] %s free below the activation floor after a %.2fGiB clone; parking on host",
+            str(next(iter(homes))),
+            total_need / 2**30,
+        )
+        return collect_best_params(block, "cpu")
+    if isinstance(gather_device, torch.device):
+        logger.info("[snapshot] cloning %.2fGiB to idle peer %s", total_need / 2**30, gather_device)
+        return collect_best_params(block, gather_device)
+    try:
         return collect_best_params_local(block)
-    return collect_best_params(block, cache_device)
+    except RuntimeError as e:  # last-ditch: the clone itself failed
+        logger.warning("[snapshot] local copy failed (%s); parking the snapshot on host", e)
+        return collect_best_params(block, "cpu")
 
 
 def snapshot_window_floor_bytes(wrapper) -> int:
@@ -319,22 +407,9 @@ def select_snapshot_device(wrapper) -> torch.device:
     except (RuntimeError, ValueError):  # pragma: no cover - exotic devices
         pass
 
-    try:
-        count = torch.cuda.device_count()
-    except (RuntimeError, ValueError):  # pragma: no cover
-        count = 0
-    for index in range(count):
-        candidate = torch.device("cuda", index)
-        if candidate == home:
-            continue
-        try:
-            peer_free, _peer_total = torch.cuda.mem_get_info(candidate)
-        except (RuntimeError, ValueError):  # pragma: no cover
-            continue
-        # an idle peer carries a CUDA context and allocator fragmentation;
-        # leave a tenth of its free memory untouched
-        if peer_free * 0.9 >= need:
-            return candidate
+    peer = _idle_peer_for_(need, home)
+    if peer is not None:
+        return peer
 
     return torch.device("cpu")
 
