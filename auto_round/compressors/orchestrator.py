@@ -1057,7 +1057,12 @@ class CompressionOrchestrator(BaseOrchestrator):
         self._begin_predictor_capture_("fp")
 
     def _discover_final_norm_(self, all_blocks) -> Optional[str]:
-        """Name-agnostic final-norm discovery: the last block-external leaf with one 1-D param."""
+        """Name-agnostic final-norm discovery: the last block-external norm-like leaf.
+
+        Accepts any leaf whose parameters are ALL 1-D (RMSNorm has one,
+        LayerNorm-with-bias has two - GPT-J/OPT-class models) and whose name
+        says norm/ln_f; lm_head-class projections carry a 2-D weight and never
+        match."""
         block_prefixes = [name for block in all_blocks for name in block]
         best = None
         for name, m in self.model_context.model.named_modules():
@@ -1068,7 +1073,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             if list(m.children()):
                 continue
             params = list(m.parameters())
-            if len(params) == 1 and params[0].dim() == 1:
+            if params and all(p.dim() == 1 for p in params):
                 low = name.lower()
                 if "norm" in low or "ln_f" in low:
                     best = name

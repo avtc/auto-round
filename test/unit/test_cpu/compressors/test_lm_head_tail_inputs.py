@@ -220,6 +220,48 @@ class TestLmHeadTailInputs:
         assert out is not None and len(out[0]) == 3
 
 
+class TestFinalNormDiscovery:
+    """The discovery must cover LayerNorm-with-bias finals (GPT-J/OPT class),
+    not just single-param RMSNorms (Qwen/LLaMA class)."""
+
+    def _disc(self, model, blocks):
+        return _orchestrator_like(model)._discover_final_norm_(blocks)
+
+    def test_layernorm_with_bias_final_is_found(self):
+        class _M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.body = nn.Module()
+                self.body.blocks = nn.Module()  # block prefix marker
+                self.ln_f = nn.LayerNorm(8)
+                self.lm_head = nn.Linear(8, 16)
+
+        assert self._disc(_M(), [["body.blocks"]]) == "ln_f"
+
+    def test_rmsnorm_single_param_final_still_found(self):
+        class _M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.body = nn.Module()
+                self.body.blocks = nn.Module()
+                self.norm = nn.RMSNorm(8)
+                self.lm_head = nn.Linear(8, 16)
+
+        assert self._disc(_M(), [["body.blocks"]]) == "norm"
+
+    def test_block_internal_norms_excluded(self):
+        class _M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.body = nn.Module()
+                self.body.blocks = nn.Module()
+                self.body.blocks.ln_1 = nn.LayerNorm(8)
+                self.ln_f = nn.LayerNorm(8)
+                self.lm_head = nn.Linear(8, 16)
+
+        assert self._disc(_M(), [["body.blocks"]]) == "ln_f"
+
+
 class TestTailModeGates:
     def test_override_false_without_predictor(self):
         o = _orchestrator_like(_TinyModel())
