@@ -323,6 +323,23 @@ def _idle_peer_for_(need_bytes, home) -> Optional[torch.device]:
     return None
 
 
+def _snapshot_route_log_(block, route, msg, *args, warn_first=False) -> None:
+    """Log a snapshot routing decision once per change; DEBUG on repeats.
+
+    The ladder re-runs on every best-params update because free memory moves
+    between iterations; the re-evaluation stays, but an unchanged route (the
+    common case - parameters improving again) should not repeat at INFO.
+    ``warn_first`` keeps a fallback's first occurrence at WARNING."""
+    last = getattr(block, "_snapshot_route", None)
+    if last == route:
+        logger.debug(msg, *args)
+    elif warn_first:
+        logger.warning(msg, *args)
+    else:
+        logger.info(msg, *args)
+    block._snapshot_route = route
+
+
 def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
     """Collect the best-params snapshot, keeping multi-device blocks on-device.
 
@@ -370,21 +387,32 @@ def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
             gather_device = _idle_peer_for_(total_need, home) or "cpu"
             break
     if gather_device == "cpu":
-        logger.warning(
+        _snapshot_route_log_(
+            block,
+            "host",
             "[snapshot] %s free below the activation floor after a %.2fGiB clone; parking on host",
             str(next(iter(homes))),
             total_need / 2**30,
+            warn_first=True,
         )
         return collect_best_params(block, "cpu")
     if gather_device is None:
-        logger.info(
+        _snapshot_route_log_(
+            block,
+            "beside",
             "[snapshot] %.2fGiB stays beside the weights (floor %.2fGiB, free %.2fGiB)",
             total_need / 2**30,
             act_floor_bytes / 2**30,
             (info[0] if info else 0) / 2**30,
         )
     if isinstance(gather_device, torch.device):
-        logger.info("[snapshot] cloning %.2fGiB to idle peer %s", total_need / 2**30, gather_device)
+        _snapshot_route_log_(
+            block,
+            f"peer:{gather_device}",
+            "[snapshot] cloning %.2fGiB to idle peer %s",
+            total_need / 2**30,
+            gather_device,
+        )
         return collect_best_params(block, gather_device)
     try:
         return collect_best_params_local(block)
