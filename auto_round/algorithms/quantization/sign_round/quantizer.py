@@ -347,6 +347,59 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         return loss
 
+    def _log_tune_peak_prediction_(self, block, inputs, batch_size, act_floor_bytes) -> None:
+        """DEBUG: exact predicted tune peak, per module, from the scheme fields.
+
+        Steady terms (weight, value, min/max, grads, snapshot) come from
+        tune_memory's per-module arithmetic; the saved-for-backward term is
+        probe-measured for this wrapper class, scheme, and torch build (one
+        tiny replica forward per distinct signature per process); activations
+        come from the block memory estimator. Unknown probe ratios report
+        saved=None rather than guessing."""
+        try:
+            import logging as _logging
+
+            if not logger.isEnabledFor(_logging.DEBUG):
+                return
+            from auto_round.utils.tune_memory import predict_block_tune_peak
+
+            wrapper_cls = getattr(self, "wrapper_block", None)
+            wrapper_cls = getattr(wrapper_cls, "__func__", wrapper_cls)  # V2 partial-like
+            if not isinstance(wrapper_cls, type):
+                from auto_round.wrapper import WrapperLinear as wrapper_cls  # type: ignore[no-redef]
+            layers = [
+                m for _, m in block.named_modules() if getattr(m, "bits", 16) is not None and check_to_quantized(m)
+            ]
+            free_b = None
+            try:
+                from auto_round.utils.device import get_device_memory
+
+                free_b = int(get_device_memory(device_manager.device) or 0)
+            except Exception:  # pylint: disable=broad-except
+                pass
+            out = predict_block_tune_peak(
+                layers,
+                device_manager.device,
+                enable_minmax_tuning=bool(self.enable_minmax_tuning),
+                wrapper_cls=wrapper_cls,
+                allocated_now=0,
+                act_est_bytes=act_floor_bytes or 0,
+                frag_budget_bytes=0,
+                snapshot_on_host=act_floor_bytes is not None,
+            )
+            gib = lambda b: (b or 0) / 2**30  # noqa: E731
+            logger.debug(
+                "[tune-mem] %d modules: fixed %.2fGiB snapshot %s saved %s act %.2fGiB%s",
+                out["modules"],
+                gib(out["fixed"]),
+                "host" if out["snapshot"] == 0 else f"{gib(out['snapshot']):.2f}GiB",
+                "unknown" if out["saved"] is None else f"{gib(out['saved']):.2f}GiB",
+                gib(out["act"]),
+                f" | free {free_b / 2**30:.2f}GiB" if free_b else "",
+            )
+        except Exception as e:  # pylint: disable=broad-except - advisory logging
+            logger.debug("[tune-mem] prediction unavailable (%s: %s)", type(e).__name__, e)
+
     @staticmethod
     def _snapshot_act_floor_(block, inputs, batch_size):
         """Free-VRAM floor a home-resident best-params snapshot must leave.
@@ -503,6 +556,7 @@ class SignRoundQuantizer(BaseQuantizer):
         total_loss = 0
         batch_size = self.calibration_context.batch_size
         act_floor = self._snapshot_act_floor_(block, active_inputs, batch_size)
+        self._log_tune_peak_prediction_(block, active_inputs, batch_size, act_floor)
         global_batch_size = batch_size * self.gradient_accumulate_steps
         global_batch_size = min(nsamples, global_batch_size)
         # Compute num_elm once before the loop (used to normalise the accumulated loss).
