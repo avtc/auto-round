@@ -91,6 +91,14 @@ def probe_saved_ratio(
     ratios = {"fwd": None, "peak": None}
     try:
         probe_layer = torch.nn.Linear(512, 256, bias=False)
+        # the replica must satisfy the REAL wrapper ctor: it reads the act_*
+        # fields too, and an unstamped replica dies with AttributeError
+        defaults = {
+            "act_bits": 16,
+            "act_sym": True,
+            "act_data_type": None,
+            "act_dynamic": None,
+        }
         for attr in (
             "data_type",
             "bits",
@@ -99,9 +107,12 @@ def probe_saved_ratio(
             "super_bits",
             "super_group_size",
             "scale_dtype",
+            "act_bits",
+            "act_sym",
+            "act_data_type",
+            "act_dynamic",
         ):
-            if hasattr(layer, attr):
-                setattr(probe_layer, attr, getattr(layer, attr))
+            setattr(probe_layer, attr, getattr(layer, attr, defaults.get(attr)))
         probe_layer = probe_layer.to(
             getattr(layer, "weight", probe_layer.weight).dtype if layer.weight is not None else torch.bfloat16
         )

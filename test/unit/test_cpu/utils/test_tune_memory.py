@@ -137,3 +137,25 @@ class TestPredictionLineAtDebug:
                 ar_logger.removeHandler(caplog.handler)
         assert "[tune-mem]" in caplog.text
         assert "unavailable" not in caplog.text
+
+
+class TestProbeWithRealWrapper:
+    def test_probe_builds_through_real_wrapperlinear(self):
+        """The probe replica must satisfy the real WrapperLinear constructor.
+
+        The server hit AttributeError 'Linear' object has no attribute
+        'act_bits' here; the fake-wrapper tests could not see it."""
+        import torch.nn as nn
+
+        from auto_round.utils.tune_memory import _PROBE_CACHE, probe_saved_ratio
+
+        layer = nn.Linear(512, 256, bias=False).to(torch.bfloat16)
+        layer.bits, layer.group_size, layer.sym, layer.data_type = 4, 128, True, "int"
+        layer.super_bits = layer.super_group_size = None
+        layer.scale_dtype = None
+        layer.act_bits, layer.act_sym, layer.act_data_type, layer.act_dynamic = 16, True, None, None
+        from auto_round.wrapper import WrapperLinear
+
+        _PROBE_CACHE.clear()
+        ratios = probe_saved_ratio(WrapperLinear, layer, torch.device("cpu"), True)
+        assert ratios["fwd"] is not None and ratios["fwd"] > 0

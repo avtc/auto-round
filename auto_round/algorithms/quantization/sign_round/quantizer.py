@@ -368,9 +368,13 @@ class SignRoundQuantizer(BaseQuantizer):
             wrapper_cls = getattr(wrapper_cls, "__func__", wrapper_cls)  # V2 partial-like
             if not isinstance(wrapper_cls, type):
                 from auto_round.wrapper import WrapperLinear as wrapper_cls  # type: ignore[no-redef]
-            layers = [
-                m for _, m in block.named_modules() if getattr(m, "bits", 16) is not None and check_to_quantized(m)
-            ]
+            from auto_round.wrapper import WrapperLinear
+
+            _wrappers = [m for _, m in block.named_modules() if isinstance(m, WrapperLinear)]
+            # price each wrapper's original layer once; named_modules also
+            # yields the wrapper's registered orig_layer child, which would
+            # double-count every module
+            layers = [w.orig_layer for w in _wrappers if getattr(w, "orig_layer", None) is not None]
             free_b = None
             try:
                 from auto_round.compressors.utils import _accel_mem_get_info_

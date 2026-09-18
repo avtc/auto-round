@@ -264,6 +264,11 @@ def _accel_mem_get_info_(device):
     cuda, xpu and hpu behave identically; ``None`` means "unknown" and every
     caller keeps its fallback instead of guessing.
     """
+    if isinstance(device, str):
+        # device_manager.device may be a str ("cuda:0"); strings have no
+        # .type attribute, so the getattr below would misclassify them as
+        # cpu (the same class as the census str-device guard)
+        device = torch.device(device)
     if device is None or getattr(device, "type", "cpu") == "cpu":
         return None
     try:
