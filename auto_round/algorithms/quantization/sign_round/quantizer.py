@@ -452,17 +452,24 @@ class SignRoundQuantizer(BaseQuantizer):
                 return False, "saved term unknown (probe failed)"
             incremental = out["saved"] + out["act"] + out["snapshot"] + self._TWO_PASS_FRAG_BUDGET
             engaged = incremental > free_b
-            logger.info(
-                "[tune-mem] two-pass windowing %s: incremental %.2fGiB (saved %.2f act %.2f snapshot %.2f frag %.2f)"
-                " vs %.2fGiB free",
-                "ENGAGED" if engaged else "declined",
-                incremental / 2**30,
-                out["saved"] / 2**30,
-                out["act"] / 2**30,
-                out["snapshot"] / 2**30,
-                self._TWO_PASS_FRAG_BUDGET / 2**30,
-                free_b / 2**30,
-            )
+            if engaged:
+                logger.info(
+                    "[tune-mem] tuning this block in weight windows to fit memory: needs ~%.1f GiB"
+                    " (quantization intermediates %.1f, activations %.1f, snapshot %.1f,"
+                    " fragmentation reserve %.1f) but only %.1f GiB is free",
+                    incremental / 2**30,
+                    out["saved"] / 2**30,
+                    out["act"] / 2**30,
+                    out["snapshot"] / 2**30,
+                    self._TWO_PASS_FRAG_BUDGET / 2**30,
+                    free_b / 2**30,
+                )
+            else:
+                logger.debug(
+                    "[tune-mem] tuning this block in one pass: needs ~%.1f GiB, %.1f GiB free",
+                    incremental / 2**30,
+                    free_b / 2**30,
+                )
             return engaged, "memory gate"
         except Exception as e:  # pylint: disable=broad-except - gate is advisory
             logger.warning("[tune-mem] two-pass gate unavailable (%s: %s); plain path", type(e).__name__, e)
