@@ -420,6 +420,41 @@ class TestTreeTuneContainment:
         assert o._lm_head_chain_tail_ is None  # tail released in the finally
 
 
+class TestStampPin:
+    def test_minimal_pin_still_exposes_wrapper_attributes(self, tmp_path):
+        """The row-blocked wrapper reads orig_layer.scale_dtype (and every
+        scheme field); a minimal pin {bits, group_size, sym} must leave the
+        attribute PRESENT (None resolves to defaults downstream), matching
+        apply_plan_to_model semantics."""
+        o = _orch(_Body(), tmp_path)
+        import torch.nn as nn
+
+        m = nn.Linear(8, 8)
+        o._stamp_pin_(m, "mtp.layers.0.self_attn.q_proj", {"bits": 4, "group_size": 128, "sym": True})
+        assert m.bits == 4 and m.group_size == 128 and m.sym is True
+        assert hasattr(m, "scale_dtype") and m.scale_dtype is None
+        assert m.act_bits == 16
+        assert m.global_name == "mtp.layers.0.self_attn.q_proj"
+
+    def test_schema_pins_carry_scale_dtype(self, tmp_path):
+        o = _orch(
+            _Body(),
+            tmp_path,
+            composer=SimpleNamespace(
+                block_quantizer=[
+                    SimpleNamespace(
+                        iters=10,
+                        config=SimpleNamespace(
+                            bits=4, group_size=128, sym=True, data_type="int", scale_dtype="float16"
+                        ),
+                    )
+                ]
+            ),
+        )
+        pins = o._schema_pins_for_tree_(["mtp.layers.0.mlp.down_proj.weight"])
+        assert pins["mtp.layers.0.mlp.down_proj"]["scale_dtype"] == "float16"
+
+
 class TestLazyRefs:
     def test_refs_resolve_live_through_wrappers(self, tmp_path):
         from auto_round.compressors.predictor_tree import bind_predictor_forward

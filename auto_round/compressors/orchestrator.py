@@ -1118,6 +1118,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             "group_size": getattr(cfg, "group_size", 128),
             "sym": bool(getattr(cfg, "sym", False)),
             "data_type": getattr(cfg, "data_type", "int"),
+            "scale_dtype": getattr(cfg, "scale_dtype", None),
         }
         # keys as MODULE paths (param suffix stripped): the attach stage
         # matches pins against module names via regex search
@@ -1157,8 +1158,10 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         scheme_keys = tuple(f.name for f in dc_fields(QuantizationScheme)) + ("scale_dtype",)
         for attr in scheme_keys:
-            if pin.get(attr) is not None:
-                setattr(module, attr, pin[attr])
+            # ALWAYS set the attribute: readers (the row-blocked wrapper reads
+            # orig_layer.scale_dtype) require it to exist; None is a valid
+            # value they resolve to defaults, mirroring apply_plan_to_model
+            setattr(module, attr, pin.get(attr))
         # explicit None must not defeat the defaults (AutoScheme emits None);
         # same idiom as the base plan application
         module.act_bits = pin.get("act_bits") or 16
