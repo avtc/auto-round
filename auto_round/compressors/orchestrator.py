@@ -1532,14 +1532,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         # its allocator cache first so the tree's tuning state and activations
         # start from a defragmented pool. The streaming lane gets this for
         # free (every prior block is parked to meta and cleared per group) -
-        # the data-driven lane needs the explicit clear. The censuses bracket
-        # the clear: what the lm_head stage left, and what survives the clear
-        # going into the tree tune (DEBUG-gated; no-op without it).
-        from auto_round.utils.device import log_cuda_memory_census
-
-        log_cuda_memory_census("predictor-tree entry (pre-clear)", device_manager.device)
+        # the data-driven lane needs the explicit clear.
         clear_memory()
-        log_cuda_memory_census("predictor-tree entry (post-clear)", device_manager.device)
         for group in roots:
             info = analyze_predictor_group(ckpt, group, hidden)
             if info is None:
@@ -1611,10 +1605,11 @@ class CompressionOrchestrator(BaseOrchestrator):
         # mirrors the lm_head lane's wrapper-ready census (quantizer.py,
         # quantize_layer_outside_block): the tree block tunes via compress_block,
         # which carries no census of its own - this is the last clean vantage
-        # before the tune's value/grad/activation allocations begin
+        # before the tune's value/grad/activation allocations begin. Header
+        # only: the tensor-list walk runs in the failure handler
         from auto_round.utils.device import log_cuda_memory_census
 
-        log_cuda_memory_census(f"predictor tree ready {group}", device_manager.device)
+        log_cuda_memory_census(f"predictor tree ready {group}", device_manager.device, walk=False)
         ctx = BlockContext(
             model=self.model_context.model,
             block_names=[group],

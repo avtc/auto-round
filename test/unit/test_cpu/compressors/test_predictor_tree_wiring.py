@@ -427,7 +427,7 @@ class TestOOMCensusInContainment:
 
         def _census(tag, *a, **k):
             events.append(f"census:{tag}")
-            census_calls.append((tag, a, k))
+            census_calls.append((tag, a, k))  # kwargs carry walk= for list-vs-header
 
         _dev.log_cuda_memory_census = _census
         try:
@@ -444,6 +444,11 @@ class TestOOMCensusInContainment:
         for tag, a, k in census_calls:
             dev = k.get("device") or (a[0] if a else None)
             assert dev is not None, f"census {tag!r} called without a device"
+        # the expensive tensor-list walk runs only in the catch; the
+        # always-on entry/tree-ready censuses log the cheap header alone
+        walk_by_tag = {tag: k.get("walk", True) for tag, a, k in census_calls}
+        assert walk_by_tag["predictor tree ready mtp"] is False  # header only
+        assert walk_by_tag["predictor tree mtp OOM (at failure)"] is True  # full walk
 
 
 class TestImmediatePackingPath:

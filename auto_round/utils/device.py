@@ -1767,7 +1767,7 @@ def dispatch_model_by_all_available_devices(
     return model
 
 
-def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
+def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = True) -> None:
     """Log a DEBUG-level VRAM census: allocator totals plus the largest live tensors.
 
     Intended for diagnosing memory pressure at specific points (tuning huge
@@ -1783,6 +1783,22 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12) -> None:
     if device is None:
         device = torch.device("cuda") if torch.cuda.is_available() else None
     if device is None or getattr(device, "type", "cpu") != "cuda":
+        return
+    if not walk:
+        # allocator-only header: the gc walk is the expensive part and runs
+        # only where a failure needs the tensor list
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(device)
+        except Exception:  # pylint: disable=broad-except
+            return
+        logger.debug(
+            "[vram] %s: free %.2fGiB / total %.2fGiB | torch allocated %.2fGiB reserved %.2fGiB",
+            tag,
+            free_b / 2**30,
+            total_b / 2**30,
+            torch.cuda.memory_allocated(device) / 2**30,
+            torch.cuda.memory_reserved(device) / 2**30,
+        )
         return
     try:
         free_b, total_b = torch.cuda.mem_get_info(device)
