@@ -904,6 +904,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             derived = self._lm_head_tail_inputs_(tail_name)
             if derived is not None:
                 tail_inputs[tail_name] = derived
+                self._attach_tail_imatrix_(tail_name, derived[0])
         if tail_inputs:
             layer_inputs = dict(layer_inputs)
             for tail_name, (fp_rows, _q_rows) in tail_inputs.items():
@@ -1245,11 +1246,12 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         The early-stop at the last cached block would otherwise abort every
         forward before the final norm, and the tail hook would never fire.
-        Tail-fed external layers (lm_head) need the same override: their
-        statistics hooks (imatrix/act-max) fire only when the forward runs
-        through them.
+        Tail-fed external layers (lm_head) must NOT engage this override: the
+        single-block-target early-stop keeps the collection walk at the first
+        block, and their statistics are attached from the chain tail rows
+        instead (see ``_attach_tail_imatrix_``).
         """
-        return getattr(self, "_predictor_plan_", None) is not None or bool(getattr(self, "_tail_fed_layers_", None))
+        return getattr(self, "_predictor_plan_", None) is not None
 
     @staticmethod
     def _chain_hidden_rows(chain_state):
@@ -1277,6 +1279,33 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "multiple lm_head candidates in the outside-block plan %s; tuning %s", candidates, candidates[0]
             )
         return candidates[0]
+
+    def _attach_tail_imatrix_(self, lm_head_name, fp_rows) -> None:
+        """Attach the fp-input imatrix for lm_head from the chain tail rows.
+
+        In the capture path this statistic was accumulated by the quantizer's
+        fp-input forward hook while the collection walk executed lm_head; with
+        the single-block-target early-stop the walk never reaches lm_head, so
+        the same math (fp32 column sums of squares over all token rows, plus
+        the row count for the RTN normalization) runs directly over the tail
+        rows - the identical inputs the hook would have seen. Never overwrites
+        an existing statistic.
+        """
+        module = get_module(self.model_context.model, lm_head_name)
+        if module is None or hasattr(module, "imatrix"):
+            return
+        if not fp_rows:
+            return
+        total = None
+        count = 0
+        for row in fp_rows:
+            flattened = row.reshape(-1, row.shape[-1]).to(torch.float32)
+            squared = torch.sum(torch.pow(flattened, 2), dim=0).to(torch.float32)
+            total = squared if total is None else total + squared.to(total.device)
+            count += flattened.shape[0]
+        module.imatrix = total
+        module.imatrix_cnt = count
+        logger.info("[lm_head] attached the fp-input imatrix for %s from %d chain-tail rows", lm_head_name, count)
 
     def _lm_head_tail_inputs_(self, lm_head_name):
         """``(fp_rows, q_rows)`` for lm_head from the calibration chain tail.

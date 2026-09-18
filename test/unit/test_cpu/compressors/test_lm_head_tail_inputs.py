@@ -48,7 +48,7 @@ def _orchestrator_like(model):
         _predictor_plan_=None,
     )
     o._chain_hidden_rows = CompressionOrchestrator._chain_hidden_rows  # staticmethod: bind directly
-    for name in ("_resolve_lm_head_name_", "_lm_head_tail_inputs_", "_discover_final_norm_"):
+    for name in ("_resolve_lm_head_name_", "_lm_head_tail_inputs_", "_discover_final_norm_", "_attach_tail_imatrix_"):
         setattr(o, name, MethodType(getattr(CompressionOrchestrator, name), o))
     o._predictor_overrides_last_cache_ = MethodType(CompressionOrchestrator._predictor_overrides_last_cache_, o)
     return o
@@ -145,19 +145,58 @@ class TestLmHeadTailInputs:
 
 
 class TestTailModeGates:
-    def test_override_false_without_tail_or_predictor(self):
+    def test_override_false_without_predictor(self):
         o = _orchestrator_like(_TinyModel())
         assert o._predictor_overrides_last_cache_() is False
 
-    def test_override_true_with_tail_fed_layers(self):
+    def test_override_false_with_tail_fed_layers_only(self):
+        # the single-block-target early-stop must stay active for tail mode:
+        # lm_head statistics come from the tail rows, not from the walk
         o = _orchestrator_like(_TinyModel())
         o._tail_fed_layers_ = ["lm_head"]
-        assert o._predictor_overrides_last_cache_() is True
+        assert o._predictor_overrides_last_cache_() is False
 
     def test_override_true_with_predictor_plan(self):
         o = _orchestrator_like(_TinyModel())
         o._predictor_plan_ = {"roots": ["mtp"]}
         assert o._predictor_overrides_last_cache_() is True
+
+
+class TestTailImatrix:
+    """The fp-input imatrix must equal what the quantizer hook would accumulate."""
+
+    def _rows(self):
+        torch.manual_seed(0)
+        return [torch.randn(1, 7, 8) for _ in range(3)]
+
+    def test_imatrix_matches_hook_math(self):
+        model = _TinyModel()
+        o = _orchestrator_like(model)
+        rows = self._rows()
+        o._attach_tail_imatrix_("lm_head", rows)
+        expected = None
+        n = 0
+        for row in rows:
+            flat = row.reshape(-1, row.shape[-1]).to(torch.float32)
+            sq = torch.sum(flat.pow(2), dim=0)
+            expected = sq if expected is None else expected + sq
+            n += flat.shape[0]
+        assert hasattr(model.lm_head, "imatrix")
+        assert torch.allclose(model.lm_head.imatrix, expected, atol=1e-5)
+        assert model.lm_head.imatrix_cnt == n
+
+    def test_imatrix_never_overwrites_existing(self):
+        model = _TinyModel()
+        o = _orchestrator_like(model)
+        model.lm_head.imatrix = torch.ones(8)
+        o._attach_tail_imatrix_("lm_head", self._rows())
+        assert torch.equal(model.lm_head.imatrix, torch.ones(8))
+
+    def test_imatrix_skipped_without_rows(self):
+        model = _TinyModel()
+        o = _orchestrator_like(model)
+        o._attach_tail_imatrix_("lm_head", [])
+        assert not hasattr(model.lm_head, "imatrix")
 
 
 class TestLaneConsumesTailInputs:
@@ -216,3 +255,18 @@ class TestLaneConsumesTailInputs:
         # the tail rows were consumed and released; no capture pass was issued at all
         assert o._lm_head_chain_tail_ is None
         assert cache_calls == []
+
+    def test_lane_attaches_tail_imatrix(self, monkeypatch):
+        captured_calls, cache_calls, o = self._run_lane(monkeypatch)
+        lm = o.model_context.model.lm_head
+        assert hasattr(lm, "imatrix") and lm.imatrix.numel() == lm.in_features
+        # parity with the hook math over the exact rows the lane received
+        norm = o.model_context.model.model.norm
+        rows = captured_calls[0][0]
+        expected = None
+        for row in rows:
+            flat = row.reshape(-1, row.shape[-1]).to(torch.float32)
+            sq = torch.sum(flat.pow(2), dim=0)
+            expected = sq if expected is None else expected + sq
+        assert torch.allclose(lm.imatrix, expected, atol=1e-5)
+        assert lm.imatrix_cnt == sum(r.numel() // r.shape[-1] for r in rows)
