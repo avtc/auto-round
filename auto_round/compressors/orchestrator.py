@@ -1528,6 +1528,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             return
         all_blocks = get_block_names(self.model_context.model)
         source_dir = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
+        # the tree stage follows the lm_head tune on the same device; reclaim
+        # its allocator cache first so the tree's tuning state and activations
+        # start from a defragmented pool. The streaming lane gets this for
+        # free (every prior block is parked to meta and cleared per group) -
+        # the data-driven lane needs the explicit clear.
+        clear_memory()
         for group in roots:
             info = analyze_predictor_group(ckpt, group, hidden)
             if info is None:

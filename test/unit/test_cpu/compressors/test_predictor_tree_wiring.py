@@ -332,6 +332,49 @@ class TestTreeFallbacks:
         assert calls["block"] == []
 
 
+class TestTreeStageMemoryHygiene:
+    def test_clear_memory_precedes_tree_tuning(self, tmp_path, monkeypatch):
+        """The tree stage follows the lm_head tune on the same device and must
+        reclaim its allocator cache first - the streaming lane gets a clean
+        device by construction (prior blocks parked to meta and cleared per
+        group); the data-driven lane needs the explicit clear."""
+        _write_ckpt(tmp_path)
+        model = _Body()
+        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o.formats = []
+        o._prepare_predictor_tuning_([["blocks.0"], ["blocks.1"]])
+        rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (rows(), rows())
+        o._predictor_tree_aux_ = {}
+        events = []
+
+        class _Composer:
+            block_quantizer = [SimpleNamespace(iters=10)]
+
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
+
+            def compress_block(self, *a, **k):
+                events.append("tune")
+                return None, None
+
+            def compress_layer_outside_block(self, *a, **k):
+                pass
+
+        o.alg_composer = _Composer()
+        import auto_round.compressors.orchestrator as om
+
+        om.get_block_names = lambda mm: [["blocks.0"], ["blocks.1"]]
+        _orig_clear = om.clear_memory
+        om.clear_memory = lambda *a, **k: events.append("clear")
+        try:
+            o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        finally:
+            om.clear_memory = _orig_clear
+        assert "tune" in events
+        assert events.index("clear") < events.index("tune")
+
+
 class TestImmediatePackingPath:
     def test_tree_modules_packed_when_immediate(self, tmp_path, monkeypatch):
         _write_ckpt(tmp_path)
