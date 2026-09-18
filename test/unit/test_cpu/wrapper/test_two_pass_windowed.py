@@ -160,3 +160,62 @@ class TestRealWrapperTwoPass:
         )
         # forward outputs identical
         assert torch.equal(y.detach(), y2.detach())
+
+
+class TestStepParity:
+    def _mk_wrapper(self, seed, in_f=512, out_f=256):
+        torch.manual_seed(seed)
+        layer = torch.nn.Linear(in_f, out_f, bias=False).to(torch.bfloat16)
+        layer.bits, layer.group_size, layer.sym, layer.data_type = 4, 128, True, "int"
+        layer.super_bits = layer.super_group_size = None
+        layer.scale_dtype = None
+        layer.act_bits, layer.act_sym, layer.act_data_type, layer.act_dynamic = 16, True, None, None
+        from auto_round.wrapper import WrapperLinear
+
+        w = WrapperLinear(layer, enable_minmax_tuning=True, enable_torch_compile=False, device=torch.device("cpu"))
+        for key in ("value", "min_scale", "max_scale"):
+            w.params[key].requires_grad_(True)
+        w.min_scale = w.params["min_scale"]
+        w.max_scale = w.params["max_scale"]
+        return w
+
+    def test_step_matches_plain_backward_bitexact(self):
+        from types import SimpleNamespace
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        w1, w2 = self._mk_wrapper(2), self._mk_wrapper(3, 256, 128)
+        x = torch.randn(2, 16, 512, dtype=torch.bfloat16)
+        ref = torch.randn(2, 16, 128, dtype=torch.float32)
+
+        def block_fwd(a, b, inp):
+            return b(a(inp))
+
+        # plain composite
+        y = block_fwd(w1, w2, x)
+        loss = (y.float() - ref).pow(2).mean()
+        loss.backward()
+        plain = {n: w.params["value"].grad.clone() for n, w in (("w1", w1), ("w2", w2))}
+
+        for w in (w1, w2):
+            w.params["value"].grad = None
+
+        # engaged: leaves + the quantizer step (chained wrappers = block shape)
+        leaves = [w.begin_two_pass_forward_() for w in (w1, w2)]
+        y2 = block_fwd(w1, w2, x)
+        loss2 = (y2.float() - ref).pow(2).mean()
+        SignRoundQuantizer._two_pass_backward_step_(SimpleNamespace(), [w1, w2], [], loss2, leaves)
+
+        assert torch.equal(y.detach(), y2.detach())
+        assert torch.equal(w1.params["value"].grad, plain["w1"])
+        assert torch.equal(w2.params["value"].grad, plain["w2"])
+
+    def test_quantize_block_gates_the_engaged_path(self):
+        import inspect
+
+        from auto_round.algorithms.quantization.sign_round import quantizer as qmod
+
+        src = inspect.getsource(qmod.SignRoundQuantizer.quantize_block)
+        assert "_should_two_pass_" in src  # gate decision inside the tune
+        assert "_two_pass_backward_step_" in src  # engaged replacement
+        assert "_scale_loss_and_backward(scaler, loss)" in src  # plain path retained

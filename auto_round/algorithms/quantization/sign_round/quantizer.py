@@ -400,6 +400,85 @@ class SignRoundQuantizer(BaseQuantizer):
         except Exception as e:  # pylint: disable=broad-except - advisory logging
             logger.debug("[tune-mem] prediction unavailable (%s: %s)", type(e).__name__, e)
 
+    _TWO_PASS_FRAG_BUDGET = 2 * 2**30  # flat, census-measured fragmentation class
+
+    def _should_two_pass_(self, block, inputs, batch_size, act_floor_bytes, scaler) -> tuple:
+        """Whether this block tune should run the two-pass windowed backward.
+
+        Engages when the tune's predicted INCREMENTAL working set (probe-
+        measured saved qdq intermediates + activation estimate + snapshot +
+        the flat fragmentation budget) exceeds the device's free memory, and
+        no gradient-sync owner (torch DDP, sharded/manual sync, in-process
+        mirrors) is active. Declines loudly; never raises."""
+        from auto_round.utils.distributed import engine_owns_gradient_sync
+
+        if scaler is not None:
+            return False, "scaler active"
+        if engine_owns_gradient_sync(block, getattr(self, "_tune_sync_fn", None)):
+            return False, "gradient-sync engine active"
+        wrappers = [
+            m for _, m in block.named_modules() if hasattr(m, "orig_layer") and m.params.get("value") is not None
+        ]
+        if not wrappers:
+            return False, "no wrapped layers"
+        try:
+            from auto_round.compressors.utils import _accel_mem_get_info_
+            from auto_round.utils.tune_memory import predict_block_tune_peak
+
+            info = _accel_mem_get_info_(device_manager.device)
+            if info is None:
+                return False, "free memory unknown"
+            free_b = info[0]
+            layers = [w.orig_layer for w in wrappers]
+            out = predict_block_tune_peak(
+                layers,
+                device_manager.device,
+                enable_minmax_tuning=bool(self.enable_minmax_tuning),
+                wrapper_cls=type(wrappers[0]),
+                allocated_now=0,
+                act_est_bytes=act_floor_bytes or 0,
+                frag_budget_bytes=0,
+                snapshot_on_host=act_floor_bytes is not None,
+            )
+            if out["saved"] is None:
+                return False, "saved term unknown (probe failed)"
+            incremental = out["saved"] + out["act"] + out["snapshot"] + self._TWO_PASS_FRAG_BUDGET
+            engaged = incremental > free_b
+            logger.info(
+                "[tune-mem] two-pass windowing %s: incremental %.2fGiB (saved %.2f act %.2f snapshot %.2f frag %.2f)"
+                " vs %.2fGiB free",
+                "ENGAGED" if engaged else "declined",
+                incremental / 2**30,
+                out["saved"] / 2**30,
+                out["act"] / 2**30,
+                out["snapshot"] / 2**30,
+                self._TWO_PASS_FRAG_BUDGET / 2**30,
+                free_b / 2**30,
+            )
+            return engaged, "memory gate"
+        except Exception as e:  # pylint: disable=broad-except - gate is advisory
+            logger.warning("[tune-mem] two-pass gate unavailable (%s: %s); plain path", type(e).__name__, e)
+            return False, "gate error"
+
+    def _two_pass_backward_step_(self, wrappers, other_targets, scaled_loss, leaves) -> None:
+        """One engaged sub-batch backward: act/bias params via pass 1, wrappers via pass 2.
+
+        Pass 1 backpropagates the (already scaled) loss into the leaf weights
+        and any non-wrapper tuning parameters (activation scales, tuned
+        biases); pass 2 turns each wrapper's dL/dw_q into parameter grads via
+        its windowed local graphs. Together they equal the plain composite
+        backward exactly."""
+        if other_targets:
+            scaled_loss.backward(inputs=list(other_targets) + list(leaves), allow_unused=True)
+            grads = [leaf.grad for leaf in leaves]
+        else:
+            grads = torch.autograd.grad(scaled_loss, list(leaves), allow_unused=True)
+        for wrapper, g in zip(wrappers, grads):
+            if g is not None:
+                wrapper.backward_from_weight_grad_(g)
+            else:
+                wrapper.end_two_pass_forward_()
+
     @staticmethod
     def _snapshot_act_floor_(block, inputs, batch_size):
         """Free-VRAM floor a home-resident best-params snapshot must leave.
@@ -567,6 +646,15 @@ class SignRoundQuantizer(BaseQuantizer):
                 num_elm = sum(active_inputs[i.item()].numel() for i in whole_indices)
 
         block, sync_gradients = setup_ddp_if_needed_(self, block, device_manager.device_list)
+        self._tune_sync_fn = sync_gradients
+        two_pass, _two_pass_why = self._should_two_pass_(block, active_inputs, batch_size, act_floor, scaler)
+        _tp_wrappers = []
+        if two_pass:
+            from auto_round.wrapper import WrapperLinear as _WL
+
+            _tp_wrappers = [
+                m for _, m in block.named_modules() if isinstance(m, _WL) and m.params.get("value") is not None
+            ]
         index_sampler = IndexSampler(nsamples, global_batch_size)
         block_fwd = self.block_forward
 
@@ -624,6 +712,7 @@ class SignRoundQuantizer(BaseQuantizer):
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
                     staged = tuning_cache.get(indices) if tuning_cache is not None else None
+                    _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers] if two_pass else None
                     if staged is None:
                         ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
                         pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
@@ -648,7 +737,19 @@ class SignRoundQuantizer(BaseQuantizer):
                         # clear memory to avoid OOM due to memory fragmentation
                         clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
 
-                    self._scale_loss_and_backward(scaler, loss)
+                    if two_pass:
+                        _wrapper_param_ids = {
+                            id(p) for w in _tp_wrappers for p in w.params.values() if isinstance(p, torch.Tensor)
+                        }
+                        _other = [
+                            p
+                            for group in optimizer.param_groups
+                            for p in group["params"]
+                            if id(p) not in _wrapper_param_ids
+                        ]
+                        self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
+                    else:
+                        self._scale_loss_and_backward(scaler, loss)
 
                     if mid_iter_mem_check:
                         # clear memory to avoid OOM due to memory fragmentation
