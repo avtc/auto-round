@@ -96,6 +96,7 @@ _ORCH_METHODS = (
     "_snapshot_predictor_aux_",
     "_tune_predictor_trees_",
     "_tune_predictor_trees_impl_",
+    "_tune_one_predictor_tree_",
 )
 
 
@@ -377,6 +378,46 @@ class TestCacheOverrideHelpers:
         entry2 = {"input_ids": rows, "attention_mask": masks}
         o._snapshot_predictor_aux_({"blocks.1": entry2}, ["blocks.0", "blocks.1"])
         assert set(o._predictor_tree_aux_.keys()) == {"attention_mask"}
+
+
+class TestTreeTuneContainment:
+    def test_tune_failure_leaves_export_path_and_releases(self, tmp_path, monkeypatch):
+        """A crash anywhere in the tree tune (here: materialize) must degrade
+        loudly to the export path and release the tree - the run continues
+        after every block is already tuned and streamed."""
+        _write_ckpt(tmp_path)
+        model = _Body()
+        calls = {"detach": 0}
+        monkeypatch.setattr(
+            CompressionOrchestrator,
+            "_detach_tree_",
+            lambda self, group: calls.__setitem__("detach", calls["detach"] + 1),
+        )
+        import auto_round.compressors.orchestrator as orch_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("synthetic tune failure")
+
+        monkeypatch.setattr(orch_mod, "materialize_model_", _boom)
+        o = _orch(
+            model,
+            tmp_path,
+            layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}},
+            composer=SimpleNamespace(
+                block_quantizer=[SimpleNamespace(iters=10)],
+                dispatch_block=lambda block, input_ids, input_others: block,
+                compress_block=lambda *a, **k: None,
+            ),
+        )
+        o._detach_tree_ = lambda group: calls.__setitem__("detach", calls["detach"] + 1)
+        monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        _rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (_rows(), _rows())
+        o._predictor_tree_aux_ = {}
+        o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        assert calls["detach"] == 1  # tree released for the export pass
+        assert o._lm_head_chain_tail_ is None  # tail released in the finally
 
 
 class TestLazyRefs:

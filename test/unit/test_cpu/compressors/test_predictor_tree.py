@@ -206,6 +206,21 @@ class TestBuildPredictorTree:
         assert name.startswith("blocks.")
         assert isinstance(mod, _DecLayer)
 
+    def test_tree_builds_from_meta_sibling(self, tmp_path):
+        """Immediate saving moves tuned blocks to meta after their shard
+        write; the tree builder must still produce real, checkpoint-valued
+        params (copy_ into a meta param silently keeps it meta)."""
+        mtp_ref, body, tensors, info, all_blocks = self._setup(tmp_path)
+        name, sibling = pick_sibling_layer(body, tensors, info, all_blocks)
+        sibling.to("meta")
+        claimed = build_predictor_tree(body, str(tmp_path), tensors, info, sibling)
+        tree = body.get_submodule("mtp")
+        for pname, p in tree.named_parameters():
+            assert not p.is_meta, pname
+        assert torch.allclose(tree.eh_proj.weight, mtp_ref.eh_proj.weight.detach())
+        assert torch.allclose(tree.layer.fc1.weight, mtp_ref.layer.fc1.weight.detach())
+        assert torch.allclose(tree.enorm.weight, mtp_ref.enorm.weight.detach())
+
     def test_tree_builds_and_matches_reference(self, tmp_path):
         mtp_ref, body, tensors, info, all_blocks = self._setup(tmp_path)
         name, sibling = pick_sibling_layer(body, tensors, info, all_blocks)

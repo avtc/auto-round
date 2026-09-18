@@ -1007,12 +1007,29 @@ class CompressionOrchestrator(BaseOrchestrator):
             else:
                 q_layer_input = q_layer_inputs.get(layer_name, None) if q_layer_inputs is not None else None
                 q_layer_input = to_device(q_layer_input, self.compress_context.cache_device)
-            self.alg_composer.compress_layer_outside_block(
-                get_module(self.model, layer_name),
-                fp_inputs=layer_input,
-                q_inputs=q_layer_input,
-                input_ids=token_ids,
-            )
+            try:
+                self.alg_composer.compress_layer_outside_block(
+                    get_module(self.model, layer_name),
+                    fp_inputs=layer_input,
+                    q_inputs=q_layer_input,
+                    input_ids=token_ids,
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                # containment: a failed tune leaves the layer unquantized and
+                # the export pass (missing-tensors) completes the artifact,
+                # instead of losing a run whose blocks are already tuned and
+                # streamed
+                logger.warning(
+                    "outside-block layer %s tuning failed (%s: %s); leaving it to the export path",
+                    layer_name,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+                del layer_input
+                clear_memory(q_layer_input)
+                clear_memory()
+                continue
             if self.compress_context.is_immediate_packing:
                 immediate_pack(layer_name, self.layer_config)
 
@@ -1483,56 +1500,81 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # pristine)
                 pins = self._schema_pins_for_tree_(names_under)
                 logger.info("predictor tree %s follows the run's schema", group)
-            attached = self._attach_pinned_tree_(group, ckpt, info, pins, all_blocks, source_dir)
-            if attached is None:
+            # containment: any failure from here through the tune leaves the
+            # tree to the export pass (missing-tensors covers whatever this
+            # run leaves unquantized) instead of killing the run after every
+            # block has already been tuned and streamed
+            try:
+                self._tune_one_predictor_tree_(
+                    group, ckpt, info, pins, all_blocks, source_dir, fp_tail, token_ids, e_rows
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    "predictor tree %s tuning failed (%s: %s); leaving it to the export path",
+                    group,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+                try:
+                    self._detach_tree_(group)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                clear_memory()
                 continue
-            shell, pinned, claimed = attached
-            bind_predictor_forward(
-                shell,
-                {
-                    "norm_e": info["norm_e"][: -len(".weight")],
-                    "norm_h": info["norm_h"][: -len(".weight")],
-                    "fc": info["fc"][: -len(".weight")],
-                    "layer": info["layer_root"],
-                    "final_norm": info["final_norm"][: -len(".weight")] if info.get("final_norm") else None,
-                },
-                e=e_rows[0],
-                model=self.model_context.model,
-            )
-            aux = dict(self._predictor_tree_aux_ or {})
-            aux["_predictor_e"] = e_rows
-            _, input_others = self._preprocess_block_inputs({"input_ids": fp_tail, **aux})
-            from auto_round.algorithms.composer import BlockContext
 
-            # same infrastructure the block loop applies: materialize meta
-            # tensors, honor the amp dtype policy, and place the tree on the
-            # tuning device (compress_block treats placement as caller's job)
-            materialize_model_(shell)
-            convert_module_to_hp_if_necessary(shell, self.model_context.amp_dtype, device_manager.device)
-            shell = self.alg_composer.dispatch_block(shell, fp_tail, input_others)
-            ctx = BlockContext(
-                model=self.model_context.model,
-                block_names=[group],
-                block_name=group,
-                block_index=len(all_blocks),
-                bs=self.calibration_context.batch_size,
-                block_cnt=len(all_blocks) + 1,
-            )
-            new_q_output, reference_output = self.alg_composer.compress_block(
-                shell,
-                fp_tail,
-                input_others,
-                block_ctx=ctx,
-                q_inputs=self._predictor_q_tail_,
-                input_ids=token_ids,
-            )
-            self._tune_tree_heads_(
-                group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids
-            )
-            if self.compress_context.is_immediate_packing:
-                for module_name in pinned:
-                    immediate_pack(module_name, self.layer_config)
-            clear_memory()
+    def _tune_one_predictor_tree_(
+        self, group, ckpt, info, pins, all_blocks, source_dir, fp_tail, token_ids, e_rows
+    ) -> None:
+        """Attach, tune, and pack one predictor tree (failures handled by the caller)."""
+        attached = self._attach_pinned_tree_(group, ckpt, info, pins, all_blocks, source_dir)
+        if attached is None:
+            return
+        shell, pinned, claimed = attached
+        bind_predictor_forward(
+            shell,
+            {
+                "norm_e": info["norm_e"][: -len(".weight")],
+                "norm_h": info["norm_h"][: -len(".weight")],
+                "fc": info["fc"][: -len(".weight")],
+                "layer": info["layer_root"],
+                "final_norm": info["final_norm"][: -len(".weight")] if info.get("final_norm") else None,
+            },
+            e=e_rows[0],
+            model=self.model_context.model,
+        )
+        aux = dict(self._predictor_tree_aux_ or {})
+        aux["_predictor_e"] = e_rows
+        _, input_others = self._preprocess_block_inputs({"input_ids": fp_tail, **aux})
+        from auto_round.algorithms.composer import BlockContext
+
+        # same infrastructure the block loop applies: materialize meta
+        # tensors, honor the amp dtype policy, and place the tree on the
+        # tuning device (compress_block treats placement as caller's job)
+        materialize_model_(shell)
+        convert_module_to_hp_if_necessary(shell, self.model_context.amp_dtype, device_manager.device)
+        shell = self.alg_composer.dispatch_block(shell, fp_tail, input_others)
+        ctx = BlockContext(
+            model=self.model_context.model,
+            block_names=[group],
+            block_name=group,
+            block_index=len(all_blocks),
+            bs=self.calibration_context.batch_size,
+            block_cnt=len(all_blocks) + 1,
+        )
+        new_q_output, reference_output = self.alg_composer.compress_block(
+            shell,
+            fp_tail,
+            input_others,
+            block_ctx=ctx,
+            q_inputs=self._predictor_q_tail_,
+            input_ids=token_ids,
+        )
+        self._tune_tree_heads_(group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids)
+        if self.compress_context.is_immediate_packing:
+            for module_name in pinned:
+                immediate_pack(module_name, self.layer_config)
+        clear_memory()
 
     def _check_compatibility(self) -> None:
         """Checks compatibility of the configurations and model."""

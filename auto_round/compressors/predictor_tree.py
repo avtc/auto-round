@@ -361,6 +361,10 @@ def build_predictor_tree(
     hidden = ckpt_tensors[info["fc"]][0][0]
     layer_root = info["layer_root"]
     layer_mod = copy.deepcopy(sibling)
+    # under immediate saving the sibling has been moved to meta after its
+    # shard write; empty-then-copy_ transitions meta params to real (copy_
+    # into a meta param silently keeps it meta, and set_data refuses it)
+    layer_mod.to_empty(device="cpu")
     # the snapshot copies instance-level forwards too (replacement wrappers)
     # whose closures bind the ORIGINAL module - calling them re-enters the
     # source block instead of the copy.  Restore each module's class forward.
@@ -390,6 +394,7 @@ def build_predictor_tree(
         if proto is None:
             raise RuntimeError(f"no norm prototype inside the sibling for {role}")
         mod = copy.deepcopy(proto)
+        mod.to_empty(device="cpu")
         with torch.no_grad():
             mod.weight.data.copy_(load_checkpoint_tensor(source_dir, ckpt_tensors, tensor_name))
         mod_path = tensor_name[: -len(".weight")]
