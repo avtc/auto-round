@@ -25,7 +25,7 @@ def _fmt(gguf=False):
     )
 
 
-def _compressor(outside_block_layers):
+def _compressor(outside_block_layers, rtncfg=True):
     model = type("QwenForCausalLM", (), {"_tied_weight_keys": {}})()
     o = SimpleNamespace(
         formats=[_fmt()],
@@ -36,7 +36,7 @@ def _compressor(outside_block_layers):
         output_dir="/tmp/does-not-matter",
         shard_writer=None,
         _ensure_shard_writer=lambda self_=None: None,
-        quantize_config=RTNConfig(data_type="int"),
+        quantize_config=RTNConfig(data_type="int") if rtncfg else _SignRoundCfg(),
         model_context=SimpleNamespace(model=model, is_mllm=False),
         compress_context=SimpleNamespace(
             is_immediate_packing=True,
@@ -48,6 +48,12 @@ def _compressor(outside_block_layers):
     return o
 
 
+class _SignRoundCfg:
+    """Stands in for SignRoundConfig (not an RTNConfig)."""
+
+    data_type = "int"
+
+
 class TestImmediatePackingWithOutsideBlockLayers:
     def test_outside_block_layers_keep_immediate_packing(self):
         c = _compressor(outside_block_layers=True)
@@ -55,6 +61,22 @@ class TestImmediatePackingWithOutsideBlockLayers:
         assert c.compress_context.is_immediate_packing is True
         # low_cpu_mem_usage + packing upgrades to progressive shard writes
         assert c.compress_context.is_immediate_saving is True
+
+    def test_signround_outside_block_layers_keep_immediate_saving(self):
+        """iters>0 runs: the old capture-path concern (whole-model materialize
+        under low_cpu_mem) is gone with the tail lane - no forced downgrade."""
+        c = _compressor(outside_block_layers=True, rtncfg=False)
+        c._adjust_immediate_packing_and_saving()
+        assert c.compress_context.is_immediate_packing is True
+        assert c.compress_context.is_immediate_saving is True
+        assert c.compress_context.low_cpu_mem_usage is True
+
+    def test_inplace_not_disabled_for_outside_block_layers(self):
+        """The inplace=False starvation used to leave is_immediate_packing
+        False even with the gate removed; the quantize() entry no longer
+        touches inplace for outside-block layers."""
+        src = open(__import__("auto_round.compressors.base", fromlist=["x"]).__file__, encoding="utf-8").read()
+        assert "self.inplace = False" not in src
 
     def test_plain_run_unchanged(self):
         c = _compressor(outside_block_layers=False)

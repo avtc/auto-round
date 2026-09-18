@@ -1735,17 +1735,15 @@ class BaseOrchestrator(object):
         if self.compress_context.low_cpu_mem_usage:
             self._offloader.reset()
 
-        # Disable inplace when quantized layers live outside transformer blocks.
-        # gguf lm-head used rtn in version>=0.13
-        if (
-            self.has_qlayer_outside_block
-            and self.need_calib
-            and (
-                self.compress_context.formats is None
-                or "gguf" not in self.compress_context.formats[0].__class__.__name__.lower()
-            )
-        ):
-            self.inplace = False
+        # Historical note: quantized layers outside transformer blocks used to
+        # force inplace False here ("gguf lm-head used rtn in version>=0.13"),
+        # which starved the immediate-packing condition in
+        # _adjust_immediate_packing_and_saving for every non-GGUF format -
+        # blocks stayed unpacked in RAM until one whole-model pack+save at the
+        # end. The tail lane feeds outside-block layers from the calibration
+        # chain (no post-block model walk), so the restriction is gone: blocks
+        # pack and shards stream progressively exactly as they do without
+        # outside-block layers.
 
         if not hasattr(self, "formats"):
             logger.warning("this API is deprecated, please use `quantize_and_save` instead")
@@ -1891,14 +1889,12 @@ class BaseOrchestrator(object):
                     "Keeping `low_cpu_mem_usage` enabled in RTN mode (iters=0): "
                     "RTN path uses blockwise quantization and supports per-block offloading."
                 )
-            elif self.has_qlayer_outside_block and not isinstance(self.quantize_config, RTNConfig):
-                logger.warning(
-                    "`low_cpu_mem_usage` is not fully supported "
-                    "when there are quantized layers outside blocks and optimized RTN is disabled. "
-                    "Setting low_cpu_mem_usage to False."
-                )
-                self.compress_context.low_cpu_mem_usage = False
-                self.compress_context.is_immediate_saving = False
+        # Historical note: the third branch here used to force
+        # low_cpu_mem_usage/is_immediate_saving to False for non-RTN runs with
+        # quantized layers outside blocks (the capture path materialized the
+        # whole model, which low_cpu could not host). The tail lane removed
+        # that walk, so SignRound runs keep progressive packing and saving
+        # too.
 
         if self.compress_context.is_immediate_saving and not (
             "int" in self.quantize_config.data_type
