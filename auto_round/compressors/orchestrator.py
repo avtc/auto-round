@@ -1532,8 +1532,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         # its allocator cache first so the tree's tuning state and activations
         # start from a defragmented pool. The streaming lane gets this for
         # free (every prior block is parked to meta and cleared per group) -
-        # the data-driven lane needs the explicit clear.
+        # the data-driven lane needs the explicit clear. The censuses bracket
+        # the clear: what the lm_head stage left, and what survives the clear
+        # going into the tree tune (DEBUG-gated; no-op without it).
+        from auto_round.utils.device import log_cuda_memory_census
+
+        log_cuda_memory_census("predictor-tree entry (pre-clear)")
         clear_memory()
+        log_cuda_memory_census("predictor-tree entry (post-clear)")
         for group in roots:
             info = analyze_predictor_group(ckpt, group, hidden)
             if info is None:

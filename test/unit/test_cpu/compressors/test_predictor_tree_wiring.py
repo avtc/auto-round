@@ -367,12 +367,20 @@ class TestTreeStageMemoryHygiene:
         om.get_block_names = lambda mm: [["blocks.0"], ["blocks.1"]]
         _orig_clear = om.clear_memory
         om.clear_memory = lambda *a, **k: events.append("clear")
+
+        import auto_round.utils.device as _dev
+
+        _orig_census = _dev.log_cuda_memory_census
+        _dev.log_cuda_memory_census = lambda tag, *a, **k: events.append(f"census:{tag}")
         try:
             o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
         finally:
             om.clear_memory = _orig_clear
+            _dev.log_cuda_memory_census = _orig_census
         assert "tune" in events
         assert events.index("clear") < events.index("tune")
+        assert events.index("census:predictor-tree entry (pre-clear)") < events.index("clear")
+        assert events.index("census:predictor-tree entry (post-clear)") > events.index("clear")
 
 
 class TestImmediatePackingPath:
