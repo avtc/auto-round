@@ -168,12 +168,14 @@ class TestPreparePredictor:
         o._prepare_predictor_tuning_(ALL_BLOCKS)
         assert o._predictor_plan_ is not None
 
-    def test_noop_for_gguf_formats(self, tmp_path):
+    def test_plan_for_gguf_formats_too(self, tmp_path):
+        # tuned MTP under gguf is the proven campaign configuration (the GGUF
+        # twins carry quantized nextn); the tree tunes regardless of format
         _write_ckpt(tmp_path)
         o = _orch(_Body(), tmp_path)
         o.formats = [SimpleNamespace(is_gguf=lambda: True)]
         o._prepare_predictor_tuning_(ALL_BLOCKS)
-        assert o._predictor_plan_ is None
+        assert o._predictor_plan_ is not None
 
 
 class TestTunePredictorTrees:

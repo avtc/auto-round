@@ -1040,11 +1040,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         source_dir = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
         if not source_dir or not os.path.isdir(source_dir):
             return
-        formats = getattr(self, "formats", None) or []
-        if any(f.is_gguf() for f in formats):
-            # gguf owns its MTP export shape (unpinned nextn tensors go out at
-            # the run's qtype); keep the tree off the tuning pipeline there
-            return
         ckpt = list_checkpoint_tensors(source_dir)
         roots = checkpoint_only_roots(ckpt, self.model_context.model)
         if not roots:
