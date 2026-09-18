@@ -683,7 +683,35 @@ def _get_save_folder_name(format, *args, **kwargs) -> str:
     return compress_context.output_dir
 
 
-def immediate_pack(name: str, layer_config: dict):
+def _resolve_pack_device_(weight, default_device):
+    """Pack device for a layer: the host when int64 intermediates can't fit VRAM.
+
+    Huge layers (a 248k-vocab lm_head) pack into int64 intermediates of ~8-16
+    bytes/elem: right after its tune the GPU still holds tuning remnants, and
+    the pack OOMs even though the tune itself fit. Probe the live free VRAM
+    and drop to the host when the intermediates cannot fit - the packed
+    output serializes to disk from the host just as well. Body-sized linears
+    stay on the device. Caller-specified devices bypass the probe entirely.
+    """
+    if weight is None or not str(default_device).startswith("cuda"):
+        return default_device
+    try:
+        free_b, _ = torch.cuda.mem_get_info(default_device)
+    except Exception:  # pylint: disable=broad-except
+        return default_device
+    need_b = weight.numel() * 16
+    if need_b > free_b * 0.9:
+        logger.info(
+            "[pack] packing on cpu: intermediates ~%.1fGiB vs %.1fGiB free on %s",
+            need_b / 2**30,
+            free_b / 2**30,
+            default_device,
+        )
+        return torch.device("cpu")
+    return default_device
+
+
+def immediate_pack(name: str, layer_config: dict, device=None):
     from auto_round.context.compress import CompressContext
     from auto_round.context.model import ModelContext
 
@@ -692,10 +720,14 @@ def immediate_pack(name: str, layer_config: dict):
 
     if not compress_context.is_immediate_packing:
         return
+    pack_device = _resolve_pack_device_(
+        getattr(get_module(model_context.model, name), "weight", None),
+        device if device is not None else device_manager.device,
+    )
     compress_context.formats[0].immediate_pack(
         name=name,
         model=model_context.model,
-        device=device_manager.device,
+        device=pack_device,
         output_dir=_get_save_folder_name(compress_context.formats[0]),
         layer_config=layer_config,
         tokenizer=model_context.tokenizer,
