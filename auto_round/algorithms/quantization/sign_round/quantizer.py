@@ -402,7 +402,9 @@ class SignRoundQuantizer(BaseQuantizer):
 
     _TWO_PASS_FRAG_BUDGET = 2 * 2**30  # flat, census-measured fragmentation class
 
-    def _should_two_pass_(self, block, inputs, batch_size, act_floor_bytes, scaler) -> tuple:
+    def _should_two_pass_(
+        self, block, inputs, batch_size, act_floor_bytes, scaler, parallel_engine_active=False
+    ) -> tuple:
         """Whether this block tune should run the two-pass windowed backward.
 
         Engages when the tune's predicted INCREMENTAL working set (probe-
@@ -414,6 +416,12 @@ class SignRoundQuantizer(BaseQuantizer):
 
         if scaler is not None:
             return False, "scaler active"
+        if parallel_engine_active:
+            # the tune-parallel engine (feature/ddp-parallel-tuning) replaces
+            # the serial sub-batch loop wholesale; pass accel-is-not-None here
+            # when that branch merges so the gate stays correct under any
+            # future loop reshaping
+            return False, "tune-parallel engine active"
         if engine_owns_gradient_sync(block, getattr(self, "_tune_sync_fn", None)):
             return False, "gradient-sync engine active"
         wrappers = [
@@ -712,44 +720,60 @@ class SignRoundQuantizer(BaseQuantizer):
                 for batch_start in range(0, len(global_indices), batch_size):
                     indices = global_indices[batch_start : batch_start + batch_size]
                     staged = tuning_cache.get(indices) if tuning_cache is not None else None
-                    _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers] if two_pass else None
-                    if staged is None:
-                        ref_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
-                        pred_output = block_fwd.forward(block, active_inputs, input_others, indices, _fwd_cache_device)
-                    else:
-                        ref_output = staged[2]
-                        pred_output = tuning_cache.forward(block, staged, _fwd_cache_device)
-                    if loss_device is not None:
-                        pred_output = pred_output.to(loss_device)
-                    if (
-                        block_ctx.block_index == block_ctx.block_cnt - 1
-                        and self.enable_lfq
-                        and input_ids is not None
-                        and self._is_text_decoder_block(block_ctx.block_name)
-                    ):
-                        loss = self.lfq_loss(pred_output, torch.cat([input_ids[i] for i in indices], dim=0))
-                    else:
-                        loss = self._get_loss(pred_output, ref_output, indices, mse_loss, device, valid_token_mask)
+
+                    def _compute_loss():
+                        if staged is None:
+                            ref_output_l = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
+                            pred_output_l = block_fwd.forward(
+                                block, active_inputs, input_others, indices, _fwd_cache_device
+                            )
+                        else:
+                            ref_output_l = staged[2]
+                            pred_output_l = tuning_cache.forward(block, staged, _fwd_cache_device)
+                        if loss_device is not None:
+                            pred_output_l = pred_output_l.to(loss_device)
+                        if (
+                            block_ctx.block_index == block_ctx.block_cnt - 1
+                            and self.enable_lfq
+                            and input_ids is not None
+                            and self._is_text_decoder_block(block_ctx.block_name)
+                        ):
+                            return self.lfq_loss(pred_output_l, torch.cat([input_ids[i] for i in indices], dim=0))
+                        return self._get_loss(pred_output_l, ref_output_l, indices, mse_loss, device, valid_token_mask)
+
+                    try:
+                        _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers] if two_pass else None
+                        loss = _compute_loss()
+                        if two_pass:
+                            _wrapper_param_ids = {
+                                id(p) for w in _tp_wrappers for p in w.params.values() if isinstance(p, torch.Tensor)
+                            }
+                            _other = [
+                                p
+                                for group in optimizer.param_groups
+                                for p in group["params"]
+                                if id(p) not in _wrapper_param_ids
+                            ]
+                            self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
+                        else:
+                            self._scale_loss_and_backward(scaler, loss)
+                    except Exception:
+                        if not two_pass:
+                            raise
+                        # never lose the tune to an engaged-path failure: clear
+                        # the leaves, redo this sub-batch on the plain path, and
+                        # stay plain for the rest of the tune
+                        logger.warning(
+                            "[tune-mem] two-pass step failed; falling back to the plain path for the rest of the tune",
+                            exc_info=True,
+                        )
+                        for w in _tp_wrappers:
+                            w.end_two_pass_forward_()
+                        two_pass = False
+                        loss = _compute_loss()
+                        self._scale_loss_and_backward(scaler, loss)
                     num_elm = 1 if num_elm <= 0 else num_elm
                     total_loss += loss.item() / num_elm
-
-                    if mid_iter_mem_check:
-                        # clear memory to avoid OOM due to memory fragmentation
-                        clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
-
-                    if two_pass:
-                        _wrapper_param_ids = {
-                            id(p) for w in _tp_wrappers for p in w.params.values() if isinstance(p, torch.Tensor)
-                        }
-                        _other = [
-                            p
-                            for group in optimizer.param_groups
-                            for p in group["params"]
-                            if id(p) not in _wrapper_param_ids
-                        ]
-                        self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
-                    else:
-                        self._scale_loss_and_backward(scaler, loss)
 
                     if mid_iter_mem_check:
                         # clear memory to avoid OOM due to memory fragmentation
