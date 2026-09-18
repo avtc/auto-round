@@ -23,7 +23,7 @@ from auto_round.compressors.predictor_tree import (
     synthesize_predictor_e,
 )
 
-HID = 8
+HID = 32  # divisible by 32: canonical shape policy keeps tree Linears quantizable
 
 
 class _Norm(nn.Module):

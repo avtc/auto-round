@@ -15,7 +15,7 @@ import torch.nn as nn
 from auto_round.compressors.orchestrator import CompressionOrchestrator
 from auto_round.compressors.predictor_tree import list_checkpoint_tensors
 
-HID = 8
+HID = 32  # divisible by 32: canonical shape policy keeps tree Linears quantizable
 
 
 class _Norm(nn.Module):
@@ -72,7 +72,7 @@ class _Body(nn.Module):
 
 def _write_ckpt(tmp_path):
     mtp = _MTP()
-    fc = nn.Linear(HID, 16, bias=False)  # vocab head pinned like mtp.fc
+    fc = nn.Linear(HID, 32, bias=False)  # vocab head pinned like mtp.fc (32: shape-divisible)
     tensors = {f"mtp.{n}": p.detach().clone() for n, p in mtp.named_parameters()}
     tensors["mtp.fc.weight"] = fc.weight.detach().clone()
     from safetensors.torch import save_file
@@ -87,7 +87,7 @@ _ORCH_METHODS = (
     "_discover_final_norm_",
     "_prepare_predictor_tuning_",
     "_pins_for_tree_",
-    "_schema_pins_for_tree_",
+    "_resolve_tree_pins_",
     "_stamp_pin_",
     "_attach_pinned_tree_",
     "_detach_tree_",
@@ -109,7 +109,24 @@ def _orch(model, tmp_path, layer_config=None, iters=10, composer=None):
             setattr(o, name, getattr(CompressionOrchestrator, name).__get__(o))
     if not hasattr(model, "config"):
         model.config = SimpleNamespace(name_or_path=str(tmp_path), hidden_size=HID, text_config=None)
-    o.model_context = SimpleNamespace(model=model, amp_dtype=torch.float32)
+    o.model_context = SimpleNamespace(model=model, amp_dtype=torch.float32, is_mllm=False)
+    from auto_round.schemes import QuantizationScheme
+
+    o.scheme_context = QuantizationScheme(
+        bits=4,
+        group_size=-1,
+        sym=True,
+        data_type="int",
+        act_bits=16,
+        act_sym=True,
+        act_data_type=None,
+        act_group_size=None,
+    )
+    o.scale_dtype = "fp16"
+    o.supported_types = None
+    o.inner_supported_types = None
+    o.ignore_layers = ""
+    o._formats_policy_string = lambda: "auto_round"
     o.layer_config = layer_config if layer_config is not None else {}
     o.alg_composer = composer or SimpleNamespace(block_quantizer=[SimpleNamespace(iters=iters)])
     o.formats = []
@@ -420,6 +437,48 @@ class TestTreeTuneContainment:
         assert o._lm_head_chain_tail_ is None  # tail released in the finally
 
 
+class TestHeadShapePolicy:
+    def test_indivisible_head_stays_full_precision(self, tmp_path):
+        """The canonical shape-divisibility policy applies to tree heads too:
+        a vocab dim not divisible by 32 resolves to fp16 and the heads path
+        leaves the tensor verbatim for the export."""
+        _write_ckpt(tmp_path)
+        model = _Body()
+        # shrink the head to an indivisible vocab
+        import safetensors.torch as st
+
+        f = os.path.join(tmp_path, "model.safetensors")
+        tensors = st.load_file(f)
+        tensors["mtp.fc.weight"] = torch.randn(16, HID)
+        st.save_file(tensors, f)
+        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o._prepare_predictor_tuning_([["blocks.0"], ["blocks.1"]])
+        rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (rows(), rows())
+        o._predictor_tree_aux_ = {}
+        tuned = []
+
+        class _Composer:
+            block_quantizer = [SimpleNamespace(iters=10)]
+
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
+
+            def compress_block(self, *a, **k):
+                return None, None
+
+            def compress_layer_outside_block(self, mod, *a, **k):
+                tuned.append(getattr(mod, "global_name", "?"))
+
+        o.alg_composer = _Composer()
+        import auto_round.compressors.orchestrator as om
+
+        om.get_block_names = lambda mm: [["blocks.0"], ["blocks.1"]]
+        o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        assert "mtp.fc" not in tuned  # policy skip, left verbatim for the export
+        assert "mtp.fc" not in o.layer_config
+
+
 class TestStampPin:
     def test_minimal_pin_still_exposes_wrapper_attributes(self, tmp_path):
         """The row-blocked wrapper reads orig_layer.scale_dtype (and every
@@ -435,24 +494,6 @@ class TestStampPin:
         assert hasattr(m, "scale_dtype") and m.scale_dtype is None
         assert m.act_bits == 16
         assert m.global_name == "mtp.layers.0.self_attn.q_proj"
-
-    def test_schema_pins_carry_scale_dtype(self, tmp_path):
-        o = _orch(
-            _Body(),
-            tmp_path,
-            composer=SimpleNamespace(
-                block_quantizer=[
-                    SimpleNamespace(
-                        iters=10,
-                        config=SimpleNamespace(
-                            bits=4, group_size=128, sym=True, data_type="int", scale_dtype="float16"
-                        ),
-                    )
-                ]
-            ),
-        )
-        pins = o._schema_pins_for_tree_(["mtp.layers.0.mlp.down_proj.weight"])
-        assert pins["mtp.layers.0.mlp.down_proj"]["scale_dtype"] == "float16"
 
 
 class TestLazyRefs:

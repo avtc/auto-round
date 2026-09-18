@@ -1100,35 +1100,6 @@ class CompressionOrchestrator(BaseOrchestrator):
                     best = name
         return best
 
-    def _schema_pins_for_tree_(self, tree_tensor_names) -> dict:
-        """Synthesized pins for an unpinned predictor tree: the run's schema.
-
-        Every other layer gets these fields from the resolved scheme; the tree
-        gets the same treatment instead of the export-time WOQ round-trip with
-        global defaults. Layer-config pins, when present, always win.
-        """
-        quantizer = getattr(self.alg_composer, "block_quantizer", None)
-        if isinstance(quantizer, (list, tuple)):
-            quantizer = quantizer[0] if quantizer else None
-        cfg = getattr(quantizer, "config", None)
-        if cfg is None:
-            return {}
-        scheme_pin = {
-            "bits": getattr(cfg, "bits", 4),
-            "group_size": getattr(cfg, "group_size", 128),
-            "sym": bool(getattr(cfg, "sym", False)),
-            "data_type": getattr(cfg, "data_type", "int"),
-            "scale_dtype": getattr(cfg, "scale_dtype", None),
-        }
-        # keys as MODULE paths (param suffix stripped): the attach stage
-        # matches pins against module names via regex search
-        module_paths = []
-        for n in tree_tensor_names:
-            mod = n.rsplit(".", 1)[0]
-            if mod not in module_paths:
-                module_paths.append(mod)
-        return {mod: dict(scheme_pin) for mod in module_paths}
-
     def _pins_for_tree_(self, tree_tensor_names) -> dict:
         """Layer-config entries (exact or regex) matching tree tensor paths.
 
@@ -1208,37 +1179,98 @@ class CompressionOrchestrator(BaseOrchestrator):
             return None
         logger.info("tuning predictor tree %s (layer from sibling %s)", group, sibling_name)
         shell = self.model_context.model.get_submodule(group)
+        # canonical layer-config resolution on the attached tree: user pins
+        # resolve with the repo's own precedence and EVERY entry carries the
+        # full scheme field set - the same dict the export writes into
+        # quantization_config; unpinned tree modules resolve to the run's
+        # scheme
+        resolved = self._resolve_tree_pins_(group, pins)
         pinned = []
         for n, m in shell.named_modules():
             if not isinstance(m, torch.nn.Linear):
                 continue
             module_name = f"{group}.{n}" if n else group
-            for key, pin in pins.items():
-                if module_name == key or re.compile(to_standard_regex(key)).search(module_name):
-                    self._stamp_pin_(m, module_name, pin)
-                    self.layer_config[module_name] = pin
-                    pinned.append(module_name)
-                    break
+            entry = resolved.get(module_name)
+            if entry is None:
+                continue
+            self._stamp_pin_(m, module_name, entry)
+            self.layer_config[module_name] = entry
+            pinned.append(module_name)
         if not pinned:
             logger.warning(
                 "predictor tree %s: pins %s matched no Linear; leaving to the export pass", group, list(pins)
             )
             self._detach_tree_(group)
             return None
-        return shell, pinned, claimed
+        return shell, pinned, claimed, resolved
+
+    def _resolve_tree_pins_(self, group, user_pins) -> dict:
+        """Canonical layer-config resolution over the attached tree modules.
+
+        Reuses the compressor's resolver (``resolve_layer_config``): user
+        pins expand and resolve with the repo's own precedence, and every
+        entry carries the full scheme field set - the same dict registered in
+        ``layer_config`` and exported into ``quantization_config``. Unpinned
+        tree modules resolve to the run's scheme defaults.
+        """
+        from auto_round.compressors.config_resolution.contracts import ResolvedScheme
+        from auto_round.compressors.layer_config_resolver import _resolve_layer_config_presets, resolve_layer_config
+
+        # outside-block modules are opt-in in the resolver (entries appear only
+        # when the user pins them); the tree stage's policy is schema-follow,
+        # so seed every tree Linear with the canonical scheme default and let
+        # user pins win through the resolver's own expansion/precedence
+        _, default_dict, _, _ = _resolve_layer_config_presets(
+            {}, self.model_context.model, self.ignore_layers, self.scheme_context, self.scale_dtype, True
+        )
+        tree_defaults = {}
+        for n, mod in self.model_context.model.named_modules():
+            if isinstance(mod, torch.nn.Linear) and (n == group or n.startswith(group + ".")):
+                tree_defaults[n] = copy.deepcopy(default_dict)
+        merged = {**tree_defaults, **{k: dict(v) for k, v in (user_pins or {}).items()}}
+        resolved = resolve_layer_config(
+            model=self.model_context.model,
+            scheme=ResolvedScheme.from_scheme(self.scheme_context),
+            layer_config=merged,
+            scale_dtype=self.scale_dtype,
+            supported_types=self.supported_types,
+            inner_supported_types=self.inner_supported_types,
+            quant_block_list=None,
+            ignore_layers=self.ignore_layers,
+            quant_lm_head=False,
+            enable_gguf_official_mixed=False,
+            is_mllm=self.model_context.is_mllm,
+            format=self._formats_policy_string(),
+        )
+        return dict(resolved)
 
     def _tune_tree_heads_(
-        self, group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids
+        self,
+        group,
+        ckpt,
+        info,
+        user_pins,
+        resolved_pins,
+        claimed,
+        source_dir,
+        new_q_output,
+        reference_output,
+        token_ids,
     ):
-        """Tune remaining pinned 2-D tensors (e.g. the vocab head) on the tree's outputs."""
+        """Tune remaining 2-D tensors (e.g. the vocab head) on the tree's outputs.
+
+        Head modules are created first, then the canonical resolver runs once
+        over the now-complete module set (user pins with the repo precedence;
+        schema defaults for the rest), and each created head tunes on the
+        tree's fp/q outputs with its resolved entry registered for export.
+        """
         role_names = {info[r] for r in ("fc", "norm_e", "norm_h", "final_norm") if info.get(r)}
+        heads = []
         for n in (n for n in ckpt if n.startswith(group + ".")):
             if n in claimed or n in role_names or not n.endswith(".weight"):
                 continue
             shape = ckpt[n][0]
             if len(shape) != 2:
-                continue
-            if not any(n == key or re.compile(to_standard_regex(key)).search(n) for key in pins):
                 continue
             path = n[: -len(".weight")]
             try:
@@ -1250,14 +1282,21 @@ class CompressionOrchestrator(BaseOrchestrator):
                 parent = ensure_module_path(self.model_context.model, path)
                 parent.add_module(path.rsplit(".", 1)[-1], head)
                 with torch.no_grad():
-                    head.weight.copy_(load_checkpoint_tensor(source_dir, ckpt, n))
+                    head.weight.data.copy_(load_checkpoint_tensor(source_dir, ckpt, n))
+            heads.append(path)
+        if not heads:
+            return
+        resolved = self._resolve_tree_pins_(group, user_pins)
+        for path in heads:
+            entry = resolved.get(path)
+            if entry is None:
+                continue
+            if entry.get("data_type") == "float" or int(entry.get("bits") or 0) >= 16:
+                continue  # full-precision pin: leave the tensor verbatim for the export
             mod = self.model_context.model.get_submodule(path)
-            for key, pin in pins.items():
-                if path == key or re.compile(to_standard_regex(key)).search(path):
-                    self._stamp_pin_(mod, path, pin)
-                    self.layer_config[path] = pin
-                    break
-            logger.info("tuning pinned predictor tensor %s on the tree outputs", path)
+            self._stamp_pin_(mod, path, entry)
+            self.layer_config[path] = entry
+            logger.info("tuning predictor tensor %s on the tree outputs", path)
             self.alg_composer.compress_layer_outside_block(
                 mod,
                 fp_inputs=reference_output,
@@ -1497,12 +1536,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             names_under = [n for n in ckpt if n.startswith(group + ".")]
             pins = self._pins_for_tree_(names_under)
             if not pins:
-                # no explicit pins: the tree follows the run's schema, the
-                # same recipe every other layer gets (pins, when present,
-                # always win - e.g. an explicit bits-16 pin keeps the draft
-                # pristine)
-                pins = self._schema_pins_for_tree_(names_under)
-                logger.info("predictor tree %s follows the run's schema", group)
+                logger.info("predictor tree %s follows the run's schema (no layer-config pins)", group)
             # containment: any failure from here through the tune leaves the
             # tree to the export pass (missing-tensors covers whatever this
             # run leaves unquantized) instead of killing the run after every
@@ -1533,7 +1567,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         attached = self._attach_pinned_tree_(group, ckpt, info, pins, all_blocks, source_dir)
         if attached is None:
             return
-        shell, pinned, claimed = attached
+        shell, pinned, claimed, resolved_pins = attached
         bind_predictor_forward(
             shell,
             {
@@ -1573,7 +1607,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             q_inputs=self._predictor_q_tail_,
             input_ids=token_ids,
         )
-        self._tune_tree_heads_(group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids)
+        self._tune_tree_heads_(
+            group, ckpt, info, pins, resolved_pins, claimed, source_dir, new_q_output, reference_output, token_ids
+        )
         if self.compress_context.is_immediate_packing:
             for module_name in pinned:
                 immediate_pack(module_name, self.layer_config)
