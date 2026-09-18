@@ -407,84 +407,44 @@ class SignRoundQuantizer(BaseQuantizer):
         except Exception as e:  # pylint: disable=broad-except - advisory logging
             logger.debug("[tune-mem] prediction unavailable (%s: %s)", type(e).__name__, e)
 
-    _TWO_PASS_FRAG_BUDGET = 2 * 2**30  # flat, census-measured fragmentation class
+    @staticmethod
+    def _is_oom_(e: BaseException) -> bool:
+        """Whether an exception means the accelerator ran out of memory."""
+        import torch as _torch
 
-    def _should_two_pass_(
-        self, block, inputs, batch_size, act_floor_bytes, scaler, parallel_engine_active=False
-    ) -> tuple:
-        """Whether this block tune should run the two-pass windowed backward.
+        oom_cls = getattr(getattr(_torch.cuda, "OutOfMemoryError", None), "__name__", "")
+        if oom_cls and type(e).__name__ == oom_cls:
+            return True
+        return "out of memory" in str(e).lower()
 
-        Engages when the tune's predicted INCREMENTAL working set (probe-
-        measured saved qdq intermediates + activation estimate + snapshot +
-        the flat fragmentation budget) exceeds the device's free memory, and
-        no gradient-sync owner (torch DDP, sharded/manual sync, in-process
-        mirrors) is active. Declines loudly; never raises."""
+    def _resolve_chunked_mode_(self, block, scaler) -> tuple:
+        """Effective chunked-backward mode: "0", "1", or "auto".
+
+        AR_TUNE_CHUNKED_BACKWARD rules the mode; preconditions (no scaler,
+        no gradient-sync owner) can only DECLINE a forced mode, loudly - a
+        tune must never silently ignore the operator's setting."""
+        from auto_round import envs as _envs
         from auto_round.utils.distributed import engine_owns_gradient_sync
 
+        mode = _envs.AR_TUNE_CHUNKED_BACKWARD
+        why = "env"
+        if mode == "0":
+            return mode, why
         if scaler is not None:
-            return False, "scaler active"
-        if parallel_engine_active:
-            # the tune-parallel engine (feature/ddp-parallel-tuning) replaces
-            # the serial sub-batch loop wholesale; pass accel-is-not-None here
-            # when that branch merges so the gate stays correct under any
-            # future loop reshaping
-            return False, "tune-parallel engine active"
-        if engine_owns_gradient_sync(block, getattr(self, "_tune_sync_fn", None)):
-            return False, "gradient-sync engine active"
-        wrappers = [
-            m for _, m in block.named_modules() if hasattr(m, "orig_layer") and m.params.get("value") is not None
-        ]
-        if not wrappers:
-            return False, "no wrapped layers"
-        try:
-            from auto_round.compressors.utils import _accel_mem_get_info_
-            from auto_round.utils.tune_memory import predict_block_tune_peak
-
-            info = _accel_mem_get_info_(device_manager.device)
-            if info is None:
-                return False, "free memory unknown"
-            free_b = info[0]
-            layers = [w.orig_layer for w in wrappers]
-            out = predict_block_tune_peak(
-                layers,
-                device_manager.device,
-                enable_minmax_tuning=bool(self.enable_minmax_tuning),
-                wrapper_cls=type(wrappers[0]),
-                allocated_now=0,
-                act_est_bytes=act_floor_bytes or 0,
-                frag_budget_bytes=0,
-                snapshot_on_host=act_floor_bytes is not None,
-            )
-            if out["saved"] is None:
+            if mode == "1":
                 logger.warning(
-                    "[tune-mem] cannot measure this wrapper class's saved-for-backward footprint; "
-                    "tuning the block in one pass"
+                    "[chunked-backward] AR_TUNE_CHUNKED_BACKWARD=1 ignored for this tune: "
+                    "a grad scaler is active and the chunked path does not handle it"
                 )
-                return False, "saved term unknown (probe failed)"
-            incremental = out["saved"] + out["act"] + out["snapshot"] + self._TWO_PASS_FRAG_BUDGET
-            engaged = incremental > free_b
-            if engaged:
-                logger.info(
-                    "[tune-mem] tuning this block in weight windows to fit memory: needs ~%.1f GiB"
-                    " (quantization intermediates %.1f, activations %.1f, snapshot %.1f,"
-                    " fragmentation reserve %.1f) but only %.1f GiB is free",
-                    incremental / 2**30,
-                    out["saved"] / 2**30,
-                    out["act"] / 2**30,
-                    out["snapshot"] / 2**30,
-                    self._TWO_PASS_FRAG_BUDGET / 2**30,
-                    free_b / 2**30,
+            return "0", "scaler active"
+        if engine_owns_gradient_sync(block, getattr(self, "_tune_sync_fn", None)):
+            if mode == "1":
+                logger.warning(
+                    "[chunked-backward] AR_TUNE_CHUNKED_BACKWARD=1 ignored for this tune: "
+                    "a gradient-sync engine owns the backward"
                 )
-            else:
-                logger.debug(
-                    "[tune-mem] tuning this block in one pass: needs ~%.1f GiB, %.1f GiB free",
-                    incremental / 2**30,
-                    free_b / 2**30,
-                )
-            return engaged, "memory gate"
-        except Exception as e:  # pylint: disable=broad-except - gate is advisory
-            logger.warning("[tune-mem] two-pass gate unavailable (%s: %s); plain path", type(e).__name__, e)
-            return False, "gate error"
+            return "0", "gradient-sync engine active"
+        return mode, why
 
     def _two_pass_backward_step_(self, wrappers, other_targets, scaled_loss, leaves) -> None:
         """One engaged sub-batch backward: act/bias params via pass 1, wrappers via pass 2.
@@ -673,14 +633,19 @@ class SignRoundQuantizer(BaseQuantizer):
 
         block, sync_gradients = setup_ddp_if_needed_(self, block, device_manager.device_list)
         self._tune_sync_fn = sync_gradients
-        two_pass, _two_pass_why = self._should_two_pass_(block, active_inputs, batch_size, act_floor, scaler)
+        _chunked_mode, _chunked_why = self._resolve_chunked_mode_(block, scaler)
+        two_pass = _chunked_mode == "1"
         _tp_wrappers = []
-        if two_pass:
+        if _chunked_mode != "0":
             from auto_round.wrapper import WrapperLinear as _WL
 
             _tp_wrappers = [
                 m for _, m in block.named_modules() if isinstance(m, _WL) and m.params.get("value") is not None
             ]
+            if not _tp_wrappers:
+                _chunked_mode = "0"
+            elif two_pass:
+                logger.info("[chunked-backward] tuning this block's backward in chunks (AR_TUNE_CHUNKED_BACKWARD=1)")
         index_sampler = IndexSampler(nsamples, global_batch_size)
         block_fwd = self.block_forward
 
@@ -775,21 +740,47 @@ class SignRoundQuantizer(BaseQuantizer):
                             self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
                         else:
                             self._scale_loss_and_backward(scaler, loss)
-                    except Exception:
-                        if not two_pass:
+                    except Exception as e:
+                        if two_pass:
+                            if _chunked_mode == "1":
+                                # forced mode: no silent retreat, the operator
+                                # asked for chunked or nothing
+                                raise
+                            # auto: an engaged-path failure falls back to the
+                            # plain path for the rest of the tune
+                            logger.warning(
+                                "[chunked-backward] chunked step failed; plain path for the rest of the tune",
+                                exc_info=True,
+                            )
+                            for w in _tp_wrappers:
+                                w.end_two_pass_forward_()
+                            two_pass = False
+                            loss = _compute_loss()
+                            self._scale_loss_and_backward(scaler, loss)
+                        elif _chunked_mode == "auto" and self._is_oom_(e):
+                            # auto: the plain path just hit the accelerator's
+                            # ceiling - switch this tune to the chunked backward
+                            # and redo the failed sub-batch (grads from earlier
+                            # sub-batches of this iteration are already exact)
+                            logger.info(
+                                "[chunked-backward] out of memory on the plain path; "
+                                "tuning this block's backward in chunks (AR_TUNE_CHUNKED_BACKWARD=auto)"
+                            )
+                            two_pass = True
+                            _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers]
+                            loss = _compute_loss()
+                            _wrapper_param_ids = {
+                                id(p) for w in _tp_wrappers for p in w.params.values() if isinstance(p, torch.Tensor)
+                            }
+                            _other = [
+                                p
+                                for group in optimizer.param_groups
+                                for p in group["params"]
+                                if id(p) not in _wrapper_param_ids
+                            ]
+                            self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
+                        else:
                             raise
-                        # never lose the tune to an engaged-path failure: clear
-                        # the leaves, redo this sub-batch on the plain path, and
-                        # stay plain for the rest of the tune
-                        logger.warning(
-                            "[tune-mem] two-pass step failed; falling back to the plain path for the rest of the tune",
-                            exc_info=True,
-                        )
-                        for w in _tp_wrappers:
-                            w.end_two_pass_forward_()
-                        two_pass = False
-                        loss = _compute_loss()
-                        self._scale_loss_and_backward(scaler, loss)
                     num_elm = 1 if num_elm <= 0 else num_elm
                     total_loss += loss.item() / num_elm
 

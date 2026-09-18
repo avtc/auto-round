@@ -251,6 +251,16 @@ AR_ALLOW_W8_ASYM=1 python -m auto_round --model ... --scheme W8A16 --asym --form
 export AR_RESUME_DIR=/path/to/resume/state
 ```
 
+### AR_TUNE_CHUNKED_BACKWARD
+- **Description**: Controls the chunked (windowed) backward for block tuning on memory-bound blocks. The plain tuning path builds one autograd graph over every wrapped weight at once; the chunked backward walks each weight in row chunks with a small graph per chunk, producing bit-identical gradients while keeping only one chunk's intermediates alive. `auto` starts each tune on the plain path and switches to the chunked backward for the rest of the tune after an out-of-memory failure, redoing the failed sub-batch. `1` forces the chunked backward from the first iteration -- for runs where the accelerator is known to be tight and no experiments are wanted. `0` disables it entirely; an out of memory is then a hard error.
+- **Default**: `auto`
+- **Valid Values**: `auto`, `1`, `0`
+- **Usage**: Set `1` when a block tune repeatedly OOMs mid-run (for example a large `lm_head`-like or multi-head-prediction tree stage on a 24 GB card) and you want the memory-lean backward from the start.
+
+```bash
+export AR_TUNE_CHUNKED_BACKWARD=1
+```
+
 ## Usage Examples
 
 ### Setting Environment Variables

@@ -210,12 +210,73 @@ class TestStepParity:
         assert torch.equal(w1.params["value"].grad, plain["w1"])
         assert torch.equal(w2.params["value"].grad, plain["w2"])
 
-    def test_quantize_block_gates_the_engaged_path(self):
+    def test_quantize_block_rules_chunked_backward_by_env(self):
         import inspect
 
         from auto_round.algorithms.quantization.sign_round import quantizer as qmod
 
         src = inspect.getsource(qmod.SignRoundQuantizer.quantize_block)
-        assert "_should_two_pass_" in src  # gate decision inside the tune
+        assert "AR_TUNE_CHUNKED_BACKWARD" in src or "_resolve_chunked_mode_" in src  # env rules the mode
         assert "_two_pass_backward_step_" in src  # engaged replacement
         assert "_scale_loss_and_backward(scaler, loss)" in src  # plain path retained
+        assert "_is_oom_" in src  # auto switches on out-of-memory only
+
+
+class TestChunkedBackwardMode:
+    def test_env_tri_state_and_default(self, monkeypatch):
+        from auto_round import envs as envs_mod
+
+        monkeypatch.delenv("AR_TUNE_CHUNKED_BACKWARD", raising=False)
+        assert envs_mod.AR_TUNE_CHUNKED_BACKWARD == "auto"
+        for val in ("1", "0", "auto", " AUTO "):
+            monkeypatch.setenv("AR_TUNE_CHUNKED_BACKWARD", val)
+            assert envs_mod.AR_TUNE_CHUNKED_BACKWARD == val.strip().lower()
+        monkeypatch.setenv("AR_TUNE_CHUNKED_BACKWARD", "yes")
+        try:
+            envs_mod.AR_TUNE_CHUNKED_BACKWARD
+        except ValueError as e:
+            assert "AR_TUNE_CHUNKED_BACKWARD" in str(e)
+        else:
+            raise AssertionError("invalid value must fail loudly")
+
+    def test_is_oom(self):
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+
+        assert SignRoundQuantizer._is_oom_(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))
+        assert not SignRoundQuantizer._is_oom_(RuntimeError("shape mismatch"))
+        try:
+            raise torch.cuda.OutOfMemoryError  # type: ignore[attr-defined]
+        except torch.cuda.OutOfMemoryError as e:  # type: ignore[attr-defined]
+            assert SignRoundQuantizer._is_oom_(e)
+
+    def test_forced_mode_declines_loudly_under_scaler(self, caplog):
+        import logging
+        from types import SimpleNamespace
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
+        from auto_round.logger import logger as ar_logger
+
+        fake = SimpleNamespace(_tune_sync_fn=None)
+        mode, why = SignRoundQuantizer._resolve_chunked_mode_(fake, None, scaler=object())
+        assert mode == "0" and why == "scaler active"
+
+        with caplog.at_level(logging.DEBUG, logger="autoround"):
+            ar_logger.addHandler(caplog.handler)
+            try:
+                fake2 = SimpleNamespace(_tune_sync_fn=None)
+                monkey_env = {"AR_TUNE_CHUNKED_BACKWARD": "1"}
+                import os
+
+                old = os.environ.get("AR_TUNE_CHUNKED_BACKWARD")
+                os.environ["AR_TUNE_CHUNKED_BACKWARD"] = "1"
+                try:
+                    mode2, _ = SignRoundQuantizer._resolve_chunked_mode_(fake2, None, scaler=object())
+                finally:
+                    if old is None:
+                        os.environ.pop("AR_TUNE_CHUNKED_BACKWARD", None)
+                    else:
+                        os.environ["AR_TUNE_CHUNKED_BACKWARD"] = old
+            finally:
+                ar_logger.removeHandler(caplog.handler)
+        assert mode2 == "0"
+        assert any("AR_TUNE_CHUNKED_BACKWARD=1 ignored" in r.message for r in caplog.records)
