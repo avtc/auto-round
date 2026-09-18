@@ -1373,10 +1373,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             offloader.reload(self.model_context.model, norm_name)
             materialize_model_(norm_mod)
         with torch.no_grad():
-            dev, dt = fp_rows[0].device, norm_mod.weight.dtype
-            fp_rows = [norm_mod(r.to(dev).to(dt)).to(dev) for r in fp_rows]
+            # Compute on the norm's device (its params stay put) and land the
+            # result back on the row's device: chain-tail rows are parked on
+            # the cache device (often host) while the norm's weight can be
+            # resident elsewhere (e.g. cuda) - mixing the two crashes RMSNorm.
+            keep_dev = fp_rows[0].device
+            ndev, dt = norm_mod.weight.device, norm_mod.weight.dtype
+            fp_rows = [norm_mod(r.to(ndev).to(dt)).to(keep_dev) for r in fp_rows]
             if q_rows is not None:
-                q_rows = [norm_mod(r.to(dev).to(dt)).to(dev) for r in q_rows]
+                q_rows = [norm_mod(r.to(ndev).to(dt)).to(keep_dev) for r in q_rows]
         return fp_rows, q_rows
 
     def _snapshot_predictor_aux_(self, all_inputs, to_cache_block_names) -> None:

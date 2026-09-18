@@ -114,6 +114,32 @@ class TestLmHeadTailInputs:
         for got, exp in zip(out[1], expected_q):
             assert torch.allclose(got, exp, atol=1e-6)
 
+    def test_norm_runs_on_weight_device_rows_return_to_row_device(self):
+        """Cross-device contract: the row handed to the norm sits on the norm's
+        weight device, the returned row lands on the row's original device.
+        Chain-tail rows park on the cache device (host) while the norm's weight
+        can be resident elsewhere - mixing them crashes RMSNorm."""
+        fp, q = self._rows(), self._rows(2.0)
+        self.o._lm_head_chain_tail_ = (q, fp)
+        norm = self.model.model.norm
+        seen_devices = []
+        orig_forward = norm.forward
+
+        def recording_forward(x):
+            seen_devices.append(x.device)
+            return orig_forward(x)
+
+        norm.forward = recording_forward
+        try:
+            out = self.o._lm_head_tail_inputs_("lm_head")
+        finally:
+            norm.forward = orig_forward
+        assert out is not None
+        wdev = norm.weight.device
+        assert all(d == wdev for d in seen_devices), f"norm saw rows on {seen_devices}, weight on {wdev}"
+        assert all(r.device == fp[0].device for r in out[0])
+        assert all(r.device == q[0].device for r in out[1])
+
     def test_missing_tail_falls_back(self):
         assert self.o._lm_head_tail_inputs_("lm_head") is None
 
