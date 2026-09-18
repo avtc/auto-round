@@ -1849,8 +1849,12 @@ class BaseOrchestrator(object):
         ):
             self.compress_context.is_immediate_packing = True
 
-        if self.has_qlayer_outside_block and self.need_calib and not has_single_gguf_format:
-            self.compress_context.is_immediate_packing = False
+        # Outside-block layers no longer disable immediate packing: the tail
+        # lane feeds them from the calibration chain (no post-block model walk
+        # through packed blocks), and each outside-block layer is packed right
+        # after it is tuned (see _quantize_layers_outside_blocks). GGUF has
+        # always bypassed this concern; the remaining format-support and
+        # inplace conditions above are the real gates.
         if not ("causallm" in self.model_context.model.__class__.__name__.lower() and not self.model_context.is_mllm):
             # TODO For tied keys, there may some issues, we haven't not verified this
             tied_weight_keys = getattr(self.model_context.model, "_tied_weight_keys", {})
