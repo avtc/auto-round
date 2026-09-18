@@ -909,6 +909,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             layer_inputs = dict(layer_inputs)
             for tail_name, (fp_rows, _q_rows) in tail_inputs.items():
                 layer_inputs[tail_name] = fp_rows
+            # the raw tail was only needed to derive these inputs and their
+            # imatrix; release it BEFORE the tune loop so its residency does
+            # not collide with the wrapper's value/grad buffers
+            self._lm_head_chain_tail_ = None
 
         for layer_name in copy.deepcopy(layer_names):
             if layer_name not in layer_inputs:
@@ -980,13 +984,18 @@ class CompressionOrchestrator(BaseOrchestrator):
             self.model = mv_module_from_gpu(self.model)
         clear_memory()
         for layer_name in layer_names:
-            layer_input = layer_inputs[layer_name]
-            layer_input = to_device(layer_input, self.compress_context.cache_device)
+            if layer_name in tail_inputs:
+                # tail rows are parked on host by design and the tune loop
+                # streams them per micro-batch; pulling the whole set onto
+                # cache_device is the capture-path contract, not ours
+                layer_input = layer_inputs[layer_name]
+            else:
+                layer_input = to_device(layer_inputs[layer_name], self.compress_context.cache_device)
             if layer_name in tail_inputs:
                 q_layer_input = tail_inputs[layer_name][1]
             else:
                 q_layer_input = q_layer_inputs.get(layer_name, None) if q_layer_inputs is not None else None
-            q_layer_input = to_device(q_layer_input, self.compress_context.cache_device)
+                q_layer_input = to_device(q_layer_input, self.compress_context.cache_device)
             self.alg_composer.compress_layer_outside_block(
                 get_module(self.model, layer_name),
                 fp_inputs=layer_input,
@@ -1003,9 +1012,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             clear_memory(q_layer_input)
             memory_monitor.log_summary()
 
-        # the chain tail was only needed to feed these layers; release it
-        if tail_inputs:
-            self._lm_head_chain_tail_ = None
         self._tune_predictor_trees_(token_ids)
 
     # ── Predictor-tree (MTP) tuning ─────────────────────────────────────
@@ -1396,15 +1402,16 @@ class CompressionOrchestrator(BaseOrchestrator):
             offloader.reload(self.model_context.model, norm_name)
             materialize_model_(norm_mod)
         with torch.no_grad():
-            # Compute on the norm's device (its params stay put) and land the
-            # result back on the row's device: chain-tail rows are parked on
-            # the cache device (often host) while the norm's weight can be
-            # resident elsewhere (e.g. cuda) - mixing the two crashes RMSNorm.
-            keep_dev = fp_rows[0].device
+            # Compute on the norm's device (its params stay put); results park
+            # on the HOST: the tune loop streams rows per micro-batch
+            # (torch.cat(...).to(device)), so keeping the whole set resident on
+            # cache_device only collides with the wrapper's value/grad buffers
+            # on tight GPUs. Only one per-sample transient is away from host
+            # at a time.
             ndev, dt = norm_mod.weight.device, norm_mod.weight.dtype
-            fp_rows = [norm_mod(r.to(ndev).to(dt)).to(keep_dev) for r in fp_rows]
+            fp_rows = [norm_mod(r.to(ndev).to(dt)).to("cpu") for r in fp_rows]
             if q_rows is not None:
-                q_rows = [norm_mod(r.to(ndev).to(dt)).to(keep_dev) for r in q_rows]
+                q_rows = [norm_mod(r.to(ndev).to(dt)).to("cpu") for r in q_rows]
         return fp_rows, q_rows
 
     def _snapshot_predictor_aux_(self, all_inputs, to_cache_block_names) -> None:

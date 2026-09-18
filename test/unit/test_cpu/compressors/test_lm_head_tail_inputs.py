@@ -123,11 +123,11 @@ class TestLmHeadTailInputs:
         for got, exp in zip(out[1], expected_q):
             assert torch.allclose(got, exp, atol=1e-6)
 
-    def test_norm_runs_on_weight_device_rows_return_to_row_device(self):
+    def test_norm_runs_on_weight_device_rows_park_on_host(self):
         """Cross-device contract: the row handed to the norm sits on the norm's
-        weight device, the returned row lands on the row's original device.
-        Chain-tail rows park on the cache device (host) while the norm's weight
-        can be resident elsewhere - mixing them crashes RMSNorm."""
+        weight device, the returned rows park on the host (the tune loop
+        streams them per micro-batch). Chain-tail rows can be cuda-resident
+        while the norm's weight lives elsewhere - mixing them crashes RMSNorm."""
         fp, q = self._rows(), self._rows(2.0)
         self.o._lm_head_chain_tail_ = (q, fp)
         norm = self.model.model.norm
@@ -146,8 +146,8 @@ class TestLmHeadTailInputs:
         assert out is not None
         wdev = norm.weight.device
         assert all(d == wdev for d in seen_devices), f"norm saw rows on {seen_devices}, weight on {wdev}"
-        assert all(r.device == fp[0].device for r in out[0])
-        assert all(r.device == q[0].device for r in out[1])
+        assert all(r.device.type == "cpu" for r in out[0])
+        assert all(r.device.type == "cpu" for r in out[1])
 
     def test_missing_tail_falls_back(self):
         assert self.o._lm_head_tail_inputs_("lm_head") is None
@@ -293,10 +293,20 @@ class TestLaneConsumesTailInputs:
                 return True
 
             def compress_layer_outside_block(self, layer, fp_inputs=None, q_inputs=None, **kw):
-                captured_calls.append((fp_inputs, q_inputs))
+                # snapshot the lists: the lane frees them in place afterwards
+                # (clear_memory nulls elements), which must not hide what ran
+                captured_calls.append(
+                    (
+                        [r for r in fp_inputs] if fp_inputs is not None else None,
+                        [r for r in q_inputs] if q_inputs is not None else None,
+                        o._lm_head_chain_tail_ is None,
+                    )
+                )
 
         o.alg_composer = _Composer()
-        o.compress_context = SimpleNamespace(is_immediate_packing=False, is_immediate_saving=False, cache_device="cpu")
+        o.compress_context = SimpleNamespace(
+            is_immediate_packing=False, is_immediate_saving=False, cache_device="cuda:0"
+        )
         o.calibration_context = SimpleNamespace(nsamples=2)
         o.formats = []
         o.act_bits = 16
@@ -315,29 +325,35 @@ class TestLaneConsumesTailInputs:
 
         lane = MethodType(orch.CompressionOrchestrator._quantize_layers_outside_blocks, o)
         lane(["lm_head"], {}, token_ids=None)
-        return captured_calls, cache_calls, o
+        return captured_calls, cache_calls, o, (q, fp)
 
     def test_lane_passes_tail_rows_and_skips_capture(self, monkeypatch):
-        captured_calls, cache_calls, o = self._run_lane(monkeypatch)
+        captured_calls, cache_calls, o, (raw_q, raw_fp) = self._run_lane(monkeypatch)
         assert len(captured_calls) == 1
-        fp_used, q_used = captured_calls[0]
+        fp_used, q_used, tail_released = captured_calls[0]
         assert fp_used is not None and q_used is not None
+        # host parking by design: no cache-device pull for tail rows, and the
+        # raw tail is released BEFORE the tune loop builds its buffers
+        assert all(r.device.type == "cpu" for r in fp_used)
+        assert all(r.device.type == "cpu" for r in q_used)
+        assert tail_released
         norm = o.model_context.model.model.norm
         with torch.no_grad():
-            exp_fp = [norm(r) for r in o._lm_head_chain_tail_[1]] if o._lm_head_chain_tail_ else None
-        if exp_fp is not None:
-            for got, exp in zip(fp_used, exp_fp):
-                assert torch.allclose(got, exp, atol=1e-6)
+            exp_fp = [norm(r) for r in raw_fp]
+            exp_q = [norm(r) for r in raw_q]
+        for got, exp in zip(fp_used, exp_fp):
+            assert torch.allclose(got, exp, atol=1e-6)
+        for got, exp in zip(q_used, exp_q):
+            assert torch.allclose(got, exp, atol=1e-6)
         # the tail rows were consumed and released; no capture pass was issued at all
         assert o._lm_head_chain_tail_ is None
         assert cache_calls == []
 
     def test_lane_attaches_tail_imatrix(self, monkeypatch):
-        captured_calls, cache_calls, o = self._run_lane(monkeypatch)
+        captured_calls, cache_calls, o, _ = self._run_lane(monkeypatch)
         lm = o.model_context.model.lm_head
         assert hasattr(lm, "imatrix") and lm.imatrix.numel() == lm.in_features
         # parity with the hook math over the exact rows the lane received
-        norm = o.model_context.model.model.norm
         rows = captured_calls[0][0]
         expected = None
         for row in rows:
