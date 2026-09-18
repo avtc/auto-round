@@ -462,8 +462,9 @@ class TestTuningGradBuffers:
         # torch.device("cuda") never equals an indexed "cuda:0" and hides tensors)
         q_src = Path(_sr_q.__file__).read_text(encoding="utf-8")
         assert "walk=False" in q_src  # wrapper-ready baseline is header-only
-        assert "outside-block layer {layer_name} OOM (at failure)" in src
-        assert "device_manager.device" in src
+        lane_src = inspect.getsource(CompressionOrchestrator._quantize_layers_outside_blocks)
+        assert "outside-block layer {layer_name} OOM (at failure)" in lane_src
+        assert "device_manager.device" in lane_src
 
 
 class TestGradScatterSlice:
