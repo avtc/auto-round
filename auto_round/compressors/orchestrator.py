@@ -1558,6 +1558,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                     group, ckpt, info, pins, all_blocks, source_dir, fp_tail, token_ids, e_rows
                 )
             except Exception as e:  # pylint: disable=broad-except
+                if "OutOfMemory" in type(e).__name__:
+                    # the entry censuses fire before the tune's allocations
+                    # exist; this is the only vantage that sees the working
+                    # set that failed (DEBUG-gated like the others)
+                    log_cuda_memory_census(f"predictor tree {group} OOM (at failure)")
                 logger.warning(
                     "predictor tree %s tuning failed (%s: %s); leaving it to the export path",
                     group,

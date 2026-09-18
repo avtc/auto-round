@@ -385,6 +385,54 @@ class TestTreeStageMemoryHygiene:
         assert events.index("census:predictor tree ready mtp") < events.index("tune")
 
 
+class TestOOMCensusInContainment:
+    def test_oom_triggers_failure_census(self, tmp_path, monkeypatch):
+        """A tree-tune OOM must leave a census at the failure moment - the
+        entry censuses fire before the tune's allocations exist; only the
+        containment handler sees the 21+ GiB working set that needs naming."""
+        _write_ckpt(tmp_path)
+        model = _Body()
+        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o.formats = []
+        o._prepare_predictor_tuning_([["blocks.0"], ["blocks.1"]])
+        rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (rows(), rows())
+        o._predictor_tree_aux_ = {}
+        events = []
+        _OOM = type("OutOfMemoryError", (RuntimeError,), {})  # matched by name, like the handler
+
+        class _Composer:
+            block_quantizer = [SimpleNamespace(iters=10)]
+
+            def dispatch_block(self, block, input_ids, input_others):
+                return block
+
+            def compress_block(self, *a, **k):
+                events.append("tune")
+                raise _OOM("CUDA out of memory. Tried to allocate 320.00 MiB.")
+
+            def compress_layer_outside_block(self, *a, **k):
+                pass
+
+        o.alg_composer = _Composer()
+        import auto_round.compressors.orchestrator as om
+
+        om.get_block_names = lambda mm: [["blocks.0"], ["blocks.1"]]
+        _orig_clear = om.clear_memory
+        om.clear_memory = lambda *a, **k: events.append("clear")
+        import auto_round.utils.device as _dev
+
+        _orig_census = _dev.log_cuda_memory_census
+        _dev.log_cuda_memory_census = lambda tag, *a, **k: events.append(f"census:{tag}")
+        try:
+            o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
+        finally:
+            om.clear_memory = _orig_clear
+            _dev.log_cuda_memory_census = _orig_census
+        assert "census:predictor tree mtp OOM (at failure)" in events  # before the fallback clear
+        assert events.index("census:predictor tree mtp OOM (at failure)") < events.index("tune") + 2
+
+
 class TestImmediatePackingPath:
     def test_tree_modules_packed_when_immediate(self, tmp_path, monkeypatch):
         _write_ckpt(tmp_path)
