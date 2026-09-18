@@ -56,6 +56,24 @@ def cuda_probes(monkeypatch):
             self.count = 0
 
         def install(self):
+            # the ladders route through the device-manager abstraction
+            import auto_round.utils.device_manager as dm_mod
+
+            probes = self
+
+            class _FakeAR:
+                def is_available(self):
+                    return True
+
+                @property
+                def device_count(self):
+                    return probes.count
+
+                def mem_get_info(self, index=0):
+                    dev = torch.device("cuda", index)
+                    return probes.free.get(dev, 0), 0
+
+            monkeypatch.setattr(dm_mod, "get_ar_device", lambda t: _FakeAR())
             monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev: (self.free.get(dev, 0), 0))
             monkeypatch.setattr(torch.cuda, "device_count", lambda: self.count)
 

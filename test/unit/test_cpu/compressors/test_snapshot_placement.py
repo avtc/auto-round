@@ -25,18 +25,29 @@ class _Wrap(nn.Module):
         self.device = torch.device(device)
 
 
-def _cuda_stub(monkeypatch, free_bytes_by_index, device_count=1):
-    """Stub the CUDA introspection the ladder consults; keeps tests on CPU."""
-    import auto_round.compressors.utils as utils_mod
+class _FakeAR:
+    """Device-manager backend stub: the ladder routes through get_ar_device."""
 
-    def fake_mem_get_info(idx=0):
-        return free_bytes_by_index.get(torch.device(idx).index or 0, 0), 1 << 40
+    def __init__(self, free_by_index, count):
+        self._free_by_index, self._count = free_by_index, count
 
-    def fake_count():
-        return device_count
+    def is_available(self):
+        return True
 
-    monkeypatch.setattr(utils_mod.torch.cuda, "mem_get_info", fake_mem_get_info, raising=False)
-    monkeypatch.setattr(utils_mod.torch.cuda, "device_count", fake_count, raising=False)
+    @property
+    def device_count(self):
+        return self._count
+
+    def mem_get_info(self, index=0):
+        return self._free_by_index.get(index, 0), 1 << 40
+
+
+def _cuda_stub(monkeypatch, free_bytes_by_index, device_count=1, dev_type="cuda"):
+    """Stub the accelerator introspection the ladder consults; CPU-only tests."""
+    import auto_round.utils.device_manager as dm_mod
+
+    fake = _FakeAR(free_bytes_by_index, device_count)
+    monkeypatch.setattr(dm_mod, "get_ar_device", lambda t: fake)
 
 
 class TestSnapshotBestParams:
@@ -74,6 +85,19 @@ class TestSnapshotBestParams:
         monkeypatch.setattr(utils_mod, "collect_best_params", lambda block, dev: calls.append(dev) or {"value": None})
         snapshot_best_params(blk, "cuda:0", act_floor_bytes=1 << 30)
         assert calls and calls[0] == torch.device("cuda", 1)  # idle peer, not host
+
+
+class TestNonCudaAccelerators:
+    def test_xpu_home_floor_exceeded_parks_on_host(self, monkeypatch):
+        import auto_round.compressors.utils as utils_mod
+
+        blk = _Wrap(8, 4)
+        _cuda_stub(monkeypatch, {0: 1 << 20}, device_count=1, dev_type="xpu")
+        warned = []
+        monkeypatch.setattr(utils_mod.logger, "warning", lambda *a, **k: warned.append(a), raising=False)
+        out = snapshot_best_params(blk, "xpu:0", act_floor_bytes=1 << 30)
+        assert out["value"].device.type == "cpu"
+        assert warned
 
 
 class TestActFloorHelper:

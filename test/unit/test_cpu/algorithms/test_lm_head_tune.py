@@ -452,7 +452,7 @@ class TestTuningGradBuffers:
 
     def test_outside_block_loop_releases_cached_blocks(self):
         src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
-        assert "torch.cuda.empty_cache()" in src
+        assert "empty_cache()" in src  # device-manager based: works on cuda/xpu/hpu
 
 
 class TestGradScatterSlice:

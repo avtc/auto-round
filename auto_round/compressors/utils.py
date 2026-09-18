@@ -257,6 +257,27 @@ def collect_best_params_local(block):
         return collect_best_params(block, "cpu")
 
 
+def _accel_mem_get_info_(device):
+    """``(free_bytes, total_bytes)`` for any accelerator device, or ``None``.
+
+    Routes through the device-manager abstraction (``get_ar_device``), so
+    cuda, xpu and hpu behave identically; ``None`` means "unknown" and every
+    caller keeps its fallback instead of guessing.
+    """
+    if device is None or getattr(device, "type", "cpu") == "cpu":
+        return None
+    try:
+        from auto_round.utils.device_manager import get_ar_device
+
+        ar_device = get_ar_device(device.type)
+        if not ar_device.is_available():
+            return None
+        free_b, total_b = ar_device.mem_get_info(device.index or 0)
+        return int(free_b), int(total_b)
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 def _snapshot_param_needs(block) -> list[tuple[torch.device, int]]:
     """Per-device snapshot need (bytes) across the block's wrappers."""
     needs = {}
@@ -283,19 +304,21 @@ def _idle_peer_for_(need_bytes, home) -> Optional[torch.device]:
     block path). An idle peer still carries a CUDA context and allocator
     fragmentation; a tenth of its free memory stays untouched.
     """
+    if home is None or getattr(home, "type", "cpu") == "cpu":
+        return None
     try:
-        count = torch.cuda.device_count()
-    except (RuntimeError, ValueError):  # pragma: no cover - exotic devices
+        from auto_round.utils.device_manager import get_ar_device
+
+        count = get_ar_device(home.type).device_count
+        count = count() if callable(count) else count  # property or method
+    except Exception:  # pylint: disable=broad-except - exotic devices
         return None
     for index in range(count):
-        candidate = torch.device("cuda", index)
-        if home is not None and candidate == home:
+        candidate = torch.device(home.type, index)
+        if candidate == home:
             continue
-        try:
-            peer_free, _peer_total = torch.cuda.mem_get_info(candidate)
-        except (RuntimeError, ValueError):  # pragma: no cover
-            continue
-        if peer_free * 0.9 >= need_bytes:
+        info = _accel_mem_get_info_(candidate)
+        if info is not None and info[0] * 0.9 >= need_bytes:
             return candidate
     return None
 
@@ -339,12 +362,11 @@ def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
     gather_device = None  # None: beside-weights local copies
     for home in homes:
         need_home = need_by_home.get(home, 0)
-        try:
-            free, _total = torch.cuda.mem_get_info(home)
-        except (RuntimeError, ValueError):
+        info = _accel_mem_get_info_(home)
+        if info is None:
             gather_device = "cpu"
             break
-        if free - need_home < act_floor_bytes:
+        if info[0] - need_home < act_floor_bytes:
             gather_device = _idle_peer_for_(total_need, home) or "cpu"
             break
     if gather_device == "cpu":
@@ -396,16 +418,15 @@ def select_snapshot_device(wrapper) -> torch.device:
     if not isinstance(home, torch.device):
         value = getattr(wrapper, "params", {}).get("value")
         home = value.device if isinstance(value, torch.Tensor) else None
-    if need <= 0 or home is None or home.type != "cuda":
+    if need <= 0 or home is None or home.type == "cpu":
         return torch.device("cpu")
 
-    try:
-        free, _total = torch.cuda.mem_get_info(home)
+    info = _accel_mem_get_info_(home)
+    if info is not None:
+        free = info[0]
         floor = snapshot_window_floor_bytes(wrapper)
         if free - need >= floor:
             return home
-    except (RuntimeError, ValueError):  # pragma: no cover - exotic devices
-        pass
 
     peer = _idle_peer_for_(need, home)
     if peer is not None:
@@ -768,12 +789,12 @@ def _resolve_pack_device_(weight, default_device):
     output serializes to disk from the host just as well. Body-sized linears
     stay on the device. Caller-specified devices bypass the probe entirely.
     """
-    if weight is None or not str(default_device).startswith("cuda"):
+    info = _accel_mem_get_info_(
+        torch.device(default_device) if not isinstance(default_device, torch.device) else default_device
+    )
+    if weight is None or info is None:
         return default_device
-    try:
-        free_b, _ = torch.cuda.mem_get_info(default_device)
-    except Exception:  # pylint: disable=broad-except
-        return default_device
+    free_b = info[0]
     need_b = weight.numel() * 16
     if need_b > free_b * 0.9:
         logger.info(

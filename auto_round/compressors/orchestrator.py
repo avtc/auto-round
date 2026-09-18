@@ -547,8 +547,11 @@ class CompressionOrchestrator(BaseOrchestrator):
             # buffers; returning them to the driver keeps the allocator pool
             # compact before the (potentially huge) outside-block wrappers
             # are built, instead of reserving fragmented segments nobody can use
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            from auto_round.utils.device_manager import get_current_device_manager
+
+            _ar = get_current_device_manager()
+            if _ar.is_available():
+                _ar.empty_cache()
             log_cuda_memory_census(f"outside-block loop entry {name}")
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
