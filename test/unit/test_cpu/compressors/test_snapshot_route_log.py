@@ -27,7 +27,6 @@ class TestSnapshotRouteLog:
                 ar_logger.removeHandler(caplog.handler)
         infos = [r for r in caplog.records if r.levelno == logging.INFO]
         warns = [r for r in caplog.records if r.levelno == logging.WARNING]
-        debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
         assert len(infos) == 1  # first peer announcement only
         assert len(warns) == 1  # first host fallback only
-        assert len(debugs) == 2  # both repeats
+        assert len(caplog.records) == 2  # repeats log nothing at any level

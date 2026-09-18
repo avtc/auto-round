@@ -324,19 +324,16 @@ def _idle_peer_for_(need_bytes, home) -> Optional[torch.device]:
 
 
 def _snapshot_route_log_(block, route, msg, *args, warn_first=False) -> None:
-    """Log a snapshot routing decision once per change; DEBUG on repeats.
+    """Log a snapshot routing decision once per change; repeats log nothing.
 
     The ladder re-runs on every best-params update because free memory moves
     between iterations; the re-evaluation stays, but an unchanged route (the
-    common case - parameters improving again) should not repeat at INFO.
-    ``warn_first`` keeps a fallback's first occurrence at WARNING."""
+    common case - parameters improving again) says nothing worth reading at
+    any level. ``warn_first`` keeps a fallback's first occurrence at WARNING."""
     last = getattr(block, "_snapshot_route", None)
     if last == route:
-        logger.debug(msg, *args)
-    elif warn_first:
-        logger.warning(msg, *args)
-    else:
-        logger.info(msg, *args)
+        return
+    (logger.warning if warn_first else logger.info)(msg, *args)
     block._snapshot_route = route
 
 
