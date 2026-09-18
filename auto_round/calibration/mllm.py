@@ -192,8 +192,13 @@ class MLLMCalibrator(LLMCalibrator):
                     data_new = data
 
                 if isinstance(data_new, dict):
+                    _ids = data_new.get("input_ids")
+                    if isinstance(_ids, torch.Tensor) and _ids.shape[-1] >= self.seqlen:
+                        self._cache_raw_input_ids_(_ids)
                     self.model(**data_new)
                 else:
+                    if isinstance(data_new, torch.Tensor) and data_new.shape[-1] >= self.seqlen:
+                        self._cache_raw_input_ids_(data_new)
                     self.model(data_new)
             except NotImplementedError:
                 pass

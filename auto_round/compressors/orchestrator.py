@@ -905,6 +905,10 @@ class CompressionOrchestrator(BaseOrchestrator):
                         [r.detach().to("cpu", copy=True) for r in q_rows] if q_rows is not None else None,
                         [r.detach().to("cpu", copy=True) for r in fp_rows],
                     )
+                # drop every alias to the pre-park rows: the locals kept the
+                # raw device-side storages alive through the whole lane otherwise
+                del tail, q_rows, fp_rows
+                clear_memory()
         tail_inputs = {}
         for tail_name in list(getattr(self, "_tail_fed_layers_", []) or []):
             if tail_name not in layer_names:
