@@ -1553,9 +1553,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 )
             except Exception as e:  # pylint: disable=broad-except
                 if "OutOfMemory" in type(e).__name__:
-                    # the entry censuses fire before the tune's allocations
-                    # exist; this is the only vantage that sees the working
-                    # set that failed (DEBUG-gated like the others)
+                    # the only vantage that sees the working set that failed
+                    from auto_round.utils.device import log_cuda_memory_census
+
                     log_cuda_memory_census(f"predictor tree {group} OOM (at failure)", device_manager.device)
                 logger.warning(
                     "predictor tree %s tuning failed (%s: %s); leaving it to the export path",
