@@ -184,6 +184,7 @@ class WrapperLinear(torch.nn.Module):
         activation quantization, and bias/normalization.
         """
         self.params = {}
+        self._two_pass_leaf_weight = None
         p_dtype = torch.float32  ##parameter dtype
 
         orig_layer = self.orig_layer
@@ -527,6 +528,39 @@ class WrapperLinear(torch.nn.Module):
         )
         return weight_q
 
+    def begin_two_pass_forward_(self):
+        """Snapshot the quantized weight (no autograd graph) as a leaf.
+
+        Pass 1 of the two-pass block tune: the block forward runs on this
+        leaf and its graph differentiates only dL/dw_q - the qdq math saves
+        nothing, so the block's saved set stays activation-sized."""
+        with torch.no_grad():
+            weight_q, *_ = self._qdq_weight(self.value, self.min_scale, self.max_scale)
+        leaf = weight_q.detach().clone().requires_grad_(True)
+        self._two_pass_leaf_weight = leaf
+        return leaf
+
+    def end_two_pass_forward_(self) -> None:
+        self._two_pass_leaf_weight = None
+
+    def backward_from_weight_grad_(self, g_wq) -> None:
+        """Accumulate dL/d(tuning params) from dL/dw_q via windowed local graphs.
+
+        Pass 2: every weight window's qdq is recomputed WITH graph and hit
+        with the inner product against ``g_wq``; by the chain rule
+        (dL/dvalue = g . dqdq/dvalue; no cross terms exist) the accumulated
+        parameter gradients equal differentiating through the composite -
+        while only one window's fp32 qdq intermediates are alive at a time.
+        Grads land in ``params`` via the same ``_GradScatterSlice`` views the
+        row-blocked forward uses."""
+        leaf = self._two_pass_leaf_weight
+        g = g_wq.to(device=leaf.device, dtype=leaf.dtype)
+        for start, end in self.row_block_bounds():
+            weight_q_win = self._row_block_params(start, end)
+            local = (weight_q_win * g[start:end]).sum()
+            local.backward()
+        self._two_pass_leaf_weight = None
+
     def forward_rows(self, x, start, end, bias=None):
         """Output columns ``[start:end)`` computed with the row-blocked fake-quant
         math, keeping only this block's autograd graph alive. Tuning loops use
@@ -788,7 +822,15 @@ class WrapperLinear(torch.nn.Module):
         x = x.to(self.device)
         row_blocked = self._use_row_blocked_output()
         weight_q = None
-        if not row_blocked:
+        leaf = getattr(self, "_two_pass_leaf_weight", None)
+        if leaf is not None:
+            # two-pass pass 1: the quantized weight is a precomputed leaf, so
+            # this forward's graph saves activation-sized tensors only and
+            # differentiates dL/dw_q; the qdq math runs again (windowed, with
+            # graph) in backward_from_weight_grad_
+            weight_q = leaf
+            row_blocked = False
+        elif not row_blocked:
             weight_q, *_ = self._qdq_weight(self.value, self.min_scale, self.max_scale)
 
         if self.enable_act_quant:
