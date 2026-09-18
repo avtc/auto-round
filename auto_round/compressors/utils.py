@@ -376,6 +376,13 @@ def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
             total_need / 2**30,
         )
         return collect_best_params(block, "cpu")
+    if gather_device is None:
+        logger.info(
+            "[snapshot] %.2fGiB stays beside the weights (floor %.2fGiB, free %.2fGiB)",
+            total_need / 2**30,
+            act_floor_bytes / 2**30,
+            (info[0] if info else 0) / 2**30,
+        )
     if isinstance(gather_device, torch.device):
         logger.info("[snapshot] cloning %.2fGiB to idle peer %s", total_need / 2**30, gather_device)
         return collect_best_params(block, gather_device)

@@ -1022,6 +1022,12 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # the export pass (missing-tensors) completes the artifact,
                 # instead of losing a run whose blocks are already tuned and
                 # streamed
+                if "OutOfMemory" in type(e).__name__:
+                    # the only vantage that sees the failed working set; the
+                    # baseline header fired at wrapper-ready time
+                    from auto_round.utils.device import log_cuda_memory_census
+
+                    log_cuda_memory_census(f"outside-block layer {layer_name} OOM (at failure)", device_manager.device)
                 logger.warning(
                     "outside-block layer %s tuning failed (%s: %s); leaving it to the export path",
                     layer_name,

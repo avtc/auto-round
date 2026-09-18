@@ -1780,6 +1780,10 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
 
     if not logger.isEnabledFor(logging.DEBUG):
         return  # the gc walk below is expensive; skip it entirely unless visible
+    if isinstance(device, str):
+        # device_manager.device is a str; normalize so the type checks below
+        # do not silently drop the census (observed live: str has no .type)
+        device = torch.device(device)
     if device is None:
         device = torch.device("cuda") if torch.cuda.is_available() else None
     if device is None or getattr(device, "type", "cpu") != "cuda":

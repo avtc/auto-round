@@ -113,3 +113,35 @@ class TestActFloorHelper:
         from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
 
         assert SignRoundQuantizer._snapshot_act_floor_(None, None, 0) is None
+
+
+class TestCensusStrDevice:
+    def test_str_device_is_normalized_not_dropped(self, monkeypatch):
+        """device_manager.device is a str; a str must reach the allocator
+        probe instead of silently failing the .type check (the live 00:10 run
+        printed no census lines at all for exactly this reason)."""
+        import auto_round.utils.device as dev_mod
+
+        seen = {}
+
+        class _FakeCuda:
+            @staticmethod
+            def mem_get_info(dev=None):
+                seen["dev"] = dev
+                return 8 << 30, 23 << 30
+
+            @staticmethod
+            def memory_allocated(dev=None):
+                return 1 << 30
+
+            @staticmethod
+            def memory_reserved(dev=None):
+                return 2 << 30
+
+        monkeypatch.setattr(dev_mod.logger, "isEnabledFor", lambda lvl: True, raising=False)
+        monkeypatch.setattr(dev_mod.torch, "cuda", _FakeCuda, raising=False)
+        logs = []
+        monkeypatch.setattr(dev_mod.logger, "debug", lambda *a, **k: logs.append(a), raising=False)
+        dev_mod.log_cuda_memory_census("str-device probe", "cuda:0", walk=False)
+        assert seen["dev"] == torch.device("cuda:0")  # normalized, probed
+        assert logs, "header must print for a str device"

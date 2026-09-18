@@ -362,7 +362,10 @@ class SignRoundQuantizer(BaseQuantizer):
 
             _layers, act_gb, _io_gb, add_gb = estimate_tuning_block_mem(block, inputs, batch_size)
             return int((act_gb + add_gb) * 1024**3)
-        except Exception:  # pylint: disable=broad-except
+        except Exception as e:  # pylint: disable=broad-except
+            # loud, never a silent None: a swallowed failure skips the ladder
+            # and restores the blind on-device clone this helper exists to prevent
+            logger.warning("[snapshot] activation floor unavailable (%s: %s); ladder skipped", type(e).__name__, e)
             return None
 
     def quantize_block(
@@ -761,7 +764,10 @@ class SignRoundQuantizer(BaseQuantizer):
             enable_torch_compile=compile_wrapper,
             device=device,
         ).to(device)
-        log_cuda_memory_census(f"outside-block wrapper ready {layer_name} (compile={compile_wrapper})", device)
+        # header only: the tensor-list walk runs in the lane's failure handler
+        log_cuda_memory_census(
+            f"outside-block wrapper ready {layer_name} (compile={compile_wrapper})", device, walk=False
+        )
         round_params = []
         minmax_params = []
         for key in wrapper_linear.params.keys():

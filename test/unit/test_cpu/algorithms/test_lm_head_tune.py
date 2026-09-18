@@ -11,6 +11,7 @@ streams unwrap parameters back window-by-window.
 """
 
 import inspect
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -451,8 +452,18 @@ class TestTuningGradBuffers:
         assert "zero_grad(set_to_none=False)" in src
 
     def test_outside_block_loop_releases_cached_blocks(self):
+
+        import auto_round.algorithms.quantization.sign_round.quantizer as _sr_q
+
         src = inspect.getsource(CompressionOrchestrator._quantize_zero_shot)
         assert "empty_cache()" in src  # device-manager based: works on cuda/xpu/hpu
+        # census contract: header-only baseline at wrapper-ready; the tensor-list
+        # walk only in the lane's OOM catch, with an explicit device (the default
+        # torch.device("cuda") never equals an indexed "cuda:0" and hides tensors)
+        q_src = Path(_sr_q.__file__).read_text(encoding="utf-8")
+        assert "walk=False" in q_src  # wrapper-ready baseline is header-only
+        assert "outside-block layer {layer_name} OOM (at failure)" in src
+        assert "device_manager.device" in src
 
 
 class TestGradScatterSlice:
