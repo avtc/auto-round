@@ -332,6 +332,12 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             q_input = new_q_input
 
+            # keep the chain tail alive for tail-fed external layers (lm_head):
+            # the last block's fp reference and quantized-chain outputs are its
+            # inputs once the final norm is applied
+            if getattr(self, "_tail_fed_layers_", None):
+                self._lm_head_chain_tail_ = (new_q_input, reference_output)
+
             # ── Infrastructure: hook removal, device cleanup, logging ─────────
             if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
                 accelerate.hooks.remove_hook_from_submodules(m)
@@ -591,12 +597,23 @@ class CompressionOrchestrator(BaseOrchestrator):
                 supported_types=SUPPORTED_LAYER_TYPES,
                 quant_block_list=self.quant_block_list,
             )
+        # lm_head-class external layers are tail-fed: the block loop's chain
+        # output (fp reference + quantized rows through the final norm) is
+        # their input, so they neither join the upfront capture call nor the
+        # outside-block q-capture pass - no extra whole-model forwards
+        self._tail_fed_layers_ = []
+        self._lm_head_chain_tail_ = None
+        self._lm_head_norm_name_ = None
+        lm_head_name = self._resolve_lm_head_name_(layer_names)
+        if lm_head_name is not None:
+            self._tail_fed_layers_ = [lm_head_name]
+            self._lm_head_norm_name_ = self._discover_final_norm_(all_blocks)
         if not self.has_variable_block_shape:
             to_cache_block_names = [block[0] for block in all_blocks]
         else:
             to_cache_block_names = flatten_list(all_blocks)
         _last_cache_name = to_cache_block_names[-1] if len(to_cache_block_names) > 1 else None
-        to_cache_layer_names = layer_names
+        to_cache_layer_names = [n for n in layer_names if n not in self._tail_fed_layers_]
         if self.super_group_size is not None:
             to_cache_layer_names = []
         if len(layer_names) > 0:
@@ -878,6 +895,20 @@ class CompressionOrchestrator(BaseOrchestrator):
         # TODO currently we take all the layers outside blocks as post block layers which is not optimal
         # if there is no input for layer, we use rtn
 
+        # tail-fed layers (lm_head) receive their inputs from the block loop's
+        # chain output through the final norm - no input-capture entries
+        tail_inputs = {}
+        for tail_name in list(getattr(self, "_tail_fed_layers_", []) or []):
+            if tail_name not in layer_names:
+                continue
+            derived = self._lm_head_tail_inputs_(tail_name)
+            if derived is not None:
+                tail_inputs[tail_name] = derived
+        if tail_inputs:
+            layer_inputs = dict(layer_inputs)
+            for tail_name, (fp_rows, _q_rows) in tail_inputs.items():
+                layer_inputs[tail_name] = fp_rows
+
         for layer_name in copy.deepcopy(layer_names):
             if layer_name not in layer_inputs:
                 if self.act_bits < 16 and not self.act_dynamic:
@@ -931,10 +962,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             dispatch_model(self.model, self.model.hf_device_map)
 
         if enable_quanted_input:
-            logger.info("starting to cache layer inputs for %s, this may be quite slow ", layer_names)
-            self._begin_predictor_q_capture_()
-            q_layer_inputs = self.cache_data([], self.calibration_context.nsamples, layer_names=layer_names)
-            self._finish_predictor_capture_("q")
+            capture_names = [n for n in layer_names if n not in tail_inputs]
+            # the predictor q-tail rides this pass too - keep it when a tree is active
+            if capture_names or getattr(self, "_predictor_plan_", None) is not None:
+                logger.info("starting to cache layer inputs for %s, this may be quite slow ", capture_names)
+                self._begin_predictor_q_capture_()
+                q_layer_inputs = self.cache_data([], self.calibration_context.nsamples, layer_names=capture_names)
+                self._finish_predictor_capture_("q")
+            else:
+                logger.info("outside-block layer inputs come from the calibration chain tail; no extra pass")
             if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
                 accelerate.hooks.remove_hook_from_submodules(
                     self.model
@@ -945,7 +981,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         for layer_name in layer_names:
             layer_input = layer_inputs[layer_name]
             layer_input = to_device(layer_input, self.compress_context.cache_device)
-            q_layer_input = q_layer_inputs.get(layer_name, None) if q_layer_inputs is not None else None
+            if layer_name in tail_inputs:
+                q_layer_input = tail_inputs[layer_name][1]
+            else:
+                q_layer_input = q_layer_inputs.get(layer_name, None) if q_layer_inputs is not None else None
             q_layer_input = to_device(q_layer_input, self.compress_context.cache_device)
             self.alg_composer.compress_layer_outside_block(
                 get_module(self.model, layer_name),
@@ -963,6 +1002,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             clear_memory(q_layer_input)
             memory_monitor.log_summary()
 
+        # the chain tail was only needed to feed these layers; release it
+        if tail_inputs:
+            self._lm_head_chain_tail_ = None
         self._tune_predictor_trees_(token_ids)
 
     # ── Predictor-tree (MTP) tuning ─────────────────────────────────────
@@ -1203,8 +1245,110 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         The early-stop at the last cached block would otherwise abort every
         forward before the final norm, and the tail hook would never fire.
+        Tail-fed external layers (lm_head) need the same override: their
+        statistics hooks (imatrix/act-max) fire only when the forward runs
+        through them.
         """
-        return getattr(self, "_predictor_plan_", None) is not None
+        return getattr(self, "_predictor_plan_", None) is not None or bool(getattr(self, "_tail_fed_layers_", None))
+
+    @staticmethod
+    def _chain_hidden_rows(chain_state):
+        """A chain input/output as a plain list of per-sample row tensors.
+
+        The chain keeps rows as a list, or a dict of per-key row lists for
+        block classes with structured outputs (e.g. gated-delta-net): take its
+        ``hidden_states`` rows."""
+        rows = chain_state.get("hidden_states") if isinstance(chain_state, dict) else chain_state
+        if isinstance(rows, dict):
+            rows = next(iter(rows.values()))
+        return rows
+
+    def _resolve_lm_head_name_(self, layer_names) -> Optional[str]:
+        """lm_head's module name from the outside-block plan, or ``None``."""
+        if not layer_names:
+            return None
+        candidates = [n for n in layer_names if n == "lm_head" or n.rsplit(".", 1)[-1] == "lm_head"]
+        if not candidates:
+            candidates = [n for n in layer_names if "lm_head" in n]
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            logger.warning(
+                "multiple lm_head candidates in the outside-block plan %s; tuning %s", candidates, candidates[0]
+            )
+        return candidates[0]
+
+    def _lm_head_tail_inputs_(self, lm_head_name):
+        """``(fp_rows, q_rows)`` for lm_head from the calibration chain tail.
+
+        The block loop's chain output is the RAW last-block output; lm_head
+        consumes POST-final-norm states, so the final norm is applied to the
+        rows (its weights stream in when still meta). Returns ``None`` on any
+        mismatch - the caller then keeps the closed-form path for the layer.
+        """
+        tail = getattr(self, "_lm_head_chain_tail_", None)
+        if tail is None:
+            logger.warning("[lm_head] %s keeps the input-capture path: the block loop kept no chain tail", lm_head_name)
+            return None
+        new_q_output, reference_output = tail
+        fp_rows = self._chain_hidden_rows(reference_output)
+        if (
+            not isinstance(fp_rows, (list, tuple))
+            or len(fp_rows) == 0
+            or not all(isinstance(r, torch.Tensor) for r in fp_rows)
+        ):
+            logger.warning(
+                "[lm_head] %s keeps the input-capture path: unexpected chain-tail row format (%s)",
+                lm_head_name,
+                type(fp_rows).__name__,
+            )
+            return None
+        q_rows = self._chain_hidden_rows(new_q_output) if new_q_output is not None else None
+        if not isinstance(q_rows, (list, tuple)) or len(q_rows) != len(fp_rows):
+            logger.warning(
+                "[lm_head] %s tunes on FP chain inputs (enable_quanted_input cannot be honored): "
+                "quantized chain rows are missing or malformed",
+                lm_head_name,
+            )
+            q_rows = None
+        norm_name = getattr(self, "_lm_head_norm_name_", None)
+        norm_mod = get_module(self.model_context.model, norm_name) if norm_name else None
+        if norm_mod is None:
+            logger.warning(
+                "[lm_head] %s keeps the input-capture path: cannot locate the final norm that feeds it",
+                lm_head_name,
+            )
+            return None
+        # a wrongly picked leaf is detectable: the real final norm scales the
+        # hidden dim lm_head consumes
+        in_features = getattr(get_module(self.model_context.model, lm_head_name), "in_features", None)
+        if in_features is not None and norm_mod.weight.numel() != in_features:
+            logger.warning(
+                "[lm_head] %s keeps the input-capture path: candidate final norm %s does not match lm_head's "
+                "input width (%d vs %d)",
+                lm_head_name,
+                norm_name,
+                norm_mod.weight.numel(),
+                in_features,
+            )
+            return None
+        if any(p.is_meta for p in norm_mod.parameters()):
+            offloader = getattr(self, "_offloader", None)
+            if offloader is None:
+                logger.warning(
+                    "[lm_head] %s keeps the input-capture path: the final norm is still meta and no offloader "
+                    "is available to load it",
+                    lm_head_name,
+                )
+                return None
+            offloader.reload(self.model_context.model, norm_name)
+            materialize_model_(norm_mod)
+        with torch.no_grad():
+            dev, dt = fp_rows[0].device, norm_mod.weight.dtype
+            fp_rows = [norm_mod(r.to(dev).to(dt)).to(dev) for r in fp_rows]
+            if q_rows is not None:
+                q_rows = [norm_mod(r.to(dev).to(dt)).to(dev) for r in q_rows]
+        return fp_rows, q_rows
 
     def _snapshot_predictor_aux_(self, all_inputs, to_cache_block_names) -> None:
         """Keep the last block group's auxiliary inputs (attention mask,
