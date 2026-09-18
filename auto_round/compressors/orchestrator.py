@@ -1280,6 +1280,19 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         return candidates[0]
 
+    def _quantizer_requests_q_inputs_(self) -> bool:
+        """Whether the active quantizer(s) maintain the quantized-input chain.
+
+        SignRound defaults ``enable_quanted_input`` to True, RTN (iters=0)
+        defaults to False; drives the log level of the FP-only tail fallback.
+        """
+        quantizers = getattr(self.alg_composer, "block_quantizer", None)
+        if quantizers is None:
+            return False
+        if not isinstance(quantizers, (list, tuple)):
+            quantizers = [quantizers]
+        return any(bool(getattr(q, "enable_quanted_input", False)) for q in quantizers)
+
     def _attach_tail_imatrix_(self, lm_head_name, fp_rows) -> None:
         """Attach the fp-input imatrix for lm_head from the chain tail rows.
 
@@ -1333,12 +1346,22 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             return None
         q_rows = self._chain_hidden_rows(new_q_output) if new_q_output is not None else None
+        q_requested = self._quantizer_requests_q_inputs_()
         if not isinstance(q_rows, (list, tuple)) or len(q_rows) != len(fp_rows):
-            logger.warning(
-                "[lm_head] %s tunes on FP chain inputs (enable_quanted_input cannot be honored): "
-                "quantized chain rows are missing or malformed",
-                lm_head_name,
-            )
+            if q_requested:
+                logger.warning(
+                    "[lm_head] %s tunes on FP chain inputs (enable_quanted_input cannot be honored): "
+                    "quantized chain rows are missing or malformed",
+                    lm_head_name,
+                )
+            else:
+                # RTN (iters=0) defaults enable_quanted_input to False: the q chain
+                # was never maintained by configuration, so this is the expected
+                # path, not a degradation - and the search ignores q rows anyway.
+                logger.info(
+                    "[lm_head] %s tunes on FP chain inputs (quantized-input chain disabled by config)",
+                    lm_head_name,
+                )
             q_rows = None
         norm_name = getattr(self, "_lm_head_norm_name_", None)
         norm_mod = get_module(self.model_context.model, norm_name) if norm_name else None

@@ -20,6 +20,7 @@ early-stop override gate, and the outside-block lane consuming tail inputs
 without issuing capture passes.
 """
 
+import logging
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -48,7 +49,13 @@ def _orchestrator_like(model):
         _predictor_plan_=None,
     )
     o._chain_hidden_rows = CompressionOrchestrator._chain_hidden_rows  # staticmethod: bind directly
-    for name in ("_resolve_lm_head_name_", "_lm_head_tail_inputs_", "_discover_final_norm_", "_attach_tail_imatrix_"):
+    for name in (
+        "_resolve_lm_head_name_",
+        "_lm_head_tail_inputs_",
+        "_discover_final_norm_",
+        "_attach_tail_imatrix_",
+        "_quantizer_requests_q_inputs_",
+    ):
         setattr(o, name, MethodType(getattr(CompressionOrchestrator, name), o))
     o._predictor_overrides_last_cache_ = MethodType(CompressionOrchestrator._predictor_overrides_last_cache_, o)
     return o
@@ -96,6 +103,8 @@ class TestLmHeadTailInputs:
         self.model = _TinyModel()
         self.o = _orchestrator_like(self.model)
         self.o._lm_head_norm_name_ = "model.norm"
+        # SignRound-style default: the quantized-input chain is requested
+        self.o.alg_composer = SimpleNamespace(block_quantizer=SimpleNamespace(enable_quanted_input=True))
 
     def _rows(self, scale=1.0):
         return [torch.randn(1, 5, 8) * scale for _ in range(3)]
@@ -159,8 +168,49 @@ class TestLmHeadTailInputs:
 
     def test_malformed_q_rows_degrade_to_fp_only(self):
         self.o._lm_head_chain_tail_ = (None, self._rows())
+        self.o.alg_composer = SimpleNamespace(block_quantizer=SimpleNamespace(enable_quanted_input=True))
         out = self.o._lm_head_tail_inputs_("lm_head")
         assert out is not None and out[1] is None
+
+    def _capturing_logger(self):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        records = []
+
+        class _Rec:
+            def info(self, msg, *a):
+                records.append((logging.INFO, msg % a if a else msg))
+
+            def warning(self, msg, *a):
+                records.append((logging.WARNING, msg % a if a else msg))
+
+        orig = orch_mod.logger
+        orch_mod.logger = _Rec()
+        return records, lambda: setattr(orch_mod, "logger", orig)
+
+    def test_q_absence_by_config_is_info_not_warning(self):
+        """RTN (iters=0) defaults enable_quanted_input=False: the missing q chain
+        is the configured path - no WARNING, just an info line."""
+        self.o._lm_head_chain_tail_ = (None, self._rows())
+        self.o.alg_composer = SimpleNamespace(block_quantizer=SimpleNamespace(enable_quanted_input=False))
+        records, restore = self._capturing_logger()
+        try:
+            out = self.o._lm_head_tail_inputs_("lm_head")
+        finally:
+            restore()
+        assert out is not None and out[1] is None
+        assert all(lvl < logging.WARNING for lvl, _ in records)
+        assert any("disabled by config" in msg for _, msg in records)
+
+    def test_q_absence_when_requested_stays_warning(self):
+        self.o._lm_head_chain_tail_ = (None, self._rows())
+        self.o.alg_composer = SimpleNamespace(block_quantizer=SimpleNamespace(enable_quanted_input=True))
+        records, restore = self._capturing_logger()
+        try:
+            self.o._lm_head_tail_inputs_("lm_head")
+        finally:
+            restore()
+        assert any(lvl == logging.WARNING and "cannot be honored" in msg for lvl, msg in records)
 
     def test_structured_chain_state(self):
         fp = {"hidden_states": self._rows()}
