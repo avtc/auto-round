@@ -86,29 +86,32 @@ def _write_ckpt(tmp_path):
 _ORCH_METHODS = (
     "_discover_final_norm_",
     "_prepare_predictor_tuning_",
-    "_begin_predictor_capture_",
-    "_finish_predictor_capture_",
-    "_begin_predictor_q_capture_",
     "_pins_for_tree_",
+    "_schema_pins_for_tree_",
     "_stamp_pin_",
     "_attach_pinned_tree_",
     "_detach_tree_",
     "_tune_tree_heads_",
-    "_predictor_overrides_last_cache_",
+    "_chain_hidden_rows",
     "_snapshot_predictor_aux_",
     "_tune_predictor_trees_",
+    "_tune_predictor_trees_impl_",
 )
 
 
 def _orch(model, tmp_path, layer_config=None, iters=10, composer=None):
     o = SimpleNamespace()
     for name in _ORCH_METHODS:
-        setattr(o, name, getattr(CompressionOrchestrator, name).__get__(o))
+        if name == "_chain_hidden_rows":  # staticmethod: bind directly, no __get__
+            setattr(o, name, getattr(CompressionOrchestrator, name))
+        else:
+            setattr(o, name, getattr(CompressionOrchestrator, name).__get__(o))
     if not hasattr(model, "config"):
         model.config = SimpleNamespace(name_or_path=str(tmp_path), hidden_size=HID, text_config=None)
     o.model_context = SimpleNamespace(model=model, amp_dtype=torch.float32)
     o.layer_config = layer_config if layer_config is not None else {}
     o.alg_composer = composer or SimpleNamespace(block_quantizer=[SimpleNamespace(iters=iters)])
+    o.formats = []
     o.calibration_context = SimpleNamespace(batch_size=2, nsamples=2)
     o.compress_context = SimpleNamespace(is_immediate_packing=False)
     o._preprocess_block_inputs = lambda inputs: (
@@ -139,22 +142,17 @@ class TestPinsForTree:
 
 
 class TestPreparePredictor:
-    def test_plan_and_hook_when_pinned(self, tmp_path):
+    def test_plan_without_pins_or_hooks(self, tmp_path):
         _write_ckpt(tmp_path)
         model = _Body()
-        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
+        o = _orch(model, tmp_path)  # no pins: the tree follows the schema now
         o._prepare_predictor_tuning_(ALL_BLOCKS)
         assert o._predictor_plan_ is not None
         assert o._predictor_plan_["norm"] == "norm"
         assert "mtp" in o._predictor_plan_["roots"]
-        # forward through the model captures the fp tail
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
-        assert o._predictor_fp_tail_ is not None and len(o._predictor_fp_tail_) == 2
-        assert o._predictor_fp_tail_[0].shape == (1, 5, HID)
-        # hook removed after finish
-        handles = getattr(model.norm, "_forward_pre_hooks", {})
-        assert len(handles) == 0
+        # no capture hook is installed anywhere: tails come from the chain
+        assert getattr(model.norm, "_forward_pre_hooks", {}) == {}
+        assert getattr(model, "_forward_pre_hooks", {}) == {}
 
     def test_noop_without_local_dir(self, tmp_path):
         o = _orch(_Body(), tmp_path)
@@ -162,9 +160,18 @@ class TestPreparePredictor:
         o._prepare_predictor_tuning_(ALL_BLOCKS)
         assert o._predictor_plan_ is None
 
-    def test_noop_at_zero_iters(self, tmp_path):
+    def test_plan_at_zero_iters_too(self, tmp_path):
+        # iters=0 aligns the tree with the run's search path instead of the
+        # export-time WOQ round-trip
         _write_ckpt(tmp_path)
-        o = _orch(_Body(), tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}}, iters=0)
+        o = _orch(_Body(), tmp_path, iters=0)
+        o._prepare_predictor_tuning_(ALL_BLOCKS)
+        assert o._predictor_plan_ is not None
+
+    def test_noop_for_gguf_formats(self, tmp_path):
+        _write_ckpt(tmp_path)
+        o = _orch(_Body(), tmp_path)
+        o.formats = [SimpleNamespace(is_gguf=lambda: True)]
         o._prepare_predictor_tuning_(ALL_BLOCKS)
         assert o._predictor_plan_ is None
 
@@ -208,15 +215,16 @@ class TestTunePredictorTrees:
         )
         monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
         o._prepare_predictor_tuning_(ALL_BLOCKS)
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
+        # the block loop's stored chain tail: (q rows, fp rows), raw pre-norm
+        _rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (_rows(), _rows())
         token_ids = [torch.randint(0, 16, (1, 5)) for _ in range(2)]
         o._predictor_tree_aux_ = {"attention_mask": [torch.ones(1, 5) for _ in range(2)]}
         o._tune_predictor_trees_(token_ids)
 
         assert len(calls["block"]) == 1
         b = calls["block"][0]
-        assert b["fp"] == 2 and b["e_rows"] == 2 and b["q"] is True
+        assert b["fp"] == 2 and b["e_rows"] == 2 and b["q"] is False  # chain tail carries q rows
         assert b["out_shape"] == (5, HID)
         assert "attention_mask" in b["io_keys"]
         # the vocab head tuned layer-wise on the tree outputs
@@ -225,58 +233,27 @@ class TestTunePredictorTrees:
         assert "mtp.eh_proj" in o.layer_config
         assert "mtp.fc" in o.layer_config
         assert getattr(model.get_submodule("mtp.eh_proj"), "bits", None) == 4
-
-
-class TestCaptureLifecycle:
-    def test_q_capture_roundtrip(self, tmp_path):
-        _write_ckpt(tmp_path)
-        model = _Body()
-        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
-        o._prepare_predictor_tuning_(ALL_BLOCKS)
-        model(torch.randint(0, 16, (2, 5)))  # fp pass
-        o._finish_predictor_capture_("fp")
-        assert o._predictor_fp_tail_ is not None
-        # second (quantized-chain) pass captures independently
-        o._begin_predictor_q_capture_()
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("q")
-        assert o._predictor_q_tail_ is not None and len(o._predictor_q_tail_) == 2
-        assert len(model.norm._forward_pre_hooks) == 0
-
-    def test_kind_mismatch_still_removes_hook(self, tmp_path):
-        _write_ckpt(tmp_path)
-        model = _Body()
-        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
-        o._prepare_predictor_tuning_(ALL_BLOCKS)
-        o._finish_predictor_capture_("q")  # wrong kind: hook must still be removed
-        assert len(model.norm._forward_pre_hooks) == 0
-        assert o._predictor_fp_tail_ is None
-
-    def test_rows_capped_at_nsamples(self, tmp_path):
-        _write_ckpt(tmp_path)
-        model = _Body()
-        o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
-        o._prepare_predictor_tuning_(ALL_BLOCKS)
-        for _ in range(3):  # simulate calibration retry re-running batches
-            model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
-        assert len(o._predictor_fp_tail_) == o.calibration_context.nsamples
+        # the raw chain tail is consumed and released by the stage
+        assert o._lm_head_chain_tail_ is None
 
 
 class TestTreeFallbacks:
-    def test_no_pins_leaves_export_path(self, tmp_path, monkeypatch):
+    def test_no_pins_tunes_via_schema(self, tmp_path, monkeypatch):
         _write_ckpt(tmp_path)
         model = _Body()
         calls = {"block": [], "outside": []}
 
         class _Composer:
-            block_quantizer = [SimpleNamespace(iters=10)]
+            block_quantizer = [
+                SimpleNamespace(iters=10, config=SimpleNamespace(bits=4, group_size=-1, sym=True, data_type="int"))
+            ]
 
             def dispatch_block(self, block, input_ids, input_others):
                 return block
 
-            def compress_block(self, *a, **k):
+            def compress_block(self, shell, fp, io, **k):
                 calls["block"].append(1)
+                return fp, fp  # (new_q_output, reference_output)
 
             def compress_layer_outside_block(self, *a, **k):
                 calls["outside"].append(1)
@@ -286,11 +263,13 @@ class TestTreeFallbacks:
         )
         monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
         o._prepare_predictor_tuning_(ALL_BLOCKS)
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
+        _rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (_rows(), _rows())
+        o._predictor_tree_aux_ = {}
         o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
-        assert calls["block"] == [] and calls["outside"] == []
-        assert "mtp" not in [n for n, _ in model.named_modules()]
+        # the tree joined as an extra block with SCHEMA pins (no explicit pins)
+        assert len(calls["block"]) == 1
+        assert getattr(model.get_submodule("mtp.eh_proj"), "bits", None) == 4
 
     def test_build_failure_degrades_to_export_path(self, tmp_path, monkeypatch):
         _write_ckpt(tmp_path)
@@ -298,7 +277,9 @@ class TestTreeFallbacks:
         calls = {"block": []}
 
         class _Composer:
-            block_quantizer = [SimpleNamespace(iters=10)]
+            block_quantizer = [
+                SimpleNamespace(iters=10, config=SimpleNamespace(bits=4, group_size=-1, sym=True, data_type="int"))
+            ]
 
             def dispatch_block(self, block, input_ids, input_others):
                 return block
@@ -324,8 +305,9 @@ class TestTreeFallbacks:
 
         monkeypatch.setattr(orch_mod, "build_predictor_tree", _boom)
         o._prepare_predictor_tuning_(ALL_BLOCKS)
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
+        _rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (_rows(), _rows())
+        o._predictor_tree_aux_ = getattr(o, "_predictor_tree_aux_", {})
         o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
         assert calls["block"] == []
 
@@ -361,22 +343,24 @@ class TestImmediatePackingPath:
 
         monkeypatch.setattr(orch_mod, "immediate_pack", lambda name, cfg: packed.append(name))
         o._prepare_predictor_tuning_(ALL_BLOCKS)
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
+        _rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (_rows(), _rows())
+        o._predictor_tree_aux_ = getattr(o, "_predictor_tree_aux_", {})
         o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
         assert "mtp.fc" in packed  # head packed inside _tune_tree_heads_
         assert any(name.startswith("mtp.") for name in packed)  # tree Linears packed
 
 
 class TestCacheOverrideHelpers:
-    def test_override_flag_tracks_plan(self, tmp_path):
-        _write_ckpt(tmp_path)
-        o = _orch(_Body(), tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
-        o._prepare_predictor_tuning_(ALL_BLOCKS)
-        assert o._predictor_overrides_last_cache_() is True
-        o2 = _orch(_Body(), tmp_path)  # no pins, no plan
-        o2._prepare_predictor_tuning_(ALL_BLOCKS)
-        assert o2._predictor_overrides_last_cache_() is False
+    def test_no_early_stop_override_left(self):
+        # the sentinel override is retired: predictor tails come from the
+        # stored chain tail, so the collection walk keeps its fast path
+        src = (
+            open(CompressionOrchestrator.__module__.replace(".", "/") + ".py", encoding="utf-8").read()
+            if False
+            else open("auto_round/compressors/orchestrator.py", encoding="utf-8").read()
+        )
+        assert "_predictor_overrides_last_cache_" not in src
 
     def test_aux_snapshot_excludes_both_row_spellings(self, tmp_path):
         o = _orch(_Body(), tmp_path)
@@ -401,8 +385,6 @@ class TestLazyRefs:
         model = _Body()
         o = _orch(model, tmp_path, layer_config={"mtp.*": {"bits": 4, "group_size": -1, "sym": True}})
         o._prepare_predictor_tuning_(ALL_BLOCKS)
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
 
         import auto_round.compressors.predictor_tree as pt
 
@@ -462,17 +444,6 @@ class TestRegexConfigPins:
         assert o._predictor_plan_ is not None, "regex_config pins must activate the predictor plan"
 
 
-class TestNoEarlyStopSentinel:
-    def test_sentinel_is_never_a_module_name(self, tmp_path):
-        from auto_round.calibration.utils import _infer_last_cache_name
-
-        sentinel = "\x00predictor-no-early-stop"
-        # non-None requests are returned verbatim by the inference helper and
-        # never equal a real module name, disabling the early stop
-        assert _infer_last_cache_name(["blocks.0", "blocks.1"], [], sentinel) == sentinel
-        assert all(sentinel != n for n, _ in _Body().named_modules())
-
-
 class TestDetachOnNoPinnedLinear:
     def test_tree_detached_when_pins_match_nothing(self, tmp_path, monkeypatch):
         _write_ckpt(tmp_path)
@@ -500,7 +471,8 @@ class TestDetachOnNoPinnedLinear:
         )
         monkeypatch.setattr("auto_round.compressors.orchestrator.get_block_names", lambda m: ALL_BLOCKS)
         o._prepare_predictor_tuning_(ALL_BLOCKS)
-        model(torch.randint(0, 16, (2, 5)))
-        o._finish_predictor_capture_("fp")
+        _rows = lambda: [torch.randn(1, 5, HID) for _ in range(2)]  # noqa: E731
+        o._lm_head_chain_tail_ = (_rows(), _rows())
+        o._predictor_tree_aux_ = getattr(o, "_predictor_tree_aux_", {})
         o._tune_predictor_trees_([torch.randint(0, 16, (1, 5)) for _ in range(2)])
         assert "mtp" not in [n for n, _ in model.named_modules()], "tree must detach when no Linear matched"

@@ -57,7 +57,6 @@ def _orchestrator_like(model):
         "_quantizer_requests_q_inputs_",
     ):
         setattr(o, name, MethodType(getattr(CompressionOrchestrator, name), o))
-    o._predictor_overrides_last_cache_ = MethodType(CompressionOrchestrator._predictor_overrides_last_cache_, o)
     return o
 
 
@@ -263,21 +262,12 @@ class TestFinalNormDiscovery:
 
 
 class TestTailModeGates:
-    def test_override_false_without_predictor(self):
-        o = _orchestrator_like(_TinyModel())
-        assert o._predictor_overrides_last_cache_() is False
-
-    def test_override_false_with_tail_fed_layers_only(self):
-        # the single-block-target early-stop must stay active for tail mode:
-        # lm_head statistics come from the tail rows, not from the walk
-        o = _orchestrator_like(_TinyModel())
-        o._tail_fed_layers_ = ["lm_head"]
-        assert o._predictor_overrides_last_cache_() is False
-
-    def test_override_true_with_predictor_plan(self):
-        o = _orchestrator_like(_TinyModel())
-        o._predictor_plan_ = {"roots": ["mtp"]}
-        assert o._predictor_overrides_last_cache_() is True
+    def test_no_early_stop_override_remains(self):
+        # the sentinel override is retired for BOTH tail mode and predictor
+        # plans: tails come from the stored chain, the walk keeps its fast path
+        src = open("auto_round/compressors/orchestrator.py", encoding="utf-8").read()
+        assert "_predictor_overrides_last_cache_" not in src
+        assert "predictor-no-early-stop" not in src
 
 
 class TestTailImatrix:

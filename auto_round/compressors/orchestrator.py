@@ -332,10 +332,11 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             q_input = new_q_input
 
-            # keep the chain tail alive for tail-fed external layers (lm_head):
-            # the last block's fp reference and quantized-chain outputs are its
-            # inputs once the final norm is applied
-            if getattr(self, "_tail_fed_layers_", None):
+            # keep the chain tail alive for tail-fed external layers (lm_head)
+            # and predictor trees (MTP): the last block's fp reference and
+            # quantized-chain outputs are their inputs (lm_head applies the
+            # final norm; the tree consumes the raw rows)
+            if getattr(self, "_tail_fed_layers_", None) or getattr(self, "_predictor_plan_", None):
                 self._lm_head_chain_tail_ = (new_q_input, reference_output)
 
             # ── Infrastructure: hook removal, device cleanup, logging ─────────
@@ -623,21 +624,12 @@ class CompressionOrchestrator(BaseOrchestrator):
         else:
             logger.info("start to cache block inputs")
         self._prepare_predictor_tuning_(all_blocks)
-        if self._predictor_overrides_last_cache_():
-            # the calibration early-stop would otherwise abort every forward at
-            # the last cache target, before the final norm runs; the predictor
-            # tail hook needs those rows. A non-None sentinel is returned
-            # verbatim by _infer_last_cache_name and never equals a module
-            # name (null byte), disabling the early stop entirely - the extra
-            # cost is one norm + lm_head forward per calibration batch.
-            _last_cache_name = "\x00predictor-no-early-stop"
         all_inputs = self.cache_data(
             to_cache_block_names,
             self.calibration_context.nsamples,
             to_cache_layer_names,
             last_cache_name=_last_cache_name,
         )
-        self._finish_predictor_capture_("fp")
         # Raw token IDs from the tokenizer, cached during calibration for use in quantize_block.
         input_ids_cache = all_inputs.pop("input_ids", None)
         self.inputs = all_inputs
@@ -897,6 +889,22 @@ class CompressionOrchestrator(BaseOrchestrator):
 
         # tail-fed layers (lm_head) receive their inputs from the block loop's
         # chain output through the final norm - no input-capture entries
+        #
+        # the predictor trees also consume the raw chain tail: park it on the
+        # host FIRST so the lm_head tune below and the tree tune afterwards
+        # both read host-resident rows (the raw tail's ~2x rows on the tune
+        # device would collide with the wrapper's value/grad buffers)
+        if getattr(self, "_predictor_plan_", None) is not None:
+            tail = getattr(self, "_lm_head_chain_tail_", None)
+            if tail is not None:
+                q_rows, fp_rows = tail
+                q_rows = self._chain_hidden_rows(q_rows) if q_rows is not None else None
+                fp_rows = self._chain_hidden_rows(fp_rows)
+                if fp_rows is not None:
+                    self._lm_head_chain_tail_ = (
+                        [r.detach().to("cpu", copy=True) for r in q_rows] if q_rows is not None else None,
+                        [r.detach().to("cpu", copy=True) for r in fp_rows],
+                    )
         tail_inputs = {}
         for tail_name in list(getattr(self, "_tail_fed_layers_", []) or []):
             if tail_name not in layer_names:
@@ -909,10 +917,11 @@ class CompressionOrchestrator(BaseOrchestrator):
             layer_inputs = dict(layer_inputs)
             for tail_name, (fp_rows, _q_rows) in tail_inputs.items():
                 layer_inputs[tail_name] = fp_rows
-            # the raw tail was only needed to derive these inputs and their
-            # imatrix; release it BEFORE the tune loop so its residency does
-            # not collide with the wrapper's value/grad buffers
-            self._lm_head_chain_tail_ = None
+            # when no predictor tree needs the raw tail, release it now so its
+            # residency does not collide with the wrapper's value/grad buffers;
+            # with a plan, the tree stage consumes it and releases afterwards
+            if getattr(self, "_predictor_plan_", None) is None:
+                self._lm_head_chain_tail_ = None
 
         for layer_name in copy.deepcopy(layer_names):
             if layer_name not in layer_inputs:
@@ -969,11 +978,9 @@ class CompressionOrchestrator(BaseOrchestrator):
         if enable_quanted_input:
             capture_names = [n for n in layer_names if n not in tail_inputs]
             # the predictor q-tail rides this pass too - keep it when a tree is active
-            if capture_names or getattr(self, "_predictor_plan_", None) is not None:
+            if capture_names:
                 logger.info("starting to cache layer inputs for %s, this may be quite slow ", capture_names)
-                self._begin_predictor_q_capture_()
                 q_layer_inputs = self.cache_data([], self.calibration_context.nsamples, layer_names=capture_names)
-                self._finish_predictor_capture_("q")
             else:
                 logger.info("outside-block layer inputs come from the calibration chain tail; no extra pass")
             if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
@@ -1019,11 +1026,11 @@ class CompressionOrchestrator(BaseOrchestrator):
     def _prepare_predictor_tuning_(self, all_blocks) -> None:
         """Discover pinned checkpoint-only predictor trees before calibration.
 
-        Reads checkpoint metadata once (tensor names/shapes only); installs a
-        forward-pre hook on the final norm so the calibration pass captures
-        the fp chain tail (the tree's hidden-side input). No-op - and zero
-        cost - when the model has no checkpoint-only groups or no local
-        checkpoint directory.
+        Reads checkpoint metadata once (tensor names/shapes only); the fp/q
+        chain tails come from the block loop's stored last-block output (the
+        same rows a final-norm pre-hook would see - see
+        ``_tune_predictor_trees_``). No-op - and zero cost - when the model
+        has no checkpoint-only groups or no local checkpoint directory.
         """
         self._predictor_plan_ = None
         self._predictor_fp_tail_ = None
@@ -1033,28 +1040,26 @@ class CompressionOrchestrator(BaseOrchestrator):
         source_dir = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
         if not source_dir or not os.path.isdir(source_dir):
             return
+        formats = getattr(self, "formats", None) or []
+        if any(f.is_gguf() for f in formats):
+            # gguf owns its MTP export shape (unpinned nextn tensors go out at
+            # the run's qtype); keep the tree off the tuning pipeline there
+            return
         ckpt = list_checkpoint_tensors(source_dir)
         roots = checkpoint_only_roots(ckpt, self.model_context.model)
         if not roots:
             return
-        quantizers = self.alg_composer.block_quantizer
-        if not isinstance(quantizers, (list, tuple)):
-            quantizers = [quantizers]
-        iters = max(int(getattr(q, "iters", 0) or 0) for q in quantizers) if quantizers else 0
-        if iters <= 0:
-            return
         root_tensor_names = [n for r in roots for n in ckpt if n.startswith(r + ".")]
-        if not self._pins_for_tree_(root_tensor_names):
-            return  # nothing pinned under the trees: keep the early-stop optimization
         norm_name = self._discover_final_norm_(all_blocks)
         if norm_name is None:
-            logger.warning(
+            logger.info(
                 "checkpoint-only groups %s found but no final norm discovered; trees stay on the export path",
                 ", ".join(roots),
             )
             return
         self._predictor_plan_ = {"ckpt": ckpt, "roots": roots, "norm": norm_name}
-        self._begin_predictor_capture_("fp")
+        if not self._pins_for_tree_(root_tensor_names):
+            logger.info("predictor trees %s follow the run's schema (no layer-config pins)", ", ".join(roots))
 
     def _discover_final_norm_(self, all_blocks) -> Optional[str]:
         """Name-agnostic final-norm discovery: the last block-external norm-like leaf.
@@ -1079,42 +1084,33 @@ class CompressionOrchestrator(BaseOrchestrator):
                     best = name
         return best
 
-    def _begin_predictor_capture_(self, kind: str) -> None:
-        """Install the final-norm pre-hook capturing per-sample chain tails."""
-        norm_name = self._predictor_plan_["norm"]
-        mod = get_module(self.model_context.model, norm_name)
-        storage = {"rows": []}
+    def _schema_pins_for_tree_(self, tree_tensor_names) -> dict:
+        """Synthesized pins for an unpinned predictor tree: the run's schema.
 
-        def _hook(module, args, kwargs):
-            x = args[0] if args else (kwargs or {}).get("hidden_states")
-            if isinstance(x, torch.Tensor) and x.dim() >= 2:
-                for i in range(x.shape[0]):
-                    storage["rows"].append(x[i].detach().to("cpu", copy=True)[None])
-
-        handle = mod.register_forward_pre_hook(_hook, with_kwargs=True)
-        self._predictor_hook_ = (handle, storage, kind)
-
-    def _finish_predictor_capture_(self, kind: str) -> None:
-        """Remove the hook and store the captured rows as the fp/q tail."""
-        hooked = getattr(self, "_predictor_hook_", None)
-        self._predictor_hook_ = None
-        if hooked is None:
-            return
-        handle, storage, hooked_kind = hooked
-        handle.remove()  # always remove, even on kind mismatch - never leak a hook
-        if hooked_kind != kind:
-            return
-        rows = storage["rows"]
-        if not rows:
-            return
-        nsamples = getattr(self.calibration_context, "nsamples", None)
-        if isinstance(nsamples, int) and nsamples > 0 and len(rows) > nsamples:
-            rows = rows[:nsamples]  # calibration OOM retries re-run batches; keep the first pass
-        setattr(self, "_predictor_fp_tail_" if kind == "fp" else "_predictor_q_tail_", rows)
-
-    def _begin_predictor_q_capture_(self) -> None:
-        if getattr(self, "_predictor_plan_", None):
-            self._begin_predictor_capture_("q")
+        Every other layer gets these fields from the resolved scheme; the tree
+        gets the same treatment instead of the export-time WOQ round-trip with
+        global defaults. Layer-config pins, when present, always win.
+        """
+        quantizer = getattr(self.alg_composer, "block_quantizer", None)
+        if isinstance(quantizer, (list, tuple)):
+            quantizer = quantizer[0] if quantizer else None
+        cfg = getattr(quantizer, "config", None)
+        if cfg is None:
+            return {}
+        scheme_pin = {
+            "bits": getattr(cfg, "bits", 4),
+            "group_size": getattr(cfg, "group_size", 128),
+            "sym": bool(getattr(cfg, "sym", False)),
+            "data_type": getattr(cfg, "data_type", "int"),
+        }
+        # keys as MODULE paths (param suffix stripped): the attach stage
+        # matches pins against module names via regex search
+        module_paths = []
+        for n in tree_tensor_names:
+            mod = n.rsplit(".", 1)[0]
+            if mod not in module_paths:
+                module_paths.append(mod)
+        return {mod: dict(scheme_pin) for mod in module_paths}
 
     def _pins_for_tree_(self, tree_tensor_names) -> dict:
         """Layer-config entries (exact or regex) matching tree tensor paths.
@@ -1251,18 +1247,6 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             if self.compress_context.is_immediate_packing:
                 immediate_pack(path, self.layer_config)
-
-    def _predictor_overrides_last_cache_(self) -> bool:
-        """True when the predictor plan forces calibration to run the full forward.
-
-        The early-stop at the last cached block would otherwise abort every
-        forward before the final norm, and the tail hook would never fire.
-        Tail-fed external layers (lm_head) must NOT engage this override: the
-        single-block-target early-stop keeps the collection walk at the first
-        block, and their statistics are attached from the chain tail rows
-        instead (see ``_attach_tail_imatrix_``).
-        """
-        return getattr(self, "_predictor_plan_", None) is not None
 
     @staticmethod
     def _chain_hidden_rows(chain_state):
@@ -1447,10 +1431,30 @@ class CompressionOrchestrator(BaseOrchestrator):
         plan = getattr(self, "_predictor_plan_", None)
         if plan is None:
             return
+        try:
+            self._tune_predictor_trees_impl_(token_ids, plan)
+        finally:
+            # the raw chain tail fed both this stage and any tail-fed external
+            # layers; nothing needs it after the trees
+            self._lm_head_chain_tail_ = None
+
+    def _tune_predictor_trees_impl_(self, token_ids, plan) -> None:
+        """Body of :meth:`_tune_predictor_trees_` (plan already resolved)."""
         ckpt, roots, norm_name = plan["ckpt"], plan["roots"], plan["norm"]
-        fp_tail = self._predictor_fp_tail_
+        # fp/q tails come from the block loop's stored chain tail: the raw
+        # last-block outputs are exactly the rows a final-norm pre-hook would
+        # have captured (the norm's input), so no extra calibration pass and
+        # no early-stop override are needed anywhere
+        tail = getattr(self, "_lm_head_chain_tail_", None)
+        fp_tail = q_tail = None
+        if tail is not None:
+            q_out, ref_out = tail
+            fp_tail = self._chain_hidden_rows(ref_out)
+            q_tail = self._chain_hidden_rows(q_out) if q_out is not None else None
+            self._predictor_fp_tail_ = fp_tail
+            self._predictor_q_tail_ = q_tail
         if not fp_tail:
-            logger.warning("predictor trees %s stay on the closed-form path: no final-norm tail captured", roots)
+            logger.warning("predictor trees %s stay on the export path: no chain tail kept by the block loop", roots)
             return
         cfg = getattr(self.model_context.model, "config", None)
         text_cfg = getattr(cfg, "text_config", None) or cfg
@@ -1474,8 +1478,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             names_under = [n for n in ckpt if n.startswith(group + ".")]
             pins = self._pins_for_tree_(names_under)
             if not pins:
-                logger.info("predictor tree %s has no layer-config pins; leaving it to the export pass", group)
-                continue
+                # no explicit pins: the tree follows the run's schema, the
+                # same recipe every other layer gets (pins, when present,
+                # always win - e.g. an explicit bits-16 pin keeps the draft
+                # pristine)
+                pins = self._schema_pins_for_tree_(names_under)
+                logger.info("predictor tree %s follows the run's schema", group)
             attached = self._attach_pinned_tree_(group, ckpt, info, pins, all_blocks, source_dir)
             if attached is None:
                 continue
