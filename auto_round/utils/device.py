@@ -20,6 +20,7 @@ import re
 import shutil
 import sys
 import tempfile
+from collections import defaultdict
 from contextlib import ContextDecorator, contextmanager
 from functools import lru_cache
 from threading import Lock
@@ -1893,18 +1894,25 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
         )
         if nbytes / 2**30 >= 0.5:
             # attribution: name the actual container objects for copies that
-            # are NOT plain requires-grad params (the leaked ones)
-            shown = 0
-            for t in copies:
-                if getattr(t, "requires_grad", False):
-                    continue
-                for r in gc.get_referrers(t):
-                    if isinstance(r, (list, dict, defaultdict)):
-                        rep = repr(r)
-                        if len(rep) > 160:
-                            rep = rep[:160] + "..."
-                        logger.debug("[vram]     copy %s held by %s: %s", str(tuple(t.shape)), type(r).__name__, rep)
-                        shown += 1
+            # are NOT plain requires-grad params (the leaked ones). This runs
+            # inside OOM handlers: it must never raise (a census failure once
+            # replaced the containment and killed the whole run).
+            try:
+                shown = 0
+                for t in copies:
+                    if getattr(t, "requires_grad", False):
+                        continue
+                    for r in gc.get_referrers(t):
+                        if isinstance(r, (list, dict, defaultdict)):
+                            rep = repr(r)
+                            if len(rep) > 160:
+                                rep = rep[:160] + "..."
+                            logger.debug(
+                                "[vram]     copy %s held by %s: %s", str(tuple(t.shape)), type(r).__name__, rep
+                            )
+                            shown += 1
+                            break
+                    if shown >= 6:
                         break
-                if shown >= 6:
-                    break
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug("[vram]     attribution skipped (%s: %s)", type(e).__name__, e)
