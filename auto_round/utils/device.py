@@ -1827,11 +1827,14 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
             if torch.is_tensor(obj) and obj.device == device:
                 nbytes = obj.element_size() * obj.numel()
                 key = (tuple(obj.shape), str(obj.dtype))
-                groups.setdefault(key, [0, 0])
+                groups.setdefault(key, [0, 0, set()])
                 groups[key][0] += 1
                 groups[key][1] += nbytes
                 # views share storage; count each storage once for the total
+                # AND once per row: a row of split() views otherwise reports
+                # the underlying storage's bytes once per view
                 ptr = obj.untyped_storage().data_ptr()
+                groups[key][2].add(ptr)
                 if ptr not in storages:
                     storages[ptr] = obj.untyped_storage().nbytes()
         except Exception:  # pylint: disable=broad-except
@@ -1850,12 +1853,21 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
     ]
     logger.debug(*lines)
     top_items = sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]
-    for (shape, dtype), (count, nbytes) in top_items:
-        logger.debug("[vram]   %6.3fGiB x%-3d %s %s", nbytes / 2**30, count, dtype, shape)
+    for (shape, dtype), (count, nbytes, uniq) in top_items:
+        uniq_gib = sum(storages[p] for p in uniq if p in storages) / 2**30
+        logger.debug(
+            "[vram]   %6.3fGiB x%-3d %s %s (unique %.3fGiB in %d storages)",
+            nbytes / 2**30,
+            count,
+            dtype,
+            shape,
+            uniq_gib,
+            len(uniq),
+        )
     # forensics: across ALL copies of the biggest groups - python referrer
     # kinds per copy, plus how many copies sit inside a live autograd graph
     # (grad_fn set, no python referrers = held by C++ autograd nodes)
-    for (shape, dtype), (count, nbytes) in top_items[:3]:
+    for (shape, dtype), (count, nbytes, _uniq) in top_items[:3]:
         if nbytes / 2**30 < 0.5:
             continue
         copies = [
