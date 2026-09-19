@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Block-path best-params snapshot placement: one ladder for every lane.
 
-The outside-block lane decides snapshot placement via select_snapshot_device
-(fits-beside-floor -> idle peer -> host). The block path cloned blindly to
-cache_device - the predictor-tree tune died at iter 1 because the clone fit
-but took the room the next backward needed. snapshot_best_params gives the
-block path the same ladder: host under low_gpu_mem, beside-weights local
-copies when the activation floor leaves room, idle peer, host fallback."""
+Attempt-based placement for the block-path best-params snapshot:
+beside the weights -> freest visible accelerator -> host (+WARNING), every
+step attempted for real with failure falling through, the successful route
+sticky per block, the host terminal. The outside-block lane keeps its own
+select_snapshot_device reservation."""
 
 import torch
 import torch.nn as nn
@@ -56,35 +55,100 @@ class TestSnapshotBestParams:
         out = snapshot_best_params(blk, "cpu")
         assert out["value"].device.type == "cpu"
 
-    def test_no_floor_and_free_gpu_keeps_local_copy(self, monkeypatch):
+    def test_free_gpu_attempts_beside_weights_first(self, monkeypatch):
         blk = _Wrap(8, 4)
         _cuda_stub(monkeypatch, {0: 8 << 30})
         out = snapshot_best_params(blk, "cuda:0")
-        # beside-weights semantics: the copy stays on the parameter device
+        # first attempt = per-parameter local duplication, no prediction gates it
         assert out["value"].device.type == blk.params["value"].device.type
 
-    def test_floor_exceeded_without_peer_parks_on_host(self, monkeypatch):
+    def test_local_failure_falls_to_freest_peer(self, monkeypatch):
         import auto_round.compressors.utils as utils_mod
 
         blk = _Wrap(8, 4)
-        _cuda_stub(monkeypatch, {0: 1 << 20}, device_count=1)  # ~no free VRAM
+        # two idle peers: cuda:1 (8GiB) and cuda:2 (16GiB) - freest first
+        _cuda_stub(monkeypatch, {0: 1 << 20, 1: 8 << 30, 2: 16 << 30}, device_count=3)
+        calls = []
+        monkeypatch.setattr(
+            utils_mod, "collect_best_params_local", lambda b: (_ for _ in ()).throw(RuntimeError("OOM"))
+        )
+        monkeypatch.setattr(utils_mod, "collect_best_params", lambda block, dev: calls.append(dev) or {"value": None})
+        snapshot_best_params(blk, "cuda:0")
+        assert calls and calls[0] == torch.device("cuda", 2)  # freest, not first-index
+
+    def test_all_accelerators_fail_parks_on_host_with_warning(self, monkeypatch):
+        import auto_round.compressors.utils as utils_mod
+
+        blk = _Wrap(8, 4)
+        _cuda_stub(monkeypatch, {0: 1 << 20}, device_count=1)  # no peer at all
+        monkeypatch.setattr(
+            utils_mod, "collect_best_params_local", lambda b: (_ for _ in ()).throw(RuntimeError("OOM"))
+        )
         warned = []
         monkeypatch.setattr(utils_mod.logger, "warning", lambda *a, **k: warned.append(a), raising=False)
-        out = snapshot_best_params(blk, "cuda:0", act_floor_bytes=1 << 30)
+        out = snapshot_best_params(blk, "cuda:0")
         assert out["value"].device.type == "cpu"  # host fallback, never raises
         assert warned  # loud, not silent
 
-    def test_floor_exceeded_with_idle_peer_gathers_to_peer(self, monkeypatch):
-        """Assert the DECISION (CPU-only build cannot perform the copy)."""
+    def test_peer_failure_falls_through_to_host(self, monkeypatch):
         import auto_round.compressors.utils as utils_mod
 
         blk = _Wrap(8, 4)
-        # home cuda:0 nearly full; idle cuda:1 has headroom
-        _cuda_stub(monkeypatch, {0: 1 << 20, 1: 16 << 30}, device_count=2)
+        _cuda_stub(monkeypatch, {0: 1 << 20, 1: 4 << 30}, device_count=2)
+        monkeypatch.setattr(
+            utils_mod, "collect_best_params_local", lambda b: (_ for _ in ()).throw(RuntimeError("OOM"))
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "collect_best_params",
+            lambda block, dev: (
+                (_ for _ in ()).throw(RuntimeError("OOM")) if str(dev) != "cpu" else {"value": torch.zeros(1)}
+            ),
+        )
+        warned = []
+        monkeypatch.setattr(utils_mod.logger, "warning", lambda *a, **k: warned.append(a), raising=False)
+        out = snapshot_best_params(blk, "cuda:0")
+        assert out["value"].device.type == "cpu"
+        assert warned
+
+    def test_successful_route_is_sticky(self, monkeypatch):
+        import auto_round.compressors.utils as utils_mod
+
+        blk = _Wrap(8, 4)
+        _cuda_stub(monkeypatch, {0: 1 << 20, 1: 8 << 30}, device_count=2)
         calls = []
+        monkeypatch.setattr(
+            utils_mod, "collect_best_params_local", lambda b: (_ for _ in ()).throw(RuntimeError("OOM"))
+        )
         monkeypatch.setattr(utils_mod, "collect_best_params", lambda block, dev: calls.append(dev) or {"value": None})
-        snapshot_best_params(blk, "cuda:0", act_floor_bytes=1 << 30)
-        assert calls and calls[0] == torch.device("cuda", 1)  # idle peer, not host
+        snapshot_best_params(blk, "cuda:0")
+        assert calls == [torch.device("cuda", 1)]
+        # second improving iteration: the peer is retried first (local would
+        # raise again, but the peer is tried BEFORE re-enumerating)
+        snapshot_best_params(blk, "cuda:0")
+        assert calls == [torch.device("cuda", 1), torch.device("cuda", 1)]
+
+    def test_host_is_terminal(self, monkeypatch):
+        import auto_round.compressors.utils as utils_mod
+
+        blk = _Wrap(8, 4)
+        _cuda_stub(monkeypatch, {0: 1 << 20, 1: 8 << 30}, device_count=2)
+        monkeypatch.setattr(
+            utils_mod, "collect_best_params_local", lambda b: (_ for _ in ()).throw(RuntimeError("OOM"))
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "collect_best_params",
+            lambda block, dev: (
+                (_ for _ in ()).throw(RuntimeError("OOM")) if str(dev) != "cpu" else {"value": torch.zeros(1)}
+            ),
+        )
+        snapshot_best_params(blk, "cuda:0")
+        assert blk._snapshot_route == "host"
+        # later iterations stay on the host even though local now works
+        monkeypatch.setattr(utils_mod, "collect_best_params_local", lambda b: {"value": blk.params["value"].clone()})
+        out = snapshot_best_params(blk, "cuda:0")
+        assert out["value"].device.type == "cpu"
 
 
 class TestNonCudaAccelerators:
@@ -95,7 +159,10 @@ class TestNonCudaAccelerators:
         _cuda_stub(monkeypatch, {0: 1 << 20}, device_count=1, dev_type="xpu")
         warned = []
         monkeypatch.setattr(utils_mod.logger, "warning", lambda *a, **k: warned.append(a), raising=False)
-        out = snapshot_best_params(blk, "xpu:0", act_floor_bytes=1 << 30)
+        monkeypatch.setattr(
+            utils_mod, "collect_best_params_local", lambda b: (_ for _ in ()).throw(RuntimeError("OOM"))
+        )
+        out = snapshot_best_params(blk, "xpu:0")
         assert out["value"].device.type == "cpu"
         assert warned
 

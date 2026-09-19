@@ -342,23 +342,43 @@ def _snapshot_route_log_(block, route, msg, *args, warn_first=False) -> None:
     block._snapshot_route = route
 
 
+def _snapshot_free_devices_(dev_type: str, need_bytes: int) -> list:
+    """Visible accelerator devices of ``dev_type`` with room, most free first.
+
+    Same introspection as ``_idle_peer_for_`` but returns the full ordering:
+    the attempt ladder tries the freest device first, and every candidate is
+    still guarded by a real attempt-and-catch at clone time."""
+    devices = []
+    try:
+        from auto_round.utils.device_manager import get_ar_device
+
+        count = get_ar_device(dev_type).device_count
+        count = count() if callable(count) else count  # property or method
+    except Exception:  # pylint: disable=broad-except - exotic devices
+        return devices
+    for index in range(count):
+        candidate = torch.device(dev_type, index)
+        info = _accel_mem_get_info_(candidate)
+        if info is not None and info[0] * 0.9 >= need_bytes:
+            devices.append((info[0], candidate))
+    devices.sort(key=lambda kv: kv[0], reverse=True)
+    return [d for _b, d in devices]
+
+
 def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
-    """Collect the best-params snapshot, keeping multi-device blocks on-device.
+    """Collect the best-params snapshot by attempt, falling back device by device.
 
-    A CPU ``cache_device`` (``low_gpu_mem_usage``) keeps the historical host
-    snapshot. A non-CPU ``cache_device`` means VRAM was budgeted for caching;
-    each parameter is then duplicated on its own device instead of gathering
-    every device's copies onto one cache device. Single-device blocks are
-    unaffected either way (the cache device already equals each parameter's
-    device).
+    Sticky per block: duplicate beside the weights first (per-parameter local
+    copies), then the freest visible accelerator of the same type, then the
+    host with a WARNING. Every step is attempted for real - a failure
+    (typically an out of memory during the clone itself) falls through to
+    the next candidate; a successful route is retried first on later
+    improving iterations, and the host is terminal. A CPU ``cache_device``
+    (``low_gpu_mem_usage``) snapshots on the host directly - VRAM was never
+    budgeted for caching.
 
-    ``act_floor_bytes`` applies the same ladder the huge-layer path uses
-    (``select_snapshot_device``): a snapshot may only stay beside the weights
-    when every host device keeps ``act_floor_bytes`` free after the clone -
-    that floor is the tune's remaining activation working set (the shape-based
-    estimate), so the clone cannot take the room the next backward needs.
-    Otherwise: an idle peer with headroom, else the host - always loud, never
-    raising.
+    ``act_floor_bytes`` is accepted for call-site compatibility; placement
+    no longer routes on any prediction - the clone attempt is the test.
     """
     try:
         non_cpu = torch.device(str(cache_device)).type != "cpu"
@@ -367,60 +387,48 @@ def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
     if not non_cpu:
         return collect_best_params(block, cache_device)
 
-    per_home = _snapshot_param_needs(block)
-    if act_floor_bytes is None:
-        try:
-            return collect_best_params_local(block)
-        except RuntimeError as e:  # last-ditch: the clone itself failed
-            logger.warning("[snapshot] local copy failed (%s); parking the snapshot on host", e)
-            return collect_best_params(block, "cpu")
+    last = getattr(block, "_snapshot_route", None)
+    if last == "host":
+        # terminal: no mid-tune flip-flopping back onto accelerators
+        return collect_best_params(block, "cpu")
 
-    homes = [home for home, _need in per_home if home.type != "cpu"] or [torch.device(str(cache_device))]
-    need_by_home = dict(per_home)
-    total_need = sum(need for _home, need in per_home) or 0
-    gather_device = None  # None: beside-weights local copies
-    for home in homes:
-        need_home = need_by_home.get(home, 0)
-        info = _accel_mem_get_info_(home)
-        if info is None:
-            gather_device = "cpu"
-            break
-        if info[0] - need_home < act_floor_bytes:
-            gather_device = _idle_peer_for_(total_need, home) or "cpu"
-            break
-    if gather_device == "cpu":
-        _snapshot_route_log_(
-            block,
-            "host",
-            "[snapshot] %s free below the activation floor after a %.2fGiB clone; parking on host",
-            str(next(iter(homes))),
-            total_need / 2**30,
-            warn_first=True,
-        )
-        return collect_best_params(block, "cpu")
-    if gather_device is None:
-        _snapshot_route_log_(
-            block,
-            "beside",
-            "[snapshot] %.2fGiB stays beside the weights (floor %.2fGiB, free %.2fGiB)",
-            total_need / 2**30,
-            act_floor_bytes / 2**30,
-            (info[0] if info else 0) / 2**30,
-        )
-    if isinstance(gather_device, torch.device):
-        _snapshot_route_log_(
-            block,
-            f"peer:{gather_device}",
-            "[snapshot] cloning %.2fGiB to idle peer %s",
-            total_need / 2**30,
-            gather_device,
-        )
-        return collect_best_params(block, gather_device)
-    try:
-        return collect_best_params_local(block)
-    except RuntimeError as e:  # last-ditch: the clone itself failed
-        logger.warning("[snapshot] local copy failed (%s); parking the snapshot on host", e)
-        return collect_best_params(block, "cpu")
+    total_need = sum(need for _home, need in _snapshot_param_needs(block)) or 0
+    candidates: list = []
+    if last == "local":
+        candidates.append("local")
+    elif isinstance(last, str) and last.startswith("peer:"):
+        try:
+            candidates.append(torch.device(last[5:]))
+        except (ValueError, RuntimeError):
+            pass
+    if "local" not in candidates:
+        candidates.append("local")
+    for dev in _snapshot_free_devices_(torch.device(str(cache_device)).type, total_need):
+        if dev not in candidates:
+            candidates.append(dev)
+
+    for cand in candidates:
+        try:
+            if cand == "local":
+                out = collect_best_params_local(block)
+                _snapshot_route_log_(block, "local", "[snapshot] %.2fGiB stays beside the weights", total_need / 2**30)
+                return out
+            out = collect_best_params(block, cand)
+            _snapshot_route_log_(block, f"peer:{cand}", "[snapshot] cloning %.2fGiB to %s", total_need / 2**30, cand)
+            return out
+        except Exception as e:  # pylint: disable=broad-except - the attempt IS the test
+            logger.debug(
+                "[snapshot] placement on %s failed (%s: %s); trying the next candidate", cand, type(e).__name__, e
+            )
+            continue
+    _snapshot_route_log_(
+        block,
+        "host",
+        "[snapshot] no accelerator could hold the %.2fGiB snapshot; parking on host",
+        total_need / 2**30,
+        warn_first=True,
+    )
+    return collect_best_params(block, "cpu")
 
 
 def snapshot_window_floor_bytes(wrapper) -> int:
