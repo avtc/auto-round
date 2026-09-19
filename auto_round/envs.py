@@ -37,6 +37,20 @@ if TYPE_CHECKING:
     AR_FORCE_MOE_ROUTING_ALL_EXPERTS: bool = False
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
     AR_ALLOW_W8_ASYM: bool = False
+    AR_TUNE_CHUNKED_BACKWARD: str = "auto"
+
+
+def _get_chunked_backward_env(name: str) -> str:
+    """Read the chunked-backward mode: one of ``auto``, ``1``, ``0``.
+
+    ``auto`` (default) tunes plain first and switches to chunked backward
+    for the rest of the tune after an out-of-memory failure; ``1`` forces
+    the chunked backward from iteration 0; ``0`` disables it entirely (an
+    out of memory is a hard error). Anything else fails loudly."""
+    raw = (os.getenv(name) or "auto").strip().lower()
+    if raw not in ("auto", "1", "0"):
+        raise ValueError(f"{name} must be one of auto, 1, 0; got {raw!r}")
+    return raw
 
 
 def _get_optional_positive_int_env(name: str) -> Optional[int]:
@@ -205,6 +219,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Exposed on the CLI as ``--num_hidden_layers``. The resulting model is a
     # partial model and must not be used for a real/production quantization run.
     "AR_DEBUG_LAYER_NUM": lambda: _get_optional_positive_int_env("AR_DEBUG_LAYER_NUM"),
+    "AR_TUNE_CHUNKED_BACKWARD": lambda: _get_chunked_backward_env("AR_TUNE_CHUNKED_BACKWARD"),
 }
 
 

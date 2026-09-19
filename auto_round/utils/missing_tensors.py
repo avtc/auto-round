@@ -436,6 +436,13 @@ def copy_missing_tensors_from_source(
     )
 
 
+# Substrings of tensor names whose Linears never get WOQ-quantized by the
+# export completion pass. Shared with the predictor-tree stage so a tree the
+# RUN quantizes (iters=0 or iters>0) and a tree the completer picks up after
+# a failed tune produce the SAME artifact shape.
+EXPORT_IGNORE_BLOCKS = [".shared_expert_gate.", ".mlp.gate.", ".g_proj.", "mtp.fc."]
+
+
 def _woq_quantize_missing_tensors(target_dir: str, missing_tensors_dict: dict) -> dict:
     """Apply WOQ (Weight-Only Quantization) to missing Linear weight tensors.
 
@@ -465,7 +472,7 @@ def _woq_quantize_missing_tensors(target_dir: str, missing_tensors_dict: dict) -
     """
     import re as _re
 
-    BLOCK_NAME_TO_IGNORE = [".shared_expert_gate.", ".mlp.gate.", ".g_proj.", "mtp.fc."]
+    BLOCK_NAME_TO_IGNORE = EXPORT_IGNORE_BLOCKS
     qconfig = _get_woq_config_from_dir(target_dir)
     if qconfig is None:
         return missing_tensors_dict

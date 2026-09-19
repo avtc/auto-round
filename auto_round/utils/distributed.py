@@ -27,6 +27,34 @@ def is_distributed():
     return dist.is_initialized() and dist.get_world_size() > 1
 
 
+def engine_owns_gradient_sync(block, sync_fn) -> bool:
+    """Whether any distributed engine owns gradient synchronization.
+
+    Covers all three sync regimes ``setup_ddp_if_needed_`` can produce plus
+    in-process mirror engines: a torch DDP wrap (hooks fire per backward),
+    a non-noop manual sync callable (sharded multi-GPU ranks, in-process
+    mirrors), or an initialized process group. Memory-relief paths that
+    replace one backward with several small ones (windowed tune loops) must
+    not engage while an engine owns sync - partial gradients would cross
+    sync points the engine did not plan for.
+    """
+    import torch.distributed as dist
+
+    try:
+        from torch.nn.parallel import DistributedDataParallel
+
+        if isinstance(block, DistributedDataParallel):
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+    if sync_fn is not _noop_sync:
+        return True
+    try:
+        return dist.is_available() and dist.is_initialized()
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
 def setup_ddp_if_needed_(ar, block: torch.nn.Module, device_list: list[int]):
     """Prepare ``block`` for distributed training and return a gradient-sync hook.
 

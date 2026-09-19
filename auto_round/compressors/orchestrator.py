@@ -14,6 +14,7 @@
 import copy
 import gc
 import os
+import re
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -29,6 +30,15 @@ from auto_round.calibration.utils import (
     _update_inputs,
 )
 from auto_round.compressors.base import BaseOrchestrator
+from auto_round.compressors.predictor_tree import (
+    analyze_predictor_group,
+    bind_predictor_forward,
+    build_predictor_tree,
+    checkpoint_only_roots,
+    list_checkpoint_tensors,
+    pick_sibling_layer,
+    synthesize_predictor_e,
+)
 from auto_round.compressors.utils import (
     _get_quantized_layer_names_outside_blocks,
     immediate_pack,
@@ -53,6 +63,7 @@ from auto_round.utils import (
     set_amax_for_all_moe_layers,
     set_module,
     to_device,
+    to_standard_regex,
 )
 from auto_round.utils.device import (
     _force_trim_malloc,
@@ -321,6 +332,13 @@ class CompressionOrchestrator(BaseOrchestrator):
 
             q_input = new_q_input
 
+            # keep the chain tail alive for tail-fed external layers (lm_head)
+            # and predictor trees (MTP): the last block's fp reference and
+            # quantized-chain outputs are their inputs (lm_head applies the
+            # final norm; the tree consumes the raw rows)
+            if getattr(self, "_tail_fed_layers_", None) or getattr(self, "_predictor_plan_", None):
+                self._lm_head_chain_tail_ = (new_q_input, reference_output)
+
             # ── Infrastructure: hook removal, device cleanup, logging ─────────
             if len(device_manager.device_list) > 1 and not self.model_context.is_diffusion:
                 accelerate.hooks.remove_hook_from_submodules(m)
@@ -523,6 +541,18 @@ class CompressionOrchestrator(BaseOrchestrator):
             remain_layer_names.append(n)
         for name in remain_layer_names:
             logger.info(f"Quantizing remaining layer {name} on CPU.")
+            from auto_round.utils.device import log_cuda_memory_census
+
+            # phase boundary: the block loop just freed its large tuning
+            # buffers; returning them to the driver keeps the allocator pool
+            # compact before the (potentially huge) outside-block wrappers
+            # are built, instead of reserving fragmented segments nobody can use
+            from auto_round.utils.device_manager import get_current_device_manager
+
+            _ar = get_current_device_manager()
+            if _ar.is_available():
+                _ar.empty_cache()
+            log_cuda_memory_census(f"outside-block loop entry {name}", walk=False)
             self.alg_composer.compress_layer_outside_block(get_module(self.model, name))
             # Outside-block layers (embed_tokens/lm_head/etc.) are typically few so just
             # log a summary after each one.
@@ -571,12 +601,23 @@ class CompressionOrchestrator(BaseOrchestrator):
                 supported_types=SUPPORTED_LAYER_TYPES,
                 quant_block_list=self.quant_block_list,
             )
+        # lm_head-class external layers are tail-fed: the block loop's chain
+        # output (fp reference + quantized rows through the final norm) is
+        # their input, so they neither join the upfront capture call nor the
+        # outside-block q-capture pass - no extra whole-model forwards
+        self._tail_fed_layers_ = []
+        self._lm_head_chain_tail_ = None
+        self._lm_head_norm_name_ = None
+        lm_head_name = self._resolve_lm_head_name_(layer_names)
+        if lm_head_name is not None:
+            self._tail_fed_layers_ = [lm_head_name]
+            self._lm_head_norm_name_ = self._discover_final_norm_(all_blocks)
         if not self.has_variable_block_shape:
             to_cache_block_names = [block[0] for block in all_blocks]
         else:
             to_cache_block_names = flatten_list(all_blocks)
         _last_cache_name = to_cache_block_names[-1] if len(to_cache_block_names) > 1 else None
-        to_cache_layer_names = layer_names
+        to_cache_layer_names = [n for n in layer_names if n not in self._tail_fed_layers_]
         if self.super_group_size is not None:
             to_cache_layer_names = []
         if len(layer_names) > 0:
@@ -585,6 +626,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
         else:
             logger.info("start to cache block inputs")
+        self._prepare_predictor_tuning_(all_blocks)
         all_inputs = self.cache_data(
             to_cache_block_names,
             self.calibration_context.nsamples,
@@ -594,6 +636,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         # Raw token IDs from the tokenizer, cached during calibration for use in quantize_block.
         input_ids_cache = all_inputs.pop("input_ids", None)
         self.inputs = all_inputs
+        self._snapshot_predictor_aux_(all_inputs, to_cache_block_names)
 
         all_q_inputs = None
         # Leave it to gguf itself to handle
@@ -847,6 +890,46 @@ class CompressionOrchestrator(BaseOrchestrator):
         # TODO currently we take all the layers outside blocks as post block layers which is not optimal
         # if there is no input for layer, we use rtn
 
+        # tail-fed layers (lm_head) receive their inputs from the block loop's
+        # chain output through the final norm - no input-capture entries
+        #
+        # the predictor trees also consume the raw chain tail: park it on the
+        # host FIRST so the lm_head tune below and the tree tune afterwards
+        # both read host-resident rows (the raw tail's ~2x rows on the tune
+        # device would collide with the wrapper's value/grad buffers)
+        if getattr(self, "_predictor_plan_", None) is not None:
+            tail = getattr(self, "_lm_head_chain_tail_", None)
+            if tail is not None:
+                q_rows, fp_rows = tail
+                q_rows = self._chain_hidden_rows(q_rows) if q_rows is not None else None
+                fp_rows = self._chain_hidden_rows(fp_rows)
+                if fp_rows is not None:
+                    self._lm_head_chain_tail_ = (
+                        [r.detach().to("cpu", copy=True) for r in q_rows] if q_rows is not None else None,
+                        [r.detach().to("cpu", copy=True) for r in fp_rows],
+                    )
+                # drop every alias to the pre-park rows: the locals kept the
+                # raw device-side storages alive through the whole lane otherwise
+                del tail, q_rows, fp_rows
+                clear_memory()
+        tail_inputs = {}
+        for tail_name in list(getattr(self, "_tail_fed_layers_", []) or []):
+            if tail_name not in layer_names:
+                continue
+            derived = self._lm_head_tail_inputs_(tail_name)
+            if derived is not None:
+                tail_inputs[tail_name] = derived
+                self._attach_tail_imatrix_(tail_name, derived[0])
+        if tail_inputs:
+            layer_inputs = dict(layer_inputs)
+            for tail_name, (fp_rows, _q_rows) in tail_inputs.items():
+                layer_inputs[tail_name] = fp_rows
+            # when no predictor tree needs the raw tail, release it now so its
+            # residency does not collide with the wrapper's value/grad buffers;
+            # with a plan, the tree stage consumes it and releases afterwards
+            if getattr(self, "_predictor_plan_", None) is None:
+                self._lm_head_chain_tail_ = None
+
         for layer_name in copy.deepcopy(layer_names):
             if layer_name not in layer_inputs:
                 if self.act_bits < 16 and not self.act_dynamic:
@@ -885,6 +968,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         if len(layer_names) == 0:
             memory_monitor.update()
             memory_monitor.log_summary()
+            self._tune_predictor_trees_(token_ids)
             return
         q_layer_inputs = None
         enable_quanted_input = self.alg_composer.need_quanted_input()
@@ -899,8 +983,13 @@ class CompressionOrchestrator(BaseOrchestrator):
             dispatch_model(self.model, self.model.hf_device_map)
 
         if enable_quanted_input:
-            logger.info("starting to cache layer inputs for %s, this may be quite slow ", layer_names)
-            q_layer_inputs = self.cache_data([], self.calibration_context.nsamples, layer_names=layer_names)
+            capture_names = [n for n in layer_names if n not in tail_inputs]
+            # the predictor q-tail rides this pass too - keep it when a tree is active
+            if capture_names:
+                logger.info("starting to cache layer inputs for %s, this may be quite slow ", capture_names)
+                q_layer_inputs = self.cache_data([], self.calibration_context.nsamples, layer_names=capture_names)
+            else:
+                logger.info("outside-block layer inputs come from the calibration chain tail; no extra pass")
             if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
                 accelerate.hooks.remove_hook_from_submodules(
                     self.model
@@ -909,16 +998,49 @@ class CompressionOrchestrator(BaseOrchestrator):
             self.model = mv_module_from_gpu(self.model)
         clear_memory()
         for layer_name in layer_names:
-            layer_input = layer_inputs[layer_name]
-            layer_input = to_device(layer_input, self.compress_context.cache_device)
-            q_layer_input = q_layer_inputs.get(layer_name, None) if q_layer_inputs is not None else None
-            q_layer_input = to_device(q_layer_input, self.compress_context.cache_device)
-            self.alg_composer.compress_layer_outside_block(
-                get_module(self.model, layer_name),
-                fp_inputs=layer_input,
-                q_inputs=q_layer_input,
-                input_ids=token_ids,
-            )
+            if layer_name in tail_inputs:
+                # tail rows are parked on host by design and the tune loop
+                # streams them per micro-batch; pulling the whole set onto
+                # cache_device is the capture-path contract, not ours
+                layer_input = layer_inputs[layer_name]
+            else:
+                layer_input = to_device(layer_inputs[layer_name], self.compress_context.cache_device)
+            if layer_name in tail_inputs:
+                q_layer_input = tail_inputs[layer_name][1]
+            else:
+                q_layer_input = q_layer_inputs.get(layer_name, None) if q_layer_inputs is not None else None
+                q_layer_input = to_device(q_layer_input, self.compress_context.cache_device)
+            try:
+                self.alg_composer.compress_layer_outside_block(
+                    get_module(self.model, layer_name),
+                    fp_inputs=layer_input,
+                    q_inputs=q_layer_input,
+                    input_ids=token_ids,
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                # containment: a failed tune leaves the layer unquantized and
+                # the export pass (missing-tensors) completes the artifact,
+                # instead of losing a run whose blocks are already tuned and
+                # streamed
+                from auto_round.utils.device import is_oom_exception  # pylint: disable=import-outside-toplevel
+
+                if is_oom_exception(e):
+                    # the only vantage that sees the failed working set; the
+                    # baseline header fired at wrapper-ready time
+                    from auto_round.utils.device import log_cuda_memory_census
+
+                    log_cuda_memory_census(f"outside-block layer {layer_name} OOM (at failure)", device_manager.device)
+                logger.warning(
+                    "outside-block layer %s tuning failed (%s: %s); leaving it to the export path",
+                    layer_name,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+                del layer_input
+                clear_memory(q_layer_input)
+                clear_memory()
+                continue
             if self.compress_context.is_immediate_packing:
                 immediate_pack(layer_name, self.layer_config)
 
@@ -928,6 +1050,621 @@ class CompressionOrchestrator(BaseOrchestrator):
             del layer_input
             clear_memory(q_layer_input)
             memory_monitor.log_summary()
+
+        self._tune_predictor_trees_(token_ids)
+
+    # ── Predictor-tree (MTP) tuning ─────────────────────────────────────
+
+    def _prepare_predictor_tuning_(self, all_blocks) -> None:
+        """Discover pinned checkpoint-only predictor trees before calibration.
+
+        Reads checkpoint metadata once (tensor names/shapes only); the fp/q
+        chain tails come from the block loop's stored last-block output (the
+        same rows a final-norm pre-hook would see - see
+        ``_tune_predictor_trees_``). No-op - and zero cost - when the model
+        has no checkpoint-only groups or no local checkpoint directory.
+        """
+        self._predictor_plan_ = None
+        self._predictor_fp_tail_ = None
+        self._predictor_q_tail_ = None
+        self._predictor_tree_aux_ = None
+        cfg = getattr(self.model_context.model, "config", None)
+        source_dir = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
+        if not source_dir or not os.path.isdir(source_dir):
+            return
+        ckpt = list_checkpoint_tensors(source_dir)
+        roots = checkpoint_only_roots(ckpt, self.model_context.model)
+        if not roots:
+            return
+        root_tensor_names = [n for r in roots for n in ckpt if n.startswith(r + ".")]
+        norm_name = self._discover_final_norm_(all_blocks)
+        if norm_name is None:
+            logger.info(
+                "checkpoint-only groups %s found but no final norm discovered; trees stay on the export path",
+                ", ".join(roots),
+            )
+            return
+        self._predictor_plan_ = {"ckpt": ckpt, "roots": roots, "norm": norm_name}
+        if not self._pins_for_tree_(root_tensor_names):
+            logger.info("predictor trees %s follow the run's schema (no layer-config pins)", ", ".join(roots))
+
+    def _discover_final_norm_(self, all_blocks) -> Optional[str]:
+        """Name-agnostic final-norm discovery: the last block-external norm-like leaf.
+
+        Accepts any leaf whose parameters are ALL 1-D (RMSNorm has one,
+        LayerNorm-with-bias has two - GPT-J/OPT-class models) and whose name
+        says norm/ln_f; lm_head-class projections carry a 2-D weight and never
+        match."""
+        block_prefixes = [name for block in all_blocks for name in block]
+        best = None
+        for name, m in self.model_context.model.named_modules():
+            if not name:
+                continue
+            if any(name == b or name.startswith(b + ".") for b in block_prefixes):
+                continue
+            if list(m.children()):
+                continue
+            params = list(m.parameters())
+            if params and all(p.dim() == 1 for p in params):
+                low = name.lower()
+                if "norm" in low or "ln_f" in low:
+                    best = name
+        return best
+
+    def _pins_for_tree_(self, tree_tensor_names) -> dict:
+        """Layer-config entries (exact or regex) matching tree tensor paths.
+
+        Pins for checkpoint-only tensors are popped from ``layer_config`` into
+        ``regex_config`` by the resolver (the modules did not exist at resolve
+        time), so BOTH sources must be consulted or the predictor stage would
+        silently never activate. Exact in-model entries take precedence.
+        """
+        sources = {}
+        sources.update(getattr(self, "regex_config", None) or {})
+        sources.update(dict(self.layer_config))
+        pins = {}
+        for key, cfg in sources.items():
+            if not isinstance(cfg, dict) or not check_to_quantized(cfg):
+                continue
+            regex = re.compile(to_standard_regex(key))
+            if key in tree_tensor_names or any(regex.search(n) for n in tree_tensor_names):
+                pins[key] = cfg
+        return pins
+
+    def _stamp_pin_(self, module, name: str, pin: dict) -> None:
+        # same field set as the canonical plan boundary (apply_plan_to_model)
+        # so future scheme fields reach predictor-tree modules too
+        from dataclasses import fields as dc_fields
+
+        from auto_round.schemes import QuantizationScheme
+
+        scheme_keys = tuple(f.name for f in dc_fields(QuantizationScheme)) + ("scale_dtype",)
+        for attr in scheme_keys:
+            # ALWAYS set the attribute: readers (the row-blocked wrapper reads
+            # orig_layer.scale_dtype) require it to exist; None is a valid
+            # value they resolve to defaults, mirroring apply_plan_to_model
+            setattr(module, attr, pin.get(attr))
+        # explicit None must not defeat the defaults (AutoScheme emits None);
+        # same idiom as the base plan application
+        module.act_bits = pin.get("act_bits") or 16
+        module.act_sym = pin.get("act_sym") if pin.get("act_sym") is not None else True
+        module.act_data_type = pin.get("act_data_type") or None
+        module.global_name = name
+
+    def _detach_tree_(self, group: str) -> None:
+        """Remove a (possibly partial) predictor tree from the model.
+
+        Attached tree tensors would satisfy the export missing-tensors check,
+        silently disabling the verbatim copy the export path would otherwise
+        perform for the group.
+        """
+        segs = group.split(".")
+        try:
+            parent = (
+                self.model_context.model.get_submodule(".".join(segs[:-1]))
+                if len(segs) > 1
+                else self.model_context.model
+            )
+        except AttributeError:
+            return
+        parent._modules.pop(segs[-1], None)
+
+    def _attach_pinned_tree_(self, group, ckpt, info, pins, all_blocks, source_dir):
+        """Materialize one predictor tree and stamp pins on its Linears.
+
+        Returns ``(shell, pinned_module_names, claimed_tensor_names)`` or None
+        (with a warning logged) when no sibling covers the tree, the build
+        fails, or the pins match no Linear.
+        """
+        picked = pick_sibling_layer(self.model_context.model, ckpt, info, all_blocks)
+        if picked is None:
+            logger.warning("predictor tree %s skipped: no sibling layer covers its tensors", group)
+            return None
+        sibling_name, sibling = picked
+        try:
+            claimed = build_predictor_tree(self.model_context.model, source_dir, ckpt, info, sibling)
+        except Exception as e:  # degrade, never die: the export path still handles the group
+            logger.warning("predictor tree %s skipped: %s: %s", group, type(e).__name__, e)
+            self._detach_tree_(group)
+            logger.info("detached partially materialized predictor tree %s", group)
+            return None
+        logger.info("tuning predictor tree %s (layer from sibling %s)", group, sibling_name)
+        shell = self.model_context.model.get_submodule(group)
+        # canonical layer-config resolution on the attached tree: user pins
+        # resolve with the repo's own precedence and EVERY entry carries the
+        # full scheme field set - the same dict the export writes into
+        # quantization_config; unpinned tree modules resolve to the run's
+        # scheme
+        resolved = self._resolve_tree_pins_(group, pins)
+        pinned = []
+        for n, m in shell.named_modules():
+            if not isinstance(m, torch.nn.Linear):
+                continue
+            module_name = f"{group}.{n}" if n else group
+            entry = resolved.get(module_name)
+            if entry is None:
+                continue
+            self._stamp_pin_(m, module_name, entry)
+            self.layer_config[module_name] = entry
+            pinned.append(module_name)
+        if not pinned:
+            logger.warning(
+                "predictor tree %s: pins %s matched no Linear; leaving to the export pass", group, list(pins)
+            )
+            self._detach_tree_(group)
+            return None
+        return shell, pinned, claimed
+
+    def _resolve_tree_pins_(self, group, user_pins) -> dict:
+        """Canonical layer-config resolution over the attached tree modules.
+
+        Reuses the compressor's resolver (``resolve_layer_config``): user
+        pins expand and resolve with the repo's own precedence, and every
+        entry carries the full scheme field set - the same dict registered in
+        ``layer_config`` and exported into ``quantization_config``. Unpinned
+        tree modules resolve to the run's scheme defaults.
+        """
+        from auto_round.compressors.config_resolution.contracts import ResolvedScheme
+        from auto_round.compressors.layer_config_resolver import _resolve_layer_config_presets, resolve_layer_config
+
+        # outside-block modules are opt-in in the resolver (entries appear only
+        # when the user pins them); the tree stage's policy is schema-follow,
+        # so seed every tree Linear with the canonical scheme default and let
+        # user pins win through the resolver's own expansion/precedence
+        _, default_dict, _, _ = _resolve_layer_config_presets(
+            {}, self.model_context.model, self.ignore_layers, self.scheme_context, self.scale_dtype, True
+        )
+        from auto_round.utils.missing_tensors import EXPORT_IGNORE_BLOCKS
+
+        tree_defaults = {}
+        for n, mod in self.model_context.model.named_modules():
+            if isinstance(mod, torch.nn.Linear) and (n == group or n.startswith(group + ".")):
+                entry = copy.deepcopy(default_dict)
+                if any(ign in f"{n}." for ign in EXPORT_IGNORE_BLOCKS):
+                    # same ignore the export completion pass applies: a tree
+                    # the run quantizes and a tree the completer picks up must
+                    # produce the same artifact shape. Substring semantics
+                    # match the completer's tensor-name test.
+                    entry["bits"] = 16
+                    entry["data_type"] = "fp"
+                    logger.info("predictor tree module %s stays fp (export ignore list)", n)
+                tree_defaults[n] = entry
+        merged = {**tree_defaults, **{k: dict(v) for k, v in (user_pins or {}).items()}}
+        resolved = resolve_layer_config(
+            model=self.model_context.model,
+            scheme=ResolvedScheme.from_scheme(self.scheme_context),
+            layer_config=merged,
+            scale_dtype=self.scale_dtype,
+            supported_types=self.supported_types,
+            inner_supported_types=self.inner_supported_types,
+            quant_block_list=None,
+            ignore_layers=self.ignore_layers,
+            quant_lm_head=False,
+            enable_gguf_official_mixed=False,
+            is_mllm=self.model_context.is_mllm,
+            format=self._formats_policy_string(),
+        )
+        return dict(resolved)
+
+    def _tune_tree_heads_(
+        self,
+        group,
+        ckpt,
+        info,
+        user_pins,
+        claimed,
+        source_dir,
+        new_q_output,
+        reference_output,
+        token_ids,
+    ):
+        """Tune remaining 2-D tensors (e.g. the vocab head) on the tree's outputs.
+
+        Head modules are created first, then the canonical resolver runs once
+        over the now-complete module set (user pins with the repo precedence;
+        schema defaults for the rest), and each created head tunes on the
+        tree's fp/q outputs with its resolved entry registered for export.
+        """
+        role_names = {info[r] for r in ("fc", "norm_e", "norm_h", "final_norm") if info.get(r)}
+        heads = []
+        for n in (n for n in ckpt if n.startswith(group + ".")):
+            if n in claimed or n in role_names or not n.endswith(".weight"):
+                continue
+            shape = ckpt[n][0]
+            if len(shape) != 2:
+                continue
+            path = n[: -len(".weight")]
+            try:
+                self.model_context.model.get_submodule(path)
+            except AttributeError:
+                from auto_round.compressors.predictor_tree import ensure_module_path, load_checkpoint_tensor
+
+                # build at the checkpoint tensor's dtype: a fresh nn.Linear
+                # defaults to fp32 and copy_ upcasts, exporting a
+                # surprise-fp32 head on bf16 checkpoints (same bug class as
+                # the fixed fc mixer)
+                head_w = load_checkpoint_tensor(source_dir, ckpt, n)
+                head = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=False, dtype=head_w.dtype)
+                parent = ensure_module_path(self.model_context.model, path)
+                parent.add_module(path.rsplit(".", 1)[-1], head)
+                with torch.no_grad():
+                    head.weight.data.copy_(head_w)
+            heads.append(path)
+        if not heads:
+            return
+        resolved = self._resolve_tree_pins_(group, user_pins)
+        for path in heads:
+            entry = resolved.get(path)
+            if entry is None:
+                continue
+            if entry.get("data_type") == "float" or int(entry.get("bits") or 0) >= 16:
+                continue  # full-precision pin: leave the tensor verbatim for the export
+            mod = self.model_context.model.get_submodule(path)
+            self._stamp_pin_(mod, path, entry)
+            self.layer_config[path] = entry
+            logger.info("tuning predictor tensor %s on the tree outputs", path)
+            self.alg_composer.compress_layer_outside_block(
+                mod,
+                fp_inputs=reference_output,
+                q_inputs=new_q_output,
+                input_ids=token_ids,
+            )
+            if self.compress_context.is_immediate_packing:
+                immediate_pack(path, self.layer_config)
+
+    @staticmethod
+    def _chain_hidden_rows(chain_state):
+        """A chain input/output as a plain list of per-sample row tensors.
+
+        The chain keeps rows as a list, or a dict of per-key row lists for
+        block classes with structured outputs (e.g. gated-delta-net): take its
+        ``hidden_states`` rows."""
+        rows = chain_state.get("hidden_states") if isinstance(chain_state, dict) else chain_state
+        if isinstance(rows, dict):
+            rows = next(iter(rows.values()))
+        return rows
+
+    def _resolve_lm_head_name_(self, layer_names) -> Optional[str]:
+        """lm_head's module name from the outside-block plan, or ``None``."""
+        if not layer_names:
+            return None
+        candidates = [n for n in layer_names if n == "lm_head" or n.rsplit(".", 1)[-1] == "lm_head"]
+        if not candidates:
+            candidates = [n for n in layer_names if "lm_head" in n]
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            logger.warning(
+                "multiple lm_head candidates in the outside-block plan %s; tuning %s", candidates, candidates[0]
+            )
+        return candidates[0]
+
+    def _quantizer_requests_q_inputs_(self) -> bool:
+        """Whether the active quantizer(s) maintain the quantized-input chain.
+
+        SignRound defaults ``enable_quanted_input`` to True, RTN (iters=0)
+        defaults to False; drives the log level of the FP-only tail fallback.
+        """
+        quantizers = getattr(self.alg_composer, "block_quantizer", None)
+        if quantizers is None:
+            return False
+        if not isinstance(quantizers, (list, tuple)):
+            quantizers = [quantizers]
+        return any(bool(getattr(q, "enable_quanted_input", False)) for q in quantizers)
+
+    def _attach_tail_imatrix_(self, lm_head_name, fp_rows) -> None:
+        """Attach the fp-input imatrix for lm_head from the chain tail rows.
+
+        In the capture path this statistic was accumulated by the quantizer's
+        fp-input forward hook while the collection walk executed lm_head; with
+        the single-block-target early-stop the walk never reaches lm_head, so
+        the same math (fp32 column sums of squares over all token rows, plus
+        the token-row count) runs directly over the tail rows - the identical
+        input VALUES the hook would have seen. Count-convention note: the
+        lm_head hook sees a (tokens, hidden) input, so its imatrix_cnt also
+        counts token rows; BLOCK-layer hooks count batch entries instead. The
+        outside-block lane never divides by imatrix_cnt, so the difference is
+        inert here. Never overwrites an existing statistic.
+        """
+        module = get_module(self.model_context.model, lm_head_name)
+        if module is None or hasattr(module, "imatrix"):
+            return
+        if not fp_rows:
+            return
+        total = None
+        count = 0
+        for row in fp_rows:
+            flattened = row.reshape(-1, row.shape[-1]).to(torch.float32)
+            squared = torch.sum(torch.pow(flattened, 2), dim=0).to(torch.float32)
+            total = squared if total is None else total + squared.to(total.device)
+            count += flattened.shape[0]  # token rows - the lm_head hook's convention
+        module.imatrix = total
+        module.imatrix_cnt = count
+        logger.info("[lm_head] attached the fp-input imatrix for %s from %d chain-tail rows", lm_head_name, count)
+
+    def _lm_head_tail_inputs_(self, lm_head_name):
+        """``(fp_rows, q_rows)`` for lm_head from the calibration chain tail.
+
+        The block loop's chain output is the RAW last-block output; lm_head
+        consumes POST-final-norm states, so the final norm is applied to the
+        rows (its weights stream in when still meta). Returns ``None`` on any
+        mismatch - the caller then keeps the closed-form path for the layer.
+        """
+        tail = getattr(self, "_lm_head_chain_tail_", None)
+        if tail is None:
+            logger.warning(
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): the block loop kept no chain tail",
+                lm_head_name,
+            )
+            return None
+        new_q_output, reference_output = tail
+        fp_rows = self._chain_hidden_rows(reference_output)
+        if (
+            not isinstance(fp_rows, (list, tuple))
+            or len(fp_rows) == 0
+            or not all(isinstance(r, torch.Tensor) for r in fp_rows)
+        ):
+            logger.warning(
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): unexpected chain-tail row format (%s)",
+                lm_head_name,
+                type(fp_rows).__name__,
+            )
+            return None
+        q_rows = self._chain_hidden_rows(new_q_output) if new_q_output is not None else None
+        q_requested = self._quantizer_requests_q_inputs_()
+        if not isinstance(q_rows, (list, tuple)) or len(q_rows) != len(fp_rows):
+            if q_requested:
+                logger.warning(
+                    "[lm_head] %s tunes on FP chain inputs (enable_quanted_input cannot be honored): "
+                    "quantized chain rows are missing or malformed",
+                    lm_head_name,
+                )
+            else:
+                # RTN (iters=0) defaults enable_quanted_input to False: the q chain
+                # was never maintained by configuration, so this is the expected
+                # path, not a degradation - and the search ignores q rows anyway.
+                logger.info(
+                    "[lm_head] %s tunes on FP chain inputs (quantized-input chain disabled by config)",
+                    lm_head_name,
+                )
+            q_rows = None
+        norm_name = getattr(self, "_lm_head_norm_name_", None)
+        norm_mod = get_module(self.model_context.model, norm_name) if norm_name else None
+        if norm_mod is None:
+            logger.warning(
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): cannot locate the final norm that feeds it",
+                lm_head_name,
+            )
+            return None
+        # a wrongly picked leaf is detectable: the real final norm scales the
+        # hidden dim lm_head consumes
+        in_features = getattr(get_module(self.model_context.model, lm_head_name), "in_features", None)
+        if in_features is not None and norm_mod.weight.numel() != in_features:
+            logger.warning(
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): candidate final norm %s does not match lm_head's "
+                "input width (%d vs %d)",
+                lm_head_name,
+                norm_name,
+                norm_mod.weight.numel(),
+                in_features,
+            )
+            return None
+        if any(p.is_meta for p in norm_mod.parameters()):
+            offloader = getattr(self, "_offloader", None)
+            if offloader is None:
+                logger.warning(
+                    "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): the final norm is still meta and no offloader "
+                    "is available to load it",
+                    lm_head_name,
+                )
+                return None
+            offloader.reload(self.model_context.model, norm_name)
+            materialize_model_(norm_mod)
+        with torch.no_grad():
+            # Compute on the norm's device (its params stay put); results park
+            # on the HOST: the tune loop streams rows per micro-batch
+            # (torch.cat(...).to(device)), so keeping the whole set resident on
+            # cache_device only collides with the wrapper's value/grad buffers
+            # on tight GPUs. Only one per-sample transient is away from host
+            # at a time.
+            ndev, dt = norm_mod.weight.device, norm_mod.weight.dtype
+            fp_rows = [norm_mod(r.to(ndev).to(dt)).to("cpu") for r in fp_rows]
+            if q_rows is not None:
+                q_rows = [norm_mod(r.to(ndev).to(dt)).to("cpu") for r in q_rows]
+        return fp_rows, q_rows
+
+    def _snapshot_predictor_aux_(self, all_inputs, to_cache_block_names) -> None:
+        """Keep the last block group's auxiliary inputs (attention mask,
+        position ids) for the predictor-tree stage.
+
+        Excludes the block's primary row key under BOTH spellings: entries are
+        cached as "hidden_states" and renamed to "input_ids" only later -
+        leaking either into aux would override the tree's true hidden input.
+        Values are shared list references that survive the block loop's pops.
+        """
+        self._predictor_tree_aux_ = None
+        last_first = to_cache_block_names[-1] if to_cache_block_names else None
+        entry = all_inputs.get(last_first) if last_first else None
+        if isinstance(entry, dict):
+            self._predictor_tree_aux_ = {k: v for k, v in entry.items() if k not in ("input_ids", "hidden_states")}
+
+    def _tune_predictor_trees_(self, token_ids) -> None:
+        """Materialize and tune pinned checkpoint-only predictor trees (MTP).
+
+        Runs after the block loop and the outside-block layer loop: fp/q tails
+        were captured with the final-norm hook; the tree joins as one extra
+        block (fp reference vs quantized chain), then any remaining pinned 2-D
+        tensors (e.g. the vocabulary head) tune layer-wise on the tree's
+        outputs. Trees are attached under checkpoint-spelled paths so pins,
+        packing, saving and the missing-tensors pass see checkpoint names.
+        """
+        plan = getattr(self, "_predictor_plan_", None)
+        if plan is None:
+            return
+        try:
+            self._tune_predictor_trees_impl_(token_ids, plan)
+        finally:
+            # the raw chain tail fed both this stage and any tail-fed external
+            # layers; nothing needs it after the trees
+            self._lm_head_chain_tail_ = None
+
+    def _tune_predictor_trees_impl_(self, token_ids, plan) -> None:
+        """Body of :meth:`_tune_predictor_trees_` (plan already resolved)."""
+        ckpt, roots, norm_name = plan["ckpt"], plan["roots"], plan["norm"]
+        # fp/q tails come from the block loop's stored chain tail: the raw
+        # last-block outputs are exactly the rows a final-norm pre-hook would
+        # have captured (the norm's input), so no extra calibration pass and
+        # no early-stop override are needed anywhere
+        tail = getattr(self, "_lm_head_chain_tail_", None)
+        fp_tail = q_tail = None
+        if tail is not None:
+            q_out, ref_out = tail
+            fp_tail = self._chain_hidden_rows(ref_out)
+            q_tail = self._chain_hidden_rows(q_out) if q_out is not None else None
+            self._predictor_fp_tail_ = fp_tail
+            self._predictor_q_tail_ = q_tail
+        if not fp_tail:
+            logger.warning("predictor trees %s stay on the export path: no chain tail kept by the block loop", roots)
+            return
+        cfg = getattr(self.model_context.model, "config", None)
+        text_cfg = getattr(cfg, "text_config", None) or cfg
+        hidden = getattr(text_cfg, "hidden_size", None)
+        embed_getter = getattr(self.model_context.model, "get_input_embeddings", None)
+        embed = embed_getter() if callable(embed_getter) else None
+        if token_ids and embed is not None:
+            e_rows = [synthesize_predictor_e(ids, embed=embed) for ids in token_ids]
+        else:
+            e_rows = None
+        if e_rows is None:
+            logger.warning("predictor trees %s skipped: no cached token ids for the e-side input", roots)
+            return
+        all_blocks = get_block_names(self.model_context.model)
+        source_dir = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
+        # the tree stage follows the lm_head tune on the same device; reclaim
+        # its allocator cache first so the tree's tuning state and activations
+        # start from a defragmented pool. The streaming lane gets this for
+        # free (every prior block is parked to meta and cleared per group) -
+        # the data-driven lane needs the explicit clear.
+        clear_memory()
+        for group in roots:
+            info = analyze_predictor_group(ckpt, group, hidden)
+            if info is None:
+                logger.info("checkpoint-only group %s is not a predictor tree; leaving it to the export pass", group)
+                continue
+            names_under = [n for n in ckpt if n.startswith(group + ".")]
+            pins = self._pins_for_tree_(names_under)
+            if not pins:
+                logger.info("predictor tree %s follows the run's schema (no layer-config pins)", group)
+            # containment: any failure from here through the tune leaves the
+            # tree to the export pass (missing-tensors covers whatever this
+            # run leaves unquantized) instead of killing the run after every
+            # block has already been tuned and streamed
+            try:
+                self._tune_one_predictor_tree_(
+                    group, ckpt, info, pins, all_blocks, source_dir, fp_tail, token_ids, e_rows
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                from auto_round.utils.device import is_oom_exception  # pylint: disable=import-outside-toplevel
+
+                if is_oom_exception(e):
+                    # the only vantage that sees the working set that failed
+                    from auto_round.utils.device import log_cuda_memory_census
+
+                    log_cuda_memory_census(f"predictor tree {group} OOM (at failure)", device_manager.device)
+                logger.warning(
+                    "predictor tree %s tuning failed (%s: %s); leaving it to the export path",
+                    group,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+                try:
+                    self._detach_tree_(group)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                clear_memory()
+                continue
+
+    def _tune_one_predictor_tree_(
+        self, group, ckpt, info, pins, all_blocks, source_dir, fp_tail, token_ids, e_rows
+    ) -> None:
+        """Attach, tune, and pack one predictor tree (failures handled by the caller)."""
+        attached = self._attach_pinned_tree_(group, ckpt, info, pins, all_blocks, source_dir)
+        if attached is None:
+            return
+        shell, pinned, claimed = attached
+        bind_predictor_forward(
+            shell,
+            {
+                "norm_e": info["norm_e"][: -len(".weight")],
+                "norm_h": info["norm_h"][: -len(".weight")],
+                "fc": info["fc"][: -len(".weight")],
+                "layer": info["layer_root"],
+                "final_norm": info["final_norm"][: -len(".weight")] if info.get("final_norm") else None,
+            },
+            e=e_rows[0],
+            model=self.model_context.model,
+        )
+        aux = dict(self._predictor_tree_aux_ or {})
+        aux["_predictor_e"] = e_rows
+        _, input_others = self._preprocess_block_inputs({"input_ids": fp_tail, **aux})
+        from auto_round.algorithms.composer import BlockContext
+
+        # same infrastructure the block loop applies: materialize meta
+        # tensors, honor the amp dtype policy, and place the tree on the
+        # tuning device (compress_block treats placement as caller's job)
+        materialize_model_(shell)
+        convert_module_to_hp_if_necessary(shell, self.model_context.amp_dtype, device_manager.device)
+        shell = self.alg_composer.dispatch_block(shell, fp_tail, input_others)
+        # mirrors the lm_head lane's wrapper-ready census (quantizer.py,
+        # quantize_layer_outside_block): the tree block tunes via compress_block,
+        # which carries no census of its own - this is the last clean vantage
+        # before the tune's value/grad/activation allocations begin. Header
+        # only: the tensor-list walk runs in the failure handler
+        from auto_round.utils.device import log_cuda_memory_census
+
+        log_cuda_memory_census(f"predictor tree ready {group}", device_manager.device, walk=False)
+        ctx = BlockContext(
+            model=self.model_context.model,
+            block_names=[group],
+            block_name=group,
+            block_index=len(all_blocks),
+            bs=self.calibration_context.batch_size,
+            block_cnt=len(all_blocks) + 1,
+        )
+        new_q_output, reference_output = self.alg_composer.compress_block(
+            shell,
+            fp_tail,
+            input_others,
+            block_ctx=ctx,
+            q_inputs=self._predictor_q_tail_,
+            input_ids=token_ids,
+        )
+        self._tune_tree_heads_(group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids)
+        if self.compress_context.is_immediate_packing:
+            for module_name in pinned:
+                immediate_pack(module_name, self.layer_config)
+        clear_memory()
 
     def _check_compatibility(self) -> None:
         """Checks compatibility of the configurations and model."""
