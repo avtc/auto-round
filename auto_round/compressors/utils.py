@@ -327,19 +327,20 @@ def _idle_peer_for_(need_bytes, home) -> Optional[torch.device]:
     return None
 
 
-def _snapshot_route_log_(block, route, msg, *args, warn_first=False, debug=False) -> None:
+def _snapshot_route_log_(block, route, msg, *args, warn_first=False, silent=False) -> None:
     """Log a snapshot routing decision once per change; repeats log nothing.
 
     The ladder re-runs on every best-params update because free memory moves
     between iterations; the re-evaluation stays, but an unchanged route (the
     common case - parameters improving again) says nothing worth reading at
-    any level. ``debug`` keeps the unremarkable route (duplicating beside the
-    weights, the expected path) at DEBUG; ``warn_first`` keeps a fallback's
-    first occurrence at WARNING."""
+    any level. ``silent`` records the route for stickiness without logging
+    (the unremarkable beside-the-weights path never logs); ``warn_first``
+    keeps a fallback's first occurrence at WARNING."""
     last = getattr(block, "_snapshot_route", None)
     if last == route:
         return
-    (logger.debug if debug else (logger.warning if warn_first else logger.info))(msg, *args)
+    if not silent:
+        (logger.warning if warn_first else logger.info)(msg, *args)
     block._snapshot_route = route
 
 
@@ -422,7 +423,7 @@ def snapshot_best_params(block, cache_device="cpu"):
             if cand == "local":
                 out = collect_best_params_local(block)
                 _snapshot_route_log_(
-                    block, "local", "[snapshot] %.2fGiB stays beside the weights", total_need / 2**30, debug=True
+                    block, "local", "[snapshot] %.2fGiB stays beside the weights", total_need / 2**30, silent=True
                 )
                 return out
             out = collect_best_params(block, cand)
