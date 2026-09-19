@@ -1721,7 +1721,21 @@ class BaseOrchestrator(object):
             for name, cfg in layer_config.items()
             if not dict(cfg).get("in_blocks", False) and check_to_quantized(dict(cfg))
         ]
-        return bool(outside) and all(name.rsplit(".", 1)[-1] == "lm_head" for name in outside)
+        if not outside:
+            return False
+        heads = [name for name in outside if name.rsplit(".", 1)[-1] == "lm_head"]
+        # the tail lane feeds exactly ONE resolved lm_head; with several
+        # lm_head-named outside layers the extras run the legacy capture walk
+        # and must keep the restrictions (fail loud about the divergence)
+        if len(heads) == len(outside) == 1:
+            return True
+        if heads:
+            logger.warning(
+                "outside-block layers %s: only a single lm_head is tail-fed; the remaining layers keep "
+                "the in-place/immediate-packing restrictions",
+                outside,
+            )
+        return False
 
     def _hardware_setup(self) -> None:
         """Phase 5 – Hardware and compile configuration.

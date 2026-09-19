@@ -1,4 +1,5 @@
-# Copyright 2026 Intel Corporation
+# coding=utf-8
+# Copyright (c) 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 """Block-path best-params snapshot placement: one ladder for every lane.
 

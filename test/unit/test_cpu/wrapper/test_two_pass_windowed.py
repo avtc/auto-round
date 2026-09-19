@@ -1,4 +1,5 @@
-# Copyright 2026 Intel Corporation
+# coding=utf-8
+# Copyright (c) 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 """Two-pass windowed backward: exact block-tune gradients without the
 full-size saved set.
