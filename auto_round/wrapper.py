@@ -529,15 +529,27 @@ class WrapperLinear(torch.nn.Module):
         return weight_q
 
     def begin_two_pass_forward_(self):
-        """Snapshot the quantized weight (no autograd graph) as a leaf.
+        """Refresh the quantized-weight leaf (no autograd graph) for this iteration.
 
         Pass 1 of the two-pass block tune: the block forward runs on this
         leaf and its graph differentiates only dL/dw_q - the qdq math saves
-        nothing, so the block's saved set stays activation-sized."""
+        nothing, so the block's saved set stays activation-sized.
+
+        The leaf TENSOR is allocated once per tune and reused via ``copy_``:
+        a fresh tensor object per iteration would break dynamo's guards on
+        the wrapper attribute every iteration, forcing a recompile whose
+        compiled variant retains example tensors (observed ~2GiB per
+        recompile accumulating until the accelerator fills). Bit-identical
+        content, stable identity."""
         with torch.no_grad():
             weight_q, *_ = self._qdq_weight(self.value, self.min_scale, self.max_scale)
-        leaf = weight_q.detach().clone().requires_grad_(True)
-        self._two_pass_leaf_weight = leaf
+            weight_q = weight_q.detach()
+            leaf = self._two_pass_leaf_weight
+            if leaf is None or leaf.shape != weight_q.shape or leaf.dtype != weight_q.dtype:
+                leaf = weight_q.clone().requires_grad_(True)
+                self._two_pass_leaf_weight = leaf
+            else:
+                leaf.copy_(weight_q)
         return leaf
 
     def end_two_pass_forward_(self) -> None:
@@ -552,14 +564,14 @@ class WrapperLinear(torch.nn.Module):
         parameter gradients equal differentiating through the composite -
         while only one window's fp32 qdq intermediates are alive at a time.
         Grads land in ``params`` via the same ``_GradScatterSlice`` views the
-        row-blocked forward uses."""
+        row-blocked forward uses. The leaf stays allocated for the next
+        iteration; ``end_two_pass_forward_`` releases it at tune end."""
         leaf = self._two_pass_leaf_weight
         g = g_wq.to(device=leaf.device, dtype=leaf.dtype)
         for start, end in self.row_block_bounds():
             weight_q_win = self._row_block_params(start, end)
             local = (weight_q_win * g[start:end]).sum()
             local.backward()
-        self._two_pass_leaf_weight = None
 
     def forward_rows(self, x, start, end, bias=None):
         """Output columns ``[start:end)`` computed with the row-blocked fake-quant

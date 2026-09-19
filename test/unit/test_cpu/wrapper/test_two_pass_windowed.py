@@ -280,3 +280,39 @@ class TestChunkedBackwardMode:
                 ar_logger.removeHandler(caplog.handler)
         assert mode2 == "0"
         assert any("AR_TUNE_CHUNKED_BACKWARD=1 ignored" in r.message for r in caplog.records)
+
+
+class TestStableLeaf:
+    def test_leaf_identity_stable_content_refreshes(self):
+        w = self._w() if hasattr(self, "_w") else None
+        import torch.nn as nn
+
+        from auto_round.wrapper import WrapperLinear
+
+        torch.manual_seed(7)
+        layer = nn.Linear(64, 32, bias=False).to(torch.bfloat16)
+        layer.bits, layer.group_size, layer.sym, layer.data_type = 4, 128, True, "int"
+        layer.super_bits = layer.super_group_size = None
+        layer.scale_dtype = None
+        layer.act_bits, layer.act_sym, layer.act_data_type, layer.act_dynamic = 16, True, None, None
+        w = WrapperLinear(layer, enable_minmax_tuning=True, enable_torch_compile=False, device=torch.device("cpu"))
+        for k in ("value", "min_scale", "max_scale"):
+            w.params[k].requires_grad_(True)
+        w.min_scale = w.params["min_scale"]
+        w.max_scale = w.params["max_scale"]
+
+        leaf1 = w.begin_two_pass_forward_()
+        leaf2 = w.begin_two_pass_forward_()
+        # same tensor object across iterations: dynamo guards on the wrapper
+        # attribute stay valid instead of recompiling per iteration
+        assert leaf1 is leaf2
+        before = leaf1.detach().clone()
+
+        with torch.no_grad():
+            w.params["value"].add_(0.5)
+        leaf3 = w.begin_two_pass_forward_()
+        assert leaf3 is leaf1
+        assert not torch.equal(leaf3.detach(), before)  # content follows the params
+
+        w.end_two_pass_forward_()
+        assert w._two_pass_leaf_weight is None  # released for pack

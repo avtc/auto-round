@@ -449,21 +449,23 @@ class SignRoundQuantizer(BaseQuantizer):
     def _two_pass_backward_step_(self, wrappers, other_targets, scaled_loss, leaves) -> None:
         """One engaged sub-batch backward: act/bias params via pass 1, wrappers via pass 2.
 
-        Pass 1 backpropagates the (already scaled) loss into the leaf weights
-        and any non-wrapper tuning parameters (activation scales, tuned
-        biases); pass 2 turns each wrapper's dL/dw_q into parameter grads via
-        its windowed local graphs. Together they equal the plain composite
-        backward exactly."""
-        if other_targets:
-            scaled_loss.backward(inputs=list(other_targets) + list(leaves), allow_unused=True)
-            grads = [leaf.grad for leaf in leaves]
-        else:
-            grads = torch.autograd.grad(scaled_loss, list(leaves), allow_unused=True)
-        for wrapper, g in zip(wrappers, grads):
+        Pass 1 reads dL/dleaf and dL/d(any non-wrapper tuning parameter -
+        activation scales, tuned biases) via ``torch.autograd.grad`` (which
+        frees the pass-1 graph); other-param grads are accumulated into
+        ``.grad`` manually. Pass 2 turns each wrapper's dL/dw_q into
+        parameter grads via its windowed local graphs. Together they equal
+        the plain composite backward exactly."""
+        leaves = list(leaves)
+        others = list(other_targets)
+        grads = torch.autograd.grad(scaled_loss, leaves + others, allow_unused=True)
+        n = len(leaves)
+        for p, g in zip(others, grads[n:]):
+            if g is None:
+                continue
+            p.grad = g if p.grad is None else (p.grad + g)
+        for wrapper, g in zip(wrappers, grads[:n]):
             if g is not None:
                 wrapper.backward_from_weight_grad_(g)
-            else:
-                wrapper.end_two_pass_forward_()
 
     @staticmethod
     def _snapshot_act_floor_(block, inputs, batch_size):
@@ -820,6 +822,12 @@ class SignRoundQuantizer(BaseQuantizer):
         finally:
             if tuning_cache is not None:
                 tuning_cache.close()
+            if _tp_wrappers:
+                # release the persistent quantized-weight leaves before the
+                # best-params restore and pack (they ride through iterations
+                # by design; see begin_two_pass_forward_)
+                for _w in _tp_wrappers:
+                    _w.end_two_pass_forward_()
 
         last_loss = total_loss
         best_iter = self.iters
