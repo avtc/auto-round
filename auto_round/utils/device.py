@@ -1848,5 +1848,33 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
         len(groups),
     ]
     logger.debug(*lines)
-    for (shape, dtype), (count, nbytes) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]:
+    top_items = sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]
+    for (shape, dtype), (count, nbytes) in top_items:
         logger.debug("[vram]   %6.3fGiB x%-3d %s %s", nbytes / 2**30, count, dtype, shape)
+    # forensics: for the biggest groups, what KIND of object refers to a
+    # representative tensor - tells the reader WHO retains the set
+    for (shape, dtype), (count, nbytes) in top_items[:3]:
+        if nbytes / 2**30 < 0.5:
+            continue
+        rep = next(
+            (
+                o
+                for o in gc.get_objects()
+                if torch.is_tensor(o)
+                and getattr(o, "device", None) == device
+                and tuple(o.shape) == tuple(shape)
+                and str(o.dtype) == str(dtype)
+            ),
+            None,
+        )
+        if rep is None:
+            continue
+        kinds = {}
+        for r in gc.get_referrers(rep):
+            k = type(r).__name__
+            if isinstance(r, (list, tuple)):
+                k += f"[{type(r[0]).__name__}]" if len(r) else "[]"
+            elif isinstance(r, dict):
+                k += "[dict]"
+            kinds[k] = kinds.get(k, 0) + 1
+        logger.debug("[vram]   referrers of %s %s: %s", dtype, tuple(shape), kinds)

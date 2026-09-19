@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import logging
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
@@ -355,6 +356,34 @@ class SignRoundQuantizer(BaseQuantizer):
         if oom_cls and type(e).__name__ == oom_cls:
             return True
         return "out of memory" in str(e).lower()
+
+    @staticmethod
+    def _leak_check_(iter_n, wrappers) -> None:
+        """DEBUG: per-iteration census of value-shaped tensors per wrapper.
+
+        A leaked iteration graph shows up as the per-wrapper count growing
+        with iter_n; a flat count means the iteration's tensors were freed.
+        Runs only under DEBUG and only when chunked wrappers exist."""
+        import gc as _gc
+
+        _gc.collect()
+        want = {}
+        for w in wrappers:
+            v = w.params.get("value")
+            if isinstance(v, torch.Tensor):
+                key = (tuple(v.shape), str(v.dtype))
+                want[key] = want.get(key, 0) + 1
+        have = {}
+        for o in _gc.get_objects():
+            try:
+                if torch.is_tensor(o):
+                    k = (tuple(o.shape), str(o.dtype))
+                    if k in want:
+                        have[k] = have.get(k, 0) + 1
+            except Exception:  # pylint: disable=broad-except
+                continue
+        parts = [f"{list(shape)}x{have.get((shape, dtype), 0)}/{want[(shape, dtype)]}" for shape, dtype in want]
+        logger.debug("[leak-check] iter %d value-shaped: %s", iter_n, " ".join(parts))
 
     def _resolve_chunked_mode_(self, block, scaler) -> tuple:
         """Effective chunked-backward mode: "0", "1", or "auto".
@@ -710,6 +739,8 @@ class SignRoundQuantizer(BaseQuantizer):
                     init_loss = total_loss
                 current_lr = optimizer.param_groups[0]["lr"]
                 logger.debug("iter %d loss: %.3e lr: %s", i, total_loss, current_lr)
+                if _tp_wrappers and logger.isEnabledFor(logging.DEBUG):
+                    self._leak_check_(i, _tp_wrappers)
 
                 if total_loss < best_loss:
                     best_loss = total_loss
