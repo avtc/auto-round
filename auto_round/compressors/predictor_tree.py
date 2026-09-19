@@ -403,9 +403,14 @@ def build_predictor_tree(
         claimed.add(tensor_name)
 
     fc_meta = ckpt_tensors[info["fc"]]
-    fc = torch.nn.Linear(int(fc_meta[0][1]), int(fc_meta[0][0]), bias=False)
+    fc_w = load_checkpoint_tensor(source_dir, ckpt_tensors, info["fc"])
+    # a fresh nn.Linear defaults to fp32; copy_ upcasts into the destination,
+    # so a bf16 checkpoint would export a surprise-fp32 fc (real artifact:
+    # F32 mtp.fc beside an all-bf16 model, detonating dtype-checked
+    # consumers). Build the mixer at the checkpoint tensor's dtype instead.
+    fc = torch.nn.Linear(int(fc_meta[0][1]), int(fc_meta[0][0]), bias=False, dtype=fc_w.dtype)
     with torch.no_grad():
-        fc.weight.copy_(load_checkpoint_tensor(source_dir, ckpt_tensors, info["fc"]))
+        fc.weight.copy_(fc_w)
     fc_path = info["fc"][: -len(".weight")]
     fc_parent = ensure_module_path(model, fc_path)
     fc_parent.add_module(fc_path.rsplit(".", 1)[-1], fc)

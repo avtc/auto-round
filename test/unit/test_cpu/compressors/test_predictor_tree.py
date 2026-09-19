@@ -221,6 +221,20 @@ class TestBuildPredictorTree:
         assert torch.allclose(tree.layer.fc1.weight, mtp_ref.layer.fc1.weight.detach())
         assert torch.allclose(tree.enorm.weight, mtp_ref.enorm.weight.detach())
 
+    def test_tree_honors_checkpoint_dtype(self, tmp_path):
+        """A fresh nn.Linear defaults to fp32 and copy_ upcasts into the
+        destination: a bf16 checkpoint must not yield a surprise-fp32 mixer
+        (real-world artifact shipped F32 mtp.fc beside an all-bf16 model)."""
+        mtp = _MTP().to(torch.bfloat16)
+        _write_ckpt(tmp_path, mtp)
+        body = _Body()
+        tensors = list_checkpoint_tensors(str(tmp_path))
+        info = analyze_predictor_group(tensors, "mtp", HID)
+        _, sibling = pick_sibling_layer(body, tensors, info, [["blocks.0"], ["blocks.1"]])
+        build_predictor_tree(body, str(tmp_path), tensors, info, sibling)
+        tree = body.get_submodule("mtp")
+        assert tree.eh_proj.weight.dtype == torch.bfloat16
+
     def test_tree_builds_and_matches_reference(self, tmp_path):
         mtp_ref, body, tensors, info, all_blocks = self._setup(tmp_path)
         name, sibling = pick_sibling_layer(body, tensors, info, all_blocks)
