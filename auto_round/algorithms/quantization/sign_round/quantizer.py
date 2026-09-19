@@ -347,67 +347,6 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         return loss
 
-    def _log_tune_peak_prediction_(self, block, inputs, batch_size, act_floor_bytes) -> None:
-        """DEBUG: exact predicted tune peak, per module, from the scheme fields.
-
-        Steady terms (weight, value, min/max, grads, snapshot) come from
-        tune_memory's per-module arithmetic; the saved-for-backward term is
-        probe-measured for this wrapper class, scheme, and torch build (one
-        tiny replica forward per distinct signature per process); activations
-        come from the block memory estimator. Unknown probe ratios report
-        saved=None rather than guessing."""
-        try:
-            import logging as _logging
-
-            if not logger.isEnabledFor(_logging.DEBUG):
-                return
-            from auto_round.utils.model import check_to_quantized
-            from auto_round.utils.tune_memory import predict_block_tune_peak
-
-            wrapper_cls = getattr(self, "wrapper_block", None)
-            wrapper_cls = getattr(wrapper_cls, "__func__", wrapper_cls)  # V2 partial-like
-            if not isinstance(wrapper_cls, type):
-                from auto_round.wrapper import WrapperLinear as wrapper_cls  # type: ignore[no-redef]
-            from auto_round.wrapper import WrapperLinear
-
-            _wrappers = [m for _, m in block.named_modules() if isinstance(m, WrapperLinear)]
-            # price each wrapper's original layer once; named_modules also
-            # yields the wrapper's registered orig_layer child, which would
-            # double-count every module
-            layers = [w.orig_layer for w in _wrappers if getattr(w, "orig_layer", None) is not None]
-            free_b = None
-            try:
-                from auto_round.compressors.utils import _accel_mem_get_info_
-
-                _info = _accel_mem_get_info_(device_manager.device)
-                if _info is not None:
-                    free_b = int(_info[0])
-            except Exception:  # pylint: disable=broad-except
-                pass
-            out = predict_block_tune_peak(
-                layers,
-                device_manager.device,
-                enable_minmax_tuning=bool(self.enable_minmax_tuning),
-                wrapper_cls=wrapper_cls,
-                allocated_now=0,
-                act_est_bytes=act_floor_bytes or 0,
-                frag_budget_bytes=0,
-                snapshot_on_host=act_floor_bytes is not None,
-            )
-            gib = lambda b: (b or 0) / 2**30  # noqa: E731
-            logger.debug(
-                "[tune-mem] %d modules: fixed %.2fGiB snapshot %s saved %s act %.2fGiB%s",
-                out["modules"],
-                gib(out["fixed"]),
-                "host" if out["snapshot"] == 0 else f"{gib(out['snapshot']):.2f}GiB",
-                "unknown" if out["saved"] is None else f"{gib(out['saved']):.2f}GiB",
-                gib(out["act"]),
-                f" | free {free_b / 2**30:.2f}GiB" if free_b else "",
-            )
-        except Exception as e:  # pylint: disable=broad-except - advisory logging
-            logger.debug("[tune-mem] prediction unavailable (%s: %s)", type(e).__name__, e)
-
-    @staticmethod
     def _is_oom_(e: BaseException) -> bool:
         """Whether an exception means the accelerator ran out of memory."""
         import torch as _torch
@@ -466,27 +405,6 @@ class SignRoundQuantizer(BaseQuantizer):
         for wrapper, g in zip(wrappers, grads[:n]):
             if g is not None:
                 wrapper.backward_from_weight_grad_(g)
-
-    @staticmethod
-    def _snapshot_act_floor_(block, inputs, batch_size):
-        """Free-VRAM floor a home-resident best-params snapshot must leave.
-
-        The tune's remaining per-iteration working set (saved activations plus
-        attention workspace) from the same shape-based estimator the block
-        placement uses. A snapshot clone that eats this room kills the next
-        backward (observed: the predictor-tree tune died at iter 1 after the
-        iter-0 clone fit). Advisory: ``None`` keeps the historical snapshot
-        behavior when the estimate is unavailable."""
-        try:
-            from auto_round.utils.device import estimate_tuning_block_mem
-
-            _layers, act_gb, _io_gb, add_gb = estimate_tuning_block_mem(block, inputs, batch_size)
-            return int((act_gb + add_gb) * 1024**3)
-        except Exception as e:  # pylint: disable=broad-except
-            # loud, never a silent None: a swallowed failure skips the ladder
-            # and restores the blind on-device clone this helper exists to prevent
-            logger.warning("[snapshot] activation floor unavailable (%s: %s); ladder skipped", type(e).__name__, e)
-            return None
 
     def quantize_block(
         self,
@@ -622,8 +540,6 @@ class SignRoundQuantizer(BaseQuantizer):
         best_params = {}
         total_loss = 0
         batch_size = self.calibration_context.batch_size
-        act_floor = self._snapshot_act_floor_(block, active_inputs, batch_size)
-        self._log_tune_peak_prediction_(block, active_inputs, batch_size, act_floor)
         global_batch_size = batch_size * self.gradient_accumulate_steps
         global_batch_size = min(nsamples, global_batch_size)
         # Compute num_elm once before the loop (used to normalise the accumulated loss).
@@ -801,16 +717,14 @@ class SignRoundQuantizer(BaseQuantizer):
                         best_params = (
                             tuning_cache.collect_best_params()
                             if tuning_cache is not None and tuning_cache.best is not None
-                            else snapshot_best_params(
-                                block, self.compress_context.cache_device, act_floor_bytes=act_floor
-                            )
+                            else snapshot_best_params(block, self.compress_context.cache_device)
                         )
                         last_best_iter = i
                 if self.not_use_best_mse and i == self.iters - 1:
                     best_params = (
                         tuning_cache.collect_best_params()
                         if tuning_cache is not None and tuning_cache.best is not None
-                        else snapshot_best_params(block, self.compress_context.cache_device, act_floor_bytes=act_floor)
+                        else snapshot_best_params(block, self.compress_context.cache_device)
                     )
 
                 if not self.not_use_best_mse:

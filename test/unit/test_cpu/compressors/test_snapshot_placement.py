@@ -167,35 +167,6 @@ class TestNonCudaAccelerators:
         assert warned
 
 
-class TestActFloorHelper:
-    def test_floor_is_estimator_backed_and_positive(self):
-        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
-
-        blk = _Wrap(8, 4)
-        rows = [torch.randn(1, 16, 4) for _ in range(2)]
-        floor = SignRoundQuantizer._snapshot_act_floor_(blk, rows, 2)
-        assert floor is not None and floor > 0
-
-    def test_floor_survives_wrapped_quantizable_modules(self):
-        """A quantizable wrapper (orig_layer stamped, wrapper bare) is the
-        production shape; the estimator must read act_bits through
-        orig_layer instead of raising on the wrapper (live 00:45 run: the
-        AttributeError skipped the snapshot ladder and the on-device clone
-        OOM'd the next backward)."""
-        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
-
-        blk = _Wrap(8, 4)
-        blk.orig_layer.bits = 4  # quantizable via orig_layer; wrapper has no act_bits
-        rows = [torch.randn(1, 16, 4) for _ in range(2)]
-        floor = SignRoundQuantizer._snapshot_act_floor_(blk, rows, 2)
-        assert floor is not None and floor > 0
-
-    def test_floor_is_none_on_unestimatable_input(self):
-        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer
-
-        assert SignRoundQuantizer._snapshot_act_floor_(None, None, 0) is None
-
-
 class TestCensusStrDevice:
     def test_str_device_is_normalized_not_dropped(self, monkeypatch):
         """device_manager.device is a str; a str must reach the allocator

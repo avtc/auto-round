@@ -365,7 +365,7 @@ def _snapshot_free_devices_(dev_type: str, need_bytes: int) -> list:
     return [d for _b, d in devices]
 
 
-def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
+def snapshot_best_params(block, cache_device="cpu"):
     """Collect the best-params snapshot by attempt, falling back device by device.
 
     Sticky per block: duplicate beside the weights first (per-parameter local
@@ -376,9 +376,6 @@ def snapshot_best_params(block, cache_device="cpu", act_floor_bytes=None):
     improving iterations, and the host is terminal. A CPU ``cache_device``
     (``low_gpu_mem_usage``) snapshots on the host directly - VRAM was never
     budgeted for caching.
-
-    ``act_floor_bytes`` is accepted for call-site compatibility; placement
-    no longer routes on any prediction - the clone attempt is the test.
     """
     try:
         non_cpu = torch.device(str(cache_device)).type != "cpu"
