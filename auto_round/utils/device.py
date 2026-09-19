@@ -1851,30 +1851,43 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
     top_items = sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]
     for (shape, dtype), (count, nbytes) in top_items:
         logger.debug("[vram]   %6.3fGiB x%-3d %s %s", nbytes / 2**30, count, dtype, shape)
-    # forensics: for the biggest groups, what KIND of object refers to a
-    # representative tensor - tells the reader WHO retains the set
+    # forensics: across ALL copies of the biggest groups - python referrer
+    # kinds per copy, plus how many copies sit inside a live autograd graph
+    # (grad_fn set, no python referrers = held by C++ autograd nodes)
     for (shape, dtype), (count, nbytes) in top_items[:3]:
         if nbytes / 2**30 < 0.5:
             continue
-        rep = next(
-            (
-                o
-                for o in gc.get_objects()
-                if torch.is_tensor(o)
-                and getattr(o, "device", None) == device
-                and tuple(o.shape) == tuple(shape)
-                and str(o.dtype) == str(dtype)
-            ),
-            None,
-        )
-        if rep is None:
+        copies = [
+            o
+            for o in gc.get_objects()
+            if torch.is_tensor(o)
+            and getattr(o, "device", None) == device
+            and tuple(o.shape) == tuple(shape)
+            and str(o.dtype) == str(dtype)
+        ]
+        if not copies:
             continue
+        in_graph = sum(1 for t in copies if getattr(t, "grad_fn", None) is not None)
+        requires = sum(1 for t in copies if getattr(t, "requires_grad", False))
         kinds = {}
-        for r in gc.get_referrers(rep):
-            k = type(r).__name__
-            if isinstance(r, (list, tuple)):
-                k += f"[{type(r[0]).__name__}]" if len(r) else "[]"
-            elif isinstance(r, dict):
-                k += "[dict]"
-            kinds[k] = kinds.get(k, 0) + 1
-        logger.debug("[vram]   referrers of %s %s: %s", dtype, tuple(shape), kinds)
+        for t in copies:
+            refs = gc.get_referrers(t)
+            if not refs:
+                kinds["<C++-held/no-python-ref>"] = kinds.get("<C++-held/no-python-ref>", 0) + 1
+                continue
+            for r in refs:
+                k = type(r).__name__
+                if isinstance(r, (list, tuple)):
+                    k += f"[{type(r[0]).__name__}]" if len(r) else "[]"
+                elif isinstance(r, dict):
+                    k += "[dict]"
+                kinds[k] = kinds.get(k, 0) + 1
+        logger.debug(
+            "[vram]   %s %s x%d: in-graph(grad_fn)=%d requires_grad=%d; python referrers: %s",
+            dtype,
+            tuple(shape),
+            len(copies),
+            in_graph,
+            requires,
+            kinds,
+        )

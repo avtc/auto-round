@@ -366,6 +366,10 @@ class SignRoundQuantizer(BaseQuantizer):
         Runs only under DEBUG and only when chunked wrappers exist."""
         import gc as _gc
 
+        try:  # drain pending kernels first: separates real leaks from lag
+            torch.cuda.synchronize()
+        except Exception:  # pylint: disable=broad-except - non-CUDA devices
+            pass
         _gc.collect()
         want = {}
         for w in wrappers:
