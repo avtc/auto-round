@@ -1891,3 +1891,20 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
             requires,
             kinds,
         )
+        if nbytes / 2**30 >= 0.5:
+            # attribution: name the actual container objects for copies that
+            # are NOT plain requires-grad params (the leaked ones)
+            shown = 0
+            for t in copies:
+                if getattr(t, "requires_grad", False):
+                    continue
+                for r in gc.get_referrers(t):
+                    if isinstance(r, (list, dict, defaultdict)):
+                        rep = repr(r)
+                        if len(rep) > 160:
+                            rep = rep[:160] + "..."
+                        logger.debug("[vram]     copy %s held by %s: %s", str(tuple(t.shape)), type(r).__name__, rep)
+                        shown += 1
+                        break
+                if shown >= 6:
+                    break
