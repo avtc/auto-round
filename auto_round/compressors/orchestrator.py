@@ -1232,10 +1232,21 @@ class CompressionOrchestrator(BaseOrchestrator):
         _, default_dict, _, _ = _resolve_layer_config_presets(
             {}, self.model_context.model, self.ignore_layers, self.scheme_context, self.scale_dtype, True
         )
+        from auto_round.utils.missing_tensors import EXPORT_IGNORE_BLOCKS
+
         tree_defaults = {}
         for n, mod in self.model_context.model.named_modules():
             if isinstance(mod, torch.nn.Linear) and (n == group or n.startswith(group + ".")):
-                tree_defaults[n] = copy.deepcopy(default_dict)
+                entry = copy.deepcopy(default_dict)
+                if any(ign in f"{n}." for ign in EXPORT_IGNORE_BLOCKS):
+                    # same ignore the export completion pass applies: a tree
+                    # the run quantizes and a tree the completer picks up must
+                    # produce the same artifact shape. Substring semantics
+                    # match the completer's tensor-name test.
+                    entry["bits"] = 16
+                    entry["data_type"] = "fp"
+                    logger.info("predictor tree module %s stays fp (export ignore list)", n)
+                tree_defaults[n] = entry
         merged = {**tree_defaults, **{k: dict(v) for k, v in (user_pins or {}).items()}}
         resolved = resolve_layer_config(
             model=self.model_context.model,
