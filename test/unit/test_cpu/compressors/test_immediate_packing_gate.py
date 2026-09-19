@@ -25,7 +25,7 @@ def _fmt(gguf=False):
     )
 
 
-def _compressor(outside_block_layers, rtncfg=True):
+def _compressor(outside_block_layers, rtncfg=True, tail_only=True):
     model = type("QwenForCausalLM", (), {"_tied_weight_keys": {}})()
     o = SimpleNamespace(
         formats=[_fmt()],
@@ -37,6 +37,7 @@ def _compressor(outside_block_layers, rtncfg=True):
         shard_writer=None,
         _ensure_shard_writer=lambda self_=None: None,
         quantize_config=RTNConfig(data_type="int") if rtncfg else _SignRoundCfg(),
+        layer_config={"lm_head": {"bits": 4}} if tail_only else {"model.embed_tokens": {"bits": 8}},
         model_context=SimpleNamespace(model=model, is_mllm=False),
         compress_context=SimpleNamespace(
             is_immediate_packing=True,
@@ -45,6 +46,7 @@ def _compressor(outside_block_layers, rtncfg=True):
         ),
     )
     o._adjust_immediate_packing_and_saving = MethodType(base_mod.BaseCompressor._adjust_immediate_packing_and_saving, o)
+    o._outside_block_quantized_tail_only_ = MethodType(base_mod.BaseCompressor._outside_block_quantized_tail_only_, o)
     return o
 
 
@@ -56,11 +58,21 @@ class _SignRoundCfg:
 
 class TestImmediatePackingWithOutsideBlockLayers:
     def test_outside_block_layers_keep_immediate_packing(self):
+        # lm_head-class outside-block layers are tail-fed: no capture walk,
+        # so packing/saving stay progressive
         c = _compressor(outside_block_layers=True)
         c._adjust_immediate_packing_and_saving()
         assert c.compress_context.is_immediate_packing is True
         # low_cpu_mem_usage + packing upgrades to progressive shard writes
         assert c.compress_context.is_immediate_saving is True
+
+    def test_non_tail_outside_block_layers_restore_the_guards(self):
+        # a non-lm_head outside-block quantized layer (e.g. a pinned
+        # embed_tokens) still runs the legacy capture path through the model;
+        # the old restrictions stand for that class
+        c = _compressor(outside_block_layers=True, tail_only=False)
+        c._adjust_immediate_packing_and_saving()
+        assert c.compress_context.is_immediate_packing is False
 
     def test_signround_outside_block_layers_keep_immediate_saving(self):
         """iters>0 runs: the old capture-path concern (whole-model materialize
@@ -71,12 +83,13 @@ class TestImmediatePackingWithOutsideBlockLayers:
         assert c.compress_context.is_immediate_saving is True
         assert c.compress_context.low_cpu_mem_usage is True
 
-    def test_inplace_not_disabled_for_outside_block_layers(self):
-        """The inplace=False starvation used to leave is_immediate_packing
-        False even with the gate removed; the quantize() entry no longer
-        touches inplace for outside-block layers."""
+    def test_inplace_guard_restored_only_for_non_tail_layers(self):
+        """The inplace=False starvation is back, but ONLY for outside-block
+        layers the chain-tail lane does not cover (lm_head-class layers are
+        exempt through _outside_block_quantized_tail_only_)."""
         src = open(__import__("auto_round.compressors.base", fromlist=["x"]).__file__, encoding="utf-8").read()
-        assert "self.inplace = False" not in src
+        assert "self.inplace = False" in src
+        assert "_outside_block_quantized_tail_only_()" in src
 
     def test_plain_run_unchanged(self):
         c = _compressor(outside_block_layers=False)

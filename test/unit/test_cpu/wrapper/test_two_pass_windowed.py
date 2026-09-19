@@ -248,6 +248,12 @@ class TestChunkedBackwardMode:
             raise torch.cuda.OutOfMemoryError  # type: ignore[attr-defined]
         except torch.cuda.OutOfMemoryError as e:  # type: ignore[attr-defined]
             assert SignRoundQuantizer._is_oom_(e)
+        # bound call: the auto OOM switch reaches _is_oom_ through
+        # self._is_oom_(e) - a plain def without self made that a TypeError
+        # and killed the default-mode fallback on every plain-path OOM
+        inst = object.__new__(SignRoundQuantizer)
+        assert inst._is_oom_(RuntimeError("CUDA out of memory"))
+        assert not inst._is_oom_(RuntimeError("shape mismatch"))
 
     def test_forced_mode_declines_loudly_under_scaler(self, caplog):
         import logging
@@ -282,9 +288,35 @@ class TestChunkedBackwardMode:
         assert any("AR_TUNE_CHUNKED_BACKWARD=1 ignored" in r.message for r in caplog.records)
 
 
+class TestPass2ParamIds:
+    def test_only_weight_qdq_params_are_excluded(self):
+        """Pass 2 differentiates value/min/max only; bias_v and activation
+        scales must ride pass 1 or their gradients are silently dropped."""
+        from types import SimpleNamespace
+
+        from auto_round.algorithms.quantization.sign_round.quantizer import SignRoundQuantizer as _SRQ
+
+        _tp_pass2_param_ids = _SRQ._tp_pass2_param_ids
+
+        w = SimpleNamespace(
+            params={
+                "value": torch.zeros(4, requires_grad=True),
+                "min_scale": torch.zeros(4, requires_grad=True),
+                "max_scale": torch.zeros(4, requires_grad=True),
+                "bias_v": torch.zeros(4, requires_grad=True),
+                "act_max_scale": torch.zeros(4, requires_grad=True),
+                "act_min_scale": torch.zeros(4, requires_grad=True),
+            }
+        )
+        ids = _tp_pass2_param_ids([w])
+        keep = {id(w.params[k]) for k in ("value", "min_scale", "max_scale")}
+        ride_pass1 = {id(w.params[k]) for k in ("bias_v", "act_max_scale", "act_min_scale")}
+        assert ids == keep
+        assert not (ids & ride_pass1)
+
+
 class TestStableLeaf:
     def test_leaf_identity_stable_content_refreshes(self):
-        w = self._w() if hasattr(self, "_w") else None
         import torch.nn as nn
 
         from auto_round.wrapper import WrapperLinear

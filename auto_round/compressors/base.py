@@ -1704,6 +1704,25 @@ class BaseOrchestrator(object):
         # (AutoScheme path) runs delta-loss forward+backward passes.
         self._scheme_post_init()
 
+    def _outside_block_quantized_tail_only_(self) -> bool:
+        """Whether every outside-block quantized layer is lm_head-class.
+
+        lm_head-class layers are fed from the calibration chain tail (no
+        post-block model walk), so they do not force the in-place /
+        immediate-packing restrictions; any other outside-block quantized
+        layer still runs the legacy capture path and does. Predictor trees
+        (mtp.*) are checkpoint-only and never appear in the resolved layer
+        config, so they never enter this test."""
+        from auto_round.compressors.layer_config_resolver import check_to_quantized
+
+        layer_config = getattr(self, "layer_config", None) or {}
+        outside = [
+            name
+            for name, cfg in layer_config.items()
+            if not dict(cfg).get("in_blocks", False) and check_to_quantized(dict(cfg))
+        ]
+        return bool(outside) and all(name.rsplit(".", 1)[-1] == "lm_head" for name in outside)
+
     def _hardware_setup(self) -> None:
         """Phase 5 – Hardware and compile configuration.
 
@@ -1718,8 +1737,9 @@ class BaseOrchestrator(object):
           - Re-evaluates ``torch.compile`` eligibility now that ``data_type`` is
             resolved and writes the result back to ``compress_context``.
           - Resets the offload manager when ``low_cpu_mem_usage`` is active.
-          - Disables ``self.inplace`` when quantized layers live outside
-            transformer blocks (incompatible with in-place rewriting).
+          - Restores the in-place/immediate-packing restrictions when outside-block
+            quantized layers exist that the chain-tail lane does not cover
+            (lm_head-class layers are covered and exempt).
           - Calls :meth:`_adjust_immediate_packing_and_saving` to decide whether
             layers should be packed / written immediately after each block.
 
@@ -1735,15 +1755,25 @@ class BaseOrchestrator(object):
         if self.compress_context.low_cpu_mem_usage:
             self._offloader.reset()
 
-        # Historical note: quantized layers outside transformer blocks used to
-        # force inplace False here ("gguf lm-head used rtn in version>=0.13"),
-        # which starved the immediate-packing condition in
-        # _adjust_immediate_packing_and_saving for every non-GGUF format -
-        # blocks stayed unpacked in RAM until one whole-model pack+save at the
-        # end. The tail lane feeds outside-block layers from the calibration
-        # chain (no post-block model walk), so the restriction is gone: blocks
-        # pack and shards stream progressively exactly as they do without
-        # outside-block layers.
+        # Quantized layers outside transformer blocks used to force inplace
+        # False here ("gguf lm-head used rtn in version>=0.13"), which starved
+        # the immediate-packing condition in _adjust_immediate_packing_and_saving
+        # for every non-GGUF format. The chain-tail lane feeds lm_head-class
+        # outside-block layers from the calibration chain (no post-block model
+        # walk), so THOSE no longer need the restriction and blocks pack and
+        # stream progressively. Any OTHER outside-block quantized layer (e.g. a
+        # pinned embed_tokens) still runs the legacy capture path through the
+        # model - for that class the old restrictions stand.
+        if (
+            self.has_qlayer_outside_block
+            and self.need_calib
+            and not self._outside_block_quantized_tail_only_()
+            and (
+                self.compress_context.formats is None
+                or "gguf" not in self.compress_context.formats[0].__class__.__name__.lower()
+            )
+        ):
+            self.inplace = False
 
         if not hasattr(self, "formats"):
             logger.warning("this API is deprecated, please use `quantize_and_save` instead")
@@ -1847,12 +1877,16 @@ class BaseOrchestrator(object):
         ):
             self.compress_context.is_immediate_packing = True
 
-        # Outside-block layers no longer disable immediate packing: the tail
-        # lane feeds them from the calibration chain (no post-block model walk
-        # through packed blocks), and each outside-block layer is packed right
-        # after it is tuned (see _quantize_layers_outside_blocks). GGUF has
-        # always bypassed this concern; the remaining format-support and
-        # inplace conditions above are the real gates.
+        # lm_head-class outside-block layers no longer disable immediate
+        # packing: the chain-tail lane feeds them from the calibration chain
+        # (no post-block model walk through packed blocks), and each such
+        # layer is packed right after it is tuned (see
+        # _quantize_layers_outside_blocks). Other outside-block quantized
+        # layers still run the legacy capture walk - for those the old
+        # restriction stands. GGUF has always bypassed this concern.
+        if self.has_qlayer_outside_block and self.need_calib and not has_single_gguf_format:
+            if not self._outside_block_quantized_tail_only_():
+                self.compress_context.is_immediate_packing = False
         if not ("causallm" in self.model_context.model.__class__.__name__.lower() and not self.model_context.is_mllm):
             # TODO For tied keys, there may some issues, we haven't not verified this
             tied_weight_keys = getattr(self.model_context.model, "_tied_weight_keys", {})

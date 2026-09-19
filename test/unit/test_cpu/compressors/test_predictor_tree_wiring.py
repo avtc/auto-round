@@ -492,11 +492,7 @@ class TestCacheOverrideHelpers:
     def test_no_early_stop_override_left(self):
         # the sentinel override is retired: predictor tails come from the
         # stored chain tail, so the collection walk keeps its fast path
-        src = (
-            open(CompressionOrchestrator.__module__.replace(".", "/") + ".py", encoding="utf-8").read()
-            if False
-            else open("auto_round/compressors/orchestrator.py", encoding="utf-8").read()
-        )
+        src = open("auto_round/compressors/orchestrator.py", encoding="utf-8").read()
         assert "_predictor_overrides_last_cache_" not in src
 
     def test_aux_snapshot_excludes_both_row_spellings(self, tmp_path):

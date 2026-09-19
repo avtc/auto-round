@@ -492,7 +492,7 @@ class BestParamsSlot:
     def __init__(self, wrapper):
         self.device = select_snapshot_device(wrapper)
         self.buffers = None
-        if self.device.type == "cuda":
+        if self.device.type != "cpu":  # any accelerator; the ladder may pick xpu/hpu peers
             try:
                 self.buffers = {
                     key: torch.empty_like(t.data, device=self.device)
@@ -502,7 +502,7 @@ class BestParamsSlot:
                 logger.warning("[snapshot] slot reservation on %s failed (%s); using the host", self.device, e)
                 self.device = torch.device("cpu")
                 self.buffers = None
-        if self.device.type == "cuda":
+        if self.device.type != "cpu":  # any accelerator; the ladder may pick xpu/hpu peers
             need = sum(t.numel() * t.element_size() for t in self.buffers.values())
             logger.info(
                 "[snapshot] best-params slot reserved on %s (%.2f GiB); "

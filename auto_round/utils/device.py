@@ -1777,6 +1777,18 @@ def dispatch_model_by_all_available_devices(
     return model
 
 
+def is_oom_exception(exc: BaseException) -> bool:
+    """Whether an exception means the accelerator ran out of memory.
+
+    Shared by the quantizer's auto chunked-backward switch and the
+    containment censuses: recognizes both the typed
+    ``torch.cuda.OutOfMemoryError`` and message-only OOM runtimes."""
+    oom_cls = getattr(getattr(torch.cuda, "OutOfMemoryError", None), "__name__", "")
+    if oom_cls and type(exc).__name__ == oom_cls:
+        return True
+    return "out of memory" in str(exc).lower()
+
+
 def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = True) -> None:
     """Log a DEBUG-level VRAM census: allocator totals plus the largest live tensors.
 
@@ -1795,7 +1807,11 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
         # do not silently drop the census (observed live: str has no .type)
         device = torch.device(device)
     if device is None:
-        device = torch.device("cuda") if torch.cuda.is_available() else None
+        if not torch.cuda.is_available():
+            return
+        # un-indexed torch.device("cuda") never equals cuda:i tensors in the
+        # walk below; resolve to the current device
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
     if device is None or getattr(device, "type", "cpu") != "cuda":
         return
     if not walk:

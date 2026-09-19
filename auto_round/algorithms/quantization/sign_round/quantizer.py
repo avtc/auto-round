@@ -348,14 +348,33 @@ class SignRoundQuantizer(BaseQuantizer):
             )
         return loss
 
-    def _is_oom_(e: BaseException) -> bool:
-        """Whether an exception means the accelerator ran out of memory."""
-        import torch as _torch
+    @staticmethod
+    def _tp_pass2_param_ids(wrappers):
+        """Ids of the tuning params the two-pass windowed backward differentiates.
 
-        oom_cls = getattr(getattr(_torch.cuda, "OutOfMemoryError", None), "__name__", "")
-        if oom_cls and type(e).__name__ == oom_cls:
-            return True
-        return "out of memory" in str(e).lower()
+        Pass 2 owns the grads of ``value`` / ``min_scale`` / ``max_scale`` (the
+        windowed qdq graphs); every OTHER wrapper param - ``bias_v``, activation
+        scales - must ride pass 1, or its gradient is silently dropped for the
+        whole tune. Lives on the class: a module-level def of this name was
+        picked up by the algorithm registry as the pipeline member for
+        SignRoundConfig (resolve_pipeline_member scans module attributes)."""
+        return {
+            id(w.params[k])
+            for w in wrappers
+            for k in ("value", "min_scale", "max_scale")
+            if isinstance(w.params.get(k), torch.Tensor)
+        }
+
+    @staticmethod
+    def _is_oom_(e: BaseException) -> bool:
+        """Whether an exception means the accelerator ran out of memory.
+
+        Static: called both bound (``self._is_oom_(e)`` in the sub-batch
+        handler) and through the class (tests); the pre-staticmethod plain
+        def made the bound call raise TypeError, killing the auto switch."""
+        from auto_round.utils.device import is_oom_exception
+
+        return is_oom_exception(e)
 
     def _resolve_chunked_mode_(self, block, scaler) -> tuple:
         """Effective chunked-backward mode: "0", "1", or "auto".
@@ -553,6 +572,10 @@ class SignRoundQuantizer(BaseQuantizer):
         block, sync_gradients = setup_ddp_if_needed_(self, block, device_manager.device_list)
         self._tune_sync_fn = sync_gradients
         _chunked_mode, _chunked_why = self._resolve_chunked_mode_(block, scaler)
+        # once the chunked path itself fails we never re-enter it for this
+        # tune: the auto fallback would otherwise ping-pong (plain OOM ->
+        # chunked -> chunked failure -> plain -> plain OOM -> ...)
+        _chunked_ever_failed = False
         two_pass = _chunked_mode == "1"
         _tp_wrappers = []
         if _chunked_mode != "0":
@@ -564,7 +587,11 @@ class SignRoundQuantizer(BaseQuantizer):
             if not _tp_wrappers:
                 _chunked_mode = "0"
             elif two_pass:
-                logger.info("[chunked-backward] tuning this block's backward in chunks (AR_TUNE_CHUNKED_BACKWARD=1)")
+                logger.info(
+                    "[chunked-backward] tuning this block's backward in chunks (AR_TUNE_CHUNKED_BACKWARD=%s; %s)",
+                    _chunked_mode,
+                    _chunked_why,
+                )
         index_sampler = IndexSampler(nsamples, global_batch_size)
         block_fwd = self.block_forward
 
@@ -619,93 +646,107 @@ class SignRoundQuantizer(BaseQuantizer):
                 if valid_token_mask:
                     num_elm = self._get_non_zero_cnt(valid_token_mask, global_indices)
 
-                for batch_start in range(0, len(global_indices), batch_size):
-                    indices = global_indices[batch_start : batch_start + batch_size]
-                    staged = tuning_cache.get(indices) if tuning_cache is not None else None
+                _retry_batches = False
+                for _attempt in (0, 1):
+                    if _attempt:
+                        # the previous attempt died mid-sub-batch and may
+                        # have written partial .grad; restart this
+                        # iteration's accumulation from clean grads so the
+                        # fallback path is exact
+                        for _grp in optimizer.param_groups:
+                            for _p in _grp["params"]:
+                                _p.grad = None
+                        total_loss = 0.0
+                    for batch_start in range(0, len(global_indices), batch_size):
+                        indices = global_indices[batch_start : batch_start + batch_size]
+                        staged = tuning_cache.get(indices) if tuning_cache is not None else None
 
-                    def _compute_loss():
-                        if staged is None:
-                            ref_output_l = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
-                            pred_output_l = block_fwd.forward(
-                                block, active_inputs, input_others, indices, _fwd_cache_device
+                        def _compute_loss():
+                            if staged is None:
+                                ref_output_l = torch.cat([fp_outputs[i] for i in indices], dim=0).to(loss_device)
+                                pred_output_l = block_fwd.forward(
+                                    block, active_inputs, input_others, indices, _fwd_cache_device
+                                )
+                            else:
+                                ref_output_l = staged[2]
+                                pred_output_l = tuning_cache.forward(block, staged, _fwd_cache_device)
+                            if loss_device is not None:
+                                pred_output_l = pred_output_l.to(loss_device)
+                            if (
+                                block_ctx.block_index == block_ctx.block_cnt - 1
+                                and self.enable_lfq
+                                and input_ids is not None
+                                and self._is_text_decoder_block(block_ctx.block_name)
+                            ):
+                                return self.lfq_loss(pred_output_l, torch.cat([input_ids[i] for i in indices], dim=0))
+                            return self._get_loss(
+                                pred_output_l, ref_output_l, indices, mse_loss, device, valid_token_mask
                             )
-                        else:
-                            ref_output_l = staged[2]
-                            pred_output_l = tuning_cache.forward(block, staged, _fwd_cache_device)
-                        if loss_device is not None:
-                            pred_output_l = pred_output_l.to(loss_device)
-                        if (
-                            block_ctx.block_index == block_ctx.block_cnt - 1
-                            and self.enable_lfq
-                            and input_ids is not None
-                            and self._is_text_decoder_block(block_ctx.block_name)
-                        ):
-                            return self.lfq_loss(pred_output_l, torch.cat([input_ids[i] for i in indices], dim=0))
-                        return self._get_loss(pred_output_l, ref_output_l, indices, mse_loss, device, valid_token_mask)
 
-                    try:
-                        _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers] if two_pass else None
-                        loss = _compute_loss()
-                        if two_pass:
-                            _wrapper_param_ids = {
-                                id(p) for w in _tp_wrappers for p in w.params.values() if isinstance(p, torch.Tensor)
-                            }
-                            _other = [
-                                p
-                                for group in optimizer.param_groups
-                                for p in group["params"]
-                                if id(p) not in _wrapper_param_ids
-                            ]
-                            self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
-                        else:
-                            self._scale_loss_and_backward(scaler, loss)
-                    except Exception as e:
-                        if two_pass:
-                            if _chunked_mode == "1":
-                                # forced mode: no silent retreat, the operator
-                                # asked for chunked or nothing
+                        try:
+                            _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers] if two_pass else None
+                            loss = _compute_loss()
+                            if two_pass:
+                                _wrapper_param_ids = self._tp_pass2_param_ids(_tp_wrappers)
+                                _other = [
+                                    p
+                                    for group in optimizer.param_groups
+                                    for p in group["params"]
+                                    if id(p) not in _wrapper_param_ids
+                                ]
+                                self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
+                            else:
+                                self._scale_loss_and_backward(scaler, loss)
+                        except Exception as e:
+                            if two_pass:
+                                if _chunked_mode == "1":
+                                    # forced mode: no silent retreat, the operator
+                                    # asked for chunked or nothing
+                                    raise
+                                # auto: an engaged-path failure falls back to the
+                                # plain path for the rest of the tune. The failed
+                                # attempt may hold partial grads (pass 1 writes
+                                # others' grads before pass 2 runs), so the
+                                # iteration restarts from clean grads - exactness
+                                # by construction rather than by partial salvage
+                                logger.warning(
+                                    "[chunked-backward] chunked step failed (%s: %s); plain path for the rest "
+                                    "of the tune, this iteration restarts from clean grads",
+                                    type(e).__name__,
+                                    e,
+                                )
+                                for w in _tp_wrappers:
+                                    w.end_two_pass_forward_()
+                                two_pass = False
+                                _chunked_ever_failed = True
+                                _retry_batches = True
+                                break
+                            elif _chunked_mode == "auto" and self._is_oom_(e) and not _chunked_ever_failed:
+                                # auto: the plain path just hit the accelerator's
+                                # ceiling - switch this tune to the chunked
+                                # backward and redo the iteration on it (the
+                                # failed attempt may hold partial mid-backward
+                                # grads)
+                                logger.info(
+                                    "[chunked-backward] out of memory on the plain path (%s); tuning this "
+                                    "block's backward in chunks (AR_TUNE_CHUNKED_BACKWARD=auto), this "
+                                    "iteration restarts from clean grads",
+                                    type(e).__name__,
+                                )
+                                two_pass = True
+                                _retry_batches = True
+                                break
+                            else:
                                 raise
-                            # auto: an engaged-path failure falls back to the
-                            # plain path for the rest of the tune
-                            logger.warning(
-                                "[chunked-backward] chunked step failed; plain path for the rest of the tune",
-                                exc_info=True,
-                            )
-                            for w in _tp_wrappers:
-                                w.end_two_pass_forward_()
-                            two_pass = False
-                            loss = _compute_loss()
-                            self._scale_loss_and_backward(scaler, loss)
-                        elif _chunked_mode == "auto" and self._is_oom_(e):
-                            # auto: the plain path just hit the accelerator's
-                            # ceiling - switch this tune to the chunked backward
-                            # and redo the failed sub-batch (grads from earlier
-                            # sub-batches of this iteration are already exact)
-                            logger.info(
-                                "[chunked-backward] out of memory on the plain path; "
-                                "tuning this block's backward in chunks (AR_TUNE_CHUNKED_BACKWARD=auto)"
-                            )
-                            two_pass = True
-                            _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers]
-                            loss = _compute_loss()
-                            _wrapper_param_ids = {
-                                id(p) for w in _tp_wrappers for p in w.params.values() if isinstance(p, torch.Tensor)
-                            }
-                            _other = [
-                                p
-                                for group in optimizer.param_groups
-                                for p in group["params"]
-                                if id(p) not in _wrapper_param_ids
-                            ]
-                            self._two_pass_backward_step_(_tp_wrappers, _other, loss, _tp_leaves)
-                        else:
-                            raise
-                    num_elm = 1 if num_elm <= 0 else num_elm
-                    total_loss += loss.item() / num_elm
+                        num_elm = 1 if num_elm <= 0 else num_elm
+                        total_loss += loss.item() / num_elm
 
-                    if mid_iter_mem_check:
-                        # clear memory to avoid OOM due to memory fragmentation
-                        clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
+                        if mid_iter_mem_check:
+                            # clear memory to avoid OOM due to memory fragmentation
+                            clear_memory_if_reached_threshold(threshold=0.8, device_list=device_manager.device_list)
+
+                    if not _retry_batches:
+                        break
 
                 if i == 0:
                     init_loss = total_loss

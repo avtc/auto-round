@@ -193,12 +193,20 @@ class MLLMCalibrator(LLMCalibrator):
 
                 if isinstance(data_new, dict):
                     _ids = data_new.get("input_ids")
-                    if isinstance(_ids, torch.Tensor) and _ids.shape[-1] >= self.seqlen:
-                        self._cache_raw_input_ids_(_ids)
+                else:
+                    _ids = data_new if isinstance(data_new, torch.Tensor) else None
+                # mirror the text calibrator: a batch shorter than seqlen is
+                # skipped ENTIRELY (forward included). Forwarding it while
+                # caching only longer batches would silently misalign the
+                # token-id rows against the hook-captured chain rows (and the
+                # valid-token mask) downstream.
+                if isinstance(_ids, torch.Tensor) and _ids.shape[-1] < self.seqlen:
+                    continue
+                if isinstance(_ids, torch.Tensor):
+                    self._cache_raw_input_ids_(_ids)
+                if isinstance(data_new, dict):
                     self.model(**data_new)
                 else:
-                    if isinstance(data_new, torch.Tensor) and data_new.shape[-1] >= self.seqlen:
-                        self._cache_raw_input_ids_(data_new)
                     self.model(data_new)
             except NotImplementedError:
                 pass

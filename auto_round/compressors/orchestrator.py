@@ -1022,7 +1022,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                 # the export pass (missing-tensors) completes the artifact,
                 # instead of losing a run whose blocks are already tuned and
                 # streamed
-                if "OutOfMemory" in type(e).__name__:
+                from auto_round.utils.device import is_oom_exception  # pylint: disable=import-outside-toplevel
+
+                if is_oom_exception(e):
                     # the only vantage that sees the failed working set; the
                     # baseline header fired at wrapper-ready time
                     from auto_round.utils.device import log_cuda_memory_census
@@ -1388,7 +1390,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             flattened = row.reshape(-1, row.shape[-1]).to(torch.float32)
             squared = torch.sum(torch.pow(flattened, 2), dim=0).to(torch.float32)
             total = squared if total is None else total + squared.to(total.device)
-            count += flattened.shape[0]
+            count += flattened.shape[0]  # token rows - the lm_head hook's convention
         module.imatrix = total
         module.imatrix_cnt = count
         logger.info("[lm_head] attached the fp-input imatrix for %s from %d chain-tail rows", lm_head_name, count)
@@ -1403,7 +1405,10 @@ class CompressionOrchestrator(BaseOrchestrator):
         """
         tail = getattr(self, "_lm_head_chain_tail_", None)
         if tail is None:
-            logger.warning("[lm_head] %s keeps the input-capture path: the block loop kept no chain tail", lm_head_name)
+            logger.warning(
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): the block loop kept no chain tail",
+                lm_head_name,
+            )
             return None
         new_q_output, reference_output = tail
         fp_rows = self._chain_hidden_rows(reference_output)
@@ -1413,7 +1418,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             or not all(isinstance(r, torch.Tensor) for r in fp_rows)
         ):
             logger.warning(
-                "[lm_head] %s keeps the input-capture path: unexpected chain-tail row format (%s)",
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): unexpected chain-tail row format (%s)",
                 lm_head_name,
                 type(fp_rows).__name__,
             )
@@ -1440,7 +1445,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         norm_mod = get_module(self.model_context.model, norm_name) if norm_name else None
         if norm_mod is None:
             logger.warning(
-                "[lm_head] %s keeps the input-capture path: cannot locate the final norm that feeds it",
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): cannot locate the final norm that feeds it",
                 lm_head_name,
             )
             return None
@@ -1449,7 +1454,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         in_features = getattr(get_module(self.model_context.model, lm_head_name), "in_features", None)
         if in_features is not None and norm_mod.weight.numel() != in_features:
             logger.warning(
-                "[lm_head] %s keeps the input-capture path: candidate final norm %s does not match lm_head's "
+                "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): candidate final norm %s does not match lm_head's "
                 "input width (%d vs %d)",
                 lm_head_name,
                 norm_name,
@@ -1461,7 +1466,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             offloader = getattr(self, "_offloader", None)
             if offloader is None:
                 logger.warning(
-                    "[lm_head] %s keeps the input-capture path: the final norm is still meta and no offloader "
+                    "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): the final norm is still meta and no offloader "
                     "is available to load it",
                     lm_head_name,
                 )
@@ -1572,7 +1577,9 @@ class CompressionOrchestrator(BaseOrchestrator):
                     group, ckpt, info, pins, all_blocks, source_dir, fp_tail, token_ids, e_rows
                 )
             except Exception as e:  # pylint: disable=broad-except
-                if "OutOfMemory" in type(e).__name__:
+                from auto_round.utils.device import is_oom_exception  # pylint: disable=import-outside-toplevel
+
+                if is_oom_exception(e):
                     # the only vantage that sees the working set that failed
                     from auto_round.utils.device import log_cuda_memory_census
 
