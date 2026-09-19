@@ -255,7 +255,7 @@ class TestChunkedBackwardMode:
         assert inst._is_oom_(RuntimeError("CUDA out of memory"))
         assert not inst._is_oom_(RuntimeError("shape mismatch"))
 
-    def test_forced_mode_declines_loudly_under_scaler(self, caplog):
+    def test_forced_mode_declines_loudly_under_scaler(self, caplog, monkeypatch):
         import logging
         from types import SimpleNamespace
 
@@ -270,22 +270,27 @@ class TestChunkedBackwardMode:
             ar_logger.addHandler(caplog.handler)
             try:
                 fake2 = SimpleNamespace(_tune_sync_fn=None)
-                monkey_env = {"AR_TUNE_CHUNKED_BACKWARD": "1"}
-                import os
-
-                old = os.environ.get("AR_TUNE_CHUNKED_BACKWARD")
-                os.environ["AR_TUNE_CHUNKED_BACKWARD"] = "1"
-                try:
-                    mode2, _ = SignRoundQuantizer._resolve_chunked_mode_(fake2, None, scaler=object())
-                finally:
-                    if old is None:
-                        os.environ.pop("AR_TUNE_CHUNKED_BACKWARD", None)
-                    else:
-                        os.environ["AR_TUNE_CHUNKED_BACKWARD"] = old
+                monkeypatch.setenv("AR_TUNE_CHUNKED_BACKWARD", "1")
+                mode2, _ = SignRoundQuantizer._resolve_chunked_mode_(fake2, None, scaler=object())
             finally:
                 ar_logger.removeHandler(caplog.handler)
         assert mode2 == "0"
         assert any("AR_TUNE_CHUNKED_BACKWARD=1 ignored" in r.message for r in caplog.records)
+
+
+class TestSecondFailureFatal:
+    def test_attempt_budget_makes_second_failure_raise(self):
+        """After one restart the attempt budget is spent; a second mid-
+        iteration failure must raise (stepping on the failed attempt's
+        partial grads would be silently inexact) instead of falling through
+        to optimizer.step()."""
+        import inspect
+
+        from auto_round.algorithms.quantization.sign_round import quantizer as q_mod
+
+        src = inspect.getsource(q_mod.SignRoundQuantizer.quantize_block)
+        assert 'if _chunked_mode == "1" or _attempt:' in src
+        assert "for _attempt in (0, 1):" in src
 
 
 class TestPass2ParamIds:

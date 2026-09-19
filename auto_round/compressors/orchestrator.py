@@ -1213,7 +1213,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             )
             self._detach_tree_(group)
             return None
-        return shell, pinned, claimed, resolved
+        return shell, pinned, claimed
 
     def _resolve_tree_pins_(self, group, user_pins) -> dict:
         """Canonical layer-config resolution over the attached tree modules.
@@ -1272,7 +1272,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         ckpt,
         info,
         user_pins,
-        resolved_pins,
         claimed,
         source_dir,
         new_q_output,
@@ -1298,13 +1297,18 @@ class CompressionOrchestrator(BaseOrchestrator):
             try:
                 self.model_context.model.get_submodule(path)
             except AttributeError:
-                head = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=False)
                 from auto_round.compressors.predictor_tree import ensure_module_path, load_checkpoint_tensor
 
+                # build at the checkpoint tensor's dtype: a fresh nn.Linear
+                # defaults to fp32 and copy_ upcasts, exporting a
+                # surprise-fp32 head on bf16 checkpoints (same bug class as
+                # the fixed fc mixer)
+                head_w = load_checkpoint_tensor(source_dir, ckpt, n)
+                head = torch.nn.Linear(int(shape[1]), int(shape[0]), bias=False, dtype=head_w.dtype)
                 parent = ensure_module_path(self.model_context.model, path)
                 parent.add_module(path.rsplit(".", 1)[-1], head)
                 with torch.no_grad():
-                    head.weight.data.copy_(load_checkpoint_tensor(source_dir, ckpt, n))
+                    head.weight.data.copy_(head_w)
             heads.append(path)
         if not heads:
             return
@@ -1375,9 +1379,12 @@ class CompressionOrchestrator(BaseOrchestrator):
         fp-input forward hook while the collection walk executed lm_head; with
         the single-block-target early-stop the walk never reaches lm_head, so
         the same math (fp32 column sums of squares over all token rows, plus
-        the row count for the RTN normalization) runs directly over the tail
-        rows - the identical inputs the hook would have seen. Never overwrites
-        an existing statistic.
+        the token-row count) runs directly over the tail rows - the identical
+        input VALUES the hook would have seen. Count-convention note: the
+        lm_head hook sees a (tokens, hidden) input, so its imatrix_cnt also
+        counts token rows; BLOCK-layer hooks count batch entries instead. The
+        outside-block lane never divides by imatrix_cnt, so the difference is
+        inert here. Never overwrites an existing statistic.
         """
         module = get_module(self.model_context.model, lm_head_name)
         if module is None or hasattr(module, "imatrix"):
@@ -1605,7 +1612,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         attached = self._attach_pinned_tree_(group, ckpt, info, pins, all_blocks, source_dir)
         if attached is None:
             return
-        shell, pinned, claimed, resolved_pins = attached
+        shell, pinned, claimed = attached
         bind_predictor_forward(
             shell,
             {
@@ -1653,9 +1660,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             q_inputs=self._predictor_q_tail_,
             input_ids=token_ids,
         )
-        self._tune_tree_heads_(
-            group, ckpt, info, pins, resolved_pins, claimed, source_dir, new_q_output, reference_output, token_ids
-        )
+        self._tune_tree_heads_(group, ckpt, info, pins, claimed, source_dir, new_q_output, reference_output, token_ids)
         if self.compress_context.is_immediate_packing:
             for module_name in pinned:
                 immediate_pack(module_name, self.layer_config)

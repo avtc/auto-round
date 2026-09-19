@@ -585,7 +585,13 @@ class SignRoundQuantizer(BaseQuantizer):
                 m for _, m in block.named_modules() if isinstance(m, _WL) and m.params.get("value") is not None
             ]
             if not _tp_wrappers:
+                if two_pass:
+                    logger.warning(
+                        "[chunked-backward] AR_TUNE_CHUNKED_BACKWARD=1 ignored for this tune: "
+                        "no wrapper with a tuning value lives in this block"
+                    )
                 _chunked_mode = "0"
+                two_pass = False
             elif two_pass:
                 logger.info(
                     "[chunked-backward] tuning this block's backward in chunks (AR_TUNE_CHUNKED_BACKWARD=%s; %s)",
@@ -686,6 +692,9 @@ class SignRoundQuantizer(BaseQuantizer):
                         try:
                             _tp_leaves = [w.begin_two_pass_forward_() for w in _tp_wrappers] if two_pass else None
                             loss = _compute_loss()
+                            if mid_iter_mem_check:
+                                # clear memory to avoid OOM due to memory fragmentation
+                                clear_memory_if_reached_threshold(threshold=0.5, device_list=device_manager.device_list)
                             if two_pass:
                                 _wrapper_param_ids = self._tp_pass2_param_ids(_tp_wrappers)
                                 _other = [
@@ -699,9 +708,13 @@ class SignRoundQuantizer(BaseQuantizer):
                                 self._scale_loss_and_backward(scaler, loss)
                         except Exception as e:
                             if two_pass:
-                                if _chunked_mode == "1":
+                                if _chunked_mode == "1" or _attempt:
                                     # forced mode: no silent retreat, the operator
-                                    # asked for chunked or nothing
+                                    # asked for chunked or nothing. And after one
+                                    # restart the attempt budget is spent: a second
+                                    # failure cannot be restarted again, and
+                                    # stepping on the failed attempt's partial
+                                    # grads would be silently inexact - fatal.
                                     raise
                                 # auto: an engaged-path failure falls back to the
                                 # plain path for the rest of the tune. The failed

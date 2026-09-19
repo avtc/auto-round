@@ -239,22 +239,21 @@ def collect_best_params_local(block):
     iteration. Duplicating each parameter on the device that already hosts it
     keeps the footprint spread like the weights themselves, removes the
     cross-device traffic, and makes the unwrap copy-back local. Values and the
-    restore path are unchanged. Falls back to a host snapshot (with a warning)
-    when a local copy fails.
+    restore path are unchanged. Raises on failure (typically an out of memory
+    during the clone itself): the snapshot ladder's attempt-and-catch then
+    walks the next rung - swallowing the error here would skip the freest-peer
+    rung, mislabel the sticky route as local while the data sits on the host,
+    and re-attempt the doomed clone every improving iteration.
     """
     params = {}
-    try:
-        if hasattr(block, "orig_layer"):
-            for key, p_ in block.params.items():
-                params[key] = p_.data.to(p_.data.device, copy=True)
-        else:
-            for n, m in block.named_modules():
-                if hasattr(m, "orig_layer"):
-                    params[n] = {key: p_.data.to(p_.data.device, copy=True) for key, p_ in m.params.items()}
-        return params
-    except RuntimeError as e:
-        logger.warning("[snapshot] local copy failed (%s); parking the snapshot on host", e)
-        return collect_best_params(block, "cpu")
+    if hasattr(block, "orig_layer"):
+        for key, p_ in block.params.items():
+            params[key] = p_.data.to(p_.data.device, copy=True)
+    else:
+        for n, m in block.named_modules():
+            if hasattr(m, "orig_layer"):
+                params[n] = {key: p_.data.to(p_.data.device, copy=True) for key, p_ in m.params.items()}
+    return params
 
 
 def _accel_mem_get_info_(device):
@@ -342,12 +341,14 @@ def _snapshot_route_log_(block, route, msg, *args, warn_first=False) -> None:
     block._snapshot_route = route
 
 
-def _snapshot_free_devices_(dev_type: str, need_bytes: int) -> list:
+def _snapshot_free_devices_(dev_type: str, need_bytes: int, exclude=()) -> list:
     """Visible accelerator devices of ``dev_type`` with room, most free first.
 
     Same introspection as ``_idle_peer_for_`` but returns the full ordering:
     the attempt ladder tries the freest device first, and every candidate is
-    still guarded by a real attempt-and-catch at clone time."""
+    still guarded by a real attempt-and-catch at clone time. Devices already
+    hosting the block's params are excluded - the local rung covers them, and
+    re-attempting a just-failed same-device clone is pure churn."""
     devices = []
     try:
         from auto_round.utils.device_manager import get_ar_device
@@ -356,8 +357,11 @@ def _snapshot_free_devices_(dev_type: str, need_bytes: int) -> list:
         count = count() if callable(count) else count  # property or method
     except Exception:  # pylint: disable=broad-except - exotic devices
         return devices
+    excluded = {torch.device(d) if not isinstance(d, torch.device) else d for d in exclude}
     for index in range(count):
         candidate = torch.device(dev_type, index)
+        if candidate in excluded:
+            continue
         info = _accel_mem_get_info_(candidate)
         if info is not None and info[0] * 0.9 >= need_bytes:
             devices.append((info[0], candidate))
@@ -400,7 +404,14 @@ def snapshot_best_params(block, cache_device="cpu"):
             pass
     if "local" not in candidates:
         candidates.append("local")
-    for dev in _snapshot_free_devices_(torch.device(str(cache_device)).type, total_need):
+    _home = {
+        p_.data.device
+        for m in block.named_modules()
+        if hasattr(m, "orig_layer")
+        for p_ in m.params.values()
+        if isinstance(p_, torch.Tensor)
+    }
+    for dev in _snapshot_free_devices_(torch.device(str(cache_device)).type, total_need, exclude=_home):
         if dev not in candidates:
             candidates.append(dev)
 

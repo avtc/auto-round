@@ -363,8 +363,27 @@ def build_predictor_tree(
     layer_mod = copy.deepcopy(sibling)
     # under immediate saving the sibling has been moved to meta after its
     # shard write; empty-then-copy_ transitions meta params to real (copy_
-    # into a meta param silently keeps it meta, and set_data refuses it)
+    # into a meta param silently keeps it meta, and set_data refuses it).
+    # to_empty also re-allocates BUFFERS to uninitialized memory, and buffers
+    # (rotary tables etc.) are not checkpoint tensors - back them up first
+    # and restore after; a buffer with no value source is reported loudly
+    # instead of silently tuning on garbage
+    _buffer_backup = {n_: b_.detach().clone() for n_, b_ in layer_mod.named_buffers() if not b_.is_meta}
     layer_mod.to_empty(device="cpu")
+    _unsourced = []
+    with torch.no_grad():
+        for _bn, _b in layer_mod.named_buffers():
+            if _bn in _buffer_backup:
+                _b.copy_(_buffer_backup[_bn])
+            else:
+                _unsourced.append(_bn)
+    if _unsourced:
+        logger.warning(
+            "predictor tree %s: buffers %s have no value source (the sibling was moved to meta before "
+            "the tree build); they stay uninitialized - layers reading local buffers are unsupported",
+            layer_root,
+            _unsourced,
+        )
     # the snapshot copies instance-level forwards too (replacement wrappers)
     # whose closures bind the ORIGINAL module - calling them re-enters the
     # source block instead of the copy.  Restore each module's class forward.

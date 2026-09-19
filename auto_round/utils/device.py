@@ -1883,17 +1883,23 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
     # forensics: across ALL copies of the biggest groups - python referrer
     # kinds per copy, plus how many copies sit inside a live autograd graph
     # (grad_fn set, no python referrers = held by C++ autograd nodes)
-    for (shape, dtype), (count, nbytes, _uniq) in top_items[:3]:
-        if nbytes / 2**30 < 0.5:
-            continue
-        copies = [
-            o
-            for o in gc.get_objects()
-            if torch.is_tensor(o)
-            and getattr(o, "device", None) == device
-            and tuple(o.shape) == tuple(shape)
-            and str(o.dtype) == str(dtype)
-        ]
+    # one gc pass for ALL groups (each walk costs seconds on a big heap,
+    # and this runs inside OOM handlers)
+    _forensic_keys = [
+        (shape, dtype) for (shape, dtype), (count, nbytes, _uniq) in top_items[:3] if nbytes / 2**30 >= 0.5
+    ]
+    _forensic_copies = {key: [] for key in _forensic_keys}
+    if _forensic_keys:
+        for o in gc.get_objects():
+            try:
+                if torch.is_tensor(o) and getattr(o, "device", None) == device:
+                    key = (tuple(o.shape), str(o.dtype))
+                    if key in _forensic_copies:
+                        _forensic_copies[key].append(o)
+            except Exception:  # pylint: disable=broad-except
+                continue
+    for shape, dtype in _forensic_keys:
+        copies = _forensic_copies[(shape, dtype)]
         if not copies:
             continue
         in_graph = sum(1 for t in copies if getattr(t, "grad_fn", None) is not None)
@@ -1920,7 +1926,7 @@ def log_cuda_memory_census(tag: str, device=None, top: int = 12, walk: bool = Tr
             requires,
             kinds,
         )
-        if nbytes / 2**30 >= 0.5:
+        if True:
             # attribution: name the actual container objects for copies that
             # are NOT plain requires-grad params (the leaked ones). This runs
             # inside OOM handlers: it must never raise (a census failure once

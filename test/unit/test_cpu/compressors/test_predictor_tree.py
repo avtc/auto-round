@@ -221,6 +221,20 @@ class TestBuildPredictorTree:
         assert torch.allclose(tree.layer.fc1.weight, mtp_ref.layer.fc1.weight.detach())
         assert torch.allclose(tree.enorm.weight, mtp_ref.enorm.weight.detach())
 
+    def test_tree_preserves_sibling_buffers(self, tmp_path):
+        """to_empty re-allocates buffers to uninitialized memory; buffers are
+        not checkpoint tensors, so their values must be backed up and
+        restored (a layer reading a local buffer would silently tune on
+        garbage otherwise)."""
+        mtp_ref, body, tensors, info, all_blocks = self._setup(tmp_path)
+        # give the sibling a buffer (e.g. a rotary table)
+        name, sibling = pick_sibling_layer(body, tensors, info, all_blocks)
+        sibling.register_buffer("inv_freq", torch.arange(8, dtype=torch.float32) * 2.0)
+        build_predictor_tree(body, str(tmp_path), tensors, info, sibling)
+        tree = body.get_submodule("mtp")
+        got = dict(tree.layer.named_buffers())["inv_freq"]
+        assert torch.equal(got, sibling.inv_freq)
+
     def test_tree_honors_checkpoint_dtype(self, tmp_path):
         """A fresh nn.Linear defaults to fp32 and copy_ upcasts into the
         destination: a bf16 checkpoint must not yield a surprise-fp32 mixer
