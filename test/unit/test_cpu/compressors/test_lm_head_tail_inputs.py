@@ -49,7 +49,6 @@ def _orchestrator_like(model):
     )
     o._chain_hidden_rows = CompressionOrchestrator._chain_hidden_rows  # staticmethod: bind directly
     for name in (
-        "_resolve_lm_head_name_",
         "_lm_head_tail_inputs_",
         "_discover_final_norm_",
         "_attach_tail_imatrix_",
@@ -76,24 +75,6 @@ class TestChainHiddenRows:
     def test_nested_dict_under_hidden_states(self):
         rows = [torch.zeros(1, 4)]
         assert CompressionOrchestrator._chain_hidden_rows({"hidden_states": {"inner": rows}}) is rows
-
-
-class TestResolveLmHeadName:
-    def setup_method(self):
-        self.o = _orchestrator_like(_TinyModel())
-
-    def test_exact_leaf_match(self):
-        assert self.o._resolve_lm_head_name_(["lm_head"]) == "lm_head"
-
-    def test_dotted_leaf_match(self):
-        assert self.o._resolve_lm_head_name_(["model.lm_head", "other"]) == "model.lm_head"
-
-    def test_substring_fallback(self):
-        assert self.o._resolve_lm_head_name_(["proj.lm_head_w8"]) == "proj.lm_head_w8"
-
-    def test_none_when_absent(self):
-        assert self.o._resolve_lm_head_name_(["embed_tokens"]) is None
-        assert self.o._resolve_lm_head_name_([]) is None
 
 
 class TestLmHeadTailInputs:

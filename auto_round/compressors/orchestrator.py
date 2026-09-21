@@ -605,8 +605,8 @@ class CompressionOrchestrator(BaseOrchestrator):
         self._tail_fed_layers_ = []
         self._lm_head_chain_tail_ = None
         self._lm_head_norm_name_ = None
-        lm_head_name = self._resolve_lm_head_name_(layer_names)
-        if lm_head_name is not None:
+        lm_head_name = get_lm_head_name(self.model_context.model)
+        if lm_head_name is not None and lm_head_name in layer_names:
             self._tail_fed_layers_ = [lm_head_name]
             self._lm_head_norm_name_ = self._discover_final_norm_(all_blocks)
         if not self.has_variable_block_shape:
@@ -1060,21 +1060,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         if isinstance(rows, dict):
             rows = next(iter(rows.values()))
         return rows
-
-    def _resolve_lm_head_name_(self, layer_names) -> Optional[str]:
-        """lm_head's module name from the outside-block plan, or ``None``."""
-        if not layer_names:
-            return None
-        candidates = [n for n in layer_names if n == "lm_head" or n.rsplit(".", 1)[-1] == "lm_head"]
-        if not candidates:
-            candidates = [n for n in layer_names if "lm_head" in n]
-        if not candidates:
-            return None
-        if len(candidates) > 1:
-            logger.warning(
-                "multiple lm_head candidates in the outside-block plan %s; tuning %s", candidates, candidates[0]
-            )
-        return candidates[0]
 
     def _quantizer_requests_q_inputs_(self) -> bool:
         """Whether the active quantizer(s) maintain the quantized-input chain.

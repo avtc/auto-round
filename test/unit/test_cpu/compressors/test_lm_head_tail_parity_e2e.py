@@ -98,9 +98,7 @@ class TestLmHeadTailParityE2E:
         # ── capture arm: full-residency walk collects lm_head's inputs ──────
         spy_capture = _RowSpy()
         spy_capture.install(monkeypatch)
-        monkeypatch.setattr(
-            orchestrator_mod.CompressionOrchestrator, "_resolve_lm_head_name_", lambda self, names: None
-        )
+        monkeypatch.setattr(orchestrator_mod, "get_lm_head_name", lambda model: None)
         run_capture = _quantize_lmonly(tiny_gptj_model_path, _Loader(vocab))
         monkeypatch.undo()
 
