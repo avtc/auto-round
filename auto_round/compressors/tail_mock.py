@@ -41,20 +41,21 @@ __all__ = [
 class PassthroughStub(nn.Module):
     """Decoder-layer stand-in that forwards the hidden states untouched.
 
-    ``tuple_arity`` selects the return convention the model's layer loop
-    expects: a bare tensor or a single-element tuple (``out[0]`` and
-    ``out[-1]`` both resolve to the tensor, which also satisfies loops that
-    collect KV caches from ``layer_outputs[-1]``).
+    ``arity`` selects the return convention the model's layer loop expects:
+    ``1`` (default) a single-element tuple (``out[0]``/``out[-1]`` both resolve
+    to the tensor, which also satisfies cache-collecting loops), ``2`` a
+    ``(hidden, residual)`` pair for residual-stream families (e.g. zaya), or
+    ``0`` a bare tensor.
     """
 
-    def __init__(self, tuple_arity: bool = True):
+    def __init__(self, arity: int = 1):
         super().__init__()
-        self.tuple_arity = tuple_arity
+        self.arity = arity
 
     def forward(self, hidden_states, *args, **kwargs):
-        if self.tuple_arity:
-            return (hidden_states,)
-        return hidden_states
+        if self.arity == 0:
+            return hidden_states
+        return tuple(hidden_states for _ in range(self.arity))
 
 
 class TailInjector(nn.Module):
@@ -65,15 +66,15 @@ class TailInjector(nn.Module):
     their original dtype and device preserved.
     """
 
-    def __init__(self, tail: torch.Tensor, tuple_arity: bool = True):
+    def __init__(self, tail: torch.Tensor, arity: int = 1):
         super().__init__()
-        self.tuple_arity = tuple_arity
+        self.arity = arity
         self.tail = tail
 
     def forward(self, *args, **kwargs):
-        if self.tuple_arity:
-            return (self.tail,)
-        return self.tail
+        if self.arity == 0:
+            return self.tail
+        return tuple(self.tail for _ in range(self.arity))
 
 
 class CaptureHead(nn.Module):
@@ -87,10 +88,25 @@ class CaptureHead(nn.Module):
     module, not to this stand-in.
     """
 
-    def __init__(self, out_features: int):
+    def __init__(self, out_features: int, original: nn.Module = None):
         super().__init__()
         self.out_features = out_features
+        # kept as a plain attribute (not a submodule) so it never fires
+        self._capture_original = original
         self.records: List[torch.Tensor] = []
+
+    def __getattr__(self, name):
+        # models may probe head attributes during forward (e.g. mamba reads
+        # ``self.lm_head.weight.dtype`` for its pre-head cast): delegate to the
+        # real head after the normal nn.Module lookup fails. The original is
+        # stored via nn.Module's setattr (it lands in ``_modules``).
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            original = self._modules.get("_capture_original") if "_modules" in self.__dict__ else None
+            if original is not None:
+                return getattr(original, name)
+            raise
 
     def forward(self, hidden_states):
         self.records.append(hidden_states.detach().to("cpu"))
@@ -106,7 +122,7 @@ class CaptureHead(nn.Module):
 def install_block_stubs_(
     model: nn.Module,
     block_names: List[str],
-    tuple_arity: bool = True,
+    arity: int = 1,
 ) -> Dict[str, object]:
     """Replace each named block module with a :class:`PassthroughStub`.
 
@@ -114,7 +130,7 @@ def install_block_stubs_(
     modules are kept alive by the returned mapping, so streaming/meta state
     underneath them survives the temporary swap.
     """
-    restore_info: Dict[str, object] = {"slots": [], "tuple_arity": tuple_arity}
+    restore_info: Dict[str, object] = {"slots": [], "arity": arity}
     try:
         for name in block_names:
             parent_path, _, attr = name.rpartition(".")
@@ -122,7 +138,7 @@ def install_block_stubs_(
             if parent is None or not hasattr(parent, attr):
                 raise ValueError(f"cannot install a stub for unknown block '{name}'")
             original = getattr(parent, attr)
-            setattr(parent, attr, PassthroughStub(tuple_arity=tuple_arity))
+            setattr(parent, attr, PassthroughStub(arity=arity))
             restore_info["slots"].append((parent, attr, original))
     except Exception:
         # roll back partial installs so a failed call leaves the model untouched
@@ -162,17 +178,17 @@ def tail_smoke_check(
     lm_head_name: str,
     block_names: List[str],
     seq_len: int = 2,
-) -> Tuple[bool, Union[bool, None]]:
+) -> Tuple[bool, Union[int, None]]:
     """Init-time smoke gate for the mocked-continuation lane.
 
     Temporarily replaces the named blocks with pass-through stubs and runs one
     tiny forward with the REAL language head. The model's own pre-loop and
     post-block code executes on stub outputs, which validates everything the
     lane depends on: text-only callability, the stub return arity the layer
-    loop accepts, and the post-block chain. Tuple arity is tried first (its
-    ``out[0]``/``out[-1]`` convention also satisfies cache-collecting loops).
+    loop accepts, and the post-block chain. Arity 1 (single-element tuple) is tried first, then 2
+    (residual-stream pairs, e.g. zaya), then the bare tensor.
 
-    Returns ``(ok, tuple_arity)``; ``(False, None)`` means the conservative
+    Returns ``(ok, arity)``; ``(False, None)`` means the conservative
     capture walk should feed the head instead. The original block modules are
     always restored, and the training mode is preserved.
     """
@@ -196,15 +212,15 @@ def tail_smoke_check(
     was_training = model.training
     model.eval()
     try:
-        for tuple_arity in (True, False):
+        for arity in (1, 2, 0):
             restore_info = None
             try:
-                restore_info = install_block_stubs_(model, block_names, tuple_arity=tuple_arity)
+                restore_info = install_block_stubs_(model, block_names, arity=arity)
                 with torch.no_grad():
                     output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                 logits = _smoke_logits_(output)
                 if logits is not None and logits.dim() == 3 and logits.shape[0] == 1 and logits.shape[-1] == vocab:
-                    return (True, tuple_arity)
+                    return (True, arity)
             except Exception:  # any family-specific failure: try the next arity
                 continue
             finally:

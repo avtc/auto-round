@@ -124,7 +124,7 @@ class TestLaneConsumesTailInputs:
         model = _ForwardModel()
         o = _orchestrator_like(model)
         o._tail_fed_layers_ = ["lm_head"]
-        o._tail_stub_arity_ = True
+        o._tail_stub_arity_ = 1
         o._tail_lane_blocks_ = ["model.layers.0", "model.layers.1"]
         o._offloader = None
         fp, q = [torch.randn(1, 5, 8) for _ in range(2)], [torch.randn(1, 5, 8) for _ in range(2)]
@@ -249,7 +249,7 @@ def _capturing_logger_():
     return records, lambda: setattr(orch_mod, "logger", orig)
 
 
-def _capture_orchestrator(model, arity=True, blocks=None):
+def _capture_orchestrator(model, arity=1, blocks=None):
     o = SimpleNamespace(
         model_context=SimpleNamespace(model=model),
         _tail_fed_layers_=[],
@@ -500,13 +500,13 @@ class TestTailLaneDecision:
 
         def fake_smoke(model, lm_head_name, block_names, seq_len=2):
             calls.append((lm_head_name, list(block_names)))
-            return (True, True)
+            return (True, 1)
 
         monkeypatch.setattr(orch_mod, "tail_smoke_check", fake_smoke)
         o = self._decider(self._model_with_blocks())
         o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0", "model.layers.1"]])
         assert o._tail_fed_layers_ == ["lm_head"]
-        assert o._tail_stub_arity_ is True
+        assert o._tail_stub_arity_ == 1
         assert o._tail_lane_blocks_ == ["model.layers.0", "model.layers.1"]
         # the tail-only relaxations stay granted on the pass path
         assert o.inplace is True and o.compress_context.is_immediate_packing is True

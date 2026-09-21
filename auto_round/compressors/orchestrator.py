@@ -1222,7 +1222,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                     break
             target_device = chain_device if chain_device is not None else embed_device
 
-            restore_info = install_block_stubs_(model, block_names, tuple_arity=arity)
+            restore_info = install_block_stubs_(model, block_names, arity=arity)
             head_parent = None
             head_attr = None
             original_head = None
@@ -1230,12 +1230,12 @@ class CompressionOrchestrator(BaseOrchestrator):
             model.eval()
             try:
                 last_parent, last_attr, _ = restore_info["slots"][-1]
-                injector = TailInjector(fp_rows[0], tuple_arity=arity)
+                injector = TailInjector(fp_rows[0], arity=arity)
                 setattr(last_parent, last_attr, injector)
                 head_parent_path, _, head_attr = lm_head_name.rpartition(".")
                 head_parent = get_module(model, head_parent_path) if head_parent_path else model
                 original_head = getattr(head_parent, head_attr)
-                capture_head = CaptureHead(out_features)
+                capture_head = CaptureHead(out_features, original=original_head)
                 setattr(head_parent, head_attr, capture_head)
                 for variant, rows in (("fp", fp_rows), ("q", q_rows)):
                     if rows is None:
