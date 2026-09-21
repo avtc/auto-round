@@ -1054,12 +1054,15 @@ class CompressionOrchestrator(BaseOrchestrator):
         # The tail-only relaxations granted at post_init (inplace stays True and
         # immediate packing stays on when the only outside-block layer is a
         # single lm_head) are void now: the capture walk executes the model
-        # through the blocks, so the legacy restrictions apply again. GGUF
-        # always bypassed this concern (per-block packing).
+        # through the blocks, so the legacy restrictions apply again.
+        # is_immediate_saving is granted only while immediate packing is on
+        # (base post_init), so it reverts with it; a lazily-created shard
+        # writer simply stays unused. GGUF runs never reach this branch: they
+        # resolve outside-block layers differently and the plan is empty.
         self.inplace = False
-        formats = getattr(self, "formats", None) or []
-        if not (len(formats) == 1 and formats[0].is_gguf()):
-            self.compress_context.is_immediate_packing = False
+        self.compress_context.is_immediate_packing = False
+        if self.compress_context.is_immediate_saving:
+            self.compress_context.is_immediate_saving = False
 
     @staticmethod
     def _chain_hidden_rows(chain_state):
@@ -1216,6 +1219,9 @@ class CompressionOrchestrator(BaseOrchestrator):
             target_device = chain_device if chain_device is not None else embed_device
 
             restore_info = install_block_stubs_(model, block_names, tuple_arity=arity)
+            head_parent = None
+            head_attr = None
+            original_head = None
             was_training = model.training
             model.eval()
             try:
@@ -1244,7 +1250,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     else:
                         q_captured = captured
             finally:
-                setattr(head_parent, head_attr, original_head)
+                if head_parent is not None:
+                    setattr(head_parent, head_attr, original_head)
                 restore_blocks_(model, restore_info)
                 model.train(was_training)
             return fp_captured, q_captured if q_rows is not None else None

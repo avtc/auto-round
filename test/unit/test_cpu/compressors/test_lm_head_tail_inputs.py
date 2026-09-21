@@ -350,6 +350,58 @@ class TestMockedTailCapture:
         for got, exp in zip(out[0], expected):
             assert torch.allclose(got, exp, atol=1e-6)
 
+    def test_missing_tail_falls_back(self):
+        o = _capture_orchestrator(_ForwardModel())
+        o._lm_head_chain_tail_ = None
+        records, restore = _capturing_logger_()
+        try:
+            out = o._lm_head_tail_inputs_("lm_head")
+        finally:
+            restore()
+        assert out is None
+        assert any("no chain tail" in msg for _, msg in records)
+
+    def test_bad_row_format_falls_back(self):
+        o = _capture_orchestrator(_ForwardModel())
+        o._lm_head_chain_tail_ = (None, {"hidden_states": "not-a-list"})
+        assert o._lm_head_tail_inputs_("lm_head") is None
+
+    def test_malformed_q_rows_degrade_to_fp_only(self):
+        model = _ForwardModel()
+        o = _capture_orchestrator(model)
+        o._lm_head_chain_tail_ = (None, _rows())
+        o.alg_composer = SimpleNamespace(block_quantizer=SimpleNamespace(enable_quanted_input=False))
+        # q variant malformed relative to fp rows: capture proceeds fp-only
+        out = o._lm_head_tail_inputs_("lm_head", token_ids=_ids_like(_rows()))
+        assert out is not None and out[1] is None
+
+    def test_q_absence_by_config_is_info_not_warning(self):
+        model = _ForwardModel()
+        o = _capture_orchestrator(model)
+        o._lm_head_chain_tail_ = (None, _rows())
+        o.alg_composer = SimpleNamespace(block_quantizer=SimpleNamespace(enable_quanted_input=False))
+        records, restore = _capturing_logger_()
+        try:
+            out = o._lm_head_tail_inputs_("lm_head", token_ids=_ids_like(_rows()))
+        finally:
+            restore()
+        assert out is not None and out[1] is None
+        assert any("disabled by config" in msg for lvl, msg in records if lvl == logging.INFO)
+        assert not any("cannot be honored" in msg for _, msg in records)
+
+    def test_q_absence_when_requested_stays_warning(self):
+        model = _ForwardModel()
+        o = _capture_orchestrator(model)
+        o._lm_head_chain_tail_ = (None, _rows())
+        o.alg_composer = SimpleNamespace(block_quantizer=SimpleNamespace(enable_quanted_input=True))
+        records, restore = _capturing_logger_()
+        try:
+            out = o._lm_head_tail_inputs_("lm_head", token_ids=_ids_like(_rows()))
+        finally:
+            restore()
+        assert out is not None
+        assert any("cannot be honored" in msg for lvl, msg in records if lvl >= logging.WARNING)
+
     def test_meta_chain_module_reloaded_via_offloader(self):
         import torch.nn as nn
 
@@ -432,7 +484,7 @@ class TestTailLaneDecision:
         o = _orchestrator_like(model)
         o.inplace = True
         o.formats = []
-        o.compress_context = SimpleNamespace(is_immediate_packing=True)
+        o.compress_context = SimpleNamespace(is_immediate_packing=True, is_immediate_saving=False)
         o._decide_tail_fed_lane_ = MethodType(CompressionOrchestrator._decide_tail_fed_lane_, o)
         return o
 
@@ -477,15 +529,16 @@ class TestTailLaneDecision:
         assert o.compress_context.is_immediate_packing is False
         assert any(lvl >= logging.WARNING and "keeps the ordinary capture walk" in msg for lvl, msg in records)
 
-    def test_smoke_fail_single_gguf_keeps_packing(self, monkeypatch):
+    def test_smoke_fail_reverts_immediate_saving_with_packing(self, monkeypatch):
         import auto_round.compressors.orchestrator as orch_mod
 
         monkeypatch.setattr(orch_mod, "tail_smoke_check", lambda *a, **k: (False, None))
         o = self._decider(self._model_with_blocks())
-        o.formats = [SimpleNamespace(is_gguf=lambda: True)]
+        o.compress_context.is_immediate_saving = True  # granted only while packing is on
         o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0"]])
-        # GGUF always bypassed the concern: per-block packing stays on
-        assert o.compress_context.is_immediate_packing is True
+        # the granted pair reverts together: saving is never on while packing is off
+        assert o.compress_context.is_immediate_packing is False
+        assert o.compress_context.is_immediate_saving is False
 
     def test_head_outside_plan_skips_smoke(self, monkeypatch):
         import auto_round.compressors.orchestrator as orch_mod
