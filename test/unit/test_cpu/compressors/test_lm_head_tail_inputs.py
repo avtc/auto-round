@@ -348,3 +348,76 @@ class TestMockedTailCapture:
             expected = [model.model.norm(r) for r in _rows()]
         for got, exp in zip(out[0], expected):
             assert torch.allclose(got, exp, atol=1e-6)
+
+    def test_meta_chain_module_reloaded_via_offloader(self):
+        import torch.nn as nn
+
+        model = _ForwardModel()
+
+        class _FakeOffloader:
+            def __init__(self, model):
+                self.model = model
+                self.reloaded = []
+
+            def reload(self, model, name):
+                self.reloaded.append(name)
+                # fake the reload: swap meta parameters for real cpu ones
+                mod = None
+                for n, m in model.named_modules():
+                    if n == name:
+                        mod = m
+                for pname, p in list(mod.named_parameters(recurse=False)):
+                    if p.is_meta:
+                        setattr(mod, pname, nn.Parameter(torch.ones_like(p, device="cpu")))
+
+        offloader = _FakeOffloader(model)
+        with torch.no_grad():
+            model.model.norm.weight = nn.Parameter(torch.empty(8, device="meta"))
+        o = _capture_orchestrator(model)
+        o._offloader = offloader
+        fp = _rows()
+        out = o._mocked_tail_capture_("lm_head", fp, None, _ids_like(fp))
+        assert out is not None
+        assert any("norm" in n for n in offloader.reloaded)
+
+    def test_meta_chain_module_without_offloader_returns_none(self):
+        import torch.nn as nn
+
+        model = _ForwardModel()
+        with torch.no_grad():
+            model.model.norm.weight = nn.Parameter(torch.empty(8, device="meta"))
+        o = _capture_orchestrator(model)
+        o._offloader = None
+        out = o._mocked_tail_capture_("lm_head", _rows(), None, _ids_like(_rows()))
+        assert out is None
+
+    def test_negative_padding_ids_are_clamped(self):
+        model = _ForwardModel()
+        o = _capture_orchestrator(model)
+        fp = _rows(n=2)
+        ids = [torch.tensor([[-100, -100, 5, 7]]), torch.tensor([[3, -100, 9, 1]])]
+        out = o._mocked_tail_capture_("lm_head", fp, None, token_ids=ids)
+        assert out is not None and len(out[0]) == 2
+
+    def test_records_mismatch_returns_none(self):
+        model = _ForwardModel()
+
+        def once_then_silent(input_ids, attention_mask=None, **kwargs):
+            # forward that stops calling the head after the first sample
+            if not hasattr(model, "_calls"):
+                model._calls = 0
+            model._calls += 1
+            if model._calls > 1:
+                raise RuntimeError("simulated early stop before the head")
+            return _ForwardModel.forward(model, input_ids, attention_mask, **kwargs)
+
+        model.forward = once_then_silent
+        o = _capture_orchestrator(model)
+        layers_before = list(model.model.layers)
+        head_before = model.lm_head
+        out = o._mocked_tail_capture_("lm_head", _rows(n=2), None, _ids_like(_rows(n=2)))
+        assert out is None
+        # restore still happened on the failure path
+        assert model.lm_head is head_before
+        for before, after in zip(layers_before, model.model.layers):
+            assert before is after

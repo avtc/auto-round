@@ -1079,14 +1079,14 @@ class CompressionOrchestrator(BaseOrchestrator):
         return any(bool(getattr(q, "enable_quanted_input", False)) for q in quantizers)
 
     def _attach_tail_imatrix_(self, lm_head_name, fp_rows) -> None:
-        """Attach the fp-input imatrix for lm_head from the chain tail rows.
+        """Attach the fp-input imatrix for lm_head from the captured rows.
 
-        In the capture path this statistic was accumulated by the quantizer's
-        fp-input forward hook while the collection walk executed lm_head; with
-        the single-block-target early-stop the walk never reaches lm_head, so
-        the same math (fp32 column sums of squares over all token rows, plus
-        the token-row count) runs directly over the tail rows - the identical
-        input VALUES the hook would have seen. Count-convention note: the
+        In the walk lane this statistic is accumulated by the quantizer's
+        fp-input forward hook while the collection walk executes lm_head; the
+        tail-fed lane never executes lm_head, so the same math (fp32 column
+        sums of squares over all token rows, plus the token-row count) runs
+        directly over the captured rows - the identical input VALUES the hook
+        would have seen. Count-convention note: the
         lm_head hook sees a (tokens, hidden) input, so its imatrix_cnt also
         counts token rows; BLOCK-layer hooks count batch entries instead. The
         outside-block lane never divides by imatrix_cnt, so the difference is
@@ -1124,8 +1124,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         or ``None`` when the pass cannot run (the caller then keeps the
         zero-shot RTN path).
         """
-        import torch as _torch
-
         from auto_round.compressors.tail_mock import CaptureHead, TailInjector, install_block_stubs_, restore_blocks_
 
         model = self.model_context.model
@@ -1147,11 +1145,11 @@ class CompressionOrchestrator(BaseOrchestrator):
             ids = token_ids[index] if token_ids is not None and index < len(token_ids) else None
             if (
                 ids is None
-                or not isinstance(ids, _torch.Tensor)
+                or not isinstance(ids, torch.Tensor)
                 or ids.shape[0] != row.shape[0]
                 or ids.shape[-1] != row.shape[1]
             ):
-                ids = _torch.zeros(row.shape[0], row.shape[1], dtype=_torch.long)
+                ids = torch.zeros(row.shape[0], row.shape[1], dtype=torch.long)
             # cached ids may carry -100 padding; the stubbed layers ignore the
             # embedding content, so remap to a valid index instead of failing
             return ids.clamp(min=0)
@@ -1210,18 +1208,17 @@ class CompressionOrchestrator(BaseOrchestrator):
             target_device = chain_device if chain_device is not None else embed_device
 
             restore_info = install_block_stubs_(model, block_names, tuple_arity=arity)
-            last_parent, last_attr, _ = restore_info["slots"][-1]
-            injector = TailInjector(fp_rows[0], tuple_arity=arity)
-            setattr(last_parent, last_attr, injector)
-            head_parent_path, _, head_attr = lm_head_name.rpartition(".")
-            head_parent = get_module(model, head_parent_path) if head_parent_path else model
-            original_head = getattr(head_parent, head_attr)
-            capture_head = CaptureHead(out_features)
-            setattr(head_parent, head_attr, capture_head)
-
             was_training = model.training
             model.eval()
             try:
+                last_parent, last_attr, _ = restore_info["slots"][-1]
+                injector = TailInjector(fp_rows[0], tuple_arity=arity)
+                setattr(last_parent, last_attr, injector)
+                head_parent_path, _, head_attr = lm_head_name.rpartition(".")
+                head_parent = get_module(model, head_parent_path) if head_parent_path else model
+                original_head = getattr(head_parent, head_attr)
+                capture_head = CaptureHead(out_features)
+                setattr(head_parent, head_attr, capture_head)
                 for variant, rows in (("fp", fp_rows), ("q", q_rows)):
                     if rows is None:
                         continue
@@ -1229,8 +1226,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                     for index, row in enumerate(rows):
                         injector.tail = row.to(target_device)
                         ids = _ids_for(index, row).to(embed_device)
-                        with _torch.no_grad():
-                            model(input_ids=ids, attention_mask=_torch.ones_like(ids), use_cache=False)
+                        with torch.no_grad():
+                            model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False)
                     captured = list(capture_head.records)
                     if len(captured) != len(rows):
                         raise RuntimeError(f"the mocked pass recorded {len(captured)} row sets for {len(rows)} samples")
@@ -1308,6 +1305,8 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "[lm_head] %s falls back to zero-shot RTN (the captured head-input rows are unavailable)",
                 lm_head_name,
             )
+            # the raw tail only fed the capture; release it on the fallback path
+            self._lm_head_chain_tail_ = None
             return None
         return captured
 

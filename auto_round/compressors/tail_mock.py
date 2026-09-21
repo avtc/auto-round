@@ -115,14 +115,20 @@ def install_block_stubs_(
     underneath them survives the temporary swap.
     """
     restore_info: Dict[str, object] = {"slots": [], "tuple_arity": tuple_arity}
-    for name in block_names:
-        parent_path, _, attr = name.rpartition(".")
-        parent = get_module(model, parent_path) if parent_path else model
-        if parent is None or not hasattr(parent, attr):
-            raise ValueError(f"cannot install a stub for unknown block '{name}'")
-        original = getattr(parent, attr)
-        setattr(parent, attr, PassthroughStub(tuple_arity=tuple_arity))
-        restore_info["slots"].append((parent, attr, original))
+    try:
+        for name in block_names:
+            parent_path, _, attr = name.rpartition(".")
+            parent = get_module(model, parent_path) if parent_path else model
+            if parent is None or not hasattr(parent, attr):
+                raise ValueError(f"cannot install a stub for unknown block '{name}'")
+            original = getattr(parent, attr)
+            setattr(parent, attr, PassthroughStub(tuple_arity=tuple_arity))
+            restore_info["slots"].append((parent, attr, original))
+    except Exception:
+        # roll back partial installs so a failed call leaves the model untouched
+        # (otherwise a later retry could record a stub as the "original")
+        restore_blocks_(model, restore_info)
+        raise
     return restore_info
 
 

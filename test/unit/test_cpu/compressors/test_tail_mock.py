@@ -157,6 +157,18 @@ class TestInstallRestore:
         restore_blocks_(model, restore_info)
         assert isinstance(model.model.layers[0], _FakeLayer)
 
+    def test_partial_install_failure_rolls_back(self):
+        model = _fake_model()
+        originals = list(model.model.layers)
+        try:
+            install_block_stubs_(model, block_names=["model.layers.0", "model.does_not_exist"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError")
+        for before, after in zip(originals, model.model.layers):
+            assert before is after
+
     def test_missing_block_name_raises(self):
         model = _fake_model()
         try:
