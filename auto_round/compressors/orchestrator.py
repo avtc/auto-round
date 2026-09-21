@@ -626,6 +626,10 @@ class CompressionOrchestrator(BaseOrchestrator):
             last_cache_name=_last_cache_name,
         )
         # Raw token IDs from the tokenizer, cached during calibration for use in quantize_block.
+        # NOTE: these cached ids are LOSS-LABEL convention, not forward input:
+        # ignored positions carry -100 (the loss-mask contract, see
+        # _compute_valid_token_mask). Any consumer feeding them back into a
+        # model forward must clamp (the mocked tail capture does).
         input_ids_cache = all_inputs.pop("input_ids", None)
         self.inputs = all_inputs
 
