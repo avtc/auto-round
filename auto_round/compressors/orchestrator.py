@@ -1036,7 +1036,6 @@ class CompressionOrchestrator(BaseOrchestrator):
         self._lm_head_chain_tail_ = None
         self._tail_stub_arity_ = None
         self._tail_lane_blocks_ = []
-        self._tail_stub_arity_ = None
         lm_head_name = get_lm_head_name(self.model_context.model)
         if lm_head_name is None or lm_head_name not in layer_names:
             return
@@ -1052,6 +1051,15 @@ class CompressionOrchestrator(BaseOrchestrator):
             "lm_head joins the upfront input capture like any external layer",
             lm_head_name,
         )
+        # The tail-only relaxations granted at post_init (inplace stays True and
+        # immediate packing stays on when the only outside-block layer is a
+        # single lm_head) are void now: the capture walk executes the model
+        # through the blocks, so the legacy restrictions apply again. GGUF
+        # always bypassed this concern (per-block packing).
+        self.inplace = False
+        formats = getattr(self, "formats", None) or []
+        if not (len(formats) == 1 and formats[0].is_gguf()):
+            self.compress_context.is_immediate_packing = False
 
     @staticmethod
     def _chain_hidden_rows(chain_state):
@@ -1104,7 +1112,7 @@ class CompressionOrchestrator(BaseOrchestrator):
             squared = torch.sum(torch.pow(flattened, 2), dim=0).to(torch.float32)
             total = squared if total is None else total + squared.to(total.device)
             count += flattened.shape[0]  # token rows - the lm_head hook's convention
-        module.imatrix = total
+        module.imatrix = total.to(device_manager.device)
         module.imatrix_cnt = count
         logger.info("[lm_head] attached the fp-input imatrix for %s from %d chain-tail rows", lm_head_name, count)
 
@@ -1259,7 +1267,7 @@ class CompressionOrchestrator(BaseOrchestrator):
         norm, scalings, casts, stream mixers - whatever the family does) with a
         capture head in place of lm_head, recording the exact rows the real
         model feeds the head. Returns ``None`` on any failure - the caller then
-        keeps the closed-form path for the layer.
+        falls back to zero-shot RTN for the layer.
         """
         tail = getattr(self, "_lm_head_chain_tail_", None)
         if tail is None:
@@ -1267,6 +1275,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 "[lm_head] %s falls back to zero-shot RTN (no input-capture entry; the layer was excluded from capture caching): the block loop kept no chain tail",
                 lm_head_name,
             )
+            self._lm_head_chain_tail_ = None
             return None
         new_q_output, reference_output = tail
         fp_rows = self._chain_hidden_rows(reference_output)
@@ -1280,6 +1289,7 @@ class CompressionOrchestrator(BaseOrchestrator):
                 lm_head_name,
                 type(fp_rows).__name__,
             )
+            self._lm_head_chain_tail_ = None
             return None
         q_rows = self._chain_hidden_rows(new_q_output) if new_q_output is not None else None
         q_requested = self._quantizer_requests_q_inputs_()

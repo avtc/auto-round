@@ -15,7 +15,8 @@
 """Tests for lm_head chain-tail inputs (block-loop chain output -> final norm -> lm_head).
 
 Covers: row extraction from list/dict chain states, lm_head name resolution,
-the tail derivation (norm applied, width sanity, closed-form fallbacks), the
+the tail derivation (mocked capture through the model's own post-block code,
+RTN fallbacks), the
 early-stop override gate, and the outside-block lane consuming tail inputs
 without issuing capture passes.
 """
@@ -421,3 +422,80 @@ class TestMockedTailCapture:
         assert model.lm_head is head_before
         for before, after in zip(layers_before, model.model.layers):
             assert before is after
+
+
+class TestTailLaneDecision:
+    """Init-time lane selection: smoke PASS -> tail-fed; FAIL -> capture walk + restrictions."""
+
+    @staticmethod
+    def _decider(model):
+        o = _orchestrator_like(model)
+        o.inplace = True
+        o.formats = []
+        o.compress_context = SimpleNamespace(is_immediate_packing=True)
+        o._decide_tail_fed_lane_ = MethodType(CompressionOrchestrator._decide_tail_fed_lane_, o)
+        return o
+
+    def _model_with_blocks(self):
+        model = _TinyModel()
+        model.model.layers = nn.ModuleList([nn.Linear(8, 8) for _ in range(2)])
+        return model
+
+    def test_smoke_pass_selects_tail_fed_lane(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        calls = []
+
+        def fake_smoke(model, lm_head_name, block_names, seq_len=2):
+            calls.append((lm_head_name, list(block_names)))
+            return (True, True)
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", fake_smoke)
+        o = self._decider(self._model_with_blocks())
+        o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0", "model.layers.1"]])
+        assert o._tail_fed_layers_ == ["lm_head"]
+        assert o._tail_stub_arity_ is True
+        assert o._tail_lane_blocks_ == ["model.layers.0", "model.layers.1"]
+        # the tail-only relaxations stay granted on the pass path
+        assert o.inplace is True and o.compress_context.is_immediate_packing is True
+        assert calls == [("lm_head", ["model.layers.0", "model.layers.1"])]
+
+    def test_smoke_fail_keeps_capture_walk_and_restores_restrictions(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", lambda *a, **k: (False, None))
+        o = self._decider(self._model_with_blocks())
+        records, restore = _capturing_logger_()
+        try:
+            o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0", "model.layers.1"]])
+        finally:
+            restore()
+        assert o._tail_fed_layers_ == []
+        assert o._tail_stub_arity_ is None
+        # the relaxations granted on the tail-only premise are reverted
+        assert o.inplace is False
+        assert o.compress_context.is_immediate_packing is False
+        assert any(lvl >= logging.WARNING and "keeps the ordinary capture walk" in msg for lvl, msg in records)
+
+    def test_smoke_fail_single_gguf_keeps_packing(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", lambda *a, **k: (False, None))
+        o = self._decider(self._model_with_blocks())
+        o.formats = [SimpleNamespace(is_gguf=lambda: True)]
+        o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0"]])
+        # GGUF always bypassed the concern: per-block packing stays on
+        assert o.compress_context.is_immediate_packing is True
+
+    def test_head_outside_plan_skips_smoke(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        def fail_if_called(*a, **k):
+            raise AssertionError("smoke must not run when the head is outside the plan")
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", fail_if_called)
+        o = self._decider(self._model_with_blocks())
+        o._decide_tail_fed_lane_(["other.layer"], [["model.layers.0", "model.layers.1"]])
+        assert o._tail_fed_layers_ == []
+        # relaxations granted elsewhere are left alone when the lane never engages
+        assert o.inplace is True and o.compress_context.is_immediate_packing is True
