@@ -30,6 +30,7 @@ from auto_round.calibration.utils import (
     _update_inputs,
 )
 from auto_round.compressors.base import BaseOrchestrator
+from auto_round.compressors.tail_mock import tail_smoke_check
 from auto_round.compressors.utils import (
     _get_quantized_layer_names_outside_blocks,
     immediate_pack,
@@ -599,16 +600,11 @@ class CompressionOrchestrator(BaseOrchestrator):
                 quant_block_list=self.quant_block_list,
             )
         # lm_head-class external layers are tail-fed: the block loop's chain
-        # output (fp reference + quantized rows through the final norm) is
-        # their input, so they neither join the upfront capture call nor the
-        # outside-block q-capture pass - no extra whole-model forwards
-        self._tail_fed_layers_ = []
-        self._lm_head_chain_tail_ = None
-        self._lm_head_norm_name_ = None
-        lm_head_name = get_lm_head_name(self.model_context.model)
-        if lm_head_name is not None and lm_head_name in layer_names:
-            self._tail_fed_layers_ = [lm_head_name]
-            self._lm_head_norm_name_ = self._discover_final_norm_(all_blocks)
+        # output (fp reference + quantized rows) is their input, so they neither
+        # join the upfront capture call nor the outside-block q-capture pass -
+        # no extra whole-model forwards. The init-time smoke gate decides the
+        # lane: a failed check keeps lm_head on the ordinary capture walk.
+        self._decide_tail_fed_lane_(layer_names, all_blocks)
         if not self.has_variable_block_shape:
             to_cache_block_names = [block[0] for block in all_blocks]
         else:
@@ -1025,6 +1021,36 @@ class CompressionOrchestrator(BaseOrchestrator):
             del layer_input
             clear_memory(q_layer_input)
             memory_monitor.log_summary()
+
+    def _decide_tail_fed_lane_(self, layer_names, all_blocks) -> None:
+        """Select the lm_head input lane at init, before any quantization work.
+
+        Runs the two-token mocked-continuation smoke check against the loaded
+        model. PASS -> the tail-fed lane: lm_head leaves the upfront capture
+        set and immediate packing stays on. FAIL -> lm_head keeps the ordinary
+        capture walk (the conservative path, as on main): the upfront walk
+        executes through the head and captures its inputs, and the outside-block
+        q-capture pass covers it like any external layer.
+        """
+        self._tail_fed_layers_ = []
+        self._lm_head_chain_tail_ = None
+        self._lm_head_norm_name_ = None
+        self._tail_stub_arity_ = None
+        lm_head_name = get_lm_head_name(self.model_context.model)
+        if lm_head_name is None or lm_head_name not in layer_names:
+            return
+        flat_blocks = [name for block in all_blocks for name in block]
+        smoke_ok, tuple_arity = tail_smoke_check(self.model_context.model, lm_head_name, flat_blocks)
+        if smoke_ok:
+            self._tail_fed_layers_ = [lm_head_name]
+            self._tail_stub_arity_ = tuple_arity
+            self._lm_head_norm_name_ = self._discover_final_norm_(all_blocks)
+            return
+        logger.warning(
+            "[lm_head] %s keeps the ordinary capture walk (the mocked-continuation smoke check failed): "
+            "lm_head joins the upfront input capture like any external layer",
+            lm_head_name,
+        )
 
     def _discover_final_norm_(self, all_blocks) -> Optional[str]:
         """Name-agnostic final-norm discovery: the last block-external norm-like leaf.

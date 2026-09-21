@@ -34,6 +34,7 @@ __all__ = [
     "TailInjector",
     "install_block_stubs_",
     "restore_blocks_",
+    "tail_smoke_check",
 ]
 
 
@@ -136,3 +137,72 @@ def restore_blocks_(model: nn.Module, restore_info: Union[Dict[str, object], Non
         return
     for parent, attr, original in restore_info["slots"]:
         setattr(parent, attr, original)
+
+
+def _smoke_logits_(output) -> Union[torch.Tensor, None]:
+    """Best-effort logits extraction from a model forward output."""
+    if isinstance(output, torch.Tensor):
+        return output
+    logits = getattr(output, "logits", None)
+    if isinstance(logits, torch.Tensor):
+        return logits
+    if isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
+        return output[0]
+    return None
+
+
+def tail_smoke_check(
+    model: nn.Module,
+    lm_head_name: str,
+    block_names: List[str],
+    seq_len: int = 2,
+) -> Tuple[bool, Union[bool, None]]:
+    """Init-time smoke gate for the mocked-continuation lane.
+
+    Temporarily replaces the named blocks with pass-through stubs and runs one
+    tiny forward with the REAL language head. The model's own pre-loop and
+    post-block code executes on stub outputs, which validates everything the
+    lane depends on: text-only callability, the stub return arity the layer
+    loop accepts, and the post-block chain. Tuple arity is tried first (its
+    ``out[0]``/``out[-1]`` convention also satisfies cache-collecting loops).
+
+    Returns ``(ok, tuple_arity)``; ``(False, None)`` means the conservative
+    capture walk should feed the head instead. The original block modules are
+    always restored, and the training mode is preserved.
+    """
+    head = get_module(model, lm_head_name) if lm_head_name else None
+    vocab = getattr(head, "out_features", None) if head is not None else None
+    if vocab is None:
+        return (False, None)
+    device = None
+    try:
+        embeddings = model.get_input_embeddings()
+        device = embeddings.weight.device if embeddings is not None else None
+    except Exception:
+        device = None
+    if device is None or device.type == "meta":
+        try:
+            device = next(p.device for p in model.parameters() if p.device.type != "meta")
+        except StopIteration:
+            return (False, None)
+    input_ids = torch.zeros(1, seq_len, dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids)
+    was_training = model.training
+    model.eval()
+    try:
+        for tuple_arity in (True, False):
+            restore_info = None
+            try:
+                restore_info = install_block_stubs_(model, block_names, tuple_arity=tuple_arity)
+                with torch.no_grad():
+                    output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                logits = _smoke_logits_(output)
+                if logits is not None and logits.dim() == 3 and logits.shape[0] == 1 and logits.shape[-1] == vocab:
+                    return (True, tuple_arity)
+            except Exception:  # any family-specific failure: try the next arity
+                continue
+            finally:
+                restore_blocks_(model, restore_info)
+    finally:
+        model.train(was_training)
+    return (False, None)

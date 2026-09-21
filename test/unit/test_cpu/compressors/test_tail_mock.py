@@ -165,3 +165,106 @@ class TestInstallRestore:
             pass
         else:
             raise AssertionError("expected ValueError for an unknown block name")
+
+
+class TestTailSmokeCheck:
+    """The two-token init-time smoke: stubs + real head + the model's own code."""
+
+    @staticmethod
+    def _tuple_loop_model(hidden=8, vocab=32, n_layers=3):
+        class Body(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_FakeLayer(hidden) for _ in range(n_layers)])
+                self.norm = nn.LayerNorm(hidden)
+
+        class Model(nn.Module):
+            def forward(self, input_ids, attention_mask=None, **kwargs):
+                hidden = input_ids.float().unsqueeze(-1).expand(-1, -1, self.lm_head.in_features)
+                hidden = hidden.clone()
+                for layer in self.model.layers:
+                    out = layer(hidden)
+                    hidden = out[0] if isinstance(out, tuple) else out
+                return self.lm_head(self.model.norm(hidden))
+
+        m = Model()
+        m.model = Body()
+        m.lm_head = nn.Linear(hidden, vocab)
+        return m
+
+    @staticmethod
+    def _bare_loop_model(hidden=8, vocab=32):
+        class Body(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_FakeLayer(hidden) for _ in range(2)])
+                self.norm = nn.LayerNorm(hidden)
+
+        class Model(nn.Module):
+            def forward(self, input_ids, attention_mask=None, **kwargs):
+                hidden = input_ids.float().unsqueeze(-1).expand(-1, -1, self.lm_head.in_features).clone()
+                for layer in self.model.layers:
+                    hidden = layer(hidden)  # consumes bare tensors only
+                return self.lm_head(self.model.norm(hidden))
+
+        m = Model()
+        m.model = Body()
+        m.lm_head = nn.Linear(hidden, vocab)
+        return m
+
+    def _run(self, model):
+        from auto_round.compressors.tail_mock import tail_smoke_check
+
+        blocks = [f"model.layers.{i}" for i in range(len(model.model.layers))]
+        return tail_smoke_check(model, "lm_head", blocks)
+
+    def test_tuple_loop_passes_with_tuple_arity(self):
+        ok, arity = self._run(self._tuple_loop_model())
+        assert ok is True and arity is True
+
+    def test_bare_loop_passes_with_bare_arity(self):
+        ok, arity = self._run(self._bare_loop_model())
+        assert ok is True and arity is False
+
+    def test_layers_restored_after_pass(self):
+        model = self._tuple_loop_model()
+        originals = list(model.model.layers)
+        self._run(model)
+        for before, after in zip(originals, model.model.layers):
+            assert before is after
+
+    def test_broken_wrapper_fails_and_restores(self):
+        model = self._tuple_loop_model()
+
+        def broken_forward(*args, **kwargs):
+            raise RuntimeError("text-only call unsupported")
+
+        model.forward = broken_forward
+        originals = list(model.model.layers)
+        ok, arity = self._run(model)
+        assert ok is False and arity is None
+        for before, after in zip(originals, model.model.layers):
+            assert before is after
+
+    def test_wrong_shape_logits_fail(self):
+        model = self._tuple_loop_model()
+
+        def flat_forward(input_ids, attention_mask=None, **kwargs):
+            return torch.zeros(1, 5)  # 2-D output regardless of stubs
+
+        model.forward = flat_forward
+        ok, arity = self._run(model)
+        assert ok is False and arity is None
+
+    def test_missing_head_fails(self):
+        from auto_round.compressors.tail_mock import tail_smoke_check
+
+        model = self._tuple_loop_model()
+        ok, arity = tail_smoke_check(model, "does_not_exist", ["model.layers.0"])
+        assert ok is False and arity is None
+
+    def test_training_mode_preserved(self):
+        model = self._tuple_loop_model()
+        model.train()
+        self._run(model)
+        assert model.training is True

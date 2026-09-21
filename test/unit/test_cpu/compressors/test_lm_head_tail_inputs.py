@@ -364,3 +364,86 @@ class TestLaneConsumesTailInputs:
             expected = sq if expected is None else expected + sq
         assert torch.allclose(lm.imatrix, expected, atol=1e-5)
         assert lm.imatrix_cnt == sum(r.numel() // r.shape[-1] for r in rows)
+
+
+class TestTailLaneDecision:
+    """Init-time lane selection: smoke PASS -> tail-fed; FAIL -> ordinary capture walk."""
+
+    @staticmethod
+    def _decider(model):
+        o = _orchestrator_like(model)
+        o._decide_tail_fed_lane_ = MethodType(CompressionOrchestrator._decide_tail_fed_lane_, o)
+        return o
+
+    @staticmethod
+    def _capturing_logger():
+        import auto_round.compressors.orchestrator as orch_mod
+
+        records = []
+
+        class _Rec:
+            def info(self, msg, *a):
+                records.append((logging.INFO, msg % a if a else msg))
+
+            def warning(self, msg, *a):
+                records.append((logging.WARNING, msg % a if a else msg))
+
+        orig = orch_mod.logger
+        orch_mod.logger = _Rec()
+        return records, lambda: setattr(orch_mod, "logger", orig)
+
+    def _model_with_blocks(self):
+        model = _TinyModel()
+        model.model.layers = nn.ModuleList([nn.Linear(8, 8) for _ in range(2)])
+        return model
+
+    def test_smoke_pass_selects_tail_fed_lane(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        calls = []
+
+        def fake_smoke(model, lm_head_name, block_names, seq_len=2):
+            calls.append((lm_head_name, list(block_names)))
+            return (True, True)
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", fake_smoke)
+        o = self._decider(self._model_with_blocks())
+        o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0", "model.layers.1"]])
+        assert o._tail_fed_layers_ == ["lm_head"]
+        assert o._tail_stub_arity_ is True
+        assert calls == [("lm_head", ["model.layers.0", "model.layers.1"])]
+
+    def test_smoke_fail_keeps_capture_walk_with_warning(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", lambda *a, **k: (False, None))
+        o = self._decider(self._model_with_blocks())
+        records, restore = self._capturing_logger()
+        try:
+            o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0", "model.layers.1"]])
+        finally:
+            restore()
+        assert o._tail_fed_layers_ == []
+        assert o._tail_stub_arity_ is None
+        assert o._lm_head_norm_name_ is None
+        assert any(lvl >= logging.WARNING and "keeps the ordinary capture walk" in msg for lvl, msg in records)
+
+    def test_head_outside_plan_skips_smoke(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        def fail_if_called(*a, **k):
+            raise AssertionError("smoke must not run when the head is outside the plan")
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", fail_if_called)
+        o = self._decider(self._model_with_blocks())
+        o._decide_tail_fed_lane_(["other.layer"], [["model.layers.0", "model.layers.1"]])
+        assert o._tail_fed_layers_ == []
+
+    def test_smoke_pass_discovers_norm_name(self, monkeypatch):
+        import auto_round.compressors.orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "tail_smoke_check", lambda *a, **k: (True, False))
+        o = self._decider(self._model_with_blocks())
+        o._decide_tail_fed_lane_(["lm_head"], [["model.layers.0", "model.layers.1"]])
+        assert o._tail_fed_layers_ == ["lm_head"]
+        assert o._lm_head_norm_name_ == "model.norm"
