@@ -144,6 +144,44 @@ class TestShardsFullLocalBatch:
         assert ctx.full_local_batch is False
 
 
+class TestWarmupDrawSize:
+    """The serial warm-up draws the lane's actual per-iteration batch, so
+    shape-dependent triton autotune keys are compiled serially before the
+    threaded fan-out (the triton Autotuner is thread-unsafe)."""
+
+    def _warm_shards(self, ctx):
+        seen = []
+        opt = mock.Mock()
+        opt.zero_grad = mock.Mock()
+
+        def step(rep, shard, dev, rec):
+            seen.append(list(shard))
+
+        with mock.patch.object(ctx, "_log_warmup_failure"):
+            ctx.warmup(step, opt)
+        return seen
+
+    def test_default_lane_warms_world_split_draw(self):
+        ctx = _make_tune_ctx(world=2, nsamples=8)
+        ctx.shards(nsamples=8, global_batch_size=4)  # draw 4 // 2 = 2
+        seen = self._warm_shards(ctx)
+        assert seen == [[0, 1], [4, 5]]  # head-of-shard, plan.shard_size-sized
+
+    def test_full_local_batch_lane_warms_the_full_draw(self):
+        ctx = _make_tune_ctx(world=2, nsamples=8)
+        with mock.patch.dict("os.environ", {"AR_TUNE_DDP_FULL_LOCAL_BATCH": "1"}):
+            ctx.shards(nsamples=8, global_batch_size=4)  # draw 4 (undivided)
+        seen = self._warm_shards(ctx)
+        assert seen == [[0, 1, 2, 3], [4, 5, 6, 7]]  # the lane's iteration shape
+
+    def test_warm_draw_never_exceeds_the_pool_shard(self):
+        ctx = _make_tune_ctx(world=2, nsamples=8)
+        with mock.patch.dict("os.environ", {"AR_TUNE_DDP_FULL_LOCAL_BATCH": "1"}):
+            ctx.shards(nsamples=8, global_batch_size=6)  # clamps to shard 4
+        seen = self._warm_shards(ctx)
+        assert seen == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
 class TestMeanLoss:
     def test_world_normalized_accounting(self):
         ctx = _make_tune_ctx(world=2)

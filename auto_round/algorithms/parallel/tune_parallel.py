@@ -104,6 +104,7 @@ class TuneParallelContext:
         self.params_per_replica: List[List[torch.nn.Parameter]] = []
         self._samplers: Optional[List[Any]] = None
         self.full_local_batch: bool = False
+        self.tune_draw: int = 0  # per-replica draw size for the tune loop (set by shards())
         self._pending_sync = False
         self.perf: dict = {}
         # collect-forward concurrency cap (from the run's ParallelPolicy;
@@ -510,11 +511,19 @@ class TuneParallelContext:
         try:
             _t0 = _ptime.perf_counter()
             _pool_shard = max(1, self.nsamples // self.group.world)
+            # warm the lane's ACTUAL per-iteration draw (the full-local-batch
+            # lane draws the full requested batch per replica): triton
+            # autotune keys are shape-dependent, and this serial warm-up is
+            # the only place those shapes get compiled and benchmarked before
+            # the threaded fan-out -- a first-time key inside the fan-out
+            # races the thread-unsafe triton Autotuner (its per-call nargs
+            # live on the shared kernel object)
+            _draw = min(getattr(self, "tune_draw", 0) or self.plan.shard_size, _pool_shard)
             for r, rep in enumerate(self.group.replicas):
-                # warm only one batch's worth (shard_size samples) at the
-                # head of this replica's pool shard -- warming the whole
-                # shard would materialize its full activations on the mirror
-                _warm = list(range(r * _pool_shard, r * _pool_shard + self.plan.shard_size))
+                # warm only one batch's worth at the head of this replica's
+                # pool shard -- warming the whole shard would materialize its
+                # full activations on the mirror
+                _warm = list(range(r * _pool_shard, r * _pool_shard + _draw))
                 _dev_r = next(rep.parameters()).device
                 with _device_scope(_dev_r):
                     step_fn(rep, _warm, _dev_r, _StepRecord())
@@ -600,6 +609,7 @@ class TuneParallelContext:
             # the default lane.
             shard = nsamples // world
             per_replica = max(1, min(global_batch_size, shard))
+            self.tune_draw = per_replica
             if per_replica < global_batch_size:
                 logger.info(
                     "[tune-ddp] full-local-batch: requested %d exceeds the per-replica shard %d; "
@@ -617,6 +627,7 @@ class TuneParallelContext:
                     world,
                 )
             return
+        self.tune_draw = global_batch_size // world
         if global_batch_size % world == 0:
             self._samplers = shard_samplers(nsamples, world, global_batch_size // world)
 
