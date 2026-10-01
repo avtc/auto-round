@@ -101,6 +101,49 @@ class TestNextShards:
         assert ctx._samplers is None
 
 
+class TestShardsFullLocalBatch:
+    """AR_TUNE_DDP_FULL_LOCAL_BATCH: per-replica draw = the requested global
+    batch (torchrun-lane semantics), still drawn from each replica's own
+    contiguous shard."""
+
+    def test_default_splits_global_batch(self):
+        ctx = _make_tune_ctx(world=4, nsamples=128)
+        ctx.shards(nsamples=128, global_batch_size=8)
+        assert ctx.full_local_batch is False
+        draws = [s_.next_batch() for s_ in ctx._samplers]
+        assert all(len(d) == 2 for d in draws)  # 8 // 4
+        for r, d in enumerate(draws):  # each draw stays inside its own shard
+            assert all(r * 32 <= j < (r + 1) * 32 for j in d)
+
+    def test_env_makes_per_replica_draw_the_full_batch(self):
+        ctx = _make_tune_ctx(world=4, nsamples=128)
+        with mock.patch.dict("os.environ", {"AR_TUNE_DDP_FULL_LOCAL_BATCH": "1"}):
+            ctx.shards(nsamples=128, global_batch_size=8)
+        assert ctx.full_local_batch is True
+        shards, gidx = ctx.next_shards(index_sampler=mock.Mock())
+        assert len(gidx) == 32  # world x global_batch_size
+        for r, d in enumerate(shards):
+            assert len(d) == 8  # the requested batch, undivided
+            assert all(r * 32 <= j < (r + 1) * 32 for j in d)  # own shard only
+
+    def test_env_clamps_draw_to_the_shard(self):
+        ctx = _make_tune_ctx(world=4, nsamples=128)
+        with mock.patch.dict("os.environ", {"AR_TUNE_DDP_FULL_LOCAL_BATCH": "1"}):
+            ctx.shards(nsamples=128, global_batch_size=48)  # shard = 32
+        assert ctx.full_local_batch is True
+        shards, _ = ctx.next_shards(index_sampler=mock.Mock())
+        for r, d in enumerate(shards):
+            assert len(d) == 32  # the whole shard per iteration
+            assert sorted(d) == list(range(r * 32, (r + 1) * 32))
+
+    def test_env_indivisible_pool_falls_back_to_global_batch(self):
+        ctx = _make_tune_ctx(world=4, nsamples=130)  # 130 % 4 != 0
+        with mock.patch.dict("os.environ", {"AR_TUNE_DDP_FULL_LOCAL_BATCH": "1"}):
+            ctx.shards(nsamples=130, global_batch_size=8)
+        assert ctx._samplers is None
+        assert ctx.full_local_batch is False
+
+
 class TestMeanLoss:
     def test_world_normalized_accounting(self):
         ctx = _make_tune_ctx(world=2)

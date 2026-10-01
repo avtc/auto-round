@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     AR_NVFP4_FUSED_LAYER_GLOBAL_SCALE: bool = True
     AR_ALLOW_W8_ASYM: bool = False
     AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES: int = 0
+    AR_TUNE_DDP_FULL_LOCAL_BATCH: bool = False
 
 
 def _get_non_negative_int_env(name: str, default: int) -> int:
@@ -261,6 +262,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES": lambda: _get_non_negative_int_env(
         "AR_TUNE_DDP_MAX_COLLECT_FORWARD_DEVICES", 0
     ),
+    # Tune-loop batch semantics for --parallel_quantization. Default off:
+    # the requested batch_size is the GLOBAL per-iteration batch and every
+    # replica draws its world-split share (serial-equivalent updates). On:
+    # every replica draws the full requested global batch from its OWN pool
+    # shard per iteration -- per-replica batch = batch_size, global effective
+    # batch = batch_size * world, matching the torchrun (one process per
+    # rank) lane, where each rank runs the serial loop over its shard with
+    # the full batch_size. The draw clamps to the shard when the pool split
+    # is smaller than the request (each replica then tunes its whole shard
+    # per iteration; per-forward micro-batching still caps at batch_size).
+    "AR_TUNE_DDP_FULL_LOCAL_BATCH": lambda: os.getenv("AR_TUNE_DDP_FULL_LOCAL_BATCH", "False").strip().lower()
+    in ("1", "true", "yes"),
 }
 
 

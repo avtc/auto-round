@@ -658,6 +658,15 @@ class SignRoundQuantizer(BaseQuantizer):
                             # double normalization the lane must reproduce:
                             # its per-forward losses are always sums)
                             num_elm *= sum(int(active_inputs[j].numel()) for j in global_indices)
+                    elif getattr(accel, "full_local_batch", False) and isinstance(active_inputs, list):
+                        # full-local-batch lane: each iteration's union is the
+                        # whole world's draw (world x global_batch_size), so
+                        # the pre-loop count (sized to the split global batch)
+                        # undercounts by the world factor -- recompute from the
+                        # actual draw so the reported lane loss keeps the
+                        # serial mean scale (best-iter selection is
+                        # scale-invariant, but the logged loss is not)
+                        num_elm = sum(int(active_inputs[j].numel()) for j in global_indices)
                     # without a mask, num_elm keeps its pre-loop value (the
                     # element count over the whole global batch), matching the
                     # serial accumulation normalization

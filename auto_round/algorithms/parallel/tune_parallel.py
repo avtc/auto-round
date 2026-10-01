@@ -103,6 +103,7 @@ class TuneParallelContext:
         self.mirror_schedules: List[Any] = []
         self.params_per_replica: List[List[torch.nn.Parameter]] = []
         self._samplers: Optional[List[Any]] = None
+        self.full_local_batch: bool = False
         self._pending_sync = False
         self.perf: dict = {}
         # collect-forward concurrency cap (from the run's ParallelPolicy;
@@ -583,8 +584,41 @@ class TuneParallelContext:
     def shards(self, nsamples: int, global_batch_size: int) -> None:
         """Build per-replica shard samplers when the global batch splits
         evenly across the world (else the loop falls back to index slicing)."""
-        if self.group is not None and global_batch_size % self.group.world == 0:
-            self._samplers = shard_samplers(nsamples, self.group.world, global_batch_size // self.group.world)
+        if self.group is None:
+            return
+        world = self.group.world
+        from auto_round import envs
+
+        if envs.AR_TUNE_DDP_FULL_LOCAL_BATCH:
+            # torchrun-lane semantics (AR_TUNE_DDP_FULL_LOCAL_BATCH): every
+            # replica draws the FULL requested global batch from its own
+            # contiguous shard each iteration, so the per-replica batch is
+            # batch_size (not the world-split share) and the global effective
+            # batch is batch_size * world. The draw clamps to the shard when
+            # the pool split is smaller than the request; a pool that cannot
+            # split (indivisible) keeps the global-sampler fallback, matching
+            # the default lane.
+            shard = nsamples // world
+            per_replica = max(1, min(global_batch_size, shard))
+            if per_replica < global_batch_size:
+                logger.info(
+                    "[tune-ddp] full-local-batch: requested %d exceeds the per-replica shard %d; "
+                    "drawing the whole shard per iteration",
+                    global_batch_size,
+                    shard,
+                )
+            self._samplers = shard_samplers(nsamples, world, per_replica)
+            self.full_local_batch = self._samplers is not None
+            if not self.full_local_batch:
+                logger.warning(
+                    "[tune-ddp] full-local-batch: pool of %d does not split into %d shards; "
+                    "falling back to the shared global batch",
+                    nsamples,
+                    world,
+                )
+            return
+        if global_batch_size % world == 0:
+            self._samplers = shard_samplers(nsamples, world, global_batch_size // world)
 
     def next_shards(self, index_sampler) -> Tuple[List[List[int]], List[int]]:
         """Draw the next global batch and split it into per-replica shards.
